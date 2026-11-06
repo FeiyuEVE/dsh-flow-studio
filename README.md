@@ -124,7 +124,7 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 | PUT | `/flows/<id>` | 整份覆盖保存 |
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
-| GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` / `connection+token`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
+| GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
 | GET/POST | `/runs` | run 列表（`limit`）/ 新建 run（`pending`，不自动开跑） |
 | POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；已有 run 在写 → 409） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |

@@ -181,7 +181,7 @@ $DSH_HOME/flow-studio/runs/
 1. **第一层（必做）**：插件路由与 `/api` **同一道门**——每个 handler 入口调宿主 `ctx.get('connection')?.requestRejection(req)`，把它返回的 401/403 原样透出；拿不到 connection 服务时 **fail-closed 503**，绝不放行。这把 DNS rebinding / 跨站 fetch / 未登录直连一并挡在门外（宿主自带的同源 + 登录 cookie 校验）。
 2. **第二层（可选）**：设置 `FLOW_STUDIO_TOKEN`（≥16 字符）后，`/api/flow-studio/*` 另外要求 `Authorization: Bearer <token>`；**只有导出接口**允许 `?token=<token>`（方便一次性下载）。客户端支持从 `location.search` 的 `fs_token` 读一次存 `sessionStorage` 并在请求头里带上；没配 token 时只走第一层。
 3. **信任边界要写明**：经过鉴权的写入方（引擎进程、运维用 curl）**被视为可信**——它们能直接写 run 目录，也能构造任意事件。所以「证据对账」（§13.7）防的是**模型自述**（`extra.provenance='model-claim'`），不是防运维；不带 `provenance` 的事件会被当作可信事件直接采纳（实测带一个不存在的 `evidenceRef` 也能 pass），这是已知边界，不是漏洞。要更严就把 `provenance` 列为必填并默认降级为 unknown。
-4. **`GET /health` 增补字段**：`auth`（`connection` / `connection+token`）、`runsDir`、`version`、`engine`（`real` / `stub`），让运维一眼看出当前档位；未鉴权时**不返回** `dir/runsDir`。
+4. **`GET /health` 增补字段**：`auth`（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`runsDir`、`version`、`engine`（`real` / `stub`），让运维一眼看出当前档位；未鉴权时**不返回** `dir/runsDir`。
 5. **错误响应不得带内部绝对路径**：500 只回通用文案 + `traceId`，详细错误写进程日志。
 
 ### 8.6 性能与鲁棒性

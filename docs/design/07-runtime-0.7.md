@@ -263,7 +263,7 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
 | T2 | 节点会话出现在顶层会话列表；run 收尾 dispose 后仍在列表、可 resume | 容器实测（不是类型推断） |
 | T3 | 同工作区两个 run 并发跑通；不同工作区并发跑通；同 runId 二次 start → 409 | 单测 + 容器 |
 | T4 | `worktree.enabled=true` 时 run 目录里真的有那个 worktree；`on` + 非 git → 400 | 单测 + 容器（真 git 仓库） |
-| T5 | codex/custom executor 用桩命令跑通，产出结构化判定 | 单测 |
+| T5 | codex/custom executor 跑通并产出结构化判定 | 单测（桩命令）+ **真 codex 实测**（06 册 §17.9：直连 19.7s、整条 run 25.5s、`usage` 记上、节点 passed） |
 | T6 | supervision 到点只唤醒一次、重启恢复、失败降级 | 单测 + 容器 |
 | T7 | `npm test` 全绿、`node scripts/build.mjs` 通过、client 体积在限内 | 命令输出 |
 

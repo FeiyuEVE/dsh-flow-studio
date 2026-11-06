@@ -74,7 +74,9 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
 - **节点可换外部 executor**：`node.executor = dsh | codex | custom`。codex 起
   `codex exec --json --output-schema …`，custom 跑 `sh -c <模板>`；过程输出映射成节点日志与
   `model/call` 用量，结构化判定仍按同一份 `outputSchema` 解析。外部 executor 只允许 single，
-  非法配置**能保存、不能开跑**。
+  非法配置**能保存、不能开跑**。**codex 路径已用本机 `codex-cli 0.166.0` 真跑验证**
+  （单次 exec 直连 + 整条 run，见 06 册 §17.9）；`--output-schema` 会自动转成 strict 形态，
+  否则 codex 服务端会以 `additionalProperties` 报 400。
 - **节点会话是顶层会话**：默认 `ctx.agents.create` 建独立会话（不挂父会话），在会话列表能看到、
   能点开接管；run 收尾 `dispose()` 只关句柄，不删日志。
 - **worktree 由 start 决策**：`run.json.workspace / worktree / sessionMode` 一次写入；工作区是 git
@@ -292,7 +294,7 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
   v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）。
 - `test/worktree.test.mjs` —— 工作区与 worktree：`workspaceIdFor` 稳定、真 git 仓库根 / 子目录 / 非 git 的区分、
   `git` 不可用与「不是仓库」分开、`auto/on/off` 决策、分支冲突 `-2`、真 worktree 落盘、脏 worktree 删除校验与路径越界拒绝。
-- `test/executor.test.mjs` —— 外部 executor：三档归一化与 `EXECUTOR_INVALID`、codex argv 顺序、JSONL 的
+- `test/executor.test.mjs` —— 外部 executor：三档归一化与 `EXECUTOR_INVALID`、codex argv 顺序、strict schema 转换、JSONL 的
   final / usage / 过程 / 未知事件、custom 占位符与 shell 转义、超时 / abort / 非 0 退出 / spawn 失败、
   跨 chunk 半行、真 node 子进程端到端；**不依赖真 codex、不联网**。
 - `test/runtime.test.mjs` —— 进程级注册表：两个 runId 并发跑通、同 runId 二次 start 409、失败实例摘除、

@@ -24,6 +24,7 @@ const engineModule = await import('../src/engine.js')
 const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
 const { summarize } = await import('../src/runlog.js')
+const { toStrictOutputSchema } = await import('../src/executor.js')
 
 const {
   createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
@@ -2650,13 +2651,31 @@ try {
         && typeof event.data.text === 'string'
         && event.data.text.includes('echo hi')), '节点日志里应能看到外部进程输出')
 
-      // schema 文件在 run 目录下（不写 /tmp），内容是引擎既有输出 schema。
+      // schema 文件在 run 目录下（不写 /tmp），内容是「严格化」后的节点输出 schema。
+      // codex 的 --output-schema 走 OpenAI strict structured outputs：每个 object 必须
+      // additionalProperties:false 且 required 列全，否则服务端 400（真 codex 实测）。
       const schemaPath = join(runsRoot, run.id, 'executors', '1.schema.json')
       A.ok(existsSync(schemaPath), 'schema 必须落在 <runsRoot>/<runId>/executors/<attemptId>.schema.json')
       const schema = JSON.parse(readFileSync(schemaPath, 'utf8'))
       A.equal(schema.type, 'object')
-      A.deepEqual(schema.required, ['verdict'])
-      A.deepEqual(schema, ENGINE_OUTPUT_SCHEMA)
+      A.deepEqual(schema.required, Object.keys(schema.properties))
+      A.equal(schema.additionalProperties, false)
+      A.deepEqual(schema, toStrictOutputSchema(ENGINE_OUTPUT_SCHEMA))
+      // 递归检查：每一层 object 都必须闭合，且不许残留 oneOf/anyOf。
+      const walk = (node, path) => {
+        if (!node || typeof node !== 'object') return
+        if (Array.isArray(node)) {
+          node.forEach((item, index) => walk(item, `${path}[${index}]`))
+          return
+        }
+        A.equal(node.oneOf === undefined && node.anyOf === undefined, true, `${path} 不该有 oneOf/anyOf`)
+        if (node.properties) {
+          A.equal(node.additionalProperties, false, `${path} 必须是 additionalProperties:false`)
+          A.deepEqual(node.required, Object.keys(node.properties), `${path} 的 required 必须列全`)
+        }
+        for (const [key, value] of Object.entries(node)) walk(value, `${path}.${key}`)
+      }
+      walk(schema, 'schema')
     } finally {
       rmSync(repo, { recursive: true, force: true })
       rmSync(execDir, { recursive: true, force: true })

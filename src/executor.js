@@ -84,6 +84,52 @@ export function normalizeExecutor(node) {
 }
 
 /**
+ * 把一份「宽松」的 JSON Schema 改写成 codex `--output-schema` 能接受的严格形态。
+ *
+ * 为什么必须转：codex 0.166 把 `--output-schema` 当成 OpenAI 的 **strict structured
+ * outputs** 用，服务端要求**每个 object 都带 `additionalProperties:false`，且 required
+ * 必须列全所有 properties**。引擎自己的节点输出 schema 是宽松的（一堆 optional、
+ * `additionalProperties:true`），原样传过去会被 400 拒掉：
+ *   Invalid schema for response_format 'codex_output_schema': 'schema.additionalProperties'
+ *   is required to be supplied and to be false when strict is true.
+ * （2026-11-06 真 codex 实测，见 docs/design/06-execution-engine.md §17。）
+ *
+ * 转换规则（只严格化、不改语义）：
+ *   - 有 `properties` 的 object：`additionalProperties:false` + `required` = 全部键；
+ *     optional 字段于是变成「必须给（空数组 / 空串 / 0 / na）」——strict 模式的硬要求；
+ *   - array：递归处理 `items`；
+ *   - 带 `oneOf` / `anyOf` 的属性整条丢弃（strict 对联合类型支持不稳，宁缺勿炸）；
+ *   - 其余关键字原样保留。
+ *
+ * @param {any} schema
+ * @returns {any} 严格化后的新对象（不修改入参）
+ */
+export function toStrictOutputSchema(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
+  const out = {}
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'required' || key === 'additionalProperties' || key === 'properties') continue
+    if (Array.isArray(value)) out[key] = value.map(item => (item && typeof item === 'object' ? toStrictOutputSchema(item) : item))
+    else out[key] = value && typeof value === 'object' ? toStrictOutputSchema(value) : value
+  }
+  if (schema.type === 'array') {
+    out.items = toStrictOutputSchema(schema.items)
+    return out
+  }
+  if (schema.properties && typeof schema.properties === 'object') {
+    const properties = {}
+    for (const [name, sub] of Object.entries(schema.properties)) {
+      if (sub && typeof sub === 'object' && (sub.oneOf !== undefined || sub.anyOf !== undefined)) continue
+      properties[name] = toStrictOutputSchema(sub)
+    }
+    out.properties = properties
+    out.required = Object.keys(properties)
+    out.additionalProperties = false
+  }
+  return out
+}
+
+/**
  * 拼 codex exec 的 argv。
  *
  * 依据：本机 codex 0.166.0 的 `codex exec --help`：
@@ -197,6 +243,9 @@ export function parseCodexLine(line) {
     const itemType = typeof item.type === 'string' ? item.type : ''
     if (itemType === 'error') {
       const text = textOf(item)
+      // codex 会把「你的 config.toml 里有不认识的键」这种告警发成 error 事件；
+      // 它对结果没有任何影响，写进节点日志只会让人误以为执行出错。
+      if (/unrecognized configuration setting/i.test(text)) return { kind: 'ignore' }
       return text !== '' ? { kind: 'log', text, level: 'error' } : { kind: 'ignore' }
     }
     if (itemType === 'command_execution' || itemType === 'reasoning'

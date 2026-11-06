@@ -36,7 +36,7 @@ import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 // 07 §4（R1+R4）：工作区解析 / worktree 决策是 start 时的一次性判断，纯逻辑 + 真 git。
 import { createWorktree, decideWorktree, resolveWorkspace, workspaceIdFor } from './worktree.js'
 // 07 §6（R6）：外部 executor（codex / custom）的运行与事件归一化。
-import { normalizeExecutor, runExternalExecutor } from './executor.js'
+import { normalizeExecutor, runExternalExecutor, toStrictOutputSchema } from './executor.js'
 import {
   RunError, appendEvents, readAllEvents, readRunMeta, runsDir, writeRunMeta,
 } from './runstore.js'
@@ -3049,7 +3049,9 @@ class FlowEngine {
     const dir = join(this.runsRoot, runId, 'executors')
     await mkdir(dir, { recursive: true, mode: 0o700 })
     const file = join(dir, `${attempt}.schema.json`)
-    await writeFile(file, `${JSON.stringify(ENGINE_OUTPUT_SCHEMA, null, 2)}\n`, {
+    // codex 的 --output-schema 走 OpenAI strict structured outputs：必须每个 object 都
+    // additionalProperties:false 且 required 列全（实测原样传宽松 schema 会被 400 拒）。
+    await writeFile(file, `${JSON.stringify(toStrictOutputSchema(ENGINE_OUTPUT_SCHEMA), null, 2)}\n`, {
       encoding: 'utf8',
       mode: 0o600,
     })
@@ -3098,6 +3100,7 @@ class FlowEngine {
     }
 
     let lastUsage = null
+    let usageSum = null
     const result = await runExternalExecutor({
       spec: runnable,
       prompt,
@@ -3108,17 +3111,29 @@ class FlowEngine {
         if (!event || typeof event !== 'object') return
         if (event.kind === 'usage') {
           lastUsage = event.usage || lastUsage
+          // codex 一轮 exec 可能有多条 turn.completed（工具调用后继续），各自带 usage；
+          // 只取最后一条会少算前面的 token，这里逐条累加，最后一次性写 model/call。
+          if (event.usage) {
+            usageSum = {
+              input: (usageSum ? usageSum.input : 0) + event.usage.input,
+              output: (usageSum ? usageSum.output : 0) + event.usage.output,
+            }
+          }
           return
         }
         // final 已经在 result.text / result.structured 里收口，不再重复写一条日志。
         if (event.kind === 'final') return
+        // stderr 不作为节点日志：codex 会往里写「Reading additional input from stdin…」
+        // 这类与结果无关的噪音，混进节点日志只会让人以为执行失败。
+        // 真失败时 `result.tail` 会把 stderr 尾部拼进错误消息。
+        if (event.kind === 'stderr') return
         if (typeof event.text === 'string') appendLog(event.text)
       },
     })
     await logChain
 
     // 5) 用量：有才记，不编造（四桶归一化由 mapHostUsage 完成，缺桶补 0）。
-    const usage = result.usage || lastUsage
+    const usage = usageSum || result.usage || lastUsage
     if (usage) {
       const mapped = mapHostUsage(usage)
       if (mapped) {
@@ -3148,8 +3163,15 @@ class FlowEngine {
       }
       const tail = typeof result.tail === 'string' && result.tail.trim() !== '' ? result.tail.trim() : ''
       const code = Number.isInteger(result.exitCode) ? String(result.exitCode) : '未知'
+      // codex 的真实失败原因常常在 stdout 的 `turn.failed` 事件里（stderr 只有噪音，
+      // 例如「Reading additional input from stdin...」），所以把最后一条 error 日志也带上。
+      const errorLog = [...(Array.isArray(result.events) ? result.events : [])]
+        .reverse()
+        .find(event => event && event.kind === 'log' && event.level === 'error')
+      const reasonText = errorLog && typeof errorLog.text === 'string' ? errorLog.text.trim() : ''
+      const detail = [reasonText, tail].filter(part => part !== '').join('；')
       throw new Error(clip(
-        `外部 executor（${provider}）非 0 退出（${code}）：${tail || '没有 stderr 输出'}`,
+        `外部 executor（${provider}）非 0 退出（${code}）：${detail || '没有可读的错误输出'}`,
         2000,
       ))
     }

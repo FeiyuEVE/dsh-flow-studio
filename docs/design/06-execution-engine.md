@@ -783,6 +783,24 @@ codex exec --json --output-schema <schema.json> -C <cwd> --skip-git-repo-check \
 - 不联网、不真跑 codex 也能测：`test/executor.test.mjs` 全部用假 `spawn` 或真 `node` 子进程桩，
   `test/engine.test.mjs` 用 `node -e` / `sh -c` 桩命令。
 
+**`--output-schema` 必须是 strict 形态**（2026-11-06 真 codex 实测）：codex 0.166 把这份 schema
+直接交给 OpenAI 的 strict structured outputs，服务端要求**每个 object 都带
+`additionalProperties:false`、且 `required` 列全所有 properties**。引擎自己的节点输出 schema 是宽松的
+（一堆 optional、`additionalProperties:true`），原样传过去会被 400：
+
+```
+Invalid schema for response_format 'codex_output_schema':
+'schema.additionalProperties' is required to be supplied and to be false when strict is true.
+```
+
+所以 `_writeExecutorSchema()` 写盘前先过 `toStrictOutputSchema()`（`src/executor.js`）：递归闭合每一层
+object、`required` 取全部键、丢掉带 `oneOf/anyOf` 的属性（例如 `checks.ruleSetVersion`）。代价是
+optional 字段必须给空值（`[]` / `""` / `0` / `"na"`），换来的是「模型一定返回可解析的 JSON」。
+`test/engine.test.mjs` 会递归断言写出的 schema 每层都闭合。
+
+另外：codex 在 stdin 非 TTY 时会往 stderr 打 `Reading additional input from stdin...`，子进程用
+`stdio: ['ignore','pipe','pipe']`；这条 stderr 噪音**不进节点日志**（真失败时进错误消息的尾部）。
+
 ### 17.4 custom 的命令模板
 
 - 执行方式固定 `sh -c <script>`，不经过引擎的 argv 解析。
@@ -833,6 +851,9 @@ stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如
 不登记 `sessionIndex`。因此收件箱对它的可达方式只有 `queued`（消息随下一次节点提示词消费），
 `injected / resumed` 不适用；外部进程里也无法调用 `flow_reply`。
 
+**一轮 exec 可能有多条 `turn.completed`**（codex 调工具后会继续下一 turn，每条都带 `usage`）。
+引擎把这次执行里所有 `usage` 事件**逐条累加**后只写一条 `model/call`；只取最后一条会少算前面的 token。
+
 ### 17.6 失败语义
 
 节点级重试沿用 §9：默认重试 1 次（`FLOW_STUDIO_NODE_RETRIES`，0–5），**不新增 `attemptId`**；
@@ -866,13 +887,29 @@ stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如
 
 ```sh
 node test/executor.test.mjs     # 13 组 / 81 条断言
-node test/engine.test.mjs       # 61 组 / 493 条断言（含 v0.7 外部 executor 5 组）
+node test/engine.test.mjs       # 61 组 / 547 条断言（含 v0.7 外部 executor 5 组与 strict schema 递归断言）
 node test/model.test.mjs        # 17 组（executor 校验 1 组）
 ```
 
 对应代码：`src/executor.js` 的 `normalizeExecutor` / `buildCodexArgs` / `parseCodexLine` /
 `runExternalExecutor`；`src/engine.js` 的 `_executorSpecOf` / `_writeExecutorSchema` /
 `_runExternalNode`；`src/model.js` 的 `EXECUTOR` / `validateFlow`。
+
+### 17.9 真 codex 实测（2026-11-06）
+
+本机 `codex-cli 0.166.0`（ChatGPT 登录）真跑，不走桩：
+
+| 场景 | 结果 |
+|---|---|
+| `runExternalExecutor` 直连（`-s read-only`，问 1+1） | `ok=true`，19.7s，`structured={"answer":"1+1 等于 2。"}`，`usage={input:17678, output:16, total:17694}` |
+| 引擎整条 run（`executor:'codex'` 的 stage 节点） | `run.status=done`、`node/end.status=passed`、25.5s、`model/call` 的 provider=`codex`、`usage={input:18488, output:394}`；事件链 `run/start → node/start → model/call → review/verdict → artifact/write → check/form → test/report → node/end → run/end` |
+
+第一次真跑时暴露的两个 bug（都已修）：① schema 未严格化 → codex 400
+（`additionalProperties` 报错），节点失败；② 失败消息只带 stderr 尾
+（`Reading additional input from stdin...`），把真正的 `turn.failed` 原因藏在 stdout 里——
+现在错误消息会带上最后一条 error 级日志。
+
+复现方式：`node scripts/codex-smoke.mjs`（会真调 codex、产生 token 消耗；产物落 `.tmp/`，`KEEP_SMOKE=1` 可保留现场）。
 
 ## 18 内建 supervision（v0.7）
 

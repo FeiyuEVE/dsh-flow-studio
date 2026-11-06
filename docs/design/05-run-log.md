@@ -48,7 +48,7 @@ $DSH_HOME/flow-studio/runs/
 | `node/start` | `title`、`mode`（`single`/`team`）、`model?`、`skills[]` | 引擎 |
 | `node/end` | `status`（`passed`/`rejected`/`failed`/`skipped`）、`durationMs` | 引擎 |
 | `member/start` | `name`、`role?`、`model?` | 引擎 |
-| `member/end` | `status`、`durationMs` | 引擎 |
+| `member/end` | `status`（`passed`/`failed`/`aborted`/`partial`）、`durationMs` | 引擎 |
 | `model/call` | `provider`、`model`、`usage`（见 §3）、`stopReason?` | 宿主事件归集 |
 | `tool/call` | `name`、`argumentsDigest?`、`ok`、`durationMs?` | 宿主事件归集 |
 | `skill/load` | `skill`（唯一名）、`ok` | `tool/call` 里 `name==='skill'` |
@@ -128,7 +128,7 @@ $DSH_HOME/flow-studio/runs/
 - **`ref.url`**：可选；没有就只显示文字引用，不假装是可点击链接。
 - **`ts`**：允许客户端给，服务端统一规范成 UTC `Z`；缺失或非法一律用服务端时间，不报错。
 - **run 级 vs 节点级**：只有 `run/start`、`run/end` 是 run 级事件；**其余全部**（含 `reject/trigger`）必须带 `nodeId` + `attemptId`，缺失即 400。反之，run 级事件**带 `nodeId`/`attemptId` 也 400**（防止污染节点索引）。
-- **`member/start`、`member/end` 的 `memberId` 必填**；`member/end.data.status` 只接受 `passed` / `failed` / `aborted`。
+- **`member/start`、`member/end` 的 `memberId` 必填**；`member/end.data.status` 只接受 `passed` / `failed` / `aborted` / `partial`。`partial` = 成员确实跑过、但没有可信结论（06 §13.10：宿主观察不到成员自己上报的结论，**不得**由 lead 的 verdict 反推成员 passed/failed，宁可不写也不编造）。
 - **`extra`**：键**数量** ≤16，单值字符串 ≤256，总字节 ≤2048；超限丢弃不报错。
 - **`artifact/write.data.path`**：相对 run 目录，禁止绝对路径、`..`、反斜杠、空段，长度 ≤512；写入方必须在事件里同时给 `bytes` 与 `sha256`（可选但推荐），没有 `sha256` 时摘要标注「未校验」。
 - **`skill/load.data.ok=false`**：不计入 `loaded`，计入 `loads.failed`；`missing` = 声明集 − 成功加载集（因此失败项也会出现在 missing 里）。
@@ -149,6 +149,7 @@ $DSH_HOME/flow-studio/runs/
 ### 8.3 聚合口径修正
 
 - **progress 按打回失效**：`reject/trigger` 发生时，从 `fromNodeId` 上溯到 `toNodeId`（含两端在路径上的节点）的**当前 attempt 的 passed** 全部失效，计入 `invalidated`；`ratio = 有效 passed / (总阶段 − skipped)`，并强制 `≤ 1`。旧 attempt 的结论不计。
+- **`progress.nodes` 必须下发（B1）**：`summary.progress` / `GET /runs` / `GET /runs/<id>` 都要带 `nodes: { <nodeId>: { attemptId, status, endSeq, invalidated } }` 与 `invalidatedNodes[]`，不能只回计数。长跑或事件窗口被截断（`since`/尾部读）时，客户端只剩这份每节点状态可用；只回计数会让已通过的节点退化成「未开始」。
 - **findings**：
   - `id` 在 **run 内全局唯一**（跨节点不得复用，否则合并）；
   - `total` = 去重后的唯一 finding 数（取每条最新状态），`reportedCount` = 原始事件数，两者都要返回；
@@ -170,6 +171,7 @@ $DSH_HOME/flow-studio/runs/
   - 返工 1 且 P1=0 且 `acceptedRate ≥ 0.6` → `state=pass`、`label=良：返工 1 轮后达标`；
   - 否则 → `state=warn`、`label=可：返工 <n> 轮`（**不是绿灯**）。
 - `progress.ratio < 1` → 至少 `warn`，即使其它证据全过（半成品不许绿）。
+- **旧失败必须复判（B4）**：三类证据指标只在当前 attempt 里聚合，于是「上一轮判 `fail`、这一轮不再提这条」会被静默洗成绿灯。按标识（`itemId` / `suite` / `ruleSetId`）**全量回放**：若某标识最新一次判定仍是 `fail`、且当前 attempt 完全没有该标识的新判定，则该指标强制 `unknown`（理由写「上一轮判未通过、本轮没有复判」，并列 `staleFails[]`）。既不按通过算，也不直接判 `fail`——没复判就是没复判。
 
 ### 8.5 安全（B2）—— 诚实的两层
 

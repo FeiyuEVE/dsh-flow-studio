@@ -280,6 +280,14 @@ try {
     assert.equal(attempt1.status, 'passed')
     // §8.3：第 2 轮已开始但还没有 node/end，第 1 轮的 passed 不再算作当前有效结论。
     assert.equal(detail.run.nodeDone, 0)
+    // B1：详情接口必须带每节点状态，不能只回计数（否则客户端长跑时只能退回事件窗口）。
+    assert.ok(detail.run.progress.nodes, 'readRunDetail 必须下发 progress.nodes')
+    assert.equal(detail.run.progress.nodes.n_req.attemptId, 2)
+    assert.equal(detail.run.progress.nodes.n_req.status, 'pending')
+    assert.equal(detail.run.progress.nodes.n_req.invalidated, false)
+    assert.deepEqual(detail.run.progress.invalidatedNodes, [])
+    // 该 run 没有 run/start（nodeTotal 未知）且当前 attempt 还是 pending，分母 0 → ratio=null
+    assert.equal(detail.run.progress.ratio, null)
   })
 
   console.log('runstore.js · 边界与拒绝')

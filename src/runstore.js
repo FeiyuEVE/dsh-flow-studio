@@ -1606,6 +1606,13 @@ export async function readRunDetail(runsRoot, runId) {
         failed: progress.failed,
         rejected: progress.rejected,
         invalidated: progress.invalidated,
+        invalidatedNodes: progress.invalidatedNodes,
+        // B1：详情接口也要带每节点状态——只回计数会让客户端拿不到 nodes、
+        // 长跑或事件窗口被截断时只能退回事件窗口推导，已通过的节点会显示成未开始。
+        nodes: progress.nodes,
+        total: progress.total,
+        observed: progress.observed,
+        denominator: progress.denominator,
         ratio: progress.ratio,
       },
     },

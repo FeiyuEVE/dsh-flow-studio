@@ -62,7 +62,9 @@ const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end'])
 
 const RUN_END_STATUS = new Set(['done', 'aborted', 'failed'])
 const NODE_END_STATUS = new Set(['passed', 'rejected', 'failed', 'skipped'])
-const MEMBER_END_STATUS = new Set(['passed', 'failed', 'aborted'])
+// 06 §13.10：team 节点的成员由 lead 派发，成员自己上报的结论我们观察不到，
+// 引擎收尾只能写 `partial`（= 成员跑过但没有可信结论）。宁可不写，也不伪造 passed/failed。
+const MEMBER_END_STATUS = new Set(['passed', 'failed', 'aborted', 'partial'])
 const EXEC_MODE = new Set(['single', 'team'])
 const ARTIFACT_KIND = new Set(['md', 'diff', 'json', 'log'])
 const SEVERITY = new Set(['P0', 'P1', 'P2'])
@@ -1001,6 +1003,18 @@ export function computeProgress(events = []) {
     rejected,
     invalidated: invalidatedNodes.length,
     invalidatedNodes: invalidatedNodes.sort((a, b) => a.localeCompare(b)),
+    // B1：长跑 / 事件窗口被截断时，客户端只剩这份每节点状态可用（计数对象不够）。
+    // 客户端 normalizeProgress 认 `{attemptId,status,endSeq,invalidated}` 这四字段。
+    nodes: Object.fromEntries(
+      [...nodes.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([nodeId, entry]) => [nodeId, {
+          attemptId: entry.attemptId,
+          status: entry.status,
+          endSeq: entry.endSeq,
+          invalidated: entry.invalidated,
+        }]),
+    ),
     total,
     observed,
     denominator,
@@ -1445,6 +1459,70 @@ export function countRework(events = []) {
 }
 
 /**
+ * 三类证据指标各自的「标识字段」与「这次判定算不算 fail」。
+ * 与 computeAcceptance / computeTests / checkEvidence 里的判定保持同一口径。
+ */
+const STALE_METRICS = {
+  'acceptance/verdict': {
+    name: 'acceptance',
+    idField: 'itemId',
+    isFail: data => data.status === 'fail',
+  },
+  'test/report': {
+    name: 'tests',
+    idField: 'suite',
+    isFail: data => (Number.isInteger(data.failed) && data.failed > 0)
+      || (Number.isInteger(data.executed) && Number.isInteger(data.passed)
+        && data.executed > 0 && data.passed < data.executed),
+  },
+  'check/form': {
+    name: 'checks',
+    idField: 'ruleSetId',
+    isFail: data => data.state === 'fail',
+  },
+}
+
+/**
+ * B4：返工后的旧失败必须被**复判**，不能被「这一轮不再提它」洗成绿灯。
+ *
+ * 三个证据指标只在当前 attempt 里聚合（§8.2 / §8.3），所以节点被打回重跑后，
+ * 上一轮 `itemId` / `suite` / `ruleSetId` 判过的 fail 会随着旧 attempt 一起被过滤掉。
+ * 这里按标识全量回放：**最新一次判定仍是 fail，且当前 attempt 完全没有该标识的新判定**
+ * → 记为「未复判」，上层据此把该指标降为 unknown（不给 pass、也不直接判 fail）。
+ *
+ * @param {object[]} events
+ * @returns {{ acceptance: string[], tests: string[], checks: string[] }}
+ */
+export function computeStaleFails(events = []) {
+  const attempts = currentAttempts(events)
+  const latest = new Map()
+  for (const event of sortEvents(events)) {
+    if (!event || !event.data) continue
+    const metric = STALE_METRICS[event.kind]
+    if (!metric) continue
+    const id = event.data[metric.idField]
+    if (typeof id !== 'string' || id === '') continue
+    const key = `${metric.name}\u0000${id}`
+    const entry = latest.get(key) || { metric: metric.name, id, fail: false, rejudged: false }
+    // sortEvents 保证升序，所以最后写进来的就是「最新一次判定」。
+    entry.fail = metric.isFail(event.data)
+    if (isCurrentAttempt(event, attempts)) entry.rejudged = true
+    latest.set(key, entry)
+  }
+  const stale = { acceptance: [], tests: [], checks: [] }
+  for (const entry of latest.values()) {
+    if (entry.fail && !entry.rejudged) stale[entry.metric].push(entry.id)
+  }
+  for (const list of Object.values(stale)) list.sort((a, b) => a.localeCompare(b))
+  return stale
+}
+
+function staleFailReason(label, ids) {
+  const shown = ids.slice(0, 3).join('、')
+  return `${label}里有 ${ids.length} 条上一轮判未通过、本轮没有复判（${shown}${ids.length > 3 ? ' 等' : ''}），不能按通过算`
+}
+
+/**
  * 质量结论（§8.4，按 04 §3.9.3 落地）。
  *
  * 必要证据五项：acceptance / tests / checks / review / p0p1。
@@ -1504,6 +1582,32 @@ export function computeQuality(events = [], options = {}) {
       reason: conflictReason(CONFLICT_LABELS.findings, conflicts.findings),
       conflicts: conflicts.findings,
     }
+  }
+
+  // B4：上一轮判 fail、本轮没有复判的条目 → 该指标 unknown（先记着，别让旧失败被洗白）。
+  const stale = computeStaleFails(events)
+  for (const [metric, label] of [
+    ['acceptance', EVIDENCE_LABELS.acceptance],
+    ['tests', EVIDENCE_LABELS.tests],
+    ['checks', EVIDENCE_LABELS.checks],
+  ]) {
+    const ids = stale[metric]
+    if (ids.length === 0) continue
+    const target = metric === 'acceptance' ? acceptance : metric === 'tests' ? tests : checks
+    if (target.state === 'unknown') {
+      // 已经是 unknown 了：保留原来的更具体理由，只补上未复判清单。
+      target.staleFails = ids
+      continue
+    }
+    const next = {
+      ...target,
+      state: 'unknown',
+      reason: staleFailReason(label, ids),
+      staleFails: ids,
+    }
+    if (metric === 'acceptance') acceptance = next
+    else if (metric === 'tests') tests = next
+    else checks = next
   }
 
   const evidence = {

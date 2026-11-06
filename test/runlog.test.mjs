@@ -10,8 +10,8 @@ import assert from 'node:assert/strict'
 import {
   EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex, computeAcceptance,
   computeConflicts, computeFindings, computeProgress, computeQuality, computeRejects,
-  computeSkillUsage, computeTests, computeTokens, isSafeRelPath, normalizeEvent, renderRunMarkdown,
-  summarize, summarizeAcceptance,
+  computeSkillUsage, computeStaleFails, computeTests, computeTokens, isSafeRelPath, normalizeEvent,
+  renderRunMarkdown, summarize, summarizeAcceptance,
 } from '../src/runlog.js'
 
 let checks = 0
@@ -878,6 +878,117 @@ check('§13.7 stub 引擎：quality 强制 unknown，label 前缀「桩」，sum
     ...fullEvidence().slice(1),
   ])
   assert.equal(fromEvent.engine, 'stub', 'run/start.data.engine=stub 也要被识别')
+})
+
+check('§8.1/§13.10 member/end.status=partial 合法：成员结论不可观测，不伪造 passed/failed', () => {
+  const event = ok(base({
+    kind: 'member/end',
+    memberId: 'n_req:1',
+    data: { status: 'partial', durationMs: 5 },
+  }))
+  assert.equal(event.data.status, 'partial')
+  // 仍然拒绝白名单外的取值（引擎的 partial 探针就是靠这个判断宿主能力）。
+  bad(base({ kind: 'member/end', memberId: 'n_req:1', data: { status: 'done', durationMs: 5 } }), 'data.status')
+})
+
+check('§8.3 summary.progress 带 nodes（B1）：每节点 attemptId/status/endSeq/invalidated', () => {
+  const events = [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 3 } }),
+    ev('node/start', { nodeId: 'n_a', attemptId: 1, data: { title: 'A', mode: 'single', skills: [] } }),
+    ev('node/end', { nodeId: 'n_a', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ev('node/start', { nodeId: 'n_b', attemptId: 1, data: { title: 'B', mode: 'single', skills: [] } }),
+    ev('node/end', { nodeId: 'n_b', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ev('node/start', { nodeId: 'n_c', attemptId: 1, data: { title: 'C', mode: 'single', skills: [] } }),
+    ev('reject/trigger', {
+      nodeId: 'n_b', attemptId: 1,
+      data: { edgeId: 'e1', fromNodeId: 'n_b', toNodeId: 'n_a', reason: '打回' },
+    }),
+  ]
+  const progress = computeProgress(events)
+  assert.ok(progress.nodes, 'computeProgress 必须返回 nodes')
+  assert.deepEqual(progress.nodes.n_a, {
+    attemptId: 1, status: 'passed', endSeq: events[2].seq, invalidated: true,
+  })
+  assert.deepEqual(progress.nodes.n_b, {
+    attemptId: 1, status: 'passed', endSeq: events[4].seq, invalidated: true,
+  })
+  assert.equal(progress.nodes.n_c.status, 'pending', '没跑到的节点是 pending，不是 passed')
+  assert.equal(progress.nodes.n_c.invalidated, false)
+  assert.deepEqual(progress.invalidatedNodes, ['n_a', 'n_b'])
+  assert.equal(progress.passed, 0)
+  const summary = summarize(events)
+  assert.equal(summary.progress.nodes.n_b.status, 'passed', 'summary.progress.nodes 也要有')
+  assert.equal(summary.progress.nodes.n_c.attemptId, 1)
+})
+
+/** attempt 1 判 fail、attempt 2 是否复判可控的验收 / 测试证据。 */
+function staleEvents(rejudge) {
+  const list = [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 1 } }),
+    ev('node/start', { nodeId: 'n_req', attemptId: 1, data: { title: '需求', mode: 'single', skills: [] } }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_req', attemptId: 1,
+      data: { itemId: 'R1', status: 'fail', decidedBy: 'auto' },
+    }),
+    ev('test/report', {
+      nodeId: 'n_req', attemptId: 1,
+      data: { suite: 'unit', executed: 3, passed: 1, failed: 2, skipped: 0, reportRef: 'ev/unit.json' },
+    }),
+    ev('node/end', { nodeId: 'n_req', attemptId: 1, data: { status: 'rejected', durationMs: 1 } }),
+    ev('reject/trigger', {
+      nodeId: 'n_req', attemptId: 1,
+      data: { edgeId: 'e1', fromNodeId: 'n_req', toNodeId: 'n_req', reason: '返工' },
+    }),
+    ev('node/start', { nodeId: 'n_req', attemptId: 2, data: { title: '需求', mode: 'single', skills: [] } }),
+    // attempt 2 只交了个新的通过条目 R2；旧的两条 fail 再没出现过。
+    ev('acceptance/verdict', {
+      nodeId: 'n_req', attemptId: 2,
+      data: { itemId: 'R2', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/r2.md' },
+    }),
+  ]
+  if (rejudge) {
+    list.push(
+      ev('acceptance/verdict', {
+        nodeId: 'n_req', attemptId: 2,
+        data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/r1.md' },
+      }),
+      ev('test/report', {
+        nodeId: 'n_req', attemptId: 2,
+        data: { suite: 'unit', executed: 3, passed: 3, failed: 0, skipped: 0, reportRef: 'ev/unit2.json' },
+      }),
+    )
+  }
+  list.push(ev('node/end', { nodeId: 'n_req', attemptId: 2, data: { status: 'passed', durationMs: 1 } }))
+  return list
+}
+
+check('§8.4 B4 旧 fail 未复判 → unknown：不能被下一轮的「不再提」洗成绿灯', () => {
+  const events = staleEvents(false)
+  const stale = computeStaleFails(events)
+  assert.deepEqual(stale.acceptance, ['R1'])
+  assert.deepEqual(stale.tests, ['unit'])
+  assert.deepEqual(stale.checks, [])
+
+  // 只看当前 attempt 时 R1 与 unit 的 fail 根本不在窗口里，旧的聚合会给 pass。
+  assert.equal(computeAcceptance(events).state, 'pass', '前提：单看当前 attempt 就是假绿')
+
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.acceptance.state, 'unknown')
+  assert.deepEqual(quality.evidence.acceptance.staleFails, ['R1'])
+  assert.match(quality.evidence.acceptance.reason, /复判/)
+  assert.equal(quality.evidence.tests.state, 'unknown')
+  assert.deepEqual(quality.evidence.tests.staleFails, ['unit'])
+  assert.notEqual(quality.state, 'pass', '有未复判的旧失败时不许给绿灯')
+  assert.ok(quality.missing.includes('acceptance'), quality.missing.join(','))
+})
+
+check('§8.4 B4 复判过就不算 stale：attempt 2 重判 R1/unit 通过后回到 pass', () => {
+  const events = staleEvents(true)
+  assert.deepEqual(computeStaleFails(events), { acceptance: [], tests: [], checks: [] })
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.acceptance.state, 'pass')
+  assert.equal(quality.evidence.tests.state, 'pass')
+  assert.equal(quality.evidence.acceptance.staleFails, undefined)
 })
 
 console.log(`\n${checks} 组通过`)

@@ -93,9 +93,12 @@ function MemberCard({ member, index, onPatch, onRemove }) {
     }))
 }
 
-function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchMember, onRemoveMember }) {
+function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge }) {
   const isStage = node.kind === NODE_KIND.STAGE
   const rejectEdges = flow.edges.filter(edge => edge.from === node.id && edge.kind === EDGE_KIND.REJECT)
+  const targets = flow.nodes.filter(item => item.id !== node.id)
+  const step = event => (event.shiftKey ? 20 : 4)
+  const nudge = (dx, dy) => event => onNudge(dx * step(event), dy * step(event))
 
   return h('div', { className: 'fs-panel-body' },
     h('div', { className: 'fs-group' },
@@ -122,6 +125,34 @@ function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchM
           rows: 2,
           onChange: event => onPatch({ outputs: event.target.value }),
         }))),
+
+    // 单指针 / 键盘替代：不拖拽也能连线，不拖拽也能移动（WCAG 2.2 拖动替代）。
+    h('div', { className: 'fs-group' },
+      h('div', { className: 'fs-group-title' }, '位置与连线'),
+      h(Field, { label: '位置', hint: '点按微调；按住 Shift 步长 20px' },
+        h('div', { className: 'fs-pos' },
+          h('div', { className: 'fs-pos-val' }, 'X ' + Math.round(node.x) + ' · Y ' + Math.round(node.y)),
+          h('div', { className: 'fs-pos-grid' },
+            h('span', { className: 'fs-pos-gap', 'aria-hidden': true }),
+            h('button', { type: 'button', className: 'fs-btn ghost sm fs-pos-btn', title: '上移（Shift 20px）', onClick: nudge(0, -1) }, '上'),
+            h('span', { className: 'fs-pos-gap', 'aria-hidden': true }),
+            h('button', { type: 'button', className: 'fs-btn ghost sm fs-pos-btn', title: '左移（Shift 20px）', onClick: nudge(-1, 0) }, '左'),
+            h('span', { className: 'fs-pos-gap', 'aria-hidden': true }),
+            h('button', { type: 'button', className: 'fs-btn ghost sm fs-pos-btn', title: '右移（Shift 20px）', onClick: nudge(1, 0) }, '右'),
+            h('span', { className: 'fs-pos-gap', 'aria-hidden': true }),
+            h('button', { type: 'button', className: 'fs-btn ghost sm fs-pos-btn', title: '下移（Shift 20px）', onClick: nudge(0, 1) }, '下'),
+            h('span', { className: 'fs-pos-gap', 'aria-hidden': true })))),
+      h(Field, { label: '连接到…', hint: '选中即建边；方向按上下游自动判定' },
+        h('select', {
+          className: 'fs-select',
+          value: '',
+          onChange: event => {
+            const target = event.target.value
+            if (target) onConnect(target)
+          },
+        },
+        h('option', { value: '' }, targets.length > 0 ? '选择一个目标节点…' : '没有其他节点可连'),
+        targets.map(item => h('option', { key: item.id, value: item.id }, '到 ' + item.title))))),
 
     isStage
       ? h('div', { className: 'fs-group' },
@@ -240,14 +271,14 @@ function EdgeForm({ edge, flow, onPatch, onDelete }) {
         ? h('div', { className: 'fs-hint' },
           sameTarget > 0
             ? '这个节点已有 ' + sameTarget + ' 条打回线进入，本线会再占一个槽位。'
-            : '打回线走画布下方航道，超出 6 条会收起成徽标。')
+            : '打回线走画布下方航道，共 6 个槽位；第 7 条起并入最外航道并收起标签。')
         : null),
 
     h('div', { className: 'fs-divider' }),
     h('button', { type: 'button', className: 'fs-btn danger', onClick: onDelete }, '删除这条连线'))
 }
 
-export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge, onAddMember, onPatchMember, onRemoveMember }) {
+export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge, onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge }) {
   let title = '配置'
   let body = h('div', { className: 'fs-empty-panel' },
     '点画布上的节点或连线来配置。',
@@ -269,6 +300,8 @@ export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, o
         onAddMember,
         onPatchMember: (index, patch) => onPatchMember(node.id, index, patch),
         onRemoveMember: index => onRemoveMember(node.id, index),
+        onConnect: targetId => onConnect(node.id, targetId),
+        onNudge: (dx, dy) => onNudge(node.id, dx, dy),
       })
     }
   } else if (selection && selection.kind === 'edge') {

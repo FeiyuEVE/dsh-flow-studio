@@ -40,7 +40,7 @@ const { bindReact } = await import('../src/client/runtime.js')
 bindReact(React)
 
 const model = await import('../src/model.js')
-const { FlowCanvas } = await import('../src/client/canvas.js')
+const { FlowCanvas, wheelPanDelta } = await import('../src/client/canvas.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList } = await import('../src/client/flowlist.js')
@@ -48,6 +48,7 @@ const { FlowStudioPage } = await import('../src/client/page.js')
 
 const flow = model.defaultFlow()
 flow.id = 'flow-test'
+const { beginLink } = await import('../src/client/link.js')
 
 console.log('components')
 
@@ -68,6 +69,57 @@ check('画布渲染出全部阶段节点与打回标签', () => {
   assert.ok(html.includes('<svg'), '连线层没有 SVG')
 })
 
+check('键盘连线待定：候选列出「到 <节点名>」并高亮当前目标', () => {
+  const linkState = beginLink(flow.nodes, 'n_req')
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: { kind: 'node', id: 'n_req' },
+    linkState,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+    onPickCandidate() {},
+  }))
+  assert.ok(html.includes('连线待定：从「需求分析」到'), '连线待定态没有可读的源节点名')
+  assert.ok(html.includes('到 方案设计'), '候选没有显示「到 <节点名>」')
+  assert.ok(html.includes('fs-link-option on'), '当前候选没有高亮')
+  assert.ok(html.includes('fs-link-target'), '候选节点没有高亮类')
+  assert.ok(html.includes('Tab 切换 · Enter 确认 · Esc 取消'), '缺少键盘操作提示')
+})
+
+check('打回线超过 6 条：画 +N 汇总角标并提示已并入最外航道', () => {
+  const crowded = model.defaultFlow()
+  crowded.id = 'flow-crowded'
+  const extra = [
+    ['n_review', 'n_req'], ['n_test', 'n_req'], ['n_shape', 'n_req'],
+    ['n_plan', 'n_start'], ['n_review', 'n_start'],
+  ]
+  extra.forEach(([from, to], index) => {
+    crowded.edges.push({ id: 'e_extra_' + index, from, to, kind: 'reject', label: '溢出打回' })
+  })
+  const html = render(React.createElement(FlowCanvas, {
+    flow: crowded,
+    selection: null,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(html.includes('+3'), '第 7 条起应当在航道末端汇总 +N')
+  assert.ok(html.includes('并入最外航道'), '缺少确定性降级提示')
+  assert.ok(!html.includes('结构设计被打回'), '并入最外航道的边应当收起标签')
+})
+
+check('Shift+滚轮走横移；Ctrl/Cmd 与裸滚轮仍走缩放', () => {
+  // 判定顺序：Shift 且不带 Ctrl/Cmd 才是横移；pinch 带 ctrlKey，必须仍走缩放。
+  assert.equal(wheelPanDelta({ shiftKey: true, deltaY: 120, deltaX: 0 }), 120, 'Shift+滚轮应返回横移增量')
+  assert.equal(wheelPanDelta({ shiftKey: true, deltaY: 0, deltaX: -40 }), -40, '触控板横向手势应映射到横移')
+  assert.equal(wheelPanDelta({ shiftKey: true, ctrlKey: true, deltaY: 120 }), null, 'pinch 带 ctrlKey 时仍走缩放')
+  assert.equal(wheelPanDelta({ shiftKey: true, metaKey: true, deltaY: 120 }), null, 'Cmd+Shift 仍走缩放')
+  assert.equal(wheelPanDelta({ shiftKey: false, deltaY: 120 }), null, '裸滚轮保持缩放')
+})
+
 check('检查器（节点）渲染出执行方式与 skills 选择器', () => {
   const html = render(React.createElement(Inspector, {
     flow,
@@ -86,6 +138,12 @@ check('检查器（节点）渲染出执行方式与 skills 选择器', () => {
   assert.ok(html.includes('主管 + 子 agent'))
   assert.ok(html.includes('java-service'), '技能列表没渲染出来')
   assert.ok(html.includes('资深需求分析师'), '角色内容没回填')
+  assert.ok(html.includes('连接到…'), '单指针连线入口没渲染')
+  assert.ok(html.includes('到 方案设计'), '连线目标没有可读名字')
+  assert.ok(html.includes('位置'), '可点按移动入口没渲染')
+  assert.ok(html.includes('X 300 · Y 220'), '当前坐标没显示')
+  assert.ok(html.includes('按住 Shift 步长 20px'), '微调步长提示没渲染')
+  assert.ok(html.includes('>上<') && html.includes('>下<') && html.includes('>左<') && html.includes('>右<'), '四个方向按钮不齐')
 })
 
 check('检查器（打回连线）渲染出打回说明输入', () => {
@@ -166,7 +224,9 @@ check('页面带流程时装配出画布 / 检查器 / 底栏', () => {
   assert.ok(html.includes('双击空白处新增节点'), '检查器没进入空选中态')
   assert.ok(html.includes('条打回'), '底栏没统计打回')
   assert.ok(html.includes('结构完整'), '底栏没显示校验结论')
-  assert.ok(html.includes('已同步'), '保存状态没显示')
+  assert.ok(html.includes('已加载'), '保存状态没显示')
+  assert.ok(html.includes('aria-live="polite"'), '状态栏缺少 aria-live 播报区')
+  assert.ok(html.includes('role="status"'), '状态栏缺少 status 角色')
 })
 
 check('页面骨架在没有流程时给出加载态', () => {

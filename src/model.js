@@ -10,9 +10,12 @@
 /** 存储格式版本。改动字段语义时递增，读侧据此拒绝过旧数据。 */
 export const SCHEMA_VERSION = 1
 
-/** 画布上节点的固定尺寸（px，逻辑坐标）。固定宽高让连线锚点与命中测试都能纯算。 */
+/**
+ * 画布上节点的固定尺寸（px，逻辑坐标）。固定宽高让连线锚点与命中测试都能纯算。
+ * 208×96 是 DESIGN.md §6 的裁决值；主从节点加 20px（116）放成员点行。
+ */
 export const NODE_W = 208
-export const NODE_H = 88
+export const NODE_H = 96
 
 /** 节点类型：开始 / 阶段 / 结束。 */
 export const NODE_KIND = { START: 'start', STAGE: 'stage', END: 'end' }
@@ -32,6 +35,10 @@ export const LIMITS = {
   skillsPerNode: 12,
   teamMembers: 8,
   maxRounds: 9,
+  /** 未知字段兜底（extras）的上限：键数、单条字符串长度、序列化后的总字节数。 */
+  extrasKeys: 16,
+  extrasTextLen: 256,
+  extrasBytes: 2048,
 }
 
 /** 生成短 id。Host / 浏览器都有 crypto.randomUUID，但短一点更好读。 */
@@ -188,7 +195,168 @@ function clip(value, max) {
 }
 
 /**
- * 把外部来的任意 JSON 收敛成合法流程。不认识的东西一律丢掉，不抛错——
+ * 未知字段兜底容器（extras）的已知键。
+ * 已知字段有显式校验与默认值；这里只收「白名单之外、但需要往返保存」的字段，
+ * 让新增字段在引擎/客户端接入前至少不会被保存链静默丢掉。
+ */
+const NODE_KNOWN_FIELDS = new Set([
+  'id', 'kind', 'title', 'x', 'y', 'mode', 'role', 'task',
+  'skills', 'outputs', 'maxRounds', 'model', 'team', 'extras',
+])
+const EDGE_KNOWN_FIELDS = new Set(['id', 'from', 'to', 'kind', 'label', 'extras'])
+const MEMBER_KNOWN_FIELDS = new Set(['name', 'role', 'task', 'extras'])
+
+const EXTRAS_KEY_MAX = 64
+const EXTRAS_DEPTH = 3
+const EXTRAS_ARRAY_MAX = 16
+const EXTRAS_OBJECT_KEYS = 16
+
+/** 用 defineProperty 写自有键，避免 `__proto__` 之类的键改写原型。 */
+function setOwn(target, key, value) {
+  Object.defineProperty(target, key, { value, enumerable: true, configurable: true, writable: true })
+}
+
+/**
+ * 把一个任意值收敛成「JSON 可序列化的原始值」。
+ * 只接受字符串 / 数字 / 布尔 / null / 普通对象 / 数组；函数、undefined、NaN、
+ * Infinity、BigInt、Symbol、类实例、循环引用、超深嵌套一律返回 undefined（丢弃）。
+ * 复合值里只要有一个成员不合法，整个值丢弃——不做半截保留，避免读回时类型漂移。
+ */
+function jsonSafeValue(value, depth = 0, seen = new WeakSet()) {
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    return value.length > LIMITS.extrasTextLen ? value.slice(0, LIMITS.extrasTextLen) : value
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value !== 'object') return undefined
+  if (depth >= EXTRAS_DEPTH || seen.has(value)) return undefined
+  if (Array.isArray(value)) {
+    seen.add(value)
+    try {
+      const out = []
+      for (const entry of value.slice(0, EXTRAS_ARRAY_MAX)) {
+        const safe = jsonSafeValue(entry, depth + 1, seen)
+        if (safe === undefined) return undefined
+        out.push(safe)
+      }
+      return out
+    } catch {
+      return undefined
+    } finally {
+      seen.delete(value)
+    }
+  }
+
+  let proto
+  try {
+    proto = Object.getPrototypeOf(value)
+  } catch {
+    return undefined
+  }
+  if (proto !== Object.prototype && proto !== null) return undefined
+
+  seen.add(value)
+  try {
+    const out = {}
+    let count = 0
+    for (const key of Object.keys(value)) {
+      if (count >= EXTRAS_OBJECT_KEYS) break
+      if (typeof key !== 'string' || key.length === 0 || key.length > EXTRAS_KEY_MAX) continue
+      const safe = jsonSafeValue(value[key], depth + 1, seen)
+      if (safe === undefined) return undefined
+      setOwn(out, key, safe)
+      count += 1
+    }
+    return out
+  } catch {
+    return undefined
+  } finally {
+    seen.delete(value)
+  }
+}
+
+/**
+ * 收集未知字段。先读回上一次 normalize 存下的 extras（保证往返不丢），再补本次新出现的键。
+ * 超限只丢弃，不截断已知字段，也不抛错。
+ */
+function collectExtras(source, known) {
+  const extras = {}
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return extras
+  let keys = 0
+  let bytes = 2 // '{}'
+
+  const add = (key, value) => {
+    if (typeof key !== 'string' || key.length === 0 || key.length > EXTRAS_KEY_MAX) return true
+    const safe = jsonSafeValue(value)
+    if (safe === undefined) return true
+    let text
+    try {
+      text = JSON.stringify(safe)
+    } catch {
+      return true
+    }
+    if (typeof text !== 'string') return true
+    // 保守估算：key 引号 + 冒号 + value + 逗号。
+    const size = JSON.stringify(key).length + text.length + 4
+    if (Object.prototype.hasOwnProperty.call(extras, key)) {
+      // 往返读回同一个键：只更新，不重复占键数 / 字节额度。
+      setOwn(extras, key, safe)
+      return true
+    }
+    if (keys >= LIMITS.extrasKeys) return false
+    if (bytes + size > LIMITS.extrasBytes) return false
+    setOwn(extras, key, safe)
+    keys += 1
+    bytes += size
+    return true
+  }
+
+  let previous
+  try {
+    previous = source.extras
+  } catch {
+    previous = undefined
+  }
+  if (previous && typeof previous === 'object' && !Array.isArray(previous)) {
+    try {
+      for (const key of Object.keys(previous)) {
+        if (known.has(key)) continue
+        if (!add(key, previous[key])) return extras
+      }
+    } catch {
+      // 损坏的旧 extras 直接忽略。
+    }
+  }
+
+  let sourceKeys
+  try {
+    sourceKeys = Object.keys(source)
+  } catch {
+    return extras
+  }
+  for (const key of sourceKeys) {
+    if (known.has(key)) continue
+    let value
+    try {
+      value = source[key]
+    } catch {
+      continue
+    }
+    if (!add(key, value)) break
+  }
+  return extras
+}
+
+/** 有未知字段时才挂 extras；没有就不改变既有节点/边的形状。 */
+function withExtras(target, source, known) {
+  const extras = collectExtras(source, known)
+  if (Object.keys(extras).length > 0) target.extras = extras
+  return target
+}
+
+/**
+ * 把外部来的任意 JSON 收敛成合法流程。已知字段走白名单校验；白名单外的
+ * 节点/边/成员字段收进有界的 extras（往返保存不丢，超限丢弃），仍不抛错——
  * 读旧版本留下的文件时宁可降级也不要打不开面板。
  * @param {unknown} raw
  * @param {string} fallbackName
@@ -208,13 +376,13 @@ export function normalizeFlow(raw, fallbackName) {
       const kind = Object.values(NODE_KIND).includes(item.kind) ? item.kind : NODE_KIND.STAGE
       const mode = Object.values(EXEC_MODE).includes(item.mode) ? item.mode : EXEC_MODE.SINGLE
       const team = Array.isArray(item.team)
-        ? item.team.slice(0, LIMITS.teamMembers).map(member => ({
+        ? item.team.slice(0, LIMITS.teamMembers).map(member => withExtras({
           name: clip(String(member && member.name || ''), 60),
           role: clip(String(member && member.role || ''), LIMITS.textLen),
           task: clip(String(member && member.task || ''), LIMITS.textLen),
-        }))
+        }, member, MEMBER_KNOWN_FIELDS))
         : []
-      nodes.push({
+      const node = {
         id,
         kind,
         title: clip(String(item.title || ''), LIMITS.titleLen) || '未命名节点',
@@ -233,7 +401,8 @@ export function normalizeFlow(raw, fallbackName) {
           : 2,
         model: clip(String(item.model || ''), 120),
         team,
-      })
+      }
+      nodes.push(withExtras(node, item, NODE_KNOWN_FIELDS))
     }
   }
 
@@ -250,13 +419,14 @@ export function normalizeFlow(raw, fallbackName) {
       const key = `${from}->${to}:${kind}`
       if (edgeKeys.has(key)) continue
       edgeKeys.add(key)
-      edges.push({
+      const edge = {
         id: clip(String(item.id || ''), 64) || makeId('e'),
         from,
         to,
         kind,
         label: clip(String(item.label || ''), 60),
-      })
+      }
+      edges.push(withExtras(edge, item, EDGE_KNOWN_FIELDS))
     }
   }
 

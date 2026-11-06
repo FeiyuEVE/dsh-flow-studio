@@ -10,13 +10,24 @@
  */
 
 import { EDGE_KIND, EXEC_MODE, NODE_KIND, NODE_W } from '../model.js'
-import { assignRejectLanes, fitView, lodOf, nextPath, nodeAt, nodeHeight } from './geometry.js'
+import { FIT_MIN, assignRejectLanes, fitView, hiddenColumnsOf, lodOf, nextPath, nodeAt, nodeHeight } from './geometry.js'
 import { h, rt } from './runtime.js'
 
-const ZOOM_MIN = 0.25
+/** 手动缩放地板与适配地板同源，避免「适配进得去、手动缩不到」。 */
+const ZOOM_MIN = FIT_MIN
 const ZOOM_MAX = 2
 const SNAP = 4
 const CORNER = 10
+
+/**
+ * 滚轮手势口径（01 §5.1 #7/#8）：Shift+滚轮横移，裸滚轮与 Ctrl/Cmd+滚轮（含 pinch）缩放。
+ * 横移优先用 deltaY；触控板横向手势只给 deltaX 时同样映射到横移。
+ * 返回横向增量（屏幕 px，方向未取反），非横移返回 null。Ctrl/Cmd 优先于 Shift，保证 pinch 仍缩放。
+ */
+export function wheelPanDelta(event) {
+  if (!event.shiftKey || event.ctrlKey || event.metaKey) return null
+  return event.deltaY !== 0 ? event.deltaY : (event.deltaX || 0)
+}
 
 /** 屏幕坐标 → 逻辑坐标。 */
 function toLogical(clientX, clientY, rect, view) {
@@ -77,7 +88,7 @@ function memberTint(index) {
   return `color-mix(in srgb, var(--dsw-alias-state-business-primary) ${weight}%, var(--dsw-alias-bg-layer-2))`
 }
 
-function NodeCard({ node, selected, rejects, onPointerDown, onStartLink }) {
+function NodeCard({ node, selected, rejects, candidate, activeCandidate, onPointerDown, onStartLink }) {
   const isStage = node.kind === NODE_KIND.STAGE
   const team = isStage && node.mode === EXEC_MODE.TEAM && node.team.length > 0
   const tags = []
@@ -85,12 +96,13 @@ function NodeCard({ node, selected, rejects, onPointerDown, onStartLink }) {
   if (node.skills.length > 0) tags.push(h('span', { key: 's', className: 'fs-tag skill' }, `skill ${node.skills.length}`))
 
   return h('div', {
-    className: 'fs-node kind-' + node.kind + (selected ? ' selected' : ''),
+    className: 'fs-node kind-' + node.kind + (selected ? ' selected' : '')
+      + (candidate ? ' fs-link-target' : '') + (activeCandidate ? ' fs-link-active' : ''),
     style: { left: node.x, top: node.y, width: NODE_W, height: nodeHeight(node) },
     onPointerDown,
     role: 'button',
     tabIndex: 0,
-    'aria-label': '节点 ' + node.title,
+    'aria-label': '节点 ' + node.title + (activeCandidate ? '，键盘连线目标' : ''),
     'aria-pressed': selected ? 'true' : 'false',
   },
   isStage ? h('div', { className: 'fs-port in', 'aria-hidden': true }) : null,
@@ -124,7 +136,7 @@ function NodeCard({ node, selected, rejects, onPointerDown, onStartLink }) {
   )
 }
 
-export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAddEdge, onAddNodeAt }) {
+export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMoveNode, onAddEdge, onAddNodeAt, onPickCandidate }) {
   const { useState, useEffect, useRef, useCallback } = rt.React
   const containerRef = useRef(null)
   const [view, setView] = useState({ x: 48, y: 24, z: 0.92 })
@@ -142,6 +154,10 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
   const byId = new Map(nodes.map(node => [node.id, node]))
   const heights = new Map(nodes.map(node => [node.id, nodeHeight(node)]))
   const lanes = assignRejectLanes(nodes, flow.edges)
+  const linkSource = linkState ? byId.get(linkState.fromId) : null
+  const candidateIds = linkState && Array.isArray(linkState.candidates) ? linkState.candidates : []
+  const candidateSet = new Set(candidateIds)
+  const activeCandidateId = linkState ? candidateIds[linkState.index] || '' : ''
   const rejectCount = new Map()
   for (const edge of flow.edges) {
     if (edge.kind === EDGE_KIND.REJECT) rejectCount.set(edge.from, (rejectCount.get(edge.from) || 0) + 1)
@@ -167,10 +183,14 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
           const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, current.z * ratio))
           const px = rect.width / 2
           const py = rect.height / 2
+          const x = px - (px - current.x) * (next / current.z)
+          const y = py - (py - current.y) * (next / current.z)
           return {
-            x: px - (px - current.x) * (next / current.z),
-            y: py - (py - current.y) * (next / current.z),
+            x,
+            y,
             z: next,
+            clamped: current.clamped,
+            hiddenColumns: hiddenColumnsOf(flowRef.current.nodes, rect.width, x, next),
           }
         })
       },
@@ -202,22 +222,33 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
     }
   }, [doFit])
 
-  // 滚轮缩放：React 的 onWheel 可能是 passive，用原生监听显式 preventDefault。
+  // 滚轮：裸滚轮 / Ctrl-Cmd 缩放（以指针为中心），Shift+滚轮横向平移。
+  // React 的 onWheel 可能是 passive，用原生监听显式 preventDefault。
   useEffect(() => {
     const element = containerRef.current
     if (!element) return undefined
     const onWheel = event => {
       event.preventDefault()
+      const pan = wheelPanDelta(event)
+      if (pan !== null) {
+        // 1px 滚轮增量 = 1px 视口位移，与中键 / 空格拖动同一手感；横移只改 x，不改 z。
+        if (pan !== 0) setView(current => ({ ...current, x: current.x - pan }))
+        return
+      }
       const rect = element.getBoundingClientRect()
       const current = viewRef.current
       const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, current.z * Math.exp(-event.deltaY * 0.0016)))
       if (next === current.z) return
       const px = event.clientX - rect.left
       const py = event.clientY - rect.top
+      const x = px - (px - current.x) * (next / current.z)
+      const y = py - (py - current.y) * (next / current.z)
       setView({
-        x: px - (px - current.x) * (next / current.z),
-        y: py - (py - current.y) * (next / current.z),
+        x,
+        y,
         z: next,
+        clamped: current.clamped,
+        hiddenColumns: hiddenColumnsOf(flowRef.current.nodes, rect.width, x, next),
       })
     }
     element.addEventListener('wheel', onWheel, { passive: false })
@@ -283,7 +314,7 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
   const startPan = event => {
     if (event.button !== 0) return
     const target = event.target
-    if (target && typeof target.closest === 'function' && target.closest('.fs-node, .fs-edge-hit, .fs-hud')) return
+    if (target && typeof target.closest === 'function' && target.closest('.fs-node, .fs-edge-hit, .fs-hud, .fs-link-picker, .fs-canvas-note, .fs-canvas-hint')) return
     onSelect(null)
     dragRef.current = { mode: 'pan', clientX: event.clientX, clientY: event.clientY, viewX: view.x, viewY: view.y }
     setDragKind('pan')
@@ -312,7 +343,7 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
 
   const onDoubleClick = event => {
     const target = event.target
-    if (target && typeof target.closest === 'function' && target.closest('.fs-node, .fs-edge-hit, .fs-hud')) return
+    if (target && typeof target.closest === 'function' && target.closest('.fs-node, .fs-edge-hit, .fs-hud, .fs-link-picker, .fs-canvas-note, .fs-canvas-hint')) return
     const rect = containerRef.current.getBoundingClientRect()
     const point = toLogical(event.clientX, event.clientY, rect, view)
     onAddNodeAt(
@@ -371,7 +402,7 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
           markerEnd: marker,
           style: { pointerEvents: 'none' },
         })))
-      if (geometry.reject) {
+      if (geometry.reject && !lanes.overflow.has(edge.id)) {
         items.push(h('text', {
           key: edge.id + '-l',
           className: 'fs-edge-label',
@@ -379,6 +410,30 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
           y: geometry.label.y,
           textAnchor: 'middle',
         }, edge.label || '打回'))
+      }
+    }
+
+    // 第 7 条起并入最外航道：这些边不再各带标签，只在航道末端汇总一个 +N。
+    if (lanes.overflowCount > 0 && lanes.outerLaneY !== null) {
+      let laneEndX = -Infinity
+      for (const edge of flow.edges) {
+        if (!lanes.overflow.has(edge.id)) continue
+        const lane = lanes.lanes.get(edge.id)
+        const from = byId.get(edge.from)
+        const to = byId.get(edge.to)
+        if (!lane || !from || !to) continue
+        const sx = from.x * view.z + view.x + (NODE_W / 2 + lane.outSlot) * view.z
+        const ex = to.x * view.z + view.x + (NODE_W / 2 + lane.inSlot) * view.z
+        laneEndX = Math.max(laneEndX, sx, ex)
+      }
+      if (Number.isFinite(laneEndX)) {
+        items.push(h('text', {
+          key: 'lane-overflow',
+          className: 'fs-edge-flag',
+          x: laneEndX,
+          y: lanes.outerLaneY * view.z + view.y - 4,
+          textAnchor: 'end',
+        }, '+' + lanes.overflowCount))
       }
     }
 
@@ -399,7 +454,8 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
   }
 
   const lod = lodOf(view.z)
-  const overflow = lanes.overflow.size
+  const overflow = lanes.overflowCount
+  const hiddenColumns = view.hiddenColumns || 0
 
   return h('div', {
     ref: containerRef,
@@ -416,6 +472,8 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
     node,
     selected: Boolean(selection && selection.kind === 'node' && selection.id === node.id),
     rejects: rejectCount.get(node.id) || 0,
+    candidate: candidateSet.has(node.id),
+    activeCandidate: node.id === activeCandidateId,
     onPointerDown: event => startNodeDrag(event, node),
     onStartLink: event => startLink(event, node),
   }))),
@@ -424,8 +482,37 @@ export function FlowCanvas({ flow, selection, apiRef, onSelect, onMoveNode, onAd
     h(ArrowDefs, null),
     renderEdges()),
 
+  // 键盘连线待定：候选以「到 <节点名>」的可读名字列出，Tab 移、Enter 确认、Esc 取消。
+  linkState && linkSource
+    ? h('div', {
+      className: 'fs-link-picker',
+      role: 'group',
+      'aria-label': '连线候选',
+      onPointerDown: event => event.stopPropagation(),
+    },
+    h('div', { className: 'fs-link-picker-head' },
+      '连线待定：从「' + linkSource.title + '」到'),
+    h('div', { className: 'fs-link-list' },
+      candidateIds.map(id => {
+        const target = byId.get(id)
+        if (!target) return null
+        const active = id === activeCandidateId
+        return h('button', {
+          key: id,
+          type: 'button',
+          className: 'fs-link-option' + (active ? ' on' : ''),
+          onClick: () => onPickCandidate && onPickCandidate(id),
+        }, '到 ' + target.title)
+      })),
+    h('div', { className: 'fs-link-picker-hint' }, 'Tab 切换 · Enter 确认 · Esc 取消'))
+    : null,
+
+  hiddenColumns > 0
+    ? h('div', { className: 'fs-canvas-note' }, '还有 ' + hiddenColumns + ' 列在视野外')
+    : null,
+
   overflow > 0
-    ? h('div', { className: 'fs-canvas-hint' }, '还有 ' + overflow + ' 条打回线收起来了（画布最多画 6 条航道）')
+    ? h('div', { className: 'fs-canvas-hint' }, '另有 ' + overflow + ' 条打回线并入最外航道（标签已收起）')
     : null,
 
   h('div', { className: 'fs-hud' },

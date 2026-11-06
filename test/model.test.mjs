@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 
 import {
-  EDGE_KIND, EXEC_MODE, NODE_KIND, defaultFlow, describeFlow, normalizeFlow, summarize, validateFlow,
+  EDGE_KIND, EXEC_MODE, LIMITS, NODE_KIND, defaultFlow, describeFlow, normalizeFlow, summarize, validateFlow,
 } from '../src/model.js'
 
 let checks = 0
@@ -64,6 +64,128 @@ check('normalizeFlow 对垃圾输入不抛错', () => {
   assert.equal(flow.nodes.length, 0)
   assert.equal(flow.name, '兜底')
   assert.equal(validateFlow(flow).ok, false)
+})
+
+check('未知字段进 extras：节点 / 边 / 团队成员往返保存都不丢', () => {
+  const raw = {
+    name: '带扩展字段的流程',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, priority: 'high' },
+      {
+        id: 'b',
+        kind: 'stage',
+        title: '阶段',
+        x: 10,
+        y: 10,
+        task: '做事',
+        mode: 'team',
+        estimateMinutes: 12,
+        condition: { field: 'env', op: 'eq', value: 'prod' },
+        team: [{ name: '主管', role: '负责', task: '拆活', model: 'deepseek-chat' }],
+      },
+    ],
+    edges: [{ id: 'e1', from: 'a', to: 'b', kind: 'next', condition: { when: 'ok' }, weight: 0.5 }],
+  }
+  const flow = normalizeFlow(raw, '兜底')
+  const start = flow.nodes.find(node => node.id === 'a')
+  const stage = flow.nodes.find(node => node.id === 'b')
+  const edge = flow.edges[0]
+  assert.equal(start.extras.priority, 'high')
+  assert.deepEqual(stage.extras.condition, { field: 'env', op: 'eq', value: 'prod' })
+  assert.equal(stage.extras.estimateMinutes, 12)
+  assert.equal(stage.team[0].extras.model, 'deepseek-chat')
+  assert.deepEqual(edge.extras.condition, { when: 'ok' })
+  assert.equal(edge.extras.weight, 0.5)
+
+  // 再跑一次 normalize（保存 → 读回 → 再保存）仍然不丢，且不重复嵌套。
+  const round = normalizeFlow(flow, '兜底')
+  assert.deepEqual(round.nodes.find(node => node.id === 'a').extras, start.extras)
+  assert.deepEqual(round.nodes.find(node => node.id === 'b').extras, stage.extras)
+  assert.deepEqual(round.nodes.find(node => node.id === 'b').team[0].extras, stage.team[0].extras)
+  assert.deepEqual(round.edges[0].extras, edge.extras)
+  // 已知字段语义不变。
+  assert.equal(stage.title, '阶段')
+  assert.equal(stage.x, 10)
+  assert.deepEqual(stage.skills, [])
+})
+
+check('extras 有界：键数 / 字符串 / 总字节超限只丢弃，不膨胀也不抛错', () => {
+  const many = { id: 'many', kind: 'stage', title: '多键', x: 0, y: 0, task: 't' }
+  for (let i = 0; i < 100; i += 1) many[`k${i}`] = i
+  const longText = { id: 'long', kind: 'stage', title: '长文本', x: 0, y: 0, task: 't', huge: 'x'.repeat(10000) }
+  const bigValues = { id: 'big', kind: 'stage', title: '大值', x: 0, y: 0, task: 't' }
+  for (let i = 0; i < 20; i += 1) bigValues[`big${i}`] = 'y'.repeat(200)
+
+  const flow = normalizeFlow({ nodes: [many, longText, bigValues], edges: [] })
+  const manyExtras = flow.nodes.find(node => node.id === 'many').extras
+  const longExtras = flow.nodes.find(node => node.id === 'long').extras
+  const bigExtras = flow.nodes.find(node => node.id === 'big').extras
+  assert.ok(Object.keys(manyExtras).length <= LIMITS.extrasKeys)
+  assert.ok(JSON.stringify(manyExtras).length <= LIMITS.extrasBytes)
+  assert.equal(longExtras.huge.length, LIMITS.extrasTextLen, '超长字符串按上限截断')
+  assert.ok(JSON.stringify(bigExtras).length <= LIMITS.extrasBytes)
+  assert.ok(Object.keys(bigExtras).length < 20, '字节上限会先于键数上限生效')
+
+  const round = normalizeFlow(flow, '兜底')
+  assert.deepEqual(round.nodes.find(node => node.id === 'many').extras, manyExtras)
+  assert.deepEqual(round.nodes.find(node => node.id === 'long').extras, longExtras)
+  assert.deepEqual(round.nodes.find(node => node.id === 'big').extras, bigExtras)
+})
+
+check('extras 坏输入：函数 / undefined / NaN / BigInt / 循环引用 / 坏旧 extras 都不抛错', () => {
+  const circular = { name: '环' }
+  circular.self = circular
+  const raw = {
+    nodes: [{
+      id: 'a',
+      kind: 'stage',
+      title: '坏值',
+      x: 0,
+      y: 0,
+      task: 't',
+      fn: () => {},
+      nothing: undefined,
+      nan: Number.NaN,
+      infinity: Number.POSITIVE_INFINITY,
+      bigint: 10n,
+      symbol: Symbol('s'),
+      circular,
+      nestedBad: { ok: 1, fn: () => {} },
+      good: 'ok',
+    }],
+    edges: [],
+  }
+  let flow
+  assert.doesNotThrow(() => { flow = normalizeFlow(raw, '兜底') })
+  const extras = flow.nodes[0].extras
+  assert.equal(extras.good, 'ok')
+  for (const key of ['fn', 'nothing', 'nan', 'infinity', 'bigint', 'symbol', 'circular', 'nestedBad']) {
+    assert.ok(!(key in extras), `不该保留不可序列化的 ${key}`)
+  }
+  assert.doesNotThrow(() => normalizeFlow({ nodes: [{ id: 'b', extras: circular }], edges: [] }))
+  assert.doesNotThrow(() => normalizeFlow({ nodes: [{ id: 'c', extras: 'not-an-object' }], edges: [] }))
+
+  // JSON 里的自有 __proto__ 键不能改写原型。
+  const protoRaw = JSON.parse('{"nodes":[{"id":"p","kind":"stage","title":"p","x":0,"y":0,"task":"t","__proto__":{"polluted":true}}],"edges":[]}')
+  const protoFlow = normalizeFlow(protoRaw, '兜底')
+  assert.equal({}.polluted, undefined)
+  assert.equal(Object.getPrototypeOf(protoFlow.nodes[0].extras), Object.prototype)
+  assert.deepEqual(protoFlow.nodes[0].extras.__proto__, { polluted: true })
+
+  // 取值即抛错的 getter 也不能把 normalizeFlow 带崩。
+  const thrower = { id: 'd', kind: 'stage', title: 'd', x: 0, y: 0, task: 't' }
+  Object.defineProperty(thrower, 'boom', { enumerable: true, get() { throw new Error('boom') } })
+  let thrownFlow
+  assert.doesNotThrow(() => { thrownFlow = normalizeFlow({ nodes: [thrower], edges: [] }, '兜底') })
+  assert.ok(!thrownFlow.nodes[0].extras, '唯一未知字段取值抛错时应整体丢弃')
+})
+
+check('没有未知字段时不挂 extras，既有形状不变', () => {
+  const flow = defaultFlow()
+  const round = normalizeFlow(flow, '兜底')
+  assert.ok(round.nodes.every(node => !('extras' in node)))
+  assert.ok(round.edges.every(edge => !('extras' in edge)))
+  assert.deepEqual(round.nodes.map(node => node.id), flow.nodes.map(node => node.id))
 })
 
 check('校验抓出「没有开始节点」', () => {

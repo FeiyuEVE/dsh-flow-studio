@@ -136,6 +136,11 @@ export const CSS = `
   border-color:var(--dsw-alias-brand-primary);
   box-shadow:0 0 0 4px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
 }
+.fs-node.fs-link-target{border-color:var(--dsw-alias-state-business-primary)}
+.fs-node.fs-link-active{
+  outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:3px;
+  box-shadow:0 0 0 4px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent);
+}
 .fs-node.kind-start{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-1));border-radius:999px}
 .fs-node.kind-end{background:var(--dsw-alias-bg-layer-2);border-radius:999px}
 .fs-node-title{
@@ -197,6 +202,26 @@ export const CSS = `
 .fs-canvas-hint{position:absolute;left:12px;bottom:12px;max-width:60%;padding:5px 9px;border-radius:var(--dsw-radius-sm);
   background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);
   font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);pointer-events:none;z-index:5}
+.fs-canvas-note{position:absolute;right:12px;top:12px;padding:5px 9px;border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);pointer-events:none;z-index:5}
+
+/* 键盘连线待定：候选节点高亮 + 「到 <节点名>」可读列表 */
+.fs-link-picker{position:absolute;left:12px;top:12px;z-index:6;display:flex;flex-direction:column;gap:6px;
+  padding:10px;max-width:300px;background:var(--dsw-alias-bg-layer-2);
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}
+.fs-link-picker-head{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+.fs-link-list{display:flex;flex-direction:column;gap:2px;max-height:200px;overflow-y:auto}
+.fs-link-option{display:block;width:100%;text-align:left;border:1px solid transparent;background:transparent;
+  border-radius:var(--dsw-radius-xs);padding:4px 6px;font-family:inherit;font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-secondary);cursor:pointer}
+.fs-link-option:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.fs-link-option.on{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 14%, transparent);
+  border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
+.fs-link-option:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.fs-link-picker-hint{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.fs-edge-flag{font-size:12px;line-height:14px;fill:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;
+  paint-order:stroke;stroke:var(--dsw-alias-bg-layer-1);stroke-width:3px;stroke-linejoin:round}
 
 /* 缩放等级：只降内容，不动位置 */
 .fs-canvas[data-lod="mid"] .fs-node-summary{display:none}
@@ -235,6 +260,13 @@ export const CSS = `
 .fs-input::placeholder,.fs-textarea::placeholder{color:var(--dsw-alias-label-tertiary)}
 .fs-textarea{resize:vertical;min-height:60px;line-height:22px}
 .fs-input.num{font-variant-numeric:tabular-nums}
+
+/* 可点按移动入口（拖动替代） */
+.fs-pos{display:flex;flex-direction:column;gap:6px}
+.fs-pos-val{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.fs-pos-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+.fs-pos-btn{width:100%;padding:0}
+.fs-pos-gap{display:block}
 .fs-seg{display:flex;border:1px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);overflow:hidden}
 .fs-seg-btn{
   flex:1;height:28px;border:none;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);
@@ -281,6 +313,15 @@ export const CSS = `
 }
 .fs-error .fs-tool{margin-left:auto;color:inherit}
 
+/* 本地草稿横幅：只有恢复 / 丢弃两个动作，措辞与实现一致 */
+.fs-draft{
+  display:flex;align-items:center;gap:8px;flex:none;padding:6px 12px;
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, var(--dsw-alias-bg-layer-1));
+  border-bottom:1px solid var(--dsw-alias-border-l1);
+  color:var(--fs-r2-warn);font-size:12px;line-height:16px;
+}
+.fs-draft-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* ══ 状态栏 ════════════════════════════════════════════ */
 .fs-status{
   display:flex;align-items:center;gap:12px;flex:none;height:28px;padding:0 12px;
@@ -290,6 +331,7 @@ export const CSS = `
 }
 .fs-status b{font-weight:500;color:var(--dsw-alias-label-secondary)}
 .fs-status-spacer{flex:1}
+.fs-status-live{max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 .fs-status-btn{display:inline-flex;align-items:center;gap:4px;border:none;background:transparent;
   font-family:inherit;font-size:12px;line-height:16px;color:inherit;cursor:pointer;padding:0}
 .fs-status-btn:hover{color:var(--dsw-alias-label-primary)}

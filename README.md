@@ -5,7 +5,15 @@
 > 流程模板落到本机，随时打开继续改。
 
 第一版（0.1.0）交付**设计器**：画布 + 节点配置 + 状态流转与打回循环 + 模板存储 + 结构校验。
-执行引擎与指标看板在路线图里（见文末），数据模型已经按「可执行」的形态设计。
+
+**0.2.0** 是照设计终稿重写的设计器：208×96 节点卡（主从 208×116，成员行常驻）、打回线走下方**正交航道**
+（每侧 6 个槽位，超过 6 条确定性降级成双线 + `+N` 角标）、选中用中性色 / 运行用 business 蓝、
+全览单一世界坐标源（`fit = min((W−96)/boundsW, (H−96)/boundsH)`，地板 15%，装不下时提示「还有 N 列在视野外」）、
+LOD 三档（60% / 45%）、键盘也能连线（`C` → `Tab` → `Enter`）、保存失败落**本地草稿**并能恢复。
+设计依据在 [`docs/DESIGN.md`](docs/DESIGN.md)（四份分册 + [`docs/design/REVIEW.md`](docs/design/REVIEW.md) 的独立审核与逐条裁决）。
+
+执行引擎与指标看板仍在路线图里（见文末），数据模型已经按「可执行」的形态设计：
+未识别字段原样收进 `extras`（有界、坏输入不抛错），后续加字段不会被保存链静默丢掉。
 
 ## 它解决什么
 
@@ -32,11 +40,16 @@
 | 区域 | 做什么 |
 |---|---|
 | 左侧 | 流程模板列表：新建 / 打开 / 删除 |
-| 中间 | 画布：拖动节点、从右侧圆点拖到另一个节点建连线、双击空白处新增节点、滚轮缩放、拖空白处平移 |
-| 右侧 | 检查器：选中节点或连线后配置 |
-| 底栏 | 节点 / 连线 / 打回统计 + 结构校验结论（点开看逐条问题，可跳转到对应节点） |
+| 中间 | 画布：拖动节点、从右侧圆点拖到另一个节点建连线、双击空白处新增节点、裸滚轮缩放（指针锚定）、Shift+滚轮横移、中键/空格拖平移、`Alt` 拖动绕过 4px 吸附；双击空白以外的「全览」把整张图装进视口 |
+| 右侧 | 检查器：选中节点或连线后配置；带「位置与连线」组——X/Y 坐标、四向 4px 微调（Shift 20px）、「连接到…」下拉 |
+| 底栏 | 节点 / 连线 / 打回统计 + 结构校验结论（点开看逐条问题，可跳转到对应节点）+ 保存状态（含「本地草稿」） |
 
 连线会自动判方向：**目标在下游就建「正常流转」，目标在上游就自动建成「打回」**，建完可以在检查器里改。
+
+不用鼠标也能连：选中节点 → `C` 进入连线待定 → `Tab` / 方向键选目标（状态栏会念「从 X 到 Y」）→ `Enter` 建边 → `Esc` 取消。
+单字母快捷键只在画布上下文（已选节点、焦点不在输入框）时生效。
+保存失败或断连时改动落在 `localStorage` 的 `flow-studio:draft:<flowId>`，下次打开会问「恢复 / 丢弃」；
+保存成功才显示「已保存」，草稿随之清掉。
 
 ## 安装
 
@@ -103,11 +116,15 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 
 ```sh
 npm install
-npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 46KB）+ 复制 Host 模块
-npm test           # 三组自检，共 36 个断言
+npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈70KB）+ 复制 Host 模块
+npm test           # 五组自检，共 52 个断言
+node test/render.test.mjs   # SSR + 构建产物加载，13 个断言
 ```
 
-- `test/model.test.mjs` —— 出厂模板合法、坏数据收敛、四类结构错误能被抓出来。
+- `test/model.test.mjs` —— 出厂模板合法、坏数据收敛、四类结构错误能被抓出来、未知字段进 `extras` 不丢。
+- `test/geometry.test.mjs` —— 世界边界唯一来源、fit 公式与 15% 地板、6 槽与第 7 条降级、tie-break 与输入顺序无关。
+- `test/link.test.mjs` —— 键盘连线状态机：候选顺序、循环移动、Enter 确认、方向规则、可读播报。
+- `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。
 - `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
   `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点。
@@ -116,12 +133,15 @@ npm test           # 三组自检，共 36 个断言
 
 ## 路线图
 
-- **v0.2 执行引擎**：把图编译成执行计划，每个节点起一个真实的子 agent 会话
+- **v0.3 执行引擎**：把图编译成执行计划，每个节点起一个真实的子 agent 会话
   （`ctx.subagents.startActivation({ provider: 'spawn', delivery: 'caller', request: { prompt, parent, outputSchema } })`），
   节点产物用结构化 JSON 在节点之间传递，打回线按判定结果真的回退并累加轮次。
-- **v0.3 指标**：以 `session/event`（global）为主干，按节点归集 token（`assistant/message.usage` 五桶）、
-  工具调用、skill 采纳（`tool/call` 里 `name === 'skill'`）、审查 finding 数与采纳率。
-- **v0.4 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
+  Run 数据契约（`runId` / `attemptId` / `nodeId` / `memberId` / 状态来源 / 去重重连）已在
+  [`docs/design/04-metrics.md`](docs/design/04-metrics.md) §3.13 定好，尚未实现。
+- **v0.4 指标**：以 `session/event`（global）为主干，按节点归集 token（`inputTokens` / `outputTokens` /
+  `cacheReadTokens` / `cacheWriteTokens` 四个互斥桶）、工具调用、skill 采纳（`tool/call` 里 `name === 'skill'`，
+  按唯一 skill 去重算覆盖率）、审查 finding 数与采纳率（采纳 ≠ 修复 ≠ 复验）。
+- **v0.5 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
 
 ## 先搜现成的（按 `PLUGIN-SEARCH.md`）
 

@@ -61,6 +61,25 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
   节点运行详情面板给出角色/模式、attempt、**最近几条 agent 发言**、最近工具调用、token 用量、成员活动、
   已写产物与失败原因，运行中随轮询实时刷新。
 
+## 在会话里开流程，让主 agent 自己盯着
+
+不用先去画布点运行：在任意会话里让主 agent 直接开跑，它自己定时醒来自查「整条流水线是否正常运转」。
+
+```
+flow_list   → 看有哪些流程模板
+flow_start  → 在**当前会话**里开跑（子 agent 继承当前会话的工作目录，不需要选工作区）
+flow_watch  → 审查整个工作流：偏航 / 卡死 / 打回死循环 / 并发乱序 / 超时风险 / 质量结论
+flow_stop   → 停掉这次运行
+```
+
+`flow_start` / `flow_watch` 会返回 `supervision.nextCheckSeconds` 与一段可直接用的 `alarmPrompt`：
+主 agent 用 `proactive_set` 挂上「过 N 秒醒来查一次」的闹钟，醒来调 `flow_watch`，
+`verdict=healthy` 就 `proactive_reclaim` 安静结束，出现异常或跑完才通知人。
+
+工作区的答案是**不用选**：模板存在 `$DSH_HOME/flow-studio/flows/`（全局），
+run 的子 agent 通过 `startActivation({ request: { parent } })` 挂在父会话下面，
+`cwd` 省略即继承父会话的目录——从哪个会话启动，就在哪个工作区跑；从面板启动则取当前根会话。
+
 ## 它解决什么
 
 把一句「帮我做个 X」变成一条能盯住的流水线：
@@ -178,7 +197,7 @@ dsh plugin --profile web add ./dsh-flow-studio
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 十一个自检文件，共 261 组（含 8 进程抢锁 / 过期租约接管的跨进程回归）
+npm test           # 十三个自检文件，共 302 组（含 8 进程抢锁 / 过期租约接管的跨进程回归）
 node test/render.test.mjs   # SSR + 构建产物加载，59 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
@@ -197,6 +216,11 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
   节点与边是 `React.memo` 且相同输入复用同一对象、草稿去抖（5 次变更只写 1 次、maxWait 必落、隐藏立即 flush）。
 - `test/logdrawer.test.mjs` —— 运行详情：抽屉三档与全屏类、Esc 逐档还原、节点面板四类实时字段、
   缺失字段降级占位、长文本展开全文弹层、区域开关与窄屏单列、新 CSS 只用主题 token。
+- `test/audit.test.mjs` —— 工作流健康审计（纯函数）：pending / healthy / stalled / looping / deviating /
+  no-progress / done / failed / aborted 九种裁决，以及打回后重跑不误判偏航、坏输入不抛错。
+- `test/tools.test.mjs` —— 会话内启停的四个模型工具：按 id/名字启动、同名多份列候选、结构不合法不建 run、
+  `options.parent === exec.agent`（绑定当前会话与工作区）、supervision 文案、flow_watch 走真实审计、
+  flow_stop 业务态、输出 lossless、无 tools 服务时不炸。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
   `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点；
   运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言。

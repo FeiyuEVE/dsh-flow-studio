@@ -27,6 +27,7 @@ import { join } from 'node:path'
 import { createEngine } from './engine.js'
 import { NODE_KIND, validateFlow } from './model.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
+import { createFlowTools } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
   readLease, readRunDetail, readRunMeta, repairRunStates, runsDir, sweepExpiredLeases,
@@ -834,4 +835,18 @@ export function apply(ctx) {
       })
     },
   }), 'flow-studio: /api/flow-studio')
+
+  // 06 §15：模型工具（会话内启停 + 定时自审）。
+  // tools 服务是**可选**依赖：旧 profile / 测试环境里拿不到就只跳过注册，
+  // 面板与 /api 路由照常可用——不能因为缺少工具注册表让插件装不上。
+  const toolsSvc = (typeof ctx.get === 'function' && ctx.get('tools')) || ctx.tools
+  if (toolsSvc && typeof toolsSvc.register === 'function') {
+    const tools = createFlowTools({ flowsRoot: dir, runsRoot, engine })
+    ctx.effect(() => {
+      const disposers = tools.map(tool => toolsSvc.register(tool))
+      return () => disposers.reverse().forEach(dispose => dispose())
+    }, 'flow-studio: 注册模型工具')
+  } else {
+    log('info', 'flow-studio: 未找到 tools 服务，跳过模型工具注册（面板与 /api 路由照常可用）')
+  }
 }

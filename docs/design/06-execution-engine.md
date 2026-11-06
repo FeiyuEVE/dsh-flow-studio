@@ -288,3 +288,215 @@ run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默�
 按码点截到 ≤2000 字符（再以 UTF-8 4 KiB 兜底，保证单条事件 < 8KB）→ 同会话连续相同文本去重（hash 表 ≤64）→
 写 `agent/message{ role:'assistant', text, truncated, provider?, model? }`，事件级 `memberId` 沿用 binding。
 原有 `model/call` 映射不变：有 `usage` 才写，token / quality 口径不受新增事件影响。
+
+---
+
+## 14 工作流健康审计
+
+> 目的：让「启动流程的主 agent」在定时唤醒时，只读模板 / 事件流 / run.json 三样东西，
+> 就能判断**整条流水线**是否在正常运转（偏航、卡死、打回死循环、并发乱序），而不是逐个节点翻细节。
+> 实现：`src/audit.js` 的纯函数 `auditWorkflow(input)`；不改事件格式、不碰 fs、不 import engine/index。
+> 模型工具 `flow_watch` 的返回就是本节契约（见 §15），`supervision.nextCheckSeconds` 直接取本节的建议值。
+
+### 14.1 输入
+
+```js
+auditWorkflow({
+  flow,                 // normalizeFlow 结果（nodes / edges；node.kind: start|stage|end，edge.kind: next|reject）
+  events,               // runlog 事件数组（node/start、node/end、reject/trigger、run/start、run/end…）
+  run,                  // run.json（status / startedAt / endedAt / failedNodeId…；缺失时按事件流推断）
+  now = Date.now(),
+  stallMs = 10 * 60 * 1000,        // 多久没新事件算卡死
+  nodeTimeoutMs = 20 * 60 * 1000,  // 单节点跑多久算「有时限风险」
+  maxRejectsPerEdge = 3,           // 同一条打回边触发几次算死循环
+})
+```
+
+- 事件按 `seq` 升序重放（缺失 `seq` 退回 `ts`，再退回原顺序），事件对象只读、不改写；
+- `flow` / `events` / `run` 任一缺失或类型不对都**不抛错**：能判的照判，缺的字段给 `null` / 空数组；
+- 时间只用注入的 `now` 比较（接受毫秒数或 `Date`），便于测试与离线回放。
+
+### 14.2 判据 → verdict → recommended
+
+| 顺序 | 判据 | `verdict` | `recommended` | `nextCheckSeconds` |
+|---|---|---|---|---|
+| 1 | `run.status === 'pending'` | `pending` | `inspect` | 30 |
+| 2 | `run.status === 'done'`（headline 带 `quality`） | `done` | `report` | `null` |
+| 3 | `run.status === 'failed'`（说清失败节点与原因） | `failed` | `report` | `null` |
+| 4 | `run.status === 'aborted'` | `aborted` | `report` | `null` |
+| 5a | running：同一时刻同时存在两个已 `node/start` 未 `node/end` 的节点（**concurrency**） | `deviating` | `stop` | 60 |
+| 5b | running：`node/start` 序列偏离模板 `next` 链，且不是打回目标（**deviation**） | `deviating` | `stop` | 60 |
+| 5c | running：同一条打回边（`from→to`）累计触发 > `maxRejectsPerEdge`（**reject-loop**） | `looping` | `stop` | 60 |
+| 5d | running：`idleMs > stallMs`（**stall**） | `stalled` | `inspect` | 60 |
+| 5e | running：当前节点 `elapsedMs > nodeTimeoutMs`（**timeout-risk**） | `stalled` | `inspect` | 60 |
+| 5f | running：`progress.ratio === 0` 且运行时长 > `stallMs`（**no-progress**） | `no-progress` | `inspect` | 60 |
+| 6 | 以上都不成立 | `healthy` | `wait` | 180 |
+
+- verdict 优先级：`deviating` > `looping` > `stalled` > `no-progress` > `healthy`；
+  有 anomaly 时 `headline` 必须写清「哪一类、哪个节点」。
+- **concurrency 归入 `deviating`**：引擎设计是串行的，出现两个未结束节点就是乱序 bug，按偏航处理。
+- **timeout-risk 归入 `stalled` 类**：节点已超过单节点时限，再等就是超时失败；
+  `headline` 会区分「无新事件」与「超时风险」两种成因。
+- 终态（`done` / `failed` / `aborted`）按状态先收口：`anomalies` 只保留 `failed` 一条，
+  不在终态上再拿运行期异常改 verdict。
+
+### 14.3 输出字段
+
+| 字段 | 语义 |
+|---|---|
+| `verdict` | `AUDIT_VERDICTS` 之一：`pending / healthy / stalled / looping / deviating / no-progress / failed / done / aborted` |
+| `status` | `run.status` 原样；`run` 或该字段缺失时为 `null`（不拿推断值冒充） |
+| `headline` | 中文一句话（≤120 字），可直接展示给用户；异常时含类别与节点名 |
+| `progress` | `{ passed, total, ratio, nodes: [{ id, title, state, attempt }] }`；`ratio` 为 `null` 表示无法判定 |
+| `plan` | `{ expected, actual, deviations }`：预期阶段 id 链 / 实际 `node/start` 顺序 / 偏航明细 |
+| `currentNode` | running 时最近启动且未结束的节点：`{ id, title, attempt, elapsedMs, idleMs }`，否则 `null` |
+| `rejects` | `{ total, byNode: [{ nodeId, title, count }], looped: [{ nodeId, title, count }] }` |
+| `anomalies` | `[{ kind, nodeId?, detail }]`，`kind` ∈ `stall / timeout-risk / reject-loop / deviation / concurrency / no-progress / failed` |
+| `quality` | `null` 或 `{ state, label }`（复用 `runlog.summarize` / `computeQuality`，没有事件证据时为 `null`） |
+| `tokens` | `null` 或 `runlog.computeTokens` 的结果（四桶 + 按节点 / 成员分组） |
+| `idleMs` | 距最后一条有效 `ts` 事件多久；没有事件时以 `run.startedAt` 起算 |
+| `recommended` | `wait / report / stop / inspect`，与 verdict 的映射见上表 |
+| `nextCheckSeconds` | 建议的下次唤醒间隔；`null` = 不必再查 |
+
+### 14.4 判定细节
+
+- **正常序列**：从 `start` 节点沿 `next` 边一直走到 `end`，途中经过的阶段节点序列即 `plan.expected`；
+  没有 `start` 节点时把入口阶段算进链首，坏模板（断头路 / 成环）只降级成较短链路。
+- **偏航**：按出现顺序看 `node/start`。正常应命中「下一个预期阶段」；`reject/trigger` 之后
+  修改预期为 `toNodeId`，因此打回后从打回目标重跑**不算偏航**。既不是下一个预期节点、也不是打回目标的，
+  记一条 deviation（`index` = 在 `actual` 中的下标，`expected` = 预期阶段 id，链已走完为 `null`），
+  然后按实际节点重新对齐，避免一次跳过把后面整条链都算成偏航。
+- **重试去重**：同一 `nodeId + attemptId` 的重复 `node/start`（06 §9 的节点级重试）只记一次，
+  既不算两个阶段、也不算偏航。
+- **打回死循环**：按「边」计数，`from→to` 相同即同一条边；`rejects.looped` 按**被打回节点**汇总，
+  `count` 取该节点上超阈值边里的最大计数。
+- **进度**：`passed / ratio` 复用 `runlog.computeProgress`（打回失效、旧 attempt 不计、skipped 不进分母）；
+  `total` 优先取 `run/start.nodeTotal`，其次观察到的节点数，未开跑时退回模板阶段数（此时 `ratio` 为 `null`）。
+- **节点状态**：`state` ∈ `pending / running / passed / rejected / failed / skipped / invalidated`；
+  `running` = 已 `node/start` 未 `node/end`，`invalidated` = 被后续打回作废的旧 passed，`attempt` 为当前 attemptId（未开始为 0）。
+- **currentNode**：取打开节点中启动最晚的那个；`elapsedMs` 从它最近一条 `node/start` 起算，
+  `idleMs` 从该节点最近一条事件起算（顶层 `idleMs` 是全局口径）。
+- **有界**：`anomalies` 最多 50 条、`plan.deviations` 最多 50 条、`plan.actual` 最多 200 条；
+  事件可以到 20 万条，报告不跟着涨。
+
+### 14.5 已知边界
+
+- **只按事件流推断，不读子会话内部**：审计看不到 agent 正在想什么，只认已落盘的事件与 run.json。
+- **只支持串行图**：引擎 v0.4 不做并行分支；真出现并行会被当作 concurrency / deviation 报异常。
+- **事件窗口被截断时结论可能偏轻**：历史打回或节点启动不在窗口内，`rejects` 计数与 `plan.actual` 会不完整。
+- **依赖同一个时钟**：`ts` 与 `now` 偏差过大会误判 stall / timeout-risk；Host 侧应传服务端时间。
+- **`quality` / `tokens` 复用 `runlog.summarize`**：0 条事件时为 `null`；桩（stub）run 的质量仍是 `unknown`。
+- **只报告、不动作**：`recommended` 只是建议，审计不停止 run、不重试、也不通知主人（由主 agent 按 verdict 决定）。
+
+## 15 会话内启停（模型工具）
+
+v0.4.2 之前只能从 Web 面板点「运行」。本节定义一组**模型工具**，让主 agent 在自己所在的会话里
+直接开跑一个流程，并定时唤醒审查「整个工作流是否在正常运转」。工具实现在 `src/tools.js`，
+注册在 `src/index.js`，测试在 `test/tools.test.mjs`（`node test/tools.test.mjs`）。
+
+### 15.1 三步闭环
+
+```
+① flow_list / flow_start
+     主 agent 在当前会话里启动 run
+     → engine.start(runId, { parent: exec.agent })
+     → request.parent = 当前会话的 Agent，request.cwd 省略
+     → 子 agent 继承本会话的工作区（不需要也不应该再选目录）
+
+② proactive_set
+     after_seconds = supervision.nextCheckSeconds
+     prompt        = supervision.alarmPrompt（完整提示词，含 runId / flow_watch / proactive_reclaim）
+
+③ 每次闹钟醒来 → flow_watch（runId）
+     verdict 正常（healthy / running 类）→ proactive_reclaim 安静结束，不打扰主人
+     异常（stalled / looping / deviating / no-progress）或已跑完（done / failed / aborted）
+       → 把结论与需要决策的点通知主人
+```
+
+工具描述（`description`）里必须写清这三步——那是模型唯一会读到的使用说明。
+
+### 15.2 工具清单
+
+| 工具 | 读写 | 入参 | 出参（成功） |
+|---|---|---|---|
+| `flow_list` | 只读 | `{ limit?: integer }`（默认 20、上限 100） | `{ ok, flows: [{ id, name, nodeCount, edgeCount, updatedAt }] }` |
+| `flow_start` | 写（exclusive） | `{ flowId?, flowName?, task?, name? }`（`flowId` / `flowName` 二选一，都不给 → 失败并提示先 `flow_list`） | `{ ok, runId, flowId, flowName, status, workspace, supervision }` |
+| `flow_watch` | 只读（`isConcurrencySafe`） | `{ runId? }`（省略 = 最近一次 run） | 审计结果原样 + `{ ok, runId, flowId, supervision }` |
+| `flow_stop` | 写 | `{ runId: string }`（必填） | `{ ok, runId, status }` |
+
+命名规则：`flowId` 优先；没有 id 时按 `flowName` **精确匹配**，再退不区分大小写；同名多份 → 失败并列出候选 id
+（让模型用 `flowId` 指定，而不是猜）。`task` 是用户这次要跑的任务原文，写进 `run.json.name`；显式 `name` 优先于 `task`。
+
+### 15.3 `engine.start(runId, { parent })`：per-start 父会话
+
+`engine.start` 增加**可选**第二参数：
+
+```js
+engine.start(runId)                    // 旧调用：行为完全不变
+engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话（Agent 对象）
+```
+
+- 优先级：`startParent`（本次覆盖）→ `this.parent` → `resolveParentFn()` → `agents.roots()` 最后一个。
+  不传 / 传 `null` 时 `startParent` 为 `null`，后三段回落的既有语义**一字未改**。
+- 生命周期：只在这一次 run 内有效；run 收尾（`_cleanupActive()`）清空，不影响下一次 `start`。
+  非对象 `parent` 在抢 `START_LOCK` 之前以 400 拒绝，不会留下占位的运行态。
+- 不新增事件 kind、不写 runlog、不改变 `run/start` 与 `run.json` 的任何字段：
+  父子关系只体现在 `subagents.startActivation({ request: { parent } })` 的调用参数上。
+- 并发语义不变：模块级 `START_LOCK` 仍然保证同一时刻只有一个 run（第二个 `start` → 409）。
+
+### 15.4 工作区继承
+
+`ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', request:{ parent, cwd?, prompt, ... } })` 中：
+
+- `request.parent` 是 **Agent 对象**（不是 id 字符串）；
+- `request.cwd` 省略时**继承父 agent 的工作目录**。
+
+所以 `flow_start` 直接把 `exec.agent`（当前会话的 Agent）作为 `request.parent` 传下去，
+`request.cwd` 不传——从哪个会话启动，子 agent 就在哪个工作区里干活，无需额外选择。
+返回值里的 `workspace.inheritedFrom` 是该会话 id（`exec.agent.session.id`，取不到为 `null`），
+只用于向模型/用户交代「继承了谁」，不参与执行。
+
+### 15.5 定时自审（`supervision`）
+
+`flow_start` 与 `flow_watch` 都返回 `supervision`：
+
+| 字段 | 语义 |
+|---|---|
+| `nextCheckSeconds` | 建议的审查间隔（`proactive_set` 的 `after_seconds`）。`flow_start` 默认 180；`flow_watch` 优先用审计模块给的值，钳制在 30–900；终态（done / failed / aborted）为 `null` |
+| `alarmPrompt` | 完整中文提示词（≥40 字），包含 `runId`、要调 `flow_watch`、healthy 就 `proactive_reclaim` 安静结束、异常或跑完才通知主人；终态时说明「不必再挂闹钟」 |
+| `watchTool` | 恒为 `'flow_watch'` |
+| `hint`（仅 `flow_start`） | 一句话：用 `proactive_set` 的 `after_seconds=nextCheckSeconds` 把闹钟挂上，之后每次醒来调 `flow_watch` |
+
+审查是**旁路**：闹钟到点后由主 agent 主动调用工具，引擎不自己轮询、不自己通知。
+
+### 15.6 `flow_watch` 的边界与数据来源
+
+- 数据：`readRunDetail`（run.json + 节点/attempt 索引）+ `readAllEvents`（全量事件）+ `readFlow`（模板），
+  然后调用 `auditWorkflow({ flow, events, run, now, stallMs, nodeTimeoutMs, maxRejectsPerEdge })`
+  （`src/audit.js`，见 §14；阈值默认 10 分钟 / 20 分钟 / 3 次，可由 `createFlowTools` 注入覆盖）。
+- 输出：审计结果**原样**返回（`verdict / status / headline / progress / plan / currentNode / rejects /
+  anomalies / quality / tokens / idleMs / recommended` 等），再附 `supervision`。
+- **只报告，不自动修复、不自动停止**：是否 `flow_stop`、是否通知主人、是否继续等，由模型按 verdict 决定。
+- 审计字段形状由 `audit.js` 决定，工具的 `output.schema` 对它们用宽松声明（`oneOf` 覆盖 JSON 值类型），
+  避免实现形状差异被注册表的逐值校验拒绝；工具出口统一做 lossless 收口（无 `undefined` / `NaN` / `Date`）。
+- `src/audit.js` 用**动态 `import()`** 加载：审计模块尚未落地时只让 `flow_watch` 返回可操作失败，
+  不影响插件安装、面板与其它三个工具；测试可注入 `auditWorkflow` 桩。
+
+### 15.7 失败形状与并发
+
+- 成功：`{ ok: true, ... }`；失败：`{ ok: false, error, hint, retryable }`，**不抛异常**（取消时也返回失败值）。
+- 失败分流：流程不存在 404 → hint 指向 `flow_list`；流程不合法 → 在**建 run 之前**由
+  `validateFlowForRun` 挡下；已有 run 在跑 → 409（`engine.active` 提前挡一次，跨实例由引擎的模块级锁兜底）；
+  `flow_stop` 的目标不在运行中 → hint 明确写「这个 run 不在运行中」。
+- 同一时刻只有一个 run：`flow_start` 在已有 run 运行时直接失败，不建新 run；
+  提醒模型不要在流程里再起一个流程。
+
+### 15.8 注册与兼容
+
+- `src/index.js` 只在 `tools` 服务可用时注册：
+  `const toolsSvc = (typeof ctx.get === 'function' && ctx.get('tools')) || ctx.tools`；
+  拿不到就 `log('info', ...)` 说明并跳过——旧 profile / 测试环境不能因为缺工具注册表而装不上。
+- 注册走 `ctx.effect(() => { const disposers = tools.map(t => toolsSvc.register(t)); return () => disposers.reverse().forEach(d => d()) }, 'flow-studio: 注册模型工具')`，
+  卸载 / HMR 时逆序撤销，不留孤儿工具。
+- 复用既有 `createRun` / `engine` / `dir` / `runsRoot`，不复制第二份建 run / 开跑逻辑；
+  工具层不引入任何新依赖，也不 import dsh 包。

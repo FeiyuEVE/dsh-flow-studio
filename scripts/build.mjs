@@ -9,6 +9,8 @@
  *   src/runlog.js        -> lib/runlog.js    （事件契约与聚合，纯函数）
  *   src/runstore.js      -> lib/runstore.js  （run 目录读写）
  *   src/engine.js        -> lib/engine.js    （执行引擎，v0.4）
+ *   src/audit.js         -> lib/audit.js     （工作流健康审计，纯函数）
+ *   src/tools.js         -> lib/tools.js     （会话内启停的模型工具）
  *
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  */
@@ -73,7 +75,7 @@ if (clientSize > CLIENT_WARN) {
 }
 console.log(`✓ lib/client.js 在单文件上限（${CLIENT_LIMIT}）内`)
 
-for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js', 'engine.js']) {
+for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js', 'engine.js', 'audit.js', 'tools.js']) {
   copyFileSync(resolve(root, 'src', file), resolve(libDir, file))
   const size = statSync(resolve(libDir, file)).size
   console.log(`✓ lib/${file} ${size} bytes`)

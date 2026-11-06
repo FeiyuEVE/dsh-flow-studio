@@ -1218,6 +1218,9 @@ class FlowEngine {
     this.engineName = this.stub ? 'stub' : 'real'
     this.parent = options.parent || null
     this.resolveParentFn = typeof options.resolveParent === 'function' ? options.resolveParent : null
+    // 06 §15：per-start 父会话覆盖（模型工具 flow_start 传当前会话的 Agent）。
+    // 只活在一次 run 的生命周期内，_cleanupActive() 清掉，避免影响下一次 start。
+    this.startParent = null
 
     if (this.stub) this.activate = null
     else if (typeof options.activate === 'function') this.activate = options.activate
@@ -1332,6 +1335,9 @@ class FlowEngine {
   }
 
   async _resolveParent() {
+    // 06 §15：本次 start 显式指定了父会话时优先用它（模型工具从当前会话启动流程）。
+    // 只在这次 run 内有效；不传时 startParent 为 null，下面三段回落的既有语义完全不变。
+    if (this.startParent) return this.startParent
     if (this.parent) return this.parent
     if (this.resolveParentFn) return this.resolveParentFn()
     const agents = this.ctx && typeof this.ctx.get === 'function' ? this.ctx.get('agents') : undefined
@@ -1349,9 +1355,21 @@ class FlowEngine {
    * 失败释放；进入临界区后重读 run.json，确认 `started===false && status==='pending'`。
    * 06 §13.2：真正的 `pending -> running` 由 runstore.startRun() 原子完成（不存在时兜底）。
    * 已有运行中 run → 409；run 不存在 → 404；已开始过 / 流程非法 → 409 / 400。
+   *
+   * 06 §15：`options.parent` 可为**本次 run** 指定父会话（Agent 对象，模型工具传 `exec.agent`）。
+   * 不传 / 传 null 时 `_resolveParent()` 的既有回落顺序（this.parent → resolveParentFn →
+   * agents.roots() 最后一个）完全不变；覆盖只活到本次 run 收尾（`_cleanupActive()` 清空）。
+   *
+   * @param {string} runId
+   * @param {{ parent?: object | null }} [options]
    */
-  async start(runId) {
+  async start(runId, options = {}) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
+    // 06 §15：只接受 Agent 对象覆盖；null/undefined 都按「不覆盖」处理。
+    const parentOverride = options && typeof options === 'object' ? options.parent : undefined
+    if (parentOverride !== undefined && parentOverride !== null && typeof parentOverride !== 'object') {
+      throw new EngineError(400, 'parent 必须是 Agent 对象（或省略以沿用既有父会话解析）')
+    }
     // —— 同步占位：这一行之前不许有任何 await ——
     if (START_LOCK.holder) {
       throw new EngineError(409, `已有运行中的 run（${START_LOCK.holder.runId}），同一时刻只允许一个 run`)
@@ -1361,6 +1379,8 @@ class FlowEngine {
     START_LOCK.holder = active
     this.active = active
     this._resetRunState()
+    // 06 §15：把本次 start 的父会话覆盖挂到运行态上；_cleanupActive() 负责清掉。
+    this.startParent = parentOverride || null
     this.live = {
       currentNodeId: null,
       attempt: 0,
@@ -2891,6 +2911,8 @@ class FlowEngine {
       START_LOCK.holder = null
     }
     this.active = null
+    // 06 §15：父会话覆盖只属于刚结束的这一次 start，必须清掉，避免影响下一次 start。
+    this.startParent = null
     this.live = null
     this.current = null
     this.sessionBindings.clear()

@@ -57,7 +57,7 @@ const {
   mergeEventWindows, mergeRunDetail, needsEventFetch, nextDrawerOpen, nodeFindingsInfo, nodeProgressText, normalizeLive,
   normalizeProgress, normalizeRun, pageSlice, pickWatchRun, pollDelay, readUsage,
   runDurationMs, runIsActive, runIsPending, runIsRunning, runLiveLabel, runMetrics,
-  sortEventsDesc,
+  sortEventsDesc, statusText, stubBadgeOf,
 } = await import('../src/client/logdrawer.js')
 const {
   FS_TOKEN_STORAGE_KEY, authorizationHeader, captureFsToken, exportUrl,
@@ -660,6 +660,24 @@ check('B2：校验不过不起引擎；本次新建的 run 启动失败要 DELET
   assert.equal(firstErrorTarget({ errors: [{ message: 'x' }] }), null)
   assert.deepEqual(firstErrorTarget({ errors: [{ message: 'x', edgeId: 'e1' }] }), { kind: 'edge', id: 'e1' })
 
+  // v1.1 复核 MAJOR：画布编辑只把这些当 warning，但引擎会 400，客户端必须提前拦住。
+  const cyclic = model.defaultFlow()
+  cyclic.edges = cyclic.edges.filter(edge => !(edge.from === 'n_review' && edge.to === 'n_end'))
+  cyclic.edges.push({ id: 'e_cyc', from: 'n_review', to: 'n_dev', kind: 'next', label: '' })
+  const cyclicResult = runPreflight(cyclic)
+  assert.equal(cyclicResult.ok, false, '走不到结束节点的循环必须被开跑门禁拦下')
+
+  const forked = model.defaultFlow()
+  forked.edges.push({ id: 'e_fork', from: 'n_req', to: 'n_end', kind: 'next', label: '' })
+  const forkedResult = runPreflight(forked)
+  assert.equal(forkedResult.ok, false, '多条正常流转出边必须被开跑门禁拦下')
+  assert.ok(forkedResult.issues.errors.some(item => /恰好一条/.test(item.message)), JSON.stringify(forkedResult.issues.errors))
+
+  const badReject = model.defaultFlow()
+  badReject.edges.push({ id: 'e_bad', from: 'n_test', to: 'n_start', kind: 'reject', label: '' })
+  const badRejectResult = runPreflight(badReject)
+  assert.equal(badRejectResult.ok, false, '打回指向开始节点必须被拦下')
+
   const created = startFailurePlan('start', { status: 409, data: { error: '已有 run 正在运行' } }, { id: 'run-new' }, true)
   assert.equal(created.deleteRunId, 'run-new', '本次新建的 run 启动失败必须 DELETE')
   assert.ok(created.message.includes('已有 run 正在运行'))
@@ -1084,6 +1102,37 @@ check('done + 无 summary：结论 pill 与状态点同源中性，不冒充绿�
   assert.ok(!html.includes('fs-log-pill success'), '没有 summary 时绝不能出现绿 pill')
   assert.equal(conclusionOf(logRun, null).tone, 'neutral')
   assert.equal(conclusionOf(logRun, { quality: { state: 'pass' } }).tone, 'success')
+})
+
+check('06 §13.8 桩数据 badge：summary.engine=stub 时抽屉必须标「桩数据，不是真实证据」', () => {
+  const stubSummary = {
+    ...logSummary,
+    engine: 'stub',
+    quality: { state: 'unknown', label: '桩：良：返工 1 轮后达标', stub: true },
+  }
+  assert.equal(stubBadgeOf(stubSummary), '桩数据，不是真实证据')
+  assert.equal(stubBadgeOf({ ...stubSummary, engine: 'real', quality: { state: 'pass' } }), '')
+  assert.equal(stubBadgeOf(null), '')
+  const html = render(React.createElement(FsLogDrawer, {
+    open: false,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: stubSummary,
+  }))
+  assert.ok(html.includes('桩数据，不是真实证据'), '桩 run 的 40px 收起条必须带 badge')
+  assert.ok(html.includes('fs-log-pill stub'), 'badge 要有自己的样式档（不是用 warning pill 冒充）')
+})
+
+check('§8.1/§13.10 partial 成员结论显示为「无结论」，不是通过也不是失败', () => {
+  assert.equal(statusText('partial'), '无结论')
+  const summaryText = eventSummary({
+    kind: 'member/end',
+    memberId: 'n_dev:1',
+    data: { status: 'partial', durationMs: 1200 },
+  })
+  assert.ok(summaryText.includes('无结论'), summaryText)
+  assert.ok(!/失败|通过/.test(summaryText), summaryText)
 })
 
 check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工」；fail 走黄（m1/m6）', () => {

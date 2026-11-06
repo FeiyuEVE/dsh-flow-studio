@@ -557,6 +557,15 @@ export const CSS = `
   color:var(--dsw-alias-state-business-primary);
   background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
 }
+/* 06 §13.8 桩数据 badge：必须一眼可辨（不是「未检测」，是「这批数据不是真的」）。 */
+.fs-log-pill.stub{
+  color:var(--fs-r2-warn, var(--dsw-alias-state-warn-primary));
+  background:transparent;
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--fs-r1-warn, var(--dsw-alias-state-warn-primary)) 60%, transparent);
+  font-variant-numeric:tabular-nums;
+  letter-spacing:.02em;
+}
+.fs-log-pill.stub::before{content:'⚠';margin-right:4px;font-size:11px;line-height:1}
 .fs-log-note{
   flex:none;max-width:30%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   font-size:12px;line-height:16px;color:var(--fs-r2-error, var(--dsw-alias-state-error-primary));

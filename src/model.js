@@ -546,6 +546,112 @@ export function validateFlow(flow) {
 }
 
 /**
+ * 开跑前的硬门禁（B2）：与 Host `validateFlowForRun` 同一口径。
+ *
+ * `validateFlow` 的 error/warning 分级是给**画布编辑**用的（成环只算 warning——作者可能
+ * 正画到一半），但引擎开跑前会把这些一律 400 拒掉。客户端必须在**发请求之前**用同一套
+ * 判据拦住，否则点「运行」才在服务端失败，等于没有运行前校验。
+ *
+ * @returns {Array<{message: string, nodeId?: string, edgeId?: string}>} 空 = 可以开跑
+ */
+export function runBlockers(flow) {
+  const issues = []
+  const nodes = Array.isArray(flow && flow.nodes) ? flow.nodes : []
+  const edges = Array.isArray(flow && flow.edges) ? flow.edges : []
+  const byId = new Map(nodes.map(n => [n.id, n]))
+  const starts = nodes.filter(n => n.kind === NODE_KIND.START)
+  const ends = nodes.filter(n => n.kind === NODE_KIND.END)
+  const stages = nodes.filter(n => n.kind === NODE_KIND.STAGE)
+
+  if (starts.length !== 1) {
+    issues.push({
+      message: `必须恰好有一个「开始」节点（当前 ${starts.length} 个），否则引擎不知道从哪跑。`,
+      nodeId: starts[0] && starts[0].id,
+    })
+  }
+  if (ends.length === 0) issues.push({ message: '至少需要一个「结束」节点，否则流程收不了口。' })
+  if (stages.length === 0) issues.push({ message: '流程没有阶段节点，没有可执行的内容。' })
+
+  // 节点 id 会进 run 目录与事件，非法字符开跑前就要挡住。
+  for (const node of nodes) {
+    const id = node && node.id
+    const ok = typeof id === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(id)
+      && id !== '.' && id !== '..' && !id.startsWith('.')
+    if (!ok) {
+      issues.push({
+        message: `节点 id 不合法：「${id}」（只允许字母、数字、点、下划线、连字符，1–64 位，不能点开头）。`,
+        nodeId: id,
+      })
+    }
+  }
+
+  const { out } = nextAdjacency(flow)
+  if (starts.length === 1) {
+    const reachable = reach([starts[0].id], out)
+    for (const node of nodes) {
+      if (node.id === starts[0].id) continue
+      if (!reachable.has(node.id)) {
+        issues.push({ message: `「${node.title}」从开始节点沿正常流转走不到，是孤立的断头路。`, nodeId: node.id })
+      }
+    }
+  }
+
+  for (const node of nodes) {
+    if (node.kind === NODE_KIND.END) continue
+    const outs = edges.filter(e => e.from === node.id && e.kind === EDGE_KIND.NEXT)
+    if (outs.length !== 1) {
+      issues.push({
+        message: outs.length === 0
+          ? `「${node.title}」没有正常流转的出边：是一条断头路。`
+          : `「${node.title}」有 ${outs.length} 条正常流转出边：引擎要求恰好一条。`,
+        nodeId: node.id,
+      })
+    }
+    for (const edge of outs) {
+      if (!byId.has(edge.to)) {
+        issues.push({ message: `正常流转的连线指向了不存在的节点 ${edge.to}。`, edgeId: edge.id })
+      }
+    }
+  }
+
+  for (const edge of edges) {
+    if (edge.kind !== EDGE_KIND.REJECT) continue
+    if (!byId.has(edge.from) || !byId.has(edge.to)) {
+      issues.push({ message: '打回线指向了不存在的节点。', edgeId: edge.id })
+      continue
+    }
+    const target = byId.get(edge.to)
+    if (target.kind !== NODE_KIND.STAGE) {
+      issues.push({
+        message: `打回线「${byId.get(edge.from).title} → ${target.title}」的目标不是阶段节点：开始 / 结束节点不执行，回退到那里会让流程卡死。`,
+        edgeId: edge.id,
+      })
+      continue
+    }
+    if (!reach([edge.to], out).has(edge.from)) {
+      issues.push({
+        message: `打回线「${byId.get(edge.from).title} → ${target.title}」的目标不在上游，不构成回退。`,
+        edgeId: edge.id,
+      })
+    }
+  }
+
+  if (ends.length > 0) {
+    for (const node of stages) {
+      const reachesEnd = ends.some(end => reach([node.id], out).has(end.id))
+      if (!reachesEnd) {
+        issues.push({
+          message: `阶段「${node.title}」沿正常流转到不了任何结束节点，会是一个收不了口的循环。`,
+          nodeId: node.id,
+        })
+      }
+    }
+  }
+
+  return issues
+}
+
+/**
  * 把流程渲染成一段可读的流转说明，给人核对「我画的到底是什么意思」。
  * 只做静态展开，不做条件求值。
  */

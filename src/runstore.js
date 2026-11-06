@@ -24,7 +24,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkRunId, computeProgress,
-  normalizeEvent,
+  normalizeEvent, progressFromNodeStates,
 } from './runlog.js'
 import { resolveHome } from './store.js'
 
@@ -40,8 +40,14 @@ const NORMAL_EVENT_LIMIT = MAX_RUN_EVENTS - RESERVED_TERMINAL_EVENTS
 
 /** §13.3 单写者租约文件（放在 run 目录里，0600）。 */
 const LEASE_FILE = 'lock.json'
-/** §13.4 写盘失败的侧车文件（GET /runs/<id> 会把它作为 storageError 返回）。 */
+/** 进程间互斥用的短锁文件（startRun 的读-改-写）：不参与租约语义。 */
+const START_LOCK_FILE = 'start.lock'
+/** 写盘失败的侧车文件（GET /runs/<id> 会把它作为 storageError 返回）。 */
 const ERROR_FILE = '.error'
+/** startRun 短锁：崩溃残留的锁 mtime 超过这个值就当作陈旧锁挪走。 */
+const FILE_LOCK_TTL_MS = 10 * 1000
+/** startRun 等锁的最长时间（超时 409，让调用方重试，不无限排队）。 */
+const FILE_LOCK_WAIT_MS = 5000
 /** 默认租约 TTL：引擎每 30s 续租，90s 过期（3 次心跳）。 */
 export const DEFAULT_LEASE_TTL_MS = 90 * 1000
 
@@ -375,7 +381,8 @@ export async function createRun(runsRoot, input = {}) {
  */
 export async function startRun(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
-  return withLock(loc.id, async () => {
+  // 两条并发防线：进程内 withLock（快），进程间 start.lock（O_EXCL，跨 host / 跨进程也只有一个赢家）。
+  return withLock(loc.id, () => withRunFileLock(loc.dir, START_LOCK_FILE, async () => {
     const meta = await readMetaUnlocked(loc)
     if (!meta) throw new RunError(404, 'runId', 'run 不存在')
     if (meta.started === true || meta.status !== 'pending') {
@@ -398,7 +405,7 @@ export async function startRun(runsRoot, runId, options = {}) {
       updatedAt: now.toISOString(),
     }, loc.id)
     return writeMetaUnlocked(loc, next)
-  })
+  }))
 }
 
 /**
@@ -437,6 +444,86 @@ function leaseOwnerMatches(lease, options) {
   const pid = Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid
   const host = typeof options.host === 'string' && options.host !== '' ? options.host : hostname()
   return lease.pid === pid && lease.host === host
+}
+
+/**
+ * 原子创建（O_EXCL）：只在文件不存在时成功，用来做**跨进程**互斥。
+ * 返回 true = 抢到；false = 别人已持有。目录不存在会先建（0700）。
+ */
+async function createExclusive(path, text) {
+  let handle
+  try {
+    handle = await open(path, 'wx', FILE_MODE)
+  } catch (error) {
+    if (error && error.code === 'EEXIST') return false
+    if (error && error.code === 'ENOENT') {
+      await ensureDirMode(dirname(path))
+      handle = await open(path, 'wx', FILE_MODE).catch(inner => {
+        if (inner && inner.code === 'EEXIST') return null
+        throw inner
+      })
+      if (!handle) return false
+    } else {
+      throw error
+    }
+  }
+  try {
+    await handle.writeFile(text)
+  } finally {
+    await handle.close()
+  }
+  await chmod(path, FILE_MODE).catch(() => {})
+  return true
+}
+
+/**
+ * 把陈旧锁原子地挪走（rename 对同一源文件只有一个调用者能成功）。
+ * @returns {Promise<boolean>} true = 本进程搬走了它，可以重试创建
+ */
+async function retireStaleLock(path) {
+  const victim = `${path}.stale-${process.pid}-${tmpCounter++}`
+  try {
+    await rename(path, victim)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false
+    throw error
+  }
+  await unlink(victim).catch(() => {})
+  return true
+}
+
+/**
+ * 进程间互斥的短临界区（startRun 这类「读-改-写」元数据的操作）。
+ * O_EXCL 创建锁文件；持有者崩溃留下的陈旧锁（mtime 超过 ttl）会被原子改名挪走。
+ */
+async function withRunFileLock(dir, name, task, options = {}) {
+  const path = join(dir, name)
+  const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : FILE_LOCK_TTL_MS
+  const waitMs = Number.isInteger(options.waitMs) && options.waitMs >= 0 ? options.waitMs : FILE_LOCK_WAIT_MS
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    if (await createExclusive(path, `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`)) break
+    let info = null
+    try {
+      info = await stat(path)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') continue
+      throw error
+    }
+    if (Date.now() - info.mtimeMs > ttlMs) {
+      await retireStaleLock(path)
+      continue
+    }
+    if (Date.now() > deadline) {
+      throw new RunError(409, 'runId', '另一个进程正在处理这个 run，请稍后重试')
+    }
+    await new Promise(done => { setTimeout(done, 20) })
+  }
+  try {
+    return await task()
+  } finally {
+    await unlink(path).catch(() => {})
+  }
 }
 
 async function readLeaseFile(dir) {
@@ -516,25 +603,37 @@ export async function readLease(runsRoot, runId, options = {}) {
 
 /**
  * 抢单写者租约。已有**未过期**租约（任何持有者）一律 409；过期租约可被抢。
- * 同一 run 的 claim 在进程内串行化。
+ *
+ * 互斥靠**文件系统**而不是进程内锁（06 §13.6 B1）：`lock.json` 用 `O_EXCL` 原子创建，
+ * 两个进程同时抢只有一个能创建成功；过期租约的接管是「原子改名搬走 → 再 O_EXCL 创建」，
+ * `rename` 对同一个源文件只有一个调用者能成功，所以也只有一个赢家。
  * @returns {Promise<object>} 新租约
  */
 export async function claimLease(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
+  if (!await readMetaUnlocked(loc)) throw new RunError(404, 'runId', 'run 不存在')
   const { now, ttlMs, pid, host } = leaseOptions(options)
   return withLock(loc.id, async () => {
-    const existing = await readLeaseFile(loc.dir)
-    if (existing && !leaseExpired(existing, now)) {
-      throw new RunError(
-        409,
-        'runId',
-        `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
-      )
-    }
     const iso = now.toISOString()
     const lease = { pid, host, ttlMs, acquiredAt: iso, heartbeatAt: iso }
-    await writeLeaseFile(loc.dir, lease)
-    return lease
+    const path = leasePath(loc.dir)
+    const text = `${JSON.stringify(lease, null, 2)}\n`
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (await createExclusive(path, text)) return lease
+      const existing = await readLeaseFile(loc.dir)
+      // 持有者刚好释放：直接重试创建。
+      if (!existing) continue
+      if (!leaseExpired(existing, now)) {
+        throw new RunError(
+          409,
+          'runId',
+          `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
+        )
+      }
+      // 过期：先原子搬走，再回到循环顶部用 O_EXCL 争创建（可能被第三方先抢到 → 409）。
+      await retireStaleLock(path)
+    }
+    throw new RunError(409, 'runId', '并发抢占执行租约失败，请重试')
   })
 }
 
@@ -1534,6 +1633,11 @@ export async function listRuns(runsRoot, options = {}) {
       nodeTotal: meta.nodeTotal,
       tokenTotal: meta.tokenTotal,
       eventCount: meta.eventCount,
+      // 05 §8.3：progress（含每节点状态）三个端点都要发；列表只读 run.json 的增量计数器，
+      // 不扫事件，所以和详情同口径靠 progressFromNodeStates 保证。
+      progress: meta.progress && meta.progress.nodes
+        ? progressFromNodeStates(meta.progress.nodes, meta.nodeTotal)
+        : undefined,
     })
   }
 

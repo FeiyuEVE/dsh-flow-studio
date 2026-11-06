@@ -25,10 +25,12 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
 点「运行」把图编译成执行计划，每个节点起一个真实的子 agent 会话（单个 agent，或主管 + 子 agent），
 节点产物经结构化输出在节点之间传递，打回线按判定真的回退并累加 attempt。跑之前先把图校验一遍：
 成环、断头路、多出边、打回指向结束节点、缺角色/缺任务一律 400 拒跑，不会跑到一半才卡死。
-运行期间画布结构锁死、只读观察，可随时停止；单写者租约保证同一个 run 不会被两个进程同时写；
+运行期间画布结构锁死、只读观察，可随时停止；单写者租约用 `O_EXCL` 原子创建 `lock.json`（过期接管靠原子改名），
+跨进程 / 跨 host 抢同一个 run 只有一个赢家——这条有 6 个真实子进程抢锁的回归测试；
 写盘失败会把 run 标成 `failed` 并留 `.error` 侧车，不静默挂住；预算按 run 限步数 / 墙钟 / 产物字节。
 模型自述的证据（`provenance=model-claim`）必须对得上 `artifact/write` 的 path + sha256 且文件真实存在，
-对不上就降级成「未检测」——**质量结论不接受自证**。
+对不上就降级成「未检测」——**质量结论不接受自证**；返工后上一轮判过的失败项必须在本轮**重新判成通过**才算清账，
+改报「跳过」也洗不白。运行前校验与引擎同一口径（成环 / 多出边 / 打回指向非阶段节点），在发请求之前就拦住。
 
 ## 它解决什么
 
@@ -122,7 +124,7 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 | PUT | `/flows/<id>` | 整份覆盖保存 |
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
-| GET | `/health` | 目录、schema 版本、skills 服务是否在位、`auth` 档位（`origin-only` / `token`） |
+| GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` / `connection+token`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
 | GET/POST | `/runs` | run 列表（`limit`）/ 新建 run（`pending`，不自动开跑） |
 | POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；已有 run 在写 → 409） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
@@ -141,9 +143,9 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 
 ```sh
 npm install
-npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈143KB）+ 复制 Host 模块
-npm test           # 九组自检，共 199 组
-node test/render.test.mjs   # SSR + 构建产物加载，49 组
+npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈146 KB）+ 复制 Host 模块
+npm test           # 九组自检，共 202 组（含 6 进程抢锁的跨进程回归）
+node test/render.test.mjs   # SSR + 构建产物加载，51 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 

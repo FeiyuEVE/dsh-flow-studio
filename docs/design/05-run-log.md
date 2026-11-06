@@ -171,14 +171,18 @@ $DSH_HOME/flow-studio/runs/
   - 返工 1 且 P1=0 且 `acceptedRate ≥ 0.6` → `state=pass`、`label=良：返工 1 轮后达标`；
   - 否则 → `state=warn`、`label=可：返工 <n> 轮`（**不是绿灯**）。
 - `progress.ratio < 1` → 至少 `warn`，即使其它证据全过（半成品不许绿）。
-- **旧失败必须复判（B4）**：三类证据指标只在当前 attempt 里聚合，于是「上一轮判 `fail`、这一轮不再提这条」会被静默洗成绿灯。按标识（`itemId` / `suite` / `ruleSetId`）**全量回放**：若某标识最新一次判定仍是 `fail`、且当前 attempt 完全没有该标识的新判定，则该指标强制 `unknown`（理由写「上一轮判未通过、本轮没有复判」，并列 `staleFails[]`）。既不按通过算，也不直接判 `fail`——没复判就是没复判。
+- **旧失败必须复判（B4）**：三类证据指标只在当前 attempt 里聚合，于是「上一轮判 `fail`、这一轮不再提这条」会被静默洗成绿灯；更糟的是**改个说法就能洗白**——上一轮 `R1=fail`，这一轮把同一条改成 `skip`/`na`，按「取最新判定」它就不再是 fail，而 skip 只记 `notApplicable`，其余条目 pass 就给了绿灯。
+  所以判据按标识（`itemId` / `suite` / `ruleSetId`）**全量回放**：`failEver`（任何 attempt 出现过 fail，顺序无关）× `passInCurrent`（当前 attempt 出现过 **pass**——这是唯一能清账的复判）× `failInCurrent`（当前 attempt 也 fail，交给正常 `fail` 路径）。
+  即 `failEver && !passInCurrent && !failInCurrent` → 该指标强制 `unknown`（理由写「上一轮判未通过、本轮没有复判为通过」，并列 `staleFails[]`）。
+  **skip / na / 干脆不提都不算复判**；反过来，`fail` 不会被 stale 降级成 `unknown`（§8.4「任一项 fail → fail」优先）。
 
 ### 8.5 安全（B2）—— 诚实的两层
 
-1. **默认**：同源校验（`Origin` 与 `Host` 不一致 → 403）+ 不做伪造防护，与同工作区其它插件一致。契约与 README 必须写明：**同网段内能访问该端口的人可以读写删 run 日志**，这是默认部署假设。
-2. **可选加固**：设置环境变量 `FLOW_STUDIO_TOKEN`（≥16 字符）后，`/api/flow-studio/*` 全部要求 `Authorization: Bearer <token>` 或 `?token=<token>`，否则 401。客户端支持从 `location.search` 的 `fs_token` 读一次存 `sessionStorage` 并在请求头里带上；没配 token 时行为不变。
-3. **`GET /health` 增补字段**：`auth`（`origin-only` / `token`）、`runsDir`、`version`，让运维一眼看出当前档位。
-4. **错误响应不得带内部绝对路径**：500 只回通用文案 + `traceId`，详细错误写进程日志。
+1. **第一层（必做）**：插件路由与 `/api` **同一道门**——每个 handler 入口调宿主 `ctx.get('connection')?.requestRejection(req)`，把它返回的 401/403 原样透出；拿不到 connection 服务时 **fail-closed 503**，绝不放行。这把 DNS rebinding / 跨站 fetch / 未登录直连一并挡在门外（宿主自带的同源 + 登录 cookie 校验）。
+2. **第二层（可选）**：设置 `FLOW_STUDIO_TOKEN`（≥16 字符）后，`/api/flow-studio/*` 另外要求 `Authorization: Bearer <token>`；**只有导出接口**允许 `?token=<token>`（方便一次性下载）。客户端支持从 `location.search` 的 `fs_token` 读一次存 `sessionStorage` 并在请求头里带上；没配 token 时只走第一层。
+3. **信任边界要写明**：经过鉴权的写入方（引擎进程、运维用 curl）**被视为可信**——它们能直接写 run 目录，也能构造任意事件。所以「证据对账」（§13.7）防的是**模型自述**（`extra.provenance='model-claim'`），不是防运维；不带 `provenance` 的事件会被当作可信事件直接采纳（实测带一个不存在的 `evidenceRef` 也能 pass），这是已知边界，不是漏洞。要更严就把 `provenance` 列为必填并默认降级为 unknown。
+4. **`GET /health` 增补字段**：`auth`（`connection` / `connection+token`）、`runsDir`、`version`、`engine`（`real` / `stub`），让运维一眼看出当前档位；未鉴权时**不返回** `dir/runsDir`。
+5. **错误响应不得带内部绝对路径**：500 只回通用文案 + `traceId`，详细错误写进程日志。
 
 ### 8.6 性能与鲁棒性
 

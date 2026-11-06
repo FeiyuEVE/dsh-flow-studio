@@ -1063,6 +1063,19 @@ function conclusionText(value) {
 }
 
 /**
+ * 06 §13.8：桩数据的 badge 文案。桩引擎的结论一律 unknown，但那只是「不判定」，
+ * 读者仍需要一眼看出这批数据**不是真实证据**，不能拿去做质量判断。
+ * @returns {string} 非桩返回 ''
+ */
+export function stubBadgeOf(summary) {
+  if (!isObject(summary)) return ''
+  if (summary.engine === 'stub') return '桩数据，不是真实证据'
+  const quality = isObject(summary.quality) ? summary.quality : null
+  if (quality && quality.stub === true) return '桩数据，不是真实证据'
+  return ''
+}
+
+/**
  * 结论 pill（05 §8.4 / 04 §3.9.3）。只认结构化 `quality.state`，不再从
  * 任意文本里猜绿色：
  *   pass → 绿（优 / 良），warn → 黄（可），fail → 红（需返工），
@@ -2045,6 +2058,8 @@ export function FsLogDrawer({
   const acceptance = acceptanceOf(summary)
   const metrics = runMetrics(feedRun, summary)
   const conclusion = feedRun ? conclusionOf(feedRun, summary) : null
+  // 06 §13.8：桩 run 必须能一眼辨认，badge 同时进 40px 收起条与展开后的头行。
+  const stubBadge = stubBadgeOf(summary)
   const detailEvent = selectedEventKey === ''
     ? null
     : (events.find(event => eventKey(event) === selectedEventKey) || null)
@@ -2072,6 +2087,7 @@ export function FsLogDrawer({
   const barLabel = feedRun
     ? '运行日志：' + feedRun.name + ' · ' + statusText(runStatusOf(feedRun))
       + ' · ' + acceptance.text + (conclusion ? ' · ' + conclusion.text : '')
+      + (stubBadge !== '' ? ' · ' + stubBadge : '')
     : runTitle
 
   const refresh = () => { void refreshAll({ force: true }) }
@@ -2282,6 +2298,9 @@ export function FsLogDrawer({
       : null,
     feedRun && conclusion
       ? h('span', { className: 'fs-log-pill ' + conclusion.tone, title: conclusion.text }, conclusion.text)
+      : null,
+    feedRun && stubBadge !== ''
+      ? h('span', { className: 'fs-log-pill stub', title: '桩引擎产出：不是真实证据，不能用于质量判断' }, stubBadge)
       : null,
     !feedRun && runError !== ''
       ? h('span', { className: 'fs-log-note', title: runError }, runError)

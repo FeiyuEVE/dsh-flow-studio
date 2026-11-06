@@ -9,7 +9,7 @@
  */
 
 import {
-  EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, summarize, validateFlow,
+  EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, runBlockers, summarize, validateFlow,
 } from '../model.js'
 import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
@@ -74,18 +74,32 @@ export function firstErrorTarget(issues) {
 }
 
 /**
- * 开始运行前的门禁：`validateFlow` 有 error 就**不建 run、不起引擎**。
- * 返回 targets 给调用方打开问题列表 + 定位第一条错误。
+ * 开始运行前的门禁：不建 run、不起引擎。
+ *
+ * 判据 = `validateFlow` 的 error **加** `runBlockers` 的开跑硬门禁。后者与 Host
+ * `validateFlowForRun` 同口径（成环 / 多出边 / 打回指向非阶段节点 / 非法节点 id…）——
+ * 这些在画布编辑里只是 warning（作者可能正画到一半），但引擎会 400 拒跑，
+ * 所以必须在**发请求之前**拦住（B2）。重复的条目按 message 去重。
+ *
+ * 返回 target 给调用方打开问题列表 + 定位第一条错误。
  */
 export function runPreflight(flow) {
   const issues = validateFlow(flow)
-  if (issues.errors.length === 0) {
-    return { ok: true, issues, target: null, message: '' }
+  const seen = new Set(issues.errors.map(item => item.message))
+  const extra = runBlockers(flow).filter(item => {
+    if (seen.has(item.message)) return false
+    seen.add(item.message)
+    return true
+  })
+  const errors = [...issues.errors, ...extra]
+  const merged = { ...issues, ok: errors.length === 0, errors }
+  if (errors.length === 0) {
+    return { ok: true, issues: merged, target: null, message: '' }
   }
-  const target = firstErrorTarget(issues)
-  const message = '流程校验未通过：' + issues.errors.length + ' 个错误，已取消开始。'
+  const target = firstErrorTarget(merged)
+  const message = '流程校验未通过：' + errors.length + ' 个错误，已取消开始。'
     + (target ? '已定位到第 1 个错误，可在问题列表逐条修复。' : '请在问题列表里逐条修复。')
-  return { ok: false, issues, target, message }
+  return { ok: false, issues: merged, target, message }
 }
 
 /**

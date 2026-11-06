@@ -6,6 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync,
   writeFileSync,
@@ -829,6 +830,60 @@ try {
     assert.equal(after.status, 'running')
     assert.equal(after.started, true)
     assert.equal(after.engine, 'stub')
+  })
+  await check('§13.2 跨进程互斥：6 个进程同时 claimLease / startRun，只有一个赢（BLOCKER-2 回归）', async () => {
+    // 同进程的 withLock 挡不住多进程，所以这条必须真的起子进程去抢。
+    const childCode = `
+const [root, id, at, action] = process.argv.slice(1)
+const store = await import(${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)})
+const wait = Number(at) - Date.now()
+if (wait > 0) await new Promise(done => setTimeout(done, wait))
+try {
+  if (action === 'start') await store.startRun(root, id, { now: new Date() })
+  else await store.claimLease(root, id, { now: new Date(), host: 'child' })
+  process.stdout.write('WON')
+} catch (error) {
+  process.stdout.write('LOST:' + (error && error.status))
+}
+`
+    const race = (count, id, action) => new Promise((resolveRace, rejectRace) => {
+      const at = String(Date.now() + 700)
+      const results = []
+      let done = 0
+      for (let i = 0; i < count; i += 1) {
+        const proc = spawn(
+          process.execPath,
+          ['--input-type=module', '-e', childCode, runsRoot, id, at, action],
+          { stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let out = ''
+        let err = ''
+        proc.stdout.on('data', chunk => { out += chunk })
+        proc.stderr.on('data', chunk => { err += chunk })
+        proc.on('error', rejectRace)
+        proc.on('close', code => {
+          results.push(out.trim() || `EXIT:${code}:${err.slice(0, 200)}`)
+          done += 1
+          if (done === count) resolveRace(results)
+        })
+      }
+    })
+
+    const leased = await makeRun()
+    created.push(leased.id)
+    const leaseResults = await race(6, leased.id, 'claim')
+    assert.equal(leaseResults.filter(item => item === 'WON').length, 1,
+      `6 个进程抢租约只能有一个赢：${leaseResults.join(' | ')}`)
+    assert.equal(leaseResults.filter(item => item === 'LOST:409').length, 5, leaseResults.join(' | '))
+
+    const started = await makeRun()
+    created.push(started.id)
+    const startResults = await race(6, started.id, 'start')
+    assert.equal(startResults.filter(item => item === 'WON').length, 1,
+      `6 个进程同时 startRun 只能有一个赢：${startResults.join(' | ')}`)
+    assert.equal(startResults.filter(item => item === 'LOST:409').length, 5, startResults.join(' | '))
+    const after = await store.readRunMeta(runsRoot, started.id)
+    assert.equal(after.status, 'running')
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

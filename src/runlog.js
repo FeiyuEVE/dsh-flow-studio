@@ -977,6 +977,19 @@ export function computeProgress(events = []) {
     }
   }
 
+  return aggregateProgress(nodes, nodeTotal)
+}
+
+/**
+ * 从「每节点状态」算进度汇总（§8.3）。
+ *
+ * 事件回放（{@link computeProgress}）和 run.json 的增量计数器（runstore 的
+ * `meta.progress.nodes`）必须同口径，所以聚合只写一份，两边都调它。
+ *
+ * @param {Map<string, {attemptId:number,status:string,endSeq:number,invalidated:boolean}>} nodes
+ * @param {number|null} nodeTotal
+ */
+function aggregateProgress(nodes, nodeTotal) {
   let passed = 0
   let skipped = 0
   let failed = 0
@@ -1021,6 +1034,26 @@ export function computeProgress(events = []) {
     ratio,
     nodeDone: passed,
   }
+}
+
+/**
+ * 从 run.json 里的每节点状态算进度（列表接口用；与 {@link computeProgress} 同口径）。
+ * @param {object} nodeStates meta.progress.nodes
+ * @param {number|null} [nodeTotal]
+ */
+export function progressFromNodeStates(nodeStates, nodeTotal = null) {
+  const map = new Map()
+  for (const [nodeId, entry] of Object.entries(nodeStates || {})) {
+    if (!entry || typeof entry !== 'object') continue
+    if (typeof entry.status !== 'string') continue
+    map.set(nodeId, {
+      attemptId: Number.isInteger(entry.attemptId) ? entry.attemptId : 0,
+      status: entry.status,
+      endSeq: Number.isInteger(entry.endSeq) ? entry.endSeq : 0,
+      invalidated: entry.invalidated === true,
+    })
+  }
+  return aggregateProgress(map, Number.isInteger(nodeTotal) ? nodeTotal : null)
 }
 
 const EVIDENCE_LABELS = {
@@ -1459,26 +1492,30 @@ export function countRework(events = []) {
 }
 
 /**
- * 三类证据指标各自的「标识字段」与「这次判定算不算 fail」。
+ * 三类证据指标各自的「标识字段」与「这次判定算什么」。
  * 与 computeAcceptance / computeTests / checkEvidence 里的判定保持同一口径。
  */
 const STALE_METRICS = {
   'acceptance/verdict': {
     name: 'acceptance',
     idField: 'itemId',
-    isFail: data => data.status === 'fail',
+    verdict: data => (data.status === 'fail' ? 'fail' : data.status === 'pass' ? 'pass' : 'other'),
   },
   'test/report': {
     name: 'tests',
     idField: 'suite',
-    isFail: data => (Number.isInteger(data.failed) && data.failed > 0)
-      || (Number.isInteger(data.executed) && Number.isInteger(data.passed)
-        && data.executed > 0 && data.passed < data.executed),
+    verdict: data => {
+      if (!Number.isInteger(data.executed) || !Number.isInteger(data.passed) || !Number.isInteger(data.failed)) {
+        return 'other'
+      }
+      if (data.failed > 0 || (data.executed > 0 && data.passed < data.executed)) return 'fail'
+      return data.executed > 0 && data.passed === data.executed ? 'pass' : 'other'
+    },
   },
   'check/form': {
     name: 'checks',
     idField: 'ruleSetId',
-    isFail: data => data.state === 'fail',
+    verdict: data => (data.state === 'fail' ? 'fail' : data.state === 'pass' ? 'pass' : 'other'),
   },
 }
 
@@ -1486,9 +1523,15 @@ const STALE_METRICS = {
  * B4：返工后的旧失败必须被**复判**，不能被「这一轮不再提它」洗成绿灯。
  *
  * 三个证据指标只在当前 attempt 里聚合（§8.2 / §8.3），所以节点被打回重跑后，
- * 上一轮 `itemId` / `suite` / `ruleSetId` 判过的 fail 会随着旧 attempt 一起被过滤掉。
- * 这里按标识全量回放：**最新一次判定仍是 fail，且当前 attempt 完全没有该标识的新判定**
- * → 记为「未复判」，上层据此把该指标降为 unknown（不给 pass、也不直接判 fail）。
+ * 上一轮判过的 `fail` 会随着旧 attempt 一起被过滤掉。更要命的是「改个说法就能洗白」：
+ * 上一轮 `R1=fail`，这一轮把同一条改成 `skip`，按「取最新判定」它就不再是 fail，
+ * 而 skip 只记 notApplicable —— 其余条目 pass 就给了绿灯。所以判据是：
+ *
+ * - `failEver`：该标识在**任何** attempt 里出现过 `fail`（顺序无关，晚到的旧事件也算）；
+ * - `passInCurrent`：**当前** attempt 里出现过 `pass`（这是唯一能清账的复判）；
+ * - `failInCurrent`：当前 attempt 里出现过 `fail`（它已经是 fail，交给正常路径，不重复报 stale）。
+ *
+ * `failEver && !passInCurrent && !failInCurrent` → 未复判（skip / na / 干脆不提都算）。
  *
  * @param {object[]} events
  * @returns {{ acceptance: string[], tests: string[], checks: string[] }}
@@ -1503,15 +1546,21 @@ export function computeStaleFails(events = []) {
     const id = event.data[metric.idField]
     if (typeof id !== 'string' || id === '') continue
     const key = `${metric.name}\u0000${id}`
-    const entry = latest.get(key) || { metric: metric.name, id, fail: false, rejudged: false }
-    // sortEvents 保证升序，所以最后写进来的就是「最新一次判定」。
-    entry.fail = metric.isFail(event.data)
-    if (isCurrentAttempt(event, attempts)) entry.rejudged = true
+    const entry = latest.get(key) || {
+      metric: metric.name, id, failEver: false, passInCurrent: false, failInCurrent: false,
+    }
+    const verdict = metric.verdict(event.data)
+    if (verdict === 'fail') {
+      entry.failEver = true
+      if (isCurrentAttempt(event, attempts)) entry.failInCurrent = true
+    } else if (verdict === 'pass' && isCurrentAttempt(event, attempts)) {
+      entry.passInCurrent = true
+    }
     latest.set(key, entry)
   }
   const stale = { acceptance: [], tests: [], checks: [] }
   for (const entry of latest.values()) {
-    if (entry.fail && !entry.rejudged) stale[entry.metric].push(entry.id)
+    if (entry.failEver && !entry.passInCurrent && !entry.failInCurrent) stale[entry.metric].push(entry.id)
   }
   for (const list of Object.values(stale)) list.sort((a, b) => a.localeCompare(b))
   return stale
@@ -1519,7 +1568,7 @@ export function computeStaleFails(events = []) {
 
 function staleFailReason(label, ids) {
   const shown = ids.slice(0, 3).join('、')
-  return `${label}里有 ${ids.length} 条上一轮判未通过、本轮没有复判（${shown}${ids.length > 3 ? ' 等' : ''}），不能按通过算`
+  return `${label}里有 ${ids.length} 条上一轮判未通过、本轮没有复判为通过（${shown}${ids.length > 3 ? ' 等' : ''}），不能按通过算`
 }
 
 /**
@@ -1594,8 +1643,8 @@ export function computeQuality(events = [], options = {}) {
     const ids = stale[metric]
     if (ids.length === 0) continue
     const target = metric === 'acceptance' ? acceptance : metric === 'tests' ? tests : checks
-    if (target.state === 'unknown') {
-      // 已经是 unknown 了：保留原来的更具体理由，只补上未复判清单。
+    if (target.state === 'unknown' || target.state === 'fail') {
+      // unknown：保留更具体的原理由；fail：fail 比 unknown 更坏，不能降级（§8.4「任一项 fail → fail」）。
       target.staleFails = ids
       continue
     }

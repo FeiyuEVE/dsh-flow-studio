@@ -991,4 +991,64 @@ check('§8.4 B4 复判过就不算 stale：attempt 2 重判 R1/unit 通过后回
   assert.equal(quality.evidence.acceptance.staleFails, undefined)
 })
 
+check('§8.4 B4 第二轮改报 skip / na 不算复判：旧 fail 仍是 unknown（BLOCKER-1 回归）', () => {
+  for (const status of ['skip', 'na']) {
+    const events = [
+      ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 1 } }),
+      ev('node/start', { nodeId: 'n_dev', attemptId: 1, data: { title: '开发', mode: 'single', skills: [] } }),
+      ev('acceptance/verdict', {
+        nodeId: 'n_dev', attemptId: 1,
+        data: { itemId: 'R1', status: 'fail', decidedBy: 'auto' },
+      }),
+      ev('node/end', { nodeId: 'n_dev', attemptId: 1, data: { status: 'rejected', durationMs: 1 } }),
+      ev('reject/trigger', {
+        nodeId: 'n_dev', attemptId: 1,
+        data: { edgeId: 'e1', fromNodeId: 'n_dev', toNodeId: 'n_dev', reason: '返工' },
+      }),
+      ev('node/start', { nodeId: 'n_dev', attemptId: 2, data: { title: '开发', mode: 'single', skills: [] } }),
+      // 把上一轮 fail 的条目改说成「跳过」，再补一条新的通过条目 —— 不能因此变成绿灯。
+      ev('acceptance/verdict', {
+        nodeId: 'n_dev', attemptId: 2,
+        data: { itemId: 'R1', status, decidedBy: 'auto' },
+      }),
+      ev('acceptance/verdict', {
+        nodeId: 'n_dev', attemptId: 2,
+        data: { itemId: 'R2', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/r2.md' },
+      }),
+      ev('node/end', { nodeId: 'n_dev', attemptId: 2, data: { status: 'passed', durationMs: 1 } }),
+    ]
+    assert.equal(computeAcceptance(events).state, 'pass', '前提：单看当前 attempt 会把 R1 记成不适用')
+    assert.deepEqual(computeStaleFails(events).acceptance, ['R1'])
+    const quality = computeQuality(events)
+    assert.equal(quality.evidence.acceptance.state, 'unknown', `状态改成 ${status} 也不能洗白`)
+    assert.match(quality.evidence.acceptance.reason, /复判/)
+  }
+})
+
+check('§8.4 B4 本轮真 fail 不被 stale 降级成 unknown（MAJOR-3 回归）', () => {
+  const events = [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 1 } }),
+    ev('node/start', { nodeId: 'n_dev', attemptId: 1, data: { title: '开发', mode: 'single', skills: [] } }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_dev', attemptId: 1,
+      data: { itemId: 'R1', status: 'fail', decidedBy: 'auto' },
+    }),
+    ev('reject/trigger', {
+      nodeId: 'n_dev', attemptId: 1,
+      data: { edgeId: 'e1', fromNodeId: 'n_dev', toNodeId: 'n_dev', reason: '返工' },
+    }),
+    ev('node/start', { nodeId: 'n_dev', attemptId: 2, data: { title: '开发', mode: 'single', skills: [] } }),
+    // 本轮真的判了一条 fail（且旧 R1 没复判）：结论必须是 fail，不是 unknown。
+    ev('acceptance/verdict', {
+      nodeId: 'n_dev', attemptId: 2,
+      data: { itemId: 'R3', status: 'fail', decidedBy: 'auto' },
+    }),
+    ev('node/end', { nodeId: 'n_dev', attemptId: 2, data: { status: 'failed', durationMs: 1 } }),
+  ]
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.acceptance.state, 'fail')
+  assert.equal(quality.state, 'fail')
+  assert.deepEqual(quality.evidence.acceptance.staleFails, ['R1'], '未复判的旧 fail 仍要列出来')
+})
+
 console.log(`\n${checks} 组通过`)

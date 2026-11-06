@@ -127,7 +127,7 @@ check('流转预览列出阶段与打回', () => {
   const html = render(React.createElement(PreviewDialog, { flow, onClose() {} }))
   assert.ok(html.includes('流转预览'))
   assert.ok(html.includes('需求分析'))
-  assert.ok(html.includes('打回最多 2 轮'))
+  assert.ok(html.includes('打回上限默认 2 轮'))
 })
 
 check('校验弹层把错误与提醒分开渲染', () => {

@@ -1,14 +1,15 @@
 /**
- * 面板主体：装配流程列表 / 画布 / 检查器 / 校验与预览，并负责自动保存。
+ * 面板主体：装配顶栏 / 流程列表 / 画布 / 检查器 / 状态栏，并负责自动保存。
  *
- * 编辑一律走「整份流程对象替换」，Host 侧是整份覆盖写；没有增量补丁协议，
- * 因此不存在半更新的中间态。
+ * 编辑一律走「整份流程对象替换」，Host 侧是整份覆盖写，因此不存在半更新中间态。
+ * 设计态与运行态是同一张图的两层（运行层留到 v0.3），所以这里只有一块画布，
+ * 不切 Tab、不换页面。
  *
  * @module @feiyueve/dsh-flow-studio/client/page
  */
 
 import {
-  EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, makeId, summarize, validateFlow,
+  EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, summarize, validateFlow,
 } from '../model.js'
 import { api } from './api.js'
 import { FlowCanvas } from './canvas.js'
@@ -18,7 +19,7 @@ import { Inspector } from './inspector.js'
 import { h, rt } from './runtime.js'
 import { CSS } from './styles.js'
 
-/** 沿正常流转边做可达判定：判断新连线是往前走还是往回退。 */
+/** 沿正常流转边做可达判定：决定新连线是前进还是回退。 */
 function canReach(flow, fromId, toId) {
   const adjacency = new Map(flow.nodes.map(node => [node.id, []]))
   for (const edge of flow.edges) {
@@ -38,17 +39,15 @@ function canReach(flow, fromId, toId) {
   return false
 }
 
-/** 校验摘要文案。 */
-function validationText(issues) {
-  if (issues.errors.length > 0) return `${issues.errors.length} 个错误`
-  if (issues.warnings.length > 0) return `${issues.warnings.length} 个提醒`
+function validationLabel(issues) {
+  if (issues.errors.length > 0) return issues.errors.length + ' 个错误'
+  if (issues.warnings.length > 0) return issues.warnings.length + ' 个提醒'
   return '结构完整'
 }
 
 /**
  * @param {object} [props]
- * @param {object} [props.initialFlow] 启动时预置的流程。省略则从 Host 拉取第一份。
- *   预置时仍会拉列表与 skill 目录，但不会用列表里的流程覆盖它 —— 测试与将来的深链都用这条。
+ * @param {object} [props.initialFlow] 启动时预置的流程；省略则从 Host 拉第一份。
  * @param {Array} [props.initialSkills] 预置的 skill 目录，省一次往返。
  */
 export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) {
@@ -64,17 +63,18 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [booted, setBooted] = useState(Boolean(initialFlow))
+  const [overview, setOverview] = useState(false)
+  const [railCollapsed, setRailCollapsed] = useState(false)
 
   const pinned = useRef(Boolean(initialFlow))
-
   const flowRef = useRef(null)
   flowRef.current = flow
   const selectionRef = useRef(null)
   selectionRef.current = selection
+  const canvasApi = useRef(null)
   const editVersion = useRef(0)
   const savedVersion = useRef(0)
 
-  /** 任何编辑：标脏 + 递增版本号。 */
   const touch = useCallback(() => {
     editVersion.current += 1
     setSaveState('dirty')
@@ -99,7 +99,6 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       : previous))
   }, [touch])
 
-  /** 立即保存当前流程。失败只标错，不打断编辑。 */
   const saveNow = useCallback(async target => {
     const snapshot = target || flowRef.current
     if (!snapshot || !snapshot.id) return
@@ -114,11 +113,10 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       setError('')
     } catch (failure) {
       setSaveState('error')
-      setError(failure && failure.message ? failure.message : '保存失败')
+      setError('保存失败：' + (failure && failure.message ? failure.message : '未知原因') + '。改动还在，重试或先别切走。')
     }
   }, [])
 
-  /** 打开一份流程；切走前把未落盘的改动先写完。 */
   const openFlow = useCallback(async id => {
     if (editVersion.current > savedVersion.current && flowRef.current) {
       await saveNow(flowRef.current)
@@ -132,13 +130,12 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       setSaveState('idle')
       setError('')
     } catch (failure) {
-      setError(failure && failure.message ? failure.message : '打开流程失败')
+      setError('打开流程失败：' + (failure && failure.message ? failure.message : '未知原因'))
     } finally {
       setBusy(false)
     }
   }, [saveNow])
 
-  // 首次进入：拉流程列表、skill 目录，并打开第一份。
   useEffect(() => {
     let alive = true
     const boot = async () => {
@@ -160,7 +157,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
         setBooted(true)
       } catch (failure) {
         if (!alive) return
-        setError(failure && failure.message ? failure.message : '初始化失败')
+        setError('连不上宿主服务：' + (failure && failure.message ? failure.message : '未知原因'))
         setBooted(true)
       }
     }
@@ -168,12 +165,10 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
     return () => { alive = false }
   }, [])
 
-  // 每次流程变化都重算校验：图小，算得起，省一套脏标记。
   useEffect(() => {
     if (flow) setIssues(validateFlow(flow))
   }, [flow])
 
-  // 自动保存：停止编辑 700ms 后落盘。
   useEffect(() => {
     if (saveState !== 'dirty' || !flow) return undefined
     const timer = setTimeout(() => { void saveNow(flow) }, 700)
@@ -187,9 +182,9 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       if (editVersion.current > savedVersion.current && flowRef.current) await saveNow(flowRef.current)
       const starter = blankFlow('新流程')
       starter.nodes = [
-        blankNode(NODE_KIND.START, 60, 180, '任务输入'),
-        blankNode(NODE_KIND.STAGE, 340, 180, '新阶段'),
-        blankNode(NODE_KIND.END, 620, 180, '完成'),
+        blankNode(NODE_KIND.START, 60, 220, '任务输入'),
+        blankNode(NODE_KIND.STAGE, 320, 220, '新阶段'),
+        blankNode(NODE_KIND.END, 580, 220, '完成'),
       ]
       starter.edges = [
         blankEdge(starter.nodes[0].id, starter.nodes[1].id),
@@ -203,7 +198,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       setSaveState('idle')
       setError('')
     } catch (failure) {
-      setError(failure && failure.message ? failure.message : '新建失败')
+      setError('新建失败：' + (failure && failure.message ? failure.message : '未知原因'))
     } finally {
       setBusy(false)
     }
@@ -231,7 +226,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
         setSaveState('idle')
       }
     } catch (failure) {
-      setError(failure && failure.message ? failure.message : '删除失败')
+      setError('删除失败：' + (failure && failure.message ? failure.message : '未知原因'))
     } finally {
       setBusy(false)
     }
@@ -251,7 +246,6 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       setSelection({ kind: 'node', id: to })
       return
     }
-    // 目标在上游 → 这是一条回退线，自动按「打回」建；否则按正常流转。
     const kind = canReach(current, from, to) ? EDGE_KIND.NEXT : EDGE_KIND.REJECT
     const edge = blankEdge(from, to, kind)
     touch()
@@ -286,7 +280,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
     patchNode(node.id, { team: [...node.team, { name: '', role: '', task: '' }] })
   }, [patchNode])
 
-  // 键盘：Delete 删选中、Esc 取消选中、⌘/Ctrl+S 立即保存。
+  // 键盘：Delete 删选中、Esc 逐层退、⌘/Ctrl+S 立即保存、F 全览。
   useEffect(() => {
     const onKeyDown = event => {
       const target = event.target
@@ -299,46 +293,42 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       }
       if (event.key === 'Escape') {
         if (dialog) setDialog(null)
+        else if (overview) setOverview(false)
         else setSelection(null)
         return
       }
       if (typing) return
-      if (event.key !== 'Delete' && event.key !== 'Backspace') return
-      const selected = selectionRef.current
-      if (!selected) return
-      event.preventDefault()
-      if (selected.kind === 'node') deleteNode(selected.id)
-      else deleteEdge(selected.id)
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        const selected = selectionRef.current
+        if (!selected) return
+        event.preventDefault()
+        if (selected.kind === 'node') deleteNode(selected.id)
+        else deleteEdge(selected.id)
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [deleteEdge, deleteNode, dialog, saveNow])
+  }, [deleteEdge, deleteNode, dialog, overview, saveNow])
 
-  const saveLabel = saveState === 'dirty'
-    ? '未保存'
-    : saveState === 'saving'
-      ? '保存中…'
-      : saveState === 'saved'
-        ? '已保存'
-        : saveState === 'error'
-          ? '保存失败'
-          : '已同步'
-  const saveDotClass = saveState === 'dirty'
-    ? 'dirty'
-    : saveState === 'saving'
-      ? 'busy'
-      : saveState === 'error'
-        ? 'error'
-        : ''
+  const saveLabel = saveState === 'dirty' ? '未保存'
+    : saveState === 'saving' ? '保存中…'
+      : saveState === 'error' ? '保存失败'
+        : saveState === 'saved' ? '已保存' : '已同步'
+  const dotClass = saveState === 'dirty' ? 'dirty'
+    : saveState === 'saving' ? 'saving'
+      : saveState === 'error' ? 'error' : ''
 
   const rejectCount = flow ? flow.edges.filter(edge => edge.kind === EDGE_KIND.REJECT).length : 0
   const teamCount = flow ? flow.nodes.filter(node => node.kind === NODE_KIND.STAGE && node.mode === EXEC_MODE.TEAM).length : 0
+  const stageCount = flow ? flow.nodes.filter(node => node.kind === NODE_KIND.STAGE).length : 0
+  const issueClass = issues.errors.length > 0 ? 'fs-status-bad'
+    : issues.warnings.length > 0 ? 'fs-status-warn' : 'fs-status-ok'
 
   return h('div', { className: 'fs-root' },
     h('style', null, CSS),
 
-    h('div', { className: 'fs-head' },
-      h('div', { className: 'fs-head-title', style: { flex: 1, minWidth: 0 } },
+    h('header', { className: 'fs-head' },
+      h('div', { className: 'fs-head-titles' },
         h('input', {
           className: 'fs-title-input',
           value: flow ? flow.name : '流程编排工作室',
@@ -349,87 +339,114 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
         }),
         h('div', { className: 'fs-sub' },
           flow
-            ? `${flow.nodes.length} 节点 · ${flow.edges.length} 连线 · ${rejectCount} 打回`
-            : '可视化配置每个阶段的 agent 角色与流转')),
-      h('div', { className: 'fs-save-state' }, h('span', { className: `fs-dot ${saveDotClass}` }), saveLabel),
-      h('button', { type: 'button', className: 'fs-btn', disabled: !flow, onClick: () => setDialog('preview') }, '预览流转'),
-      h('button', { type: 'button', className: 'fs-btn primary', onClick: createFlow, disabled: busy }, '新建流程')),
+            ? stageCount + ' 个阶段 · ' + rejectCount + ' 条打回 · ' + teamCount + ' 个主从节点'
+            : '把一条研发流水线画出来，每个节点是一个 agent 角色')),
+      h('div', { className: 'fs-save' }, h('span', { className: 'fs-dot ' + dotClass }), saveLabel),
+      h('div', { className: 'fs-toolbar' },
+        h('button', {
+          type: 'button',
+          className: 'fs-tool' + (overview ? ' on' : ''),
+          title: '全览：临时收起左右两栏，把整条主干放到能读标题的缩放',
+          disabled: !flow,
+          onClick: () => setOverview(value => !value),
+        }, '全览'),
+        h('button', {
+          type: 'button', className: 'fs-tool', title: '适应内容',
+          disabled: !flow,
+          onClick: () => canvasApi.current && canvasApi.current.fit(),
+        }, '适配'),
+        h('button', {
+          type: 'button', className: 'fs-btn', disabled: !flow,
+          onClick: () => setDialog('preview'),
+        }, '预览流转'),
+        h('button', { type: 'button', className: 'fs-btn primary', disabled: busy, onClick: createFlow }, '新建流程'))),
 
     error
-      ? h('div', { className: 'fs-error-bar' },
+      ? h('div', { className: 'fs-error' },
         h('span', null, error),
-        h('button', { type: 'button', onClick: () => setError(''), title: '关闭' }, '✕'))
+        h('button', { type: 'button', className: 'fs-tool', onClick: () => setError(''), title: '关闭' }, '✕'))
       : null,
 
     h('div', { className: 'fs-body' },
-      h(FlowList, {
-        flows,
-        activeId: flow ? flow.id : '',
-        busy,
-        onOpen: id => { void openFlow(id) },
-        onCreate: () => { void createFlow() },
-        onDelete: id => { void removeFlow(id) },
-      }),
+      overview
+        ? null
+        : h(FlowList, {
+          flows,
+          activeId: flow ? flow.id : '',
+          busy,
+          collapsed: railCollapsed,
+          onToggle: () => setRailCollapsed(value => !value),
+          onOpen: id => { void openFlow(id) },
+          onCreate: () => { void createFlow() },
+          onDelete: id => { void removeFlow(id) },
+        }),
       flow
         ? h(FlowCanvas, {
           flow,
           selection,
+          apiRef: canvasApi,
           onSelect: setSelection,
           onMoveNode: (id, x, y) => patchNode(id, { x, y }),
           onAddEdge: addEdge,
           onAddNodeAt: addNodeAt,
         })
-        : h('div', { className: 'fs-canvas', style: { cursor: 'default' } },
-          h('div', { className: 'fs-spinner', style: { marginTop: 80 } },
-            booted ? '还没有流程模板，点右上角「新建流程」开始。' : '正在加载…')),
-      h(Inspector, {
-        flow: flow || { nodes: [], edges: [] },
-        selection,
-        skills,
-        onPatchNode: patchNode,
-        onPatchEdge: patchEdge,
-        onDeleteNode: deleteNode,
-        onDeleteEdge: deleteEdge,
-        onAddMember: addMember,
-        onPatchMember: (nodeId, index, patch) => {
-          const current = flowRef.current
-          if (!current) return
-          const node = current.nodes.find(item => item.id === nodeId)
-          if (!node) return
-          patchNode(nodeId, { team: node.team.map((member, at) => (at === index ? { ...member, ...patch } : member)) })
-        },
-        onRemoveMember: (nodeId, index) => {
-          const current = flowRef.current
-          if (!current) return
-          const node = current.nodes.find(item => item.id === nodeId)
-          if (!node) return
-          patchNode(nodeId, { team: node.team.filter((_, at) => at !== index) })
-        },
-      })),
+        : h('div', { className: 'fs-canvas', style: { display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+          h('div', { className: 'fs-empty-card' },
+            h('div', { className: 'fs-empty-title' }, booted ? '还没有流程模板' : '正在加载…'),
+            h('div', { className: 'fs-empty-desc' },
+              booted
+                ? '新建一条流水线：需求分析 → 方案设计 → 结构设计 → 开发 → 测试 → 代码审查，四处可打回。'
+                : '正在从宿主读取流程模板'),
+            booted
+              ? h('button', { type: 'button', className: 'fs-btn primary', onClick: createFlow }, '新建流程')
+              : null)),
+      overview
+        ? null
+        : h(Inspector, {
+          flow: flow || { nodes: [], edges: [] },
+          selection,
+          skills,
+          onPatchNode: patchNode,
+          onPatchEdge: patchEdge,
+          onDeleteNode: deleteNode,
+          onDeleteEdge: deleteEdge,
+          onAddMember: addMember,
+          onPatchMember: (nodeId, index, patch) => {
+            const current = flowRef.current
+            if (!current) return
+            const node = current.nodes.find(item => item.id === nodeId)
+            if (!node) return
+            patchNode(nodeId, { team: node.team.map((member, at) => (at === index ? { ...member, ...patch } : member)) })
+          },
+          onRemoveMember: (nodeId, index) => {
+            const current = flowRef.current
+            if (!current) return
+            const node = current.nodes.find(item => item.id === nodeId)
+            if (!node) return
+            patchNode(nodeId, { team: node.team.filter((_, at) => at !== index) })
+          },
+        })),
 
-    h('div', { className: 'fs-foot' },
+    h('footer', { className: 'fs-status' },
       flow
-        ? h('span', null, h('b', null, String(flow.nodes.length)), ' 节点 · ', h('b', null, String(flow.edges.length)), ' 连线 · ', h('b', null, String(teamCount)), ' 个主从节点 · ', h('b', null, String(rejectCount)), ' 条打回')
+        ? h('span', null,
+          h('b', null, String(flow.nodes.length)), ' 节点 · ',
+          h('b', null, String(flow.edges.length)), ' 连线 · ',
+          h('b', null, String(rejectCount)), ' 打回')
         : h('span', null, '没有打开任何流程'),
-      h('span', { className: 'fs-foot-spacer' }),
+      overview ? h('span', null, '全览模式：Esc 退出') : null,
+      h('span', { className: 'fs-status-spacer' }),
       h('button', {
         type: 'button',
-        className: 'fs-issue-toggle',
-        onClick: () => setDialog('issues'),
+        className: 'fs-status-btn ' + issueClass,
         disabled: !flow,
-      },
-      h('span', { className: issues.errors.length > 0 ? 'bad' : issues.warnings.length > 0 ? 'warn' : 'ok' },
-        issues.errors.length > 0 ? '✕ ' : issues.warnings.length > 0 ? '! ' : '✓ ',
-        validationText(issues)))),
+        onClick: () => setDialog('issues'),
+      }, (issues.errors.length > 0 ? '✕ ' : issues.warnings.length > 0 ? '! ' : '✓ ') + validationLabel(issues))),
 
     dialog === 'preview' && flow
       ? h(PreviewDialog, { flow, onClose: () => setDialog(null) })
       : null,
     dialog === 'issues'
-      ? h(IssuesDialog, {
-        validation: issues,
-        onSelect: setSelection,
-        onClose: () => setDialog(null),
-      })
+      ? h(IssuesDialog, { validation: issues, onSelect: setSelection, onClose: () => setDialog(null) })
       : null)
 }

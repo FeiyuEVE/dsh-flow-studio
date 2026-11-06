@@ -4,6 +4,9 @@
  * 全部字段都是受控组件，改动经 onPatch* 回写整份流程；没有本地副本，
  * 所以画布上的改动与检查器永远一致。
  *
+ * 分组按「它是什么人 / 它要干什么 / 用什么资源」三段，组间不画分隔线，
+ * 只靠 24px 间距分组（Linear 式的分组语言）。
+ *
  * @module @feiyueve/dsh-flow-studio/client/inspector
  */
 
@@ -14,7 +17,7 @@ function Field({ label, hint, children }) {
   return h('div', { className: 'fs-field' },
     h('div', { className: 'fs-label' },
       h('span', null, label),
-      hint ? h('span', { className: 'fs-label-hint' }, hint) : null),
+      hint ? h('span', { className: 'fs-hint' }, hint) : null),
     children)
 }
 
@@ -23,7 +26,7 @@ function Segmented({ value, options, onChange }) {
     h('button', {
       key: option.value,
       type: 'button',
-      className: value === option.value ? 'on' : '',
+      className: 'fs-seg-btn' + (value === option.value ? ' on' : ''),
       onClick: () => onChange(option.value),
       title: option.title || '',
     }, option.label)))
@@ -36,7 +39,7 @@ function SkillsPicker({ value, skills, onChange }) {
   const keyword = filter.trim().toLowerCase()
   const visible = keyword === ''
     ? skills
-    : skills.filter(skill => `${skill.name} ${skill.description}`.toLowerCase().includes(keyword))
+    : skills.filter(skill => (skill.name + ' ' + skill.description).toLowerCase().includes(keyword))
 
   const toggle = name => {
     const next = new Set(selected)
@@ -49,15 +52,15 @@ function SkillsPicker({ value, skills, onChange }) {
   return h('div', { className: 'fs-skills' },
     h('input', {
       className: 'fs-skills-filter',
-      placeholder: `搜索 ${skills.length} 个可用 skill…`,
+      placeholder: '搜索 ' + skills.length + ' 个可用 skill…',
       value: filter,
       onChange: event => setFilter(event.target.value),
     }),
     h('div', { className: 'fs-skills-list' },
       skills.length === 0
-        ? h('div', { className: 'fs-empty', style: { padding: '12px 6px' } }, '当前 profile 没有已注册的 skill')
+        ? h('div', { className: 'fs-empty-panel', style: { padding: '12px 8px' } }, '当前 profile 没有已注册的 skill')
         : visible.length === 0
-          ? h('div', { className: 'fs-empty', style: { padding: '12px 6px' } }, '没有匹配的 skill')
+          ? h('div', { className: 'fs-empty-panel', style: { padding: '12px 8px' } }, '没有匹配的 skill')
           : visible.map(skill => h('label', { key: skill.name, className: 'fs-skill' },
             h('input', {
               type: 'checkbox',
@@ -70,11 +73,11 @@ function SkillsPicker({ value, skills, onChange }) {
 }
 
 function MemberCard({ member, index, onPatch, onRemove }) {
-  return h('div', { className: 'fs-member' },
-    h('div', { className: 'fs-member-head' },
-      h('span', { className: 'fs-member-idx' }, `子 agent ${index + 1}`),
+  return h('div', { className: 'fs-member-card' },
+    h('div', { className: 'fs-member-card-head' },
+      h('span', null, '子 agent ' + (index + 1)),
       h('span', { style: { flex: 1 } }),
-      h('button', { type: 'button', className: 'fs-btn ghost sm', title: '移除', onClick: onRemove }, '移除')),
+      h('button', { type: 'button', className: 'fs-btn ghost sm', onClick: onRemove }, '移除')),
     h('input', {
       className: 'fs-input',
       placeholder: '名称，例如「接口实现」',
@@ -85,8 +88,8 @@ function MemberCard({ member, index, onPatch, onRemove }) {
       className: 'fs-textarea',
       placeholder: '这个子 agent 的角色与分工',
       value: member.role,
-      onChange: event => onPatch({ role: event.target.value }),
       rows: 2,
+      onChange: event => onPatch({ role: event.target.value }),
     }))
 }
 
@@ -94,117 +97,108 @@ function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchM
   const isStage = node.kind === NODE_KIND.STAGE
   const rejectEdges = flow.edges.filter(edge => edge.from === node.id && edge.kind === EDGE_KIND.REJECT)
 
-  return h('div', { className: 'fs-inspector-body' },
-    h(Field, { label: '标题' },
-      h('input', {
-        className: 'fs-input',
-        value: node.title,
-        maxLength: LIMITS.titleLen,
-        onChange: event => onPatch({ title: event.target.value }),
-      })),
-
-    node.kind === NODE_KIND.STAGE
-      ? h(Field, { label: '执行方式', hint: node.mode === EXEC_MODE.TEAM ? '主管先拆任务，再分给子 agent' : '一个 agent 全包' },
-        h(Segmented, {
-          value: node.mode,
-          options: [
-            { value: EXEC_MODE.SINGLE, label: '单个 agent' },
-            { value: EXEC_MODE.TEAM, label: '主管 + 子 agent' },
-          ],
-          onChange: mode => onPatch({ mode }),
-        }))
-      : null,
-
-    isStage
-      ? h(Field, { label: '角色定位', hint: '它是什么人' },
+  return h('div', { className: 'fs-panel-body' },
+    h('div', { className: 'fs-group' },
+      h(Field, { label: '标题' },
+        h('input', {
+          className: 'fs-input',
+          value: node.title,
+          maxLength: LIMITS.titleLen,
+          onChange: event => onPatch({ title: event.target.value }),
+        })),
+      h(Field, { label: node.kind === NODE_KIND.STAGE ? '负责的事' : '这个节点的职责', hint: '它要交付什么' },
         h('textarea', {
           className: 'fs-textarea',
-          placeholder: '例如：资深需求分析师，擅长把模糊诉求拆成可验收的条目。',
-          value: node.role,
-          rows: 3,
-          onChange: event => onPatch({ role: event.target.value }),
-        }))
-      : null,
-
-    h(Field, { label: isStage ? '负责的事' : '这个节点的职责', hint: '它要交付什么' },
-      h('textarea', {
-        className: 'fs-textarea',
-        placeholder: isStage ? '例如：拆需求条目、写验收标准、列风险。' : '流程入口/出口做什么。',
-        value: node.task,
-        rows: 4,
-        onChange: event => onPatch({ task: event.target.value }),
-      })),
-
-    h(Field, { label: '期望产物', hint: '下一节点靠它接手' },
-      h('textarea', {
-        className: 'fs-textarea',
-        placeholder: '例如：需求清单 R1..Rn + 风险表',
-        value: node.outputs,
-        rows: 2,
-        onChange: event => onPatch({ outputs: event.target.value }),
-      })),
+          placeholder: isStage ? '例如：拆需求条目、写验收标准、列风险。' : '流程入口/出口做什么。',
+          value: node.task,
+          rows: 4,
+          onChange: event => onPatch({ task: event.target.value }),
+        })),
+      h(Field, { label: '期望产物', hint: '下一节点靠它接手' },
+        h('textarea', {
+          className: 'fs-textarea',
+          placeholder: '例如：需求清单 R1..Rn + 风险表',
+          value: node.outputs,
+          rows: 2,
+          onChange: event => onPatch({ outputs: event.target.value }),
+        }))),
 
     isStage
-      ? h(Field, { label: '引用 skills', hint: node.skills.length > 0 ? `已选 ${node.skills.length}` : '可选' },
-        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-          node.skills.length > 0
-            ? h('div', { className: 'fs-chips' }, node.skills.map(name => h('span', { key: name, className: 'fs-chip' },
-              name,
+      ? h('div', { className: 'fs-group' },
+        h('div', { className: 'fs-group-title' }, '谁来做'),
+        h(Field, { label: '执行方式', hint: node.mode === EXEC_MODE.TEAM ? '主管先拆任务再分给子 agent' : '一个 agent 全包' },
+          h(Segmented, {
+            value: node.mode,
+            options: [
+              { value: EXEC_MODE.SINGLE, label: '单个 agent' },
+              { value: EXEC_MODE.TEAM, label: '主管 + 子 agent' },
+            ],
+            onChange: mode => onPatch({ mode }),
+          })),
+        h(Field, { label: '角色定位', hint: '它是什么人' },
+          h('textarea', {
+            className: 'fs-textarea',
+            placeholder: '例如：资深需求分析师，擅长把模糊诉求拆成可验收的条目。',
+            value: node.role,
+            rows: 3,
+            onChange: event => onPatch({ role: event.target.value }),
+          })),
+        node.mode === EXEC_MODE.TEAM
+          ? h('div', { className: 'fs-field' },
+            h('div', { className: 'fs-label' },
+              h('span', null, '子 agent 分工'),
               h('button', {
                 type: 'button',
-                title: '移除',
-                onClick: () => onPatch({ skills: node.skills.filter(item => item !== name) }),
-              }, '×'))))
-            : null,
-          h(SkillsPicker, {
-            value: node.skills,
-            skills,
-            onChange: next => onPatch({ skills: next }),
-          })))
-      : null,
-
-    rejectEdges.length > 0
-      ? h(Field, { label: '打回上限', hint: '超过就交给人工' },
-        h('input', {
-          className: 'fs-input',
-          type: 'number',
-          min: 1,
-          max: LIMITS.maxRounds,
-          value: node.maxRounds,
-          onChange: event => onPatch({ maxRounds: Math.max(1, Math.min(LIMITS.maxRounds, Number(event.target.value) || 1)) }),
-        }))
+                className: 'fs-btn ghost sm',
+                disabled: node.team.length >= LIMITS.teamMembers,
+                onClick: onAddMember,
+              }, '+ 添加')),
+            node.team.length === 0
+              ? h('div', { className: 'fs-empty-panel', style: { padding: '10px 4px' } }, '还没配子 agent：主管会自己干完。')
+              : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                node.team.map((member, index) => h(MemberCard, {
+                  key: index,
+                  member,
+                  index,
+                  onPatch: patch => onPatchMember(index, patch),
+                  onRemove: () => onRemoveMember(index),
+                }))))
+          : null)
       : null,
 
     isStage
-      ? h(Field, { label: '模型覆盖', hint: '留空跟随会话默认' },
-        h('input', {
-          className: 'fs-input',
-          placeholder: '例如 deepseek-chat',
-          value: node.model,
-          onChange: event => onPatch({ model: event.target.value }),
-        }))
-      : null,
-
-    isStage && node.mode === EXEC_MODE.TEAM
-      ? h('div', { className: 'fs-field' },
-        h('div', { className: 'fs-label' },
-          h('span', null, '子 agent 分工'),
-          h('button', {
-            type: 'button',
-            className: 'fs-btn ghost sm',
-            disabled: node.team.length >= LIMITS.teamMembers,
-            onClick: onAddMember,
-          }, '+ 添加')),
-        node.team.length === 0
-          ? h('div', { className: 'fs-empty', style: { padding: '10px 4px' } }, '还没配子 agent：主管会自己一个人干完。')
-          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-            node.team.map((member, index) => h(MemberCard, {
-              key: index,
-              member,
-              index,
-              onPatch: patch => onPatchMember(index, patch),
-              onRemove: () => onRemoveMember(index),
-            }))))
+      ? h('div', { className: 'fs-group' },
+        h('div', { className: 'fs-group-title' }, '用什么资源'),
+        h(Field, { label: '引用 skills', hint: node.skills.length > 0 ? '已选 ' + node.skills.length : '可选' },
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            node.skills.length > 0
+              ? h('div', { className: 'fs-chips' }, node.skills.map(name => h('span', { key: name, className: 'fs-chip' },
+                name,
+                h('button', {
+                  type: 'button',
+                  title: '移除',
+                  onClick: () => onPatch({ skills: node.skills.filter(item => item !== name) }),
+                }, '×'))))
+              : null,
+            h(SkillsPicker, { value: node.skills, skills, onChange: next => onPatch({ skills: next }) }))),
+        h(Field, { label: '模型覆盖', hint: '留空跟随会话默认' },
+          h('input', {
+            className: 'fs-input',
+            placeholder: '例如 deepseek-chat',
+            value: node.model,
+            onChange: event => onPatch({ model: event.target.value }),
+          })),
+        rejectEdges.length > 0
+          ? h(Field, { label: '打回上限', hint: '超过就交给人工' },
+            h('input', {
+              className: 'fs-input num',
+              type: 'number',
+              min: 1,
+              max: LIMITS.maxRounds,
+              value: node.maxRounds,
+              onChange: event => onPatch({ maxRounds: Math.max(1, Math.min(LIMITS.maxRounds, Number(event.target.value) || 1)) }),
+            }))
+          : null)
       : null,
 
     h('div', { className: 'fs-divider' }),
@@ -216,39 +210,49 @@ function EdgeForm({ edge, flow, onPatch, onDelete }) {
   const from = byId.get(edge.from)
   const to = byId.get(edge.to)
   const isReject = edge.kind === EDGE_KIND.REJECT
-  return h('div', { className: 'fs-inspector-body' },
-    h(Field, { label: '连线' },
-      h('div', { className: 'fs-flow-meta', style: { fontSize: 11.5, color: 'var(--dsw-alias-label-secondary)' } },
-        `${from ? from.title : '?'} → ${to ? to.title : '?'}`)),
-    h(Field, { label: '类型', hint: isReject ? '目标必须是上游' : '顺序推进' },
-      h(Segmented, {
-        value: edge.kind,
-        options: [
-          { value: EDGE_KIND.NEXT, label: '正常流转' },
-          { value: EDGE_KIND.REJECT, label: '打回' },
-        ],
-        onChange: kind => onPatch({ kind, label: kind === EDGE_KIND.REJECT ? (edge.label || '打回') : '' }),
-      })),
-    isReject
-      ? h(Field, { label: '打回说明', hint: '写清什么情况打回' },
-        h('input', {
-          className: 'fs-input',
-          placeholder: '例如：方案被打回',
-          value: edge.label,
-          maxLength: 60,
-          onChange: event => onPatch({ label: event.target.value }),
-        }))
-      : null,
+  const sameTarget = flow.edges.filter(item => item.to === edge.to && item.id !== edge.id).length
+
+  return h('div', { className: 'fs-panel-body' },
+    h('div', { className: 'fs-group' },
+      h(Field, { label: '连线' },
+        h('div', { className: 'fs-hint', style: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)' } },
+          (from ? from.title : '?') + ' → ' + (to ? to.title : '?'))),
+      h(Field, { label: '类型', hint: isReject ? '目标必须是上游' : '顺序推进' },
+        h(Segmented, {
+          value: edge.kind,
+          options: [
+            { value: EDGE_KIND.NEXT, label: '正常流转' },
+            { value: EDGE_KIND.REJECT, label: '打回' },
+          ],
+          onChange: kind => onPatch({ kind, label: kind === EDGE_KIND.REJECT ? (edge.label || '打回') : '' }),
+        })),
+      isReject
+        ? h(Field, { label: '打回说明', hint: '16 字以内，超了会截断' },
+          h('input', {
+            className: 'fs-input',
+            placeholder: '例如：方案被打回',
+            value: edge.label,
+            maxLength: 60,
+            onChange: event => onPatch({ label: event.target.value }),
+          }))
+        : null,
+      isReject
+        ? h('div', { className: 'fs-hint' },
+          sameTarget > 0
+            ? '这个节点已有 ' + sameTarget + ' 条打回线进入，本线会再占一个槽位。'
+            : '打回线走画布下方航道，超出 6 条会收起成徽标。')
+        : null),
+
     h('div', { className: 'fs-divider' }),
     h('button', { type: 'button', className: 'fs-btn danger', onClick: onDelete }, '删除这条连线'))
 }
 
 export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge, onAddMember, onPatchMember, onRemoveMember }) {
-  let title = '检查器'
-  let body = h('div', { className: 'fs-empty' },
+  let title = '配置'
+  let body = h('div', { className: 'fs-empty-panel' },
     '点画布上的节点或连线来配置。',
     h('br'),
-    '双击空白处新增节点；',
+    '双击空白处新增节点，',
     h('br'),
     '从节点右侧圆点拖到另一个节点即可连线。')
 
@@ -264,9 +268,7 @@ export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, o
         onDelete: () => onDeleteNode(node.id),
         onAddMember,
         onPatchMember: (index, patch) => onPatchMember(node.id, index, patch),
-        onRemoveMember: index => {
-          onPatchNode(node.id, { team: node.team.filter((_, at) => at !== index) })
-        },
+        onRemoveMember: index => onRemoveMember(node.id, index),
       })
     }
   } else if (selection && selection.kind === 'edge') {
@@ -282,7 +284,7 @@ export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, o
     }
   }
 
-  return h('aside', { className: 'fs-inspector' },
-    h('div', { className: 'fs-inspector-head' }, h('span', null, title)),
+  return h('aside', { className: 'fs-panel' },
+    h('div', { className: 'fs-panel-head' }, h('span', null, title)),
     body)
 }

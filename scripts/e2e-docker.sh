@@ -150,10 +150,11 @@ done
 SUMMARY="$(req "$BASE/runs/$RUN_ID/summary")"
 EVENTS="$(req "$BASE/runs/$RUN_ID/events?limit=1000&order=asc")"
 DETAIL="$(req "$BASE/runs/$RUN_ID")"
+LIST="$(req "$BASE/runs?limit=10")"
 
 say "6. 断言"
-node - "$SUMMARY" "$EVENTS" "$STATUS" "$DETAIL" <<'NODE'
-const [summaryRaw, eventsRaw, status, detailRaw] = process.argv.slice(2)
+node - "$SUMMARY" "$EVENTS" "$STATUS" "$DETAIL" "$LIST" "$RUN_ID" <<'NODE'
+const [summaryRaw, eventsRaw, status, detailRaw, listRaw, runId] = process.argv.slice(2)
 const s = JSON.parse(summaryRaw).summary || JSON.parse(summaryRaw)
 const detail = JSON.parse(detailRaw).run || {}
 const ev = (JSON.parse(eventsRaw).events) || []
@@ -195,6 +196,12 @@ if (pn.n_b.attemptId !== 2) fail('n_b 当前 attempt 应为 2（打回后重跑�
 if (pn.n_b.status !== 'passed') fail('n_b 最终应为 passed，实得 ' + pn.n_b.status)
 if (!detail.progress || !detail.progress.nodes) fail('详情接口没带 progress.nodes')
 if (detail.progress.nodes.n_b.attemptId !== 2) fail('详情接口的 progress.nodes 与 summary 不一致')
+// 列表端点也必须带（05 §8.3「三个端点都带」，不只 summary / 详情）。
+const list = JSON.parse(listRaw).runs || []
+const row = list.find(item => item.id === runId)
+if (!row) fail('列表里找不到刚跑完的 run')
+if (!row.progress || !row.progress.nodes) fail('列表行缺 progress.nodes')
+if (row.progress.nodes.n_b.attemptId !== 2) fail('列表行的 progress.nodes 与 summary 不一致')
 console.log('  ✓ progress.nodes 就位（n_a/n_b attempt=2，total=2，invalidated=' + s.progress.invalidatedNodes.length + '）')
 console.log('  ✓ 状态 done，事件 ' + ev.length + ' 条，打回 ' + rej.length + ' 次，attempt=' + [...attempts].filter(a => a.endsWith('#2')).length)
 console.log('  ✓ token 合计 ' + tok.total + ' = ' + tok.input + '+' + tok.cacheRead + '+' + tok.cacheWrite + '+' + tok.output)

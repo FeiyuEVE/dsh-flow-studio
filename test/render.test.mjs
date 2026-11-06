@@ -49,6 +49,10 @@ const { lodOf, rejectPathRects } = await import('../src/client/geometry.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList, isGroupOpen, nextGroupToggles } = await import('../src/client/flowlist.js')
+const {
+  NODE_STATUS_EMPTY_TEXT, NODE_STATUS_SCROLL_AT, blockersText, hasNodeStatus,
+  nodeStatusEntries, nodeStatusOf, nodeTitleMap,
+} = await import('../src/client/flowlist.js')
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
   RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, mergeSavedFlow, progressOf,
@@ -1727,6 +1731,163 @@ check('v0.7 §4.3：页面把 initialRunView.runs 接进运行记录（旧数据
   assert.ok(html.includes('运行记录 · 1'), '页面没装配运行记录区')
   assert.ok(html.includes('未标注工作区'), '旧数据没有退化成一个默认工作区分组')
   assert.ok(html.includes('未开启'), '旧数据下 supervision 必须显示「未开启」')
+})
+
+// ── v0.8 §11.4：节点自审状态（只读） ─────────────────────────────────────
+console.log('runtime 0.8（client · 节点自审状态）')
+
+check('v0.8 §11.4：节点行渲染标题 / 状态徽标 / 进度条 / verdict 徽标', () => {
+  const runs = [{
+    id: 'run-ns', name: '节点自审运行', status: 'running',
+    nodeStatus: {
+      n_req: {
+        state: 'working', progress: 40, summary: '正在改 x.ts', verdict: null,
+        members: [], blockers: [], at: '2026-11-06T15:00:00.000Z',
+      },
+      n_plan: { state: 'done', progress: 100, verdict: 'pass' },
+      n_test: { state: 'failed', progress: 60, verdict: 'reject' },
+    },
+  }]
+  const html = renderFlowList({
+    runs,
+    selectedRunId: 'run-ns',
+    nodes: [{ id: 'n_req', title: '需求分析' }, { nodeId: 'n_plan', title: '方案设计' }],
+  })
+  assert.ok(html.includes('节点状态'), '详情头部缺少「节点状态」区')
+  assert.ok(html.includes('3 个节点'), '区块头缺少节点计数')
+  assert.ok(html.includes('需求分析'), '拿得到 nodes 标题时必须显示标题（id 键）')
+  assert.ok(html.includes('方案设计'), 'nodes 用 nodeId 键时也要能取到标题')
+  assert.ok(html.includes('n_test'), '拿不到标题时必须退回 nodeId')
+  assert.ok(html.includes('fs-node-state working'), 'working 状态徽标没有对应 class')
+  assert.ok(html.includes('fs-node-state done'), 'done 状态徽标没有对应 class')
+  assert.ok(html.includes('fs-node-state failed'), 'failed 状态徽标没有对应 class')
+  assert.ok(html.includes('进行中') && html.includes('完成') && html.includes('失败'), '状态徽标缺少可读文字')
+  assert.ok(html.includes('fs-run-node-verdict pass'), 'verdict=pass 必须显示 pass 徽标')
+  assert.ok(html.includes('fs-run-node-verdict reject'), 'verdict=reject 必须显示 reject 徽标')
+  assert.match(html, /class="fs-run-node-bar-fill" style="width:40%"/, '进度条宽度必须是 progress%')
+  assert.match(html, /aria-valuenow="40"/, '进度条缺少 aria 读数')
+  assert.ok(!html.includes(NODE_STATUS_EMPTY_TEXT), '有 nodeStatus 时不应显示降级文案')
+  // 拿到的 detail 节点表本身也要能被归一化（数组 / 映射两种形状都不抛错）。
+  assert.equal(nodeTitleMap([{ id: 'n_a', title: '甲' }]).get('n_a'), '甲')
+  assert.equal(nodeTitleMap({ n_b: { title: '乙' } }).get('n_b'), '乙')
+  assert.equal(nodeTitleMap('坏数据').size, 0)
+})
+
+check('v0.8 §11.4：blocked + blockers 显示「阻塞：」，最多 3 条并用「等 N 条」收尾', () => {
+  const runs = [{
+    id: 'run-blocked', name: '阻塞运行', status: 'running',
+    nodeStatus: {
+      n_dev: {
+        state: 'blocked', progress: 20,
+        blockers: ['等待依赖', '缺环境', '等审批', '等测试', '等人'],
+      },
+    },
+  }]
+  const html = renderFlowList({ runs, selectedRunId: 'run-blocked' })
+  assert.ok(html.includes('fs-node-state blocked'), 'blocked 状态徽标没有对应 class')
+  assert.ok(html.includes('阻塞：'), 'blocked 节点缺少「阻塞：」行')
+  assert.ok(
+    html.includes('阻塞：等待依赖、缺环境、等审批 等 5 条'),
+    '阻塞行必须只列前 3 条，并用「等 N 条」收尾',
+  )
+  assert.equal(blockersText(['a', 'b', 'c', 'd']), '阻塞：a、b、c 等 4 条')
+  assert.equal(blockersText(['只有一个']), '阻塞：只有一个')
+  assert.equal(blockersText([]), '')
+  assert.equal(blockersText('坏数据'), '', '坏类型按没有阻塞处理，不抛错')
+  // 只在 title 里保留全量（一行橙字放不下）。
+  assert.ok(/title="阻塞：[^"]*等人/.test(html), 'title 提示里应保留全部阻塞')
+})
+
+check('v0.8 §11.4：members 渲染「名字 · 状态」，有 note 时跟一行（靠 CSS 单行截断）', () => {
+  const runs = [{
+    id: 'run-members', name: '成员运行', status: 'running',
+    nodeStatus: {
+      n_dev: {
+        state: 'working', progress: 10,
+        members: [
+          { name: '实现', state: 'working', note: '正在改 x.ts' },
+          { name: '测试', state: 'done' },
+        ],
+      },
+    },
+  }]
+  const html = renderFlowList({ runs, selectedRunId: 'run-members' })
+  assert.ok(html.includes('fs-run-node-members'), '缺少成员小列表容器')
+  assert.ok(html.includes('>实现<'), '成员名字没有渲染')
+  assert.ok(html.includes('fs-run-node-member-state working'), '成员状态徽标没有对应 class')
+  assert.ok(html.includes('>进行中<'), '成员状态必须显示可读文字')
+  assert.ok(html.includes('正在改 x.ts'), '成员 note 必须渲染')
+  assert.ok(html.includes('>测试<') && html.includes('>完成<'), '没有 note 的成员也要渲染')
+  assert.match(CSS, /\.fs-run-node-member\{[^}]*white-space:nowrap/,
+    '成员行必须单行截断（CSS 限制，不是截字符串）')
+  assert.match(CSS, /\.fs-run-node-member\{[^}]*text-overflow:ellipsis/, '成员行缺少省略号')
+})
+
+check('v0.8 §11.4：nodeStatus 缺失 / 空 / 坏类型整块降级「暂无自审上报」，不抛错', () => {
+  const cases = [
+    undefined, null, {}, [], 'working', 42, { n1: 'working' }, { n1: 42 }, { n1: null },
+  ]
+  for (const nodeStatus of cases) {
+    const html = renderFlowList({
+      runs: [{ id: 'run-old', name: '老运行', status: 'done', nodeStatus }],
+      selectedRunId: 'run-old',
+    })
+    assert.ok(html.includes(NODE_STATUS_EMPTY_TEXT),
+      `坏 nodeStatus（${JSON.stringify(nodeStatus)}）必须退化到「${NODE_STATUS_EMPTY_TEXT}」`)
+    assert.ok(html.includes('老运行'), '降级时运行记录本身必须照常渲染')
+    assert.ok(html.includes('监督'), '降级时 supervision 区不能一起丢')
+    assert.ok(!html.includes('fs-run-node-head'), '降级时不应渲染任何节点行')
+    assert.equal(hasNodeStatus({ nodeStatus }), false, '坏 nodeStatus 不能算「有节点状态」')
+  }
+  assert.equal(nodeStatusOf(null), null, '坏条目归一化必须返回 null 而不是抛错')
+  assert.deepEqual(nodeStatusEntries({}), [])
+  const broken = nodeStatusEntries({
+    nodeStatus: {
+      n_ok: { state: 'done', progress: 99 },
+      n_bad: 'done',
+      '': { state: 'done' },
+    },
+  })
+  assert.equal(broken.length, 1, '只有对象条目算有效上报')
+  assert.equal(broken[0].nodeId, 'n_ok')
+  // 进度 / 状态字段收敛：越界夹取、坏值按 0、未知状态按 working。
+  assert.equal(nodeStatusOf({ state: 'weird', progress: 140 }).progress, 100)
+  assert.equal(nodeStatusOf({ state: 'done', progress: -5 }).progress, 0)
+  assert.equal(nodeStatusOf({ state: 'done', progress: '55' }).progress, 55)
+  assert.equal(nodeStatusOf({ state: 'done', progress: 'abc' }).progress, 0)
+  assert.equal(nodeStatusOf({ state: 'weird' }).state, 'working')
+  assert.equal(nodeStatusOf({ state: 'done', verdict: 'maybe' }).verdict, '')
+})
+
+check('v0.8 §11.4：节点多于 6 个时区块内部滚动，整块只读不加按钮', () => {
+  const many = {}
+  for (let index = 1; index <= 7; index += 1) {
+    many['n_' + index] = { state: 'working', progress: index * 10 }
+  }
+  const html = renderFlowList({
+    runs: [{ id: 'run-many', name: '多节点运行', status: 'running', nodeStatus: many }],
+    selectedRunId: 'run-many',
+  })
+  assert.equal(NODE_STATUS_SCROLL_AT, 6)
+  assert.ok(html.includes('fs-run-nodes-body scroll'), '7 个节点必须挂内部滚动类')
+  assert.ok(html.includes('7 个节点'))
+  assert.match(CSS, /\.fs-run-nodes-body\.scroll\{[^}]*max-height:/, '内部滚动缺少 max-height')
+  assert.match(CSS, /\.fs-run-nodes-body\.scroll\{[^}]*overflow-y:auto/, '内部滚动缺少 overflow-y')
+  const start = html.indexOf('class="fs-run-nodes"')
+  const end = html.indexOf('class="fs-rail-group"')
+  assert.ok(start > 0 && end > start, '详情头部 / 分组布局标记缺失')
+  const block = html.slice(start, end)
+  assert.ok(!block.includes('<button'), '节点状态区是只读的，不能出现按钮')
+  assert.ok(!block.includes('<input'), '节点状态区是只读的，不能出现输入框')
+
+  const few = renderFlowList({
+    runs: [{
+      id: 'run-few', name: '少节点运行', status: 'running',
+      nodeStatus: { n_1: { state: 'done', progress: 100 } },
+    }],
+    selectedRunId: 'run-few',
+  })
+  assert.ok(!few.includes('fs-run-nodes-body scroll'), '≤6 个节点不应出现内部滚动')
 })
 
 console.log(`\n${checks} 组通过`)

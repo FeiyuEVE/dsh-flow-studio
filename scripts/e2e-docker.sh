@@ -227,9 +227,11 @@ NODE
 say "6b. v0.7 断言"
 # ── 6b.1 版本 ────────────────────────────────────────────────────────────────
 HEALTH_V="$(req "$BASE/health" | jqr 'j.version')"
-[ "$VERSION" = "0.7.0" ] || die "package.json 版本是 $VERSION（期望 0.7.0）"
-[ "$HEALTH_V" = "0.7.0" ] || die "health.version=$HEALTH_V（期望 0.7.0）"
-ok "health.version = 0.7.0"
+[ -n "$VERSION" ] || die "读不到 package.json 版本"
+# v0.7 起这段断言不写死版本号：用 package.json 的版本与 health 对账，升版本不用改脚本。
+
+[ "$HEALTH_V" = "$VERSION" ] || die "health.version=$HEALTH_V（期望 $VERSION）"
+ok "health.version = $HEALTH_V（与 package.json 一致）"
 
 # ── 6b.2 并发不设上限 ────────────────────────────────────────────────────────
 # 桩节点是毫秒级的；用一条 55 阶段的长链把 run 拉长，让「两个 run 同时 running」

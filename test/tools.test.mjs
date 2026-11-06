@@ -742,7 +742,69 @@ try {
     A.ok(result.supervision.alarmPrompt.includes(started.runId))
   })
 
-  // ── 8. flow_watch 省略 runId 取最近一次 ────────────────────────────────
+  // ── 8. flow_watch · 节点自审状态（v0.8 §11.4） ──────────────────────────
+  await check('flow_watch 返回 nodeStatus；blocked 且连续两次 progress 不变 → recommended 提示', async () => {
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '节点自审状态', nodeTotal: 2, engine: 'real',
+    })
+    const startedAt = '2026-11-06T00:00:00.000Z'
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'running',
+      started: true,
+      startedAt,
+      nodeStatus: {
+        // n_a：连续两次 progress 都是 40 → 报「blocked 且无进展」。
+        n_a: { state: 'blocked', progress: 40, summary: '等接口', verdict: null, members: [], blockers: ['等接口'], at: startedAt },
+        // n_b：30 → 40 有进展，不该报。
+        n_b: { state: 'blocked', progress: 40, summary: '在推进', verdict: null, members: [], blockers: [], at: startedAt },
+      },
+    })
+    // 事件历史走真实 appendEvents（node/status 已在 runlog 白名单里）。
+    // n_a 连续两次 progress=40；n_b 30→40（有进展）。
+    const statusEvent = (nodeId, progress) => ({
+      v: 1,
+      ts: startedAt,
+      kind: 'node/status',
+      nodeId,
+      attemptId: 1,
+      traceId: `run:${run.id}`,
+      data: { nodeId, attempt: 1, state: 'blocked', progress, summary: '…', members: [], blockers: [], verdict: null },
+    })
+    await runstore.appendEvents(runsRoot, run.id, [
+      statusEvent('n_a', 40),
+      statusEvent('n_a', 40),
+      statusEvent('n_b', 30),
+      statusEvent('n_b', 40),
+    ])
+
+    auditResult = {
+      verdict: 'stalled',
+      status: 'running',
+      headline: '节点停滞',
+      progress: { passed: 0, total: 2, ratio: 0 },
+      plan: [],
+      currentNode: { nodeId: 'n_a', title: '阶段 A' },
+      rejects: { total: 0 },
+      anomalies: [],
+      quality: {},
+      tokens: {},
+      idleMs: 60_000,
+      recommended: ['先看日志'],
+      nextCheckSeconds: 60,
+    }
+    const tools = makeTools({ engine: makeEngine(), auditWorkflow: stubAudit })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.equal(result.ok, true)
+    A.equal(result.nodeStatus.n_a.state, 'blocked')
+    A.equal(result.nodeStatus.n_a.progress, 40)
+    A.equal(result.nodeStatus.n_a.summary, '等接口')
+    A.ok(Array.isArray(result.recommended), 'recommended 原类型（数组）要保留')
+    A.ok(result.recommended.includes('先看日志'), '审计原有建议不能丢')
+    A.ok(result.recommended.some(item => /节点 n_a 报告 blocked 且无进展，建议先看它卡在哪/.test(item)))
+    A.ok(!result.recommended.some(item => /节点 n_b 报告 blocked/.test(item)), '有进展的节点不该报')
+  })
+
+  // ── 9. flow_watch 省略 runId 取最近一次 ────────────────────────────────
   await check('flow_watch 省略 runId → 取最近一次 run（按 startedAt 倒序）', async () => {
     const older = await runstore.createRun(runsRoot, {
       flowId: 'flow-main', flowName: '主流程', name: '旧 run', nodeTotal: 1, engine: 'real',

@@ -48,6 +48,17 @@ export const INBOX_EVENT_KINDS = Object.freeze([
   'message/out',
 ])
 
+/**
+ * v0.8 扩展白名单：节点自审上报的结构化状态（07 §11「节点闹钟」）。
+ *
+ * 与 `INBOX_EVENT_KINDS` 同理单独列出，不污染 05 §2 冻结的 17 种基础事件。
+ * `data` 形状由 `src/supervise.js` 的 `parseNodeStatus` 决定（state / progress /
+ * summary / members / blockers / verdict），这里只负责「允许写」。
+ */
+export const NODE_STATUS_EVENT_KINDS = Object.freeze([
+  'node/status',
+])
+
 /** 单条事件序列化后的上限（字节，不含行尾换行）。 */
 export const MAX_EVENT_BYTES = 8 * 1024
 
@@ -68,7 +79,7 @@ export const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
 /** 用量四桶（互斥，reasoning 是 output 的子集，不另计）。 */
 export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
 
-const KIND_SET = new Set([...EVENT_KINDS, ...INBOX_EVENT_KINDS])
+const KIND_SET = new Set([...EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS])
 
 /**
  * run 级事件写到 run.jsonl；其余都要求 nodeId + attemptId（§1 目录布局）。
@@ -99,6 +110,16 @@ const ENGINE_NAME_SET = new Set(ENGINE_NAMES)
 
 /** §8.2：agent/message 的 role 白名单（目前只有 assistant）。 */
 const MESSAGE_ROLE = new Set(['assistant'])
+
+/** 07 §11：节点自审上报的状态枚举（与 src/supervise.js 的 parseNodeStatus 一致）。 */
+const NODE_STATUS_STATE = new Set(['working', 'done', 'blocked', 'failed'])
+const NODE_STATUS_MEMBER_STATE = new Set(['working', 'done', 'blocked'])
+const NODE_STATUS_VERDICT = new Set(['pass', 'reject'])
+const NODE_STATUS_SOURCE = new Set(['self-check'])
+const NODE_STATUS_MAX_MEMBERS = 20
+const NODE_STATUS_MAX_BLOCKERS = 20
+const NODE_STATUS_MAX_SUMMARY = 2000
+const NODE_STATUS_MAX_TEXT = 200
 /** §8.2：agent/message.data.text 的上限（字符，按 Unicode 码点）。 */
 export const AGENT_MESSAGE_MAX_CHARS = 2000
 /** §8.3：每个节点保留的最近 agent/message 条数 / 全局总量上限。 */
@@ -636,6 +657,62 @@ function validateData(kind, data) {
       out2.delivery = delivery
       for (const key of Object.keys(out)) delete out[key]
       Object.assign(out, out2)
+      break
+    }
+    case 'node/status': {
+      // 07 §11：节点闹钟采集到的结构化完成状态。state/progress 必填，其余可选但有界。
+      let bad = putEnum('state', NODE_STATUS_STATE)
+      if (bad) return bad
+      bad = putInt('progress', { min: 0 })
+      if (bad) return bad
+      if (out.progress > 100) return err('progress', '必须在 0..100 之间')
+      bad = putStr('summary', NODE_STATUS_MAX_SUMMARY, false)
+      if (bad) return bad
+      bad = putOptionalEnum('verdict', NODE_STATUS_VERDICT)
+      if (bad) return bad
+      bad = putOptionalEnum('source', NODE_STATUS_SOURCE)
+      if (bad) return bad
+      if (data.nodeId !== undefined && data.nodeId !== null) {
+        if (typeof data.nodeId !== 'string' || !checkRunId(data.nodeId)) {
+          return err('nodeId', '必须是合法的节点 id')
+        }
+        out.nodeId = data.nodeId
+      }
+      if (data.attempt !== undefined && data.attempt !== null) {
+        if (!Number.isInteger(data.attempt) || data.attempt < 1) return err('attempt', '必须是 ≥1 的整数')
+        out.attempt = data.attempt
+      }
+      if (data.members !== undefined && data.members !== null) {
+        if (!Array.isArray(data.members)) return err('members', '必须是数组')
+        if (data.members.length > NODE_STATUS_MAX_MEMBERS) {
+          return err('members', `最多 ${NODE_STATUS_MAX_MEMBERS} 条`)
+        }
+        const members = []
+        for (const member of data.members) {
+          if (!member || typeof member !== 'object' || Array.isArray(member)) {
+            return err('members', '每一条都必须是对象')
+          }
+          const name = typeof member.name === 'string' ? member.name.slice(0, NODE_STATUS_MAX_TEXT) : ''
+          const note = typeof member.note === 'string' ? member.note.slice(0, NODE_STATUS_MAX_TEXT) : ''
+          const state = NODE_STATUS_MEMBER_STATE.has(member.state) ? member.state : 'working'
+          members.push({ name, state, ...(note !== '' ? { note } : {}) })
+        }
+        out.members = members
+      }
+      if (data.blockers !== undefined && data.blockers !== null) {
+        if (!Array.isArray(data.blockers)) return err('blockers', '必须是数组')
+        if (data.blockers.length > NODE_STATUS_MAX_BLOCKERS) {
+          return err('blockers', `最多 ${NODE_STATUS_MAX_BLOCKERS} 条`)
+        }
+        const blockers = []
+        for (const blocker of data.blockers) {
+          if (typeof blocker !== 'string' || blocker.trim() === '') {
+            return err('blockers', '每一项都必须是非空字符串')
+          }
+          blockers.push(blocker.slice(0, NODE_STATUS_MAX_TEXT))
+        }
+        out.blockers = blockers
+      }
       break
     }
     default:

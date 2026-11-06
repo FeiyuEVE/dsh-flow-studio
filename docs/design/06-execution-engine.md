@@ -1029,3 +1029,201 @@ node test/host.test.mjs         # 40 组（含 POST /runs/<id>/supervision）
 关键用例：`planWake` 的终态 / pending / healthy / 异常 / 未知 verdict 五档，到点只唤醒一次、
 连续 3 次失败降级、成功清零、重启恢复计数与 `nextDueAt`、终态自动摘除、两进程落盘较新者优先、
 tick 重入保护、`flow_start` 自动开启与失败回退、HTTP 启用/禁用。
+
+## 19 节点闹钟：每个节点主管会话的自审（v0.8）
+
+> 对应 07 册 §11（R8）。实现：`src/supervise.js` 的 `NodeSupervisionScheduler` / `parseNodeStatus`
+> + `src/runtime.js` 的 `nodeSelfCheckPrompt()` / `wakeNode()` + `src/engine.js` 的
+> `_rememberNodeStatus()` / `_armSelfCheck()` / `_registerNodeSupervision()`；测试：
+> `test/supervise.test.mjs` 8.1–8.6、`test/engine.test.mjs` ①–⑨、`test/runtime.test.mjs`、
+> `test/tools.test.mjs`、`test/runlog.test.mjs`、`test/host.test.mjs`、`test/render.test.mjs`。
+
+### 19.1 和 run 级 supervision 的分工
+
+| | run 级 supervision（§18） | 节点闹钟（本节） |
+|---|---|---|
+| 叫醒谁 | **发起会话**（`wakerSessionId`） | **节点主管会话**（`sessionId`） |
+| 问什么 | 「整个 run 是否正常运转」，让它调 `flow_watch` | 「你这个节点现在什么状态」，要求结构化回报 |
+| 数据落在 | `run.json.supervision` | `node/status` 事件 + `run.json.nodeStatus` + `live.nodeStatus` |
+| 默认开启 | `flow_start` 起的 run 自动开 | 每个节点主管会话**自动登记**（不需要配置） |
+| 间隔 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 `nodeAlarmMs=120_000`（可配置），每 15s 扫一次到点（`nodeSupervisionIntervalMs` 可覆盖） |
+| 失败降级 | 连续 3 次 → `enabled:false` + `reason:'wake-failed: …'` | 连续 3 次 → `enabled:false` + `lastReason:'wake-failed: …'`，仍留在 `list()` 可查 |
+| 生命周期 | run 收尾摘除 | attempt 结束就摘；run 收尾再 `unregisterRun` |
+| 调度器 | `SupervisionScheduler`（`src/supervise.js`） | `NodeSupervisionScheduler`（同文件，**另一个实例、另一个 `setInterval`**） |
+
+两者都在 `createRuntime()` 里创建并 `start()`，共用 `now` / `log` / `setInterval` 注入；
+`runtime.dispose()` 两个都 `stop()`。**不是同一个 tick**。
+
+### 19.2 生命周期
+
+| 时点 | 动作 | 代码位置 |
+|---|---|---|
+| `agents.create` 成功 | 登记 `{runId, nodeId, sessionId, attempt}`；`nextDueAt = now + 120s`（ISO 字符串） | `_createNodeSession()` → `_registerNodeSupervision()` |
+| 打回重跑 / 外部消息二次激活、复用同一会话 | 重新登记 = **刷新**：重排 `nextDueAt`、更新 `attempt` / `nodeId`、清 `failures`，不叠加第二条，累计 `wakes` 保留 | `_followupNodeSession()` → `_registerNodeSupervision()` |
+| attempt 结束（passed / rejected / failed / 中止） | `_unregisterNodeSupervision(attemptSessionId)`；空 sessionId（外部 executor）安全 no-op | 节点执行 `finally` |
+| run 收尾 | `unregisterRun(runId)`，摘掉该 run 全部闹钟 | 引擎 `_disposeRunSessions()` + runtime `settleInstance()` |
+| 插件卸载 / 测试收尾 | 只停定时器，不清条目 | `runtime.dispose()` → `nodeSupervision.stop()` |
+
+- 登记失败只写 warn，不影响节点执行。
+- 注销返回值：`unregister(sessionId)` → `boolean`；`unregisterNode(runId, nodeId)` /
+  `unregisterRun(runId)` → 摘掉的条数（0 = 没登记）。未登记 / 空 id / 调度器抛错都幂等吞掉。
+- 同一 `sessionId` 是唯一键；新 attempt 复用同一会话时不会出现两条。
+
+### 19.3 到点动作
+
+runtime 注入的 `wakeNode(entry)` 按以下顺序决定（返回 `{ action, reason? }`）：
+
+| 现场 | 动作 | `reason` |
+|---|---|---|
+| `ctx.get('agents')` 不可用 | `skip` | `no-agents-service` |
+| `agents.get(sessionId)` 拿不到，`agents.resume` 也没有 | `skip` | `no-resume` |
+| `agents.resume({resumeSessionId})` 后仍拿不到 agent | `skip` | `no-agent` |
+| 会话 `status === 'idle'` 且有 `followup` | `followup`：起一个自审回合 | — |
+| 非 idle（busy 等）且有 `inject` | `inject`：不新开回合，避免自审混进节点结论 | — |
+| 两者都没有 | `skip` | `no-delivery` |
+| `resume` 抛错 / `inject` / `followup` 抛错 | 计一次失败（`failures+1`） | `wake-failed: …` |
+
+- 投递统一走 `buildFollowupPayload`（收件箱同一结构，`from:'flow-studio'`），提示词由
+  `nodeSelfCheckPrompt(entry)` 生成，固定带 `runId` / `nodeId` / `attempt`。
+- `wake` 必须返回 `{ action: 'inject'|'followup'|'skip' }`；缺 `action` / 未知值 / `null` 也算失败。
+- 计数：`inject` / `followup` → `wakes+1`；`skip` → 算成功、清 `failures`、**`wakes` 不加**。
+- 三种结果都推进 `nextDueAt`；失败也推进，避免同一个 due 每轮重试刷屏。
+- **`skip` 不算失败**：拿不到会话 / 没有投递通道都走 `skip`（算成功、清 `failures`、`wakes` 不加），
+  所以「会话一直拿不到」不会触发停摆；停摆只由 `resume` / `inject` / `followup` 抛错或返回
+  非法形状触发。
+- 连续 3 次失败（`maxFailures`）→ `enabled=false`、`lastReason='wake-failed: …'`，此后不再尝试；
+  条目保留在 `list()` 里可查。成功一次把 `failures` 清零。
+
+### 19.4 回报契约：`node/status`
+
+自审提问要求节点主管只用一个 JSON 代码块回报：
+
+```json
+{ "nodeId": "n_dev", "attempt": 2, "state": "working|done|blocked|failed",
+  "progress": 0, "summary": "…",
+  "members": [{ "name": "…", "state": "working|done|blocked", "note": "…" }],
+  "blockers": ["…"], "verdict": "pass|reject|null" }
+```
+
+`parseNodeStatus(text)`（`src/supervise.js`，纯函数）认 json 围栏 / 无语言围栏与裸 JSON，
+**坏输入返回 `null`、绝不抛错**。收敛规则：
+
+| 字段 | 规则 |
+|---|---|
+| `state` | 只认 `working / done / blocked / failed`（`trim` 后精确匹配，区分大小写），其它 → `working` |
+| `progress` | 真实数字才认；`Math.round` 夹到 `0..100`；数值字符串 / 布尔 / `null` → `0` |
+| `summary` | 非字符串 → `''`；超 2000 字符截断 |
+| `members` | ≤20 项；非对象丢弃；`name` / `note` 去空白（非字符串 → `''`）；`state` 同四值，非法 → `working` |
+| `blockers` | ≤20 项；非字符串 / 空串丢弃；每项去空白并截到 200 字符 |
+| `verdict` | 只认 `pass` / `reject`，其它 → `null` |
+| `nodeId` | 非空字符串才保留，否则 `null` |
+| `attempt` | 非负整数才保留（含 0），否则 `null` |
+
+落盘：
+
+| 去处 | 形状 / 上限 |
+|---|---|
+| `node/status` 事件 | 追加写；`traceId` / `nodeId` / `attemptId` 由引擎按当前绑定写；`data` 白名单见下 |
+| `live.nodeStatus` | 同步快照，每个节点只留最新 |
+| 引擎内存 `nodeStatus` | `Map<nodeId, entry>`，最多 200 个节点，超出淘汰最早登记的 |
+| `run.json.nodeStatus` | `{ state, progress, summary, verdict, at }` + `members: [{name,state}]` + `blockers: []`；`normalizeNodeStatus()` 再做一次形状收敛 |
+
+`node/status` 事件的 `data` 白名单（`src/runlog.js` `case 'node/status'`）：
+
+| 字段 | 规则 |
+|---|---|
+| `state` | **必填**，四值之一 |
+| `progress` | **必填**，整数 `0..100`；越界整条拒绝 |
+| `summary` | 可选字符串 ≤2000（超长截断） |
+| `verdict` | 可选 `pass` / `reject` |
+| `source` | 可选，只认 `self-check`（引擎恒写） |
+| `nodeId` | 可选合法节点 id；引擎先删模型自报的非法值，事件顶层 `nodeId` 才是权威 |
+| `attempt` | 可选 ≥1 整数；`<1` 由引擎先删 |
+| `members` | ≤20 项；每项 `name` / `note` ≤200（空 `note` 不写）、`state ∈ {working,done,blocked}`（未知→`working`） |
+| `blockers` | ≤20 项；每项非空字符串、≤200 |
+
+`run.json.nodeStatus` 的补充口径（`src/runstore.js` `normalizeNodeStatus()`）：同一节点只留最新；
+`state` 非法回落 `working`；`progress` 夹到 `0..100`；`summary` ≤2000；`verdict` 非
+`pass|reject` 置 `null`；`members` / `blockers` 各 ≤20、每项 ≤200；最多 200 个节点。
+**引擎快照写进 run.json 的 `members` 只有 `name` / `state`，`note` 只留在事件里**
+（runstore 读到 `note` 会保留，但引擎不写）。
+
+### 19.5 用状态驱动流转
+
+- **提前完成**：节点还在等 `whenIdle` 时，当前 attempt 的 `node/status` 若
+  `state==='done'` 且 `verdict ∈ {pass,reject}`，`_rememberNodeStatus()` 会 resolve
+  `_armSelfCheck()` 挂的信号，与 `whenIdle` 竞速：
+  - 自审先到 → 用 `{verdict, summary}` 走既有结构化结论路径；`reject` 时把 `summary` 当
+    `rejectReason`（空则写「自审回报判定打回（self-check）」）；`node/end.extra` 记
+    `completedBy:'self-check'`（passed / rejected 都记）；
+  - 原 `whenIdle` 继续在后台等完，失败只 warn，不阻塞主流程。
+- **不能替代 verdict 的合法性**：自审 `done` 但 `verdict` 非法 / 缺失 → 不发竞速信号
+  （`test/engine.test.mjs` ⑥）；回合结束仍要能解析出合法结构化结论，否则照旧
+  `StructuredOutputError`。
+- **自审块不会被当成节点结论**：`parseAssistantStructured()` 优先返回带 `verdict=pass|reject`
+  的对象；`state` 是四值枚举且 verdict 非 pass/reject 的状态块由 `isNodeSelfCheckBlock()`
+  跳过（状态块 + 正式 verdict 块同消息时取后者；测试 ⑨）。
+- **blocked 无进展**：`flow_watch` 读 `run.json.nodeStatus`，并用事件流里同一节点最近两条
+  `node/status` 比较 `progress`；满足 `state==='blocked'`、两条 `progress` 相同、且 run.json
+  最新进度与事件最新一条一致时，在 `recommended` 里追加
+  「节点 X 报告 blocked 且无进展，建议先看它卡在哪」（`src/tools.js` `blockedNodeAdvice()`）。
+  **审计本身不读 `nodeStatus`**，不会因此把 verdict 改成 `stalled`。
+
+### 19.6 可见性
+
+| 入口 | 内容 |
+|---|---|
+| `flow_watch.nodeStatus` | run.json 的最新快照（nodeId → entry；缺省 `{}`）；`recommended` 可能被 §19.5 补充 |
+| `GET /runs` 列表行 | `runBindingFields()` → `nodeStatus`（缺省 `{}`） |
+| `GET /runs/<id>` 详情 | 同上 |
+| `GET /runs/<id>/summary` | 同上（`extrasPayload`） |
+| `live.nodeStatus` | 运行中实时快照，随 `_persistLive()` 更新 |
+| `run.json.nodeStatus` | `_patchRunBinding()` 在 live 刷新 / 收尾时补写 |
+| `GET /runs/<id>` 的 `nodes[]` | `readRunDetail()` 从 `node/start` 的 `data.title` 记下 `title`，供客户端把 nodeId 换成标题 |
+| 事件流 | `node/status` 与其它节点事件同 seq 排序 |
+
+- `src/index.js` 三处都用同一份 `runNodeStatusOf(meta)`，坏形状 / 缺省一律 `{}`（不是 `null`）。
+- **客户端只读展示**：运行详情头部「节点状态」区块（`src/client/flowlist.js` `NodeStatusBlock()`）逐节点
+  显示标题、状态徽标、`progress%` 进度条、`verdict`、`members`、`blockers`（前 3 条 + 「等 N 条」）；
+  `members.note` 只有 run.json 里带 `note` 时才显示（引擎快照不写）；
+  超过 6 个节点（`NODE_STATUS_SCROLL_AT`）区块内部滚动；老 run / 坏形状显示
+  「节点状态：暂无自审上报」。页面只对确实有 `nodeStatus` 的 run 拉一次详情取标题，失败退回 nodeId。
+- **事件流展示仍有缺口**：日志抽屉的 `WATCH_EVENT_KINDS` / `EVENT_KINDS` 不含 `node/status`，
+  完整事件列表里该事件显示「未识别事件类型（node/status）」；状态区块不依赖它。
+
+### 19.7 已知边界
+
+- **闹钟只在内存**：`NodeSupervisionScheduler._nodes` 不落盘，没有 `run.json.nodeSupervision`；
+  进程重启后**不会恢复**节点闹钟（`runtime.supervisionReady` 只恢复 run 级 supervision）。
+  只有新引擎再次推进节点（`agents.create` / `_followupNodeSession`）时才重新登记；
+  崩溃残留的 running run 由 `sweepStaleRuns()` 收口成 failed。
+- **外部 executor 节点不挂闹钟**：没有节点会话可叫醒，`_runExternalNode()` 不登记，
+  `attemptSessionId` 为空，注销入口 no-op；这类节点也不写 `nodeStatus`。
+- **采集不校验回报来源**：`handleSessionEvent()` 对节点主管会话的任意 assistant JSON 都调
+  `parseNodeStatus()`；所以节点正常回合的结构化结论（只有 `verdict` / `summary`）也会被记成一条
+  `state:'working', progress:0` 的 `node/status`，并覆盖该节点最新快照。自审回报没有独立来源标记，
+  `source:'self-check'` 是引擎加的，不是模型给的。
+- **审计不消费节点状态**：`src/audit.js` 不读 `nodeStatus`；blocked 无进展只在 `flow_watch`
+  的 `recommended` 里提示。
+- **日志抽屉未收录 `node/status`**：`EVENT_KINDS` / `WATCH_EVENT_KINDS` 没有它，事件摘要显示
+  「未识别」；运行详情「节点状态」区块不受影响（§19.6）。
+- run 收尾后不再叫醒节点会话；自审不替节点写产物、不改节点提示词内容。
+
+### 19.8 可复核证据
+
+```sh
+node test/supervise.test.mjs   # 52 组 / 410 条（8.1 常量、8.2 parseNodeStatus、8.3–8.6 调度器）
+node test/engine.test.mjs      # 70 组 / 604 条（①–⑨ 节点闹钟组）
+node test/runtime.test.mjs     # 22 组 / 178 条（wake 的 idle/busy/skip、收尾 unregisterRun、dispose）
+node test/tools.test.mjs       # 36 组 / 345 条（flow_watch 返回 nodeStatus + blocked 建议）
+node test/runlog.test.mjs      # 72 组（node/status 通过校验 / 坏输入拒绝）
+node test/host.test.mjs        # 41 组（GET /runs 列表 / 详情 / summary 的 nodeStatus）
+node test/render.test.mjs      # 70 组（运行详情「节点状态」区块：标题 / 徽标 / 进度 / 成员 / 阻塞 / 降级 / 滚动）
+```
+
+`run.json.nodeStatus` 的 `normalizeNodeStatus()` 目前没有独立单测，由 host 组的真实写路径间接覆盖。
+
+关键用例：建会话即登记、attempt 结束注销先于 `unregisterRun`、打回重跑同一会话重新登记
+（attempt 1→2）、`node/status` 三处可见、`done+pass` 提前完成写 `completedBy:'self-check'`、
+非法 verdict 不触发提前完成、不注入调度器时完全退回 v0.7、外部 executor 不登记、
+连续 3 次失败停摆且不复活、`skip` 推进但不计 `wakes`、tick 重入保护。

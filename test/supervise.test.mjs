@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 内建 supervision 调度自检（07-runtime-0.7 §7 / §8）。
+ * 内建 supervision 调度自检（07-runtime-0.7 §7 / §8 / §11）。
  *
  * 全部走注入桩：假时钟、假审计、假唤醒、假读写、假定时器 —— 不启动 dsh、
  * 不 import 任何 dsh 包、不碰 fs、不起真定时器。
@@ -8,12 +8,20 @@
  * 覆盖：planWake 的终态 / pending / healthy / 异常 / 未知 verdict / 坏日期 /
  * lastWokeAt 缺失；Scheduler 的 start/stop 幂等、到点只唤醒一次、未到点不唤醒、
  * 连续失败 3 次降级、单 run 抛错隔离、tick 重入保护、终态自动摘除、重启恢复、
- * status 字段。
+ * status 字段；v0.8 节点闹钟的 parseNodeStatus 解析口径与 NodeSupervisionScheduler
+ * 的登记 / 注销 / 到点 / skip / 失败停摆 / 重入 / 快照。
  */
 
 import assert from 'node:assert/strict'
 
-import { planWake, SupervisionScheduler, SUPERVISION_INTERVALS } from '../src/supervise.js'
+import {
+  planWake,
+  SupervisionScheduler,
+  SUPERVISION_INTERVALS,
+  NODE_ALARM_DEFAULT_MS,
+  NodeSupervisionScheduler,
+  parseNodeStatus,
+} from '../src/supervise.js'
 
 let checks = 0
 /** 统计断言数（用户要求回报断言数）。 */
@@ -731,6 +739,650 @@ await check('Scheduler：没有登记任何 run 时 tick 安全返回 0', async 
   const stats = await scheduler.tick()
   A.deepEqual(stats, { skipped: false, runs: 0, woken: 0, failed: 0 })
   A.equal(calls.evaluate.length, 0)
+})
+
+// ===========================================================================
+// 8. v0.8 节点闹钟（07-runtime-0.7 §11 / R8）
+// ===========================================================================
+
+const FENCE = '```'
+
+/** 用 JSON.stringify 造回报文本，避免手写转义。 */
+const nodeReport = payload => JSON.stringify(payload)
+
+/** 只用假定时器；返回的 timer 带 unref() 以便断言 unref 被调用。 */
+function fakeNodeTimers() {
+  const state = { intervals: [], cleared: [], unrefs: 0, nextId: 1 }
+  return {
+    state,
+    setInterval(fn, ms) {
+      const timer = {
+        id: state.nextId,
+        fn,
+        ms,
+        unref() {
+          state.unrefs += 1
+        },
+      }
+      state.nextId += 1
+      state.intervals.push(timer)
+      return timer
+    },
+    clearInterval(timer) {
+      state.cleared.push(timer.id)
+    },
+  }
+}
+
+/** 组装节点闹钟：wake / 定时器 / 日志全部是桩，缺省 wake 返回 inject。 */
+function createNodeScheduler({ clock, wake, nodeAlarmMs, intervalMs = 15000, maxFailures } = {}) {
+  const timers = fakeNodeTimers()
+  const calls = { wake: [], logs: [] }
+  const scheduler = new NodeSupervisionScheduler({
+    now: clock.now,
+    wake: async entry => {
+      calls.wake.push(entry)
+      if (typeof wake !== 'function') return { action: 'inject' }
+      return wake(entry, calls.wake.length)
+    },
+    log: (level, message) => calls.logs.push({ level, message }),
+    intervalMs,
+    nodeAlarmMs,
+    maxFailures,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  })
+  return { scheduler, calls, timers }
+}
+
+// ---------------------------------------------------------------------------
+// 8.1 常量
+// ---------------------------------------------------------------------------
+
+await check('节点闹钟：NODE_ALARM_DEFAULT_MS = 120000，且是 register 缺省间隔', () => {
+  A.equal(NODE_ALARM_DEFAULT_MS, 120000)
+  A.ok(Number.isInteger(NODE_ALARM_DEFAULT_MS))
+
+  const clock = createClock()
+  const { scheduler } = createNodeScheduler({ clock })
+  const status = scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1 })
+  A.equal(status.nextDueAt, at(120), 'register 时 nextDueAt = now + 120s')
+  A.deepEqual(status, {
+    sessionId: 's1',
+    runId: 'r1',
+    nodeId: 'n1',
+    attempt: 1,
+    enabled: true,
+    nextDueAt: at(120),
+    wakes: 0,
+    failures: 0,
+    lastReason: null,
+  })
+  A.equal(Object.keys(status).length, 9)
+  A.equal(scheduler.nodeAlarmMs, NODE_ALARM_DEFAULT_MS)
+  A.equal(scheduler.maxFailures, 3)
+})
+
+// ---------------------------------------------------------------------------
+// 8.2 parseNodeStatus
+// ---------------------------------------------------------------------------
+
+await check('parseNodeStatus：```json 围栏 + 全字段', () => {
+  const text = [
+    '先说明当前进展。',
+    `${FENCE}json`,
+    nodeReport({
+      nodeId: 'n_dev',
+      attempt: 2,
+      state: 'done',
+      progress: 100,
+      summary: '接口与测试都写完了',
+      members: [
+        { name: 'agent-a', state: 'done', note: '实现' },
+        { name: 'agent-b' },
+      ],
+      blockers: [],
+      verdict: 'pass',
+    }),
+    FENCE,
+    '以上。',
+  ].join('\n')
+  const parsed = parseNodeStatus(text)
+  A.equal(parsed.state, 'done')
+  A.equal(parsed.progress, 100)
+  A.equal(parsed.summary, '接口与测试都写完了')
+  A.equal(parsed.nodeId, 'n_dev')
+  A.equal(parsed.attempt, 2)
+  A.equal(parsed.verdict, 'pass')
+  A.equal(parsed.members.length, 2)
+  A.deepEqual(parsed.members[0], { name: 'agent-a', state: 'done', note: '实现' })
+  A.deepEqual(parsed.members[1], { name: 'agent-b', state: 'working', note: '' })
+  A.deepEqual(parsed.blockers, [])
+  A.deepEqual(Object.keys(parsed), ['state', 'progress', 'summary', 'members', 'blockers', 'verdict', 'nodeId', 'attempt'])
+})
+
+await check('parseNodeStatus：裸 JSON（首个 { 到末个 }），前后夹说明文字', () => {
+  const parsed = parseNodeStatus('汇报：{ "nodeId": "n_test", "state": "blocked", "blockers": ["等 CI"] } 完毕')
+  A.equal(parsed.state, 'blocked')
+  A.equal(parsed.nodeId, 'n_test')
+  A.equal(parsed.progress, 0)
+  A.equal(parsed.summary, '')
+  A.deepEqual(parsed.members, [])
+  A.deepEqual(parsed.blockers, ['等 CI'])
+  A.equal(parsed.verdict, null)
+  A.equal(parsed.attempt, null)
+})
+
+await check('parseNodeStatus：缺字段全部走默认值', () => {
+  const parsed = parseNodeStatus('{}')
+  A.equal(parsed.state, 'working')
+  A.equal(parsed.progress, 0)
+  A.equal(parsed.summary, '')
+  A.deepEqual(parsed.members, [])
+  A.deepEqual(parsed.blockers, [])
+  A.equal(parsed.verdict, null)
+  A.equal(parsed.nodeId, null)
+  A.equal(parsed.attempt, null)
+})
+
+await check('parseNodeStatus：坏输入一律返回 null，绝不抛错', () => {
+  for (const input of ['', '   ', '这里没有任何 JSON', '{"a":1', `${FENCE}json\n{bad json}\n${FENCE}`, null, undefined, 42, [], ['{}']]) {
+    A.equal(parseNodeStatus(input), null, `坏输入应返回 null：${JSON.stringify(input)}`)
+  }
+})
+
+await check('parseNodeStatus：progress 越界夹紧 / 非数→0 / 小数取整', () => {
+  const cases = [
+    [150, 100],
+    [-20, 0],
+    [50.6, 51],
+    [0, 0],
+    [100, 100],
+    ['50', 0],
+    [null, 0],
+    [true, 0],
+  ]
+  for (const [value, expected] of cases) {
+    A.equal(parseNodeStatus(nodeReport({ progress: value })).progress, expected, `progress=${JSON.stringify(value)}`)
+  }
+})
+
+await check('parseNodeStatus：state / verdict 只认枚举，其它回落', () => {
+  A.equal(parseNodeStatus(nodeReport({ state: 'paused' })).state, 'working')
+  A.equal(parseNodeStatus(nodeReport({ state: 5 })).state, 'working')
+  A.equal(parseNodeStatus(nodeReport({ state: 'DONE' })).state, 'working', '枚举大小写严格（只认小写契约值）')
+  A.equal(parseNodeStatus(nodeReport({ state: ' done ' })).state, 'done', '只做首尾去空白')
+  A.equal(parseNodeStatus(nodeReport({ verdict: 'PASS' })).verdict, null)
+  A.equal(parseNodeStatus(nodeReport({ verdict: ' maybe ' })).verdict, null)
+  A.equal(parseNodeStatus(nodeReport({ verdict: true })).verdict, null)
+  A.equal(parseNodeStatus(nodeReport({ verdict: 'pass' })).verdict, 'pass')
+  A.equal(parseNodeStatus(nodeReport({ verdict: ' reject ' })).verdict, 'reject')
+})
+
+await check('parseNodeStatus：summary 截断 2000 / blockers 截断 200 且上限 20 条', () => {
+  const long = parseNodeStatus(nodeReport({
+    summary: '字'.repeat(2500),
+    blockers: Array.from({ length: 25 }, (_, index) => `b${index}`),
+  }))
+  A.equal(long.summary.length, 2000)
+  A.equal(long.blockers.length, 20)
+  A.equal(long.blockers[0], 'b0')
+
+  A.equal(parseNodeStatus(nodeReport({ blockers: ['x'.repeat(300)] })).blockers[0].length, 200)
+
+  const mixed = parseNodeStatus(nodeReport({ blockers: ['ok', '', 7, null, '  trim  '] }))
+  A.deepEqual(mixed.blockers, ['ok', 'trim'], '非字符串 / 空串丢弃，字符串去空白')
+
+  A.deepEqual(parseNodeStatus(nodeReport({ blockers: 'not-array' })).blockers, [])
+  A.equal(parseNodeStatus(nodeReport({ summary: 123 })).summary, '')
+})
+
+await check('parseNodeStatus：members 上限 20 条、形状收敛、非对象丢弃', () => {
+  const many = parseNodeStatus(nodeReport({ members: Array.from({ length: 25 }, (_, index) => ({ name: `m${index}` })) }))
+  A.equal(many.members.length, 20)
+  A.deepEqual(many.members[0], { name: 'm0', state: 'working', note: '' })
+
+  const mixed = parseNodeStatus(nodeReport({
+    members: ['x', null, { name: 123, state: 'failed', note: 42 }, { name: ' ok ', state: 'paused', note: ' hi ' }],
+  }))
+  A.equal(mixed.members.length, 2)
+  A.deepEqual(mixed.members[0], { name: '', state: 'failed', note: '' })
+  A.deepEqual(mixed.members[1], { name: 'ok', state: 'working', note: 'hi' })
+
+  A.deepEqual(parseNodeStatus(nodeReport({ members: {} })).members, [])
+})
+
+await check('parseNodeStatus：nodeId / attempt 合法才保留', () => {
+  const ok = parseNodeStatus(nodeReport({ nodeId: ' n1 ', attempt: 0 }))
+  A.equal(ok.nodeId, 'n1')
+  A.equal(ok.attempt, 0)
+
+  const blank = parseNodeStatus(nodeReport({ nodeId: '   ', attempt: -1 }))
+  A.equal(blank.nodeId, null)
+  A.equal(blank.attempt, null)
+
+  const wrongType = parseNodeStatus(nodeReport({ nodeId: 7, attempt: 1.5 }))
+  A.equal(wrongType.nodeId, null)
+  A.equal(wrongType.attempt, null)
+
+  A.equal(parseNodeStatus(nodeReport({ attempt: '2' })).attempt, null)
+})
+
+await check('parseNodeStatus：围栏坏掉可回落到裸 JSON；非 json 围栏忽略；数组不算命中', () => {
+  const fallback = parseNodeStatus(`{"state":"done","nodeId":"n_fb"}\n${FENCE}json\n{ 这也不是 JSON }\n${FENCE}`)
+  A.equal(fallback.state, 'done')
+  A.equal(fallback.nodeId, 'n_fb')
+
+  A.equal(parseNodeStatus(`${FENCE}json\n{oops}\n${FENCE}`), null, '围栏坏且无裸 JSON → null')
+  A.equal(parseNodeStatus(`${FENCE}js\nconst a = 1\n${FENCE}\n{"state":"failed"}`).state, 'failed')
+  A.equal(parseNodeStatus(`${FENCE}json\n[1,2,3]\n${FENCE}`), null, '围栏里是数组 → 不是对象 → null')
+  A.equal(parseNodeStatus(`${FENCE}JSON\n{"state":"blocked"}\n${FENCE}`).state, 'blocked', '围栏语言大小写不敏感')
+})
+
+// ---------------------------------------------------------------------------
+// 8.3 NodeSupervisionScheduler · 到点 / 间隔
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler：到点才唤醒，且同一 due 只唤醒一次', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({ clock })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1 })
+
+  let stats = await scheduler.tick()
+  A.equal(stats.entries, 1)
+  A.equal(stats.woken, 0)
+  A.equal(calls.wake.length, 0)
+
+  clock.advance(119)
+  stats = await scheduler.tick()
+  A.equal(stats.woken, 0, '未到点（差 1s）不该唤醒')
+
+  clock.advance(1)
+  stats = await scheduler.tick()
+  A.equal(stats.woken, 1)
+  A.equal(calls.wake.length, 1)
+  A.equal(calls.wake[0].sessionId, 's1')
+  A.equal(calls.wake[0].runId, 'r1')
+  A.equal(calls.wake[0].nodeId, 'n1')
+  A.equal(calls.wake[0].attempt, 1)
+  A.equal(scheduler.status('s1').wakes, 1)
+  A.equal(scheduler.status('s1').nextDueAt, at(240), '唤醒后推进一个 nodeAlarmMs')
+
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1, '同一 due 不会重复唤醒')
+  A.equal(scheduler.status('s1').wakes, 1)
+})
+
+await check('NodeScheduler：wake 收到只读快照，改它不影响内部状态', async () => {
+  const clock = createClock()
+  const { scheduler } = createNodeScheduler({
+    clock,
+    wake: entry => {
+      entry.wakes = 99
+      entry.enabled = false
+      entry.failures = 7
+      return { action: 'inject' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  clock.advance(60)
+  await scheduler.tick()
+  const status = scheduler.status('s1')
+  A.equal(status.wakes, 1)
+  A.equal(status.enabled, true)
+  A.equal(status.failures, 0)
+})
+
+await check('NodeScheduler：nodeAlarmMs 可注入，单条 register 的 intervalMs 覆盖它', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({ clock, nodeAlarmMs: 5000 })
+  scheduler.register({ runId: 'r', nodeId: 'n1', sessionId: 's-default', attempt: 1 })
+  scheduler.register({ runId: 'r', nodeId: 'n2', sessionId: 's-custom', attempt: 1, intervalMs: 30000 })
+  A.equal(scheduler.status('s-default').nextDueAt, at(5))
+  A.equal(scheduler.status('s-custom').nextDueAt, at(30))
+
+  clock.advance(5)
+  let stats = await scheduler.tick()
+  A.equal(stats.woken, 1)
+  A.equal(calls.wake[0].sessionId, 's-default')
+  A.equal(scheduler.status('s-default').nextDueAt, at(10))
+  A.equal(scheduler.status('s-custom').nextDueAt, at(30), '自定义间隔的还没到点')
+
+  clock.advance(25)
+  stats = await scheduler.tick()
+  A.equal(stats.woken, 2)
+  A.deepEqual(calls.wake.map(entry => entry.sessionId), ['s-default', 's-default', 's-custom'])
+
+  const fallback = scheduler.register({ runId: 'r', nodeId: 'n3', sessionId: 's-bad', attempt: 1, intervalMs: 0 })
+  A.equal(fallback.nextDueAt, clock.iso(5), '非法 intervalMs 回落到 nodeAlarmMs')
+})
+
+await check('NodeScheduler：skip 推进 nextDueAt、不计 wakes，并清掉失败 streak', async () => {
+  const clock = createClock()
+  const plan = ['throw', 'skip', 'skip']
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: () => {
+      const next = plan.shift()
+      if (next === 'throw') throw new Error('busy')
+      return { action: next, reason: 'busy' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+
+  clock.advance(60)
+  let stats = await scheduler.tick()
+  A.equal(stats.failed, 1)
+  A.equal(scheduler.status('s1').failures, 1)
+
+  clock.advance(60)
+  stats = await scheduler.tick()
+  A.equal(stats.skippedWakes, 1)
+  A.equal(stats.woken, 0)
+  const status = scheduler.status('s1')
+  A.equal(status.wakes, 0, 'skip 不算真的发出去，wakes 不 +1')
+  A.equal(status.failures, 0, 'skip 算成功，连续失败 streak 清零')
+  A.equal(status.enabled, true)
+  A.equal(status.nextDueAt, at(180), 'skip 同样推进 nextDueAt')
+  A.equal(status.lastReason, 'skip: busy')
+
+  clock.advance(60)
+  stats = await scheduler.tick()
+  A.equal(stats.skippedWakes, 1)
+  A.equal(calls.wake.length, 3)
+  A.equal(scheduler.status('s1').wakes, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 8.4 NodeSupervisionScheduler · 失败停摆
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler：连续 3 次唤醒失败 → 停摆（enabled=false），此后不再尝试但仍在 list 里', async () => {
+  const clock = createClock()
+  let attempts = 0
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: () => {
+      attempts += 1
+      throw new Error(`boom-${attempts}`)
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+
+  for (let index = 0; index < 3; index += 1) {
+    clock.advance(60)
+    await scheduler.tick()
+  }
+  A.equal(calls.wake.length, 3)
+  const status = scheduler.status('s1')
+  A.equal(status.failures, 3)
+  A.equal(status.enabled, false)
+  A.equal(status.wakes, 0)
+  A.equal(status.lastReason, 'wake-failed: boom-3')
+  A.equal(status.nextDueAt, at(240), '失败也推进 nextDueAt，避免刷屏')
+
+  clock.advance(600)
+  const stats = await scheduler.tick()
+  A.equal(stats.entries, 1)
+  A.equal(stats.failed, 0)
+  A.equal(calls.wake.length, 3, '停摆后再也不 wake')
+  A.equal(scheduler.list().length, 1, '停摆的 entry 仍留在 list 里可查')
+  A.equal(scheduler.list()[0].enabled, false)
+  A.ok(calls.logs.some(item => item.level === 'warn' && /停摆/.test(item.message)))
+})
+
+await check('NodeScheduler：wake 返回非法结果也算失败；maxFailures 可注入', async () => {
+  const clock = createClock()
+  const results = [{ action: undefined }, { action: 'nope' }, null]
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    maxFailures: 2,
+    wake: () => results.shift(),
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+
+  clock.advance(60)
+  let stats = await scheduler.tick()
+  A.equal(stats.failed, 1)
+  A.match(scheduler.status('s1').lastReason, /^wake-failed: wake 返回非法结果/)
+  A.equal(scheduler.status('s1').enabled, true)
+
+  clock.advance(60)
+  stats = await scheduler.tick()
+  A.equal(stats.failed, 1)
+  A.equal(scheduler.status('s1').failures, 2)
+  A.equal(scheduler.status('s1').enabled, false)
+  A.equal(calls.wake.length, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 8.5 NodeSupervisionScheduler · 刷新 / 注销
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler：同一 sessionId 重复 register 只刷新不叠加（重排 due / 换 attempt / 清失败 streak）', async () => {
+  const clock = createClock()
+  let mode = 'ok'
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: () => {
+      if (mode === 'boom') throw new Error('boom')
+      return { action: 'inject' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+
+  clock.advance(60)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1)
+  A.equal(scheduler.status('s1').wakes, 1)
+
+  mode = 'boom'
+  clock.advance(60)
+  await scheduler.tick()
+  A.equal(scheduler.status('s1').failures, 1)
+
+  const refreshed = scheduler.register({ runId: 'r1', nodeId: 'n2', sessionId: 's1', attempt: 2, intervalMs: 30000 })
+  A.equal(scheduler.list().length, 1, '同一 sessionId 不叠加第二条')
+  A.equal(refreshed.attempt, 2)
+  A.equal(refreshed.nodeId, 'n2')
+  A.equal(refreshed.wakes, 1, '累计 wakes 保留')
+  A.equal(refreshed.failures, 0, '刷新清连续失败 streak')
+  A.equal(refreshed.enabled, true)
+  A.equal(refreshed.nextDueAt, clock.iso(30), '刷新重排 nextDueAt')
+  A.equal(refreshed.lastReason, null)
+})
+
+await check('NodeScheduler：unregister / unregisterNode / unregisterRun 各自的口径', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({ clock })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r1', nodeId: 'n2', sessionId: 's2', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r2', nodeId: 'n1', sessionId: 's3', attempt: 1, intervalMs: 60000 })
+
+  A.equal(scheduler.unregister('s1'), true)
+  A.equal(scheduler.unregister('s1'), false, '重复注销返回 false')
+  A.equal(scheduler.unregister(''), false)
+
+  A.equal(scheduler.unregisterNode('r1', 'n2'), 1)
+  A.equal(scheduler.unregisterNode('r1', 'n2'), 0)
+  A.deepEqual(scheduler.list().map(entry => entry.sessionId), ['s3'])
+
+  A.equal(scheduler.unregisterRun('r2'), 1)
+  A.deepEqual(scheduler.list(), [])
+
+  const stats = await scheduler.tick()
+  A.deepEqual(stats, { skipped: false, entries: 0, woken: 0, skippedWakes: 0, failed: 0 })
+  A.equal(calls.wake.length, 0)
+})
+
+await check('NodeScheduler：tick 中 unregister 不崩、不复活，注销的 entry 不再被碰', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: entry => {
+      if (entry.sessionId === 's1') scheduler.unregister('s2')
+      if (entry.sessionId === 's3') scheduler.unregister('s3')
+      return { action: 'inject' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r1', nodeId: 'n2', sessionId: 's2', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r1', nodeId: 'n3', sessionId: 's3', attempt: 1, intervalMs: 60000 })
+
+  clock.advance(60)
+  const stats = await scheduler.tick()
+  A.equal(stats.entries, 3)
+  A.equal(stats.woken, 2)
+  A.equal(calls.wake.map(entry => entry.sessionId).join(','), 's1,s3', '本轮被注销的 s2 不再被唤醒')
+  A.deepEqual(scheduler.list().map(entry => entry.sessionId), ['s1'])
+  A.equal(scheduler.status('s2').lastReason, 'not-registered')
+  A.equal(scheduler.status('s3').lastReason, 'not-registered')
+  A.equal(scheduler.status('s1').wakes, 1)
+
+  clock.advance(60)
+  await scheduler.tick()
+  A.equal(calls.wake.map(entry => entry.sessionId).join(','), 's1,s3,s1', '注销后的 entry 不会在后续 tick 复活')
+  A.deepEqual(scheduler.list().map(entry => entry.sessionId), ['s1'])
+})
+
+// ---------------------------------------------------------------------------
+// 8.6 NodeSupervisionScheduler · 重入 / 隔离 / 顺序 / start-stop
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler：tick 重入保护（并发第二次直接 skipped）', async () => {
+  const clock = createClock()
+  let release
+  const gate = new Promise(resolve => {
+    release = resolve
+  })
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: async () => {
+      await gate
+      return { action: 'inject' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  clock.advance(60)
+
+  const first = scheduler.tick()
+  const second = await scheduler.tick()
+  A.deepEqual(second, { skipped: true, entries: 0, woken: 0, skippedWakes: 0, failed: 0 })
+  release()
+  const stats = await first
+  A.equal(stats.skipped, false)
+  A.equal(stats.woken, 1)
+  A.equal(calls.wake.length, 1)
+  A.equal(scheduler.status('s1').wakes, 1)
+})
+
+await check('NodeScheduler：单个 entry 的 wake 抛错不影响其它 entry', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    wake: entry => {
+      if (entry.sessionId === 's1') throw new Error('boom')
+      return { action: 'followup', reason: 'idle' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r1', nodeId: 'n2', sessionId: 's2', attempt: 1, intervalMs: 60000 })
+
+  clock.advance(60)
+  const stats = await scheduler.tick()
+  A.equal(stats.entries, 2)
+  A.equal(stats.failed, 1)
+  A.equal(stats.woken, 1)
+
+  const failed = scheduler.status('s1')
+  A.equal(failed.failures, 1)
+  A.equal(failed.enabled, true)
+  A.equal(failed.lastReason, 'wake-failed: boom')
+  A.equal(failed.nextDueAt, at(120))
+
+  const ok = scheduler.status('s2')
+  A.equal(ok.wakes, 1)
+  A.equal(ok.failures, 0)
+  A.equal(ok.lastReason, 'idle')
+  A.equal(ok.nextDueAt, at(120))
+  A.equal(calls.wake.length, 2)
+})
+
+await check('NodeScheduler：多个到点 entry 依次 await，不并发唤醒', async () => {
+  const clock = createClock()
+  const order = []
+  const { scheduler } = createNodeScheduler({
+    clock,
+    wake: async entry => {
+      order.push(`start:${entry.sessionId}`)
+      await Promise.resolve()
+      order.push(`end:${entry.sessionId}`)
+      return { action: 'inject' }
+    },
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  scheduler.register({ runId: 'r1', nodeId: 'n2', sessionId: 's2', attempt: 1, intervalMs: 60000 })
+  clock.advance(60)
+  await scheduler.tick()
+  A.deepEqual(order, ['start:s1', 'end:s1', 'start:s2', 'end:s2'])
+  A.equal(scheduler.status('s1').wakes, 1)
+  A.equal(scheduler.status('s2').wakes, 1)
+})
+
+await check('NodeScheduler：status / list 是只读快照，字段齐 9 个', () => {
+  const clock = createClock()
+  const { scheduler } = createNodeScheduler({ clock })
+  const missing = scheduler.status('nobody')
+  A.deepEqual(missing, {
+    sessionId: 'nobody',
+    runId: null,
+    nodeId: null,
+    attempt: null,
+    enabled: false,
+    nextDueAt: null,
+    wakes: 0,
+    failures: 0,
+    lastReason: 'not-registered',
+  })
+  A.equal(Object.keys(missing).length, 9)
+  A.deepEqual(scheduler.list(), [])
+
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  const snapshot = scheduler.status('s1')
+  snapshot.wakes = 42
+  snapshot.enabled = false
+  A.equal(scheduler.status('s1').wakes, 0, '改快照不影响内部计数')
+  A.equal(scheduler.status('s1').enabled, true)
+
+  const listed = scheduler.list()
+  A.equal(listed.length, 1)
+  A.equal(Object.keys(listed[0]).length, 9)
+  listed[0].failures = 9
+  A.equal(scheduler.status('s1').failures, 0)
+})
+
+await check('NodeScheduler：start 幂等 / stop 幂等 / interval 用 intervalMs / unref 已被调用', async () => {
+  const clock = createClock()
+  const { scheduler, calls, timers } = createNodeScheduler({ clock, intervalMs: 2500 })
+  A.equal(timers.state.intervals.length, 0)
+  A.equal(scheduler.start(), true)
+  A.equal(scheduler.start(), false)
+  A.equal(timers.state.intervals.length, 1)
+  A.equal(timers.state.intervals[0].ms, 2500)
+  A.equal(timers.state.unrefs, 1, '定时器要 unref，别拖住进程退出')
+  A.equal(scheduler.stop(), true)
+  A.equal(scheduler.stop(), false)
+  A.deepEqual(timers.state.cleared, [1])
+  A.equal(scheduler.start(), true)
+  A.equal(timers.state.intervals.length, 2)
+
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 60000 })
+  clock.advance(60)
+  const timer = timers.state.intervals[1]
+  A.equal(timer.fn(), undefined)
+  await waitFor(() => scheduler.status('s1').wakes === 1, '定时器回调驱动 tick')
+  A.equal(calls.wake.length, 1)
+  A.equal(scheduler.stop(), true)
 })
 
 console.log(`\nsupervise 自检：${checks} 组通过（${assertionCount} 条断言）`)

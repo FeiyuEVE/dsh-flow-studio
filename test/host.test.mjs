@@ -676,6 +676,53 @@ await check('GET /runs 行带 workspaceId / workspacePath / worktreeEnabled（�
   assert.equal(summary.json.sessionMode, 'top-level')
 })
 
+await check('v0.8 · GET /runs 行 / 详情 / summary 都带 nodeStatus（桩 run.json，缺省 {}）', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const withStatus = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 2 })
+  // v0.8 §11.4：nodeStatus 已在 runstore.normalizeMeta 白名单里，走真实写路径造桩。
+  await runstore.writeRunMeta(runsRoot, withStatus.id, {
+    nodeStatus: {
+      n_dev: {
+        state: 'blocked',
+        progress: 40,
+        summary: '等接口联调',
+        verdict: null,
+        members: [{ name: 'dev-1', state: 'working' }],
+        blockers: ['等接口'],
+        at: '2026-11-06T00:00:00.000Z',
+      },
+      n_test: { state: 'done', progress: 100, summary: '测试通过', verdict: 'pass', at: '2026-11-06T00:05:00.000Z' },
+    },
+  })
+  const bare = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 1 })
+
+  const listed = await call(route, 'GET', '/api/flow-studio/runs?limit=100')
+  assert.equal(listed.status, 200)
+  const row = listed.json.runs.find(item => item.id === withStatus.id)
+  assert.ok(row, '新 run 必须出现在列表里')
+  assert.equal(row.nodeStatus.n_dev.state, 'blocked')
+  assert.equal(row.nodeStatus.n_dev.progress, 40)
+  assert.equal(row.nodeStatus.n_dev.summary, '等接口联调')
+  assert.deepEqual(row.nodeStatus.n_dev.members, [{ name: 'dev-1', state: 'working' }])
+  assert.deepEqual(row.nodeStatus.n_dev.blockers, ['等接口'])
+  assert.equal(row.nodeStatus.n_test.verdict, 'pass')
+  // 没有 nodeStatus 的老 run：缺省 {}（不是 null / undefined）。
+  const bareRow = listed.json.runs.find(item => item.id === bare.id)
+  assert.ok(bareRow)
+  assert.deepEqual(bareRow.nodeStatus, {})
+
+  const detail = await call(route, 'GET', `/api/flow-studio/runs/${withStatus.id}`)
+  assert.equal(detail.status, 200)
+  assert.equal(detail.json.run.nodeStatus.n_dev.state, 'blocked')
+  assert.equal(detail.json.run.nodeStatus.n_dev.progress, 40)
+  assert.equal(detail.json.run.nodeStatus.n_test.state, 'done')
+
+  const summary = await call(route, 'GET', `/api/flow-studio/runs/${withStatus.id}/summary`)
+  assert.equal(summary.status, 200)
+  assert.equal(summary.json.nodeStatus.n_dev.state, 'blocked')
+  assert.equal(summary.json.nodeStatus.n_dev.at, '2026-11-06T00:00:00.000Z')
+})
+
 await check('supervision enable 对已收尾 run → 400（不登记一个永远不会被唤醒的 run）', async () => {
   const runsRoot = runstore.runsDir(home)
   const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 1 })

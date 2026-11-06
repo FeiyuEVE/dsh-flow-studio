@@ -22,9 +22,11 @@ export const CSS = `
   --fs-r1-warn:${R1('warn')};
   --fs-r1-success:${R1('success')};
   --fs-r1-error:${R1('error')};
+  --fs-r1-business:${R1('business')};
   --fs-r2-warn:${R2('warn')};
   --fs-r2-success:${R2('success')};
   --fs-r2-error:${R2('error')};
+  --fs-r2-business:${R2('business')};
   display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0;
   overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);
   font-family:var(--dsw-font-family);font-size:13px;line-height:20px;
@@ -147,6 +149,79 @@ export const CSS = `
 .fs-run-sup.on{color:var(--dsw-alias-label-secondary)}
 .fs-run-sup-label{color:var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary));margin-right:4px}
 .fs-run-sup-reason{color:var(--fs-r2-warn);word-break:break-word}
+
+/* v0.8 §11.4：节点自审状态（只读）。节点多于 6 个时区块内部滚动，不撑爆 240px 左栏。 */
+.fs-run-nodes{
+  display:flex;flex-direction:column;gap:2px;margin-top:4px;min-width:0;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+}
+.fs-run-nodes-head{display:flex;align-items:center;gap:4px;color:var(--dsw-alias-label-tertiary)}
+.fs-run-nodes-count{font-variant-numeric:tabular-nums}
+.fs-run-nodes-empty{
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.fs-run-nodes-body{display:flex;flex-direction:column;gap:4px;min-height:0;min-width:0}
+.fs-run-nodes-body.scroll{max-height:168px;overflow-y:auto;padding-right:2px}
+.fs-run-node{display:flex;flex-direction:column;gap:2px;min-width:0}
+.fs-run-node-head{display:flex;align-items:center;gap:4px;min-width:0}
+.fs-run-node-title{
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--dsw-alias-label-primary);
+}
+.fs-run-node-pct{flex:none;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.fs-node-state{
+  flex:none;padding:0 4px;border:1px solid transparent;border-radius:var(--dsw-radius-xs);
+  font-size:12px;line-height:16px;white-space:nowrap;
+}
+.fs-node-state.working{
+  color:var(--fs-r2-business);
+  border-color:color-mix(in srgb, var(--dsw-alias-state-business-primary) 38%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 10%, transparent);
+}
+.fs-node-state.done{
+  color:var(--fs-r2-success);
+  border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 38%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent);
+}
+.fs-node-state.blocked{
+  color:var(--fs-r2-warn);
+  border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 38%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, transparent);
+}
+.fs-node-state.failed{
+  color:var(--fs-r2-error);
+  border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 38%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
+}
+.fs-run-node-verdict{
+  flex:none;padding:0 3px;border-radius:var(--dsw-radius-xs);
+  font-size:12px;line-height:16px;font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+.fs-run-node-verdict.pass{color:var(--fs-r2-success);background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent)}
+.fs-run-node-verdict.reject{color:var(--fs-r2-error);background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent)}
+.fs-run-node-bar{
+  height:3px;border-radius:2px;overflow:hidden;
+  background:color-mix(in srgb, var(--dsw-alias-label-tertiary) 18%, transparent);
+}
+.fs-run-node-bar-fill{display:block;height:100%;border-radius:2px;background:var(--fs-r1-business)}
+.fs-run-node[data-state="done"] .fs-run-node-bar-fill{background:var(--fs-r1-success)}
+.fs-run-node[data-state="blocked"] .fs-run-node-bar-fill{background:var(--fs-r1-warn)}
+.fs-run-node[data-state="failed"] .fs-run-node-bar-fill{background:var(--fs-r1-error)}
+.fs-run-node-members{display:flex;flex-direction:column;gap:0;padding-left:8px;min-width:0}
+.fs-run-node-member{
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.fs-run-node-member-name{color:var(--dsw-alias-label-secondary)}
+.fs-run-node-member-state.working{color:var(--fs-r2-business)}
+.fs-run-node-member-state.done{color:var(--fs-r2-success)}
+.fs-run-node-member-state.blocked{color:var(--fs-r2-warn)}
+.fs-run-node-member-state.failed{color:var(--fs-r2-error)}
+.fs-run-node-blockers{
+  font-size:12px;line-height:16px;color:var(--fs-r2-warn);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
 .fs-rail-group{display:flex;flex-direction:column;gap:1px}
 .fs-rail-group-head{
   display:flex;align-items:center;gap:4px;width:100%;padding:4px;border:1px solid transparent;

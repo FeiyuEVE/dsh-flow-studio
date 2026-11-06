@@ -15,7 +15,7 @@ import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
-import { FlowList, extractRunRows } from './flowlist.js'
+import { FlowList, extractRunRows, hasNodeStatus } from './flowlist.js'
 import { Inspector } from './inspector.js'
 import {
   beginLink, confirmLink, describeLink, edgeKindBetween, moveLink,
@@ -291,6 +291,12 @@ export function FlowStudioPage({
   const [runRows, setRunRows] = useState(() => (
     initialRunView && Array.isArray(initialRunView.runs) ? initialRunView.runs : []
   ))
+  /**
+   * v0.8 §11.4：节点状态行要显示节点标题，标题只在 `GET /runs/<id>` 的 `nodes` 里
+   *（列表行没有）。只对确实上报过 nodeStatus 的 run 拉一次；拉不到就退回显示 nodeId。
+   */
+  const [runNodesById, setRunNodesById] = useState({})
+  const runNodesFetched = useRef(new Set())
 
   const pinned = useRef(Boolean(initialFlow))
   const flowRef = useRef(null)
@@ -934,6 +940,34 @@ export function FlowStudioPage({
     void loadRunRows()
   }, [loadRunRows, logSync, runDigest])
 
+  /**
+   * v0.8 §11.4：详情里的节点标题（`nodes: [{id,title}]`）只用于把 nodeId 显示成人话。
+   * 没有 nodeStatus 的老 run 不额外发请求；失败静默保留旧数据（下一次列表刷新再试）。
+   */
+  useEffect(() => {
+    if (selectedRunId === '' || runNodesFetched.current.has(selectedRunId)) return undefined
+    const rows = Array.isArray(runRows) ? runRows : []
+    const row = rows.find(item => String(item.id || '') === selectedRunId) || null
+    if (!row || !hasNodeStatus(row)) return undefined
+    let cancelled = false
+    void (async () => {
+      try {
+        const payload = await api.readRun(selectedRunId)
+        if (cancelled) return
+        runNodesFetched.current.add(selectedRunId)
+        setRunNodesById(previous => ({
+          ...previous,
+          [selectedRunId]: payload && Array.isArray(payload.nodes) ? payload.nodes : [],
+        }))
+      } catch {
+        // 旧 Host / 网络抖动：标题退回 nodeId，不打断运行记录本身。
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedRunId, runRows])
+
   /** 有 run 在跑时慢轮询：supervision 的 nextDueAt / wakes 会随调度变化（默认 tick 15s）。 */
   const hasActiveRun = Boolean(runView && runView.activeRun && runIsActive(runView.activeRun))
   useEffect(() => {
@@ -1242,6 +1276,8 @@ export function FlowStudioPage({
           onDelete: id => { void removeFlow(id) },
           // v0.7 §4.3：运行记录（按工作区分组）+ 只读 supervision；点击行切到抽屉里的该 run。
           runs: runRows,
+          // v0.8 §11.4：节点状态行用详情里的 nodes 把 nodeId 换成标题（拿不到就显示 nodeId）。
+          nodes: selectedRunId === '' ? null : (runNodesById[selectedRunId] || null),
           selectedRunId,
           activeRunId,
           onFocusRun: run => {

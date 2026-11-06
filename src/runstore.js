@@ -396,7 +396,51 @@ function normalizeMeta(raw, id) {
     ...(source.workspace === undefined ? {} : { workspace: normalizeBinding(source.workspace, WORKSPACE_KEYS) }),
     ...(source.worktree === undefined ? {} : { worktree: normalizeBinding(source.worktree, WORKTREE_KEYS) }),
     ...(source.supervision === undefined ? {} : { supervision: normalizeBinding(source.supervision, SUPERVISION_KEYS) }),
+    // 07 §11（R8）：节点自审上报的最新结构化状态，nodeId → 状态对象。
+    ...(source.nodeStatus === undefined ? {} : { nodeStatus: normalizeNodeStatus(source.nodeStatus) }),
   }
+}
+
+/** 节点状态表：每个节点只留最新一条，最多 200 个节点，字段逐个收敛。 */
+const NODE_STATUS_KEYS = ['state', 'progress', 'summary', 'verdict', 'at']
+const NODE_STATUS_STATES = new Set(['working', 'done', 'blocked', 'failed'])
+
+function normalizeNodeStatus(raw) {
+  if (!isPlainObject(raw)) return null
+  const out = {}
+  for (const [nodeId, value] of Object.entries(raw).slice(0, 200)) {
+    if (!isPlainObject(value)) continue
+    const entry = normalizeBinding(value, NODE_STATUS_KEYS)
+    if (!entry) continue
+    if (!NODE_STATUS_STATES.has(entry.state)) entry.state = 'working'
+    if (!Number.isInteger(entry.progress) || entry.progress < 0) entry.progress = 0
+    if (entry.progress > 100) entry.progress = 100
+    if (entry.summary !== null && entry.summary !== undefined && typeof entry.summary === 'string') {
+      entry.summary = entry.summary.length > 2000 ? entry.summary.slice(0, 2000) : entry.summary
+    } else {
+      delete entry.summary
+    }
+    if (entry.verdict !== 'pass' && entry.verdict !== 'reject') entry.verdict = null
+    // members / blockers 只在事件里留全量；run.json 只留计数，避免元数据膨胀。
+    const members = Array.isArray(value.members) ? value.members : []
+    const blockers = Array.isArray(value.blockers) ? value.blockers : []
+    entry.members = members.slice(0, 20).map(member => {
+      if (!isPlainObject(member)) return { name: '', state: 'working' }
+      const note = text2(member.note, '')
+      return {
+        name: text2(member.name, '').slice(0, 200),
+        state: NODE_STATUS_STATES.has(member.state) ? member.state : 'working',
+        ...(note !== '' ? { note: note.slice(0, 200) } : {}),
+      }
+    })
+    entry.blockers = blockers.slice(0, 20).map(item => text2(item, '').slice(0, 200)).filter(Boolean)
+    out[nodeId] = entry
+  }
+  return out
+}
+
+function text2(value, fallback) {
+  return typeof value === 'string' && value !== '' ? value : fallback
 }
 
 /** 节点会话模式（07 §3）：未知值一律 null，不猜一个看起来合理的。 */
@@ -2315,9 +2359,15 @@ export async function readRunDetail(runsRoot, runId) {
 
   for (const event of all.events) {
     if (typeof event.nodeId !== 'string' || !checkRunId(event.nodeId)) continue
-    if (!nodes.has(event.nodeId)) nodes.set(event.nodeId, { nodeId: event.nodeId, attempts: new Map(), eventCount: 0 })
+    if (!nodes.has(event.nodeId)) nodes.set(event.nodeId, { nodeId: event.nodeId, title: null, attempts: new Map(), eventCount: 0 })
     const node = nodes.get(event.nodeId)
     node.eventCount += 1
+    // 节点标题只在 node/start 的 data.title 里出现过一次；客户端要按标题展示节点状态，
+    // 这里顺手记下来（没有就保持 null，客户端回落到 nodeId）。
+    if (node.title === null && event.kind === 'node/start'
+      && event.data && typeof event.data.title === 'string' && event.data.title !== '') {
+      node.title = event.data.title.slice(0, 200)
+    }
     if (!Number.isInteger(event.attemptId)) continue
     if (!node.attempts.has(event.attemptId)) {
       node.attempts.set(event.attemptId, {
@@ -2370,6 +2420,7 @@ export async function readRunDetail(runsRoot, runId) {
       .sort((a, b) => a.nodeId.localeCompare(b.nodeId))
       .map(node => ({
         nodeId: node.nodeId,
+        title: node.title,
         eventCount: node.eventCount,
         attempts: [...node.attempts.values()].sort((a, b) => a.attemptId - b.attemptId),
       })),

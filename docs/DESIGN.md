@@ -164,11 +164,12 @@ single 即可（代价更低，但一个节点只能有一个视角）。team �
 检查器全套字段、状态栏与校验定位、流转预览、空态与异常态、撤销重做、吸附与对齐参考线、
 右键菜单、快捷键表、缩放 LOD。
 
-**0.3.0–0.7.0（运行侧）**：0.3 运行日志与指标抽屉；0.4 执行引擎（节点会话、结构化产物、打回循环、
+**0.3.0–0.8.0（运行侧）**：0.3 运行日志与指标抽屉；0.4 执行引擎（节点会话、结构化产物、打回循环、
 预算与租约）；0.5 会话内启停 + 工作流健康审计；0.6 流程收件箱 + 一个节点一个会话；
 0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision，契约见
 [07 运行模型](design/07-runtime-0.7.md)，事件与主循环仍见
-[05 运行日志](design/05-run-log.md) / [06 执行引擎](design/06-execution-engine.md)）。
+[05 运行日志](design/05-run-log.md) / [06 执行引擎](design/06-execution-engine.md)）；
+0.8 节点闹钟（每个节点主管会话的结构化自审，契约见 07 §11 / 06 §19）。
 
 **明确不做**：内嵌子画布、力导向布局、顶部 Tab 切换、任何硬编码颜色、任何 <12px 的**正文**字号
 （唯一例外是非正文徽标用 `--dsw-font-xxxs-11`，如 `↺n`、执行方式徽标、轮次「5+」）。
@@ -183,6 +184,17 @@ single 即可（代价更低，但一个节点只能有一个视角）。team �
 
 内建 supervision（`flow_start` 默认开启、HTTP 起的 run 默认关闭）是 v0.7 的第四条对外能力，
 入口与字段见 07 §7 / 06 §18。
+
+### 8.2 v0.8 的节点闹钟
+
+每个节点主管会话在 `agents.create` 成功后自动登记一个自审闹钟（默认 120s）；到点按会话状态走
+`inject` / `followup` / 冷会话 `resume`，要求节点用 `node/status` 回报
+`state / progress / summary / members / blockers / verdict`。`state=done` + 合法 `verdict` 与
+`whenIdle` 竞速、可提前完成（`node/end.extra.completedBy='self-check'`）；`blocked` 且进度不变由
+`flow_watch` 在 `recommended` 里给建议。闹钟状态只在内存、进程重启不恢复；外部 executor
+节点没有会话，不挂闹钟。Host 在 `run.json.nodeStatus` / `live.nodeStatus` / `GET /runs`
+三处下发，客户端在运行详情「节点状态」区块只读展示（标题 / 状态 / 进度 / 成员 / 阻塞）。
+契约见 07 §11 / 06 §19。
 
 ## 9. 验收口径
 

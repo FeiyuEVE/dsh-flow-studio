@@ -18,6 +18,9 @@
  *     这些调用照跑，Host 侧改动量最小。**`active` 不再提供**（并发不设上限）。
  *   - **内建 supervision**：runtime 起**唯一一个** `SupervisionScheduler`（`setInterval`
  *     用 `.unref()` 包一层，不吊住事件循环），`evaluate / wake / load / save` 全部在这里注入。
+ *   - **节点闹钟（v0.8）**：同一 runtime 里再起**唯一一个** `NodeSupervisionScheduler`
+ *     （与 run 级调度共用注入的定时器 / logger / now），`wake(entry)` 由 runtime 实现：
+ *     busy → `agent.inject`、idle → `agent.followup`、冷会话先 `agents.resume`。
  *   - **额外键直读直写**：`workspace` / `worktree` / `supervision` / `startOptions` 是 v0.7
  *     写进 `run.json` 的字段，但 `runstore.normalizeMeta()` 只保留白名单键（会丢掉它们）。
  *     本模块因此提供 `readRunExtras()` / `patchRunJson()` / `saveSupervision()`：**只**读、
@@ -39,7 +42,7 @@ import {
   listRuns, readAllEvents, readRunMeta, runsDir, writeRunMeta,
 } from './runstore.js'
 import { flowsDir, readFlow } from './store.js'
-import { SupervisionScheduler } from './supervise.js'
+import { NodeSupervisionScheduler, SupervisionScheduler } from './supervise.js'
 
 /** run.json 的权限口径与 runstore 一致（0600）。 */
 const FILE_MODE = 0o600
@@ -47,7 +50,9 @@ const FILE_MODE = 0o600
 /** runtime 自己消费、不往 Engine 透传的选项。 */
 const RUNTIME_ONLY_KEYS = new Set([
   'createEngine', 'logger', 'onSettled', 'sessionIndex', 'startedBy',
-  'auditWorkflow', 'intervalMs', 'supervisionIntervalMs', 'setInterval', 'clearInterval',
+  'auditWorkflow', 'intervalMs', 'supervisionIntervalMs',
+  'nodeSupervisionIntervalMs', 'nodeAlarmMs',
+  'setInterval', 'clearInterval',
 ])
 
 /**
@@ -215,6 +220,35 @@ export function supervisionWakePrompt(runId) {
       + '才把结论、异常点和需要主人决策的地方通知主人；',
     '③ 之后仍由内置调度按 60 / 180 秒的间隔继续唤醒你，直到这个 run 收尾为止。',
   ].join('')
+}
+
+/**
+ * 节点自审闹钟的提问词（07 v0.8 §11.2）。
+ *
+ * 与 run 级 supervision 的差别：它问的是**单个节点主管**「你这个节点现在什么状态」，
+ * 而不是「整个 run 是否正常」。要求只用 ```json 代码块回报结构化状态，方便
+ * `parseNodeStatus` / 引擎按 `state` + `verdict` 驱动流转。
+ *
+ * @param {{ runId: string, nodeId: string, attempt?: number }} entry
+ * @returns {string}
+ */
+export function nodeSelfCheckPrompt(entry = {}) {
+  const runId = typeof entry.runId === 'string' ? entry.runId : String(entry.runId ?? '')
+  const nodeId = typeof entry.nodeId === 'string' ? entry.nodeId : String(entry.nodeId ?? '')
+  const attempt = Number.isInteger(entry.attempt) ? entry.attempt : 0
+  return [
+    '【节点自审闹钟】这是流程图里的节点自审闹钟，不是新任务。',
+    `runId=${runId}，nodeId=${nodeId}，attempt=${attempt}。`,
+    '请只用 ```json 代码块回报你所在节点的状态，不要做别的事：',
+    '{"nodeId":"' + nodeId + '","attempt":' + attempt + ','
+      + '"state":"working|done|blocked|failed","progress":0,"summary":"…",'
+      + '"members":[{"name":"…","state":"working|done|blocked","note":"…"}],'
+      + '"blockers":[],"verdict":"pass|reject|null"}',
+    'state=done 且 verdict 有值表示你认为该节点已完成；不确定就写 working，不要谎报完成。',
+    // inject 会把这段问话塞进正在跑的回合：必须明确「别用状态 JSON 顶替正式交付」，
+    // 否则节点的正式结论会被状态块盖掉（引擎侧另有 parseAssistantStructured 的防御）。
+    '如果你正在做本轮任务：只把这段状态 JSON 放在答复最后，**不要**用它替代你的正式交付物与结论。',
+  ].join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +423,73 @@ export function createRuntime(options = {}) {
   // 07 §7：runtime 起来就把调度器挂上（唯一一个 interval，幂等）。
   supervision.start()
 
+  // ── 节点闹钟：每个节点主管会话的定时自审（v0.8 §11） ──────────────────
+  //
+  // 与 run 级 supervision 共用同一个 runtime / 同一份 logger / 同一个
+  // `setInterval` 注入（测试里可以一起替换成假定时器）；调度器本身只管
+  // 「什么时候叫、失败几次后停」，真正把提问送进节点会话的 `wake(entry)` 在这里实现。
+  const nodeAlarmMs = Number.isFinite(options.nodeAlarmMs) && options.nodeAlarmMs > 0
+    ? options.nodeAlarmMs
+    : undefined
+  const nodeIntervalMs = Number.isFinite(options.nodeSupervisionIntervalMs)
+    && options.nodeSupervisionIntervalMs > 0
+    ? options.nodeSupervisionIntervalMs
+    : intervalMs
+
+  /**
+   * 节点闹钟到点动作（v0.8 §11.1）：busy → inject（不新开回合）；idle → followup；
+   * 会话不在内存 → `agents.resume` 后 followup。任何拿不到会话 / 投不出去的情况
+   * 返回 `{action:'skip', reason}`，**真正的异常不在这里吞**——抛给 scheduler 计 failures。
+   */
+  async function wakeNode(entry) {
+    const ctx = options.ctx
+    const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : undefined
+    if (!agents) return { action: 'skip', reason: 'no-agents-service' }
+    let agent = typeof agents.get === 'function' ? agents.get(entry.sessionId) : null
+    if (!agent) {
+      if (typeof agents.resume !== 'function') return { action: 'skip', reason: 'no-resume' }
+      const handle = await agents.resume({ resumeSessionId: entry.sessionId })
+      agent = handle && handle.agent ? handle.agent : null
+    }
+    if (!agent) return { action: 'skip', reason: 'no-agent' }
+    const payload = buildFollowupPayload({
+      text: nodeSelfCheckPrompt(entry),
+      runId: entry.runId,
+      nodeId: entry.nodeId,
+      from: 'flow-studio',
+    })
+    const status = typeof agent.status === 'string' ? agent.status : ''
+    if (status === 'idle' && typeof agent.followup === 'function') {
+      agent.followup(payload)
+      return { action: 'followup' }
+    }
+    if (typeof agent.inject === 'function') {
+      agent.inject(payload)
+      return { action: 'inject' }
+    }
+    if (typeof agent.followup === 'function') {
+      agent.followup(payload)
+      return { action: 'followup' }
+    }
+    return { action: 'skip', reason: 'no-delivery' }
+  }
+
+  const nodeSupervision = new NodeSupervisionScheduler({
+    now,
+    log,
+    wake: wakeNode,
+    ...(nodeIntervalMs === undefined ? {} : { intervalMs: nodeIntervalMs }),
+    ...(nodeAlarmMs === undefined ? {} : { nodeAlarmMs }),
+    setInterval: typeof options.setInterval === 'function' ? options.setInterval : defaultSetInterval,
+    clearInterval: typeof options.clearInterval === 'function' ? options.clearInterval : undefined,
+  })
+
+  // 与 run 级 supervision 同时起（幂等）：engine 在 create 成功后 register，到点由这里叫。
+  nodeSupervision.start()
+
+  // engine 那一路会用它 register / unregister（v0.8 §11.1）。
+  engineDeps.nodeSupervision = nodeSupervision
+
   /** 摘掉已收尾的实例（只摘自己那一份，避免误删后来者）。 */
   function settleInstance(runId, engine) {
     if (runId !== null && runs.get(runId) !== engine) return
@@ -403,6 +504,12 @@ export function createRuntime(options = {}) {
       // 07 §7：终态立刻停调度并落盘 enabled=false（重启后也不会再唤醒已结束的 run）。
       try {
         supervision.unregister(runId)
+      } catch {
+        // 调度器状态清理失败不该影响收尾。
+      }
+      // v0.8 §11.1：run 收尾后不再叫醒这个 run 的任何节点会话。
+      try {
+        nodeSupervision.unregisterRun(runId)
       } catch {
         // 调度器状态清理失败不该影响收尾。
       }
@@ -436,6 +543,8 @@ export function createRuntime(options = {}) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
     // 07 §5：唯一 409 就是「同一个 runId 已在跑」。
     if (runs.has(runId)) throw new EngineError(409, `同一 run 已在运行（${runId}）`)
+    // v0.8 §11：节点闹钟随 runtime 起（幂等；engine 在 create 成功后自行 register）。
+    nodeSupervision.start()
     const engine = newEngine(runId)
     runs.set(runId, engine)
     try {
@@ -580,12 +689,17 @@ export function createRuntime(options = {}) {
     return { runId, enabled: false, supervision: saved, scheduler: supervision.status(runId) }
   }
 
-  /** 07 §7：停止调度并释放所有实例（插件卸载 / 测试收尾）。 */
+  /** 07 §7 / v0.8 §11：停止调度并释放所有实例（插件卸载 / 测试收尾）。 */
   function dispose() {
     try {
       supervision.stop()
     } catch {
       // 停止定时器失败不该影响卸载。
+    }
+    try {
+      nodeSupervision.stop()
+    } catch {
+      // 停止节点闹钟失败不该影响卸载。
     }
     for (const engine of [...runs.values()]) {
       try {
@@ -654,6 +768,9 @@ export function createRuntime(options = {}) {
     startedBy,
     supervision,
     supervisionReady,
+    nodeSupervision,
+    /** v0.8 §11.1：节点闹钟到点动作（调度器注入的同一实现；导出便于测试 / 诊断）。 */
+    wake: wakeNode,
     enableSupervision,
     dispose,
     // ── Engine 门面：`env.engine = runtime` 后旧调用照跑 ──────────────────

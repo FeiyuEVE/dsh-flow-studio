@@ -77,6 +77,11 @@ export const EVENT_KINDS = [
   'reject/trigger',
   'review/finding', 'review/verdict',
   'check/form',
+  // v1.1 / v1.6 / v0.8 追加的 kind 之前漏登记，事件列表里一直显示「未识别」。
+  'acceptance/verdict',
+  'test/report',
+  'message/in', 'message/out',
+  'node/status',
 ]
 
 const STATUS_TEXT = {
@@ -1110,6 +1115,36 @@ export function eventSummary(event) {
       if (data.state) parts.push(text(data.state))
       if (data.totalChecks !== undefined) parts.push(num(data.passedChecks) + '/' + num(data.totalChecks))
       break
+    case 'acceptance/verdict':
+      parts.push(text(data.itemId, '验收项') + ' ' + text(data.status, '?'))
+      if (data.decidedBy) parts.push(data.decidedBy === 'human' ? '人工判定' : '自判')
+      break
+    case 'test/report':
+      parts.push(text(data.suite, '测试'))
+      if (data.executed !== undefined) {
+        parts.push(num(data.passed) + '/' + num(data.executed))
+      }
+      if (data.failed) parts.push(num(data.failed) + ' 失败')
+      break
+    case 'message/in':
+      parts.push('来自 ' + text(data.from, '外部'))
+      if (data.targetNodeId) parts.push('→ ' + text(data.targetNodeId))
+      if (data.text) parts.push(text(data.text))
+      break
+    case 'message/out':
+      parts.push('回复')
+      if (data.text) parts.push(text(data.text))
+      break
+    case 'node/status': {
+      parts.push(text(data.state, '?'))
+      if (data.progress !== undefined) parts.push(num(data.progress) + '%')
+      if (data.verdict) parts.push('结论 ' + text(data.verdict))
+      if (Array.isArray(data.blockers) && data.blockers.length > 0) {
+        parts.push('阻塞 ' + num(data.blockers.length) + ' 条')
+      }
+      if (data.summary) parts.push(text(data.summary))
+      break
+    }
     default:
       return '未识别事件类型' + (event.kind ? '（' + text(event.kind) + '）' : '')
   }

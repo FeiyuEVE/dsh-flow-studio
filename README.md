@@ -1,6 +1,6 @@
 # dsh-flow-studio
 
-**当前版本：0.7.0**
+**当前版本：0.8.0**
 
 > DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 端用画布拖拽节点，把一条研发流水线画出来，
 > 每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来，
@@ -87,6 +87,12 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
   pending 30s），到点自动唤醒发起会话；连续 3 次唤醒失败降级关闭。HTTP 起的 run 默认不开，
   可用 `flow_supervise` 或 `POST /runs/<id>/supervision` 打开。
 
+**0.8.0 给每个节点主管会话加了自审闹钟**（[07 §11](docs/design/07-runtime-0.7.md) /
+[06 §19](docs/design/06-execution-engine.md)）：建会话即登记、attempt 结束注销，到点让节点用
+结构化 `node/status` 回报状态；`state=done` + 合法 verdict 可与 `whenIdle` 竞速提前完成，
+`blocked` 且进度不变会在 `flow_watch` 里给建议。闹钟状态只在内存，进程重启不恢复；
+外部 executor 节点没有会话，不挂闹钟。
+
 ## 在会话里开流程，让主 agent 自己盯着
 
 不用先去画布点运行：在任意会话里让主 agent 直接开跑，它自己定时醒来自查「整条流水线是否正常运转」。
@@ -166,6 +172,11 @@ POST /api/flow-studio/runs/<runId>/messages
   建失败如实写 `enabled:false`。
 - **内建 supervision**：`flow_start` 起的 run 默认由 runtime 定时唤醒发起会话复查，不用外部插件，
   也不用自己挂闹钟；连续 3 次唤醒失败自动降级。
+- **每个节点主管会话都有自审闹钟**：`agents.create` 成功后自动登记（默认 120s 一次），到点按会话
+  状态走 `inject` / `followup` / `resume`，要求节点用 json 代码块回报
+  `state / progress / summary / members / blockers / verdict`；`state=done` + 合法 verdict 可与
+  `whenIdle` 竞速提前收口（`node/end.extra.completedBy='self-check'`），连续 3 次投递失败自动停摆。
+  外部 executor 节点没有会话，不挂闹钟。
 - **打回是图的一部分，不是例外**：一条打回线指向任意上游节点，自动构成循环；每个节点可单独设打回上限。
 - **模板存在本机**：`$DSH_HOME/flow-studio/flows/<id>.json`，换浏览器、换设备都还在。
 
@@ -254,13 +265,13 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
 | GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
-| GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` |
+| GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` / `nodeStatus` |
 | POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；同一 runId 已在跑 → 409；流程非法 → 400） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
-| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision）/ 删除整个 run（租约持有中 → 409） |
+| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision / nodeStatus）/ 删除整个 run（租约持有中 → 409） |
 | GET/POST | `/runs/<runId>/supervision` | 读 `run.json.supervision` + 调度器状态 / 开或关内建 supervision（`{enabled, wakerSessionId?}`；对已收尾 run 开启 → 400） |
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验） |
-| GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论） |
+| GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论）+ `nodeStatus` |
 | GET | `/runs/<runId>/export` | 导出 markdown |
 
 **鉴权与 `/api` 同口径**：插件路由虽然绕过了 webserver 的 `/api` 通用鉴权（最长前缀优先），
@@ -274,8 +285,8 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 19 个自检文件，共 491 组（其中 7 个套件显式计数，合计 1483 条断言）
-node test/render.test.mjs   # SSR + 构建产物加载，65 组
+npm test           # 19 个自检文件，共 540 组（其中 7 个套件显式计数，合计 1845 条断言）
+node test/render.test.mjs   # SSR + 构建产物加载，70 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
@@ -285,22 +296,31 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。
 - `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）；
   v0.7 组覆盖保存宽松（空流程 / executor 非法也 200 + validation）、`?workspaceId=` 过滤、
-  `POST /runs/<id>/supervision` 的 400/404/enable/disable 与已收尾 run 拒绝开启。
-- `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）。
-- `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器。
+  `POST /runs/<id>/supervision` 的 400/404/enable/disable 与已收尾 run 拒绝开启；
+  v0.8 组覆盖 `GET /runs` 列表行 / 详情 / summary 三处 `nodeStatus`（缺省 `{}`）。
+- `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）；
+  v0.8 组覆盖 `node/status` 通过校验、可选字段收敛、成员 / 阻塞项有界与坏输入拒绝。
+- `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器；
+  `nodeStatus` 的写入 / 归一化由 host 组经真实写路径间接覆盖（本文件暂无独立用例）。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
 - `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、
   预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门；
-  v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）。
+  v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）；
+  v0.8 组覆盖节点闹钟：建会话即登记、attempt 结束注销先于 run 收尾、打回重跑重新登记、`node/status`
+  三处可见、`done+verdict` 提前完成（`completedBy:'self-check'`）、非法 verdict 不提前完成、
+  未注入调度器时退回 v0.7、外部 executor 不登记。
 - `test/worktree.test.mjs` —— 工作区与 worktree：`workspaceIdFor` 稳定、真 git 仓库根 / 子目录 / 非 git 的区分、
   `git` 不可用与「不是仓库」分开、`auto/on/off` 决策、分支冲突 `-2`、真 worktree 落盘、脏 worktree 删除校验与路径越界拒绝。
 - `test/executor.test.mjs` —— 外部 executor：三档归一化与 `EXECUTOR_INVALID`、codex argv 顺序、strict schema 转换、JSONL 的
   final / usage / 过程 / 未知事件、custom 占位符与 shell 转义、超时 / abort / 非 0 退出 / spawn 失败、
   跨 chunk 半行、真 node 子进程端到端；**不依赖真 codex、不联网**。
 - `test/runtime.test.mjs` —— 进程级注册表：两个 runId 并发跑通、同 runId 二次 start 409、失败实例摘除、
-  sessionIndex 跨实例共享、`sweep` 崩溃残留、`createEngine/new Engine` 旧用法兼容、supervision 接线与收尾落盘。
+  sessionIndex 跨实例共享、`sweep` 崩溃残留、`createEngine/new Engine` 旧用法兼容、supervision 接线与收尾落盘；
+  v0.8 组覆盖 `wake` 的 idle→followup / busy→inject / 拿不到→skip、提示词、收尾 `unregisterRun` 与 `dispose` 停表。
 - `test/supervise.test.mjs` —— 内建 supervision：`planWake` 五档间隔、到点只唤醒一次、失败 3 次降级 /
-  成功清零 / 重启恢复 / 终态摘除 / 坏日期不抛错 / tick 重入保护。
+  成功清零 / 重启恢复 / 终态摘除 / 坏日期不抛错 / tick 重入保护；v0.8 节点闹钟组覆盖
+  `parseNodeStatus` 的围栏 / 裸 JSON / 默认值 / 大小写 / 取整 / 上限，`NodeSupervisionScheduler`
+  的 120s 默认间隔、`skip` 推进但不计 `wakes`、连续 3 次失败停摆、刷新与三种注销。
 - `test/client-perf.test.mjs` —— 客户端性能回归：拖动中 0 次提交 / 松手恰好 1 次、锁定不提交、
   节点与边是 `React.memo` 且相同输入复用同一对象、草稿去抖（5 次变更只写 1 次、maxWait 必落、隐藏立即 flush）。
 - `test/logdrawer.test.mjs` —— 运行详情：抽屉三档与全屏类、Esc 逐档还原、节点面板四类实时字段、
@@ -309,21 +329,25 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
   no-progress / done / failed / aborted 九种裁决，以及打回后重跑不误判偏航、坏输入不抛错。
 - `test/tools.test.mjs` —— 会话内启停的五个基础模型工具：按 id/名字启动、同名多份列候选、结构不合法不建 run、
   `options.parent === exec.agent`（绑定发起会话与工作区）、flow_start 自动开启 supervision / 失败回退、
-  flow_supervise 开关、flow_watch 走真实审计、flow_stop 业务态、输出 lossless、无 tools 服务时不炸。
+  flow_supervise 开关、flow_watch 走真实审计、flow_stop 业务态、输出 lossless、无 tools 服务时不炸；
+  v0.8 组覆盖 `flow_watch.nodeStatus` 与 `blocked` + 连续两次进度不变的 `recommended` 提示。
 - `test/inbox.test.mjs` —— 流程收件箱与节点会话复用：`message/in`/`message/out` 事件与有界截断、messages.jsonl
   追加与分页、目标节点三路解析、活/冷会话注入、未开始当启动输入、排队与推进时并进提示词、下游可见且有界、
   `flow_reply` 三种回复通道、`flow_send_message` 省略 runId、HTTP 401/400/200、二次激活只起一次会话、
   sessions.json 容错、run 收尾 dispose、无 agents 服务退化。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
   `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点；
-  运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言。
+  运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言；
+  v0.8 组覆盖运行详情「节点状态」区块（标题 / 状态徽标 / 进度条 / verdict / members / blockers /
+  坏数据降级 / 超过 6 个节点内部滚动）。
 
 > SSR 只跑首次渲染，不跑 `useEffect`，也不测拖拽 / 缩放这些交互。**这不等于浏览器验证。**
 
 ## 路线图
 
 已交付：0.3 运行日志与指标、0.4 执行引擎、0.5 会话内启停与健康审计、0.6 流程收件箱、
-0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision）。
+0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision）、
+0.8 节点闹钟（每个节点主管会话的结构化自审与提前完成信号）。
 
 未排期：
 
@@ -354,6 +378,22 @@ v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：sessio
 `removeWorktree()`：先校验路径必须落在 `<root>/<workspaceId>/` 下，再执行
 `git -C <workspace> worktree remove [--force] <path>`；目前没有 HTTP / 模型工具入口。
 `auto` 策略下建失败会如实写 `enabled:false, reason:'create-failed: …'`，不会假装已隔离。
+
+### 节点闹钟和 run 级 supervision 有什么区别？
+
+| | run 级 supervision | 节点闹钟 |
+|---|---|---|
+| 叫醒谁 | 发起这个 run 的会话（`wakerSessionId`） | 单个节点主管会话（`sessionId`） |
+| 问什么 | 「整个 run 是否正常运转」，要求调 `flow_watch` | 「你这个节点现在什么状态」，要求结构化回报 |
+| 回报落在哪 | `run.json.supervision` | `node/status` 事件 + `run.json.nodeStatus` + `live.nodeStatus` |
+| 节奏 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 120s 一次（每 15s 扫到点） |
+| 什么时候停 | run 收尾 / 连续 3 次唤醒失败 | attempt 结束就注销；run 收尾再 `unregisterRun` |
+| 连续 3 次失败 | 关闭调度并写 `wake-failed` | 停摆（`enabled:false`），条目仍可查 |
+
+两个调度器都在 `createRuntime()` 里创建，但各自一个 `setInterval`、各自一份状态，**不是同一个 tick**。
+节点闹钟只在内存，进程重启不恢复；外部 executor 节点没有会话，不挂闹钟。
+自审说 `done` 只是「提前完成信号」，会与 `whenIdle` 竞速（采用时 `node/end.extra.completedBy='self-check'`），
+**不能**替代结构化 verdict 的合法性检查。
 
 ## 先搜现成的（按 `PLUGIN-SEARCH.md`）
 

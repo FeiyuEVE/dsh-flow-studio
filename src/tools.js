@@ -58,6 +58,65 @@ const DEFAULT_MAX_REJECTS_PER_EDGE = 3
 /** 终态 verdict：到这三个就不必再挂闹钟。 */
 const TERMINAL_VERDICTS = new Set(['done', 'failed', 'aborted'])
 
+// ── v0.8 §11：节点自审状态（flow_watch / recommended） ────────────────────
+
+/** run.json.nodeStatus 的宽松读取：缺省 / 坏形状一律 `{}`。 */
+function nodeStatusOfRun(run) {
+  const value = run && run.nodeStatus
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+/** progress 收敛成数字（缺失 / 坏值按 0，与 parseNodeStatus 的默认值一致）。 */
+function progressOf(value) {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : 0
+}
+
+/**
+ * v0.8 §11.3：`state==='blocked'` 且连续两次自审的 `progress` 不变 → 给一句 recommended。
+ *
+ * 「上一次」取事件流里同一节点最近两条 `node/status`（事件是追加的，run.json 只留最新），
+ * 因此不依赖内存状态、重启后照样能判。只有 run.json 的最新进度与事件最新一条一致时才报，
+ * 避免事件与快照不同步时误报。
+ *
+ * @param {object} nodeStatus run.json.nodeStatus
+ * @param {Array<object>} events 该 run 的全量事件（升序）
+ * @returns {string[]}
+ */
+function blockedNodeAdvice(nodeStatus, events) {
+  const advice = []
+  const list = Array.isArray(events) ? events : []
+  for (const [nodeId, entry] of Object.entries(nodeStatus || {})) {
+    if (!entry || entry.state !== 'blocked') continue
+    const reports = []
+    for (let index = list.length - 1; index >= 0 && reports.length < 2; index -= 1) {
+      const event = list[index]
+      if (!event || event.kind !== 'node/status' || event.nodeId !== nodeId) continue
+      reports.push(event)
+    }
+    if (reports.length < 2) continue
+    const latestProgress = progressOf(reports[0].data && reports[0].data.progress)
+    const previousProgress = progressOf(reports[1].data && reports[1].data.progress)
+    if (latestProgress !== previousProgress) continue
+    if (progressOf(entry.progress) !== latestProgress) continue
+    advice.push(`节点 ${nodeId} 报告 blocked 且无进展，建议先看它卡在哪。`)
+  }
+  return advice
+}
+
+/** 把节点建议并进审计给的 recommended（保持原有类型：数组追加 / 字符串续写）。 */
+function withRecommendations(recommended, advice) {
+  if (advice.length === 0) return recommended
+  if (Array.isArray(recommended)) return [...recommended, ...advice]
+  if (typeof recommended === 'string' && recommended.trim() !== '') {
+    return `${recommended}；${advice.join('；')}`
+  }
+  if (recommended && typeof recommended === 'object') {
+    return { ...recommended, nodeStatus: advice }
+  }
+  return advice
+}
+
 // ── JSON Schema 小工具 ─────────────────────────────────────────────────────
 
 /** 声明「可空」：可能为 null 的字段必须这么写，否则注册表逐值校验会拒绝。 */
@@ -862,6 +921,11 @@ export function createFlowTools(deps) {
         tokens: anyJson('用量摘要（对象；审计模块原样返回）'),
         idleMs: nullable({ type: 'integer' }, '距最近一次事件的毫秒数'),
         recommended: anyJson('建议动作（只报告，是否执行由模型决定）'),
+        nodeStatus: anyJson(
+          '各节点最新自审状态（nodeId → {state, progress, summary, verdict, members, blockers, at}；'
+          + '来自 run.json.nodeStatus，缺省为空对象 {}。state=blocked 且连续两次 progress 不变时，'
+          + 'recommended 里会多一句提示）',
+        ),
         supervision: {
           type: 'object',
           description: '定时自审信号：运行中给间隔与闹钟提示词，终态给 null 与「不必再挂」说明',
@@ -961,11 +1025,17 @@ export function createFlowTools(deps) {
             ? terminalPrompt(runId, verdict, typeof audited.headline === 'string' ? audited.headline : '')
             : watchAlarmPrompt(runId, detail.run.flowName, nextCheckSeconds)
 
+          // v0.8 §11.4：节点最新自审状态直接读 run.json；blocked 且进度不变时补一条建议。
+          const nodeStatus = nodeStatusOfRun(detail.run)
+          const nodeAdvice = blockedNodeAdvice(nodeStatus, all.events)
+
           return jsonSafe({
             ...audited,
+            recommended: withRecommendations(audited.recommended, nodeAdvice),
             ok: true,
             runId,
             flowId: detail.run.flowId,
+            nodeStatus,
             supervision: {
               nextCheckSeconds,
               alarmPrompt,

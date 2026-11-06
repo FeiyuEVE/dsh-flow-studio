@@ -37,6 +37,10 @@ import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 import { createWorktree, decideWorktree, resolveWorkspace, workspaceIdFor } from './worktree.js'
 // 07 §6（R6）：外部 executor（codex / custom）的运行与事件归一化。
 import { normalizeExecutor, runExternalExecutor, toStrictOutputSchema } from './executor.js'
+// 07 §11（R8）：节点自审回报解析。用命名空间导入而不是命名导入——v0.8 的
+// `parseNodeStatus` 与引擎改动并行落地，命名导入在对方尚未写完时会让本模块
+// 直接 import 失败；拿不到时下面按「没有自审回报」处理，引擎行为与 v0.7 一致。
+import * as superviseModule from './supervise.js'
 import {
   RunError, appendEvents, readAllEvents, readRunMeta, runsDir, writeRunMeta,
 } from './runstore.js'
@@ -176,6 +180,19 @@ function normalizeWorktreeRecord(saved) {
 
 function intOr(value, fallback = 0) {
   return Number.isInteger(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * 键序无关的 JSON 序列化（只用于「内容是否一致」比较）。
+ * runstore 的 normalizeMeta 会按自己的键序重写 nodeStatus，逐字符比较会每次都判不等。
+ */
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 function clip(value, max) {
@@ -1222,28 +1239,58 @@ function extractStructured(raw) {
 }
 
 /**
+ * 07 §11.1：自审状态块的状态枚举。用于把「自审回报」从「节点结构化结论」里排除：
+ * runtime 的 wakeNode 在会话 busy 时走 `agent.inject`，模型收尾时很可能直接回一段
+ * 状态 JSON（verdict 常为 null / 缺失）；它绝不能充当节点结论。
+ */
+const NODE_SELF_CHECK_STATES = new Set(['working', 'done', 'blocked', 'failed'])
+
+/** 是否是一段自审状态块（有合法 state、但 verdict 不是 pass/reject）。 */
+function isNodeSelfCheckBlock(value) {
+  if (!isPlainObject(value)) return false
+  if (!NODE_SELF_CHECK_STATES.has(value.state)) return false
+  return value.verdict !== 'pass' && value.verdict !== 'reject'
+}
+
+/**
  * 06 §16：从复用会话的 assistant 原文里解析结构化输出。
  * 兼容：纯 JSON / Markdown 代码块包裹 / JSON 前后夹带解释文字。
+ *
+ * 07 §11.3：同一条消息里可能同时有 `node/status` 块与结构化的 verdict 块
+ * （自审回报 + 正式输出），所以不再只取第一个围栏，而是**优先返回带
+ * verdict=pass/reject 的对象**。
+ *
+ * 防御（07 §11.1）：自审状态块（`state ∈ working|done|blocked|failed` 且
+ * verdict 不是 pass/reject）既不是结论，也不当 fallback——它被 inject 进正在
+ * 跑的回合时，把它当结论会让 normalizeStructured 以「缺少 verdict」白失败一趟。
+ * 只有都不是状态块时才退回第一个可解析对象（旧行为，交给 normalizeStructured
+ * 报「缺少 verdict」）。
  * @returns {object | null}
  */
 export function parseAssistantStructured(raw) {
   if (typeof raw !== 'string' || raw.trim() === '') return null
   const text = raw.trim()
   const candidates = [text]
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text)
-  if (fenced) candidates.push(fenced[1].trim())
+  const fences = /```(?:json)?\s*([\s\S]*?)```/gi
+  let fenced
+  while ((fenced = fences.exec(text)) !== null) candidates.push(fenced[1].trim())
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
   if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1))
+  let fallback = null
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate)
-      if (isPlainObject(parsed)) return parsed
+      if (!isPlainObject(parsed)) continue
+      if (parsed.verdict === 'pass' || parsed.verdict === 'reject') return parsed
+      // 自审状态块不能当节点结论，也不能当 fallback。
+      if (isNodeSelfCheckBlock(parsed)) continue
+      if (fallback === null) fallback = parsed
     } catch {
       // 换下一个候选。
     }
   }
-  return null
+  return fallback
 }
 
 /** 把宿主的 TokenUsage 映射成 05 §3 的四桶；reasoning 仅在 ≤ output 时带上。 */
@@ -1384,6 +1431,11 @@ class FlowEngine {
       : null
     // 07 §5：由 runtime 创建时，run 收尾回调 runtime 把实例从注册表摘掉（不轮询）。
     this.onSettled = typeof options.onSettled === 'function' ? options.onSettled : null
+    // 07 §11（R8）：节点闹钟调度器由 runtime 注入；不注入时整条链路关闭，
+    // 引擎行为与 v0.7 完全一致（既有测试靠这一点保持绿）。
+    this.nodeSupervision = options.nodeSupervision && typeof options.nodeSupervision === 'object'
+      ? options.nodeSupervision
+      : null
     // 06 §15：per-start 父会话覆盖（模型工具 flow_start 传当前会话的 Agent）。
     // 只活在一次 run 的生命周期内，_cleanupActive() 清掉，避免影响下一次 start。
     // R2 起默认路径不再把它传给 agents.create（那是领养关系，不是所有权）。
@@ -1429,6 +1481,11 @@ class FlowEngine {
     // 06 §13.7：本 run 已落盘的产物索引（path → { nodeId, attemptId, sha256 }），
     // 校验模型给的 evidenceRef / reportRef 是否真的对应一条 artifact/write。
     this.artifactIndex = new Map()
+    // 07 §11（R8）：nodeId → 最新自审状态（{state, progress, summary, members, blockers, verdict, at}）。
+    // 事件是追加（历史可查），这里只留每个节点最新一条；随 live / run.json 一起可见。
+    this.nodeStatus = new Map()
+    // 07 §11.3：sessionId → 当前 attempt 的「提前完成信号」deferred（自审 done+verdict 时 resolve）。
+    this.selfChecks = new Map()
     // 06 §16 / 07 §3.3：节点会话复用。
     //   nodeSessions     nodeId → { sessionId, handle, agent, createdAt, lastUsedAt, attempt }（本次 run 内）
     //   disposalHandles  本次 run 里所有会话句柄（只有 dispose，run 结束/停止时统一释放）
@@ -1714,37 +1771,240 @@ class FlowEngine {
   }
 
   /**
+   * 07 §11（R8）：解析节点自审回报。`parseNodeStatus` 是纯函数且承诺不抛错，
+   * 这里再兜一层：并行落地期间拿不到导出 / 意外异常一律按「没有回报」处理。
+   */
+  _parseNodeStatus(text) {
+    const parse = superviseModule.parseNodeStatus
+    if (typeof parse !== 'function') return null
+    if (typeof text !== 'string' || text.trim() === '') return null
+    // 07 §11.2：**只认真正的状态报告**。节点正常回合的结构化结论（`{verdict, summary, ...}`）
+    // 也是 JSON，若不设门槛会被记成一条 state=working/progress=0 的假状态，还会覆盖该节点
+    // 上一次真实上报。所以要求原文里至少出现一个状态专有字段。
+    if (!/"(?:state|progress|members|blockers)"\s*:/.test(text)) return null
+    try {
+      return parse(text)
+    } catch {
+      return null
+    }
+  }
+
+  /** nodeStatus Map → 普通对象（run.json / live 用；插入顺序稳定）。 */
+  _nodeStatusSnapshot() {
+    const out = {}
+    if (!(this.nodeStatus instanceof Map)) return out
+    for (const [nodeId, entry] of this.nodeStatus) out[nodeId] = entry
+    return out
+  }
+
+  /**
+   * 07 §11.2：一条自审回报落三处——
+   *   1) `node/status` 事件（追加，历史可查）；
+   *   2) `this.nodeStatus`（覆盖，只留最新）+ `live.nodeStatus`；
+   *   3) run.json.nodeStatus（由 `_patchRunBinding` 随 live 刷新补写）。
+   * 同一节点只留最新一条，节点数上限 200（超出按 LRU 淘汰最早登记的节点）。
+   */
+  _rememberNodeStatus(binding, parsed) {
+    if (!this.nodeSupervision || !this.active || !binding) return
+    const runId = this.active.runId
+    const nodeId = binding.nodeId
+    const nowIso = isoOf(this.now())
+    const entry = {
+      state: parsed.state,
+      progress: parsed.progress,
+      summary: parsed.summary,
+      // 与 runstore.normalizeNodeStatus 同一口径：name/state 必留，note 有就带上（≤200）。
+      members: Array.isArray(parsed.members)
+        ? parsed.members.map(member => {
+          const out = { name: member.name, state: member.state }
+          const note = typeof member.note === 'string' ? member.note.trim() : ''
+          if (note !== '') out.note = note.slice(0, 200)
+          return out
+        })
+        : [],
+      blockers: Array.isArray(parsed.blockers) ? [...parsed.blockers] : [],
+      verdict: parsed.verdict,
+      at: nowIso,
+    }
+    this.nodeStatus.delete(nodeId)
+    if (this.nodeStatus.size >= 200) {
+      const oldest = this.nodeStatus.keys().next().value
+      if (oldest !== undefined) this.nodeStatus.delete(oldest)
+    }
+    this.nodeStatus.set(nodeId, entry)
+    // live 是同步快照；即使事件写入排队，前端下一次轮询也能立刻看到。
+    if (this.live) this.live.nodeStatus = this._nodeStatusSnapshot()
+
+    // 07 §11.3：自审说 done 且 verdict 合法 → 给当前 attempt 的 whenIdle 竞速发信号。
+    const armed = this.selfChecks.get(binding.sessionId)
+    if (armed && armed.attemptId === binding.attemptId
+      && entry.state === 'done' && (entry.verdict === 'pass' || entry.verdict === 'reject')) {
+      armed.resolve(entry)
+    }
+
+    // 事件按会话事件队列串行写入；写入时 run 已收尾就跳过（不把记录写进别的 run）。
+    this._queueSessionWrite(async () => {
+      if (!this.active || this.active.runId !== runId) return
+      // data.nodeId / data.attempt 是模型自报的，可能非法（runlog 会整条拒绝）；
+      // 权威归属在事件顶层，这里只保留合法值，别让一条坏字段吞掉整条状态。
+      const data = { ...parsed, source: 'self-check' }
+      if (typeof data.nodeId !== 'string' || !checkRunId(data.nodeId)) delete data.nodeId
+      if (!Number.isInteger(data.attempt) || data.attempt < 1) delete data.attempt
+      await this._append(runId, [{
+        kind: 'node/status',
+        nodeId,
+        attemptId: binding.attemptId,
+        traceId: binding.traceId,
+        data,
+      }])
+    })
+  }
+
+  /** 07 §11.3：给当前 attempt 挂一个「自审提前完成」信号（不含 whenIdle）。 */
+  _armSelfCheck(sessionId, { attemptId }) {
+    // 不注入 nodeSupervision = v0.7 行为（不登记、不竞速、不写 nodeStatus）。
+    if (!this.nodeSupervision) return null
+    let resolveFn = null
+    const promise = new Promise(resolve => {
+      resolveFn = resolve
+    })
+    const record = {
+      sessionId,
+      attemptId,
+      settled: false,
+      promise,
+      resolve(value) {
+        if (record.settled) return
+        record.settled = true
+        resolveFn(value)
+      },
+    }
+    this.selfChecks.set(sessionId, record)
+    return record
+  }
+
+  /** 只清自己挂的那个信号（复用会话时可能已换成下一次 attempt 的）。 */
+  _disarmSelfCheck(sessionId, record) {
+    if (!record) return
+    if (this.selfChecks.get(sessionId) === record) this.selfChecks.delete(sessionId)
+  }
+
+  /** 07 §11.1：节点主管会话创建 / 复用成功后登记闹钟（失败只 warn，不影响执行）。 */
+  _registerNodeSupervision(runId, node, attempt, sessionId) {
+    const scheduler = this.nodeSupervision
+    if (!scheduler || typeof scheduler.register !== 'function') return
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    try {
+      scheduler.register({ runId, nodeId: node.id, sessionId, attempt })
+    } catch (error) {
+      this.log('warn', `flow-studio: 登记节点闹钟失败（${node.id} / ${sessionId}）：${error.message}`)
+    }
+  }
+
+  /** 注销一个 attempt 的闹钟。未登记 / 空 id / 调度器抛错都按幂等处理。 */
+  _unregisterNodeSupervision(sessionId) {
+    const scheduler = this.nodeSupervision
+    if (!scheduler || typeof scheduler.unregister !== 'function') return false
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    try {
+      return scheduler.unregister(sessionId)
+    } catch (error) {
+      this.log('warn', `flow-studio: 注销节点闹钟失败（${sessionId}）：${error.message}`)
+      return false
+    }
+  }
+
+  /** run 收尾：摘掉这个 run 的全部节点闹钟（未登记 / 抛错都安全）。 */
+  _unregisterRunSupervision(runId) {
+    const scheduler = this.nodeSupervision
+    if (!scheduler || typeof scheduler.unregisterRun !== 'function') return 0
+    if (typeof runId !== 'string' || runId === '') return 0
+    try {
+      return scheduler.unregisterRun(runId)
+    } catch (error) {
+      this.log('warn', `flow-studio: 注销 run 节点闹钟失败（${runId}）：${error.message}`)
+      return 0
+    }
+  }
+
+  /**
    * 向一个节点会话投一轮提示词，然后从该会话最后一条 assistant 消息里解析结构化输出。
    *
    * 07 §3.1：新建（agents.create）与复用（followup）是**同一段协议**——都靠
    * `buildFollowupPayload` 投递、`whenIdle()` 等空闲、`parseAssistantStructured`
    * 解析。解析失败抛 StructuredOutputError（走既有「结构化输出不合格」失败路径）。
+   *
+   * 07 §11.3（R8）：等待期间若自审回报 `state==='done'` 且 `verdict` 合法，与
+   * `whenIdle()` 竞速；自审先到就用它的 verdict 提前收口。**原 whenIdle 继续在
+   * 后台等完**（不阻塞主流程），避免留下悬挂回合；回合先到则完全走既有解析。
    */
   async _promptNodeSession({ agent, sessionId, prompt, runId, node, attempt, traceId, signal }) {
     // 清掉上一条 assistant 文本，避免把上一轮的结果误当成本轮输出。
     this.lastAssistantBySession.delete(sessionId)
     // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
     this.bindSession(sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId }, { rebind: true })
-    agent.followup(buildFollowupPayload({
-      text: prompt,
-      runId,
-      nodeId: node.id,
-      from: 'flow-studio',
-    }))
-    if (typeof agent.whenIdle === 'function') {
-      const idle = agent.whenIdle()
-      if (idle && typeof idle.then === 'function') await raceAbort(idle, signal)
-    }
-    // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
-    await new Promise(resolve => setTimeout(resolve, 0))
-    const raw = this.lastAssistantBySession.get(sessionId)
-    const structured = parseAssistantStructured(raw)
-    if (!structured) {
-      throw new StructuredOutputError(
-        `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的 JSON（需要与输出格式相同的结构）`,
+    // 先挂信号再 followup：注入式宿主可能同步把自审回报喂进 handleSessionEvent。
+    const selfCheck = this._armSelfCheck(sessionId, { attemptId: attempt })
+    try {
+      agent.followup(buildFollowupPayload({
+        text: prompt,
+        runId,
+        nodeId: node.id,
+        from: 'flow-studio',
+      }))
+      const idle = typeof agent.whenIdle === 'function' ? agent.whenIdle() : null
+      const idlePromise = idle && typeof idle.then === 'function' ? Promise.resolve(idle) : Promise.resolve()
+      // 观察 idle 的结果（不吞错误：错误另存，正常路径仍按原语义抛出去）。
+      let idleError = null
+      const idleObserved = idlePromise.then(
+        () => null,
+        error => {
+          idleError = error
+          return null
+        },
       )
+      // race 的结果：自审状态对象 = 自审先到；null = 回合先到（whenIdle 已结束）。
+      // 没有注入 nodeSupervision 时不挂自审信号，完全保持 v0.7 的 whenIdle 语义。
+      const winner = selfCheck
+        ? await raceAbort(Promise.race([selfCheck.promise, idleObserved]), signal)
+        : null
+      if (winner && typeof winner === 'object') {
+        // 自审提前完成：继续等原 whenIdle，但不再阻塞主流程；失败只 warn。
+        idleObserved.then(() => {
+          if (idleError) {
+            this.log('warn', `flow-studio: 自审提前完成后 whenIdle 失败（${sessionId}）：${idleError.message}`)
+          }
+        })
+        const structured = {
+          verdict: winner.verdict,
+          summary: typeof winner.summary === 'string' ? winner.summary : '',
+        }
+        // 真实代价（有意简化）：自审提前完成只带回 verdict / summary，节点自己的
+        // artifacts / findings / tests / checks / acceptance 拿不到；指标会偏少，不能
+        // 当成与「正常回合跑完」等价的证据。要走完整证据就等回合结束。
+        // 走既有打回路径：normalizeStructured 要求 reject 必须带 rejectReason。
+        if (structured.verdict === 'reject') {
+          structured.rejectReason = structured.summary.trim() !== ''
+            ? structured.summary
+            : '自审回报判定打回（self-check）'
+        }
+        return { structured, completedBy: 'self-check' }
+      }
+      // 回合先到（或没有自审信号）：保持既有语义，先等 whenIdle 再解析。
+      await raceAbort(idlePromise, signal)
+      // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const raw = this.lastAssistantBySession.get(sessionId)
+      const structured = parseAssistantStructured(raw)
+      if (!structured) {
+        throw new StructuredOutputError(
+          `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的 JSON（需要与输出格式相同的结构）`,
+        )
+      }
+      return { structured, completedBy: null }
+    } finally {
+      this._disarmSelfCheck(sessionId, selfCheck)
     }
-    return structured
   }
 
   /**
@@ -1775,10 +2035,25 @@ class FlowEngine {
     if (!agent || typeof agent.followup !== 'function') {
       throw new EngineError(503, `节点「${node.id}」的会话 ${sessionId} 无法接收消息（没有 followup）`)
     }
-    const structured = await this._promptNodeSession({
-      agent, sessionId, prompt, runId, node, attempt, traceId, signal: combined,
-    })
-    return { structured, sessionId, mode, agent }
+    // 07 §11.1：attempt 结束时注销过闹钟；打回重跑复用同一会话，要重新登记。
+    this._registerNodeSupervision(runId, node, attempt, sessionId)
+    let prompted
+    try {
+      prompted = await this._promptNodeSession({
+        agent, sessionId, prompt, runId, node, attempt, traceId, signal: combined,
+      })
+    } catch (error) {
+      // 这一轮没跑成（超时 / 结构不合格 / 中止）：attempt 到此结束，先摘闹钟。
+      this._unregisterNodeSupervision(sessionId)
+      throw error
+    }
+    return {
+      structured: prompted.structured,
+      completedBy: prompted.completedBy,
+      sessionId,
+      mode,
+      agent,
+    }
   }
 
   /**
@@ -1786,6 +2061,8 @@ class FlowEngine {
    * 中途节点失败不提前 dispose（节点可能还要被二次激活）。
    */
   async _disposeRunSessions(runId) {
+    // 07 §11.1：run 收尾后不再叫醒这个 run 的任何节点会话（与 runtime 收尾同口径、幂等）。
+    this._unregisterRunSupervision(runId)
     const handles = [...this.disposalHandles]
     this.disposalHandles.clear()
     this.nodeSessions.clear()
@@ -1905,7 +2182,10 @@ class FlowEngine {
    */
   async _patchRunBinding(runId) {
     if (typeof runId !== 'string' || runId === '') return
-    if (!this.workspaceRecord && !this.sessionMode) return
+    // 07 §11.2：节点自审状态也走这一处补写（runstore 白名单即便丢了也能从原文补回）。
+    const nodeStatus = this._nodeStatusSnapshot()
+    const hasNodeStatus = Object.keys(nodeStatus).length > 0
+    if (!this.workspaceRecord && !this.sessionMode && !hasNodeStatus) return
     const file = join(this.runsRoot, runId, 'run.json')
     let raw
     try {
@@ -1924,11 +2204,15 @@ class FlowEngine {
       && raw.worktree.reason === this.worktreeRecord.reason
       && raw.worktree.baseCommit === this.worktreeRecord.baseCommit)
     const sameMode = !this.sessionMode || raw.sessionMode === this.sessionMode
-    if (sameWorkspace && sameWorktree && sameMode) return
+    const sameNodeStatus = !hasNodeStatus
+      || (raw.nodeStatus && typeof raw.nodeStatus === 'object' && !Array.isArray(raw.nodeStatus)
+        && stableJson(raw.nodeStatus) === stableJson(nodeStatus))
+    if (sameWorkspace && sameWorktree && sameMode && sameNodeStatus) return
     const next = { ...raw }
     if (this.workspaceRecord) next.workspace = this.workspaceRecord
     if (this.worktreeRecord) next.worktree = this.worktreeRecord
     if (this.sessionMode) next.sessionMode = this.sessionMode
+    if (hasNodeStatus) next.nodeStatus = nodeStatus
     const tmp = `${file}.tmp-binding-${process.pid}-${patchCounter++}`
     try {
       await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
@@ -2190,19 +2474,24 @@ class FlowEngine {
         // 记录会话 id 失败不该阻断执行。
       }
     }
-    let structured
+    // 07 §11.1：agents.create 成功后立刻登记节点闹钟（attempt 结束 / run 收尾再注销）。
+    this._registerNodeSupervision(runId, node, attempt, sessionId)
+    let prompted
     try {
-      structured = await this._promptNodeSession({
+      prompted = await this._promptNodeSession({
         agent, sessionId, prompt, runId, node, attempt, traceId, signal,
       })
     } catch (error) {
       // 结构化输出不合格 / 超时：节点可能还会重试，这里不立即 dispose；把句柄登记到
       // run 级收口，run 结束时统一 handle.dispose()（不删会话文件）。
+      // 07 §11.1：这一轮 attempt 已经结束，先摘闹钟（重试 / 打回会重新登记）。
+      this._unregisterNodeSupervision(sessionId)
       if (handle && typeof handle.dispose === 'function') this.disposalHandles.add(handle)
       throw error
     }
     return {
-      structured,
+      structured: prompted.structured,
+      completedBy: prompted.completedBy,
       sessionId,
       agent,
       // 07 §3.3：disposalHandles 存宿主句柄；nodeSessions 另存 agent。
@@ -2362,6 +2651,8 @@ class FlowEngine {
       lastMessage: null,
       tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
       members: [],
+      // 07 §11.2：节点自审最新状态（nodeId → {state, progress, summary, members, blockers, verdict, at}）。
+      nodeStatus: {},
     }
 
     let transitioned = false
@@ -2517,6 +2808,9 @@ class FlowEngine {
     this.workspaceRecord = null
     this.worktreeRecord = null
     this.sessionMode = null
+    // 07 §11：节点自审状态只属于刚结束的 run；新 run 从空 Map 开始。
+    this.nodeStatus = new Map()
+    this.selfChecks.clear()
     this._resetInboxState()
   }
 
@@ -2784,6 +3078,10 @@ class FlowEngine {
         this.rejectContexts.delete(node.id)
 
         if (outcome.verdict === 'reject') {
+          const nodeEndExtra = {
+            ...(outcome.membersPartial ? { membersPartial: true } : {}),
+            ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+          }
           await this._append(runId, [{
             kind: 'node/end',
             nodeId: node.id,
@@ -2795,7 +3093,7 @@ class FlowEngine {
               ...(retries > 0 ? { retries } : {}),
               ...(outcome.membersPartial ? { membersPartial: true } : {}),
             },
-            ...(outcome.membersPartial ? { extra: { membersPartial: true } } : {}),
+            ...(Object.keys(nodeEndExtra).length > 0 ? { extra: nodeEndExtra } : {}),
           }])
           const choice = selectRejectTarget(flow, node, outcome.rejectTarget)
           if (!choice) {
@@ -2873,7 +3171,12 @@ class FlowEngine {
             ...(retries > 0 ? { retries } : {}),
             ...(outcome.membersPartial ? { membersPartial: true } : {}),
           },
-          ...(outcome.membersPartial ? { extra: { membersPartial: true } } : {}),
+          ...((outcome.membersPartial || outcome.completedBy) ? {
+            extra: {
+              ...(outcome.membersPartial ? { membersPartial: true } : {}),
+              ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+            },
+          } : {}),
         }])
         this.passedNodes.push({
           nodeId: node.id,
@@ -3223,6 +3526,9 @@ class FlowEngine {
     const agentOptions = model === '' ? undefined : { model }
 
     let structuredRaw
+    // 07 §11（R8）：本 attempt 绑定的会话 id / 是否由自审提前完成（node/end.extra 用）。
+    let attemptSessionId = null
+    let completedBy = null
     // 07 §6（R6）：本节点是否由外部进程执行（影响 readUsage 兜底与会话缓存）。
     let externalExecutor = false
     const timeoutController = new AbortController()
@@ -3260,11 +3566,13 @@ class FlowEngine {
         } else if (existingSession && typeof existingSession.sessionId === 'string' && this._agentsUsable()) {
           // 06 §16：一个节点一个会话。二次激活 / 打回重跑都投进同一个会话（活会话直接
           // followup，冷会话或已被压缩的会话先 resume），**不再新起会话**。
+          attemptSessionId = existingSession.sessionId
           try {
             const reused = await this._followupNodeSession({
               runId, node, attempt, prompt, signal, combined, traceId, entry: existingSession,
             })
             structuredRaw = reused.structured
+            completedBy = reused.completedBy || null
             this._recordNodeSession(runId, node.id, reused.sessionId, {
               createdAt: existingSession.createdAt,
               agent: reused.agent || null,
@@ -3317,6 +3625,7 @@ class FlowEngine {
             this.disposalHandles.add(sessionHandle)
           }
           if (activation && typeof activation.sessionId === 'string') {
+            attemptSessionId = activation.sessionId
             this.bindSession(activation.sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId })
             this._recordNodeSession(runId, node.id, activation.sessionId, {
               handle: sessionHandle,
@@ -3325,6 +3634,7 @@ class FlowEngine {
             })
             await this._persistNodeSessions(runId)
           }
+          completedBy = activation && activation.completedBy ? activation.completedBy : null
           structuredRaw = extractStructured(activation)
         }
       }
@@ -3356,6 +3666,7 @@ class FlowEngine {
         checks: written.checks,
         evidence: written.evidence,
         membersPartial,
+        ...(completedBy ? { completedBy } : {}),
       }
     } catch (error) {
       // 失败也要给已登记的成员收尾，避免 member/start 悬挂。
@@ -3363,6 +3674,9 @@ class FlowEngine {
       await this._closeMembers(runId, node, attempt, traceId).catch(() => {})
       throw error
     } finally {
+      // 07 §11.1：attempt 结束（passed / rejected / failed / abort）→ 立刻注销该会话闹钟。
+      // 外部 executor 没有会话（attemptSessionId 为 null），这里安全 no-op。
+      this._unregisterNodeSupervision(attemptSessionId)
       clearTimeout(timer)
       // 06 §16：会话句柄**不在这里** dispose（节点可能被二次激活）。
       // 统一由 run 收尾的 _disposeRunSessions() 释放，stop 也走同一条路径。
@@ -3706,9 +4020,10 @@ class FlowEngine {
     if (!sessionId || !event || typeof event.type !== 'string') return
     // 06 §16：复用会话要靠「最后一条 assistant 消息」拿结构化输出，所以这里先留存原文
     //（有界 LRU；只在本进程内存里，不落盘）。
+    let assistantText = ''
     if (event.type === 'assistant/message') {
-      const rawText = extractAssistantText(event.data && event.data.message)
-      if (rawText !== '') this._rememberAssistantRaw(sessionId, rawText)
+      assistantText = extractAssistantText(event.data && event.data.message)
+      if (assistantText !== '') this._rememberAssistantRaw(sessionId, assistantText)
     }
     let binding = this.sessionBindings.get(sessionId)
     if (!binding) {
@@ -3727,6 +4042,13 @@ class FlowEngine {
         this.pendingSessionEvents.push({ session, event })
       }
       return
+    }
+    // 07 §11.2：只采节点主管会话（memberId === null）的 assistant 消息。与结构化
+    // verdict 并行解析：同一条文本里既有 verdict 又有 status 块时两者都要处理。
+    // 未注入 nodeSupervision 时整条采集链路关闭（v0.7 行为完全不变）。
+    if (assistantText !== '' && binding.memberId === null && this.nodeSupervision) {
+      const parsed = this._parseNodeStatus(assistantText)
+      if (parsed) this._rememberNodeStatus(binding, parsed)
     }
     this._queueSessionEvent(sessionId, binding, event, session)
   }
@@ -4142,6 +4464,8 @@ class FlowEngine {
 
   async _persistLive() {
     if (!this.active || !this.live) return
+    // 07 §11.2：每次 live 刷新都带出最新节点自审状态（覆盖语义，不是追加）。
+    this.live.nodeStatus = this._nodeStatusSnapshot()
     await writeRunMeta(this.runsRoot, this.active.runId, { live: { ...this.live } }).catch(error => {
       this.log('warn', `flow-studio: 写 live 失败：${error.message}`)
     })
@@ -4214,6 +4538,9 @@ class FlowEngine {
     this.lastAssistantText.clear()
     this.liveUsage.clear()
     this.artifactIndex.clear()
+    // 07 §11：run 已收尾，自审状态 / 提前完成信号都不再跨 run 使用。
+    this.nodeStatus = new Map()
+    this.selfChecks.clear()
     // 06 §16：run 级收件箱 / 节点会话运行态归零；跨 run 的 sessionIndex 保留。
     this._resetInboxState()
     this.eventQueue = Promise.resolve()

@@ -29,7 +29,7 @@ const { toStrictOutputSchema } = await import('../src/executor.js')
 const {
   createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
   loadUpstreamArtifactContents, MAX_NODE_RETRIES, UPSTREAM_ARTIFACT_READ_MAX_BYTES,
-  nodeSessionId, ENGINE_OUTPUT_SCHEMA,
+  nodeSessionId, ENGINE_OUTPUT_SCHEMA, parseAssistantStructured,
 } = engineModule
 
 /**
@@ -263,6 +263,119 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
     },
   }
   return { ctx, created }
+}
+
+/**
+ * 07 §11（R8）假节点闹钟调度器：只记录引擎调了什么，不真的起定时器。
+ * `strictUnregister=true` 时对未登记 sessionId 抛错——用来证明引擎的注销入口
+ * 会把调度器异常吃掉（幂等安全），而不是把 run 拖失败。
+ */
+function fakeNodeAlarmScheduler({ strictUnregister = false } = {}) {
+  const calls = { register: [], unregister: [], unregisterNode: [], unregisterRun: [] }
+  const order = []
+  const entries = new Map()
+  const scheduler = {
+    calls,
+    order,
+    entries,
+    register(entry) {
+      calls.register.push({ ...entry })
+      order.push(`register:${entry.sessionId}`)
+      entries.set(entry.sessionId, { ...entry })
+      return scheduler.status(entry.sessionId)
+    },
+    unregister(sessionId) {
+      calls.unregister.push(sessionId)
+      order.push(`unregister:${sessionId}`)
+      if (strictUnregister && !entries.has(sessionId)) {
+        throw new Error(`未登记的 sessionId：${sessionId}`)
+      }
+      return entries.delete(sessionId)
+    },
+    unregisterNode(runId, nodeId) {
+      calls.unregisterNode.push({ runId, nodeId })
+      order.push(`unregisterNode:${runId}:${nodeId}`)
+      return 0
+    },
+    unregisterRun(runId) {
+      calls.unregisterRun.push(runId)
+      order.push(`unregisterRun:${runId}`)
+      let removed = 0
+      for (const [sessionId, entry] of [...entries]) {
+        if (entry.runId === runId) {
+          entries.delete(sessionId)
+          removed += 1
+        }
+      }
+      return removed
+    },
+    status(sessionId) {
+      return entries.has(sessionId) ? { ...entries.get(sessionId), enabled: true } : { enabled: false }
+    },
+    list() {
+      return [...entries.values()]
+    },
+  }
+  return scheduler
+}
+
+/**
+ * 07 §11（R8）假 agents：`agents.create` 建一个可控会话，`behavior` 在每次
+ * followup 时被调用（用 emit / emitStructured 喂 assistant 消息，用 finishIdle
+ * 放行 whenIdle）。不调用 finishIdle 时 whenIdle 永远挂着——用来验证自审提前完成。
+ */
+function nodeAlarmAgents(engineRef, behavior) {
+  const created = []
+  const agentsById = new Map()
+  const ctx = {
+    on() {
+      return () => {}
+    },
+    get(name) {
+      if (name !== 'agents') return undefined
+      return {
+        async create(options) {
+          created.push(options)
+          const sessionId = options.sessionId
+          let finishIdle = null
+          const idle = new Promise(resolve => {
+            finishIdle = resolve
+          })
+          const agent = {
+            session: { id: sessionId, header: {} },
+            status: 'working',
+            followup() {
+              const emit = text => engineRef.value.handleSessionEvent({ id: sessionId }, {
+                type: 'assistant/message',
+                data: {
+                  message: { role: 'assistant', content: [{ type: 'text', text }] },
+                },
+              })
+              behavior({
+                engine: engineRef.value,
+                sessionId,
+                options,
+                agent,
+                idle,
+                emit,
+                emitStructured: value => emit(`\`\`\`json\n${JSON.stringify(value)}\n\`\`\``),
+                finishIdle: () => finishIdle(),
+              })
+            },
+            whenIdle() {
+              return idle
+            },
+          }
+          agentsById.set(sessionId, agent)
+          return { agent, dispose: async () => {} }
+        },
+        get(sessionId) {
+          return agentsById.get(sessionId) || null
+        },
+      }
+    },
+  }
+  return { ctx, created, agentsById }
 }
 
 try {
@@ -2800,6 +2913,367 @@ try {
     } finally {
       rmSync(execDir, { recursive: true, force: true })
     }
+  })
+
+  // =========================================================================
+  // v0.8 节点闹钟（07 §11 / R8）：注入假 nodeSupervision + 假 agents
+  // =========================================================================
+  console.log('engine v0.8 · 节点闹钟（R8）')
+
+  await check('① 建会话即按 {runId,nodeId,sessionId,attempt} 登记', async () => {
+    const flow = flowOf('flow-alarm-register', [
+      startNode(), stage('n_alarm', '闹钟节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_alarm'),
+      next('e2', 'n_alarm', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-register', 1)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emitStructured, finishIdle }) => {
+      emitStructured(passResult('n_alarm').structured)
+      finishIdle()
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const sessionId = nodeSessionId(run.id, 'n_alarm', 1)
+
+    A.equal(final.status, 'done')
+    A.deepEqual(scheduler.calls.register, [{
+      runId: run.id,
+      nodeId: 'n_alarm',
+      sessionId,
+      attempt: 1,
+    }])
+    A.equal(scheduler.calls.register[0].sessionId, sessionId)
+  })
+
+  await check('② attempt 结束注销（不是 run 收尾才注销），run 收尾再 unregisterRun', async () => {
+    const flow = flowOf('flow-alarm-unregister', [
+      startNode(), stage('n_alarm2', '闹钟节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_alarm2'),
+      next('e2', 'n_alarm2', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-unregister', 1)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emitStructured, finishIdle }) => {
+      emitStructured(passResult('n_alarm2').structured)
+      finishIdle()
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const sessionId = nodeSessionId(run.id, 'n_alarm2', 1)
+
+    A.equal(final.status, 'done')
+    A.equal(scheduler.calls.unregister.filter(id => id === sessionId).length, 1, 'attempt 结束注销一次')
+    A.equal(scheduler.entries.size, 0, '注销后调度器里没有该会话')
+    A.equal(scheduler.calls.unregisterRun.filter(id => id === run.id).length, 1, 'run 收尾注销整个 run')
+    // attempt 注销必须发生在 run 收尾注销之前。
+    A.ok(
+      scheduler.order.indexOf(`unregister:${sessionId}`) < scheduler.order.indexOf(`unregisterRun:${run.id}`),
+      'attempt 注销先于 unregisterRun',
+    )
+  })
+
+  await check('③ 打回重跑：同一会话重新登记（sessionId 相同、attempt=2）', async () => {
+    const flow = flowOf('flow-alarm-rework', [
+      startNode(), stage('n_a', '开发', 300), stage('n_b', '测试', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+      reject('e4', 'n_b', 'n_a'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-rework', 2)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    const callsBySession = new Map()
+    const { ctx } = nodeAlarmAgents(engineRef, ({ sessionId, emitStructured, finishIdle }) => {
+      const call = (callsBySession.get(sessionId) || 0) + 1
+      callsBySession.set(sessionId, call)
+      if (sessionId.includes('--n_b') && call === 1) {
+        emitStructured({
+          verdict: 'reject',
+          summary: '打回返工',
+          rejectTarget: 'n_a',
+          rejectReason: '测试不达标',
+        })
+      } else {
+        emitStructured(passResult(sessionId.includes('--n_a') ? 'n_a' : 'n_b').structured)
+      }
+      finishIdle()
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+
+    const sessionA = nodeSessionId(run.id, 'n_a', 1)
+    const registersA = scheduler.calls.register.filter(entry => entry.nodeId === 'n_a')
+    A.equal(final.status, 'done')
+    A.deepEqual(registersA.map(entry => entry.attempt), [1, 2])
+    A.equal(registersA[0].sessionId, sessionA)
+    A.equal(registersA[1].sessionId, sessionA, '打回重跑复用同一会话，重新登记同一个 sessionId')
+    A.equal(scheduler.calls.unregister.filter(id => id === sessionA).length, 2, '两次 attempt 各注销一次')
+  })
+
+  await check('④ 自审回报：node/status 事件 + live.nodeStatus + run.json.nodeStatus（同文本 verdict 也解析）', async () => {
+    const flow = flowOf('flow-alarm-status', [
+      startNode(), stage('n_status', '自审节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_status'),
+      next('e2', 'n_status', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-status', 1)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    let liveNodeStatus = null
+    const statusBlock = {
+      nodeId: 'n_status',
+      attempt: 1,
+      state: 'working',
+      progress: 40,
+      summary: '正在自审',
+      members: [{ name: '成员甲', state: 'working', note: '写实现' }],
+      blockers: ['等接口'],
+      verdict: null,
+    }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ engine, emit, finishIdle }) => {
+      emit(`\`\`\`json\n${JSON.stringify(statusBlock)}\n\`\`\``)
+      setTimeout(() => {
+        liveNodeStatus = engine.live ? JSON.parse(JSON.stringify(engine.live.nodeStatus)) : null
+        // 同一条文本里既有 status 块又有正式 verdict 块：两者都要处理。
+        const closingStatus = { ...statusBlock, progress: 70, summary: '准备收尾' }
+        emit([
+          `\`\`\`json\n${JSON.stringify(closingStatus)}\n\`\`\``,
+          `\`\`\`json\n${JSON.stringify(passResult('n_status').structured)}\n\`\`\``,
+        ].join('\n'))
+        finishIdle()
+      }, 0)
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const statusEvents = events.filter(event => event.kind === 'node/status')
+    const raw = readRawRun(run.id)
+
+    A.equal(final.status, 'done')
+    A.ok(statusEvents.length >= 2, '两条自审回报都落成 node/status')
+    A.equal(statusEvents[0].nodeId, 'n_status')
+    A.equal(statusEvents[0].attemptId, 1)
+    A.match(statusEvents[0].traceId, /^tr-/)
+    A.equal(statusEvents[0].data.state, 'working')
+    A.equal(statusEvents[0].data.progress, 40)
+    A.equal(statusEvents[0].data.source, 'self-check')
+    A.equal(statusEvents.at(-1).data.progress, 70)
+    A.ok(Boolean(liveNodeStatus), '运行中 live 可读')
+    A.equal(liveNodeStatus.n_status.state, 'working')
+    A.equal(liveNodeStatus.n_status.progress, 40)
+    A.equal(liveNodeStatus.n_status.members[0].name, '成员甲')
+    A.equal(raw.nodeStatus.n_status.state, 'working')
+    A.equal(raw.nodeStatus.n_status.progress, 70)
+    A.deepEqual(raw.nodeStatus.n_status.blockers, ['等接口'])
+    A.equal(typeof raw.nodeStatus.n_status.at, 'string')
+    // 同文本里的正式 verdict 被解析成节点结论（不是被 status 块挡掉）。
+    A.equal(events.find(event => event.kind === 'node/end').data.status, 'passed')
+  })
+
+  await check('⑤ 自审 done+pass 提前完成：节点 passed 且 node/end.extra.completedBy=self-check', async () => {
+    const flow = flowOf('flow-alarm-early', [
+      startNode(), stage('n_early', '提前完成', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_early'),
+      next('e2', 'n_early', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-early', 1)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emit }) => {
+      // 只发自审回报，不放行 whenIdle —— 必须靠自审信号提前收口。
+      emit(`\`\`\`json\n${JSON.stringify({
+        nodeId: 'n_early',
+        attempt: 1,
+        state: 'done',
+        progress: 100,
+        summary: '自审认为已完成',
+        verdict: 'pass',
+      })}\n\`\`\``)
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+
+    A.equal(final.status, 'done')
+    A.equal(nodeEnd.data.status, 'passed')
+    A.equal(nodeEnd.extra.completedBy, 'self-check')
+    A.equal(events.some(event => event.kind === 'node/status' && event.data.state === 'done'), true)
+  })
+
+  await check('⑥ 自审 done 但 verdict 非法：不提前完成，仍走 whenIdle 的正常解析', async () => {
+    const flow = flowOf('flow-alarm-invalid', [
+      startNode(), stage('n_invalid', '非法 verdict', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_invalid'),
+      next('e2', 'n_invalid', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-invalid', 1)
+    const scheduler = fakeNodeAlarmScheduler()
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emit, emitStructured, finishIdle }) => {
+      emit(`\`\`\`json\n${JSON.stringify({
+        nodeId: 'n_invalid',
+        attempt: 1,
+        state: 'done',
+        progress: 100,
+        summary: '我说完成但我给不出合法 verdict',
+        verdict: 'maybe',
+      })}\n\`\`\``)
+      // 正常回合随后到达并放行 whenIdle。
+      setTimeout(() => {
+        emitStructured(passResult('n_invalid').structured)
+        finishIdle()
+      }, 0)
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+    const statusEvent = events.find(event => event.kind === 'node/status')
+
+    A.equal(final.status, 'done')
+    A.equal(nodeEnd.data.status, 'passed')
+    A.equal(nodeEnd.extra && nodeEnd.extra.completedBy, undefined, '非法 verdict 不得触发提前完成')
+    A.ok(Boolean(statusEvent), '非法 verdict 仍作为自审状态记录')
+    A.ok(statusEvent.data.verdict === undefined || statusEvent.data.verdict === null)
+  })
+
+  await check('⑦ 不注入 nodeSupervision：行为与 v0.7 一致，不写 nodeStatus / node/status', async () => {
+    const flow = flowOf('flow-alarm-none', [
+      startNode(), stage('n_plain', '无闹钟', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_plain'),
+      next('e2', 'n_plain', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-alarm-none', 1)
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emit, emitStructured, finishIdle }) => {
+      // 即使会话消息里有自审结构，没有注入调度器时也不采集、不竞速。
+      emit(`\`\`\`json\n${JSON.stringify({
+        nodeId: 'n_plain', attempt: 1, state: 'done', progress: 100, verdict: 'pass',
+      })}\n\`\`\``)
+      setTimeout(() => {
+        emitStructured(passResult('n_plain').structured)
+        finishIdle()
+      }, 0)
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const raw = readRawRun(run.id)
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+
+    A.equal(engine.nodeSupervision, null)
+    A.equal(final.status, 'done')
+    A.equal(raw.nodeStatus, undefined)
+    A.equal(events.some(event => event.kind === 'node/status'), false)
+    A.equal(nodeEnd.extra && nodeEnd.extra.completedBy, undefined, '不注入时没有自审提前完成')
+  })
+
+  await check('⑧ 外部 executor 节点：不登记、不写 nodeStatus；注销入口对未登记 sessionId 幂等安全', async () => {
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'alarm-exec-'))
+    try {
+      const stubPath = join(execDir, 'external.mjs')
+      writeFileSync(stubPath, `console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ verdict: 'pass', summary: '外部节点通过' }) } }))\n`)
+      const flow = flowOf('flow-alarm-exec', [
+        startNode(),
+        stage('n_ext_alarm', '外部节点', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_ext_alarm'),
+        next('e2', 'n_ext_alarm', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-alarm-exec', 1)
+      const scheduler = fakeNodeAlarmScheduler({ strictUnregister: true })
+      const engine = createEngine({ runsRoot, flowsRoot, nodeSupervision: scheduler })
+      await engine.start(run.id, { worktree: 'off' })
+      const final = await engine.wait(run.id)
+      const raw = readRawRun(run.id)
+
+      A.equal(final.status, 'done')
+      A.equal(scheduler.calls.register.length, 0, '外部 executor 没有会话，不登记闹钟')
+      A.equal(raw.nodeStatus, undefined, '外部 executor 不写 nodeStatus')
+      A.equal(scheduler.calls.unregisterRun.filter(id => id === run.id).length, 1)
+      // 严格调度器对未登记 sessionId 会抛错，引擎的注销入口必须吃掉它（幂等安全）。
+      A.equal(engine._unregisterNodeSupervision('ghost-session'), false)
+      A.equal(engine._unregisterNodeSupervision('ghost-session'), false)
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  await check('⑨ parseAssistantStructured 防御：自审状态块不当节点结论（缺失 verdict 不白失败）', async () => {
+    const statusOnly = {
+      nodeId: 'n_defend',
+      attempt: 1,
+      state: 'done',
+      progress: 80,
+      summary: '自审认为快完成',
+      members: [],
+      blockers: [],
+      verdict: null,
+    }
+    const verdict = passResult('n_defend').structured
+    const fenced = value => `\`\`\`json\n${JSON.stringify(value)}\n\`\`\``
+
+    // ① 只有状态块：不能当结论（旧逻辑会返回它，随后 normalizeStructured 白失败）。
+    A.equal(parseAssistantStructured(fenced(statusOnly)), null)
+    A.equal(parseAssistantStructured(JSON.stringify(statusOnly)), null)
+    // ② 状态块 + 真正的 verdict 块：返回 verdict 块。
+    A.deepEqual(parseAssistantStructured(`${fenced(statusOnly)}\n${fenced(verdict)}`), verdict)
+    // ③ 正常结构不受影响。
+    A.deepEqual(parseAssistantStructured(fenced(verdict)), verdict)
+    A.deepEqual(parseAssistantStructured(JSON.stringify(verdict)), verdict)
+    // 状态块没有 state 时仍按旧行为退回（不是自审块，不改变既有语义）。
+    A.deepEqual(parseAssistantStructured(fenced({ summary: '只有摘要' })), { summary: '只有摘要' })
+  })
+
+  await check('⑩ 自审采集只认状态报告：正常 verdict JSON 不会被记成一次状态上报', async () => {
+    const engine = createEngine({ runsRoot, flowsRoot })
+    // 节点正常回合的结构化结论：有 verdict、没有状态字段 → 不该被当成自审回报。
+    A.equal(engine._parseNodeStatus('```json\n{"verdict":"pass","summary":"做完了"}\n```'), null)
+    A.equal(engine._parseNodeStatus('{"verdict":"reject","rejectReason":"要返工"}'), null)
+    // 状态报告：至少含一个状态专有字段。
+    const status = engine._parseNodeStatus('```json\n{"state":"done","progress":100,"verdict":"pass"}\n```')
+    A.equal(status && status.state, 'done')
+    A.equal(status && status.verdict, 'pass')
+    const partial = engine._parseNodeStatus('{"progress":40,"blockers":["等依赖"]}')
+    A.equal(partial && partial.progress, 40)
+    A.deepEqual(partial && partial.blockers, ['等依赖'])
+    // 成员 note 会进 run.json 快照（客户端要显示）。
+    A.equal(engine._parseNodeStatus('not json'), null)
   })
 
 } finally {

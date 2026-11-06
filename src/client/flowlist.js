@@ -3,7 +3,8 @@
  *
  * 运行记录是 v0.7 §4.3 的「按工作区分组」：分组键是 `run.workspacePath`，
  * 没有就归到「未标注工作区」——旧数据整列退化成一个默认分组，不抛错、不白屏。
- * 详情头部只读展示 supervision（§7），不提供开关（开关走模型工具 / HTTP）。
+ * 详情头部只读展示 supervision（§7）与节点自审状态（v0.8 §11.4），不提供开关
+ *（开关走模型工具 / HTTP）。
  *
  * @module @feiyueve/dsh-flow-studio/client/flowlist
  */
@@ -140,6 +141,193 @@ export function formatWakeAt(value) {
   return sameDay ? clock : pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) + ' ' + clock
 }
 
+/** v0.8 §11.4：节点自审状态的展示词表（颜色只落在 styles.js，文字走中文）。 */
+const NODE_STATE_TEXT = { working: '进行中', done: '完成', blocked: '阻塞', failed: '失败' }
+/** 节点多于这个数量时区块内部滚动（max-height + overflow），不撑爆 240px 左栏。 */
+export const NODE_STATUS_SCROLL_AT = 6
+/** 缺字段 / 空表 / 坏类型时的整块降级文案（老 run 走这里）。 */
+export const NODE_STATUS_EMPTY_TEXT = '节点状态：暂无自审上报'
+
+/** 进度：0..100 的有限数才收（取整夹取），坏值按 0——不编造进度。 */
+function progressOf(value) {
+  const number = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
+  if (!Number.isFinite(number)) return 0
+  return Math.min(100, Math.max(0, Math.floor(number)))
+}
+
+/** 单条自审记录归一化；`value` 不是对象 → null（坏输入不抛错）。 */
+export function nodeStatusOf(value) {
+  if (!isObject(value)) return null
+  const state = text(value.state).trim().toLowerCase()
+  const key = NODE_STATE_TEXT[state] ? state : 'working'
+  const members = Array.isArray(value.members)
+    ? value.members.filter(isObject).map(member => {
+      const memberState = text(member.state).trim().toLowerCase()
+      const memberKey = NODE_STATE_TEXT[memberState] ? memberState : 'working'
+      return {
+        name: text(member.name).trim() || '未命名成员',
+        state: memberKey,
+        label: NODE_STATE_TEXT[memberKey],
+        note: text(member.note).trim(),
+      }
+    })
+    : []
+  const blockers = Array.isArray(value.blockers)
+    ? value.blockers.map(item => text(item).trim()).filter(Boolean)
+    : []
+  const verdict = value.verdict === 'pass' || value.verdict === 'reject' ? value.verdict : ''
+  return {
+    state: key,
+    label: NODE_STATE_TEXT[key],
+    progress: progressOf(value.progress),
+    summary: text(value.summary).trim(),
+    members,
+    blockers,
+    verdict,
+  }
+}
+
+/**
+ * `run.nodeStatus` → `[{ nodeId, state, label, progress, members, blockers, verdict }]`。
+ * 缺字段 / 空对象 / 坏类型一律空数组：0.7 及以前的老 run 整块走降级文案，不报错。
+ */
+export function nodeStatusEntries(run) {
+  const table = run && isObject(run.nodeStatus) ? run.nodeStatus : null
+  if (table === null) return []
+  const entries = []
+  for (const [nodeId, value] of Object.entries(table)) {
+    const id = text(nodeId).trim()
+    if (id === '') continue
+    const status = nodeStatusOf(value)
+    if (status !== null) entries.push({ nodeId: id, ...status })
+  }
+  return entries
+}
+
+/** 这个 run 是否有可展示的节点自审状态（页面据此决定要不要拉详情拿节点标题）。 */
+export function hasNodeStatus(run) {
+  return nodeStatusEntries(run).length > 0
+}
+
+/**
+ * `GET /runs/<id>` 的 `nodes` → `nodeId → 标题`。
+ * 契约是 `[{id, title}]`，这里同时容忍 `nodeId` 键与 `{ id: '标题' }` 映射；
+ * 拿不到标题就返回空表，调用方退回显示 nodeId。
+ */
+export function nodeTitleMap(nodes) {
+  const titles = new Map()
+  const take = item => {
+    if (!isObject(item)) return
+    const id = text(item.id).trim() || text(item.nodeId).trim()
+    if (id === '') return
+    const title = text(item.title).trim() || text(item.name).trim()
+    if (title !== '') titles.set(id, title)
+  }
+  if (Array.isArray(nodes)) {
+    for (const item of nodes) take(item)
+  } else if (isObject(nodes)) {
+    for (const [id, value] of Object.entries(nodes)) {
+      const key = text(id).trim()
+      if (key === '') continue
+      if (typeof value === 'string') {
+        const title = value.trim()
+        if (title !== '') titles.set(key, title)
+      } else if (isObject(value)) {
+        const title = text(value.title).trim() || text(value.name).trim()
+        if (title !== '') titles.set(key, title)
+      }
+    }
+  }
+  return titles
+}
+
+/** 阻塞文案：最多列 3 条，更多用「等 N 条」收尾；没有阻塞返回空串。 */
+export function blockersText(blockers) {
+  const list = Array.isArray(blockers)
+    ? blockers.map(item => text(item).trim()).filter(Boolean)
+    : []
+  if (list.length === 0) return ''
+  const shown = list.slice(0, 3).join('、')
+  return '阻塞：' + shown + (list.length > 3 ? ' 等 ' + list.length + ' 条' : '')
+}
+
+/** 单个节点一行：标题 + 状态徽标 + 进度条（只读，无按钮）。 */
+function NodeStatusRow({ entry, title }) {
+  return h('div', {
+    className: 'fs-run-node',
+    'data-state': entry.state,
+    title: entry.summary === '' ? entry.nodeId : entry.nodeId + ' · ' + entry.summary,
+  },
+  h('div', { className: 'fs-run-node-head' },
+    h('span', { className: 'fs-run-node-title' }, title),
+    h('span', {
+      className: 'fs-node-state ' + entry.state,
+      title: '自审状态：' + entry.state,
+    }, entry.label),
+    entry.verdict === ''
+      ? null
+      : h('span', {
+        className: 'fs-run-node-verdict ' + entry.verdict,
+        title: '自审结论：' + entry.verdict,
+      }, entry.verdict),
+    h('span', { className: 'fs-run-node-pct' }, entry.progress + '%')),
+  h('div', {
+    className: 'fs-run-node-bar',
+    role: 'progressbar',
+    'aria-label': '节点进度',
+    'aria-valuemin': 0,
+    'aria-valuemax': 100,
+    'aria-valuenow': entry.progress,
+  }, h('span', { className: 'fs-run-node-bar-fill', style: { width: entry.progress + '%' } })),
+  entry.members.length === 0
+    ? null
+    : h('div', { className: 'fs-run-node-members' },
+      entry.members.map((member, index) => h('div', {
+        key: member.name + ':' + index,
+        className: 'fs-run-node-member',
+        title: member.note === ''
+          ? member.name + ' · ' + member.label
+          : member.name + ' · ' + member.label + ' · ' + member.note,
+      },
+      h('span', { className: 'fs-run-node-member-name' }, member.name),
+      ' · ',
+      h('span', { className: 'fs-run-node-member-state ' + member.state }, member.label),
+      member.note === '' ? null : ' · ' + member.note))),
+  blockersText(entry.blockers) === ''
+    ? null
+    : h('div', {
+      className: 'fs-run-node-blockers',
+      title: '阻塞：' + entry.blockers.join('；'),
+    }, blockersText(entry.blockers)))
+}
+
+/**
+ * 节点自审状态区块（v0.8 §11.4，只读）：每个上报过的节点一行。
+ * `nodes` 是 `GET /runs/<id>` 的节点表（`{id,title}`），只用来把 nodeId 换成标题。
+ */
+function NodeStatusBlock({ run, nodes }) {
+  const entries = nodeStatusEntries(run)
+  if (entries.length === 0) {
+    return h('div', { className: 'fs-run-nodes' },
+      h('div', { className: 'fs-run-nodes-empty' }, NODE_STATUS_EMPTY_TEXT))
+  }
+  const titles = nodeTitleMap(nodes)
+  return h('div', { className: 'fs-run-nodes' },
+    h('div', { className: 'fs-run-nodes-head' },
+      h('span', { className: 'fs-run-sup-label' }, '节点状态'),
+      h('span', { className: 'fs-run-nodes-count' }, entries.length + ' 个节点')),
+    h('div', {
+      className: 'fs-run-nodes-body' + (entries.length > NODE_STATUS_SCROLL_AT ? ' scroll' : ''),
+    },
+    entries.map(entry => h(NodeStatusRow, {
+      key: entry.nodeId,
+      entry,
+      title: titles.get(entry.nodeId) || entry.nodeId,
+    }))))
+}
+
 function SupervisionLine({ run }) {
   const supervision = supervisionOf(run)
   if (!supervision.enabled) {
@@ -165,8 +353,8 @@ function SupervisionLine({ run }) {
       : h('div', { className: 'fs-run-sup-reason' }, '关闭原因：' + supervision.reason))
 }
 
-/** 运行详情头部：工作区 / worktree / supervision 都只读。 */
-function RunDetail({ run, active }) {
+/** 运行详情头部：工作区 / worktree / supervision / 节点状态都只读。 */
+function RunDetail({ run, active, nodes }) {
   const path = workspacePathOf(run)
   const worktree = worktreeOf(run)
   const name = text(run.name) || text(run.id) || '未命名运行'
@@ -176,7 +364,8 @@ function RunDetail({ run, active }) {
       '工作区 · ' + (path === '' ? UNKNOWN_WORKSPACE : workspaceTail(path))),
     h('div', { className: 'fs-run-detail-line' },
       'worktree · ' + (worktree.enabled ? (worktree.branch === '' ? '已启用' : '⎇ ' + worktree.branch) : '未启用')),
-    h(SupervisionLine, { run }))
+    h(SupervisionLine, { run }),
+    h(NodeStatusBlock, { run, nodes }))
 }
 
 function RunRow({ run, on, onFocus }) {
@@ -237,6 +426,8 @@ export function FlowList({
   runs = null,
   selectedRunId = '',
   activeRunId = '',
+  // v0.8 §11.4：`GET /runs/<id>` 的节点表（`{id,title}`），只用于把 nodeId 显示成标题。
+  nodes = null,
   onFocusRun = null,
 }) {
   const { useState } = rt.React
@@ -311,7 +502,11 @@ export function FlowList({
           runRows.length === 0
             ? h('div', { className: 'fs-empty-panel', style: { padding: '10px 8px' } }, '还没有运行记录')
             : h('div', null,
-              selected ? h(RunDetail, { run: selected, active: text(selected.id) === activeRunId }) : null,
+              selected ? h(RunDetail, {
+                run: selected,
+                active: text(selected.id) === activeRunId,
+                nodes,
+              }) : null,
               groups.map((group, index) => h(RunGroup, {
                 key: group.key === '' ? 'unknown-workspace' : group.key,
                 group,

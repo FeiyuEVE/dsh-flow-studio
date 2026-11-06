@@ -32,7 +32,7 @@ const {
   AGENT_ACTIVITY_LIMIT, DRAWER_ZOOM_LEVELS, FsLogDrawer, LogTextOverlay,
   activityMessagesOf, drawerEscapeAction, drawerZoomInfo, eventKey, eventLongTextOf,
   lowerDrawerZoom, nodeActivityOf, nodeArtifactsOf, nodeToolsOf, nodeUsageOf,
-  normalizeDrawerZoom, raiseDrawerZoom,
+  normalizeDrawerZoom, raiseDrawerZoom, EVENT_KINDS, eventSummary,
 } = await import('../src/client/logdrawer.js')
 const { CSS } = await import('../src/client/styles.js')
 
@@ -401,6 +401,23 @@ check('C 新 CSS 只用 --dsw-* token：无 hex、正文 ≥12px', () => {
   }
   assert.ok(CSS.includes('body[data-ds-dark-theme]'), '暗色主题没有专门分支')
   assert.ok(CSS.includes('var(--dsw-alias-'), '新增颜色没走宿主 token')
+})
+
+check('v0.8 事件表：node/status 与 v1.1/v1.6 的 kind 都在列，且有可读摘要（不再显示「未识别」）', () => {
+  for (const kind of ['node/status', 'acceptance/verdict', 'test/report', 'message/in', 'message/out']) {
+    assert.ok(EVENT_KINDS.includes(kind), `${kind} 应在 EVENT_KINDS 里`)
+  }
+  const line = eventSummary({
+    kind: 'node/status',
+    data: { state: 'blocked', progress: 40, verdict: null, blockers: ['等依赖'], summary: '卡在依赖上' },
+  })
+  assert.match(line, /blocked/)
+  assert.match(line, /40%/)
+  assert.match(line, /阻塞 1 条/)
+  assert.doesNotMatch(line, /未识别/)
+  const testLine = eventSummary({ kind: 'test/report', data: { suite: 'unit', executed: 10, passed: 9, failed: 1 } })
+  assert.match(testLine, /9\/10/)
+  assert.match(testLine, /1 失败/)
 })
 
 console.log(`\n${checks} 组通过`)

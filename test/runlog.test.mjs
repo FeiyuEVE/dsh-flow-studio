@@ -1445,4 +1445,35 @@ check('v1.3 结论层：全自证 warn 与 P1 遗留 warn 汇合，两个原因�
   assert.match(quality.label, /全部为自证证据（3 条），缺独立复核/)
 })
 
+check('v0.8 节点闹钟：node/status 通过校验并归一化（可选字段收敛、成员/阻塞项有界）', () => {
+  const event = ok(base({
+    kind: 'node/status',
+    data: {
+      state: 'done',
+      progress: 88,
+      summary: '子 agent 都收工了',
+      verdict: 'pass',
+      source: 'self-check',
+      members: [{ name: '实现', state: 'done', note: '' }],
+      blockers: ['等待依赖'],
+    },
+  }))
+  assert.equal(event.data.state, 'done')
+  assert.equal(event.data.progress, 88)
+  assert.equal(event.data.verdict, 'pass')
+  assert.deepEqual(event.data.members, [{ name: '实现', state: 'done' }])
+  assert.deepEqual(event.data.blockers, ['等待依赖'])
+})
+
+check('v0.8 节点闹钟：node/status 的坏输入逐条拒绝（枚举/越界/超量/缺字段）', () => {
+  bad(base({ kind: 'node/status', data: { state: 'whatever', progress: 10 } }), 'data.state')
+  bad(base({ kind: 'node/status', data: { state: 'working', progress: 101 } }), 'data.progress')
+  bad(base({ kind: 'node/status', data: { state: 'working' } }), 'data.progress')
+  bad(base({ kind: 'node/status', data: { state: 'done', progress: 1, verdict: 'maybe' } }), 'data.verdict')
+  bad(base({
+    kind: 'node/status',
+    data: { state: 'working', progress: 1, members: Array.from({ length: 21 }, () => ({ name: 'x' })) },
+  }), 'data.members')
+})
+
 console.log(`\n${checks} 组通过`)

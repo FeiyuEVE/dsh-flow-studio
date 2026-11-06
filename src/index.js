@@ -398,6 +398,15 @@ function runSupervisionOf(meta) {
 }
 
 /**
+ * v0.8 §11.4：节点最新自审状态（nodeId → {state, progress, summary, verdict,
+ * members, blockers, at}）。runstore 白名单已覆盖 `nodeStatus`；缺省给 `{}`。
+ */
+function runNodeStatusOf(meta) {
+  const value = meta && meta.nodeStatus
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+/**
  * 07 §6 的两条 executor 规则（custom 必须填 `executorCommand`；外部 executor 只能 single）
  * 目前**不在** `engine.validateFlowForRun()` 里——那是独立的结构校验器，executor 只在
  * 节点执行时由 `normalizeExecutor` 拦住（节点会失败）。为了「开跑前」就报 400，Host 侧的
@@ -418,13 +427,14 @@ function executorBlockers(flow) {
   return blockers
 }
 
-/** 07 §4 / §7：一个 run 的四个绑定字段（列表行 / 详情 / summary 同一口径）。 */
+/** 07 §4 / §7 / v0.8 §11.4：列表行 / 详情 / summary 的五字段（同一口径）。 */
 function runBindingFields(meta) {
   return {
     workspace: meta && meta.workspace ? meta.workspace : null,
     worktree: meta && meta.worktree ? meta.worktree : null,
     sessionMode: meta && typeof meta.sessionMode === 'string' ? meta.sessionMode : null,
     supervision: runSupervisionOf(meta),
+    nodeStatus: runNodeStatusOf(meta),
   }
 }
 

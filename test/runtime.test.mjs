@@ -25,7 +25,7 @@ const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
 const superviseModule = await import('../src/supervise.js')
 
-const { createRuntime } = runtimeModule
+const { createRuntime, nodeSelfCheckPrompt } = runtimeModule
 const { SupervisionScheduler } = superviseModule
 const {
   Engine, EngineError, nodeSessionId, NODE_SESSION_ID_MAX,
@@ -652,6 +652,133 @@ try {
     A.equal(terminal.status, 400)
     A.match(terminal.message, /已结束/)
     A.equal(runtime.supervision.status(run.id).enabled, false, '被拒绝的开启不能留下登记')
+    runtime.dispose()
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runtime · v0.8 节点闹钟（07 §11）')
+
+  await check('wake：会话 idle → agent.followup（payload 走 inbox.buildFollowupPayload）', async () => {
+    const sent = []
+    const fakeAgent = {
+      status: 'idle',
+      followup(payload) { sent.push(payload) },
+    }
+    const agents = { get: () => fakeAgent }
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      ctx: { get: () => agents },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    const result = await runtime.wake({ runId: 'r-node-1', nodeId: 'n_dev', attempt: 2, sessionId: 'sess-node' })
+    A.deepEqual(result, { action: 'followup' })
+    A.equal(sent.length, 1)
+    // payload 必须是 inbox 的结构（不是随手拼的 {text}）。
+    A.equal(sent[0].role, 'user')
+    A.equal(sent[0].source.kind, 'flow-studio')
+    A.equal(sent[0].source.room, 'r-node-1/n_dev')
+    A.equal(Array.isArray(sent[0].content), true)
+    const prompt = sent[0].content[0].text
+    A.match(prompt, /r-node-1/)
+    A.match(prompt, /n_dev/)
+    A.match(prompt, /attempt=2/)
+    runtime.dispose()
+  })
+
+  await check('wake：会话 busy → agent.inject（不新开回合，也不调用 followup）', async () => {
+    const injected = []
+    const followed = []
+    const fakeAgent = {
+      status: 'busy',
+      inject(payload) { injected.push(payload) },
+      followup(payload) { followed.push(payload) },
+    }
+    const agents = { get: () => fakeAgent }
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      ctx: { get: () => agents },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    const result = await runtime.wake({ runId: 'r-node-2', nodeId: 'n_dev', attempt: 1, sessionId: 'sess-node' })
+    A.deepEqual(result, { action: 'inject' })
+    A.equal(injected.length, 1)
+    A.equal(followed.length, 0, 'busy 时不能起新回合')
+    runtime.dispose()
+  })
+
+  await check('wake：agents 服务不可用 → skip（no-agents-service，不抛错）', async () => {
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      ctx: { get: () => undefined },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    const result = await runtime.wake({ runId: 'r-node-3', nodeId: 'n_dev', attempt: 1, sessionId: 'sess-node' })
+    A.deepEqual(result, { action: 'skip', reason: 'no-agents-service' })
+    runtime.dispose()
+  })
+
+  await check('nodeSelfCheckPrompt：含 runId / nodeId / attempt，要求 ```json 代码块与 verdict', () => {
+    const prompt = nodeSelfCheckPrompt({ runId: 'r-node-4', nodeId: 'n_review', attempt: 3 })
+    A.match(prompt, /r-node-4/)
+    A.match(prompt, /n_review/)
+    A.match(prompt, /attempt=3/)
+    A.match(prompt, /```json/)
+    A.match(prompt, /"state":"working\|done\|blocked\|failed"/)
+    A.match(prompt, /verdict/)
+    A.match(prompt, /不要谎报完成/)
+    A.ok([...prompt].length <= 500, `提示词应简短（当前 ${[...prompt].length} 字）`)
+  })
+
+  await check('run 收尾 onSettled → nodeSupervision.unregisterRun(runId)', async () => {
+    await saveFlow(oneStageFlow('flow-rt-node-settle'))
+    const run = await makeRun('flow-rt-node-settle')
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      activate: async ({ node }) => passResult(node.id),
+    })
+    const removed = []
+    const original = runtime.nodeSupervision.unregisterRun.bind(runtime.nodeSupervision)
+    runtime.nodeSupervision.unregisterRun = runId => {
+      removed.push(runId)
+      return original(runId)
+    }
+    await runtime.start(run.id)
+    A.equal((await runtime.wait(run.id)).status, 'done')
+    A.ok(removed.includes(run.id), `run 收尾必须调 unregisterRun（实际 ${removed.join(',')}）`)
+    runtime.dispose()
+    A.equal(runtime.nodeSupervision.stop(), false, 'dispose 后节点闹钟定时器已停')
+  })
+
+  await check('nodeSupervision 注入每个 Engine 实例（engineDeps.nodeSupervision）', () => {
+    const seen = []
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      createEngine: options => {
+        seen.push(options.nodeSupervision)
+        return {
+          async start() { return {} },
+          async stop() { return {} },
+          async wait() { return {} },
+          async sweepStaleRuns() { return [] },
+          dispose() {},
+        }
+      },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    void runtime.start('r-inject-check').catch(() => {})
+    A.equal(seen.length, 1)
+    A.equal(seen[0], runtime.nodeSupervision)
     runtime.dispose()
   })
 

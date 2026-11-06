@@ -1,0 +1,45 @@
+{
+  "name": "@feiyueve/dsh-flow-studio",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 智能体工作流编排工作室：可视化画布拖拽节点、配置每个节点的执行方式（单个 agent / 主管 + 子 agent）与角色定位、设计需求分析→方案设计→结构设计→开发→测试→代码审查的状态流转与打回循环，流程模板保存在 Host 侧，后续可直接接执行引擎与指标看板。Visual agent-workflow studio for DeepSeek Harness: a drag-and-drop canvas where every node is an agent role, a stage machine with rejection loops, and saved flow templates.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node test/model.test.mjs && node test/host.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Flow Studio",
+    "description": "Design agent workflows on a drag-and-drop canvas: requirement analysis → solution design → structural design → development → test → code review, with rejection loops back to upstream stages. Every node is an agent role (a single agent, or a lead agent with sub-agents) and can reference skills; flow templates are stored locally."
+  }
+}

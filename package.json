@@ -41,5 +41,13 @@
   "license": "MIT",
   "engines": {
     "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:FeiyuEVE/dsh-flow-studio.git"
+  },
+  "homepage": "https://github.com/FeiyuEVE/dsh-flow-studio#readme",
+  "bugs": {
+    "url": "https://github.com/FeiyuEVE/dsh-flow-studio/issues"
   }
 }

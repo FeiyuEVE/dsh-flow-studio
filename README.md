@@ -78,7 +78,8 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
 
 ```sh
 # 本地目录开发
-dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
+git clone git@github.com:FeiyuEVE/dsh-flow-studio.git
+dsh plugin --profile web add ./dsh-flow-studio
 ```
 
 装完刷新页面，侧栏出现「流程编排」图标。Host 半边（路由）需要重启 `dsh web` 才挂载。

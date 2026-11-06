@@ -45,6 +45,15 @@ const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList } = await import('../src/client/flowlist.js')
 const { FlowStudioPage } = await import('../src/client/page.js')
+const {
+  FsLogDrawer, conclusionOf, drawerActionFor, eventCountText, eventKey, eventSummary,
+  filterEvents, findingsLineOf, isStaleLoad, nextDrawerOpen, nodeFindingsInfo,
+  nodeProgressText, normalizeRun, pageSlice, readUsage, sortEventsDesc,
+} = await import('../src/client/logdrawer.js')
+const {
+  FS_TOKEN_STORAGE_KEY, authorizationHeader, captureFsToken, exportUrl,
+  extractFsToken, requestFailureText,
+} = await import('../src/client/api.js')
 
 const flow = model.defaultFlow()
 flow.id = 'flow-test'
@@ -234,6 +243,330 @@ check('页面骨架在没有流程时给出加载态', () => {
   assert.ok(html.includes('fs-root'))
   assert.ok(html.includes('正在加载'))
   assert.ok(html.includes('.fs-node'), '样式没有随组件一起渲染')
+})
+
+// 运行日志抽屉：数据都走 initial* 注入，SSR 不跑 useEffect，正好验纯渲染状态机。
+const logRun = {
+  id: 'run-20261106-1',
+  name: '标准研发流水线 · 第一次',
+  flowId: 'flow-test',
+  flowName: '标准研发流水线',
+  status: 'done',
+  startedAt: '2026-11-06T10:00:00+08:00',
+  endedAt: '2026-11-06T10:12:00+08:00',
+  nodeDone: 5,
+  nodeTotal: 6,
+  tokenTotal: 50000,
+}
+const logUsage = { input: 8000, cacheRead: 40000, cacheWrite: 0, output: 2000, reasoning: 300 }
+const logSummary = {
+  tokens: {
+    // 与 Host `summarize()` 同形：total 是一个四桶对象，byNode 按节点分桶。
+    total: logUsage,
+    byNode: { n_req: { input: 1000, cacheRead: 2000, cacheWrite: 0, output: 500, reasoning: 100, total: 3500, calls: 1 } },
+  },
+  findings: { total: 2, unresolved: 1, bySeverity: { P0: 1, P1: 1 }, byStatus: { open: 1, verified: 1 } },
+  quality: { state: 'pass', label: '良：返工 1 轮后达标' },
+  computedAt: '2026-11-06T10:12:00+08:00',
+  eventCount: 4,
+}
+const logEvents = [
+  {
+    v: 1, ts: '2026-11-06T10:00:01+08:00', kind: 'run/start', runId: logRun.id,
+    attemptId: 1, seq: 1, traceId: 't0', data: { flowId: 'flow-test', flowName: '标准研发流水线', nodeTotal: 6 },
+  },
+  {
+    v: 1, ts: '2026-11-06T10:00:05+08:00', kind: 'node/start', runId: logRun.id,
+    nodeId: 'n_req', attemptId: 1, seq: 2, traceId: 't1', data: { title: '需求分析', mode: 'single' },
+  },
+  {
+    v: 1, ts: '2026-11-06T10:02:00+08:00', kind: 'review/finding', runId: logRun.id,
+    nodeId: 'n_req', attemptId: 1, seq: 3, traceId: 't2',
+    ref: { sessionId: 'sess-abc', logLine: 42 },
+    data: { id: 'f1', severity: 'P0', title: '缺少验收证据', status: 'open' },
+  },
+  {
+    v: 1, ts: '2026-11-06T10:03:00+08:00', kind: 'review/finding', runId: logRun.id,
+    nodeId: 'n_req', attemptId: 1, seq: 4, traceId: 't3',
+    data: { id: 'f2', severity: 'P1', title: '命名不一致', status: 'verified' },
+  },
+]
+
+check('抽屉收起态：run 名 · 状态点 · 四段 token 合计 · 结论 pill', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: false,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: logSummary,
+  }))
+  assert.ok(html.includes('标准研发流水线 · 第一次'), '收起条没显示 run 名')
+  assert.ok(html.includes('fs-log-dot success'), '状态点没有按 run 状态着色')
+  assert.ok(html.includes('四段合计 50k tok'), '没有把四段 token 合计成一行')
+  assert.ok(html.includes('入 8k · 缓存读 40k · 缓存写 0 · 出 2k'), '没有显示四段明细')
+  assert.ok(html.includes('良：返工 1 轮后达标'), '结论 pill 没显示 summary.quality.label')
+  assert.ok(html.includes('aria-expanded="false"'), '收起态缺少 aria-expanded')
+  assert.ok(!html.includes('事件详情'), '收起态不该渲染三栏明细')
+})
+
+check('抽屉无 run：显示「还没有运行记录」与「刷新」', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: false,
+    onToggle() {},
+    initialRuns: [],
+  }))
+  assert.ok(html.includes('还没有运行记录'), '无 run 时缺少空态文案')
+  assert.ok(html.includes('刷新'), '无 run 时缺少刷新入口')
+})
+
+check('抽屉错误态：给出可读失败文案与重试', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [],
+    initialError: '运行日志读取失败：连不上 Host',
+  }))
+  assert.ok(html.includes('运行日志读取失败：连不上 Host'), '错误文案没显示')
+  assert.ok(html.includes('重试'), '错误态缺少重试入口')
+})
+
+check('抽屉展开态：三栏渲染 run 列表 / 事件行 / 事件详情', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: logSummary,
+    // 与 Host readRunDetail 同形：只有 nodeId / attempts，标题要从 node/start 事件补。
+    initialDetail: { run: logRun, nodes: [{ nodeId: 'n_req', eventCount: 3, attempts: [{ attemptId: 1, eventCount: 3 }] }], eventCount: 4 },
+    initialEvents: logEvents,
+    initialSelectedEventKey: eventKey(logEvents[2]),
+    onJumpToNode() {},
+  }))
+  for (const needle of [
+    '运行记录 · 最近 20', '事件流', '事件详情', 'node/start', 'review/finding',
+    '缺少验收证据', '导出 md', '复制 runId', '刷新', '跳回画布',
+  ]) {
+    assert.ok(html.includes(needle), '展开态缺少「' + needle + '」')
+  }
+  assert.ok(html.includes('&quot;severity&quot;: &quot;P0&quot;'), '详情没有渲染原始 JSON')
+  assert.ok(html.includes('sess-abc') && html.includes('第 42 行'), 'ref 提示没渲染')
+  assert.ok(html.includes('3.5k'), '该节点 token 合计没渲染')
+  assert.ok(html.includes('共 2 条 · 未解决 1') && html.includes('P0 1'), 'findings 计数没渲染')
+  assert.ok(html.includes('已复验 1'), 'verified 的 finding 没进已复验计数')
+  assert.ok(html.includes('role="listbox"') && html.includes('aria-activedescendant'), '事件流缺少 listbox 键盘语义')
+  assert.ok(html.includes('第 1/1 页 · 200 条/页'), '缺少 200 条/页的分页信息')
+})
+
+check('done + 无 summary：结论 pill 为中性，不冒充绿色（审核 M8）', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: false,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+  }))
+  assert.ok(html.includes('fs-log-pill neutral'), '没有 quality 证据时 pill 必须是中性档')
+  assert.ok(html.includes('完成 · 质量未检测'), '中性 pill 要写清「质量未检测」')
+  assert.ok(!html.includes('fs-log-pill success'), '没有 summary 时绝不能出现绿 pill')
+  assert.equal(conclusionOf(logRun, null).tone, 'neutral')
+  assert.equal(conclusionOf(logRun, { quality: { state: 'pass' } }).tone, 'success')
+})
+
+check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工」（审核 m6）', () => {
+  const pass = conclusionOf(logRun, { quality: { state: 'pass', label: '优：首轮通过' } })
+  assert.equal(pass.tone, 'success')
+  assert.equal(pass.text, '优：首轮通过')
+  const warn = conclusionOf(logRun, { quality: { state: 'warn', label: '可：返工 2 轮后达标' } })
+  assert.equal(warn.tone, 'warn')
+  assert.ok(warn.text.startsWith('可：'), 'warn 档文案应以「可」开头')
+  assert.ok(!warn.text.includes('需返工'), 'warn 不是「需返工」，那是 fail / 未通过')
+  const warnNoLabel = conclusionOf(logRun, { quality: { state: 'warn' } })
+  assert.ok(!warnNoLabel.text.includes('需返工'), '缺 label 的 warn 也不能写成需返工')
+  const fail = conclusionOf(logRun, { quality: { state: 'fail', label: '需返工：测试未通过' } })
+  assert.equal(fail.tone, 'error', 'fail 必须是红档')
+  assert.ok(fail.text.includes('需返工'))
+  const unknown = conclusionOf(logRun, { quality: { state: 'unknown', label: '证据不足：测试未检测' } })
+  assert.equal(unknown.tone, 'warn', 'Host 明确判 unknown 时按 04 走黄（证据不足），不是绿')
+  const failed = conclusionOf({ ...logRun, status: 'failed' }, { quality: { state: 'pass' } })
+  assert.equal(failed.tone, 'error', '运行失败优先于质量结论')
+  assert.equal(failed.text, '失败')
+})
+
+check('findings 按 seq 升序取最后状态：先 open 后 verified 算已复验（审核 M4）', () => {
+  const events = sortEventsDesc([
+    {
+      kind: 'review/finding', nodeId: 'n_req', seq: 7, ts: '2026-11-06T10:02:00+08:00',
+      data: { id: 'f1', severity: 'P1', title: '命名不一致', status: 'open' },
+    },
+    {
+      kind: 'review/finding', nodeId: 'n_req', seq: 8, ts: '2026-11-06T10:03:00+08:00',
+      data: { id: 'f1', severity: 'P1', title: '命名不一致', status: 'verified' },
+    },
+  ])
+  // 事件流是倒序（verified 在前、open 在后）；旧实现「同 id 取最后一次」会被 open 覆盖。
+  const info = nodeFindingsInfo(null, 'n_req', events)
+  assert.equal(info.total, 1, '同一 finding id 只算一条')
+  assert.equal(info.open, 0, 'seq 更大的 verified 必须覆盖更早的 open')
+  assert.equal(info.verified, 1, 'verified 应单列为已复验')
+  assert.equal(info.bySeverity.P1, 1)
+  const line = findingsLineOf(info, { truncated: false, loadedCount: events.length })
+  assert.ok(line.includes('共 1 条 · 未解决 0'), '未解决数应按最新状态算 0')
+  assert.ok(line.includes('已复验 1'), '详情要显示已复验数')
+})
+
+check('截断与过滤口径：分母与「基于最近 N 条（截断）」（审核 m4）', () => {
+  assert.equal(
+    eventCountText({ filteredCount: 3, loadedCount: 12, total: 40, truncated: true, filterActive: false }),
+    '3 / 40 条 · 基于最近 12 条（截断）',
+    '截断时必须写明基于最近 N 条',
+  )
+  assert.equal(
+    eventCountText({ filteredCount: 1, loadedCount: 12, total: 40, truncated: false, filterActive: true }),
+    '筛出 1 / 1 条',
+    '过滤生效时分母用过滤后的长度，不拿全 run 的 total',
+  )
+  assert.equal(
+    eventCountText({ filteredCount: 4, loadedCount: 4, total: 4, truncated: false, filterActive: false }),
+    '4 / 4 条',
+  )
+  const line = findingsLineOf(
+    { total: 2, open: 1, verified: 0, bySeverity: { P0: 1, P1: 1, P2: 0 } },
+    { truncated: true, loadedCount: 1000 },
+  )
+  assert.ok(line.includes('基于最近 1000 条（截断）'), 'findings 计数基于截断事件时必须标注')
+  const summaryLine = findingsLineOf(
+    { total: 2, open: 1, verified: 0, bySeverity: { P0: 1, P1: 1, P2: 0 }, fromSummary: true },
+    { truncated: true, loadedCount: 1000 },
+  )
+  assert.ok(!summaryLine.includes('截断'), 'summary 是全量口径，不能误标成截断计数')
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: logSummary,
+    initialDetail: { run: logRun, nodes: [{ nodeId: 'n_req', eventCount: 4, attempts: [{ attemptId: 1, eventCount: 4 }] }], eventCount: 40 },
+    initialEvents: { events: logEvents, total: 40, truncated: true },
+    initialSelectedEventKey: eventKey(logEvents[2]),
+  }))
+  assert.ok(html.includes('基于最近 4 条（截断）'), '渲染层没有透出截断标注')
+})
+
+check('切 run 请求代次：旧响应与已切换 run 的响应都判为过期（审核 m5）', () => {
+  assert.equal(isStaleLoad({ requestId: 2, latestRequestId: 2, runId: 'a', selectedRunId: 'a' }), false)
+  assert.equal(isStaleLoad({ requestId: 1, latestRequestId: 2, runId: 'a', selectedRunId: 'a' }), true,
+    '同一 run 的旧请求不能覆盖新请求')
+  assert.equal(isStaleLoad({ requestId: 2, latestRequestId: 2, runId: 'a', selectedRunId: 'b' }), true,
+    '选中 run 已变化时必须丢弃旧响应')
+})
+
+check('数值 0 与未记录分开；skill/load 缺 ok 不写已加载（审核 m8）', () => {
+  const zero = readUsage({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0 })
+  assert.equal(zero.recorded, true, '四桶全 0 是「记录过且为 0」，不是未记录')
+  assert.equal(zero.total, 0)
+  assert.deepEqual(zero.missing, [], '显式给的 0 不算缺桶')
+  const absent = readUsage({})
+  assert.equal(absent.recorded, false)
+  assert.deepEqual(absent.missing, ['input', 'cacheRead', 'cacheWrite', 'output'])
+  assert.equal(eventSummary({ kind: 'skill/load', data: { skill: 'java-service' } }), 'java-service 加载状态未知',
+    '缺 ok 不能默认「已加载」')
+  assert.equal(eventSummary({ kind: 'skill/load', data: { skill: 'java-service', ok: true } }), 'java-service 已加载')
+  assert.equal(eventSummary({ kind: 'skill/load', data: { skill: 'java-service', ok: false } }), 'java-service 加载失败')
+  const modelCall = eventSummary({
+    kind: 'model/call',
+    data: { provider: 'p', model: 'm', usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 } },
+  })
+  assert.ok(modelCall.includes('token 0'), '记录过的 0 要显示 0')
+  assert.ok(!modelCall.includes('未记录'), '0 不能显示成未记录')
+})
+
+check('可选鉴权：fs_token 存一次、Authorization 头与 401 文案（05 §8.5）', () => {
+  const writes = []
+  const storage = {
+    setItem(key, value) { writes.push([key, value]) },
+    getItem() { return null },
+  }
+  assert.equal(extractFsToken('?fs_token=abc%20123'), 'abc 123')
+  assert.equal(extractFsToken('?foo=1'), '')
+  assert.equal(extractFsToken(''), '')
+  assert.equal(captureFsToken('?fs_token=tok-1', storage), 'tok-1')
+  assert.deepEqual(writes, [[FS_TOKEN_STORAGE_KEY, 'tok-1']], '令牌应存进 sessionStorage 一次')
+  assert.deepEqual(authorizationHeader('tok-1'), { Authorization: 'Bearer tok-1' })
+  assert.deepEqual(authorizationHeader(''), {}, '没有令牌时不加 Authorization 头')
+  assert.equal(requestFailureText(401, {}), '需要访问令牌：用 ?fs_token=… 打开一次')
+  assert.equal(requestFailureText(500, { error: '内部错误' }), '内部错误')
+})
+
+check('nodeDone/nodeTotal 只取 Host 值，缺失显示「—」（05 §8.3）', () => {
+  const full = normalizeRun({ id: 'r1', nodeDone: 5, nodeTotal: 6 })
+  assert.equal(full.nodeDone, 5)
+  assert.equal(nodeProgressText(full), '5/6')
+  const missing = normalizeRun({ id: 'r2' })
+  assert.equal(missing.nodeDone, null, '缺失的 nodeDone 不能落成 0')
+  assert.equal(missing.nodeTotal, null, '缺失的 nodeTotal 不能落成 0')
+  assert.equal(nodeProgressText(missing), '—')
+  assert.equal(nodeProgressText(normalizeRun({ id: 'r3', nodeDone: 2 })), '2/—')
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [{ id: 'run-noprog', name: '无进度', status: 'done' }],
+    initialRunId: 'run-noprog',
+    initialEvents: [{ kind: 'node/end', nodeId: 'n_req', attemptId: 1, seq: 1, data: { status: 'passed' } }],
+  }))
+  assert.ok(html.includes('完成 · —'), 'Host 没给进度时应显示「—」，不能用事件自行推出 1/1')
+  assert.ok(!html.includes('完成 · 1/1'), '客户端不许用事件自行推出进度')
+})
+
+check('未识别事件与缺失字段不抛错，降级成可读占位', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [{ id: 'run-bad' }],
+    initialRunId: 'run-bad',
+    initialEvents: [{ kind: 'future/unknown' }, {}],
+  }))
+  assert.ok(html.includes('run-bad'), '缺 name 的 run 没显示 id 兜底')
+  assert.ok(html.includes('未识别事件类型'), '未知 kind 没有降级文案')
+  assert.ok(html.includes('token 未记录'), '缺 usage 时没有如实写未记录')
+})
+
+check('运行日志数据归一化：缺桶、空事件、缺字段都不抛错', () => {
+  assert.equal(readUsage({ input: 1200 }).total, 1200)
+  assert.equal(readUsage({ output: 900, reasoning: 300 }).total, 900, 'reasoning 是 output 子集，不能重复加总')
+  assert.equal(readUsage(null).recorded, false)
+  assert.equal(readUsage({ cacheRead: 5, cacheWrite: 6, input: 7, output: 8 }).total, 26)
+  assert.equal(filterEvents([{ kind: 'a' }, { kind: 'b', nodeId: 'n' }], { nodeId: 'n' }).length, 1)
+  assert.equal(filterEvents(undefined, {}).length, 0)
+  const paged = pageSlice(Array.from({ length: 401 }, (_, index) => ({ kind: 'x', seq: index })), 3, 200)
+  assert.equal(paged.pageCount, 3, '401 条应分成 3 页')
+  assert.equal(paged.items.length, 1, '第 3 页应只剩 1 条')
+  assert.equal(eventSummary({ kind: 'future/x' }), '未识别事件类型（future/x）')
+  assert.equal(exportUrl('run-1'), '/api/flow-studio/runs/run-1/export')
+  const unordered = [{ ts: '2026-11-06T10:00:01+08:00', seq: 1 }, { ts: '2026-11-06T10:00:03+08:00', seq: 3 }]
+  assert.deepEqual(sortEventsDesc(unordered).map(event => event.seq), [3, 1], '事件流必须时间倒序')
+})
+
+check('Ctrl/Cmd+J 开关抽屉；C / Delete / 方向键不归抽屉抢', () => {
+  assert.equal(drawerActionFor({ key: 'j', ctrlKey: true }), 'toggle')
+  assert.equal(drawerActionFor({ key: 'J', metaKey: true }), 'toggle')
+  assert.equal(drawerActionFor({ key: 'j' }), null, '裸 J 不应开合抽屉')
+  assert.equal(drawerActionFor({ key: 'j', ctrlKey: true, shiftKey: true }), null, 'Ctrl+Shift+J 留给浏览器')
+  assert.equal(drawerActionFor({ key: 'j', ctrlKey: true, repeat: true }), null, '长按重复事件不应反复开合')
+  assert.equal(drawerActionFor({ key: 'j', ctrlKey: true, altKey: true }), null)
+  assert.equal(nextDrawerOpen(false), true)
+  assert.equal(nextDrawerOpen(true), false)
+  assert.equal(drawerActionFor({ key: 'c' }), null, 'C 是画布连线键，不能被抽屉吞掉')
+  assert.equal(drawerActionFor({ key: 'Delete' }), null, 'Delete 是画布删除键，不能被抽屉吞掉')
+  assert.equal(drawerActionFor({ key: 'ArrowDown' }), null, '方向键归事件流自身处理')
+})
+
+check('页面底部装配运行日志抽屉，且位于主体之后、底栏之前', () => {
+  const html = render(React.createElement(FlowStudioPage, { initialFlow: flow, initialSkills: [] }))
+  assert.ok(html.includes('class="fs-log"'), '页面没挂运行日志抽屉')
+  assert.ok(html.includes('aria-expanded="false"'), '抽屉默认应当是收起的')
+  const drawerAt = html.indexOf('class="fs-log"')
+  const footerAt = html.indexOf('class="fs-status"')
+  assert.ok(drawerAt > 0 && footerAt > drawerAt, '抽屉应在主体之后、底栏之前，不能遮挡检查器')
 })
 
 // ── B. 构建产物 ────────────────────────────────────────────────────────────

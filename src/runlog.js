@@ -1,0 +1,1526 @@
+/**
+ * 运行日志：事件契约（校验 / 归一化）与聚合口径。
+ *
+ * 这里是纯函数层，不碰 fs —— 落盘在 `runstore.js`。契约见
+ * `docs/design/05-run-log.md`：
+ *   - 未知 kind 一律拒绝，不静默存；
+ *   - 必填字段缺失就报错（`usage` 缺桶不补 0）；
+ *   - `ts` 非法 / 缺失用服务端时间补齐，并归一成 UTC ISO-8601；
+ *   - `extra` 有界（键 ≤16、单串 ≤256、总字节 ≤2048），超限丢弃不报错；
+ *   - 聚合确定性计算；`quality` 缺任一必要证据一律 `unknown`，绝不默认绿灯。
+ *
+ * @module @feiyueve/dsh-flow-studio/runlog
+ */
+
+import { Buffer } from 'node:buffer'
+
+/** §2 白名单：不在表里的 kind 一律拒绝。 */
+export const EVENT_KINDS = Object.freeze([
+  'run/start',
+  'run/end',
+  'node/start',
+  'node/end',
+  'member/start',
+  'member/end',
+  'model/call',
+  'tool/call',
+  'skill/load',
+  'artifact/write',
+  'reject/trigger',
+  'review/finding',
+  'review/verdict',
+  'check/form',
+  // 05 §8.2 v1.1 新增：没有这两类事件，quality 永远只能是 unknown。
+  'acceptance/verdict',
+  'test/report',
+])
+
+/** 单条事件序列化后的上限（字节，不含行尾换行）。 */
+export const MAX_EVENT_BYTES = 8 * 1024
+
+/** 单批追加的事件条数上限。 */
+export const MAX_BATCH_EVENTS = 200
+
+/** 单个 run 的事件总数上限。 */
+export const MAX_RUN_EVENTS = 200000
+
+/** extra 的三个边界。 */
+export const MAX_EXTRA_KEYS = 16
+export const MAX_EXTRA_STRING = 256
+export const MAX_EXTRA_BYTES = 2048
+
+/** runId / nodeId / attemptId / memberId 的字符集（§1）。 */
+export const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
+
+/** 用量四桶（互斥，reasoning 是 output 的子集，不另计）。 */
+export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
+
+const KIND_SET = new Set(EVENT_KINDS)
+
+/** run 级事件写到 run.jsonl；其余都要求 nodeId + attemptId（§1 目录布局）。 */
+const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end'])
+
+const RUN_END_STATUS = new Set(['done', 'aborted', 'failed'])
+const NODE_END_STATUS = new Set(['passed', 'rejected', 'failed', 'skipped'])
+const MEMBER_END_STATUS = new Set(['passed', 'failed', 'aborted'])
+const EXEC_MODE = new Set(['single', 'team'])
+const ARTIFACT_KIND = new Set(['md', 'diff', 'json', 'log'])
+const SEVERITY = new Set(['P0', 'P1', 'P2'])
+const FINDING_STATUS = new Set(['open', 'accepted', 'fixed', 'verified', 'dismissed'])
+const VERDICT = new Set(['approve', 'reject'])
+const CHECK_STATE = new Set(['pass', 'fail', 'skipped', 'na'])
+/** §8.2 acceptance/verdict 白名单。 */
+const ACCEPTANCE_STATUS = new Set(['pass', 'fail', 'skip', 'na'])
+const DECIDED_BY = new Set(['human', 'auto'])
+
+/** 顶层保留字段；其余未识别字段折叠进有界的 `extra`。 */
+const RESERVED_FIELDS = new Set([
+  'v', 'ts', 'kind', 'runId', 'nodeId', 'attemptId', 'memberId',
+  'traceId', 'data', 'ref', 'extra', 'seq',
+])
+
+const SEVERITY_ORDER = ['P0', 'P1', 'P2']
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function fail(field, reason) {
+  return { ok: false, field, reason }
+}
+
+/**
+ * 校验一个 id（runId / nodeId / memberId）。除了契约给的字符集，还挡掉
+ * `.`、`..` 与点开头（会撞 `.index` / `.tmp` 这类内部命名），防路径穿越。
+ * @param {unknown} value
+ * @returns {string | null} 合法时原样返回，否则 null
+ */
+export function checkRunId(value) {
+  if (typeof value !== 'string') return null
+  if (!ID_PATTERN.test(value)) return null
+  if (value === '.' || value === '..') return null
+  if (value.startsWith('.')) return null
+  return value
+}
+
+/**
+ * artifact 路径必须是 run 目录内的相对路径：拒绝绝对路径、`..` 段、反斜杠与空段。
+ * @param {unknown} value
+ */
+export function isSafeRelPath(value) {
+  if (typeof value !== 'string' || value === '' || value.length > 512) return false
+  if (value.startsWith('/') || value.startsWith('\\')) return false
+  if (value.includes('\0') || value.includes('\\')) return false
+  return value.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..')
+}
+
+function checkTraceId(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed.length > 128) return null
+  if (/[\u0000-\u001f\u007f]/.test(value)) return null
+  return trimmed
+}
+
+function normalizeTs(value, now) {
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString()
+  }
+  return now.toISOString()
+}
+
+/**
+ * extra 有界化：只保留标量、丢弃超长字符串与嵌套值，键数 / 总字节超限就停。
+ * 从不抛错（§2 的「超限丢弃不报错」）。
+ * @param {Record<string, unknown>} source
+ */
+function boundExtra(source) {
+  const out = {}
+  let kept = 0
+  // 只看前 64 个键：extra 本身最多 16 个，扫过多只会放大恶意输入的成本。
+  for (const [key, value] of Object.entries(source).slice(0, 64)) {
+    if (kept >= MAX_EXTRA_KEYS) break
+    if (typeof key !== 'string' || key === '') continue
+    let scalar
+    if (typeof value === 'string') {
+      if (value.length > MAX_EXTRA_STRING) continue
+      scalar = value
+    } else if (typeof value === 'number') {
+      if (!Number.isFinite(value)) continue
+      scalar = value
+    } else if (typeof value === 'boolean' || value === null) {
+      scalar = value
+    } else {
+      continue
+    }
+    const candidate = { ...out, [key]: scalar }
+    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_EXTRA_BYTES) continue
+    out[key] = scalar
+    kept += 1
+  }
+  return out
+}
+
+function normalizeRef(value) {
+  if (!isPlainObject(value)) return fail('ref', 'ref 必须是 JSON 对象')
+  const out = {}
+  if (value.sessionId !== undefined && value.sessionId !== null) {
+    if (typeof value.sessionId !== 'string' || value.sessionId.trim() === '' || value.sessionId.length > 128) {
+      return fail('ref.sessionId', '必须是非空字符串（≤128 字符）')
+    }
+    out.sessionId = value.sessionId
+  }
+  if (value.logLine !== undefined && value.logLine !== null) {
+    if (!Number.isInteger(value.logLine) || value.logLine < 0) {
+      return fail('ref.logLine', '必须是非负整数')
+    }
+    out.logLine = value.logLine
+  }
+  // §8.1：可选；没有就只显示文字引用，不假装是可点击链接。
+  if (value.url !== undefined && value.url !== null) {
+    if (typeof value.url !== 'string' || value.url.trim() === '' || value.url.length > 512) {
+      return fail('ref.url', '必须是非空字符串（≤512 字符）')
+    }
+    out.url = value.url
+  }
+  if (Object.keys(out).length === 0) return fail('ref', '至少要给 sessionId / logLine / url 之一')
+  return { ok: true, value: out }
+}
+
+function normalizeUsage(value) {
+  if (!isPlainObject(value)) return { ok: false, key: null, reason: 'usage 必须是 JSON 对象' }
+  const usage = {}
+  for (const key of USAGE_BUCKETS) {
+    const bucket = value[key]
+    if (bucket === undefined || bucket === null) {
+      return { ok: false, key, reason: '缺少必填桶（不补 0）' }
+    }
+    if (!Number.isInteger(bucket) || bucket < 0 || bucket > Number.MAX_SAFE_INTEGER) {
+      return { ok: false, key, reason: '必须是非负整数' }
+    }
+    usage[key] = bucket
+  }
+  if (value.reasoning !== undefined && value.reasoning !== null) {
+    const reasoning = value.reasoning
+    if (!Number.isInteger(reasoning) || reasoning < 0 || reasoning > Number.MAX_SAFE_INTEGER) {
+      return { ok: false, key: 'reasoning', reason: '必须是非负整数' }
+    }
+    if (reasoning > usage.output) {
+      return { ok: false, key: 'reasoning', reason: 'reasoning 是 output 的子集，不能大于 output' }
+    }
+    usage.reasoning = reasoning
+  }
+  return { ok: true, usage }
+}
+
+function strField(data, key, { required = true, max = 256 } = {}) {
+  const value = data[key]
+  if (value === undefined || value === null) {
+    return required ? { ok: false, reason: '缺少必填字段' } : { ok: true, present: false }
+  }
+  if (typeof value !== 'string') return { ok: false, reason: '必须是字符串' }
+  if (value.trim() === '') return { ok: false, reason: '不能为空字符串' }
+  if (value.length > max) return { ok: false, reason: `超过 ${max} 字符` }
+  return { ok: true, value, present: true }
+}
+
+function strArrayField(data, key, { required = true, maxItems = 12, maxLen = 64 } = {}) {
+  const value = data[key]
+  if (value === undefined || value === null) {
+    return required ? { ok: false, reason: '缺少必填字段' } : { ok: true, present: false }
+  }
+  if (!Array.isArray(value)) return { ok: false, reason: '必须是字符串数组' }
+  if (value.length > maxItems) return { ok: false, reason: `最多 ${maxItems} 项` }
+  const out = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item.trim() === '') return { ok: false, reason: '每一项都必须是非空字符串' }
+    if (item.length > maxLen) return { ok: false, reason: `单项不超过 ${maxLen} 字符` }
+    out.push(item)
+  }
+  return { ok: true, value: out, present: true }
+}
+
+/**
+ * 逐 kind 校验 data，并把已识别的字段归一化写回；未知 data 字段保留（前向兼容，
+ * 事件总字节上限会兜住体积）。
+ * @param {string} kind
+ * @param {Record<string, unknown>} data
+ */
+function validateData(kind, data) {
+  const out = { ...data }
+  const err = (key, reason) => ({ ok: false, field: key ? `data.${key}` : 'data', reason })
+
+  const putStr = (key, max = 256, required = true) => {
+    const result = strField(data, key, { required, max })
+    if (!result.ok) return err(key, result.reason)
+    if (result.present) out[key] = result.value
+    else delete out[key]
+    return null
+  }
+  const putEnum = (key, allowed) => {
+    const value = data[key]
+    if (value === undefined || value === null) return err(key, '缺少必填字段')
+    if (typeof value !== 'string' || !allowed.has(value)) {
+      return err(key, `取值必须是 ${[...allowed].join(' / ')}`)
+    }
+    out[key] = value
+    return null
+  }
+  const putInt = (key, { required = true, min = 0 } = {}) => {
+    const value = data[key]
+    if (value === undefined || value === null) {
+      if (required) return err(key, '缺少必填字段')
+      delete out[key]
+      return null
+    }
+    if (!Number.isInteger(value) || value < min || value > Number.MAX_SAFE_INTEGER) {
+      return err(key, `必须是 ≥${min} 的整数`)
+    }
+    out[key] = value
+    return null
+  }
+  const putNum = (key, { required = true, min = 0 } = {}) => {
+    const value = data[key]
+    if (value === undefined || value === null) {
+      if (required) return err(key, '缺少必填字段')
+      delete out[key]
+      return null
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min) {
+      return err(key, `必须是 ≥${min} 的有限数字`)
+    }
+    out[key] = value
+    return null
+  }
+  const putBool = (key, { required = true } = {}) => {
+    const value = data[key]
+    if (value === undefined || value === null) {
+      if (required) return err(key, '缺少必填字段')
+      delete out[key]
+      return null
+    }
+    if (typeof value !== 'boolean') return err(key, '必须是布尔值')
+    out[key] = value
+    return null
+  }
+
+  switch (kind) {
+    case 'run/start': {
+      let bad = putStr('flowId', 128) || putStr('flowName', 200) || putInt('nodeTotal', { min: 0 })
+      if (bad) return bad
+      break
+    }
+    case 'run/end': {
+      let bad = putEnum('status', RUN_END_STATUS)
+      if (bad) return bad
+      bad = putStr('reason', 2000, false)
+      if (bad) return bad
+      break
+    }
+    case 'node/start': {
+      let bad = putStr('title', 512) || putEnum('mode', EXEC_MODE)
+      if (bad) return bad
+      bad = putStr('model', 128, false)
+      if (bad) return bad
+      const skills = strArrayField(data, 'skills', { required: true, maxItems: 12, maxLen: 64 })
+      if (!skills.ok) return err('skills', skills.reason)
+      out.skills = skills.value
+      break
+    }
+    case 'node/end': {
+      let bad = putEnum('status', NODE_END_STATUS)
+      if (bad) return bad
+      bad = putNum('durationMs', { min: 0 })
+      if (bad) return bad
+      break
+    }
+    case 'member/start': {
+      let bad = putStr('name', 200)
+      if (bad) return bad
+      bad = putStr('role', 64, false) || putStr('model', 128, false)
+      if (bad) return bad
+      break
+    }
+    case 'member/end': {
+      // §8.1：status 白名单收窄（原来接受任意 ≤32 字符字符串）。
+      let bad = putEnum('status', MEMBER_END_STATUS)
+      if (bad) return bad
+      bad = putNum('durationMs', { min: 0 })
+      if (bad) return bad
+      break
+    }
+    case 'model/call': {
+      let bad = putStr('provider', 128) || putStr('model', 128)
+      if (bad) return bad
+      const usage = normalizeUsage(data.usage)
+      if (!usage.ok) {
+        return err(usage.key ? `usage.${usage.key}` : 'usage', usage.reason)
+      }
+      out.usage = usage.usage
+      // §8.1：callId 必填（同一次调用的重试共用同一个 callId）。
+      bad = putStr('callId', 128)
+      if (bad) return bad
+      bad = putStr('stopReason', 128, false)
+      if (bad) return bad
+      break
+    }
+    case 'tool/call': {
+      let bad = putStr('name', 200)
+      if (bad) return bad
+      bad = putStr('argumentsDigest', 512, false)
+      if (bad) return bad
+      bad = putBool('ok')
+      if (bad) return bad
+      bad = putNum('durationMs', { required: false, min: 0 })
+      if (bad) return bad
+      break
+    }
+    case 'skill/load': {
+      let bad = putStr('skill', 128) || putBool('ok')
+      if (bad) return bad
+      break
+    }
+    case 'artifact/write': {
+      const path = data.path
+      if (path === undefined || path === null) return err('path', '缺少必填字段')
+      if (!isSafeRelPath(path)) return err('path', '必须是 run 目录内的相对路径（禁止绝对路径与 .. 段）')
+      out.path = path
+      let bad = putInt('bytes', { min: 0 }) || putEnum('kind', ARTIFACT_KIND)
+      if (bad) return bad
+      // §8.1：sha256 可选但推荐；给了就校验成 64 位十六进制，没给由展示层标注「未校验」。
+      if (data.sha256 !== undefined && data.sha256 !== null) {
+        if (typeof data.sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(data.sha256)) {
+          return err('sha256', '必须是 64 位十六进制摘要')
+        }
+        out.sha256 = data.sha256.toLowerCase()
+      }
+      break
+    }
+    case 'reject/trigger': {
+      let bad = putStr('edgeId', 128)
+      if (bad) return bad
+      for (const key of ['fromNodeId', 'toNodeId']) {
+        const value = data[key]
+        if (typeof value !== 'string' || !checkRunId(value)) {
+          return err(key, '必须是合法的节点 id')
+        }
+        out[key] = value
+      }
+      bad = putStr('reason', 2000)
+      if (bad) return bad
+      break
+    }
+    case 'review/finding': {
+      let bad = putStr('id', 128) || putEnum('severity', SEVERITY)
+      if (bad) return bad
+      bad = putStr('category', 64, false) || putStr('title', 512)
+      if (bad) return bad
+      bad = putEnum('status', FINDING_STATUS)
+      if (bad) return bad
+      break
+    }
+    case 'review/verdict': {
+      let bad = putEnum('verdict', VERDICT) || putInt('findingCount', { min: 0 })
+      if (bad) return bad
+      break
+    }
+    case 'check/form': {
+      let bad = putStr('ruleSetId', 128) || putStr('executor', 128)
+      if (bad) return bad
+      const version = data.ruleSetVersion
+      if (version === undefined || version === null) return err('ruleSetVersion', '缺少必填字段')
+      if (typeof version !== 'string' && typeof version !== 'number') {
+        return err('ruleSetVersion', '必须是字符串或数字')
+      }
+      if (typeof version === 'number' && !Number.isFinite(version)) {
+        return err('ruleSetVersion', '必须是有限数字')
+      }
+      const versionText = String(version)
+      if (versionText.trim() === '' || versionText.length > 128) {
+        return err('ruleSetVersion', '必须是非空字符串（≤128 字符）')
+      }
+      out.ruleSetVersion = versionText
+      bad = putEnum('state', CHECK_STATE)
+      if (bad) return bad
+      bad = putInt('passedChecks', { required: false, min: 0 })
+        || putInt('totalChecks', { required: false, min: 0 })
+        || putStr('reportRef', 512, false)
+        || putStr('executedAt', 64, false)
+      if (bad) return bad
+      if (out.passedChecks !== undefined && out.totalChecks !== undefined
+        && out.passedChecks > out.totalChecks) {
+        return err('passedChecks', '不能大于 totalChecks')
+      }
+      break
+    }
+    case 'acceptance/verdict': {
+      // §8.2：itemId 在 run 内唯一（聚合按 itemId 取 seq 最大者）。
+      let bad = putStr('itemId', 128) || putEnum('status', ACCEPTANCE_STATUS) || putEnum('decidedBy', DECIDED_BY)
+      if (bad) return bad
+      bad = putStr('evidenceRef', 512, false) || putStr('decidedAt', 64, false)
+      if (bad) return bad
+      break
+    }
+    case 'test/report': {
+      let bad = putStr('suite', 128)
+        || putInt('executed', { min: 0 })
+        || putInt('passed', { min: 0 })
+        || putInt('failed', { min: 0 })
+        || putInt('skipped', { min: 0 })
+      if (bad) return bad
+      bad = putStr('reportRef', 512, false)
+      if (bad) return bad
+      const failures = strArrayField(data, 'failures', { required: false, maxItems: 50, maxLen: 200 })
+      if (!failures.ok) return err('failures', failures.reason)
+      if (failures.present) out.failures = failures.value
+      break
+    }
+    default:
+      // 白名单已挡过，这里只是防御式兜底。
+      return err('', `未实现的 kind：${kind}`)
+  }
+  return { ok: true, data: out }
+}
+
+/**
+ * 校验并归一化一条事件。
+ *
+ * @param {unknown} raw 客户端给的事件
+ * @param {{ runId?: string, now?: Date }} [ctx] 上下文：URL 里的 runId 与服务端时间
+ * @returns {{ ok: true, event: Record<string, unknown> } | { ok: false, field: string, reason: string }}
+ */
+export function normalizeEvent(raw, ctx = {}) {
+  if (!isPlainObject(raw)) return fail('event', '事件必须是 JSON 对象')
+  if (raw.v !== 1) return fail('v', 'v 必须为 1（当前事件格式版本）')
+  const kind = raw.kind
+  if (typeof kind !== 'string' || !KIND_SET.has(kind)) {
+    return fail('kind', `未知事件类型：${String(kind)}（白名单见 EVENT_KINDS）`)
+  }
+
+  // runId：事件里给了就必须与 URL 一致；没给就用 URL 的（服务端上下文补全）。
+  if (raw.runId !== undefined && raw.runId !== null
+    && typeof ctx.runId === 'string' && ctx.runId !== '' && raw.runId !== ctx.runId) {
+    return fail('runId', `与请求路径中的 runId（${ctx.runId}）不一致`)
+  }
+  const runId = checkRunId(raw.runId === undefined || raw.runId === null ? ctx.runId : raw.runId)
+  if (!runId) {
+    return fail('runId', '非法 runId（只允许字母、数字、点、下划线、连字符，1–64 位，且不能以点开头）')
+  }
+
+  const nodeLevel = !RUN_LEVEL_KINDS.has(kind)
+  // §8.1：run 级事件（只有 run/start、run/end）带 nodeId/attemptId 要 400，
+  // 否则会污染节点索引；其余 kind 必须同时带 nodeId + attemptId。
+  if (!nodeLevel) {
+    if (raw.nodeId !== undefined && raw.nodeId !== null) {
+      return fail('nodeId', 'run 级事件（run/start、run/end）不能带 nodeId')
+    }
+    if (raw.attemptId !== undefined && raw.attemptId !== null) {
+      return fail('attemptId', 'run 级事件（run/start、run/end）不能带 attemptId')
+    }
+  }
+  let nodeId = null
+  if (raw.nodeId !== undefined && raw.nodeId !== null) {
+    nodeId = checkRunId(raw.nodeId)
+    if (!nodeId) return fail('nodeId', '非法 nodeId（只允许字母、数字、点、下划线、连字符，1–64 位）')
+  }
+  if (nodeLevel && nodeId === null) return fail('nodeId', '节点事件必须带 nodeId')
+
+  let attemptId = null
+  if (raw.attemptId !== undefined && raw.attemptId !== null) {
+    if (!Number.isInteger(raw.attemptId) || raw.attemptId < 1 || raw.attemptId > Number.MAX_SAFE_INTEGER) {
+      return fail('attemptId', '必须是从 1 开始的正整数')
+    }
+    attemptId = raw.attemptId
+  }
+  if (nodeLevel && attemptId === null) return fail('attemptId', '节点事件必须带正整数 attemptId')
+
+  let memberId = raw.memberId === undefined ? null : raw.memberId
+  if (memberId !== null) {
+    memberId = checkRunId(memberId)
+    if (!memberId) return fail('memberId', '非法 memberId（只允许字母、数字、点、下划线、连字符，1–64 位）')
+  }
+  if ((kind === 'member/start' || kind === 'member/end') && memberId === null) {
+    return fail('memberId', 'member 事件必须带 memberId')
+  }
+
+  const traceId = checkTraceId(raw.traceId)
+  if (!traceId) return fail('traceId', '必须是非空字符串（≤128 字符，不含控制字符）')
+
+  if (raw.data !== undefined && !isPlainObject(raw.data)) return fail('data', 'data 必须是 JSON 对象')
+  const checked = validateData(kind, raw.data === undefined ? {} : raw.data)
+  if (!checked.ok) return checked
+
+  const now = ctx.now instanceof Date && !Number.isNaN(ctx.now.getTime()) ? ctx.now : new Date()
+  const ts = normalizeTs(raw.ts, now)
+
+  let ref
+  if (raw.ref !== undefined && raw.ref !== null) {
+    const checkedRef = normalizeRef(raw.ref)
+    if (!checkedRef.ok) return checkedRef
+    ref = checkedRef.value
+  }
+
+  const extraSource = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (!RESERVED_FIELDS.has(key)) extraSource[key] = value
+  }
+  if (raw.extra !== undefined) {
+    if (!isPlainObject(raw.extra)) return fail('extra', 'extra 必须是 JSON 对象')
+    Object.assign(extraSource, raw.extra)
+  }
+  const extra = boundExtra(extraSource)
+
+  const event = {
+    v: 1,
+    ts,
+    kind,
+    runId,
+    ...(nodeId ? { nodeId } : {}),
+    ...(attemptId !== null ? { attemptId } : {}),
+    memberId,
+    traceId,
+    data: checked.data,
+  }
+  if (ref) event.ref = ref
+  if (Object.keys(extra).length > 0) event.extra = extra
+
+  if (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES) {
+    return fail('event', `单条事件超过 ${MAX_EVENT_BYTES} 字节（事件行上限 8KB）`)
+  }
+  return { ok: true, event }
+}
+
+// ---------------------------------------------------------------------------
+// 聚合（§4）：全部纯函数，输入是已落盘 / 已排序的事件数组。
+// ---------------------------------------------------------------------------
+
+function emptyBucket() {
+  return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, total: 0, calls: 0 }
+}
+
+function addUsage(bucket, usage) {
+  const input = Number.isFinite(usage.input) ? usage.input : 0
+  const cacheRead = Number.isFinite(usage.cacheRead) ? usage.cacheRead : 0
+  const cacheWrite = Number.isFinite(usage.cacheWrite) ? usage.cacheWrite : 0
+  const output = Number.isFinite(usage.output) ? usage.output : 0
+  bucket.input += input
+  bucket.cacheRead += cacheRead
+  bucket.cacheWrite += cacheWrite
+  bucket.output += output
+  bucket.reasoning += Number.isFinite(usage.reasoning) ? usage.reasoning : 0
+  bucket.total += input + cacheRead + cacheWrite + output
+  bucket.calls += 1
+}
+
+function sortedObject(map) {
+  return Object.fromEntries([...map.entries()].sort(([a], [b]) => String(a).localeCompare(String(b))))
+}
+
+/**
+ * token 四桶：按 nodeId / memberId 分组，`reasoning` 单列且不进 total；
+ * 同一 `traceId + data.callId` 的用量按「后到整条替换」处理（§3）。
+ */
+export function computeTokens(events = []) {
+  const keyed = new Map()
+  const unkeyed = []
+  for (const event of events) {
+    if (!event || event.kind !== 'model/call') continue
+    const usage = event.data && event.data.usage
+    if (!isPlainObject(usage)) continue
+    const callId = event.data.callId
+    const record = { event, usage }
+    if (typeof callId === 'string' && callId !== '') {
+      keyed.set(`${event.traceId}\u0000${callId}`, record)
+    } else {
+      unkeyed.push(record)
+    }
+  }
+  const effective = [...keyed.values(), ...unkeyed]
+    .sort((a, b) => (a.event.seq ?? 0) - (b.event.seq ?? 0))
+
+  const total = emptyBucket()
+  const nodeMap = new Map()
+  const memberMap = new Map()
+  for (const { event, usage } of effective) {
+    addUsage(total, usage)
+    const nodeKey = event.nodeId || '(run)'
+    if (!nodeMap.has(nodeKey)) nodeMap.set(nodeKey, emptyBucket())
+    addUsage(nodeMap.get(nodeKey), usage)
+    if (event.memberId) {
+      if (!memberMap.has(event.memberId)) memberMap.set(event.memberId, emptyBucket())
+      addUsage(memberMap.get(event.memberId), usage)
+    }
+  }
+  return {
+    total,
+    byNode: sortedObject(nodeMap),
+    byMember: sortedObject(memberMap),
+    calls: effective.length,
+    // §8.1：没有 callId 的用量事件（历史数据）按逐条累加处理，单列供核对。
+    unkeyedCalls: unkeyed.length,
+  }
+}
+
+/**
+ * skill 覆盖：声明集 = `node/start.data.skills` 的唯一名；加载集 = 成功
+ * `skill/load` 的唯一名。coverage = |声明 ∩ 已加载| / |声明|（声明为 0 时 null，
+ * 不拿 100% 冒充）。加载次数成功 / 失败单列。
+ */
+export function computeSkillUsage(events = []) {
+  const declared = new Set()
+  const loadedOk = new Set()
+  const loadedFailed = new Set()
+  const bySkill = new Map()
+  let loadTotal = 0
+
+  for (const event of events) {
+    if (!event) continue
+    if (event.kind === 'node/start' && event.data && Array.isArray(event.data.skills)) {
+      for (const skill of event.data.skills) {
+        if (typeof skill === 'string' && skill.trim() !== '') declared.add(skill)
+      }
+    }
+    if (event.kind === 'skill/load' && event.data && typeof event.data.skill === 'string') {
+      const skill = event.data.skill
+      if (skill.trim() === '') continue
+      loadTotal += 1
+      if (event.data.ok === true) loadedOk.add(skill)
+      else loadedFailed.add(skill)
+      if (!bySkill.has(skill)) bySkill.set(skill, { ok: 0, failed: 0 })
+      const counts = bySkill.get(skill)
+      if (event.data.ok === true) counts.ok += 1
+      else counts.failed += 1
+    }
+  }
+
+  const loaded = [...loadedOk]
+  const intersection = [...declared].filter(skill => loadedOk.has(skill))
+  const declaredList = [...declared]
+  return {
+    declared: declaredList.sort((a, b) => a.localeCompare(b)),
+    declaredCount: declared.size,
+    loaded: loaded.sort((a, b) => a.localeCompare(b)),
+    loadedCount: loadedOk.size,
+    missing: declaredList.filter(skill => !loadedOk.has(skill)).sort((a, b) => a.localeCompare(b)),
+    undeclared: [...new Set([...loadedOk, ...loadedFailed])]
+      .filter(skill => !declared.has(skill))
+      .sort((a, b) => a.localeCompare(b)),
+    coverage: declared.size === 0 ? null : intersection.length / declared.size,
+    loads: {
+      total: loadTotal,
+      ok: [...loadedOk].reduce((sum, skill) => sum + bySkill.get(skill).ok, 0),
+      failed: [...loadedFailed].reduce((sum, skill) => sum + bySkill.get(skill).failed, 0),
+    },
+    bySkill: sortedObject(bySkill),
+  }
+}
+
+/**
+ * 审查发现：run 内按 `id` 全局唯一，取 seq 最大的一次状态；未解决 = open + accepted + fixed，
+ * verified 与 dismissed 单列（采纳 ≠ 修复 ≠ 复验，§4 / 04 §3.10.4）。
+ * 另给 `byNode`（§8 补充）：每条唯一 finding 归到它**最新状态事件**所在的 nodeId。
+ */
+export function computeFindings(events = []) {
+  const latest = new Map()
+  let reportedCount = 0
+  for (const event of sortEvents(events)) {
+    if (!event || event.kind !== 'review/finding' || !event.data) continue
+    const id = event.data.id
+    if (typeof id !== 'string' || id === '') continue
+    reportedCount += 1
+    const previous = latest.get(id)
+    if (previous && seqOf(event) < seqOf(previous.event)) continue
+    latest.set(id, {
+      id,
+      severity: event.data.severity,
+      status: event.data.status,
+      title: event.data.title,
+      nodeId: typeof event.nodeId === 'string' ? event.nodeId : null,
+      event,
+    })
+  }
+
+  const byStatus = { open: 0, accepted: 0, fixed: 0, verified: 0, dismissed: 0 }
+  const bySeverity = { P0: 0, P1: 0, P2: 0 }
+  const unresolvedBySeverity = { P0: 0, P1: 0, P2: 0 }
+  const verifiedBySeverity = { P0: 0, P1: 0, P2: 0 }
+  const dismissedBySeverity = { P0: 0, P1: 0, P2: 0 }
+  const byNodeMap = new Map()
+
+  for (const finding of latest.values()) {
+    const severity = SEVERITY.has(finding.severity) ? finding.severity : 'P2'
+    bySeverity[severity] += 1
+    if (Object.hasOwn(byStatus, finding.status)) byStatus[finding.status] += 1
+    if (['open', 'accepted', 'fixed'].includes(finding.status)) {
+      unresolvedBySeverity[severity] += 1
+    } else if (finding.status === 'verified') {
+      verifiedBySeverity[severity] += 1
+    } else if (finding.status === 'dismissed') {
+      dismissedBySeverity[severity] += 1
+    }
+
+    // §8 补充：按节点拆分（同 id 已在上面去重，run 内只出现一次）。
+    if (finding.nodeId === null) continue
+    if (!byNodeMap.has(finding.nodeId)) {
+      byNodeMap.set(finding.nodeId, {
+        total: 0,
+        unresolved: 0,
+        verified: 0,
+        dismissed: 0,
+        byStatus: { open: 0, accepted: 0, fixed: 0, verified: 0, dismissed: 0 },
+        bySeverity: { P0: 0, P1: 0, P2: 0 },
+      })
+    }
+    const node = byNodeMap.get(finding.nodeId)
+    node.total += 1
+    node.bySeverity[severity] += 1
+    if (Object.hasOwn(node.byStatus, finding.status)) node.byStatus[finding.status] += 1
+    if (['open', 'accepted', 'fixed'].includes(finding.status)) node.unresolved += 1
+    else if (finding.status === 'verified') node.verified += 1
+    else if (finding.status === 'dismissed') node.dismissed += 1
+  }
+
+  const unresolved = unresolvedBySeverity.P0 + unresolvedBySeverity.P1 + unresolvedBySeverity.P2
+  const verified = verifiedBySeverity.P0 + verifiedBySeverity.P1 + verifiedBySeverity.P2
+  const dismissed = dismissedBySeverity.P0 + dismissedBySeverity.P1 + dismissedBySeverity.P2
+  // §8.3：采纳率 = (accepted + fixed + verified) / (total − dismissed − na)；分母 0 → unknown。
+  // 当前 finding 状态白名单里没有 na，保留变量以便未来扩展时口径不变。
+  const notApplicable = 0
+  const acceptedRateDenominator = latest.size - dismissed - notApplicable
+  const acceptedCount = byStatus.accepted + byStatus.fixed + byStatus.verified
+  const acceptedRate = acceptedRateDenominator <= 0 ? null : acceptedCount / acceptedRateDenominator
+  return {
+    total: latest.size,
+    reportedCount,
+    bySeverity,
+    byStatus,
+    byNode: sortedObject(byNodeMap),
+    unresolved,
+    unresolvedBySeverity,
+    verified,
+    verifiedBySeverity,
+    dismissed,
+    dismissedBySeverity,
+    acceptedCount,
+    acceptedRateDenominator,
+    acceptedRate,
+    acceptedRateUnknown: acceptedRate === null,
+  }
+}
+
+/** 打回：按边与目标节点两个维度各出一份计数。 */
+export function computeRejects(events = []) {
+  const byEdge = new Map()
+  const byTarget = new Map()
+  let total = 0
+  for (const event of events) {
+    if (!event || event.kind !== 'reject/trigger' || !event.data) continue
+    total += 1
+    const edgeId = typeof event.data.edgeId === 'string' ? event.data.edgeId : '(unknown)'
+    const toNodeId = typeof event.data.toNodeId === 'string' ? event.data.toNodeId : '(unknown)'
+    byEdge.set(edgeId, (byEdge.get(edgeId) || 0) + 1)
+    byTarget.set(toNodeId, (byTarget.get(toNodeId) || 0) + 1)
+  }
+  return {
+    total,
+    byEdge: Object.fromEntries([...byEdge.entries()].sort(([a], [b]) => a.localeCompare(b))),
+    byTarget: Object.fromEntries([...byTarget.entries()].sort(([a], [b]) => a.localeCompare(b))),
+  }
+}
+
+function seqOf(event) {
+  return Number.isInteger(event && event.seq) ? event.seq : 0
+}
+
+/** 事件按 seq 升序（缺失 seq 的退回 ts，再退回原顺序）。 */
+function sortEvents(events) {
+  return [...events].sort((a, b) => {
+    const sa = seqOf(a)
+    const sb = seqOf(b)
+    if (sa !== sb) return sa - sb
+    const ta = typeof a?.ts === 'string' ? Date.parse(a.ts) : Number.NaN
+    const tb = typeof b?.ts === 'string' ? Date.parse(b.ts) : Number.NaN
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb
+    return 0
+  })
+}
+
+/**
+ * 每个节点当前的 attemptId（该节点见过的最大的 attemptId）。
+ * §8.2 / §8.3：旧 attempt 的结论不进入当前聚合。
+ */
+export function currentAttempts(events = []) {
+  const map = new Map()
+  for (const event of events) {
+    if (!event || typeof event.nodeId !== 'string' || !Number.isInteger(event.attemptId)) continue
+    const current = map.get(event.nodeId)
+    if (current === undefined || event.attemptId > current) map.set(event.nodeId, event.attemptId)
+  }
+  return map
+}
+
+/** 节点事件是否属于该节点的当前 attempt；run 级事件恒为 true。 */
+function isCurrentAttempt(event, attempts) {
+  if (!event || typeof event.nodeId !== 'string') return true
+  if (!Number.isInteger(event.attemptId)) return false
+  const current = attempts.get(event.nodeId)
+  return current === undefined || event.attemptId === current
+}
+
+/** 过滤出当前 attempt 的事件（用于 quality 证据，不用于 findings 的全局生命周期）。 */
+function currentAttemptEvents(events) {
+  const attempts = currentAttempts(events)
+  return events.filter(event => isCurrentAttempt(event, attempts))
+}
+
+/**
+ * 阶段进度（§8.3）。
+ *
+ * - 每个阶段只认**当前 attempt**（该节点最大的 attemptId）的 `node/end`；
+ * - 打回时从 `toNodeId` 到 `fromNodeId` 路径上的 passed 失效：日志里没有边拓扑，
+ *   用可复算的时间窗近似——目标节点最近一次 passed 的 seq 到打回 seq 之间
+ *   passed 的节点（含两端）判为路径内；端点无论如何都失效；
+ * - 失效的 passed 单列 `invalidated`，不进分子；分母仍是「总阶段 − skipped」；
+ * - `ratio` 强制 ≤ 1，旧 attempt 的结论不计。
+ */
+export function computeProgress(events = []) {
+  const sorted = sortEvents(events)
+  let nodeTotal = null
+  // 按 seq 重放：状态只看「当时」的当前 attempt，和 runstore 的增量计数器同一套规则。
+  const nodes = new Map()
+  for (const event of sorted) {
+    if (!event || !event.data) continue
+    if (event.kind === 'run/start') {
+      if (Number.isInteger(event.data.nodeTotal) && event.data.nodeTotal >= 0) {
+        nodeTotal = event.data.nodeTotal
+      }
+      continue
+    }
+    if (event.kind === 'node/start' && typeof event.nodeId === 'string'
+      && Number.isInteger(event.attemptId)) {
+      const existing = nodes.get(event.nodeId)
+      if (!existing || event.attemptId >= existing.attemptId) {
+        nodes.set(event.nodeId, {
+          attemptId: event.attemptId,
+          status: 'pending',
+          endSeq: 0,
+          invalidated: false,
+        })
+      }
+      continue
+    }
+    if (event.kind === 'node/end' && typeof event.nodeId === 'string'
+      && Number.isInteger(event.attemptId) && typeof event.data.status === 'string') {
+      const existing = nodes.get(event.nodeId)
+      if (!existing || event.attemptId >= existing.attemptId) {
+        nodes.set(event.nodeId, {
+          attemptId: event.attemptId,
+          status: event.data.status,
+          endSeq: seqOf(event),
+          invalidated: false,
+        })
+      }
+      continue
+    }
+    if (event.kind === 'reject/trigger') {
+      const fromNodeId = event.data.fromNodeId
+      const toNodeId = event.data.toNodeId
+      const rejectSeq = seqOf(event)
+      if (typeof fromNodeId !== 'string' || typeof toNodeId !== 'string') continue
+      const target = nodes.get(toNodeId)
+      const windowStart = target && target.status === 'passed' && target.endSeq > 0
+        && target.endSeq < rejectSeq ? target.endSeq : null
+      for (const [nodeId, entry] of nodes) {
+        if (entry.status !== 'passed' || entry.invalidated) continue
+        if (entry.endSeq <= 0 || entry.endSeq >= rejectSeq) continue
+        const onPath = nodeId === fromNodeId || nodeId === toNodeId
+          || (windowStart !== null && entry.endSeq >= windowStart)
+        if (onPath) entry.invalidated = true
+      }
+    }
+  }
+
+  let passed = 0
+  let skipped = 0
+  let failed = 0
+  let rejected = 0
+  let observed = 0
+  const invalidatedNodes = []
+  for (const [nodeId, entry] of nodes) {
+    if (entry.status === 'pending') continue
+    observed += 1
+    if (entry.status === 'passed') {
+      if (entry.invalidated) invalidatedNodes.push(nodeId)
+      else passed += 1
+    } else if (entry.status === 'skipped') skipped += 1
+    else if (entry.status === 'failed') failed += 1
+    else if (entry.status === 'rejected') rejected += 1
+  }
+  const total = nodeTotal === null ? observed : nodeTotal
+  const denominator = Math.max(0, total - skipped)
+  const ratio = denominator === 0 ? null : Math.min(1, passed / denominator)
+  return {
+    passed,
+    skipped,
+    failed,
+    rejected,
+    invalidated: invalidatedNodes.length,
+    invalidatedNodes: invalidatedNodes.sort((a, b) => a.localeCompare(b)),
+    total,
+    observed,
+    denominator,
+    ratio,
+    nodeDone: passed,
+  }
+}
+
+const EVIDENCE_LABELS = {
+  acceptance: '验收条目',
+  tests: '测试',
+  checks: '规范',
+  review: '审查一致性',
+  p0p1: 'P0/P1 未解决',
+}
+
+/**
+ * 验收条目证据（§8.2 / §8.4）：同一 itemId 以 seq 最大者为准；只认当前 attempt。
+ * 缺证据或证据链接 → unknown；任一条 fail → fail；全部 skip/na → unknown。
+ */
+export function computeAcceptance(events = []) {
+  const scoped = currentAttemptEvents(events)
+  const latest = new Map()
+  for (const event of sortEvents(scoped)) {
+    if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
+    const { itemId } = event.data
+    if (typeof itemId !== 'string' || itemId === '') continue
+    latest.set(itemId, event.data)
+  }
+  if (latest.size === 0) return { state: 'unknown', reason: '没有 acceptance/verdict 记录', items: 0 }
+
+  let passed = 0
+  let failed = 0
+  let notApplicable = 0
+  let missingLink = 0
+  for (const data of latest.values()) {
+    if (data.status === 'fail') {
+      failed += 1
+      continue
+    }
+    if (data.status !== 'pass') {
+      notApplicable += 1
+      continue
+    }
+    if (typeof data.evidenceRef !== 'string' || data.evidenceRef.trim() === '') {
+      missingLink += 1
+      continue
+    }
+    passed += 1
+  }
+  if (failed > 0) return { state: 'fail', reason: `${failed} 个验收条目未通过`, items: latest.size, passed, failed, notApplicable }
+  if (missingLink > 0) {
+    return { state: 'unknown', reason: `${missingLink} 个通过的验收条目缺证据链接`, items: latest.size, passed, failed, notApplicable }
+  }
+  if (passed === 0) {
+    return { state: 'unknown', reason: '验收条目全部被跳过 / 不适用', items: latest.size, passed, failed, notApplicable }
+  }
+  return { state: 'pass', items: latest.size, passed, failed, notApplicable }
+}
+
+/**
+ * 测试证据（§8.2 / §8.4）：同一 suite 以 seq 最大者为准；只认当前 attempt。
+ * 有失败 → fail；计数缺失 / 只跑 0 条 / 缺报告链接 → unknown。
+ */
+export function computeTests(events = []) {
+  const scoped = currentAttemptEvents(events)
+  const latest = new Map()
+  for (const event of sortEvents(scoped)) {
+    if (!event || event.kind !== 'test/report' || !event.data) continue
+    const { suite } = event.data
+    if (typeof suite !== 'string' || suite === '') continue
+    latest.set(suite, event.data)
+  }
+  if (latest.size === 0) return { state: 'unknown', reason: '没有 test/report 记录', suites: 0 }
+
+  let passedSuites = 0
+  let failedSuites = 0
+  let missingCounts = 0
+  let missingLink = 0
+  const suites = []
+  for (const [suite, data] of latest) {
+    const counts = ['executed', 'passed', 'failed', 'skipped']
+    if (!counts.every(key => Number.isInteger(data[key]))) {
+      missingCounts += 1
+      continue
+    }
+    if (data.executed === 0) {
+      missingCounts += 1
+      continue
+    }
+    if (data.failed > 0) {
+      failedSuites += 1
+      suites.push({ suite, status: 'fail', executed: data.executed, passed: data.passed, failed: data.failed })
+      continue
+    }
+    if (data.passed + data.failed === 0) {
+      // 全部 skipped：没有真正执行，按未检测处理。
+      missingCounts += 1
+      continue
+    }
+    if (data.passed < data.executed) {
+      // 通过率 < 100%（含 skipped）：不通过。
+      failedSuites += 1
+      suites.push({ suite, status: 'fail', executed: data.executed, passed: data.passed, failed: data.failed })
+      continue
+    }
+    if (typeof data.reportRef !== 'string' || data.reportRef.trim() === '') {
+      missingLink += 1
+      continue
+    }
+    passedSuites += 1
+    suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
+  }
+  if (failedSuites > 0) {
+    return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites }
+  }
+  if (missingCounts > 0) {
+    return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites }
+  }
+  if (missingLink > 0) {
+    return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites }
+  }
+  if (passedSuites === 0) {
+    return { state: 'unknown', reason: '没有可用的测试执行记录', suites: latest.size, passedSuites, failedSuites, details: suites }
+  }
+  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites }
+}
+
+/**
+ * 规范检查证据（§8.3）：state=pass 只有在 passedChecks / totalChecks 都是整数、
+ * total > 0、passed === total、且 executedAt 或 reportRef 至少有一个时才成立。
+ */
+function checkEvidence(events) {
+  const latest = new Map()
+  for (const event of sortEvents(currentAttemptEvents(events))) {
+    if (!event || event.kind !== 'check/form' || !event.data) continue
+    const { ruleSetId } = event.data
+    if (typeof ruleSetId !== 'string' || ruleSetId === '') continue
+    latest.set(ruleSetId, event.data)
+  }
+  if (latest.size === 0) {
+    return { state: 'unknown', reason: '没有 check/form 执行记录' }
+  }
+
+  let applicable = 0
+  let passed = 0
+  let failed = 0
+  let incomplete = 0
+  const skipped = []
+  for (const [ruleSetId, data] of latest) {
+    if (data.state === 'fail') {
+      failed += 1
+      continue
+    }
+    if (data.state === 'skipped' || data.state === 'na') {
+      skipped.push(ruleSetId)
+      continue
+    }
+    if (data.state !== 'pass') {
+      incomplete += 1
+      continue
+    }
+    applicable += 1
+    const countsOk = Number.isInteger(data.passedChecks) && Number.isInteger(data.totalChecks)
+      && data.totalChecks > 0 && data.passedChecks === data.totalChecks
+    const hasSource = (typeof data.executedAt === 'string' && data.executedAt.trim() !== '')
+      || (typeof data.reportRef === 'string' && data.reportRef.trim() !== '')
+    if (!countsOk || !hasSource) {
+      incomplete += 1
+      continue
+    }
+    passed += 1
+  }
+  if (failed > 0) return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed }
+  if (incomplete > 0) {
+    return {
+      state: 'unknown',
+      reason: `${incomplete} 个规则集 state=pass 但计数 / 执行时间 / 报告链接不全`,
+      applicable,
+      passed,
+      failed,
+    }
+  }
+  if (applicable === 0) {
+    return { state: 'unknown', reason: '全部规则集被跳过 / 不适用', applicable, passed, failed, skipped }
+  }
+  return { state: 'pass', applicable, passed, failed, skipped }
+}
+
+/**
+ * 审查一致性与 P0/P1 未解决（§8.3）。
+ *
+ * - 取最后一次有效 `review/verdict`（seq 最大）；之前的 reject 不永久判死；
+ * - `findingCount > 0` 但该节点没有任何 finding 事件，或记录到的唯一 finding 数
+ *   大于 `findingCount`，一律 unknown（数据自相矛盾）。
+ */
+function reviewEvidence(events, findings) {
+  const verdicts = events
+    .filter(event => event && event.kind === 'review/verdict' && event.data)
+    .sort((a, b) => seqOf(a) - seqOf(b))
+  const lastVerdict = verdicts.length > 0 ? verdicts[verdicts.length - 1] : null
+  const p0 = findings.unresolvedBySeverity.P0
+  const p1 = findings.unresolvedBySeverity.P1
+
+  let reviewState
+  if (!lastVerdict) {
+    reviewState = { state: 'unknown', reason: '没有 review/verdict 结论' }
+  } else if (lastVerdict.data.verdict === 'reject') {
+    reviewState = {
+      state: 'fail',
+      reason: `最后一次审查结论为 reject（seq ${seqOf(lastVerdict)}）`,
+      verdictSeq: seqOf(lastVerdict),
+    }
+  } else if (lastVerdict.data.verdict === 'approve') {
+    const findingCount = lastVerdict.data.findingCount
+    const nodeId = lastVerdict.nodeId
+    const nodeFindings = events.filter(event => event && event.kind === 'review/finding'
+      && event.data && event.nodeId === nodeId && typeof event.data.id === 'string')
+    const uniqueIds = new Set(nodeFindings.map(event => event.data.id))
+    if (findingCount > 0 && nodeFindings.length === 0) {
+      reviewState = {
+        state: 'unknown',
+        reason: `findingCount=${findingCount} 但节点 ${nodeId} 没有任何 review/finding 事件`,
+        verdictSeq: seqOf(lastVerdict),
+      }
+    } else if (uniqueIds.size > findingCount) {
+      reviewState = {
+        state: 'unknown',
+        reason: `记录到的 finding 数（${uniqueIds.size}）大于 findingCount（${findingCount}）`,
+        verdictSeq: seqOf(lastVerdict),
+      }
+    } else {
+      reviewState = { state: 'pass', verdictSeq: seqOf(lastVerdict), verdicts: verdicts.length }
+    }
+  } else {
+    reviewState = { state: 'unknown', reason: 'review/verdict 的 verdict 取值不在白名单', verdictSeq: seqOf(lastVerdict) }
+  }
+
+  let p0p1State
+  if (p0 > 0) p0p1State = { state: 'fail', reason: `${p0} 个 P0 未解决`, p0, p1 }
+  else if (verdicts.length === 0 && findings.total === 0) {
+    p0p1State = { state: 'unknown', reason: '没有审查发现数据', p0, p1 }
+  } else p0p1State = { state: 'pass', p0, p1 }
+
+  return { review: reviewState, p0p1: p0p1State, p0, p1 }
+}
+
+/** 返工轮次 = `reject/trigger` 事件数（§8.4 的「返工 n 轮」）。 */
+export function countRework(events = []) {
+  let total = 0
+  for (const event of events) {
+    if (event && event.kind === 'reject/trigger' && event.data) total += 1
+  }
+  return total
+}
+
+/**
+ * 质量结论（§8.4，按 04 §3.9.3 落地）。
+ *
+ * 必要证据五项：acceptance / tests / checks / review / p0p1。
+ * - 任一项 unknown → unknown（缺证据不给绿灯）；
+ * - 任一项 fail → fail；
+ * - 五项全过 + progress.ratio===1 + P0 未解决===0：
+ *   返工 0 → pass「优：首轮通过」；
+ *   返工 1 + P1=0 + acceptedRate≥0.6 → pass「良：返工 1 轮后达标」；
+ *   否则 warn「可：返工 n 轮」（不是绿灯）；
+ * - progress.ratio < 1 → 至少 warn。
+ */
+export function computeQuality(events = []) {
+  const findings = computeFindings(events)
+  const scoped = currentAttemptEvents(events)
+  const checks = checkEvidence(scoped)
+  const acceptance = computeAcceptance(scoped)
+  const tests = computeTests(scoped)
+  const review = reviewEvidence(scoped, findings)
+  const progress = computeProgress(events)
+  const reworkRounds = countRework(events)
+
+  const evidence = {
+    acceptance,
+    tests,
+    checks,
+    review: review.review,
+    p0p1: review.p0p1,
+  }
+
+  const missing = Object.entries(evidence)
+    .filter(([, value]) => value.state === 'unknown')
+    .map(([key]) => key)
+  const failed = Object.entries(evidence)
+    .filter(([, value]) => value.state === 'fail')
+    .map(([key]) => key)
+
+  let state
+  let label
+  if (failed.length > 0) {
+    state = 'fail'
+    label = `需返工：${failed.map(key => EVIDENCE_LABELS[key]).join('、')}未通过`
+    if (missing.length > 0) label += `；另有 ${missing.map(key => EVIDENCE_LABELS[key]).join('、')}未检测`
+  } else if (missing.length > 0) {
+    state = 'unknown'
+    label = `证据不足：${missing.map(key => EVIDENCE_LABELS[key]).join('、')}未检测，不能判定为通过`
+  } else if (progress.ratio === null || progress.ratio < 1) {
+    // 半成品不许绿：证据全过也至少 warn。
+    state = 'warn'
+    label = progress.ratio === null
+      ? '可：阶段进度未检测，不能判定为完成'
+      : `可：进度未完成（${progress.passed}/${progress.denominator}）`
+  } else if (reworkRounds === 0) {
+    state = 'pass'
+    label = '优：首轮通过'
+  } else if (reworkRounds === 1 && review.p1 === 0
+    && findings.acceptedRate !== null && findings.acceptedRate >= 0.6) {
+    state = 'pass'
+    label = '良：返工 1 轮后达标'
+  } else {
+    state = 'warn'
+    let detail = `可：返工 ${reworkRounds} 轮`
+    if (review.p1 > 0) detail += `、遗留 ${review.p1} 个 P1`
+    if (findings.acceptedRate !== null && findings.acceptedRate < 0.6) {
+      detail += `、采纳率 ${(findings.acceptedRate * 100).toFixed(0)}%`
+    }
+    label = detail
+  }
+
+  return {
+    state,
+    label,
+    missing,
+    failed,
+    evidence,
+    reworkRounds,
+    acceptedRate: findings.acceptedRate,
+    p0Unresolved: review.p0,
+    p1Unresolved: review.p1,
+  }
+}
+
+/**
+ * 汇总（§4）：所有聚合 + computedAt / eventCount。
+ * @param {object[]} events 按 seq 升序的已落盘事件
+ * @param {{ now?: Date }} [options]
+ */
+export function summarize(events = [], options = {}) {
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime())
+    ? options.now
+    : new Date()
+  const tokens = computeTokens(events)
+  return {
+    computedAt: now.toISOString(),
+    eventCount: events.length,
+    // §8.6：summary 允许全量，但必须声明 eventCount 与 truncated。
+    truncated: options.truncated === true,
+    usage: { unkeyedCalls: tokens.unkeyedCalls },
+    tokens,
+    skillUsage: computeSkillUsage(events),
+    findings: computeFindings(events),
+    rejects: computeRejects(events),
+    progress: computeProgress(events),
+    quality: computeQuality(events),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown 导出（纯渲染，供 GET /runs/<runId>/export 用）
+// ---------------------------------------------------------------------------
+
+/** 导出里事件时间线的上限：200k 条事件不该生成几十 MB 的 md。 */
+export const EXPORT_TIMELINE_LIMIT = 2000
+
+function mdCell(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\r?\n/g, ' ')
+    .replace(/\|/g, '\\|')
+    .slice(0, 300)
+}
+
+function usageText(usage) {
+  if (!isPlainObject(usage)) return ''
+  const base = `in ${usage.input} / cacheRead ${usage.cacheRead} / cacheWrite ${usage.cacheWrite} / out ${usage.output}`
+  return usage.reasoning === undefined ? base : `${base}（reasoning ${usage.reasoning} 含在 out 内）`
+}
+
+function eventDigest(event) {
+  const data = event && event.data ? event.data : {}
+  switch (event && event.kind) {
+    case 'run/start':
+      return `flow ${data.flowId || ''} ${data.flowName || ''} · 阶段 ${data.nodeTotal}`
+    case 'run/end':
+      return `status=${data.status}${data.reason ? ` · ${data.reason}` : ''}`
+    case 'node/start':
+      return `${data.title || ''} · ${data.mode}${Array.isArray(data.skills) && data.skills.length > 0 ? ` · skills: ${data.skills.join(', ')}` : ''}`
+    case 'node/end':
+      return `status=${data.status} · ${data.durationMs}ms`
+    case 'member/start':
+      return `${data.name || ''}${data.role ? `（${data.role}）` : ''}`
+    case 'member/end':
+      return `status=${data.status} · ${data.durationMs}ms`
+    case 'model/call':
+      return `${data.provider || ''}/${data.model || ''} · ${usageText(data.usage)}`
+    case 'tool/call':
+      return `${data.name || ''} · ok=${data.ok}${data.durationMs === undefined ? '' : ` · ${data.durationMs}ms`}`
+    case 'skill/load':
+      return `${data.skill || ''} · ok=${data.ok}`
+    case 'artifact/write':
+      return `${data.path || ''} · ${data.bytes} bytes · ${data.kind}`
+        + (typeof data.sha256 === 'string' && data.sha256 !== '' ? ` · sha256 ${data.sha256.slice(0, 12)}…` : ' · 未校验')
+    case 'reject/trigger':
+      return `${data.edgeId || ''} · ${data.fromNodeId} → ${data.toNodeId} · ${data.reason || ''}`
+    case 'review/finding':
+      return `${data.severity || ''} ${data.id || ''} · ${data.status} · ${data.title || ''}`
+    case 'review/verdict':
+      return `${data.verdict} · findings=${data.findingCount}`
+    case 'check/form':
+      return `${data.ruleSetId || ''}@${data.ruleSetVersion || ''} · ${data.state}`
+    case 'acceptance/verdict':
+      return `${data.itemId || ''} · ${data.status} · ${data.decidedBy}`
+    case 'test/report':
+      return `${data.suite || ''} · ${data.passed}/${data.executed} passed`
+        + (data.failed > 0 ? ` · ${data.failed} failed` : '')
+    default:
+      return ''
+  }
+}
+
+function indexNodes(events) {
+  const map = new Map()
+  for (const event of events) {
+    if (!event || typeof event.nodeId !== 'string') continue
+    if (!map.has(event.nodeId)) {
+      map.set(event.nodeId, { nodeId: event.nodeId, attempts: new Set(), events: 0, firstTs: event.ts, lastTs: event.ts, status: null })
+    }
+    const entry = map.get(event.nodeId)
+    entry.events += 1
+    if (Number.isInteger(event.attemptId)) entry.attempts.add(event.attemptId)
+    if (typeof event.ts === 'string') {
+      if (!entry.firstTs) entry.firstTs = event.ts
+      entry.lastTs = event.ts
+    }
+    if (event.kind === 'node/end' && event.data && typeof event.data.status === 'string') {
+      entry.status = event.data.status
+    }
+  }
+  return [...map.values()].sort((a, b) => a.nodeId.localeCompare(b.nodeId))
+}
+
+/**
+ * 渲染 markdown：run 头 + 进度 / token / skill / 审查 / 打回 / 质量 + 节点索引 + 时间线。
+ * @param {Record<string, any>} meta run 元数据
+ * @param {object[]} events
+ * @param {ReturnType<typeof summarize>} [summary]
+ */
+export function renderRunMarkdown(meta = {}, events = [], summary = null) {
+  const s = summary || summarize(events)
+  const run = meta || {}
+  const lines = []
+
+  lines.push(`# 运行日志：${mdCell(run.name || run.id || '未命名 run')}`)
+  lines.push('')
+  lines.push(`- runId: \`${run.id || ''}\``)
+  lines.push(`- 流程: ${mdCell(run.flowName || '')}（\`${run.flowId || ''}\`）`)
+  lines.push(`- 状态: \`${run.status || 'unknown'}\``)
+  lines.push(`- 开始: ${run.startedAt || '—'}`)
+  lines.push(`- 结束: ${run.endedAt || '—'}`)
+  lines.push(`- 事件数: ${s.eventCount}（聚合于 ${s.computedAt}）`)
+  lines.push('')
+
+  const progress = s.progress
+  const ratio = progress.ratio === null ? '未检测' : `${(progress.ratio * 100).toFixed(1)}%`
+  lines.push('## 阶段进度')
+  lines.push('')
+  lines.push(`passed ${progress.passed} / ${progress.denominator}（总阶段 ${progress.total}，skipped ${progress.skipped} 不计入分母）· ${ratio}${progress.invalidated > 0 ? ` · 返工失效 ${progress.invalidated}（${progress.invalidatedNodes.join(', ')}）` : ''}`)
+  lines.push('')
+
+  const tokens = s.tokens.total
+  lines.push('## Token（四段互斥）')
+  lines.push('')
+  lines.push(`input ${tokens.input} · cacheRead ${tokens.cacheRead} · cacheWrite ${tokens.cacheWrite} · output ${tokens.output} · **合计 ${tokens.total}**（reasoning ${tokens.reasoning} 含在 output 内，不另计）`)
+  lines.push('')
+  lines.push('| 维度 | 键 | input | cacheRead | cacheWrite | output | 合计 | 调用数 |')
+  lines.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |')
+  for (const [key, bucket] of Object.entries(s.tokens.byNode)) {
+    lines.push(`| node | ${mdCell(key)} | ${bucket.input} | ${bucket.cacheRead} | ${bucket.cacheWrite} | ${bucket.output} | ${bucket.total} | ${bucket.calls} |`)
+  }
+  for (const [key, bucket] of Object.entries(s.tokens.byMember)) {
+    lines.push(`| member | ${mdCell(key)} | ${bucket.input} | ${bucket.cacheRead} | ${bucket.cacheWrite} | ${bucket.output} | ${bucket.total} | ${bucket.calls} |`)
+  }
+  lines.push('')
+
+  const skill = s.skillUsage
+  lines.push('## Skill 覆盖')
+  lines.push('')
+  lines.push(`声明 ${skill.declaredCount} 个唯一 skill，成功加载 ${skill.loadedCount} 个，coverage ${skill.coverage === null ? '未检测（无声明）' : `${(skill.coverage * 100).toFixed(1)}%`}`)
+  lines.push('')
+  lines.push(`- 加载次数: ${skill.loads.total}（成功 ${skill.loads.ok} / 失败 ${skill.loads.failed}，次数与覆盖率分开）`)
+  lines.push(`- 未加载: ${skill.missing.length > 0 ? skill.missing.join(', ') : '—'}`)
+  lines.push(`- 未声明但加载: ${skill.undeclared.length > 0 ? skill.undeclared.join(', ') : '—'}`)
+  lines.push('')
+
+  const findings = s.findings
+  lines.push('## 审查发现')
+  lines.push('')
+  lines.push(`唯一发现 ${findings.total} 条（原始事件 ${findings.reportedCount} 条）· P0 ${findings.bySeverity.P0} / P1 ${findings.bySeverity.P1} / P2 ${findings.bySeverity.P2}`)
+  lines.push('')
+  lines.push(`未解决 ${findings.unresolved}（P0 ${findings.unresolvedBySeverity.P0} / P1 ${findings.unresolvedBySeverity.P1} / P2 ${findings.unresolvedBySeverity.P2}）· 已复验 ${findings.verified} · 已关闭 ${findings.dismissed} · 采纳率 ${findings.acceptedRate === null ? '未检测（分母为 0）' : `${(findings.acceptedRate * 100).toFixed(1)}%`}`)
+  lines.push('')
+
+  const rejects = s.rejects
+  lines.push('## 打回')
+  lines.push('')
+  lines.push(`共 ${rejects.total} 次`)
+  lines.push('')
+  lines.push('| 维度 | 键 | 次数 |')
+  lines.push('| --- | --- | ---: |')
+  for (const [key, count] of Object.entries(rejects.byEdge)) lines.push(`| 边 | ${mdCell(key)} | ${count} |`)
+  for (const [key, count] of Object.entries(rejects.byTarget)) lines.push(`| 目标节点 | ${mdCell(key)} | ${count} |`)
+  lines.push('')
+
+  const quality = s.quality
+  lines.push('## 质量结论')
+  lines.push('')
+  lines.push(`- 结论: \`${quality.state}\` · ${quality.label}`)
+  if (quality.missing.length > 0) {
+    lines.push(`- 未检测: ${quality.missing.map(key => EVIDENCE_LABELS[key] || key).join('、')}`)
+  }
+  lines.push('')
+  lines.push('| 证据 | 状态 | 说明 |')
+  lines.push('| --- | --- | --- |')
+  for (const [key, value] of Object.entries(quality.evidence)) {
+    lines.push(`| ${EVIDENCE_LABELS[key] || key} | ${value.state} | ${mdCell(value.reason || '')} |`)
+  }
+  lines.push('')
+
+  const nodes = indexNodes(events)
+  lines.push('## 节点索引')
+  lines.push('')
+  lines.push('| 节点 | attempt | 事件数 | 首事件 | 末事件 | 末次 node/end |')
+  lines.push('| --- | --- | ---: | --- | --- | --- |')
+  for (const node of nodes) {
+    lines.push(`| ${mdCell(node.nodeId)} | ${[...node.attempts].sort((a, b) => a - b).join(', ') || '—'} | ${node.events} | ${node.firstTs || '—'} | ${node.lastTs || '—'} | ${node.status || '—'} |`)
+  }
+  lines.push('')
+
+  const timeline = events.length > EXPORT_TIMELINE_LIMIT
+    ? events.slice(-EXPORT_TIMELINE_LIMIT)
+    : events
+  lines.push(`## 事件时间线${events.length > EXPORT_TIMELINE_LIMIT ? `（最近 ${EXPORT_TIMELINE_LIMIT} / 共 ${events.length} 条）` : ''}`)
+  lines.push('')
+  lines.push('| seq | ts | kind | 节点 | attempt | member | 摘要 |')
+  lines.push('| ---: | --- | --- | --- | ---: | --- | --- |')
+  for (const event of timeline) {
+    lines.push(`| ${event.seq ?? '—'} | ${event.ts || '—'} | \`${event.kind}\` | ${mdCell(event.nodeId || '—')} | ${event.attemptId ?? '—'} | ${mdCell(event.memberId || '—')} | ${mdCell(eventDigest(event))} |`)
+  }
+  lines.push('')
+
+  return `${lines.join('\n')}\n`
+}

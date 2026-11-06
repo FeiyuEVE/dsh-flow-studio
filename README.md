@@ -15,6 +15,14 @@ LOD 三档（60% / 45%）、键盘也能连线（`C` → `Tab` → `Enter`）、
 执行引擎与指标看板仍在路线图里（见文末），数据模型已经按「可执行」的形态设计：
 未识别字段原样收进 `extras`（有界、坏输入不抛错），后续加字段不会被保存链静默丢掉。
 
+**0.3.0 加上了运行日志的骨架**（[`docs/design/05-run-log.md`](docs/design/05-run-log.md)）：
+每次运行落 `$DSH_HOME/flow-studio/runs/<runId>/`（append-only JSONL + 原子 `run.json`），
+事件带 `runId / attemptId / nodeId / memberId / seq / traceId / ts`，底部抽屉能看 run 列表、事件流、详情与
+token 四段合计，也支持导出 markdown。指标按契约确定性聚合：token 四桶、skill 覆盖率（唯一 skill 去重）、
+findings 未解决/已复验、打回计数、阶段进度（打回后旧通过失效），以及**质量结论**——
+后者要求验收条目、测试报告、规范检查、审查结论、P0/P1 五类证据齐全且可复核，缺证据一律「未检测」，不给绿灯。
+**引擎本身还没接**：事件目前由 API 手工写入，执行引擎在 v0.4。
+
 ## 它解决什么
 
 把一句「帮我做个 X」变成一条能盯住的流水线：
@@ -107,7 +115,12 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 | PUT | `/flows/<id>` | 整份覆盖保存 |
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
-| GET | `/health` | 目录、schema 版本、skills 服务是否在位 |
+| GET | `/health` | 目录、schema 版本、skills 服务是否在位、`auth` 档位（`origin-only` / `token`） |
+| GET/POST | `/runs` | run 列表（`limit`）/ 新建 run |
+| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引）/ 删除整个 run |
+| GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验） |
+| GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论） |
+| GET | `/runs/<runId>/export` | 导出 markdown |
 
 插件路由不会被 webserver 的 `/api` 通用鉴权拦到（最长前缀优先，exact/prefix 会先命中插件自己），
 所以这里自己挡跨站请求：带了 `Origin` 且与 `Host` 不一致一律 403。
@@ -116,9 +129,9 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 
 ```sh
 npm install
-npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈70KB）+ 复制 Host 模块
-npm test           # 五组自检，共 52 个断言
-node test/render.test.mjs   # SSR + 构建产物加载，13 个断言
+npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈110KB）+ 复制 Host 模块
+npm test           # 八组自检，共 133 个断言
+node test/render.test.mjs   # SSR + 构建产物加载，29 个断言
 ```
 
 - `test/model.test.mjs` —— 出厂模板合法、坏数据收敛、四类结构错误能被抓出来、未知字段进 `extras` 不丢。
@@ -126,22 +139,26 @@ node test/render.test.mjs   # SSR + 构建产物加载，13 个断言
 - `test/link.test.mjs` —— 键盘连线状态机：候选顺序、循环移动、Enter 确认、方向规则、可读播报。
 - `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。
 - `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）。
+- `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）。
+- `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器。
+- `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
-  `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点。
+  `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点；
+  运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言。
 
 > SSR 只跑首次渲染，不跑 `useEffect`，也不测拖拽 / 缩放这些交互。**这不等于浏览器验证。**
 
 ## 路线图
 
-- **v0.3 执行引擎**：把图编译成执行计划，每个节点起一个真实的子 agent 会话
+- **v0.4 执行引擎**：把图编译成执行计划，每个节点起一个真实的子 agent 会话
   （`ctx.subagents.startActivation({ provider: 'spawn', delivery: 'caller', request: { prompt, parent, outputSchema } })`），
-  节点产物用结构化 JSON 在节点之间传递，打回线按判定结果真的回退并累加轮次。
-  Run 数据契约（`runId` / `attemptId` / `nodeId` / `memberId` / 状态来源 / 去重重连）已在
-  [`docs/design/04-metrics.md`](docs/design/04-metrics.md) §3.13 定好，尚未实现。
-- **v0.4 指标**：以 `session/event`（global）为主干，按节点归集 token（`inputTokens` / `outputTokens` /
-  `cacheReadTokens` / `cacheWriteTokens` 四个互斥桶）、工具调用、skill 采纳（`tool/call` 里 `name === 'skill'`，
-  按唯一 skill 去重算覆盖率）、审查 finding 数与采纳率（采纳 ≠ 修复 ≠ 复验）。
-- **v0.5 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
+  节点产物用结构化 JSON 在节点之间传递，打回线按判定结果真的回退并累加轮次；
+  引擎只需按 [`05-run-log.md`](docs/design/05-run-log.md) 写事件，指标与抽屉自动有数据。
+  Run 数据契约（`runId` / `attemptId` / `nodeId` / `memberId` / 状态来源 / 去重重连）见
+  [`04-metrics.md`](docs/design/04-metrics.md) §3.13。
+- **v0.5 指标看板增强**：跨 run 对比、趋势图、团队汇总；把 `acceptance` / `test` / `check` 三类证据接上真实执行器
+  （目前 quality 只能在手工写入完整证据时才给结论）。
+- **v0.6 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
 
 ## 先搜现成的（按 `PLUGIN-SEARCH.md`）
 

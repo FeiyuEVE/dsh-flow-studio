@@ -20,6 +20,7 @@ import { Inspector } from './inspector.js'
 import {
   beginLink, confirmLink, describeLink, edgeKindBetween, moveLink,
 } from './link.js'
+import { FsLogDrawer, drawerActionFor } from './logdrawer.js'
 import { h, rt } from './runtime.js'
 import { CSS } from './styles.js'
 
@@ -62,6 +63,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   const [keyboardLink, setKeyboardLink] = useState(null)
   const [announce, setAnnounce] = useState('')
   const [draftNotice, setDraftNotice] = useState(null)
+  const [logOpen, setLogOpen] = useState(false)
 
   const pinned = useRef(Boolean(initialFlow))
   const flowRef = useRef(null)
@@ -393,9 +395,25 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       const target = event.target
       const tag = target && target.tagName
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(target && target.isContentEditable)
+      // 抽屉里的方向键 / Enter 归事件流自己处理；画布的 C / Delete / 方向键在这里让路。
+      const insideLog = Boolean(target && typeof target.closest === 'function' && target.closest('.fs-log'))
+      if (drawerActionFor(event) === 'toggle') {
+        event.preventDefault()
+        setLogOpen(value => !value)
+        return
+      }
       if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === 's') {
         event.preventDefault()
         void saveNow(flowRef.current)
+        return
+      }
+      if (insideLog) {
+        // 事件流自己的 Esc 已经在 logdrawer 里 stopPropagation（清详情）；
+        // 抽屉其它位置的 Esc 在这里收起抽屉，绝不顺手清掉画布选中。
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          setLogOpen(false)
+        }
         return
       }
       if (event.key === 'Escape') {
@@ -616,6 +634,26 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
           onConnect: addEdge,
           onNudge: nudgeNode,
         })),
+
+    h(FsLogDrawer, {
+      open: logOpen,
+      onToggle: () => setLogOpen(value => !value),
+      flowId: flow ? flow.id : '',
+      flowName: flow ? flow.name : '',
+      // 复用画布既有选中逻辑：选中节点 + 收起抽屉，让画布拿回高度。
+      onJumpToNode: id => {
+        const current = flowRef.current
+        const node = current ? current.nodes.find(item => item.id === id) : null
+        if (!node) {
+          setAnnounce('运行日志里的节点「' + id + '」不在当前流程')
+          return
+        }
+        setSelection({ kind: 'node', id })
+        setKeyboardLink(null)
+        setLogOpen(false)
+        setAnnounce('已定位到节点「' + node.title + '」')
+      },
+    }),
 
     h('footer', { className: 'fs-status' },
       flow

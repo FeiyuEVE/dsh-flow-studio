@@ -6,6 +6,8 @@
  *   src/index.js         -> lib/index.js
  *   src/model.js         -> lib/model.js     （Host 与 Client 共用）
  *   src/store.js         -> lib/store.js
+ *   src/runlog.js        -> lib/runlog.js    （事件契约与聚合，纯函数）
+ *   src/runstore.js      -> lib/runstore.js  （run 目录读写）
  *
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  */
@@ -47,7 +49,7 @@ if (clientSize > 262144) {
 }
 console.log('✓ lib/client.js 在 DSH STORE 单文件上限（262144）内')
 
-for (const file of ['index.js', 'model.js', 'store.js']) {
+for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js']) {
   copyFileSync(resolve(root, 'src', file), resolve(libDir, file))
   const size = statSync(resolve(libDir, file)).size
   console.log(`✓ lib/${file} ${size} bytes`)

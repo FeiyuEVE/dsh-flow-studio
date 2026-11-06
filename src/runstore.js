@@ -48,6 +48,14 @@ const ERROR_FILE = '.error'
 const FILE_LOCK_TTL_MS = 10 * 1000
 /** startRun 等锁的最长时间（超时 409，让调用方重试，不无限排队）。 */
 const FILE_LOCK_WAIT_MS = 5000
+/** 陈旧锁 / 过期租约的「接管权」选举：意图文件前缀。 */
+const TAKEOVER_PREFIX = 'lock.takeover-'
+/** 选举窗口：写完意图后等这么久，让并发者都现身。 */
+const TAKEOVER_ELECTION_MS = 15
+/** 太老的意图文件视为崩溃残留（否则会永远霸占选举）。 */
+const TAKEOVER_STALE_MS = 5000
+/** O_EXCL 建成后等这么久再复核内容，用来发现「刚建好就被接管走」。 */
+const LOCK_SETTLE_MS = 4
 /** 默认租约 TTL：引擎每 30s 续租，90s 过期（3 次心跳）。 */
 export const DEFAULT_LEASE_TTL_MS = 90 * 1000
 
@@ -413,6 +421,10 @@ export async function startRun(runsRoot, runId, options = {}) {
  * 过期由读取方清理；`sweepExpiredLeases()` 会把过期租约的 running run 标 failed。
  */
 
+function sleep(ms) {
+  return new Promise(done => { setTimeout(done, ms) })
+}
+
 function leasePath(dir) {
   return join(dir, LEASE_FILE)
 }
@@ -477,52 +489,108 @@ async function createExclusive(path, text) {
 }
 
 /**
- * 把陈旧锁原子地挪走（rename 对同一源文件只有一个调用者能成功）。
- * @returns {Promise<boolean>} true = 本进程搬走了它，可以重试创建
+ * 陈旧锁接管选举：先写一个带 `(毫秒, pid, 序号)` 的意图文件，等一个选举窗口，
+ * 再读目录里所有未过期意图，按文件名全序取最小者。
+ *
+ * 为什么不是「读 → rename 搬走」：**那不是 CAS**。A 读到「过期租约」的瞬间，B 可能刚把
+ * 同一路径换成新租约；A 随后 rename 搬走的就是 B 的新锁，而 B 仍以为自己持有 —— 两个赢家。
+ * 选举不碰锁本身：所有并发接管者先在「谁有资格接管」上达成一致（全序比较），
+ * 只有最小者去删旧锁 / 建新锁，其余等一个窗口后重读（通常已被新租约挡住 → 409）。
+ *
+ * @returns {Promise<boolean>} true = 本进程赢得接管权
  */
-async function retireStaleLock(path) {
-  const victim = `${path}.stale-${process.pid}-${tmpCounter++}`
+async function winTakeoverElection(dir) {
+  await ensureDirMode(dir)
+  const at = Date.now()
+  const name = `${TAKEOVER_PREFIX}${String(at).padStart(16, '0')}-${String(process.pid).padStart(8, '0')}-${String(tmpCounter++).padStart(4, '0')}`
+  const mine = join(dir, name)
+  await writeFile(mine, `${process.pid}\n`, { encoding: 'utf8', mode: FILE_MODE })
   try {
-    await rename(path, victim)
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return false
-    throw error
+    await sleep(TAKEOVER_ELECTION_MS)
+    let names = []
+    try {
+      names = await readdir(dir)
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error
+    }
+    const alive = []
+    for (const entry of names) {
+      if (!entry.startsWith(TAKEOVER_PREFIX)) continue
+      const ms = Number(entry.slice(TAKEOVER_PREFIX.length).split('-')[0])
+      if (!Number.isFinite(ms)) continue
+      if (Date.now() - ms > TAKEOVER_STALE_MS) {
+        await unlink(join(dir, entry)).catch(() => {})
+        continue
+      }
+      alive.push(entry)
+    }
+    alive.sort()
+    return alive.length > 0 && alive[0] === name
+  } finally {
+    await unlink(mine).catch(() => {})
   }
-  await unlink(victim).catch(() => {})
+}
+
+/**
+ * 清理陈旧锁：先确认陈旧，再打赢接管选举，再二次确认仍然陈旧，才删掉。
+ * 二次确认是为了挡住「选举期间锁已经被别人换成新的」这一小段窗口。
+ *
+ * @returns {Promise<boolean>} true = 锁已经不在了 / 本轮清掉了，可以重试创建
+ */
+async function clearStaleLock(dir, path, ttlMs) {
+  const stale = async () => {
+    try {
+      const info = await stat(path)
+      return Date.now() - info.mtimeMs > ttlMs
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null
+      throw error
+    }
+  }
+  const first = await stale()
+  if (first === null) return true
+  if (first === false) return false
+  if (!await winTakeoverElection(dir)) return false
+  const again = await stale()
+  if (again === null) return true
+  if (again === false) return false
+  await unlink(path).catch(() => {})
   return true
 }
 
 /**
  * 进程间互斥的短临界区（startRun 这类「读-改-写」元数据的操作）。
- * O_EXCL 创建锁文件；持有者崩溃留下的陈旧锁（mtime 超过 ttl）会被原子改名挪走。
+ *
+ * O_EXCL 原子创建锁文件，写入唯一 nonce；建成后等一个短窗口再复核 nonce 仍是自己的
+ * （期间若被别人接管走，就不算持有、重试）。持有者崩溃留下的陈旧锁走
+ * {@link clearStaleLock}（选举 + 二次确认），不会出现两个进程同时清同一把锁。
  */
 async function withRunFileLock(dir, name, task, options = {}) {
   const path = join(dir, name)
   const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : FILE_LOCK_TTL_MS
   const waitMs = Number.isInteger(options.waitMs) && options.waitMs >= 0 ? options.waitMs : FILE_LOCK_WAIT_MS
   const deadline = Date.now() + waitMs
+  const nonce = `${process.pid}-${Date.now().toString(36)}-${tmpCounter++}-${Math.random().toString(36).slice(2, 8)}`
   for (;;) {
-    if (await createExclusive(path, `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`)) break
-    let info = null
-    try {
-      info = await stat(path)
-    } catch (error) {
-      if (error && error.code === 'ENOENT') continue
-      throw error
-    }
-    if (Date.now() - info.mtimeMs > ttlMs) {
-      await retireStaleLock(path)
+    if (await createExclusive(path, `${nonce}\n`)) {
+      await sleep(LOCK_SETTLE_MS)
+      const holder = await readFile(path, 'utf8').catch(() => null)
+      if (holder !== null && holder.trim() === nonce) {
+        try {
+          return await task()
+        } finally {
+          const current = await readFile(path, 'utf8').catch(() => null)
+          if (current !== null && current.trim() === nonce) await unlink(path).catch(() => {})
+        }
+      }
+      // 抢到又被并发接管走：不当成持有，退回去重试。
+    } else if (await clearStaleLock(dir, path, ttlMs)) {
       continue
     }
     if (Date.now() > deadline) {
       throw new RunError(409, 'runId', '另一个进程正在处理这个 run，请稍后重试')
     }
-    await new Promise(done => { setTimeout(done, 20) })
-  }
-  try {
-    return await task()
-  } finally {
-    await unlink(path).catch(() => {})
+    await sleep(8)
   }
 }
 
@@ -604,34 +672,56 @@ export async function readLease(runsRoot, runId, options = {}) {
 /**
  * 抢单写者租约。已有**未过期**租约（任何持有者）一律 409；过期租约可被抢。
  *
- * 互斥靠**文件系统**而不是进程内锁（06 §13.6 B1）：`lock.json` 用 `O_EXCL` 原子创建，
- * 两个进程同时抢只有一个能创建成功；过期租约的接管是「原子改名搬走 → 再 O_EXCL 创建」，
- * `rename` 对同一个源文件只有一个调用者能成功，所以也只有一个赢家。
+ * 互斥靠**文件系统**而不是进程内锁（06 §13.6 B1），分两条路：
+ * - 没有租约：`lock.json` 用 `O_EXCL` 原子创建，两个进程同抢只有一个成功；建成后立刻
+ *   回读复核（pid/host/acquiredAt 都对得上）才认账，防止刚建好就被并发接管者搬走。
+ * - 租约过期：先打赢 {@link winTakeoverElection} 的接管选举（全序比较，只有一个赢家），
+ *   再由赢家删旧锁并 O_EXCL 建新锁；其他进程等一个窗口后重读，通常已被新租约挡住 → 409。
+ *
+ * 把「读 → 搬走 → 创建」当成 CAS 是错的：读到的瞬间锁可能已被别人换成新的，搬走的就是
+ * 别人的新锁。选举把这一步变成「先就谁有资格动手达成一致」。
  * @returns {Promise<object>} 新租约
  */
 export async function claimLease(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
   if (!await readMetaUnlocked(loc)) throw new RunError(404, 'runId', 'run 不存在')
   const { now, ttlMs, pid, host } = leaseOptions(options)
+  const path = leasePath(loc.dir)
   return withLock(loc.id, async () => {
     const iso = now.toISOString()
     const lease = { pid, host, ttlMs, acquiredAt: iso, heartbeatAt: iso }
-    const path = leasePath(loc.dir)
     const text = `${JSON.stringify(lease, null, 2)}\n`
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      if (await createExclusive(path, text)) return lease
+    const owned = async () => {
+      const current = await readLeaseFile(loc.dir)
+      return Boolean(current && current.pid === pid && current.host === host && current.acquiredAt === iso)
+    }
+    const busy = existing => new RunError(
+      409,
+      'runId',
+      `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
+    )
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (await createExclusive(path, text)) {
+        if (await owned()) return lease
+        throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
+      }
       const existing = await readLeaseFile(loc.dir)
       // 持有者刚好释放：直接重试创建。
       if (!existing) continue
-      if (!leaseExpired(existing, now)) {
-        throw new RunError(
-          409,
-          'runId',
-          `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
-        )
+      if (!leaseExpired(existing, now)) throw busy(existing)
+      if (!await winTakeoverElection(loc.dir)) {
+        // 输掉选举：等赢家落定，再重读（通常已经被新租约挡住）。
+        await sleep(TAKEOVER_ELECTION_MS)
+        continue
       }
-      // 过期：先原子搬走，再回到循环顶部用 O_EXCL 争创建（可能被第三方先抢到 → 409）。
-      await retireStaleLock(path)
+      const again = await readLeaseFile(loc.dir)
+      if (!again) continue
+      if (!leaseExpired(again, now)) throw busy(again)
+      await unlink(path).catch(() => {})
+      if (await createExclusive(path, text)) {
+        if (await owned()) return lease
+        throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
+      }
     }
     throw new RunError(409, 'runId', '并发抢占执行租约失败，请重试')
   })

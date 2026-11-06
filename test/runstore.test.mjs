@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync,
-  writeFileSync,
+  utimesSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -884,6 +884,77 @@ try {
     assert.equal(startResults.filter(item => item === 'LOST:409').length, 5, startResults.join(' | '))
     const after = await store.readRunMeta(runsRoot, started.id)
     assert.equal(after.status, 'running')
+  })
+  await check('§13.6 过期租约 / 陈旧锁的接管也是单赢家（BLOCKER-2 复审回归）', async () => {
+    // 复审抓到的问题：租约过期时「读 → 搬走 → 创建」不是 CAS，8 进程接管可能出现 2–4 个赢家。
+    // 现在改成「接管选举」：先写意图文件、等一个窗口、按全序取最小，只有赢家删旧锁建新锁。
+    const childCode = `
+const [root, id, at, action] = process.argv.slice(1)
+const store = await import(${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)})
+const wait = Number(at) - Date.now()
+if (wait > 0) await new Promise(done => setTimeout(done, wait))
+try {
+  if (action === 'start') await store.startRun(root, id, { now: new Date() })
+  else await store.claimLease(root, id, { now: new Date(), host: 'child' })
+  process.stdout.write('WON')
+} catch (error) {
+  process.stdout.write('LOST:' + (error && error.status))
+}
+`
+    const race = (count, id, action) => new Promise((resolveRace, rejectRace) => {
+      const at = String(Date.now() + 800)
+      const results = []
+      let done = 0
+      for (let i = 0; i < count; i += 1) {
+        const proc = spawn(
+          process.execPath,
+          ['--input-type=module', '-e', childCode, runsRoot, id, at, action],
+          { stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let out = ''
+        let err = ''
+        proc.stdout.on('data', chunk => { out += chunk })
+        proc.stderr.on('data', chunk => { err += chunk })
+        proc.on('error', rejectRace)
+        proc.on('close', code => {
+          results.push(out.trim() || `EXIT:${code}:${err.slice(0, 200)}`)
+          done += 1
+          if (done === count) resolveRace(results)
+        })
+      }
+    })
+
+    const leaseCounts = []
+    for (let round = 0; round < 5; round += 1) {
+      const meta = await makeRun()
+      created.push(meta.id)
+      // 一个 90s 前心跳的过期租约（模拟上一个引擎崩了）。
+      writeFileSync(join(runsRoot, meta.id, 'lock.json'), JSON.stringify({
+        pid: 999999,
+        host: 'dead-host',
+        ttlMs: 90000,
+        acquiredAt: '2026-11-06T08:00:00.000Z',
+        heartbeatAt: '2026-11-06T08:00:00.000Z',
+      }, null, 2), { mode: 0o600 })
+      const results = await race(8, meta.id, 'claim')
+      leaseCounts.push(results.filter(item => item === 'WON').length)
+    }
+    assert.deepEqual(leaseCounts, [1, 1, 1, 1, 1],
+      `过期租约接管必须每轮只有一个赢家：${leaseCounts.join(',')}`)
+
+    const startCounts = []
+    for (let round = 0; round < 3; round += 1) {
+      const meta = await makeRun()
+      created.push(meta.id)
+      const lockPath = join(runsRoot, meta.id, 'start.lock')
+      writeFileSync(lockPath, '999999-dead\n', { mode: 0o600 })
+      const old = new Date(Date.now() - 60000)
+      utimesSync(lockPath, old, old)
+      const results = await race(8, meta.id, 'start')
+      startCounts.push(results.filter(item => item === 'WON').length)
+    }
+    assert.deepEqual(startCounts, [1, 1, 1],
+      `崩溃残留的 start.lock 接管必须每轮只有一个赢家：${startCounts.join(',')}`)
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

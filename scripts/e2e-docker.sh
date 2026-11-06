@@ -180,19 +180,22 @@ if (!(s.skillUsage.declaredCount >= 2)) fail('skill 声明数没记上（' + (s.
 if (s.skillUsage.coverage !== 1) fail('skill 覆盖率应为 1（实得 ' + s.skillUsage.coverage + '）')
 if (!s.findings) fail('没有 findings')
 // B1 回归：progress 必须带每节点状态（只回计数会让客户端长跑时把已通过节点显示成未开始）
+// 只有 stage 节点进执行计划（start/end 是标记节点），所以这里核 n_a / n_b 两个。
 const pn = s.progress.nodes
 if (!pn || typeof pn !== 'object') fail('summary.progress 缺 nodes')
-for (const id of ['n_start', 'n_a', 'n_b', 'n_end']) {
+for (const id of ['n_a', 'n_b']) {
   const entry = pn[id]
   if (!entry || typeof entry.status !== 'string' || !Number.isInteger(entry.attemptId)) {
     fail('progress.nodes 缺节点或字段不全：' + id + ' → ' + JSON.stringify(entry))
   }
 }
 if (!Array.isArray(s.progress.invalidatedNodes)) fail('缺 invalidatedNodes')
+if (s.progress.total !== 2) fail('阶段总数应为 2（start/end 是标记节点），实得 ' + s.progress.total)
 if (pn.n_b.attemptId !== 2) fail('n_b 当前 attempt 应为 2（打回后重跑），实得 ' + pn.n_b.attemptId)
+if (pn.n_b.status !== 'passed') fail('n_b 最终应为 passed，实得 ' + pn.n_b.status)
 if (!detail.progress || !detail.progress.nodes) fail('详情接口没带 progress.nodes')
 if (detail.progress.nodes.n_b.attemptId !== 2) fail('详情接口的 progress.nodes 与 summary 不一致')
-console.log('  ✓ progress.nodes 就位（4 节点，n_b attempt=2，invalidated=' + s.progress.invalidatedNodes.length + '）')
+console.log('  ✓ progress.nodes 就位（n_a/n_b attempt=2，total=2，invalidated=' + s.progress.invalidatedNodes.length + '）')
 console.log('  ✓ 状态 done，事件 ' + ev.length + ' 条，打回 ' + rej.length + ' 次，attempt=' + [...attempts].filter(a => a.endsWith('#2')).length)
 console.log('  ✓ token 合计 ' + tok.total + ' = ' + tok.input + '+' + tok.cacheRead + '+' + tok.cacheWrite + '+' + tok.output)
 console.log('  ✓ quality=' + s.quality.state + ' · ' + (s.quality.label || ''))

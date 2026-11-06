@@ -244,6 +244,15 @@ run 目录放 `lock.json`（pid、host、heartbeatAt、ttlMs）；`start` 先抢
 引擎每 30s 续租；异常退出后由 `sweep` 清理过期租约并把该 run 标 `failed`（reason 含「引擎中断」）。
 `DELETE /runs/<id>` 在该 run 持有租约时返回 409。
 
+**租约自愈（v0.8.2）**：
+- `renewLease` 发现过期且持有者匹配时**就地 re-claim**（保留 `acquiredAt`、只刷 `heartbeatAt`），
+  不再「先删锁文件再抛 409」——旧实现会让 run 永久停在 `running`（`readLease` 变 null → DELETE 放行、
+  sweep 跳过）。写回前二次核对 `acquiredAt`，避免覆盖别人刚建的新租约。
+- `readLeaseFile` 区分 missing / corrupt / ok 三态；**corrupt 视为可接管**（走 takeover 选举），
+  不是「没有租约」。0 字节的 `lock.json`（先 `open('wx')` 再写内容时被杀留下）也能被接管。
+- `sweepExpiredLeases` 对 `started===true` 且「无租约 / 租约不可解析」的 running run 同样按崩溃残留
+  收口成 `failed`，不再 `continue` 放过。
+
 **互斥必须是跨进程的**（复审 BLOCKER）：同进程 `withLock` 挡不住第二个 dsh 进程 / 另一个 host。
 - 没租约：`lock.json` 走 `open(..., 'wx')`（O_EXCL）原子创建，建成后立刻回读复核
   `pid/host/acquiredAt` 三者都对得上才认账（防止刚建好就被并发接管者搬走）。
@@ -253,6 +262,21 @@ run 目录放 `lock.json`（pid、host、heartbeatAt、ttlMs）；`start` 先抢
   输家等一个窗口后重读（通常已被新租约挡住 → 409）。意图文件被赢家立即撤回，超过 5s 的视为崩溃残留。
 - **禁止把「读 → rename 搬走 → 创建」当成 CAS**：读到的瞬间锁可能已被别人换成新的，
   搬走的就是别人的新锁，于是两个进程都以为自己赢。`startRun` 的 `start.lock` 同理（同一套选举清理陈旧锁）。
+
+**run.json 自己的跨进程写锁（v0.8.2）**：执行租约 `lock.json` 只管「谁能跑这个 run」，
+不保护 `run.json` 的读改写。所以所有 meta 写路径（`writeRunMeta` / `appendEvents` /
+`appendRunMessages` / `writeNodeSessions` / `upsertNodeSession` / `appendRunInputMessages` /
+`startRun`）另套一把 `meta.lock`（O_EXCL，ttl 10s、等锁上限 15s，覆盖范围只有临界区，结束即删）。
+- 与 `lock.json` 分开命名，`startRun` 的加锁顺序固定 `start.lock → meta.lock`，不会形成环。
+- 抢锁超时抛可读 409（带 `runId`）；run 目录不存在直接 404（**不再自动建目录**）。
+- 实测：两个**真实子进程**各 append 40 条 → 磁盘 80 条 / `eventCount=80` / 重复 seq 0
+  （修复前：磁盘 80 / `eventCount=42` / 重复 38）。
+
+**事件 seq 的分配顺序（v0.8.2）**：`appendEvents` 改为**先分配、后写事件**——第一步原子地把
+`seq..seq+N-1` 写进 `run.json`，第二步才追加事件行，最后更新 `eventCount/progress/token`。
+代价是允许「已分配但未落盘」的**空洞**（崩溃时），换来的是**绝不重复**；读取侧容忍空洞，
+启动恢复用 `repairRunCounters()` 把 `eventCount` 修到实际行数、`seq/lastSeq` 抬到磁盘 max（只抬不降）。
+追加前还会检查目标文件最后一个字节，不是换行就先补一个——崩溃留下的半行不会再和下一条事件粘成一行。
 
 ### 13.4 事件额度与写盘失败（M1/M2）
 `run/start`、`run/end` 享有**保留额度**（总上限 − 64），普通事件不得占用；
@@ -267,7 +291,13 @@ v1.1 额外规则：恰好一个 start、至少一个 end；每个非 end 节点
 不做「取最左」）；reject 目标必须在上游且存在；所有阶段必须能到达 end。
 循环内维护 `next` 访问集：重复访问同一节点且不是打回 → `node/end failed` + `run/end failed`；
 `selectNextNode` 返回 null 且当前不是 end → failed，**不得 done**。
-run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默认 2 小时，`FLOW_STUDIO_RUN_TIMEOUT_MS`），超限 abort + failed。
+run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默认 2 小时），超限 abort + failed。
+
+**超时可配（v0.8.2）**：`start(runId, { runTimeoutMs, nodeTimeoutMs })` 接受两个可选正整数，
+优先级 **显式参数 > `FLOW_STUDIO_RUN_TIMEOUT_MS` / `FLOW_STUDIO_NODE_TIMEOUT_MS` > 默认
+（2h / 20min）**；生效值写进 `run.json.limits` 并可读回，非正整数 → 400（在写任何事件之前，
+run 仍停在 `pending`）。`POST /runs/<id>/start` 与 `flow_start` 都透传同名参数。
+为什么要这个：审计指出「10 个 run 跑 6 小时」会被默认 2h 直接打断，而旧实现只有进程环境变量能改。
 
 ### 13.6 并发启动（B1 引擎侧）
 `start` 的第一个 `await` 之前必须同步占位（`this.starting` 或带 controller 的 `active` 占位），失败再释放；
@@ -888,6 +918,15 @@ stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如
 
 已经写入的 `agent/message` / `model/call` 保留；失败不会补写假的成功事件。
 
+**进程组语义（v0.8.2）**：外部 executor 用 `{ detached: true }` 起进程，abort / timeout 时按
+**进程组**发 `SIGTERM`，250ms 宽限后 `SIGKILL`（`process.kill(-pid, …)`）。custom 走 `sh -c`，
+管道/后台里的**孙进程**也落在同一组里被一起收掉——v0.8.1 只杀直接子进程，实测 abort 之后
+`sleep 600` 仍存活、还因为遗留管道把宿主吊住 60s+。收尾同时 `destroy()` 子进程
+stdout/stderr，避免 fd 滞留。
+- 结果对象新增 `killScope: 'group' | 'process' | null` 与 `orphanWarning: string | null`。
+- Windows（无 POSIX 进程组）或注入的非真实子进程会降级为只杀直接子进程，并 emit 一条
+  `level:'warn'` 日志进节点日志；**降级必须可见**，不假装整组已清。
+
 ### 17.7 为什么只允许 `mode:'single'`
 
 `team` 模式下引擎要靠 `parentSession === leadSessionId` 把成员会话绑成 `memberId`、按成员归属
@@ -1170,6 +1209,21 @@ runtime 注入的 `wakeNode(entry)` 按以下顺序决定（返回 `{ action, re
 | `attempt` | 非负整数才保留（含 0），否则 `null` |
 | `nonce` | 非空字符串才保留，否则 `null`；与 envelope 不符的整条回报丢弃 |
 
+**收尾封口（v0.8.2）**：写 `run/end` 之前先把引擎置为「封口」状态（`_sealSessionEvents`），
+之后到达的 `session/event` 一律丢弃并计入 `droppedSessionEventsAfterSeal`；顺序固定为
+**封口 → dispose 节点会话 → 最终 drain `eventQueue` → 写 `run/end` → 写 `live:null` → 释放租约 →
+`await _cleanupActive()`**。旧顺序是「先写 `run/end` → drain → `live:null` → dispose」，dispose 期间
+宿主的迟到事件会继续落盘，于是 `run/end` 之后还有事件、`run.json.live` 被写回非 null。
+
+**结论解析（v0.8.2）**：节点结论取「本 attempt **最近一条能解析出正式结论**的 assistant 消息」
+（有界缓存 `lastStructuredBySession`，LRU≤64，attempt 收尾清理），不是「最后一条消息」。
+否则闹钟注入的自审状态块/夹带 JSON 一成为最后一条，就会把同一回合里更早的正式 verdict 顶掉，
+完成节点被判 `StructuredOutputError` 并重试。
+
+**打回上下文用原始 id（v0.8.2）**：`rejectText` 打印的是**去掉节点命名空间前缀**的原始 id
+（`R1` / `BF1`），而 `namespaceEvidenceId` 现在是幂等的（已带 `${nodeId}:` 不再加）。旧实现把
+已加前缀的 id 打印给模型、模型照抄后再加一次 → `n_a:n_a:R1`，旧 fail 永远复判不了。
+
 **结论优先级与证据保留（v0.8.1，修掉「自审可以伪造通过」）**：
 
 - 正式结论（verdict 合法 + 凭证匹配）**优先于**状态块；状态块**永远不能**把正式 `reject` 翻成
@@ -1317,20 +1371,29 @@ node test/render.test.mjs      # 71 组（运行详情「节点状态」区块�
 `FLOW_STUDIO_REPLY_TOKEN_*` + URL 只许 https/回环 + 令牌打码；`flow_watch` 暴露调度器快照与
 `health{timeouts,invalidReports,warnings}`。
 
-**仍未闭合（如实列出）**：`removeWorktree()` 没有对外入口；跨进程 `appendEvents` 无文件锁
-（依赖单写者租约）；worktree 不自动清理；节点闹钟状态只在内存、重启不恢复；本轮无真机
-（宿主 `dsh-web`）端到端，只有容器测试台。
+**0.8.2 修掉的第二批 MAJOR**（审计里的 12 条）：收尾封口（`run/end` 之后不再有事件、
+`live` 不被写回）、结论解析取「最近一条正式结论」而非最后一条、证据 id 幂等（不再 `n_a:n_a:R1`）、
+`runTimeoutMs`/`nodeTimeoutMs` 可配、seq 先分配后写 + 半行修复 + `repairRunCounters`、`meta.lock`
+跨进程写锁、磁盘满时失败文案与实际状态一致、租约自愈、外部 executor 进程组整组杀、
+worktree 自愈/分支不泄漏/`listWorktrees`+`pruneWorktrees`/dirty 告警、按发起会话合并唤醒 + 每会话预算、
+节点闹钟重启恢复。
+
+**仍未闭合（如实列出）**：本轮无真机（宿主 `dsh-web`）端到端，只有容器测试台；worktree 仍不自动
+删除（现在有 `DELETE /runs/<id>/worktree` 与 prune 入口，但属于手动动作）；节点闹钟的**调度器状态**
+仍是内存态（重启靠 run.json + sessions.json 恢复登记，恢复不出的条目会跳过并计数）。
 
 **本批没动的 MAJOR（41 条里的其余部分）**：本批按「数据损坏 / 安全 / 流程失真 / 无法恢复」
 四条优先级取舍，只收口上表 6 个 BLOCKER 与 7 条高价值 MAJOR；剩余约 25 条 MAJOR 未处理，
 其中值得优先排期的是：
 
-1. **外部 executor 只杀直接子进程**：`abort` 后 `codex`/自定义脚本的**孙进程**可能存活
-   （需要 process group / `setsid` + 组杀）。
-2. **`FLOW_STUDIO_TOKEN` 是 owner 级权限**：注入面已消除，但令牌本身仍等于插件全权；
-   配 custom executor 时等价于给该令牌一条执行路径，应按最小权限再切一层。
-3. **两份运行列表并存**：左栏列表与抽屉里的列表各自取数，口径一致但没有共享状态。
-4. **worktree 不自动清理**（同「未闭合」第 3 条）：run 收尾后目录与 `flow/*` 分支会累积。
-5. **跨进程 `appendEvents` 无文件锁**（同「未闭合」第 2 条）：多进程同 `DSH_HOME` 会撞 seq。
+1. ~~外部 executor 只杀直接子进程~~ —— 0.8.2 已改为 `detached` + 进程组整组杀（实测 abort 后
+   孙进程 pid 消失，忽略 SIGTERM 的也会在宽限期后被组 SIGKILL 收掉）。
+2. **`FLOW_STUDIO_TOKEN` 是 owner 级权限** —— 0.8.2 加了只读令牌、`FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR`
+   主机开关、可选 `FLOW_STUDIO_WORKSPACE_ROOTS` 白名单；**残余**：拿到全权令牌仍可改流程并开跑，
+   这是既有部署假设（令牌本来就等于插件全权）。
+3. ~~两份运行列表并存~~ —— 0.8.2 合并为页面唯一的 runs 数据源（左栏与抽屉共用同一次轮询）。
+4. **worktree 不自动清理** —— 0.8.2 提供了删除路由与 prune 入口，但**不会自动删**（设计内取舍：
+   用户可能要看产物），需要人工或定时任务触发。
+5. ~~跨进程 `appendEvents` 无文件锁~~ —— 0.8.2 用 `meta.lock` 修掉（真子进程 40+40 验证）。
 
 审计的复现脚本与原始报告留在 `<repo>/.tmp/audit-*.mjs`（不属于产物，不入库）。

@@ -39,6 +39,38 @@ export const IN_SLOTS = [-88, -72, -56, -40, -24, -8]
 /** 折角半径。 */
 const CORNER = 10
 
+/**
+ * G5-e：逻辑吸附步长（01 §5.1 #12 / 02 §125：4px 逻辑网格，视觉点阵 20px）。
+ * 拖拽落位默认吸附到 4px；按住 Alt（macOS 的 Option）临时绕过，自由落位但仍取整到 1px。
+ */
+export const SNAP_GRID = 4
+
+/**
+ * 单轴落位：默认吸附到 `grid`；`bypassSnap` 时只取整到 1px。
+ * 非有限数按 0 处理（拖动中的坏值不能污染流程坐标）。
+ */
+export function snapCoordinate(value, options = {}) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 0
+  if (options && options.bypassSnap === true) return Math.round(number)
+  const grid = Number.isFinite(Number(options && options.grid)) && Number(options.grid) > 0
+    ? Number(options.grid)
+    : SNAP_GRID
+  return Math.round(number / grid) * grid
+}
+
+/**
+ * G5-e：二维落位纯函数。`bypassSnap: true`（Alt 按下）不再吸附网格，
+ * 松开 Alt 后调用方传 false 即恢复 4px 吸附。
+ */
+export function snapPosition(position, options = {}) {
+  const point = position && typeof position === 'object' ? position : {}
+  return {
+    x: snapCoordinate(point.x, options),
+    y: snapCoordinate(point.y, options),
+  }
+}
+
 /** 主从节点比普通阶段节点高 20px，用来放成员点行；多出的高度向下长，中心线不变。 */
 export const NODE_H_TEAM = NODE_H + 20
 

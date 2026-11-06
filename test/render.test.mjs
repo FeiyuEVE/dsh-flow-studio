@@ -30,6 +30,13 @@ function check(name, fn) {
   console.log(`  ✓ ${name}`)
 }
 
+/** 异步检查（共享数据源 / 删除序列这类必须 await 的用例）。 */
+async function checkAsync(name, fn) {
+  await fn()
+  checks += 1
+  console.log(`  ✓ ${name}`)
+}
+
 /** 渲染一个元素成 HTML 字符串。 */
 function render(element) {
   return renderToStaticMarkup(element)
@@ -42,21 +49,23 @@ bindReact(React)
 
 const model = await import('../src/model.js')
 const {
-  FlowCanvas, canConnectNodes, edgeAriaLabel, edgeListText, guardStructureEdit, interactionState,
-  isEdgeActive, lodText, nodeAriaLabel, stateShape, wheelPanDelta,
+  FlowCanvas, canConnectNodes, createDragHandlers, edgeAriaLabel, edgeListText, guardStructureEdit,
+  interactionState, isEdgeActive, lodText, nodeAriaLabel, snapToGridEnabled, stateShape, wheelPanDelta,
 } = await import('../src/client/canvas.js')
-const { lodOf, rejectPathRects } = await import('../src/client/geometry.js')
+const { SNAP_GRID, lodOf, rejectPathRects, snapPosition } = await import('../src/client/geometry.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList, isGroupOpen, nextGroupToggles } = await import('../src/client/flowlist.js')
 const {
-  NODE_STATUS_EMPTY_TEXT, NODE_STATUS_SCROLL_AT, blockersText, hasNodeStatus,
-  nodeStatusEntries, nodeStatusOf, nodeTitleMap,
+  NODE_STATUS_EMPTY_TEXT, NODE_STATUS_SCROLL_AT, blockersText, deleteConfirmText,
+  hasNodeStatus, nodeStatusEntries, nodeStatusOf, nodeTitleMap, sessionModeText,
+  worktreeDetailText, worktreeReasonText,
 } = await import('../src/client/flowlist.js')
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
-  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, mergeSavedFlow, progressOf,
-  runEndAnnouncement, runPreflight, saveBodyFor, startFailurePlan,
+  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, deleteFlowRequest, firstErrorTarget,
+  mergeSavedFlow, progressOf, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
+  startFailurePlan,
 } = await import('../src/client/page.js')
 const {
   EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
@@ -69,8 +78,9 @@ const {
   sortEventsDesc, statusText, stubBadgeOf,
 } = await import('../src/client/logdrawer.js')
 const {
-  FS_TOKEN_STORAGE_KEY, authorizationHeader, captureFsToken, exportUrl,
-  extractFsToken, readEventsPath, requestFailureText, runActionFailureText,
+  FS_TOKEN_STORAGE_KEY, LIGHT_POLL_FALLBACK_NOTICE, RUNS_IDLE_POLL_MS, api, authorizationHeader,
+  captureFsToken, createLightRunReader, createRunsSource, exportUrl, extractFsToken,
+  readEventsPath, readRunPath, requestFailureText, runActionFailureText,
 } = await import('../src/client/api.js')
 const { CSS } = await import('../src/client/styles.js')
 
@@ -1547,6 +1557,298 @@ check('页面底部装配运行日志抽屉，且位于主体之后、底栏之�
   const drawerAt = html.indexOf('class="fs-log"')
   const footerAt = html.indexOf('class="fs-status"')
   assert.ok(drawerAt > 0 && footerAt > drawerAt, '抽屉应在主体之后、底栏之前，不能遮挡检查器')
+})
+
+// ── G5：轮询成本 / 删除安全 / 降级状态 / 共享数据源 / Alt 绕过吸附 ────────
+console.log('G5（client）')
+
+check('G5-a：light=1 路径与完整详情路径分开；抽屉打开用完整详情', () => {
+  assert.equal(readRunPath('run-1', { light: true }), '/runs/run-1?light=1', '2s 轮询必须带 light=1')
+  assert.equal(readRunPath('run-1'), '/runs/run-1', '默认仍是完整详情接口')
+  assert.equal(readRunPath('run-1', { light: false }), '/runs/run-1', '打开抽屉时显式走完整详情')
+  assert.equal(readRunPath('run/a', { light: true }), '/runs/run%2Fa?light=1', 'runId 仍需编码')
+})
+
+await checkAsync('G5-a：light=1 撞 400/404 只降级一次并提示一次；网络错误不误降级', async () => {
+  for (const status of [400, 404]) {
+    let lightCalls = 0
+    let fullCalls = 0
+    const warnings = []
+    const reader = createLightRunReader({
+      readRun: async (id, options) => {
+        if (options && options.light) {
+          lightCalls += 1
+          const error = new Error('light unsupported')
+          error.status = status
+          throw error
+        }
+        fullCalls += 1
+        return { run: { id } }
+      },
+      warn: message => warnings.push(message),
+    })
+    const first = await reader.read('run-1')
+    const second = await reader.read('run-1')
+    assert.equal(first.light, false, '降级那一次用的是完整接口')
+    assert.equal(second.light, false)
+    assert.equal(first.data.run.id, 'run-1')
+    assert.equal(lightCalls, 1, `HTTP ${status} 之后不能再每轮重试 light=1`)
+    assert.equal(fullCalls, 2, '降级后的每一轮都直接走完整接口')
+    assert.equal(warnings.length, 1, '只警告一次，不能静默也不能刷屏')
+    assert.equal(warnings[0], LIGHT_POLL_FALLBACK_NOTICE)
+    assert.equal(reader.lightSupported, false)
+    assert.equal(reader.warned, true)
+  }
+
+  // 网络错误 / 5xx 不是能力问题：照常抛给轮询退避，不永久降级。
+  let calls = 0
+  const flaky = createLightRunReader({
+    readRun: async () => {
+      calls += 1
+      throw new Error('offline')
+    },
+  })
+  await assert.rejects(() => flaky.read('run-1'), /offline/)
+  assert.equal(flaky.lightSupported, true, '网络错误不能误判为 Host 不支持 light=1')
+  assert.equal(calls, 1)
+
+  // 真实请求 URL：抽屉里的完整详情不带 light，只有后台轮询带 light=1。
+  const urls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async url => {
+    urls.push(String(url))
+    return { ok: true, status: 200, json: async () => ({ ok: true, run: { id: 'run-1' } }) }
+  }
+  try {
+    await api.readRun('run-1', { light: false })
+    await api.readRun('run-1', { light: true })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.equal(urls[0], '/api/flow-studio/runs/run-1', '打开抽屉必须走完整详情（无 light）')
+  assert.equal(urls[1], '/api/flow-studio/runs/run-1?light=1', '轮询请求必须带 light=1')
+})
+
+check('G5-b：删除有二次确认文案（流程名 / 撤销 / 草稿清理时机）', () => {
+  const text = deleteConfirmText('标准研发流水线')
+  assert.ok(text.includes('标准研发流水线'), '确认文案必须带流程名')
+  assert.ok(text.includes('撤销'), '确认文案必须说明删除后可撤销')
+  assert.ok(text.includes('服务器删除成功'), '确认文案必须说明草稿何时清理')
+  assert.ok(deleteConfirmText('').includes('未命名流程'), '空名要有可读兜底')
+
+  const html = renderFlowList({
+    flows: [{
+      id: 'flow-test', name: '标准研发流水线', description: '',
+      nodeCount: 8, edgeCount: 11, rejectCount: 4, updatedAt: '',
+    }],
+    activeId: 'flow-test',
+    initialDeleteId: 'flow-test',
+  })
+  assert.ok(html.includes('确认删除「标准研发流水线」？'), '第一次点删除必须进入确认态，不能直接删')
+  assert.ok(html.includes('确认删除'), '确认态缺少「确认删除」按钮')
+  assert.ok(html.includes('取消'), '确认态缺少「取消」按钮')
+
+  const undo = renderFlowList({ flows: [], undoDelete: { id: 'flow-x', name: '被删流程' } })
+  assert.ok(undo.includes('已删除「被删流程」'), '删除成功后缺少撤销入口')
+  assert.ok(undo.includes('撤销'), '撤销入口缺少可读按钮')
+})
+
+await checkAsync('G5-b：删除失败草稿仍在、快照可撤销；删除成功才清草稿', async () => {
+  const snapshot = { ...model.defaultFlow(), id: 'flow-del' }
+  const draftsStore = new Map()
+  const drafts = {
+    write: flow => draftsStore.set(flow.id, flow),
+    clear: id => draftsStore.delete(id),
+  }
+
+  const failing = {
+    readFlow: async () => ({ flow: snapshot }),
+    deleteFlow: async () => { throw new Error('磁盘只读') },
+  }
+  const failed = await deleteFlowRequest({ api: failing, id: 'flow-del', drafts })
+  assert.equal(failed.ok, false)
+  assert.equal(failed.stage, 'delete')
+  assert.ok(failed.backup, '删除失败必须保留内存快照，供重试 / 撤销')
+  assert.equal(failed.backup.id, 'flow-del')
+  assert.equal(draftsStore.has('flow-del'), true, '删除失败时草稿必须仍在')
+  assert.ok(failed.error.message.includes('磁盘只读'))
+
+  const succeeding = {
+    readFlow: async () => ({ flow: snapshot }),
+    deleteFlow: async () => ({ ok: true }),
+  }
+  const done = await deleteFlowRequest({ api: succeeding, id: 'flow-del', drafts })
+  assert.equal(done.ok, true)
+  assert.equal(draftsStore.has('flow-del'), false, '只有服务器删除成功后才清草稿')
+  assert.equal(done.backup.id, 'flow-del', '成功后仍保留快照供撤销')
+
+  // 拿不到快照就不删：没有备份的删除等于单点毁灭。
+  let deleted = 0
+  const noBackup = {
+    readFlow: async () => { throw new Error('读取失败') },
+    deleteFlow: async () => { deleted += 1 },
+  }
+  const blocked = await deleteFlowRequest({ api: noBackup, id: 'flow-del', drafts })
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.stage, 'snapshot')
+  assert.equal(deleted, 0, '拿不到完整快照时绝不能发 DELETE')
+
+  // 撤销：把内存快照按原 id 写回服务器（PUT /flows/<id> 是 upsert，id 不变）。
+  let saved = null
+  const restored = await restoreFlowRequest({
+    api: {
+      saveFlow: async (id, body) => {
+        saved = { id, body }
+        return { flow: { ...snapshot } }
+      },
+    },
+    backup: done.backup,
+  })
+  assert.equal(restored.ok, true)
+  assert.equal(saved.id, 'flow-del')
+  assert.equal(saved.body.id, 'flow-del')
+  assert.equal(restored.flow.id, 'flow-del')
+})
+
+check('G5-c：运行详情展示 sessionMode / worktree.reason（未知值显示原始值）', () => {
+  const known = renderFlowList({
+    runs: [{
+      id: 'run-mode', name: '模式已知', status: 'done',
+      sessionMode: 'top-level',
+      worktree: { enabled: false, reason: 'not-a-git-repo' },
+    }],
+    selectedRunId: 'run-mode',
+  })
+  assert.ok(known.includes('会话模式 · 顶层会话'), '已知 sessionMode 必须翻译成中文')
+  assert.ok(known.includes('worktree · 未启用（原因：工作区不是 git 仓库）'),
+    '未启用时必须显示可读的 worktree.reason')
+
+  const unknown = renderFlowList({
+    runs: [{
+      id: 'run-unknown', name: '未知模式', status: 'done',
+      sessionMode: 'future-mode',
+      worktree: { enabled: false, reason: 'future-reason' },
+    }],
+    selectedRunId: 'run-unknown',
+  })
+  assert.ok(unknown.includes('future-mode'), '未知 sessionMode 必须显示原始值，不能空白')
+  assert.ok(unknown.includes('future-reason'), '未知 worktree.reason 必须显示原始值')
+
+  const enabled = renderFlowList({
+    runs: [{
+      id: 'run-wt', name: 'worktree 运行', status: 'done',
+      sessionMode: 'injected',
+      worktree: { enabled: true, branch: 'flow/run-wt', path: '/repo/.worktrees/run-wt' },
+    }],
+    selectedRunId: 'run-wt',
+  })
+  assert.ok(enabled.includes('注入式会话'), 'injected 必须有中文文案')
+  assert.ok(enabled.includes('分支 flow/run-wt'), 'worktree.enabled=true 时必须显示分支')
+  assert.ok(enabled.includes('/repo/.worktrees/run-wt'), 'worktree.enabled=true 时必须显示路径')
+
+  assert.equal(sessionModeText(''), '未标注（旧 run）')
+  assert.equal(sessionModeText('stub'), '桩引擎')
+  assert.equal(sessionModeText('???'), '未知（???）')
+  assert.equal(worktreeReasonText('disabled-by-initiator'), '发起方关闭了 worktree')
+  assert.equal(worktreeReasonText('create-failed: boom'), '创建 worktree 失败：boom')
+  assert.equal(worktreeReasonText(''), '原因未标注')
+  assert.equal(worktreeReasonText('??'), '未知原因（??）')
+  assert.equal(worktreeDetailText({ enabled: true, branch: '', path: '' }), '已启用')
+})
+
+check('G5-e：Alt 绕过吸附（几何纯函数 + 拖拽落位），松开后恢复 4px 吸附', () => {
+  assert.equal(SNAP_GRID, 4, '逻辑吸附步长必须是 4px')
+  assert.deepEqual(snapPosition({ x: 201.3, y: 223.2 }), { x: 200, y: 224 }, '默认吸附 4px 网格')
+  assert.deepEqual(snapPosition({ x: 201.3, y: 223.2 }, { bypassSnap: true }), { x: 201, y: 223 },
+    'Alt 按下时自由落位，只取整到 1px')
+  assert.deepEqual(snapPosition({ x: 'x', y: null }), { x: 0, y: 0 }, '坏坐标降级成 0，不污染流程')
+  assert.equal(snapToGridEnabled(true), false, 'Alt 按下时 React Flow 的 snapToGrid 必须关闭')
+  assert.equal(snapToGridEnabled(false), true, '松开后恢复 snapToGrid')
+
+  const commits = []
+  const bypassEvents = []
+  const handlers = createDragHandlers({
+    snap: snapPosition,
+    onBypassChange: bypass => bypassEvents.push(bypass),
+    onMoveNode: (id, x, y) => commits.push([id, x, y]),
+  })
+  handlers.onNodeDrag({ altKey: false }, { id: 'n_dev', position: { x: 201.3, y: 223.2 } })
+  handlers.onNodeDragStop({ altKey: true }, { id: 'n_dev', position: { x: 201.3, y: 223.2 } })
+  handlers.onNodeDragStop({ altKey: false }, { id: 'n_dev', position: { x: 201.3, y: 223.2 } })
+  assert.deepEqual(commits[0], ['n_dev', 201, 223], 'Alt 按下松手不能被吸回 4px 网格')
+  assert.deepEqual(commits[1], ['n_dev', 200, 224], '松开 Alt 后必须恢复吸附')
+  assert.deepEqual(bypassEvents, [false, true, false], 'Alt 状态要能同步给 snapToGrid')
+})
+
+/** G5-d 用：只收集定时器、不真正等待的假时钟。 */
+function fakePollTimers() {
+  const queue = []
+  let seq = 0
+  return {
+    setTimeout(fn, ms) {
+      const id = ++seq
+      queue.push({ id, fn, ms })
+      return id
+    },
+    clearTimeout(id) {
+      const at = queue.findIndex(item => item.id === id)
+      if (at >= 0) queue.splice(at, 1)
+    },
+    delays() {
+      return queue.map(item => item.ms)
+    },
+  }
+}
+
+await checkAsync('G5-d：左栏与抽屉共用一份 runs 数据源，只发一次请求；空闲 15s / 前台立即刷新', async () => {
+  let fetchCalls = 0
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, runs: [{ id: 'run-1' }] }),
+    }
+  }
+  const timers = fakePollTimers()
+  const source = createRunsSource({
+    read: () => api.listRuns(20),
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    now: () => 1000,
+  })
+  try {
+    // 两个消费方（左栏 / 抽屉）各自刷新：并发刷新必须合并成一次 fetch。
+    const left = []
+    const drawer = []
+    source.subscribe(snapshot => left.push(snapshot))
+    source.subscribe(snapshot => drawer.push(snapshot))
+    await Promise.all([source.refresh({ force: true }), source.refresh({ force: true })])
+    assert.equal(fetchCalls, 1, '共享数据源必须只发一次请求')
+    assert.equal(left.length, 1, '左栏应从共享数据源拿到一次结果')
+    assert.equal(drawer.length, 1, '抽屉应从共享数据源拿到一次结果')
+    assert.equal(left[0], drawer[0], '两处必须是同一份快照对象（同一个 tick）')
+    assert.equal(left[0].tick, 1)
+
+    // 非 force 的第二次请求命中 1s 新鲜度保护，不会再打一次网络。
+    await source.refresh()
+    assert.equal(fetchCalls, 1, '同一 tick 内两处再问一次不应重复发请求')
+
+    source.start()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fetchCalls, 2, 'start 必须立即刷新一次')
+    assert.deepEqual(timers.delays(), [RUNS_IDLE_POLL_MS], '空闲时按 15s 轮询，不是完全停掉')
+    assert.equal(RUNS_IDLE_POLL_MS, 15000)
+    assert.equal(source.idleMs, 15000)
+
+    source.foreground()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fetchCalls, 3, '切回前台 / 重新打开面板必须立即刷新一次')
+  } finally {
+    source.stop()
+    globalThis.fetch = originalFetch
+  }
 })
 
 // ── B. 构建产物 ────────────────────────────────────────────────────────────

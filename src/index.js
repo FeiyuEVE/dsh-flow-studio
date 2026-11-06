@@ -23,15 +23,22 @@
  */
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
-import { readFileSync, realpathSync, statSync } from 'node:fs'
-import { isAbsolute, join, resolve } from 'node:path'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
 import { NODE_KIND, validateFlow } from './model.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import { createRuntime, patchRunJson, readStartOptions, saveSupervision } from './runtime.js'
-import { createFlowTools } from './tools.js'
+import * as worktreeModule from './worktree.js'
+import {
+  CUSTOM_EXECUTOR_ENV, DEFAULT_NODE_TIMEOUT_MS, DEFAULT_RUN_TIMEOUT_MS, MAX_TIMEOUT_MS,
+  NODE_TIMEOUT_ENV, RUN_TIMEOUT_ENV, WORKSPACE_ROOTS_ENV,
+  createFlowTools, customExecutorBlockers, customExecutorAllowed, listExistingRunIds,
+  parseWorkspaceRoots, workspaceAllowlistReason, worktreeRecordOf, worktreesRootFor,
+} from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
   readLease, readRunDetail, readRunMessages, readRunMeta, repairRunStates, runsDir,
@@ -49,6 +56,15 @@ export const name = 'flow-studio'
 
 /** 可选加固（§8.5）：设置该环境变量后所有 /api/flow-studio/* 都要求 token。 */
 export const AUTH_ENV = 'FLOW_STUDIO_TOKEN'
+
+/**
+ * G6-a ①：只读令牌（可选）。它只允许 GET；任何写请求（POST / PUT / DELETE…）→ 403。
+ * 全权令牌仍是 {@link AUTH_ENV}。两个都配置时按「先匹配全权、再匹配只读」判定。
+ */
+export const READ_AUTH_ENV = 'FLOW_STUDIO_READ_TOKEN'
+
+/** G6-a ②③ / G6-c：从 tools.js 与 HTTP 层共用的主机级开关（再导出，便于测试与运维引用）。 */
+export { CUSTOM_EXECUTOR_ENV, WORKSPACE_ROOTS_ENV, RUN_TIMEOUT_ENV, NODE_TIMEOUT_ENV }
 
 /** 插件版本，用于 GET /health（§8.5）。 */
 export const PLUGIN_VERSION = (() => {
@@ -147,16 +163,36 @@ function isSameOrigin(req) {
 /** 06 §13.1：FLOW_STUDIO_TOKEN 至少 16 字符，否则启动即拒绝。 */
 export const TOKEN_MIN_LENGTH = 16
 
-/** §13.1：配置了 token 就返回 {present, valid, token}；没配置视为未启用。 */
-function inspectToken(env = process.env) {
-  const raw = env[AUTH_ENV]
-  if (typeof raw !== 'string') return { present: false, valid: false, token: null }
+/** §13.1：读一个 token 环境变量 → {present, valid, token}；空串 = 未配置。 */
+function inspectTokenEnv(envName, env = process.env) {
+  const raw = env ? env[envName] : undefined
+  if (typeof raw !== 'string') return { present: false, valid: false, token: '' }
   const token = raw.trim()
-  if (token === '') return { present: false, valid: false, token: null }
+  if (token === '') return { present: false, valid: false, token: '' }
   return { present: true, valid: token.length >= TOKEN_MIN_LENGTH, token }
 }
 
-/** 兼容导出：返回当前生效的 token；未配置或配置过短（fail-closed）返回 null。 */
+/** 兼容口径：全权令牌（FLOW_STUDIO_TOKEN）的检查结果。 */
+function inspectToken(env = process.env) {
+  return inspectTokenEnv(AUTH_ENV, env)
+}
+
+/** 只读令牌（FLOW_STUDIO_READ_TOKEN）的检查结果。 */
+function inspectReadToken(env = process.env) {
+  return inspectTokenEnv(READ_AUTH_ENV, env)
+}
+
+/** 两档令牌的合并视图：任一配置就算启用鉴权；过短的记进 misconfigured（启动即拒绝）。 */
+function inspectAuth(env = process.env) {
+  const full = inspectToken(env)
+  const read = inspectReadToken(env)
+  const misconfigured = []
+  if (full.present && !full.valid) misconfigured.push({ env: AUTH_ENV, length: full.token.length })
+  if (read.present && !read.valid) misconfigured.push({ env: READ_AUTH_ENV, length: read.token.length })
+  return { present: full.present || read.present, full, read, misconfigured }
+}
+
+/** 兼容导出：返回当前生效的全权 token；未配置或配置过短（fail-closed）返回 null。 */
 export function configuredToken() {
   const inspected = inspectToken()
   return inspected.valid ? inspected.token : null
@@ -182,13 +218,28 @@ function tokenMatches(expected, provided) {
   return timingSafeEqual(a, b)
 }
 
-/** 返回 true 表示放行。token 档位只认 Authorization: Bearer（export 另允许 ?token=）。 */
-function authorize(req, url, options = {}) {
-  const inspected = inspectToken()
-  if (!inspected.present) return true
+/**
+ * 返回鉴权结论（G6-a ①）。
+ *   - `{ ok:true, mode:'connection', readOnly:false }`：没配置任何 token（沿用宿主鉴权）；
+ *   - `{ ok:true, mode:'full' }`：全权令牌（FLOW_STUDIO_TOKEN）；
+ *   - `{ ok:true, mode:'read', readOnly:true }`：只读令牌（FLOW_STUDIO_READ_TOKEN），只允许 GET；
+ *   - `{ ok:false }`：缺 / 错令牌，或配置了过短令牌（fail-closed）。
+ * token 档位只认 Authorization: Bearer（export 另允许 ?token=）。
+ */
+function authorizeRequest(req, url, options = {}) {
+  const inspected = inspectAuth()
+  if (!inspected.present) return { ok: true, mode: 'connection', readOnly: false }
   // 配置了但不足 16 字符：不悄悄退回同源，直接拒绝（启动时也会拒绝注册）。
-  if (!inspected.valid) return false
-  return tokenMatches(inspected.token, requestToken(req, url, options))
+  if (inspected.misconfigured.length > 0) return { ok: false, mode: 'none', readOnly: false }
+  const provided = requestToken(req, url, options)
+  // 先匹配全权：两档令牌配成同一个值时，全权优先（启动时会告警）。
+  if (inspected.full.valid && tokenMatches(inspected.full.token, provided)) {
+    return { ok: true, mode: 'full', readOnly: false }
+  }
+  if (inspected.read.valid && tokenMatches(inspected.read.token, provided)) {
+    return { ok: true, mode: 'read', readOnly: true }
+  }
+  return { ok: false, mode: 'none', readOnly: false }
 }
 
 /**
@@ -385,6 +436,210 @@ function parseStartOptions(body) {
 }
 
 /**
+ * G6-c：`POST /runs/<id>/start` 请求体里的可选时限。
+ *
+ * 只接受「正整数毫秒」；上限用 JavaScript 定时器上限（2^31-1 ms ≈ 24.8 天），
+ * 超过它 setTimeout 会立刻触发，等于把 run 立刻收掉。省略 = 引擎默认
+ * （run 2h / 节点 20min）或环境变量 FLOW_STUDIO_RUN_TIMEOUT_MS / FLOW_STUDIO_NODE_TIMEOUT_MS。
+ *
+ * @param {unknown} body
+ * @returns {{ runTimeoutMs?: number, nodeTimeoutMs?: number }}
+ */
+function parseTimeoutOptions(body) {
+  if (body === undefined || body === null) return {}
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    throw new RunError(400, 'body', '请求体必须是 JSON 对象')
+  }
+  const options = {}
+  const fields = [
+    ['runTimeoutMs', '整轮 run 的时限'],
+    ['nodeTimeoutMs', '单个节点的时限'],
+  ]
+  for (const [key, label] of fields) {
+    const raw = body[key]
+    if (raw === undefined || raw === null) continue
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+      throw new RunError(
+        400,
+        key,
+        `${label} ${key} 必须是正整数（毫秒）；想用默认值就不要传这个字段`,
+        { code: key },
+      )
+    }
+    if (raw > MAX_TIMEOUT_MS) {
+      throw new RunError(
+        400,
+        key,
+        `${label} ${key} 不能超过 ${MAX_TIMEOUT_MS}ms（约 24.8 天，JavaScript 定时器上限）`,
+        { code: key },
+      )
+    }
+    options[key] = raw
+  }
+  return options
+}
+
+/** 错误对象 → 可读文案（不把堆栈甩给客户端）。 */
+function errorMessage(error) {
+  if (error instanceof Error) return error.message || error.name
+  if (typeof error === 'string') return error
+  return '未知错误'
+}
+
+// ── G6-b：worktree 生命周期接线（模块逻辑在 worktree.js，这里只接线） ─────
+
+/** worktree 模块 or 注入桩（测试用）。缺导出时路由给可读失败，不假装成功。 */
+function worktreeApiOf(env) {
+  return env && env.worktree && typeof env.worktree === 'object' ? env.worktree : worktreeModule
+}
+
+/** 注入的 git runner（透传给 worktree 模块；生产不注入）。 */
+function worktreeRunnerOf(env) {
+  return env && typeof env.worktreeRunner === 'function' ? env.worktreeRunner : undefined
+}
+
+/**
+ * 孤儿 worktree 清单：`DELETE /runs/<id>` 只删 run 目录，但 run.json.worktree.path
+ * 是 worktree 的唯一指针——删掉就永久失联。所以删除前把 `{path, branch, workspaceId}`
+ * 记进 `<runsRoot>/.worktree-orphans.json`（0600，原子写），供 GET /worktrees 查询。
+ */
+const ORPHAN_FILE = '.worktree-orphans.json'
+
+/** 按 runsRoot 串行化孤儿清单的读-改-写（进程内，够用；Host 单进程）。 */
+const orphanQueues = new Map()
+
+function withOrphanLock(runsRoot, task) {
+  const key = resolve(runsRoot)
+  const previous = orphanQueues.get(key) || Promise.resolve()
+  const result = previous.then(task, task)
+  const tail = result.then(() => undefined, () => undefined)
+  orphanQueues.set(key, tail)
+  return result.finally(() => {
+    if (orphanQueues.get(key) === tail) orphanQueues.delete(key)
+  })
+}
+
+function orphanFilePath(runsRoot) {
+  return join(runsRoot, ORPHAN_FILE)
+}
+
+function isOrphanRecordShape(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.path === 'string' && value.path !== ''
+}
+
+async function readOrphanWorktrees(runsRoot) {
+  let text
+  try {
+    text = await readFile(orphanFilePath(runsRoot), 'utf8')
+  } catch {
+    return []
+  }
+  try {
+    const parsed = JSON.parse(text)
+    const list = Array.isArray(parsed)
+      ? parsed
+      : (parsed && Array.isArray(parsed.orphans) ? parsed.orphans : [])
+    return list.filter(isOrphanRecordShape)
+  } catch {
+    // 坏文件按空清单处理（不因为一条手改坏的 JSON 让 DELETE /runs 失败）。
+    return []
+  }
+}
+
+async function writeOrphanWorktrees(runsRoot, list) {
+  await mkdir(runsRoot, { recursive: true, mode: 0o700 })
+  const target = orphanFilePath(runsRoot)
+  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`
+  const body = `${JSON.stringify({ version: 1, orphans: list }, null, 2)}\n`
+  await writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 })
+  await rename(tmp, target)
+}
+
+/** 从 run.json 的 workspace + worktree 记录收敛成孤儿条目（字段至少含 path/branch/workspaceId）。 */
+function orphanRecordOf(meta, record) {
+  const workspace = meta && meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null
+  let workspaceId = workspace && typeof workspace.id === 'string' && workspace.id !== '' ? workspace.id : null
+  if (workspaceId === null && typeof record.path === 'string') {
+    // 兜底：worktree 布局是 <root>/<workspaceId>/<runId>，父目录名就是 workspaceId。
+    const parent = basename(dirname(record.path))
+    if (/^[0-9a-f]{12}$/.test(parent)) workspaceId = parent
+  }
+  return {
+    runId: meta && typeof meta.id === 'string' ? meta.id : null,
+    flowId: meta && typeof meta.flowId === 'string' ? meta.flowId : null,
+    flowName: meta && typeof meta.flowName === 'string' ? meta.flowName : null,
+    path: record.path,
+    branch: typeof record.branch === 'string' ? record.branch : null,
+    workspaceId,
+    workspacePath: workspace && typeof workspace.path === 'string' ? workspace.path : null,
+    recordedAt: new Date().toISOString(),
+    reason: 'run-deleted',
+  }
+}
+
+async function recordOrphanWorktree(runsRoot, meta, record) {
+  return withOrphanLock(runsRoot, async () => {
+    const list = await readOrphanWorktrees(runsRoot)
+    const entry = orphanRecordOf(meta, record)
+    const next = [entry, ...list.filter(item => !(item.runId === entry.runId && item.path === entry.path))]
+    await writeOrphanWorktrees(runsRoot, next)
+    return entry
+  })
+}
+
+async function dropOrphanWorktree(runsRoot, { runId, path }) {
+  return withOrphanLock(runsRoot, async () => {
+    const list = await readOrphanWorktrees(runsRoot)
+    const next = list.filter(item => !(item.runId === runId && (path === undefined || item.path === path)))
+    if (next.length === list.length) return false
+    await writeOrphanWorktrees(runsRoot, next)
+    return true
+  })
+}
+
+/** prune 之后同步清单：已删除 / 目录不存在的条目移出（保留仍需要的指针）。 */
+async function syncOrphanWorktrees(runsRoot, removedPaths) {
+  return withOrphanLock(runsRoot, async () => {
+    const list = await readOrphanWorktrees(runsRoot)
+    const next = list.filter(item => !(removedPaths.has(item.path) || !existsSync(item.path)))
+    if (next.length !== list.length) await writeOrphanWorktrees(runsRoot, next)
+    return next
+  })
+}
+
+/**
+ * G6-b ①：run 详情的 worktreeStatus（exists / dirty / head，来自 inspectWorktree）。
+ * 拿不到（没有记录 / 没 workspace / 模块缺导出 / git 探针失败）一律 `{unknown:true, reason}`，
+ * 绝不假装「目录不存在」。
+ */
+async function worktreeStatusOf(env, meta) {
+  const record = worktreeRecordOf(meta)
+  if (!record) return { unknown: true, enabled: false, reason: 'no-worktree-record' }
+  const api = worktreeApiOf(env)
+  if (typeof api.inspectWorktree !== 'function') {
+    return { unknown: true, enabled: true, reason: 'worktree 模块没有 inspectWorktree 导出' }
+  }
+  const workspace = meta && meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null
+  if (!workspace) return { unknown: true, enabled: true, reason: 'run.json 没有 workspace 记录' }
+  try {
+    const inspected = await api.inspectWorktree({ workspace, record, run: worktreeRunnerOf(env) })
+    if (!inspected || typeof inspected !== 'object' || Array.isArray(inspected)) {
+      return { unknown: true, enabled: true, reason: 'inspectWorktree 返回了非法结果' }
+    }
+    return {
+      enabled: true,
+      exists: inspected.exists === true,
+      dirty: inspected.dirty === true ? true : (inspected.dirty === false ? false : null),
+      head: typeof inspected.head === 'string' && inspected.head !== '' ? inspected.head : null,
+      ...(typeof inspected.error === 'string' && inspected.error !== '' ? { reason: inspected.error } : {}),
+    }
+  } catch (error) {
+    return { unknown: true, enabled: true, reason: errorMessage(error) }
+  }
+}
+
+/**
  * E3-a：run 是否跑在测试桩上。桩引擎不需要真实工作区（也不该被工作目录拖死），
  * 这是「启动必须给 workspace」唯一豁免。入口只有两处判据：引擎自己声明 stub，
  * 或 run.json 已经记下 `sessionMode:'stub'` / `engine:'stub'`。
@@ -435,6 +690,10 @@ function resolveWorkspaceRecord(value) {
   } catch {
     throw workspaceError(`workspace 路径无法解析：${absolute}`)
   }
+  // G6-a ③：配置了 FLOW_STUDIO_WORKSPACE_ROOTS 就必须落在白名单内（不配置 = 不限制）。
+  // 用 realpath 比较，避免「白名单外建一个指向白名单内的 symlink」绕过。
+  const allowlistReason = workspaceAllowlistReason(realpath)
+  if (allowlistReason !== null) throw workspaceError(allowlistReason)
   return { id: workspaceIdFor(realpath), path: absolute, realpath }
 }
 
@@ -563,6 +822,60 @@ function runBindingFields(meta) {
     supervision: runSupervisionOf(meta),
     nodeStatus: runNodeStatusOf(meta),
   }
+}
+
+/**
+ * G7：`GET /runs/<runId>?light=1` 的轻量投影（前端契约，字段集固定）。
+ *
+ * **只读 run.json 元数据**（`readRunMeta`），绝不调用 `readRunDetail()`：
+ * 后者会 `readAllEventsUnlocked()` 并逐事件建节点索引，正是要消掉的 ~113ms/次。
+ * 因此这里不返回 `nodes` / `events`；`eventCount` 直接取 run.json 计数器
+ * （不做任何事件解析），`live` 原样透传 run.json 里那份（可能为 null）。
+ *
+ * @param {object} meta readRunMeta 的结果
+ * @returns {object}
+ */
+function lightRunOf(meta) {
+  const worktree = meta && meta.worktree && typeof meta.worktree === 'object' ? meta.worktree : null
+  const run = {
+    id: meta.id,
+    flowId: meta.flowId,
+    flowName: meta.flowName,
+    name: meta.name,
+    status: meta.status,
+    started: meta.started === true,
+    startedAt: meta.startedAt,
+    endedAt: meta.endedAt,
+    nodeDone: meta.nodeDone,
+    nodeTotal: meta.nodeTotal,
+    tokenTotal: meta.tokenTotal,
+    // progress? 可选：run.json 里有什么给什么（不重算）。
+    ...(meta.progress && typeof meta.progress === 'object' ? { progress: meta.progress } : {}),
+    // eventCount? 可选：直接取 run.json 计数器；拿不到就省略，绝不为此解析事件。
+    ...(Number.isInteger(meta.eventCount) && meta.eventCount >= 0 ? { eventCount: meta.eventCount } : {}),
+    engine: meta.engine,
+    // live 必须是 run.json 里那份（可能为 null），不伪造。
+    live: meta.live ?? null,
+    nodeStatus: runNodeStatusOf(meta),
+    workspace: meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null,
+    // 契约字段集：{ enabled, reason, path, branch }；worktree 模块新增的 root / warnings
+    //（前端要展示「为什么要单独清理 / 有哪些告警」）与 baseCommit（空仓库时为 null）一并带上。
+    worktree: {
+      enabled: Boolean(worktree && worktree.enabled === true),
+      reason: worktree && typeof worktree.reason === 'string' ? worktree.reason : null,
+      path: worktree && typeof worktree.path === 'string' ? worktree.path : null,
+      branch: worktree && typeof worktree.branch === 'string' ? worktree.branch : null,
+      root: worktree && typeof worktree.root === 'string' ? worktree.root : null,
+      // 空仓库的 baseCommit 可能是 null —— 容忍 null，别在这里做 40 位 hex 校验。
+      baseCommit: worktree && typeof worktree.baseCommit === 'string' ? worktree.baseCommit : null,
+      warnings: worktree && Array.isArray(worktree.warnings)
+        ? worktree.warnings.filter(item => typeof item === 'string' && item !== '')
+        : [],
+    },
+    sessionMode: typeof meta.sessionMode === 'string' ? meta.sessionMode : null,
+    supervision: runSupervisionOf(meta),
+  }
+  return run
 }
 
 /**
@@ -703,21 +1016,49 @@ async function route(req, res, env) {
   // 06 §13.1：token 档位只认 Authorization: Bearer；`?token=` 仅 export 路由保留
   //（浏览器 <a download> 没法带请求头）。
   const isExportRoute = parts[0] === 'runs' && parts.length === 3 && parts[2] === 'export'
-  const authed = authorize(req, url, { allowQueryToken: isExportRoute })
-  if (!authed) {
+  const authz = authorizeRequest(req, url, { allowQueryToken: isExportRoute })
+  if (!authz.ok) {
     sendJson(res, 401, { ok: false, error: '未授权：需要 Authorization: Bearer <token>' })
+    return
+  }
+  // G6-a ①：只读令牌只能 GET；任何写请求（POST / PUT / DELETE / PATCH…）一律 403。
+  if (authz.readOnly && req.method !== 'GET') {
+    sendJson(res, 403, {
+      ok: false,
+      code: 'READ_ONLY_TOKEN',
+      error: `当前令牌是只读令牌（${READ_AUTH_ENV}）：只允许 GET，不能执行 ${req.method} 写操作`,
+      hint: `写操作请改用全权令牌（${AUTH_ENV}）或宿主的登录凭据`,
+    })
     return
   }
 
   // GET /api/flow-studio/health
   if (parts.length === 1 && parts[0] === 'health') {
     // 06 §13.1：目录只在「已通过鉴权」或「回环请求」时返回，避免把宿主路径泄露给 LAN。
-    const exposePaths = authed || isLoopbackRequest(req)
+    const exposePaths = authz.ok || isLoopbackRequest(req)
+    const authState = inspectAuth()
+    const rootsConfig = parseWorkspaceRoots()
     sendJson(res, 200, {
       ok: true,
       ...(exposePaths ? { dir: env.dir, runsDir: env.runsRoot } : {}),
-      // §8.5：运维一眼看出当前鉴权档位。
-      auth: inspectToken().valid ? 'token' : 'connection',
+      // §8.5：运维一眼看出当前鉴权档位（旧字段保持字符串，向后兼容）。
+      auth: authState.present ? 'token' : 'connection',
+      // G6-a ④：让调用方知道自己的令牌能干什么（per-request）。
+      authMode: authz.mode,
+      readOnly: authz.readOnly,
+      customExecutor: customExecutorAllowed(),
+      // G6-c：默认时限（调用方可据此决定要不要显式调大 runTimeoutMs）。
+      limits: {
+        defaultRunTimeoutMs: DEFAULT_RUN_TIMEOUT_MS,
+        defaultNodeTimeoutMs: DEFAULT_NODE_TIMEOUT_MS,
+      },
+      capabilities: {
+        mode: authz.mode,
+        readOnly: authz.readOnly,
+        write: !authz.readOnly,
+        customExecutor: customExecutorAllowed(),
+        workspaceAllowlist: { configured: rootsConfig.roots.length > 0, count: rootsConfig.roots.length },
+      },
       version: PLUGIN_VERSION,
       schemaVersion: 1,
       // 06 §12 / §13.8：stub 判定结果（只有 TESTBED=1 才算数）。
@@ -731,6 +1072,26 @@ async function route(req, res, env) {
   if (parts.length === 1 && parts[0] === 'skills') {
     const skills = await listSkills(env.ctx)
     sendJson(res, 200, { ok: true, skills })
+    return
+  }
+
+  // G6-b：worktree 生命周期入口
+  //   GET  /api/flow-studio/worktrees        —— 实时清单（listWorktrees）+ 孤儿标记 + 记录指针
+  //   POST /api/flow-studio/worktrees/prune  —— 清理不对应任何现有 run 的 worktree
+  if (parts[0] === 'worktrees') {
+    if (parts.length === 1 && req.method === 'GET') {
+      await listWorktreesRoute(req, res, env)
+      return
+    }
+    if (parts.length === 2 && parts[1] === 'prune' && req.method === 'POST') {
+      await pruneWorktreesRoute(res, env, await readBody(req))
+      return
+    }
+    if (parts.length > 2 || (parts.length === 2 && parts[1] !== 'prune')) {
+      sendJson(res, 404, { ok: false, error: '未知接口' })
+      return
+    }
+    sendJson(res, 405, { ok: false, error: parts.length === 1 ? '只支持 GET' : '只支持 POST' })
     return
   }
 
@@ -753,6 +1114,18 @@ async function route(req, res, env) {
         const body = await readBody(req)
         // 只有形状垃圾才 400；validation.errors 不拦保存（空流程/半成品都能存，见 rejectMalformedFlowBody）。
         if (rejectMalformedFlowBody(res, body)) return
+        // G6-a ②：custom executor 是宿主 RCE 面；主机开关关着时连保存都拒绝
+        //（不能只在前端拦——HTTP 调用方可以绕过画布直接 PUT）。
+        const customGate = customExecutorBlockers(body)
+        if (customGate.length > 0) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'CUSTOM_EXECUTOR_DISABLED',
+            field: 'nodes',
+            error: customGate[0].message,
+          })
+          return
+        }
         const flowId = newFlowId()
         const saved = await saveFlow(env.dir, flowId, body, { name: '新流程' })
         sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
@@ -804,6 +1177,17 @@ async function route(req, res, env) {
         }
         // 保存不因 validation.errors 拒绝（自动保存 + 中间态必然非法）；只有形状垃圾才是 400。
         if (rejectMalformedFlowBody(res, payload)) return
+        // G6-a ②：含 executor:'custom' 的流程，主机开关关着时保存即 400（与启动同口径）。
+        const customGate = customExecutorBlockers(payload)
+        if (customGate.length > 0) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'CUSTOM_EXECUTOR_DISABLED',
+            field: 'nodes',
+            error: customGate[0].message,
+          })
+          return
+        }
         try {
           const saved = await saveFlow(env.dir, id, payload)
           sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
@@ -836,6 +1220,260 @@ async function route(req, res, env) {
   }
 
   sendJson(res, 404, { ok: false, error: '未知接口' })
+}
+
+// ── G6-b：worktree 生命周期路由 ────────────────────────────────────────────
+
+/** 把 listWorktrees 的条目收敛成可安全 JSON 化的行（只保留已知字段 + orphan 标记）。 */
+function worktreeRowOf(entry, existingRunIds) {
+  const row = {
+    path: typeof entry.path === 'string' ? entry.path : null,
+    workspaceId: typeof entry.workspaceId === 'string' ? entry.workspaceId : null,
+    runId: typeof entry.runId === 'string' ? entry.runId : null,
+    exists: entry.exists === true,
+    dirty: entry.dirty === true ? true : (entry.dirty === false ? false : null),
+    head: typeof entry.head === 'string' && entry.head !== '' ? entry.head : null,
+    // registered 可能是 null（查不到主仓库），保留三态，不塌缩成 false。
+    registered: entry.registered === true ? true : (entry.registered === false ? false : null),
+    orphan: false,
+  }
+  if (typeof entry.error === 'string' && entry.error !== '') row.error = entry.error
+  if (row.runId !== null) row.orphan = !existingRunIds.has(row.runId)
+  return row
+}
+
+/**
+ * `GET /api/flow-studio/worktrees`
+ *
+ * 两个来源合并：listWorktrees 的实时清单（孤儿 = 对应 run 已不存在）+
+ * DELETE /runs 时记下的指针（recorded）。模块新导出还没落地时，实时部分标
+ * available:false + reason，但 recorded 仍然可查（孤儿指针不会因此丢失）。
+ */
+async function listWorktreesRoute(req, res, env) {
+  const root = env.runsRoot
+  const worktreesRoot = worktreesRootFor(root)
+  const api = worktreeApiOf(env)
+  const existingRunIds = new Set(await listExistingRunIds(root))
+  const recorded = await readOrphanWorktrees(root)
+
+  if (typeof api.listWorktrees !== 'function') {
+    sendJson(res, 200, {
+      ok: true,
+      root: worktreesRoot,
+      available: false,
+      reason: 'src/worktree.js 还没有导出 listWorktrees（worktree 生命周期模块尚未落地）；'
+        + 'recorded 是 DELETE /runs 时留下的孤儿指针',
+      worktrees: [],
+      orphans: [],
+      recorded,
+      keptRunCount: existingRunIds.size,
+    })
+    return
+  }
+
+  let listed
+  try {
+    listed = await api.listWorktrees({ root: worktreesRoot, run: worktreeRunnerOf(env) })
+  } catch (error) {
+    throw new RunError(500, 'worktree', `读取 worktree 列表失败：${errorMessage(error)}`)
+  }
+  const entries = Array.isArray(listed) ? listed : []
+  const worktrees = entries
+    .filter(entry => entry && typeof entry === 'object' && !Array.isArray(entry))
+    .map(entry => worktreeRowOf(entry, existingRunIds))
+  sendJson(res, 200, {
+    ok: true,
+    root: worktreesRoot,
+    available: true,
+    worktrees,
+    orphans: worktrees.filter(row => row.orphan === true),
+    recorded,
+    keptRunCount: existingRunIds.size,
+  })
+}
+
+/** `POST /api/flow-studio/worktrees/prune`：清理不对应任何现有 run 的 worktree。 */
+async function pruneWorktreesRoute(res, env, body) {
+  if (body !== undefined && (body === null || typeof body !== 'object' || Array.isArray(body))) {
+    throw new RunError(400, 'body', '请求体必须是 JSON 对象（可省略）')
+  }
+  const root = env.runsRoot
+  const worktreesRoot = worktreesRootFor(root)
+  const api = worktreeApiOf(env)
+  if (typeof api.pruneWorktrees !== 'function') {
+    throw new RunError(
+      501,
+      'worktree',
+      'src/worktree.js 还没有导出 pruneWorktrees（worktree 生命周期模块尚未落地），无法清理',
+    )
+  }
+
+  // 额外保留的 runId（可选）：现有 run 永远自动保留。
+  const extraKeep = []
+  const rawKeep = body && body.keepRunIds !== undefined && body.keepRunIds !== null ? body.keepRunIds : []
+  if (!Array.isArray(rawKeep)) throw new RunError(400, 'keepRunIds', 'keepRunIds 必须是 runId 字符串数组')
+  if (rawKeep.length > 200) throw new RunError(400, 'keepRunIds', 'keepRunIds 最多 200 个 runId')
+  for (const item of rawKeep) {
+    if (typeof item !== 'string' || !checkRunId(item.trim())) {
+      throw new RunError(400, 'keepRunIds', `keepRunIds 里有不合法的 runId：${String(item)}`)
+    }
+    const id = item.trim()
+    if (!extraKeep.includes(id)) extraKeep.push(id)
+  }
+
+  const existingRunIds = await listExistingRunIds(root)
+  const keepRunIds = [...new Set([...existingRunIds, ...extraKeep])]
+  let result
+  try {
+    result = await api.pruneWorktrees({ root: worktreesRoot, run: worktreeRunnerOf(env), keepRunIds })
+  } catch (error) {
+    throw new RunError(500, 'worktree', `清理 worktree 失败：${errorMessage(error)}`)
+  }
+  const removed = result && result.removed !== undefined ? result.removed : []
+  const skipped = result && result.skipped !== undefined ? result.skipped : []
+  const removedPaths = new Set()
+  for (const item of Array.isArray(removed) ? removed : []) {
+    const path = typeof item === 'string' ? item : (item && typeof item.path === 'string' ? item.path : null)
+    if (path !== null) removedPaths.add(path)
+  }
+  // prune 已经生效；清单同步失败只作为 warning 报告，不改写这次清理的成功结论。
+  let remaining = null
+  let recordedError = null
+  try {
+    remaining = await syncOrphanWorktrees(root, removedPaths)
+  } catch (error) {
+    recordedError = errorMessage(error)
+  }
+  sendJson(res, 200, {
+    ok: true,
+    root: worktreesRoot,
+    keepRunIds: keepRunIds.length,
+    removed,
+    skipped,
+    recorded: remaining,
+    ...(recordedError === null ? {} : { warning: `孤儿清单同步失败：${recordedError}` }),
+  })
+}
+
+/**
+ * `DELETE /api/flow-studio/runs/<id>/worktree`（G6-b ②）。
+ *
+ * 只删这一个 run 的 worktree，不动 run 目录。可读原因都要给全：
+ *   - run 不存在 → 404；
+ *   - 持租约（正在跑）→ 409；
+ *   - 没有 worktree 记录 / 没有 workspace → 200 + removed:false + reason；
+ *   - 模块没导出 / git 失败 → 501 / 400 / 500 + 中文原因。
+ */
+async function deleteRunWorktreeRoute(res, env, url, root, runId) {
+  const meta = await readRunMeta(root, runId)
+  if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+  const lease = await readLease(root, runId)
+  if (lease) {
+    throw new RunError(
+      409,
+      'runId',
+      `该 run 正被 ${lease.pid}@${lease.host} 持有执行租约，运行中不能删除它的 worktree`,
+    )
+  }
+  const record = worktreeRecordOf(meta)
+  if (!record) {
+    sendJson(res, 200, {
+      ok: true,
+      removed: false,
+      reason: 'no-worktree',
+      error: '该 run 没有可删除的 worktree 记录（worktree.enabled=false 或从未创建）',
+    })
+    return
+  }
+  const workspace = meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null
+  if (!workspace || (typeof workspace.path !== 'string' && typeof workspace.realpath !== 'string')) {
+    sendJson(res, 200, {
+      ok: true,
+      removed: false,
+      reason: 'no-workspace',
+      error: 'run.json 里没有工作区记录，无法执行 git worktree remove；请用 POST /worktrees/prune 或手工清理',
+    })
+    return
+  }
+  const api = worktreeApiOf(env)
+  if (typeof api.removeWorktree !== 'function') {
+    throw new RunError(501, 'worktree', 'src/worktree.js 没有 removeWorktree 导出，无法删除')
+  }
+  // G6-b（模块口径）：必须显式传 root（旧记录可能没有 record.root，不传会退化成宽松校验），
+  // 且路由语义就是「用户明确要求删掉这个 run 的 worktree」→ force: true（脏 / 被 lock 也要删）。
+  let result
+  try {
+    result = await api.removeWorktree({
+      workspace,
+      record,
+      run: worktreeRunnerOf(env),
+      force: true,
+      root: worktreesRootFor(root),
+    })
+  } catch (error) {
+    const code = error && typeof error.code === 'string' ? error.code : ''
+    const status = code === 'WORKTREE_PATH_UNSAFE' || code === 'WORKTREE_INVALID' || code === 'WORKSPACE_INVALID'
+      ? 400
+      : 500
+    // 原样透出模块的结构化 reason（unsafe-path / still-registered / 具体 git 错），
+    // 调用方不用从中文文案里猜。
+    sendJson(res, status, {
+      ok: false,
+      field: 'worktree',
+      reason: error && typeof error.reason === 'string' ? error.reason : null,
+      error: `删除 worktree 失败：${errorMessage(error)}`,
+    })
+    return
+  }
+  const removed = Boolean(result && result.removed === true)
+  const reason = result && typeof result.reason === 'string' && result.reason !== ''
+    ? result.reason
+    : (removed ? 'removed' : 'not-found')
+  // v0.8.2：分支回收结果原样透出（模块在删目录成功后会自动删 flow/<runId> 分支）。
+  let branchRemoved = result && typeof result.branchRemoved === 'boolean' ? result.branchRemoved : null
+  let branchWarning = result && typeof result.branchWarning === 'string' && result.branchWarning !== ''
+    ? result.branchWarning
+    : null
+  if (!removed) {
+    // 目录已被手工删过（not-found）或删除失败时，worktree 目录没了但**分支可能还在** ——
+    // 这是审计点名的「只增不减」最后一条尾巴。单独清一次分支（模块只删 flow/ 前缀，绝不碰用户分支）。
+    if (typeof api.removeRunBranch === 'function'
+      && typeof record.branch === 'string' && record.branch !== '') {
+      try {
+        const branchResult = await api.removeRunBranch({
+          workspace,
+          branch: record.branch,
+          run: worktreeRunnerOf(env),
+        })
+        branchRemoved = Boolean(branchResult && branchResult.removed === true)
+        branchWarning = branchResult && typeof branchResult.warning === 'string' && branchResult.warning !== ''
+          ? branchResult.warning
+          : null
+      } catch (error) {
+        branchWarning = `清理分支失败：${errorMessage(error)}`
+      }
+    }
+  }
+  // 删除已经生效；清单同步失败只 warning，不改写成功结论。
+  let orphanDropError = null
+  if (removed) {
+    try {
+      await dropOrphanWorktree(root, { runId, path: record.path })
+    } catch (error) {
+      orphanDropError = errorMessage(error)
+    }
+  }
+  sendJson(res, 200, {
+    ok: true,
+    removed,
+    reason,
+    path: record.path,
+    branch: typeof record.branch === 'string' ? record.branch : null,
+    branchRemoved,
+    ...(branchWarning === null ? {} : { branchWarning }),
+    root: typeof record.root === 'string' ? record.root : null,
+    ...(orphanDropError === null ? {} : { warning: `孤儿清单同步失败：${orphanDropError}` }),
+  })
 }
 
 async function handleRuns(req, res, env, url, parts) {
@@ -936,6 +1574,15 @@ async function handleRuns(req, res, env, url, parts) {
 
   if (parts.length === 2) {
     if (req.method === 'GET') {
+      // G7（前端契约）：`?light=1` 只读 run.json 元数据，不解析事件（不调 readRunDetail）；
+      // 不带 light 的老接口行为完全不变。
+      const light = url.searchParams.get('light')
+      if (light === '1' || light === 'true') {
+        const meta = await readRunMeta(root, runId)
+        if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+        sendJson(res, 200, { ok: true, run: lightRunOf(meta) })
+        return
+      }
       const detail = await readRunDetail(root, runId)
       if (!detail) throw new RunError(404, 'runId', 'run 不存在')
       // 07 §4 / §7：详情带完整 workspace / worktree / sessionMode / supervision
@@ -947,7 +1594,15 @@ async function handleRuns(req, res, env, url, parts) {
         ...runBindingFields(detail.run),
         startOptions: await readStartOptions(root, runId),
       }
-      sendJson(res, 200, { ok: true, run, nodes: detail.nodes, eventCount: detail.eventCount })
+      // G6-b ①：详情带 worktreeStatus（exists / dirty / head）；拿不到就 {unknown:true, reason}。
+      const worktreeStatus = await worktreeStatusOf(env, detail.run)
+      sendJson(res, 200, {
+        ok: true,
+        run,
+        nodes: detail.nodes,
+        eventCount: detail.eventCount,
+        worktreeStatus,
+      })
       return
     }
     if (req.method === 'DELETE') {
@@ -960,10 +1615,44 @@ async function handleRuns(req, res, env, url, parts) {
           `该 run 正被 ${lease.pid}@${lease.host} 持有执行租约，运行中不能删除`,
         )
       }
+      // G6-b ④：删除前读 run.json，worktree 指针（path / branch / workspaceId）必须留档，
+      // 不能跟着 run 目录一起消失（否则 worktree 目录 / .git/worktrees 记录 / 分支永久失联）。
+      // 只有 worktree.enabled === true 才需要留档 / 提示（off / 未创建没有可清理的东西）。
+      const meta = await readRunMeta(root, runId).catch(() => null)
+      const worktreeRecord = meta && meta.worktree && typeof meta.worktree === 'object'
+        && meta.worktree.enabled === true
+        ? worktreeRecordOf(meta)
+        : null
       const existed = await deleteRun(root, runId)
       if (!existed) throw new RunError(404, 'runId', 'run 不存在')
       summaryCache.delete(runId)
-      sendJson(res, 200, { ok: true })
+      if (!worktreeRecord) {
+        sendJson(res, 200, { ok: true })
+        return
+      }
+      // run 目录已经删掉了，孤儿清单写失败不能把这次删除变成 500（客户端重试只会 404）。
+      // 写失败时仍在响应里给出指针，并明确标 orphanPersisted:false 让调用方知道要手工记。
+      let orphan = null
+      let orphanError = null
+      try {
+        orphan = await recordOrphanWorktree(root, meta, worktreeRecord)
+      } catch (error) {
+        orphanError = errorMessage(error)
+      }
+      sendJson(res, 200, {
+        ok: true,
+        worktree: {
+          path: worktreeRecord.path,
+          branch: typeof worktreeRecord.branch === 'string' ? worktreeRecord.branch : null,
+          workspaceId: orphan ? orphan.workspaceId : null,
+          orphaned: orphan !== null,
+          ...(orphan === null ? { orphanPersisted: false } : {}),
+        },
+        ...(orphanError === null ? {} : { warning: `孤儿清单写入失败：${orphanError}` }),
+        hint: `该 run 的 worktree 需要单独清理（DELETE /runs/${runId}/worktree；`
+          + 'run 已删除则用 POST /api/flow-studio/worktrees/prune）'
+          + `：worktree 目录 ${worktreeRecord.path} 仍保留在磁盘上。`,
+      })
       return
     }
     sendJson(res, 405, { ok: false, error: '只支持 GET / DELETE' })
@@ -972,6 +1661,16 @@ async function handleRuns(req, res, env, url, parts) {
 
   if (parts.length === 3) {
     const action = parts[2]
+
+    // G6-b ②：DELETE /runs/<id>/worktree —— 单独删这个 run 的 worktree。
+    if (action === 'worktree') {
+      if (req.method !== 'DELETE') {
+        sendJson(res, 405, { ok: false, error: '只支持 DELETE' })
+        return
+      }
+      await deleteRunWorktreeRoute(res, env, url, root, runId)
+      return
+    }
 
     if (action === 'events') {
       if (req.method === 'GET') {
@@ -1087,8 +1786,10 @@ async function handleRuns(req, res, env, url, parts) {
       if (action === 'start') {
         // 07 §4.1：body 可带 {workspace, worktree}；没带就沿用建 run 时记下的发起参数
         //（内存表优先，省一次读盘；run.json.startOptions 已由 runstore 白名单可靠落盘，
-        // 进程重启后仍能读回）。
-        const explicit = parseStartOptions(await readBody(req))
+        // 进程重启后仍能读回）。G6-c：body 还可带 runTimeoutMs / nodeTimeoutMs（正整数毫秒）。
+        const body = await readBody(req)
+        const explicit = parseStartOptions(body)
+        const limits = parseTimeoutOptions(body)
         const memo = env.startOptions instanceof Map ? env.startOptions.get(runId) : undefined
         if (env.startOptions instanceof Map) env.startOptions.delete(runId)
         let stored = memo && typeof memo === 'object' ? memo : {}
@@ -1143,12 +1844,20 @@ async function handleRuns(req, res, env, url, parts) {
         }
         const worktree = explicit.worktree !== undefined ? explicit.worktree : stored.worktree
         if (typeof worktree === 'string' && WORKTREE_POLICIES.includes(worktree)) startOptions.worktree = worktree
+        // G6-c：可选时限原样透传给 engine.start（引擎负责写 run.json.limits 并按它收超时）。
+        if (limits.runTimeoutMs !== undefined) startOptions.runTimeoutMs = limits.runTimeoutMs
+        if (limits.nodeTimeoutMs !== undefined) startOptions.nodeTimeoutMs = limits.nodeTimeoutMs
         // 07 §6：executor 的两条规则要在**开跑前**拦住（引擎执行时还会再拦一次）。
         // 存储侧允许保存非法流程（自动保存要能存中间态），但这样的流程不该跑起来。
         const flow = await readFlow(env.dir, meta.flowId)
         const blockers = executorBlockers(flow)
         if (blockers.length > 0) {
           throw new RunError(400, 'executor', `流程里有非法的 executor 配置：${blockers[0].message}`)
+        }
+        // G6-a ②：custom executor 需要主机级开关；关着时启动一律 400（与保存同口径）。
+        const customGate = customExecutorBlockers(flow)
+        if (customGate.length > 0) {
+          throw new RunError(400, 'executor', customGate[0].message, { code: 'CUSTOM_EXECUTOR_DISABLED' })
         }
         // 06 §10：返回 202；同一 runId 已在跑 → 409（由 runtime 抛 EngineError）。
         // 引擎自己也会校验工作区并 400，这里不拦截、不改写引擎的错误码/文案。
@@ -1355,11 +2064,36 @@ export function apply(ctx) {
     }
   }
 
-  // 06 §13.1：TOKEN 配了但不足 16 字符 → 启动即拒绝并告警（不悄悄退回低档位）。
-  const tokenInfo = inspectToken()
-  if (tokenInfo.present && !tokenInfo.valid) {
-    log('warn', `flow-studio: ${AUTH_ENV} 只有 ${tokenInfo.token.length} 个字符，要求 ≥${TOKEN_MIN_LENGTH}；拒绝启动`)
-    throw new Error(`${AUTH_ENV} 必须至少 ${TOKEN_MIN_LENGTH} 个字符（当前 ${tokenInfo.token.length}），flow-studio 拒绝启动`)
+  // 06 §13.1 / G6-a：两档令牌（全权 + 只读）任一配了但不足 16 字符 → 启动即拒绝并告警。
+  const authInfo = inspectAuth()
+  for (const bad of authInfo.misconfigured) {
+    log('warn', `flow-studio: ${bad.env} 只有 ${bad.length} 个字符，要求 ≥${TOKEN_MIN_LENGTH}；拒绝启动`)
+    throw new Error(`${bad.env} 必须至少 ${TOKEN_MIN_LENGTH} 个字符（当前 ${bad.length}），flow-studio 拒绝启动`)
+  }
+  if (authInfo.full.valid && authInfo.read.valid && authInfo.full.token === authInfo.read.token) {
+    log(
+      'warn',
+      `flow-studio: ${READ_AUTH_ENV} 与 ${AUTH_ENV} 相同，只读令牌实际拥有全权；请给只读用途换一个不同的令牌`,
+    )
+  }
+  // G6-a ②：custom executor 是宿主 RCE 面，默认关；开启时明确告警（运维应知道后果）。
+  if (customExecutorAllowed()) {
+    log(
+      'warn',
+      `flow-studio: ${CUSTOM_EXECUTOR_ENV}=1 —— 持有全权令牌的调用方可以写任意 executorCommand`
+        + '（等价宿主 RCE）；请确认这是有意的，并给调用方发只读 / 受限令牌',
+    )
+  }
+  // G6-a ③：workspace 白名单（可选）。写错的条目忽略并告警，不把整份配置当「未配置」。
+  const workspaceRoots = parseWorkspaceRoots()
+  if (workspaceRoots.invalid.length > 0) {
+    log(
+      'warn',
+      `flow-studio: ${WORKSPACE_ROOTS_ENV} 里这些条目不是绝对路径，已忽略：${workspaceRoots.invalid.join('、')}`,
+    )
+  }
+  if (workspaceRoots.roots.length > 0) {
+    log('info', `flow-studio: workspace 白名单已启用（${workspaceRoots.roots.length} 个根）`)
   }
 
   // 06 §13.8：stub 引擎必须同时开 TESTBED，否则忽略并告警。

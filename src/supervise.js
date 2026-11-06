@@ -4,14 +4,23 @@
  * 本文件有两级调度器，共用同一套注入风格（时钟 / 唤醒 / 日志 / 定时器全部注入）：
  *   - `SupervisionScheduler`：run 级，按审计 verdict 决定间隔，可落盘恢复；
  *   - `NodeSupervisionScheduler`：节点级（v0.8 / R8），每个节点主管会话一个闹钟，
- *     到点让节点自审并回报结构化状态。节点闹钟**只在内存里**，不落盘，attempt
- *     结束 / run 收尾时由 engine 注销。
+ *     到点让节点自审并回报结构化状态。调度器自己的 `_nodes` **不落盘**，attempt
+ *     结束 / run 收尾时由 engine 注销；G7-b 的重启恢复由 runtime 在初始化时按
+ *     `run.json.nodeStatus` + `sessions.json` 重新 `register`（恢复统计经
+ *     `recordRecovery()` 进 `snapshot().recovery`），本模块仍不碰 fs / run.json。
  *
  * 职责边界：本模块**只负责调度**——什么时候该唤醒、同一 `nextDueAt` 只唤醒一次、
  * 连续失败几次后降级。真正调用 `agents.get` / `agents.resume` + `followup` 的
- * `wake(runId, { wakerSessionId })` 由 runtime 注入（runtime 是唯一知道 dsh
+ * `wake(runId, { wakerSessionId, runIds })` 由 runtime 注入（runtime 是唯一知道 dsh
  * agents 服务、会话句柄与提示词的地方）；本模块不 import 任何 dsh 包，也不直接
  * 读写 run.json：时钟、审计、唤醒、读写、日志全部由构造参数注入。
+ *
+ * G7-a（按发起会话合并唤醒）：一轮 tick 里，**同一 `wakerSessionId` 到期的所有 run
+ * 合并成一次 `wake()` 调用**（`ctx.runIds` 给出全部 runId），避免 10 个 run 共用一个
+ * 发起会话时把 review 回合堆成 200 次/小时。同时每会话有「每小时最多 N 次唤醒」与
+ * 「两次唤醒至少间隔 M 毫秒」两条预算；被限流的 run **不丢**——保留原 due（下一轮
+ * tick 再来），并记进可观测计数（`snapshot().throttled` / `entries[].throttled`）。
+ * 没有 `wakerSessionId` 的 run 无法合并投递，仍各自单独唤醒（行为与旧版一致）。
  *
  * 间隔口径与 `audit.js` 的 `nextCheckSeconds` 一致：
  *   pending 30s / healthy 180s / 异常 60s / 终态 null（停止）。
@@ -54,6 +63,27 @@ export const SUPERVISION_WAKE_TIMEOUT_MS = 60_000
  * 同一条 run 的多个节点仍串行（见 `NodeSupervisionScheduler.tick` 的分组）。
  */
 export const SUPERVISION_MAX_CONCURRENCY = 4
+
+/**
+ * G7-a：同一个发起会话（`wakerSessionId`）每小时的唤醒次数预算。
+ *
+ * 为什么必须有：`flow_start` 默认给每个 run 开 supervision，`wakerSessionId` 都是
+ * 发起会话，而调度器按 run 独立计 due。10 个 run 共用发起会话、healthy 180s 时，
+ * 发起会话约 200 次/小时、6 小时约 1200 个 agent 回合。合并唤醒 + 这个预算把上限
+ * 钉死在 30 次/小时。
+ */
+export const SUPERVISION_WAKER_HOURLY_LIMIT = 30
+
+/**
+ * G7-a：同一个发起会话两次唤醒之间的最小间隔（毫秒）。
+ *
+ * 与小时预算互补：小时预算是硬上限，最小间隔保证「短时间集中到期」不会一波打满
+ * 预算、把后面 55 分钟的复查全部挤掉。默认 120s（healthy 的巡检间隔是 180s）。
+ */
+export const SUPERVISION_WAKER_MIN_INTERVAL_MS = 120_000
+
+/** 预算统计的滚动窗口（毫秒）；与配置无关，固定为 1 小时。 */
+const WAKER_WINDOW_MS = 3_600_000
 
 /** 连续唤醒失败达到这个次数就降级：enabled=false + reason='wake-failed: ...'。 */
 const MAX_WAKE_FAILURES = 3
@@ -313,9 +343,11 @@ function normalizeSupervision(raw) {
  * 依赖全部注入（测试里用假时钟 / 假审计 / 假唤醒）：
  *   - `now()` → 当前时间（Date / 毫秒数 / ISO 均可）；
  *   - `evaluate(runId)` → `{ verdict, run }`（runtime 内部调 auditWorkflow 后喂进来）；
- *   - `wake(runId, { wakerSessionId, signal })` → 真正的 `agents.get/resume + followup`，
+ *   - `wake(runId, { wakerSessionId, signal, runIds? })` → 真正的 `agents.get/resume + followup`，
  *     返回 false 表示唤醒失败；抛错同样算失败；`signal` 是本次 entry 的 AbortSignal，
  *     超时 / stop 时会被 abort（实现可以据此收手，不理会也仍然会被 `epoch` 丢弃结果）；
+ *     G7-a 合并唤醒时 `runIds` 是本批全部 runId（第一个与 `runId` 相同），实现应当只发
+ *     一条 followup 并在正文里列出这些 id；单条唤醒不带 `runIds`。
  *   - `load(runId)` / `save(runId, supervision)` → run.json 的 supervision 持久化；
  *   - `log(level, msg)` → 带级别的日志（本模块只用 info / warn）。
  *
@@ -337,6 +369,8 @@ export class SupervisionScheduler {
    * @param {number} [options.intervalMs=15000]
    * @param {number} [options.wakeTimeoutMs=SUPERVISION_WAKE_TIMEOUT_MS] 单条 entry 一轮的超时
    * @param {number} [options.maxConcurrency=SUPERVISION_MAX_CONCURRENCY] 一轮 tick 的并发上限
+   * @param {number} [options.wakerHourlyLimit=SUPERVISION_WAKER_HOURLY_LIMIT] 每会话每小时唤醒预算
+   * @param {number} [options.wakerMinIntervalMs=SUPERVISION_WAKER_MIN_INTERVAL_MS] 每会话最小唤醒间隔
    * @param {Function} [options.setInterval]
    * @param {Function} [options.clearInterval]
    * @param {Function} [options.setTimeout] 单条超时定时器（测试可注入；缺省 globalThis.setTimeout）
@@ -359,6 +393,13 @@ export class SupervisionScheduler {
     this._maxConcurrency = Number.isInteger(opts.maxConcurrency) && opts.maxConcurrency > 0
       ? opts.maxConcurrency
       : SUPERVISION_MAX_CONCURRENCY
+    // G7-a：每会话预算（0 / 非法值按默认，不允许「关掉预算」这种静默捷径）。
+    this._wakerHourlyLimit = Number.isInteger(opts.wakerHourlyLimit) && opts.wakerHourlyLimit > 0
+      ? opts.wakerHourlyLimit
+      : SUPERVISION_WAKER_HOURLY_LIMIT
+    this._wakerMinIntervalMs = Number.isFinite(opts.wakerMinIntervalMs) && opts.wakerMinIntervalMs >= 0
+      ? opts.wakerMinIntervalMs
+      : SUPERVISION_WAKER_MIN_INTERVAL_MS
     this._setInterval = typeof opts.setInterval === 'function' ? opts.setInterval : globalThis.setInterval
     this._clearInterval = typeof opts.clearInterval === 'function' ? opts.clearInterval : globalThis.clearInterval
     const setTimeoutFn = typeof opts.setTimeout === 'function' ? opts.setTimeout : globalThis.setTimeout
@@ -366,8 +407,15 @@ export class SupervisionScheduler {
     this._wakeRunner = createWakeRunner({ setTimeoutFn, clearTimeoutFn })
     /** runId → 内存状态；持久化状态在 tick 时通过 load() 合并进来。 */
     this._runs = new Map()
+    /** G7-a：sessionId → 唤醒预算记录（滚动窗口 / 上次唤醒 / 限流与合并计数）。 */
+    this._wakers = new Map()
+    this._throttled = 0
+    this._coalesced = 0
     this._timer = null
     this._ticking = false
+    // G7-a：stop() 代际——合并唤醒把「准备」与「唤醒」拆成两段后，stop() 发生在
+    // 两段之间时不能再发起新的 wake（旧实现整条链路在一个 wakeRunner 记录里）。
+    this._stopGeneration = 0
     // ── 可观测状态（只进 snapshot()，不改 status() 的对外契约） ──────────────
     this._tickCount = 0
     this._tickSkipped = 0
@@ -385,6 +433,16 @@ export class SupervisionScheduler {
   /** 一轮 tick 的并发上限。 */
   get maxConcurrency() {
     return this._maxConcurrency
+  }
+
+  /** G7-a：每会话每小时唤醒预算。 */
+  get wakerHourlyLimit() {
+    return this._wakerHourlyLimit
+  }
+
+  /** G7-a：每会话最小唤醒间隔（毫秒）。 */
+  get wakerMinIntervalMs() {
+    return this._wakerMinIntervalMs
   }
 
   /** 启动周期扫描。幂等：重复调用不叠加定时器。返回是否真的新起了定时器。 */
@@ -419,6 +477,8 @@ export class SupervisionScheduler {
         this._safeLog('warn', `supervision 清理定时器失败：${errorMessage(error)}`)
       }
     }
+    // G7-a：让「准备阶段已结束、唤醒阶段还没开始」的合并批次作废，不再发新 followup。
+    this._stopGeneration = nonNegativeInt(this._stopGeneration) + 1
     // 在飞 entry 不能留着：否则超时 timer / 底层 wake 会一直挂着（E1-a 的收尾要求）。
     const aborted = this._wakeRunner.abortAll('supervision-scheduler-stopped')
     if (aborted > 0) {
@@ -463,6 +523,9 @@ export class SupervisionScheduler {
         lastFinishedAt: null,
         lastError: null,
         timeouts: 0,
+        // G7-a：本条被限流的次数 / 被合并进别人唤醒的次数（可观测）。
+        throttled: 0,
+        coalesced: 0,
       }
       this._runs.set(runId, entry)
     } else {
@@ -506,8 +569,12 @@ export class SupervisionScheduler {
    *   - 单个 run 的 load / evaluate / wake / save 抛错只影响该 run（被 catch + log），
    *     其余 run 照常推进；本方法本身永远 resolve。
    *
+   * G7-a：按 `wakerSessionId` 分组——同一会话的 run 共享一个 task（组内按登记顺序
+   * 逐个做 load/evaluate/plan，**到点的那几条只发一次 `wake()`**）。没有
+   * `wakerSessionId` 的 run 无法合并投递，仍各自一个 task（与旧行为一致）。
+   *
    * 返回字段保持老契约不变（`skipped/runs/woken/failed`）；超时计入 `failed`，
-   * 每条的明细（lastOutcome / timeouts / 耗时）看 `snapshot()`。
+   * 每条的明细（lastOutcome / timeouts / 合并 / 限流计数）看 `snapshot()`。
    *
    * @returns {Promise<{ skipped: boolean, runs: number, woken: number, failed: number }>}
    */
@@ -522,17 +589,35 @@ export class SupervisionScheduler {
     const startedAtMs = Date.now()
     this._tickCount += 1
     this._lastTickStartedAt = isoOf(this._nowMs())
+    // stop() 代际：合并批次在准备/唤醒两段之间若被 stop，就不许再发新 followup。
+    const generation = this._stopGeneration
+    const countOutcome = outcome => {
+      if (outcome === 'woken') stats.woken += 1
+      else if (outcome === 'failed' || outcome === 'timeout' || outcome === 'error') stats.failed += 1
+    }
     try {
       // 快照当前登记，允许 tick 过程中 unregister 不影响本轮其它 run。
-      const tasks = [...this._runs.entries()].map(([runId, entry]) => async () => {
-        stats.runs += 1
+      const groups = this._groupEntries([...this._runs.entries()])
+      const tasks = groups.map(group => async () => {
+        stats.runs += group.length
+        if (group.length === 1) {
+          const [runId, entry] = group[0]
+          try {
+            countOutcome(await this._runEntry(runId, entry))
+          } catch (error) {
+            stats.failed += 1
+            this._safeLog('warn', `supervision: ${runId} 本轮跳过：${errorMessage(error)}`)
+          }
+          return
+        }
+        // 同一 waker 的多个 run：组内准备阶段各自独立超时，唤醒阶段合并成一次。
         try {
-          const outcome = await this._runEntry(runId, entry)
-          if (outcome === 'woken') stats.woken += 1
-          else if (outcome === 'failed' || outcome === 'timeout' || outcome === 'error') stats.failed += 1
+          for (const outcome of await this._runGroup(group, generation)) countOutcome(outcome)
         } catch (error) {
+          // 防御：组内意外抛错只记一次失败，不打断整轮其它组。
           stats.failed += 1
-          this._safeLog('warn', `supervision: ${runId} 本轮跳过：${errorMessage(error)}`)
+          const firstRunId = group[0] && group[0][0] ? group[0][0] : 'unknown'
+          this._safeLog('warn', `supervision: ${firstRunId} 所在分组本轮跳过：${errorMessage(error)}`)
         }
       })
       await runPool(tasks, this._maxConcurrency)
@@ -546,14 +631,64 @@ export class SupervisionScheduler {
   }
 
   /**
+   * G7-a：按 `wakerSessionId` 分组，保持原登记顺序。
+   *
+   * 只有**非空** waker 才能合并（合并后只往这一个会话发一条 followup）；没有 waker
+   * 的 run 各自一组，保证旧行为（每条独立超时 / 独立失败计数）完全不变。
+   *
+   * @param {Array<[string, object]>} entries `[...this._runs.entries()]`
+   * @returns {Array<Array<[string, object]>>}
+   */
+  _groupEntries(entries) {
+    const byWaker = new Map()
+    for (const item of entries) {
+      const entry = item[1]
+      const waker = entry && typeof entry.wakerSessionId === 'string' && entry.wakerSessionId !== ''
+        ? entry.wakerSessionId
+        : null
+      if (waker === null) continue
+      let group = byWaker.get(waker)
+      if (!group) {
+        group = []
+        byWaker.set(waker, group)
+      }
+      group.push(item)
+    }
+    const emitted = new Set()
+    const groups = []
+    for (const item of entries) {
+      const entry = item[1]
+      const waker = entry && typeof entry.wakerSessionId === 'string' && entry.wakerSessionId !== ''
+        ? entry.wakerSessionId
+        : null
+      if (waker === null) {
+        groups.push([item])
+        continue
+      }
+      if (emitted.has(waker)) continue
+      emitted.add(waker)
+      groups.push(byWaker.get(waker))
+    }
+    return groups
+  }
+
+  /**
    * 调度器可观测快照（flow_watch / 诊断用）。**只读、纯查询**：不触发 tick、不改状态。
    *
    * 与 `status(runId)` 的分工：`status` 是对外契约（5 个字段，别动）；这里是调度器
    * 健康度——每条的最近结果 / 耗时 / 超时次数，以及整轮 tick 的耗时与并发度。
    *
+   * G7-a 新增（只增不改）：顶层 `wokenThisHour` / `throttled` / `coalesced` 三个累计
+   * 计数，外加 `waker` 明细（每会话的窗口内唤醒数、限流数、合并数、上次唤醒时间）。
+   * 每条 entry 也带自己的 `throttled` / `coalesced`。
+   *
    * @returns {{
    *   kind: 'run', ticking: boolean, started: boolean, intervalMs: number,
    *   maxConcurrency: number, wakeTimeoutMs: number,
+   *   wokenThisHour: number, throttled: number, coalesced: number,
+   *   waker: { hourlyLimit: number, minIntervalMs: number,
+   *     sessions: Array<{ sessionId: string, wokenThisHour: number, throttled: number,
+   *       coalesced: number, lastWokeAt: string|null }> },
    *   concurrency: { limit: number, active: number },
    *   tick: { count: number, skipped: number, lastStartedAt: string|null,
    *     lastFinishedAt: string|null, lastDurationMs: number|null,
@@ -562,6 +697,15 @@ export class SupervisionScheduler {
    * }}
    */
   snapshot() {
+    const nowMs = this._nowMs()
+    // 只读：这里不裁剪内部数组（真正的裁剪发生在预算判定里），只按窗口过滤出一份副本。
+    const sessions = [...this._wakers.values()].map(record => ({
+      sessionId: record.sessionId,
+      wokenThisHour: record.wakeTimes.filter(at => at > nowMs - WAKER_WINDOW_MS).length,
+      throttled: nonNegativeInt(record.throttled),
+      coalesced: nonNegativeInt(record.coalesced),
+      lastWokeAt: record.lastWokeAtMs === null ? null : isoOf(record.lastWokeAtMs),
+    }))
     return {
       kind: 'run',
       ticking: this._ticking,
@@ -569,6 +713,14 @@ export class SupervisionScheduler {
       intervalMs: this._intervalMs,
       maxConcurrency: this._maxConcurrency,
       wakeTimeoutMs: this._wakeTimeoutMs,
+      wokenThisHour: sessions.reduce((sum, session) => sum + session.wokenThisHour, 0),
+      throttled: nonNegativeInt(this._throttled),
+      coalesced: nonNegativeInt(this._coalesced),
+      waker: {
+        hourlyLimit: this._wakerHourlyLimit,
+        minIntervalMs: this._wakerMinIntervalMs,
+        sessions,
+      },
       concurrency: { limit: this._maxConcurrency, active: this._wakeRunner.active },
       tick: {
         count: this._tickCount,
@@ -586,6 +738,8 @@ export class SupervisionScheduler {
         lastFinishedAt: entry.lastFinishedAt ?? null,
         timeouts: nonNegativeInt(entry.timeouts),
         lastError: entry.lastError ?? null,
+        throttled: nonNegativeInt(entry.throttled),
+        coalesced: nonNegativeInt(entry.coalesced),
       })),
     }
   }
@@ -657,6 +811,25 @@ export class SupervisionScheduler {
   }
 
   async _tickRun(runId, entry, signal) {
+    // 1~4）准备阶段（load / 恢复计数 / 审计 / 终态 / 未到点）与合并唤醒共用同一份实现。
+    const turn = await this._prepareTurn(runId, entry)
+    if (turn.kind !== 'due') return turn.kind
+    // 5）到点：单条唤醒（含 G7-a 会话预算）。
+    return this._wakeSingle(runId, entry, turn, signal)
+  }
+
+  /**
+   * 准备阶段：读持久化 → 合并计数 → 审计 → planWake → 终态/未到点**就地收口**。
+   *
+   * 返回 `{ kind: 'due' | 'idle' | 'terminal' | 'skipped' | 'stale', ... }`：
+   *   - `due` 附带 `run / verdict / plan / nowMs / epoch`，交给唤醒阶段；
+   *   - 其它 kind 都已经把该写的状态写完（与旧 `_tickRun` 的前四步逐字对齐）。
+   *
+   * 抽出来的原因：G7-a 要把「准备」与「唤醒」拆开——同一会话的多条 run 先各自准备，
+   * 再把到点的合并成一次 `wake()`。单条路径（`_tickRun`）也走这里，两条路径的
+   * load / 恢复 / 终态 / 落盘口径因此只有一个来源。
+   */
+  async _prepareTurn(runId, entry) {
     // 本轮 token：超时 / stop 会把 epoch 推进，之后每个 await 的续体都要比对。
     const epoch = nonNegativeInt(entry.epoch) + 1
     entry.epoch = epoch
@@ -668,7 +841,7 @@ export class SupervisionScheduler {
     } catch (error) {
       this._safeLog('warn', `supervision: ${runId} 读取 supervision 失败，沿用内存状态：${errorMessage(error)}`)
     }
-    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
+    if (this._isStaleTurn(runId, entry, epoch)) return { kind: 'stale' }
 
     let reEnabled = false
     if (persisted) {
@@ -677,7 +850,7 @@ export class SupervisionScheduler {
           // 本实例已经跑过至少一轮，此时磁盘上是 disabled → 尊重它（外部关闭 / 另一进程降级）。
           this.unregister(runId)
           this._safeLog('info', `supervision: ${runId} 已禁用（${persisted.reason || 'unknown'}），停止唤醒`)
-          return 'skipped'
+          return { kind: 'skipped' }
         }
         // 首次 tick 且磁盘是 disabled：register 是显式重新启用，旧计数作废，重新开始。
         entry.wakes = 0
@@ -707,7 +880,7 @@ export class SupervisionScheduler {
 
     // 2) 审计 → verdict / run 摘要由 runtime 的 evaluate 注入。
     const evaluation = await this._require('evaluate', this._evaluate)(runId)
-    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
+    if (this._isStaleTurn(runId, entry, epoch)) return { kind: 'stale' }
     const run = isPlainObject(evaluation) && isPlainObject(evaluation.run) ? evaluation.run : null
     const verdict = isPlainObject(evaluation) ? verdictOf(evaluation.verdict) : null
     const nowMs = this._nowMs()
@@ -722,7 +895,7 @@ export class SupervisionScheduler {
       await this._persist(runId, entry, { enabled: false, reason: 'terminal' })
       this.unregister(runId)
       this._safeLog('info', `supervision: ${runId} 已收口（terminal），停止调度`)
-      return 'terminal'
+      return { kind: 'terminal' }
     }
 
     // 4) 未到点：只更新/初始化 nextDueAt，不唤醒。
@@ -730,11 +903,34 @@ export class SupervisionScheduler {
       if (reEnabled || !persisted || persisted.nextDueAt !== plan.nextDueAt) {
         await this._persist(runId, entry)
       }
-      return 'idle'
+      return { kind: 'idle' }
     }
 
-    // 5) 到点：唤醒一次，并立刻推进 nextDueAt（成功失败都推进，避免同一 due 反复叫）。
+    return { kind: 'due', epoch, run, verdict, plan, nowMs }
+  }
+
+  /**
+   * 单条 run 的唤醒阶段（G7-a：先过会话预算，再真的叫）。
+   *
+   * 预算不通过时**保留 due**（`nextDueAt` 仍是本轮计划里那个 ≤ now 的时刻），只把
+   * `lastOutcome` 记成 `throttled` 并累加计数——下一轮 tick 会再来，不丢 run。
+   */
+  async _wakeSingle(runId, entry, turn, signal) {
+    const nowMs = turn.nowMs
     const wakerSessionId = entry.wakerSessionId ?? null
+    const budget = this._wakerBudgetAllows(wakerSessionId, nowMs)
+    if (!budget.allowed) {
+      entry.lastOutcome = 'throttled'
+      entry.lastError = null
+      entry.throttled = nonNegativeInt(entry.throttled) + 1
+      entry.lastReason = `throttled: ${budget.reason}`
+      this._noteWakerThrottled(wakerSessionId)
+      await this._persist(runId, entry)
+      this._safeLog('info', `supervision: ${runId} 本次被限流（${budget.reason}），保留 due 下一轮再试`)
+      return 'throttled'
+    }
+
+    // 到点：唤醒一次，并立刻推进 nextDueAt（成功失败都推进，避免同一 due 反复叫）。
     let wakeOk = false
     let failureReason = null
     try {
@@ -746,11 +942,11 @@ export class SupervisionScheduler {
       wakeOk = false
       failureReason = errorMessage(error)
     }
-    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
+    if (this._isStaleTurn(runId, entry, turn.epoch)) return 'stale'
 
     const wokeAtIso = isoOf(nowMs)
     // 以本次唤醒时间为新基准重新算间隔；唤醒失败同样推进 nextDueAt。
-    const nextPlan = planWake({ run, now: nowMs, verdict, lastWokeAt: wokeAtIso })
+    const nextPlan = planWake({ run: turn.run, now: nowMs, verdict: turn.verdict, lastWokeAt: wokeAtIso })
     entry.lastWokeAt = wokeAtIso
     entry.nextDueAt = nextPlan.nextDueAt
 
@@ -772,11 +968,339 @@ export class SupervisionScheduler {
       return 'failed'
     }
 
+    this._noteWakerWake(wakerSessionId, nowMs)
     entry.wakes = nonNegativeInt(entry.wakes) + 1
     entry.failures = 0
     await this._persist(runId, entry)
-    this._safeLog('info', `supervision: ${runId} 第 ${entry.wakes} 次唤醒成功（${plan.reason}），下次 ${entry.nextDueAt}`)
+    this._safeLog('info', `supervision: ${runId} 第 ${entry.wakes} 次唤醒成功（${turn.plan.reason}），下次 ${entry.nextDueAt}`)
     return 'woken'
+  }
+
+  /**
+   * G7-a：同一 `wakerSessionId` 的一组 run —— 先逐条准备（各自独立超时），再把**到点
+   * 的那几条合并成一次 `wake()`**（`ctx.runIds` 带全部 runId）。
+   *
+   * 返回与 `group` 同序的 outcome 数组（`woken|failed|timeout|throttled|idle|terminal|
+   * skipped|stale|error|aborted`）；tick 按老口径统计。
+   *
+   * 组内准备是**串行**的：并发度仍由 `maxConcurrency` 按组数限制，避免 10 个 run 同
+   * waker 时准备阶段一次性开 10 个 evaluate。
+   */
+  async _runGroup(group, generation = this._stopGeneration) {
+    const items = []
+    for (const [runId, entry] of group) {
+      if (this._stopGeneration !== generation) {
+        // stop() 已发生：不再准备新的条目，也不发新 followup。
+        items.push({ runId, entry, outcome: 'aborted' })
+        continue
+      }
+      const startedAtMs = Date.now()
+      // 本轮的 lastError 由本轮结果决定；先清掉上一轮的残留。
+      entry.lastError = null
+      const result = await this._wakeRunner.run(
+        () => this._prepareTurn(runId, entry),
+        this._wakeTimeoutMs,
+      )
+      entry.lastDurationMs = Math.max(0, Date.now() - startedAtMs)
+      entry.lastFinishedAt = isoOf(this._nowMs())
+
+      if (result.status === 'timeout') {
+        // 超时口径与单条路径完全一致（累计 timeouts / failures，连续 3 次降级）。
+        items.push({ runId, entry, outcome: this._applyPrepareTimeout(runId, entry) })
+        continue
+      }
+      if (result.status === 'aborted') {
+        entry.lastOutcome = 'aborted'
+        entry.lastError = errorMessage(result.error)
+        items.push({ runId, entry, outcome: 'aborted' })
+        continue
+      }
+      if (result.status === 'error') {
+        // 兜底：_prepareTurn 内部已尽量吞错，这里防止注入实现意外 reject。
+        entry.lastOutcome = 'error'
+        entry.lastError = errorMessage(result.error)
+        entry.failures = nonNegativeInt(entry.failures) + 1
+        this._safeLog('warn', `supervision: ${runId} 本轮跳过：${entry.lastError}`)
+        items.push({ runId, entry, outcome: 'error' })
+        continue
+      }
+      const turn = result.value
+      entry.lastOutcome = turn.kind
+      items.push({ runId, entry, turn, outcome: turn.kind === 'due' ? 'pending' : turn.kind })
+    }
+
+    const due = items.filter(item => item.outcome === 'pending')
+    if (due.length > 0 && this._stopGeneration === generation) await this._wakeDueBatch(due, generation)
+    return items.map(item => (item.outcome === 'pending' ? 'aborted' : item.outcome))
+  }
+
+  /**
+   * 把一组「到点」的 run 按**真实** `wakerSessionId` 再分桶后合并唤醒。
+   *
+   * 为什么要再分桶：准备阶段可能从落盘状态补上 waker（内存里原本是 null），那时不能
+   * 把两个不同会话的 run 合成一条 followup——宁可退回单条唤醒。
+   */
+  async _wakeDueBatch(due, generation = this._stopGeneration) {
+    const partitions = new Map()
+    for (const item of due) {
+      const waker = item.entry.wakerSessionId
+      const key = typeof waker === 'string' && waker !== '' ? waker : `\u0000${item.runId}`
+      let list = partitions.get(key)
+      if (!list) {
+        list = []
+        partitions.set(key, list)
+      }
+      list.push(item)
+    }
+    for (const list of partitions.values()) {
+      if (this._stopGeneration !== generation) {
+        for (const item of list) item.outcome = 'aborted'
+        return
+      }
+      if (list.length === 1) {
+        const item = list[0]
+        item.outcome = await this._wakeSingle(item.runId, item.entry, item.turn, undefined)
+        continue
+      }
+      await this._wakePartition(list)
+    }
+    // 兜底：任何没被写回的条目都按 failed 计（不能让 outcome 停在 'pending'）。
+    for (const item of due) {
+      if (item.outcome === 'pending') item.outcome = 'failed'
+    }
+  }
+
+  /** 合并唤醒一个同会话 partition：一次 `wake()`，逐条回写 outcome / 计数 / 落盘。 */
+  async _wakePartition(list, generation = this._stopGeneration) {
+    if (this._stopGeneration !== generation) {
+      for (const item of list) item.outcome = 'aborted'
+      return
+    }
+    const sessionId = list[0].entry.wakerSessionId ?? null
+    const nowMs = this._nowMs()
+    const budget = this._wakerBudgetAllows(sessionId, nowMs)
+    if (!budget.allowed) {
+      for (const item of list) {
+        if (this._isStaleTurn(item.runId, item.entry, item.turn.epoch)) {
+          item.outcome = 'stale'
+          continue
+        }
+        item.entry.lastOutcome = 'throttled'
+        item.entry.lastError = null
+        item.entry.throttled = nonNegativeInt(item.entry.throttled) + 1
+        item.entry.lastReason = `throttled: ${budget.reason}`
+        this._noteWakerThrottled(sessionId)
+        // 保留 due：nextDueAt 仍是准备阶段算出的「已经到点」的时刻。
+        await this._persist(item.runId, item.entry)
+        item.outcome = 'throttled'
+        this._safeLog('info', `supervision: ${item.runId} 本次被限流（${budget.reason}），保留 due 下一轮再试`)
+      }
+      return
+    }
+
+    const runIds = list.map(item => item.runId)
+    const primary = list[0]
+    const startedAtMs = Date.now()
+    const result = await this._wakeRunner.run(
+      signal => this._require('wake', this._wake)(primary.runId, {
+        wakerSessionId: sessionId,
+        signal,
+        runIds,
+      }),
+      this._wakeTimeoutMs,
+    )
+    const durationMs = Math.max(0, Date.now() - startedAtMs)
+
+    if (result.status === 'timeout') {
+      const message = `唤醒超时（${this._wakeTimeoutMs}ms）`
+      const at = this._nowMs()
+      for (const item of list) {
+        item.entry.epoch = nonNegativeInt(item.entry.epoch) + 1
+        item.entry.lastDurationMs = durationMs
+        item.entry.lastFinishedAt = isoOf(at)
+        item.entry.lastOutcome = 'timeout'
+        item.entry.lastError = message
+        item.entry.timeouts = nonNegativeInt(item.entry.timeouts) + 1
+        item.entry.failures = nonNegativeInt(item.entry.failures) + 1
+        item.entry.nextDueAt = isoOf(at + SUPERVISION_INTERVALS.anomaly * 1000)
+        item.entry.lastReason = `wake-timeout: ${message}`
+        if (item.entry.failures >= MAX_WAKE_FAILURES) {
+          item.entry.enabled = false
+          void this._persist(item.runId, item.entry, { enabled: false, reason: item.entry.lastReason })
+          this.unregister(item.runId)
+          this._safeLog('warn', `supervision: ${item.runId} 连续 ${item.entry.failures} 次唤醒超时，已降级并停止调度：${message}`)
+        } else {
+          void this._persist(item.runId, item.entry)
+          this._safeLog('warn', `supervision: ${item.runId} 唤醒超时（连续 ${MAX_WAKE_FAILURES} 次后降级）：${message}`)
+        }
+        item.outcome = 'timeout'
+      }
+      return
+    }
+
+    if (result.status === 'aborted') {
+      for (const item of list) {
+        item.entry.lastOutcome = 'aborted'
+        item.entry.lastError = errorMessage(result.error)
+        item.outcome = 'aborted'
+      }
+      return
+    }
+
+    if (result.status === 'error') {
+      for (const item of list) {
+        item.entry.lastOutcome = 'error'
+        item.entry.lastError = errorMessage(result.error)
+        item.entry.failures = nonNegativeInt(item.entry.failures) + 1
+        item.outcome = 'error'
+        this._safeLog('warn', `supervision: ${item.runId} 本轮跳过：${item.entry.lastError}`)
+      }
+      return
+    }
+
+    const wakeOk = result.value !== false
+    const failureReason = wakeOk ? null : 'wake 返回 false'
+    const wokeAtIso = isoOf(nowMs)
+    // 只有真的发出去才算消耗预算：返回 false / 抛错不算（下一轮还能重试）。
+    if (wakeOk) this._noteWakerWake(sessionId, nowMs)
+    for (let index = 0; index < list.length; index += 1) {
+      const item = list[index]
+      if (this._isStaleTurn(item.runId, item.entry, item.turn.epoch)) {
+        item.outcome = 'stale'
+        continue
+      }
+      item.entry.lastDurationMs = durationMs
+      item.entry.lastFinishedAt = isoOf(this._nowMs())
+      item.entry.lastWokeAt = wokeAtIso
+      // 以本次唤醒时间为新基准重新算间隔；唤醒失败同样推进 nextDueAt。
+      item.entry.nextDueAt = planWake({
+        run: item.turn.run,
+        now: nowMs,
+        verdict: item.turn.verdict,
+        lastWokeAt: wokeAtIso,
+      }).nextDueAt
+      if (!wakeOk) {
+        item.entry.failures = nonNegativeInt(item.entry.failures) + 1
+        item.entry.lastError = failureReason
+        if (item.entry.failures >= MAX_WAKE_FAILURES) {
+          item.entry.enabled = false
+          item.entry.lastReason = `wake-failed: ${failureReason}`
+          await this._persist(item.runId, item.entry, { enabled: false, reason: item.entry.lastReason })
+          this.unregister(item.runId)
+          this._safeLog('warn', `supervision: ${item.runId} 连续 ${item.entry.failures} 次唤醒失败，已降级并停止调度：${failureReason}`)
+        } else {
+          item.entry.lastReason = `wake-failed: ${failureReason}`
+          await this._persist(item.runId, item.entry)
+          this._safeLog('warn', `supervision: ${item.runId} 第 ${item.entry.failures} 次唤醒失败（连续 ${MAX_WAKE_FAILURES} 次后降级）：${failureReason}`)
+        }
+        item.outcome = 'failed'
+        continue
+      }
+      item.entry.wakes = nonNegativeInt(item.entry.wakes) + 1
+      item.entry.failures = 0
+      if (index > 0) item.entry.coalesced = nonNegativeInt(item.entry.coalesced) + 1
+      await this._persist(item.runId, item.entry)
+      item.outcome = 'woken'
+      this._safeLog(
+        'info',
+        `supervision: ${item.runId} 第 ${item.entry.wakes} 次唤醒成功（${item.turn.plan.reason}，`
+          + `与本会话共 ${list.length} 个 run 合并为 1 次唤醒），下次 ${item.entry.nextDueAt}`,
+      )
+    }
+    // 合并计数：一次 followup 服务了 list.length 个 run，多出来的 list.length-1 就是被合并掉的。
+    if (wakeOk) this._noteWakerCoalesced(sessionId, list.length - 1)
+  }
+
+  // -------------------------------------------------------------------------
+  // G7-a：按发起会话的唤醒预算（滚动 1 小时窗口 + 最小间隔）
+  // -------------------------------------------------------------------------
+
+  /** 取（必要时创建）一个会话的预算记录。 */
+  _wakerRecord(sessionId) {
+    let record = this._wakers.get(sessionId)
+    if (!record) {
+      record = { sessionId, wakeTimes: [], lastWokeAtMs: null, throttled: 0, coalesced: 0 }
+      this._wakers.set(sessionId, record)
+    }
+    return record
+  }
+
+  /** 丢掉一小时以前的唤醒时间戳（就地裁剪，O(过期条数)）。 */
+  _pruneWaker(record, nowMs) {
+    const cutoff = nowMs - WAKER_WINDOW_MS
+    let drop = 0
+    while (drop < record.wakeTimes.length && record.wakeTimes[drop] <= cutoff) drop += 1
+    if (drop > 0) record.wakeTimes.splice(0, drop)
+  }
+
+  /**
+   * 这个会话现在能不能再唤醒一次。
+   * @returns {{ allowed: boolean, reason: string|null }} reason 会写进 `lastReason`（`throttled: ...`）
+   */
+  _wakerBudgetAllows(sessionId, nowMs) {
+    if (typeof sessionId !== 'string' || sessionId === '') return { allowed: true, reason: null }
+    const record = this._wakerRecord(sessionId)
+    this._pruneWaker(record, nowMs)
+    if (record.lastWokeAtMs !== null && nowMs - record.lastWokeAtMs < this._wakerMinIntervalMs) {
+      return { allowed: false, reason: `min-interval(${this._wakerMinIntervalMs}ms)` }
+    }
+    if (record.wakeTimes.length >= this._wakerHourlyLimit) {
+      return { allowed: false, reason: `hourly-limit(${this._wakerHourlyLimit}/h)` }
+    }
+    return { allowed: true, reason: null }
+  }
+
+  /** 记一次真实发生的唤醒（成功唤醒才消耗预算）。 */
+  _noteWakerWake(sessionId, nowMs) {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const record = this._wakerRecord(sessionId)
+    record.wakeTimes.push(nowMs)
+    record.lastWokeAtMs = nowMs
+    this._pruneWaker(record, nowMs)
+  }
+
+  /** 记一次限流（可观测；不是失败，不计 failures、不降级）。 */
+  _noteWakerThrottled(sessionId) {
+    this._throttled = nonNegativeInt(this._throttled) + 1
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const record = this._wakerRecord(sessionId)
+    record.throttled = nonNegativeInt(record.throttled) + 1
+  }
+
+  /** 记一次合并：`count` 个 run 被并入同一次唤醒（不再单独发 followup）。 */
+  _noteWakerCoalesced(sessionId, count) {
+    const merged = nonNegativeInt(count)
+    if (merged === 0) return
+    this._coalesced = nonNegativeInt(this._coalesced) + merged
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const record = this._wakerRecord(sessionId)
+    record.coalesced = nonNegativeInt(record.coalesced) + merged
+  }
+
+  /**
+   * 组内准备阶段超时：与 `_runEntry` 的超时口径一致（推进 epoch / nextDueAt、累计
+   * failures、连续 3 次降级），返回 `'timeout'`。
+   */
+  _applyPrepareTimeout(runId, entry) {
+    entry.epoch = nonNegativeInt(entry.epoch) + 1
+    const message = `唤醒超时（${this._wakeTimeoutMs}ms）`
+    entry.lastOutcome = 'timeout'
+    entry.lastError = message
+    entry.timeouts = nonNegativeInt(entry.timeouts) + 1
+    entry.failures = nonNegativeInt(entry.failures) + 1
+    entry.nextDueAt = isoOf(this._nowMs() + SUPERVISION_INTERVALS.anomaly * 1000)
+    entry.lastReason = `wake-timeout: ${message}`
+    if (entry.failures >= MAX_WAKE_FAILURES) {
+      entry.enabled = false
+      // 超时处理已经花掉了预算：不 await 落盘（_persist 自己吞错，不会 reject）。
+      void this._persist(runId, entry, { enabled: false, reason: entry.lastReason })
+      this.unregister(runId)
+      this._safeLog('warn', `supervision: ${runId} 连续 ${entry.failures} 次唤醒超时，已降级并停止调度：${message}`)
+    } else {
+      void this._persist(runId, entry)
+      this._safeLog('warn', `supervision: ${runId} 唤醒超时（连续 ${MAX_WAKE_FAILURES} 次后降级）：${message}`)
+    }
+    return 'timeout'
   }
 
   /** 判断持久化状态是否比内存状态更新（lastWokeAt 更晚）。 */
@@ -840,8 +1364,9 @@ export class SupervisionScheduler {
  *   - `SUPERVISION_INTERVALS` 是 **run 级巡检**（30 / 180 / 60 **秒**）：由
  *     `auditWorkflow` 的 verdict 决定，唤醒的是 run 的发起会话，问「整个 run 是否健康」；
  *   - `NODE_ALARM_DEFAULT_MS` 是 **节点闹钟**（默认 600 **秒**，毫秒单位）：每个节点
- *     主管会话一个闹钟，问「你这个节点现在什么状态」。它只在内存里、不落盘，由
- *     engine 在 attempt 结束 / run 收尾时注销。
+ *     主管会话一个闹钟，问「你这个节点现在什么状态」。调度器内存里维护、不落盘，由
+ *     engine 在 attempt 结束 / run 收尾时注销；进程重启后 runtime 会用同一默认间隔
+ *     重新登记（G7-b），首轮按 now + 该间隔排，不在重启瞬间刷一轮。
  * 两者互不驱动：节点自审结果由 engine 自己消费（可提前收口 attempt），不会改 run 级
  * 的 nextDueAt；run 级到点唤醒也不触发节点自审。改一个不影响另一个。
  */
@@ -1124,6 +1649,19 @@ export class NodeSupervisionScheduler {
     this._lastTickFinishedAt = null
     this._lastTickDurationMs = null
     this._lastTickStats = null
+    // G7-b：重启恢复节点闹钟的可观测统计（runtime 扫描后写进来；只进 snapshot）。
+    this._recovery = {
+      at: null,
+      scans: 0,
+      runsScanned: 0,
+      runsRecovered: 0,
+      restored: 0,
+      skipped: 0,
+      skippedTerminal: 0,
+      missingSession: 0,
+      missingAttempt: 0,
+      alreadyRegistered: 0,
+    }
   }
 
   /** 节点自审默认间隔（毫秒），runtime 拼自审提问时用得上。 */
@@ -1263,6 +1801,20 @@ export class NodeSupervisionScheduler {
     return this._nodes.delete(session)
   }
 
+  /**
+   * 这个会话是否已有闹钟登记（含已停摆的 entry）。
+   *
+   * G7-b 用它做**恢复幂等**：重启扫描只补「没有登记」的节点，绝不二次 register——
+   * 二次 register 会把 `nextDueAt` 重排到 now + 间隔，等于把已排好的闹钟往后推。
+   *
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  has(sessionId) {
+    const session = nonEmptyString(sessionId)
+    return session !== null && this._nodes.has(session)
+  }
+
   /** 摘除某 run 下某个节点的所有闹钟。返回摘掉的条数。 */
   unregisterNode(runId, nodeId) {
     const run = nonEmptyString(runId)
@@ -1391,11 +1943,38 @@ export class NodeSupervisionScheduler {
   }
 
   /**
+   * G7-b：累加一轮「重启恢复节点闹钟」的统计（runtime 扫描 run.json 后调用）。
+   *
+   * 只做加法、只进 `snapshot().recovery`，不改 `status()` / `list()` 的 9 字段契约；
+   * 重复调用是幂等的语义（第二次恢复 0 条，就把 0 加进去），由 runtime 那边保证
+   * 不会把已登记的节点再登记一遍。
+   *
+   * @param {object} [delta]
+   * @returns {object} 累加后的统计副本
+   */
+  recordRecovery(delta = {}) {
+    const add = key => nonNegativeInt(delta[key])
+    this._recovery = {
+      at: isoOf(this._nowMs()),
+      scans: nonNegativeInt(this._recovery.scans) + 1,
+      runsScanned: nonNegativeInt(this._recovery.runsScanned) + add('runsScanned'),
+      runsRecovered: nonNegativeInt(this._recovery.runsRecovered) + add('runsRecovered'),
+      restored: nonNegativeInt(this._recovery.restored) + add('restored'),
+      skipped: nonNegativeInt(this._recovery.skipped) + add('skipped'),
+      skippedTerminal: nonNegativeInt(this._recovery.skippedTerminal) + add('skippedTerminal'),
+      missingSession: nonNegativeInt(this._recovery.missingSession) + add('missingSession'),
+      missingAttempt: nonNegativeInt(this._recovery.missingAttempt) + add('missingAttempt'),
+      alreadyRegistered: nonNegativeInt(this._recovery.alreadyRegistered) + add('alreadyRegistered'),
+    }
+    return { ...this._recovery }
+  }
+
+  /**
    * 调度器可观测快照（flow_watch / 诊断用）。**只读、纯查询**：不触发 tick、不改状态。
    *
    * 与 `status()` / `list()` 的分工：那两个是对外契约（9 个字段，别动）；这里是调度器
    * 健康度——每条的最近结果 / 耗时 / 超时次数 / 最近回报判定，以及整轮 tick 的耗时
-   * 与并发度。
+   * 与并发度。G7-b 新增 `recovery`（重启恢复节点闹钟的累计统计，只增不改）。
    */
   snapshot() {
     return {
@@ -1415,6 +1994,7 @@ export class NodeSupervisionScheduler {
         lastDurationMs: this._lastTickDurationMs,
         lastStats: this._lastTickStats === null ? null : { ...this._lastTickStats },
       },
+      recovery: { ...this._recovery },
       entries: [...this._nodes.values()].map(entry => ({
         ...this._publicOf(entry),
         lastOutcome: entry.lastOutcome ?? null,

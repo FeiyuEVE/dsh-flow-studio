@@ -21,7 +21,9 @@ mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 const home = mkdtempSync(join(repoRoot, '.tmp', 'home-tools-'))
 process.env.DSH_HOME = home
 
-const { createFlowTools, DEFAULT_WATCH_SECONDS } = await import('../src/tools.js')
+const {
+  createFlowTools, DEFAULT_WATCH_SECONDS, MAX_TIMEOUT_MS,
+} = await import('../src/tools.js')
 // F1：白名单校验的唯一实现在 inbox.js（HTTP /inbox、/messages 与两个模型工具共用）。
 const {
   REPLY_LOOPBACK_HOSTS, REPLY_TOKEN_ENV_PREFIX, maskSecret, redactSecrets,
@@ -40,7 +42,10 @@ const {
   writeStoredWorkspace,
 } = await import('../src/client/page.js')
 // F2：HTTP 载荷级断言走真实客户端 api（fetch spy），不是「有传参」这种弱断言。
-const { api: clientApi } = await import('../src/client/api.js')
+// G7：轻量轮询（?light=1）的降级路径也在客户端，这里一并验证「正常时不会回退」。
+const {
+  api: clientApi, createLightRunReader, readRunPath,
+} = await import('../src/client/api.js')
 
 const flowsRoot = store.flowsDir(home)
 const runsRoot = runstore.runsDir(home)
@@ -137,8 +142,10 @@ function makeEngine({
   return engine
 }
 
-function makeTools({ engine = makeEngine(), auditWorkflow, watchSeconds, now } = {}) {
-  return createFlowTools({ flowsRoot, runsRoot, engine, auditWorkflow, watchSeconds, now })
+function makeTools({ engine = makeEngine(), auditWorkflow, watchSeconds, now, worktree, worktreeRunner } = {}) {
+  return createFlowTools({
+    flowsRoot, runsRoot, engine, auditWorkflow, watchSeconds, now, worktree, worktreeRunner,
+  })
 }
 
 /**
@@ -1030,7 +1037,16 @@ try {
     A.equal(result.supervision.nodeSchedulerSnapshot.snapshot.entries[0].lastReport.kind, 'valid')
     // 旧字段：run.json.supervision 的只读快照（这里为 null）与 status 契约都不变。
     A.ok(Object.hasOwn(result.supervision, 'scheduler'))
-    A.deepEqual(result.supervision.health, { timeouts: 0, invalidReports: 0, warnings: [] })
+    // 旧字段不变；G7-a / G7-b 追加的计数缺省为 0 / null（只加不改）。
+    A.deepEqual(result.supervision.health, {
+      timeouts: 0,
+      invalidReports: 0,
+      wokenThisHour: 0,
+      throttled: 0,
+      coalesced: 0,
+      recovery: null,
+      warnings: [],
+    })
     A.equal(statusCalls.length, 0, '快照读取不走 status()（status 契约保持不变）')
   })
 
@@ -1124,6 +1140,123 @@ try {
     A.match(text, /超时/)
     A.match(text, /格式不合规/)
     A.match(text, /停摆/)
+  })
+
+  await check('flow_watch：限流 / 合并唤醒 / 恢复扫描——非零可见，全零不刷噪音', async () => {
+    auditResult = healthyAudit({ verdict: 'healthy', headline: '正常' })
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '调度器限流', nodeTotal: 1, engine: 'real',
+    })
+    const engine = makeEngine()
+    engine.supervision = {
+      snapshot: () => ({
+        kind: 'run',
+        ticking: true,
+        started: true,
+        intervalMs: 15000,
+        wakeTimeoutMs: 1000,
+        // G7-a：发起会话唤醒预算 / 合并唤醒（顶层累计计数）。
+        wokenThisHour: 3,
+        throttled: 2,
+        coalesced: 9,
+        tick: { count: 3, skipped: 0, lastDurationMs: 10, lastStats: { runs: 1, woken: 1, failed: 0 } },
+        entries: [],
+      }),
+    }
+    engine.nodeSupervision = {
+      snapshot: () => ({
+        kind: 'node',
+        ticking: true,
+        started: true,
+        wakeTimeoutMs: 30000,
+        // G7-b：重启恢复扫描统计。
+        recovery: {
+          at: '2026-11-06T00:00:00.000Z',
+          scans: 2,
+          runsScanned: 5,
+          runsRecovered: 3,
+          restored: 2,
+          skipped: 1,
+          skippedTerminal: 0,
+          missingSession: 0,
+          missingAttempt: 1,
+          alreadyRegistered: 0,
+        },
+        tick: { count: 2, skipped: 0, lastDurationMs: 10, lastStats: null },
+        entries: [],
+      }),
+    }
+    const tools = makeTools({ engine, auditWorkflow: stubAudit })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.equal(result.ok, true)
+    // 字段齐全（原 timeouts / invalidReports / warnings 不变）。
+    A.equal(result.supervision.health.timeouts, 0)
+    A.equal(result.supervision.health.invalidReports, 0)
+    A.deepEqual(result.supervision.health.warnings, [])
+    A.equal(result.supervision.health.wokenThisHour, 3)
+    A.equal(result.supervision.health.throttled, 2)
+    A.equal(result.supervision.health.coalesced, 9)
+    A.equal(result.supervision.health.recovery.restored, 2)
+    A.equal(result.supervision.health.recovery.scans, 2)
+    A.equal(result.supervision.health.recovery.missingAttempt, 1)
+
+    // 三件事都进 recommended（机器侧）与人类可读投影。
+    A.ok(result.recommended.some(text => /限流 2 次/.test(text)), JSON.stringify(result.recommended))
+    A.ok(result.recommended.some(text => /合并 9 个 run/.test(text)))
+    A.ok(result.recommended.some(text => /恢复扫描恢复了 2 个 run/.test(text)))
+    const rendered = byName(tools, 'flow_watch').output.render({}, result)
+    const text = rendered.map(item => item.text).join('\n')
+    A.match(text, /发起会话唤醒被限流 2 次/)
+    A.match(text, /合并 9 个 run 为一次唤醒/)
+    A.match(text, /节点闹钟恢复扫描恢复了 2 个 run/)
+
+    // 全零：字段存在，但可读结论里不出现这三句（健康时不刷噪音）。
+    const quiet = makeEngine()
+    quiet.supervision = {
+      snapshot: () => ({
+        kind: 'run',
+        ticking: true,
+        started: true,
+        wakeTimeoutMs: 1000,
+        wokenThisHour: 0,
+        throttled: 0,
+        coalesced: 0,
+        tick: { count: 1, skipped: 0, lastDurationMs: 5, lastStats: null },
+        entries: [],
+      }),
+    }
+    quiet.nodeSupervision = {
+      snapshot: () => ({
+        kind: 'node',
+        ticking: true,
+        started: true,
+        wakeTimeoutMs: 30000,
+        recovery: {
+          at: null,
+          scans: 1,
+          runsScanned: 2,
+          runsRecovered: 0,
+          restored: 0,
+          skipped: 2,
+          skippedTerminal: 1,
+          missingSession: 1,
+          missingAttempt: 0,
+          alreadyRegistered: 0,
+        },
+        tick: { count: 1, skipped: 0, lastDurationMs: 5, lastStats: null },
+        entries: [],
+      }),
+    }
+    const quietTools = makeTools({ engine: quiet, auditWorkflow: stubAudit })
+    const quietResult = record(await byName(quietTools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.equal(quietResult.supervision.health.throttled, 0)
+    A.equal(quietResult.supervision.health.coalesced, 0)
+    A.equal(quietResult.supervision.health.recovery.restored, 0)
+    const quietText = byName(quietTools, 'flow_watch').output
+      .render({}, quietResult).map(item => item.text).join('\n')
+    A.equal(/限流/.test(quietText), false, '健康时不出现限流句子')
+    A.equal(/合并 .* run/.test(quietText), false, '健康时不出现合并唤醒句子')
+    A.equal(/恢复扫描/.test(quietText), false, '健康时不出现恢复扫描句子')
   })
 
   await check('flow_watch runId 不存在 → {ok:false, hint}', async () => {
@@ -1821,6 +1954,363 @@ try {
     A.equal(/api\.(createRun|startRun)\(/.test(canvasSource), false, 'canvas.js 不直接发起运行')
   })
 
+  // ── 9.5 G6：主机级开关 / 时限 / 多 run 审查 / worktree 生命周期 ────────
+  /**
+   * 带 executor:'custom' 的合法流程（有 executorCommand，所以 executor 规则本身不拦；
+   * 拦它的是主机级开关 FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR）。
+   */
+  function makeCustomFlow(id, name) {
+    const flow = makeFlow(id, name)
+    const stage = flow.nodes.find(node => node.kind === 'stage')
+    stage.executor = 'custom'
+    stage.executorCommand = 'echo hi'
+    return flow
+  }
+
+  await check('G6-c flow_start 接受 runTimeoutMs / nodeTimeoutMs 并透传；非法值不建 run；默认值明示', async () => {
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const start = byName(tools, 'flow_start')
+    // 默认值必须在描述 / schema 里明示（避免 6 小时任务开局即注定超时失败）。
+    A.match(start.description, /2 小时|7200000/)
+    A.match(start.description, /20 分钟|1200000/)
+    A.ok(start.parameters.properties.runTimeoutMs)
+    A.ok(start.parameters.properties.nodeTimeoutMs)
+    A.match(start.parameters.properties.runTimeoutMs.description, /正整数|毫秒/)
+
+    const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    const runTimeoutMs = 6 * 60 * 60 * 1000
+    const nodeTimeoutMs = 30 * 60 * 1000
+    const result = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-main', workspace: '/repo/timeouts', runTimeoutMs, nodeTimeoutMs },
+      makeExec('session-timeout'),
+    ))
+    A.equal(result.ok, true)
+    A.equal(engine.calls.start.length, 1)
+    A.equal(engine.calls.start[0].options.runTimeoutMs, runTimeoutMs)
+    A.equal(engine.calls.start[0].options.nodeTimeoutMs, nodeTimeoutMs)
+    A.equal(result.limits.runTimeoutMs, runTimeoutMs)
+    A.equal(result.limits.nodeTimeoutMs, nodeTimeoutMs)
+    A.equal(result.limits.defaultRunTimeoutMs, 2 * 60 * 60 * 1000)
+    A.equal(result.limits.defaultNodeTimeoutMs, 20 * 60 * 1000)
+
+    // 省略 = 不替引擎写死（交给默认值 / 环境变量），返回里标注 null。
+    const plain = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-main', workspace: '/repo/timeouts' },
+      makeExec('session-timeout-plain'),
+    ))
+    A.equal(plain.ok, true)
+    A.equal(Object.hasOwn(engine.calls.start[1].options, 'runTimeoutMs'), false)
+    A.equal(Object.hasOwn(engine.calls.start[1].options, 'nodeTimeoutMs'), false)
+    A.equal(plain.limits.runTimeoutMs, null)
+    A.equal(plain.limits.nodeTimeoutMs, null)
+
+    // 非法值：参数失败、不建 run、不进 engine.start。
+    const beforeBad = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    for (const [key, value] of [
+      ['runTimeoutMs', 0],
+      ['runTimeoutMs', -5],
+      ['runTimeoutMs', 1.5],
+      ['runTimeoutMs', '60000'],
+      ['nodeTimeoutMs', true],
+      ['nodeTimeoutMs', MAX_TIMEOUT_MS + 1],
+    ]) {
+      const failed = record(await byName(tools, 'flow_start').execute(
+        { flowId: 'flow-main', workspace: '/repo/timeouts', [key]: value },
+        makeExec('session-timeout-bad'),
+      ))
+      A.equal(failed.ok, false, `${key}=${String(value)}`)
+      A.match(failed.error, /整数|之间/)
+      A.equal(failed.retryable, false)
+    }
+    A.equal(engine.calls.start.length, 2, '非法时限不能进 engine.start')
+    const afterBad = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    A.equal(afterBad, beforeBad, '非法时限不能建 run')
+    A.equal(beforeBad, before + 2, '前面两次成功启动各建了一个 run')
+  })
+
+  await check('G6-a flow_start：custom executor 默认被拒，主机开关打开后放行', async () => {
+    await store.saveFlow(flowsRoot, 'flow-custom-command', makeCustomFlow('flow-custom-command', 'custom 有命令'))
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const start = byName(tools, 'flow_start')
+    const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+
+    const blocked = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-custom-command', workspace: '/repo/custom' },
+      makeExec('session-custom'),
+    ))
+    A.equal(blocked.ok, false)
+    A.match(blocked.error, /FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR/)
+    A.match(blocked.error, /executor/)
+    A.equal(blocked.retryable, false)
+    A.equal(engine.calls.start.length, 0, '被开关拦下的流程不能进 engine.start')
+    A.equal((await runstore.listRuns(runsRoot, { limit: 100 })).runs.length, before, '被拒时不建 run')
+
+    process.env.FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR = '1'
+    try {
+      const allowed = record(await start.execute(
+        { flowId: 'flow-custom-command', workspace: '/repo/custom' },
+        makeExec('session-custom-on'),
+      ))
+      A.equal(allowed.ok, true, JSON.stringify(allowed))
+      A.equal(engine.calls.start.length, 1)
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR
+    }
+  })
+
+  await check('G6-a flow_start：workspace 白名单越界失败且不建 run；根内放行', async () => {
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const start = byName(tools, 'flow_start')
+    process.env.FLOW_STUDIO_WORKSPACE_ROOTS = '/allowed/root'
+    try {
+      const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+      const failed = record(await start.execute(
+        { flowId: 'flow-main', workspace: '/elsewhere/repo' },
+        makeExec('session-scope'),
+      ))
+      A.equal(failed.ok, false)
+      A.match(failed.error, /允许的根目录/)
+      A.match(failed.hint, /FLOW_STUDIO_WORKSPACE_ROOTS/)
+      A.equal(failed.retryable, false)
+      A.equal(engine.calls.start.length, 0)
+      A.equal((await runstore.listRuns(runsRoot, { limit: 100 })).runs.length, before, '越界 workspace 不能建 run')
+
+      const inside = record(await start.execute(
+        { flowId: 'flow-main', workspace: '/allowed/root/sub/dir' },
+        makeExec('session-scope-ok'),
+      ))
+      A.equal(inside.ok, true, JSON.stringify(inside))
+      A.equal(engine.calls.start[0].options.workspace, '/allowed/root/sub/dir')
+    } finally {
+      delete process.env.FLOW_STUDIO_WORKSPACE_ROOTS
+    }
+  })
+
+  await check('G6-d flow_watch runIds：多 run 一次审查 + 每 run 结论 + 合并建议（runId 单数兼容）', async () => {
+    auditResult = {
+      verdict: 'healthy',
+      status: 'running',
+      headline: '正在执行',
+      progress: { passed: 0, total: 1, ratio: 0 },
+      plan: [],
+      currentNode: null,
+      rejects: { total: 0 },
+      anomalies: [],
+      quality: {},
+      tokens: {},
+      idleMs: 10,
+      recommended: ['继续等待'],
+      nextCheckSeconds: 60,
+    }
+    const startedAt = '2026-11-06T00:00:00.000Z'
+    const makeRun = async name => {
+      const run = await runstore.createRun(runsRoot, {
+        flowId: 'flow-main', flowName: '主流程', name, nodeTotal: 1, engine: 'real',
+      })
+      await runstore.writeRunMeta(runsRoot, run.id, { status: 'running', started: true, startedAt })
+      return run
+    }
+    const statusEvent = (run, progress) => ({
+      v: 1,
+      ts: startedAt,
+      kind: 'node/status',
+      nodeId: 'n_a',
+      attemptId: 1,
+      traceId: `run:${run.id}`,
+      data: {
+        nodeId: 'n_a', attempt: 1, state: 'working', progress,
+        summary: '…', members: [], blockers: [], verdict: null,
+      },
+    })
+    // G6-d 基准建立：只为了让 run 走审计；eventCount 不是重点。
+    // 每个 run 单独一份事件（一次读取后复用给审计与 nodeStatus 建议）。
+    const runA = await makeRun('多 run A')
+    const runB = await makeRun('多 run B')
+    await runstore.appendEvents(runsRoot, runA.id, [statusEvent(runA, 30)])
+    await runstore.appendEvents(runsRoot, runB.id, [statusEvent(runB, 70)])
+
+    const tools = makeTools({ engine: makeEngine(), auditWorkflow: stubAudit })
+    const watch = byName(tools, 'flow_watch')
+    const callsBefore = auditCalls.length
+    const multi = record(await watch.execute({ runIds: [runA.id, runB.id] }, makeExec()))
+    A.equal(multi.ok, true, JSON.stringify(multi))
+    A.equal(multi.mode, 'multi')
+    A.equal(multi.runs.length, 2)
+    A.equal(auditCalls.length, callsBefore + 2, '每个 run 只审一次（事件也只读一次）')
+    A.deepEqual(multi.runs.map(item => item.runId).sort(), [runA.id, runB.id].sort())
+    for (const entry of multi.runs) {
+      A.equal(entry.ok, true)
+      A.equal(entry.verdict, 'healthy')
+      A.equal(entry.supervision.nextCheckSeconds, 60)
+    }
+    A.equal(multi.merged.total, 2)
+    A.equal(multi.merged.ok, 2)
+    A.equal(multi.merged.failed, 0)
+    A.equal(multi.merged.terminal, false)
+    A.equal(multi.merged.nextCheckSeconds, 60)
+    A.equal(multi.merged.watchTool, 'flow_watch')
+    A.ok(Array.isArray(multi.merged.recommended))
+    A.ok(multi.merged.recommended.some(item => item.includes(runA.id)), '合并建议要能定位到具体 run')
+    A.match(multi.merged.alarmPrompt, new RegExp(runA.id))
+    A.match(multi.merged.alarmPrompt, /flow_watch/)
+    A.ok(typeof multi.merged.hint === 'string' && multi.merged.hint.length > 0)
+
+    // 重复 runId 去重 → 只审一次（不重复读事件 / 不重复审计）。
+    const dupBefore = auditCalls.length
+    const dup = record(await watch.execute({ runIds: [runA.id, runA.id] }, makeExec()))
+    A.equal(dup.runs.length, 1)
+    A.equal(auditCalls.length, dupBefore + 1)
+
+    // 混入不存在的 run：其它 run 照常出结论，失败项带可读 hint。
+    const mixed = record(await watch.execute({ runIds: [runA.id, 'r-missing-probe'] }, makeExec()))
+    A.equal(mixed.ok, true)
+    A.equal(mixed.merged.ok, 1)
+    A.equal(mixed.merged.failed, 1)
+    const missingEntry = mixed.runs.find(item => item.runId === 'r-missing-probe')
+    A.equal(missingEntry.ok, false)
+    A.ok(missingEntry.hint)
+    A.equal(missingEntry.retryable, false)
+
+    // 上限 20：超过 → 可读参数失败（400 风格），一条 run 都不读。
+    const auditBeforeLimit = auditCalls.length
+    const tooMany = record(await watch.execute(
+      { runIds: Array.from({ length: 21 }, (_, index) => `r-probe-${index}`) },
+      makeExec(),
+    ))
+    A.equal(tooMany.ok, false)
+    A.match(tooMany.error, /20/)
+    A.equal(tooMany.retryable, false)
+    A.equal(auditCalls.length, auditBeforeLimit, '超限不能读任何 run')
+
+    // runId 与 runIds 二选一。
+    const both = record(await watch.execute({ runId: runA.id, runIds: [runB.id] }, makeExec()))
+    A.equal(both.ok, false)
+    A.match(both.error, /二选一/)
+
+    // 单 run 兼容：返回形状仍是老契约（没有 runs / merged）。
+    const single = record(await watch.execute({ runId: runA.id }, makeExec()))
+    A.equal(single.ok, true)
+    A.equal(single.runId, runA.id)
+    A.equal(single.runs, undefined)
+    A.equal(single.merged, undefined)
+
+    // 全部终态 → merged.terminal=true、nextCheckSeconds=null（不必再挂闹钟）。
+    auditResult = { verdict: 'done', status: 'done', headline: '完成', anomalies: [], recommended: [], nextCheckSeconds: 30 }
+    const doneRun = await makeRun('多 run done')
+    const done = record(await watch.execute({ runIds: [doneRun.id] }, makeExec()))
+    A.equal(done.merged.terminal, true)
+    A.equal(done.merged.nextCheckSeconds, null)
+    A.match(done.merged.alarmPrompt, /不必再挂/)
+  })
+
+  await check('G6-b flow_worktrees：list 标孤儿 / prune 透传 keepRunIds；参数与失败可读', async () => {
+    const runForWorktrees = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: 'worktree list 锚点', nodeTotal: 1, engine: 'real',
+    })
+    const listCalls = []
+    const pruneCalls = []
+    const stub = {
+      async listWorktrees(input) {
+        listCalls.push(input)
+        return [
+          {
+            path: `/wt/${runForWorktrees.id}`, workspaceId: '0123456789ab', runId: runForWorktrees.id,
+            exists: true, dirty: false, head: 'abc123', registered: true,
+          },
+          {
+            path: '/wt/r-orphan-probe', workspaceId: '0123456789ab', runId: 'r-orphan-probe',
+            exists: false, dirty: null, head: null, registered: null,
+          },
+        ]
+      },
+      async pruneWorktrees(input) {
+        pruneCalls.push(input)
+        return {
+          removed: [{ path: '/wt/r-orphan-probe', runId: 'r-orphan-probe' }],
+          skipped: [{ path: '/wt/r-skip-probe', reason: 'remove-failed' }],
+        }
+      },
+    }
+    const tools = makeTools({ engine: makeEngine(), worktree: stub })
+    const worktrees = byName(tools, 'flow_worktrees')
+    A.ok(worktrees, 'flow_worktrees 必须注册')
+    A.deepEqual(worktrees.parameters.required, ['action'])
+    A.deepEqual(worktrees.parameters.properties.action.enum, ['list', 'prune'])
+    A.ok(worktrees.output && worktrees.output.schema && typeof worktrees.output.render === 'function')
+    A.equal(worktrees.isConcurrencySafe, undefined, '同一工具能 prune（写），不能标并发安全')
+
+    const listed = record(await worktrees.execute({ action: 'list' }))
+    A.equal(listed.ok, true, JSON.stringify(listed))
+    A.equal(listed.action, 'list')
+    A.equal(listed.available, true)
+    A.equal(listed.worktrees.length, 2)
+    A.equal(listed.worktrees.find(item => item.runId === runForWorktrees.id).orphan, false)
+    A.deepEqual(listed.orphans.map(item => item.runId), ['r-orphan-probe'])
+    A.equal(listCalls.length, 1)
+    A.equal(listCalls[0].root, join(dirname(runsRoot), 'worktrees'))
+
+    const pruned = record(await worktrees.execute({ action: 'prune', keepRunIds: [runForWorktrees.id] }))
+    A.equal(pruned.ok, true, JSON.stringify(pruned))
+    A.equal(pruned.action, 'prune')
+    A.deepEqual(pruned.removed.map(item => item.path), ['/wt/r-orphan-probe'])
+    A.equal(pruned.skipped.length, 1)
+    A.equal(pruned.keepRunIds, pruneCalls[0].keepRunIds.length)
+    A.ok(pruneCalls[0].keepRunIds.includes(runForWorktrees.id))
+    A.equal(pruneCalls[0].root, join(dirname(runsRoot), 'worktrees'))
+
+    // 参数校验：缺 action / 未知 action / keepRunIds 形状错 / 非法 runId。
+    for (const args of [{}, { action: 'nope' }, { action: 'list', keepRunIds: 'x' }, { action: 'prune', keepRunIds: ['../etc'] }]) {
+      const failed = record(await worktrees.execute(args))
+      A.equal(failed.ok, false, JSON.stringify(args))
+      A.ok(failed.hint)
+    }
+
+    // 注入一个没有导出的桩：明确失败（不假装清理成功）。
+    const unavailableTools = makeTools({ engine: makeEngine(), worktree: {} })
+    const unavailable = record(await byName(unavailableTools, 'flow_worktrees').execute({ action: 'list' }))
+    A.equal(unavailable.ok, false)
+    A.match(unavailable.error, /listWorktrees/)
+
+    // 真实模块（src/worktree.js 已导出 listWorktrees）：空 worktrees 根 → []，不报错。
+    const realTools = makeTools({ engine: makeEngine() })
+    const realList = record(await byName(realTools, 'flow_worktrees').execute({ action: 'list' }))
+    A.equal(realList.ok, true, JSON.stringify(realList))
+    A.equal(realList.available, true)
+    A.ok(Array.isArray(realList.worktrees))
+  })
+
+  await check('G7 前端轻量轮询：light 正常时不会回退（createLightRunReader 一直走 ?light=1）', async () => {
+    const calls = []
+    const warnings = []
+    const reader = createLightRunReader({
+      readRun: async (id, options) => {
+        calls.push({ id, options })
+        return { ok: true, run: { id, live: null, worktree: { enabled: false } } }
+      },
+      warn: message => warnings.push(message),
+    })
+    const first = await reader.read('r-light')
+    A.equal(first.light, true)
+    A.equal(first.degraded, false)
+    A.equal(reader.lightSupported, true)
+    A.equal(calls.length, 1)
+    A.deepEqual(calls[0].options, { light: true })
+    A.deepEqual(warnings, [], 'light 正常时不能出现降级提示')
+
+    // 第二轮（2s 轮询）仍然走 light，不会「先试 light 再回退」。
+    await reader.read('r-light')
+    A.equal(calls.length, 2)
+    A.deepEqual(calls[1].options, { light: true })
+    A.deepEqual(warnings, [])
+
+    // 客户端拼出来的就是后端的 `?light=1`（与 Host 路由契约一致）。
+    A.equal(readRunPath('r-light', { light: true }), '/runs/r-light?light=1')
+    A.equal(readRunPath('r-light'), '/runs/r-light')
+  })
+
   // ── 10. lossless JSON ──────────────────────────────────────────────────
   await check('所有工具输出都能 JSON 往返（无 undefined / NaN / Date）', () => {
     A.ok(outputs.length >= 10)
@@ -1839,23 +2329,30 @@ try {
     A.equal(ctx.routes.length, 1)
   })
 
-  await check('有 tools 服务时注册五个工具，卸载时逆序撤销', () => {
+  await check('有 tools 服务时注册六个工具，卸载时逆序撤销', () => {
     const { ctx, registered, disposed, disposeFns } = makeCtx({ toolsService: true })
     apply(ctx)
-    // v0.7 新增 flow_supervise（内建 supervision 开关），所以固定数量从 4 变成 5。
-    A.equal(registered.length, 5)
-    A.deepEqual(registered.map(tool => tool.name).sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch'])
+    // v0.7 新增 flow_supervise（内建 supervision 开关）；G6-b 新增 flow_worktrees
+    //（worktree 生命周期 list / prune），所以固定数量从 4 变 5 再变 6。
+    A.equal(registered.length, 6)
+    A.deepEqual(
+      registered.map(tool => tool.name).sort(),
+      ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+    )
     A.equal(ctx.routes.length, 1)
     A.ok(disposeFns.length >= 1)
-    // 最后一个 effect 就是工具注册；调用它的 disposer 应把四个工具都撤掉。
+    // 最后一个 effect 就是工具注册；调用它的 disposer 应把六个工具都撤掉。
     disposeFns[disposeFns.length - 1]()
-    A.deepEqual(disposed.slice().sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch'])
+    A.deepEqual(
+      disposed.slice().sort(),
+      ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+    )
   })
 
   await check('ctx.tools 属性（不走 ctx.get）也能注册', () => {
     const { ctx, registered } = makeCtx({ toolsService: true, useCtxProperty: true })
     apply(ctx)
-    A.equal(registered.length, 5)
+    A.equal(registered.length, 6)
   })
 
   // ── 11.5 engine.start 的 per-start parent（06 §15） ──────────────────

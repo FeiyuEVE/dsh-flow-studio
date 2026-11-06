@@ -134,14 +134,29 @@ structured = parseAssistantStructured(lastAssistantBySession.get(sessionId))
 
 ### 4.2 布局
 
-- 根：`$DSH_HOME/flow-studio/worktrees/<workspaceId>/<runId>`
+- 根：`$DSH_HOME/flow-studio/worktrees/<workspaceId>/<runId>`（`root` 也写进 `run.json.worktree`）
 - 分支：`flow/<runId>`（已存在则 `flow/<runId>-2`…，并把最终名写进 run.json）
-- base：`workspace` 的 `HEAD`（记录 baseCommit）
+- base：`workspace` 的 `HEAD`（记录 `baseCommit`）；**空仓库合法**，此时走
+  `git worktree add --orphan`，`baseCommit` 为 `null`（不要按 40 位 hex 校验）
 - 创建：`git -C <workspace> worktree add -B <branch> <path> <baseCommit>`
-- **不自动删**：run 收尾保留（用户可能要看产物）。`removeWorktree()` 提供受校验的删除入口：
-  先检查路径落在 `<root>/<workspaceId>/` 下，再 `git -C <workspace> worktree remove [--force] <path>`；
-  目录不存在返回 `not-found`，不假装删过。**当前没有 HTTP 路由或模型工具暴露它**，只能由模块调用方
-  （脚本 / 运维动作）显式触发。
+- **创建前自愈（v0.8.2）**：目标路径有残留目录、或已被 git 登记（含 `locked`）时，先
+  `worktree remove --force --force` + `worktree prune --expire now` 清干净再重建；目标是**别的仓库**
+  的 worktree 或嵌套独立仓库时拒绝（`reason:'registered-elsewhere'`），绝不误删别人的东西。
+- **失败不累积分支（v0.8.2）**：`add` 失败时回滚刚建的分支（tip 仍等于 baseCommit 才删）并清半成品
+  目录；连续 5 次失败也不会留下 `flow/<runId>-N`。
+- **未提交修改不静默丢**：创建前 `git status --porcelain` 检测 dirty / 未跟踪的 `.env`、`*.key`、
+  `node_modules`，把可读 warning 返回（进 `run.json.worktree.warnings` 与 `run/start.data.worktreeWarning`）。
+  只告警、**不复制**任何东西——worktree 永远是 HEAD 的检出。
+- **错误分类**：`not-a-repo` / `subdirectory` / `git-unavailable` / `empty-repo` / `path-exists` /
+  `registered-elsewhere` / `locked` / `create-failed`；git 本身的失败不再一律伪装成「不是 git 仓库」。
+- **linked worktree 归一**：从一个 worktree 里再开 run 时，`workspaceId` 取**主仓库**（common dir 的
+  父级），不漂移。
+- **不自动删**：run 收尾保留（用户可能要看产物）。清理入口现在有了：
+  - `DELETE /runs/<id>/worktree`（必须显式传 `root` 才能拿到严格前缀校验）；
+  - `GET /worktrees` 孤儿清单 + `POST /worktrees/prune`；
+  - `listWorktrees()` / `pruneWorktrees()` 模块导出（主仓库已删时也能清理本地目录）。
+  `removeWorktree()` 会先 realpath 再校验路径落在 `<root>/<workspaceId>/<runId>` 下（符号链接拒绝），
+  `locked` 的会先 `--force` 再 `--force --force`；目录不存在返回 `not-found` 并顺手 prune 登记。
 
 ### 4.3 列表分组（R4）
 
@@ -244,9 +259,13 @@ v0.7 之前：模块级 `START_LOCK` + 引擎实例上的一堆 per-run 字段 �
 export function workspaceIdFor(realpath)                       // → 12 位 hex
 export async function resolveWorkspace({ cwd, path, run })      // → { id, path, realpath, isGit, gitRoot }
 export function decideWorktree({ workspace, policy })           // → { enabled, reason } | throws { code:'WORKTREE_UNAVAILABLE' }
-export async function createWorktree({ workspace, runId, root, branchPrefix, baseRef, run })  // → record
+export async function createWorktree({ workspace, runId, root, branchPrefix, baseRef, run })
+                                             // → record + { root, warnings[], baseCommit|null }；失败带 reason
 export async function inspectWorktree({ workspace, record, run })  // → { exists, head, dirty }
-export async function removeWorktree({ workspace, record, run, force, root })  // 校验路径前缀，否则拒绝
+export async function removeWorktree({ workspace, record, run, force, root })
+                                             // 严格前缀校验 + 符号链接拒绝；locked 自动双 force
+export async function listWorktrees({ root, run })            // → [{ path, workspaceId, runId, exists, dirty, head, registered }]
+export async function pruneWorktrees({ root, run, keepRunIds })  // → { removed, skipped }
 ```
 
 `run(argv, { cwd, timeoutMs })` 默认 `execFile` 包装，测试注入。
@@ -307,7 +326,7 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
 ## 10 实现状态
 
 2026-11-07 按代码逐项核对（0.8.1：10 路独立审计后的 BLOCKER 修复批）；`npm test`
-**20 个文件 / 627 组全绿**（含新增的 `test/build.test.mjs` 发布门禁）。状态口径按 §2 第 3 条：
+**20 个文件 / 713 组全绿**（含新增的 `test/build.test.mjs` 发布门禁）。状态口径按 §2 第 3 条：
 `implemented` = 代码、测试或实测证据都在；本表没有 `partial / not-implemented`。
 
 | 编号 | 状态 | 落地位置（文件 · 函数 / 入口） | 复核证据 |
@@ -497,3 +516,51 @@ json 围栏代码块回报，不要做别的事」，并写明「state=done 且 
   事件摘要表还没收录该 kind，完整事件列表里会显示「未识别」。
 - run 收尾后不再叫醒节点会话（条目随 attempt / run 注销）；自审不替节点写产物、
   不改节点提示词内容，只收集状态。
+
+## 12 权限、可观测与资源回收（v0.8.2）
+
+### 12.1 两档令牌
+
+| 令牌 | 允许 | 拒绝 |
+|---|---|---|
+| `FLOW_STUDIO_TOKEN`（≥16 字符，全权） | 全部读写 | — |
+| `FLOW_STUDIO_READ_TOKEN`（≥16 字符，只读） | 仅 `GET` | 任何写请求 → **403** `code:"READ_ONLY_TOKEN"` |
+
+两档同时配置时**全权优先匹配**；只配只读令牌时，无凭据的写请求仍是 401（不该泄露「有只读令牌」）。
+`/health` 报 `authMode: 'full' | 'read'` 与 `readOnly` 布尔，调用方能自查权限。
+
+### 12.2 主机级安全开关
+
+- **`FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR`（默认关）**：`executor:'custom'` 会在宿主
+  `sh -c` 执行任意命令（等价宿主 RCE）。关闭时**保存与启动**都 400
+  （`code:"CUSTOM_EXECUTOR_DISABLED"`，文案写明「要启用必须由运维在主机上设置并重启 Host；
+  调用方不能自行绕过」）。这一层是主机级，不归调用方管。
+- **`FLOW_STUDIO_WORKSPACE_ROOTS`（可选）**：冒号分隔的绝对路径；配置后 `workspace` 必须落在其中之一，
+  用 **realpath** 比较（防止用符号链接绕过），否则 400（`field/code = workspace`）。
+  `/health` 只报 `{configured, count}`，不泄露具体路径。
+
+### 12.3 `?light=1` 轻量投影
+
+`GET /runs/<id>?light=1` 只读 `run.json`，**不读也不解析事件文件**，返回固定字段集：
+`id / flowId / flowName / name / status / started / startedAt / endedAt / nodeDone / nodeTotal /
+tokenTotal / eventCount / engine / live / nodeStatus / workspace / worktree / sessionMode / supervision`。
+不含 `nodes`，不含 `events`。
+
+- 为什么要有：客户端运行中 2s 轮询原来打完整详情接口，而该 handler 每次重读并重解析全部事件
+  （实测 5k 事件 27.7ms、20k 事件 113ms/次），长 run 会把单线程 Host 拖到常驻 CPU 并阻塞引擎写事件。
+- 证据：把 `run.jsonl` 换成一个同名目录后，`?light=1` 仍 200、完整接口 500 —— 证明它真的没碰事件文件。
+- 客户端在 light 返回 400/404 时**永久降级**到旧接口并只提示一次（兼容旧 Host）；网络错误/5xx 不误降级。
+
+### 12.4 worktree 回收面
+
+| 入口 | 行为 |
+|---|---|
+| `GET /worktrees` | 孤儿清单：`listWorktrees()` 扫描 + `DELETE /runs/<id>` 留下的删除指针（`.worktree-orphans.json`） |
+| `POST /worktrees/prune` | `{action:'prune', keepRunIds?}`；删目录、`git worktree prune` 登记、**连 `flow/<runId>` 分支一起删** |
+| `DELETE /runs/<id>/worktree` | 删该 run 的 worktree（显式传 `root`、`force` 恒 true）；返回 `{ok, removed, reason, branchRemoved}` |
+| `DELETE /runs/<id>` | **保留** worktree，把 `{path, branch, workspaceId}` 写进孤儿清单并在响应里 hint |
+
+- 分支删除有护栏：只有 `flow/` 开头的分支才会被删（分支名可注入，绝不碰用户分支）；
+  删不掉（未合并保护/分支不存在/主仓库已删）不算失败——`removed:true` + `branchRemoved:false` + 可读 warning。
+- 为什么是手动而不是自动：run 收尾保留产物是设计取舍（用户可能要看），自动删会让人措手不及；
+  清理入口 + 孤儿清单把「只增不减」变成「看得见、一条命令能清」。

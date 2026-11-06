@@ -14,6 +14,10 @@
  * v0.8.1（E1-a / E1-b）追加：每条 entry 的独立超时（hang 不拖死整轮）、有界并发、
  * stop 后无 timer 残留（含子进程自然退出实证）、snapshot() 可观测字段、
  * inspectNodeStatus 区分「没回报」与「回报了但格式错」。
+ *
+ * v0.8.2（G7-a / G7-b）追加：同 wakerSessionId 的 run 合并成一次 wake（coalesced 可查）、
+ * 每会话小时预算 + 最小间隔（限流保留 due、不降级）、NodeSupervisionScheduler.has() 与
+ * recordRecovery()（重启恢复节点闹钟的幂等支撑 + snapshot().recovery 统计）。
  */
 
 import assert from 'node:assert/strict'
@@ -26,6 +30,8 @@ import {
   SUPERVISION_INTERVALS,
   SUPERVISION_WAKE_TIMEOUT_MS,
   SUPERVISION_MAX_CONCURRENCY,
+  SUPERVISION_WAKER_HOURLY_LIMIT,
+  SUPERVISION_WAKER_MIN_INTERVAL_MS,
   NODE_ALARM_DEFAULT_MS,
   NodeSupervisionScheduler,
   parseNodeStatus,
@@ -176,6 +182,8 @@ function createScheduler({
   intervalMs = 1000,
   wakeTimeoutMs,
   maxConcurrency,
+  wakerHourlyLimit,
+  wakerMinIntervalMs,
   timeouts,
 } = {}) {
   const timers = fakeTimers()
@@ -198,6 +206,8 @@ function createScheduler({
     intervalMs,
     ...(wakeTimeoutMs === undefined ? {} : { wakeTimeoutMs }),
     ...(maxConcurrency === undefined ? {} : { maxConcurrency }),
+    ...(wakerHourlyLimit === undefined ? {} : { wakerHourlyLimit }),
+    ...(wakerMinIntervalMs === undefined ? {} : { wakerMinIntervalMs }),
     ...(timeouts === undefined
       ? {}
       : { setTimeout: timeouts.setTimeout, clearTimeout: timeouts.clearTimeout }),
@@ -1978,6 +1988,238 @@ await check('NodeScheduler(E1-b)：recordReport 把回报判定落进快照，in
   A.equal(scheduler.status('s1').lastReport, undefined)
 })
 
+// ===========================================================================
+// 9.12 v0.8.2 · G7-a：按发起会话（wakerSessionId）合并唤醒 + 每会话预算
+// ===========================================================================
+
+await check('Scheduler(G7-a)：10 个 run 同 wakerSessionId → 一轮 tick 只发 1 次 wake，另 9 个合并而非丢弃', async () => {
+  const clock = createClock()
+  const store = createStore()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    store,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+  const runIds = Array.from({ length: 10 }, (_, index) => `r-merge-${index}`)
+  for (const runId of runIds) scheduler.register(runId, { wakerSessionId: 'w-shared' })
+
+  const stats = await scheduler.tick()
+  // 关键证据：11 个 run（含注册里额外的？不，正好 10 个）只发一次 wake。
+  A.equal(calls.wake.length, 1, '10 个 run 同 waker 只发 1 次唤醒')
+  A.equal(calls.wake[0].ctx.wakerSessionId, 'w-shared')
+  A.deepEqual(calls.wake[0].ctx.runIds.slice().sort(), runIds.slice().sort(), '一次唤醒带上全部 runId')
+  A.equal(stats.runs, 10)
+  A.equal(stats.woken, 10, '10 个 run 全部算被唤醒（不是丢弃）')
+  A.equal(stats.failed, 0)
+
+  // 每条都真的推进了（若被丢弃，wakes 会停在 0、nextDueAt 不会动）。
+  for (const runId of runIds) {
+    A.equal(scheduler.status(runId).wakes, 1, `${runId} 不能被丢`)
+    A.equal(scheduler.status(runId).nextDueAt, clock.iso(180))
+    A.equal(store.get(runId).wakes, 1)
+    A.equal(store.get(runId).nextDueAt, clock.iso(180))
+  }
+
+  const snapshot = scheduler.snapshot()
+  A.equal(snapshot.coalesced, 9, '9 个 run 被合并进同一次唤醒')
+  A.equal(snapshot.throttled, 0)
+  // wokenThisHour 数的是「真的发出去的唤醒次数」（预算口径）：10 个 run 合并后是 1。
+  A.equal(snapshot.wokenThisHour, 1)
+  A.equal(snapshot.waker.hourlyLimit, SUPERVISION_WAKER_HOURLY_LIMIT)
+  A.equal(snapshot.waker.minIntervalMs, SUPERVISION_WAKER_MIN_INTERVAL_MS)
+  A.equal(snapshot.waker.sessions.length, 1)
+  A.equal(snapshot.waker.sessions[0].sessionId, 'w-shared')
+  A.equal(snapshot.waker.sessions[0].coalesced, 9)
+  A.equal(snapshot.waker.sessions[0].wokenThisHour, 1, '预算口径：合并后只算 1 次唤醒')
+  A.equal(typeof snapshot.waker.sessions[0].lastWokeAt, 'string')
+  A.equal(
+    snapshot.entries.reduce((sum, entry) => sum + entry.coalesced, 0),
+    9,
+    '每条 entry 的 coalesced 合计等于被合并数',
+  )
+
+  // 同一 due 不会因为合并把后续 tick 变成重复唤醒。
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1, '同一 nextDueAt 只唤醒一次')
+})
+
+await check('Scheduler(G7-a)：小时预算可注入；被限流的 run 保留 due、计数可见、不算失败不降级', async () => {
+  const clock = createClock()
+  const store = createStore()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    store,
+    wakerHourlyLimit: 2,
+    wakerMinIntervalMs: 0,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+  scheduler.register('r-budget', { wakerSessionId: 'w-budget' })
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1)
+  clock.advance(180)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 2)
+
+  // 第 3 次到点：预算已满 → 限流；run 不许丢（due 保留在 ≤ now）。
+  clock.advance(180)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 2, '预算满后不得再发唤醒')
+  const throttled = scheduler.status('r-budget')
+  A.equal(throttled.wakes, 2)
+  A.equal(throttled.enabled, true, '限流不是失败，不能降级')
+  A.equal(throttled.failures, 0)
+  const entry = scheduler.snapshot().entries[0]
+  A.equal(entry.lastOutcome, 'throttled')
+  A.match(entry.lastReason, /^throttled: /)
+  A.match(entry.lastReason, /hourly-limit/)
+  A.equal(entry.throttled, 1)
+  A.equal(scheduler.snapshot().throttled, 1)
+  A.ok(Date.parse(entry.nextDueAt) <= clock.ms, '被限流后 nextDueAt 仍 ≤ now（下一轮还会再来）')
+
+  // 推荐继续 tick（不推进时钟）：预算仍然满，但 run 依旧不丢。
+  await scheduler.tick()
+  A.equal(calls.wake.length, 2)
+  A.equal(scheduler.status('r-budget').wakes, 2)
+  A.equal(scheduler.snapshot().throttled, 2, '每轮都会记一次限流')
+
+  // 窗口滚过一小时 → 预算恢复，同一个 run 被补上。
+  clock.advance(3600)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 3, '窗口滚过后恢复唤醒')
+  A.equal(scheduler.status('r-budget').wakes, 3)
+  A.equal(scheduler.status('r-budget').failures, 0)
+  A.equal(store.get('r-budget').wakes, 3)
+})
+
+await check('Scheduler(G7-a)：最小唤醒间隔（默认 120s）生效，间隔到了才能再唤醒', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    evaluate: async () => ({ verdict: 'stalled', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+  scheduler.register('r-gap', { wakerSessionId: 'w-gap' })
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1)
+
+  clock.advance(60) // anomaly 间隔 60s → 已到点，但距上次唤醒只有 60s < 120s
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1, '最小间隔内不得再叫')
+  A.equal(scheduler.snapshot().entries[0].lastOutcome, 'throttled')
+  A.match(scheduler.snapshot().entries[0].lastReason, /min-interval\(\d+ms\)/)
+
+  clock.advance(60) // 距上次唤醒 120s，满足最小间隔
+  await scheduler.tick()
+  A.equal(calls.wake.length, 2)
+  A.equal(scheduler.status('r-gap').wakes, 2)
+
+  A.equal(SUPERVISION_WAKER_MIN_INTERVAL_MS, 120_000)
+  A.equal(SUPERVISION_WAKER_HOURLY_LIMIT, 30)
+  A.equal(scheduler.wakerMinIntervalMs, 120_000)
+  A.equal(scheduler.wakerHourlyLimit, 30)
+})
+
+await check('Scheduler(G7-a)：整组被限流时每个 run 都保留 due（不丢），窗口滚过后整组补一次合并唤醒', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    wakerHourlyLimit: 1,
+    wakerMinIntervalMs: 0,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+  const runIds = ['r-grp-1', 'r-grp-2', 'r-grp-3']
+  for (const runId of runIds) scheduler.register(runId, { wakerSessionId: 'w-grp' })
+
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1, '整组只发 1 次')
+  A.deepEqual(calls.wake[0].ctx.runIds.slice().sort(), runIds.slice().sort())
+  A.equal(scheduler.snapshot().coalesced, 2)
+
+  // 下一轮到点：预算（1 次/小时）已满 → 整组限流，但三个 run 都还在。
+  clock.advance(180)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 1, '预算满时整组都不发')
+  for (const runId of runIds) {
+    A.equal(scheduler.status(runId).wakes, 1, `${runId} 保留在调度里（wakes 不变、不降级）`)
+    A.equal(scheduler.status(runId).enabled, true)
+  }
+  A.equal(scheduler.snapshot().throttled, 3, '整组 3 条各记一次限流')
+  A.equal(
+    scheduler.snapshot().entries.filter(entry => entry.lastOutcome === 'throttled').length,
+    3,
+  )
+
+  // 窗口滚过一小时 → 整组再合并成一次唤醒。
+  clock.advance(3600)
+  await scheduler.tick()
+  A.equal(calls.wake.length, 2, '窗口滚过后整组补一次唤醒')
+  A.deepEqual(calls.wake[1].ctx.runIds.slice().sort(), runIds.slice().sort())
+  for (const runId of runIds) A.equal(scheduler.status(runId).wakes, 2)
+  A.equal(scheduler.snapshot().coalesced, 4, '合并计数累计（2 + 2）')
+  A.equal(scheduler.snapshot().wokenThisHour, 1, '窗口内只剩本轮这 1 次唤醒（3 个 run 合并）')
+})
+
+await check('Scheduler(G7-a)：不同 wakerSessionId / 没有 waker 的 run 各自唤醒，不误合并', async () => {
+  const clock = createClock()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+  scheduler.register('r-w1', { wakerSessionId: 'w-1' })
+  scheduler.register('r-w2', { wakerSessionId: 'w-2' })
+  scheduler.register('r-no-waker-1')
+  scheduler.register('r-no-waker-2')
+
+  const stats = await scheduler.tick()
+  A.equal(calls.wake.length, 4, '不同会话 / 无 waker 不能合并')
+  A.equal(stats.woken, 4)
+  A.equal(scheduler.snapshot().coalesced, 0)
+  A.deepEqual(calls.wake.map(call => call.runId).sort(), ['r-no-waker-1', 'r-no-waker-2', 'r-w1', 'r-w2'])
+})
+
+await check('NodeScheduler(G7-b)：has() 识别已登记（含停摆），recordRecovery 累加进 snapshot.recovery 且不动 status/list', async () => {
+  const clock = createClock()
+  const { scheduler } = createNodeScheduler({ clock })
+  A.equal(scheduler.has('s1'), false)
+  A.equal(scheduler.has(''), false)
+  A.equal(scheduler.has(null), false)
+  A.equal(scheduler.snapshot().recovery.restored, 0, '默认恢复统计为 0')
+
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1 })
+  A.equal(scheduler.has('s1'), true)
+
+  const first = scheduler.recordRecovery({
+    runsScanned: 2,
+    runsRecovered: 1,
+    restored: 3,
+    skipped: 2,
+    skippedTerminal: 1,
+    missingSession: 1,
+    missingAttempt: 2,
+    alreadyRegistered: 0,
+  })
+  A.equal(first.scans, 1)
+  A.equal(first.restored, 3)
+  A.equal(first.missingSession, 1)
+  A.equal(typeof first.at, 'string')
+
+  // 幂等语义：第二次恢复 0 条，累计值不变（只增加 scans）。
+  const second = scheduler.recordRecovery({ restored: 0, skipped: 0 })
+  A.equal(second.restored, 3)
+  A.equal(second.scans, 2)
+  A.equal(second.missingAttempt, 2)
+
+  const snapshot = scheduler.snapshot()
+  A.equal(snapshot.recovery.restored, 3)
+  A.deepEqual(Object.keys(snapshot.recovery), [
+    'at', 'scans', 'runsScanned', 'runsRecovered', 'restored', 'skipped',
+    'skippedTerminal', 'missingSession', 'missingAttempt', 'alreadyRegistered',
+  ])
+  // status / list 的 9 字段契约不变，recovery 只出现在 snapshot 里。
+  A.equal(Object.keys(scheduler.status('s1')).length, 9)
+  A.equal(Object.keys(scheduler.list()[0]).length, 9)
+  A.equal(scheduler.status('s1').recovery, undefined)
+})
+
 // ---------------------------------------------------------------------------
 // 9.11 E1-a · snapshot 契约（只读、字段齐全、不改 status）
 // ---------------------------------------------------------------------------
@@ -2000,6 +2242,11 @@ await check('Scheduler(E1-a)：snapshot 只读、字段齐全，status() 契约�
     intervalMs: 1000,
     maxConcurrency: 4,
     wakeTimeoutMs: 60_000,
+    // G7-a 新增（只增不改）：按发起会话合并唤醒 / 预算的可观测字段。
+    wokenThisHour: 0,
+    throttled: 0,
+    coalesced: 0,
+    waker: { hourlyLimit: 30, minIntervalMs: 120_000, sessions: [] },
     concurrency: { limit: 4, active: 0 },
     tick: {
       count: 0,
@@ -2028,6 +2275,8 @@ await check('Scheduler(E1-a)：snapshot 只读、字段齐全，status() 契约�
     'lastFinishedAt',
     'timeouts',
     'lastError',
+    'throttled',
+    'coalesced',
   ])
   A.deepEqual(
     Object.keys(scheduler.status(RUN_ID)),

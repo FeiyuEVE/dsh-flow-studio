@@ -21,7 +21,7 @@ import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   EXECUTORS, buildCodexArgs, normalizeExecutor, parseCodexLine, runExternalExecutor,
@@ -760,6 +760,357 @@ await check('真实 sh -c：prompt 临时文件在超时路径清理', async () 
   A.ok(state.file, '超时前必须创建过 prompt 临时文件')
   A.equal(existsSync(state.file), false, '超时后 prompt 文件必须被清理')
   A.equal(existsSync(state.dir), false, '超时后 prompt 临时目录必须被清理')
+})
+
+// ---------------------------------------------------------------------------
+// 进程组缺陷回归（审计实测：custom 的 sh -c 孙进程曾活过 abort，宿主还被管道吊住）
+// 下面全部用真进程 / 真 /proc，不 mock child_process。
+// ---------------------------------------------------------------------------
+
+/** 进程是否还存在（EPERM 说明存在但没权限，仍算存活）。 */
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && error.code === 'EPERM')
+  }
+}
+
+/** 从 /proc/<pid>/stat 读 pgid（Linux）；拿不到返回 null。 */
+function readPgid(pid) {
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return null
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    // comm 字段可能含空格 / 括号：从最后一个 ')' 之后开始切。
+    // 字段序：state(3) ppid(4) pgrp(5) session(6) …，切完 rest[0]=state、rest[1]=ppid、rest[2]=pgrp。
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    const pgid = Number(rest[2])
+    return Number.isInteger(pgid) ? pgid : null
+  } catch {
+    return null
+  }
+}
+
+/** 轮询等待进程消失；超时返回 false。 */
+async function waitGone(pid, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  return !isAlive(pid)
+}
+
+/** 兜底清理：只杀 cmdline 里确认是 sleep 的进程，避免 pid 复用误伤。 */
+function killLeftover(pid) {
+  if (!isAlive(pid)) return
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+    if (!cmdline.includes('sleep')) return
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    // 已退出 / 非 Linux：放弃兜底。
+  }
+}
+
+/** 真实 spawn 的观测包装：记下子进程对象，用来核对 pgid 与 stdout/stderr 状态。 */
+function captureChildSpawn() {
+  const state = { child: null }
+  const spawn = (command, args, options) => {
+    state.child = realSpawn(command, args, options)
+    return state.child
+  }
+  return { state, spawn }
+}
+
+/** 带 destroy 追踪的假流：验证 finish() 是否真的 destroy 了 stdout / stderr。 */
+function trackedStream() {
+  const stream = new EventEmitter()
+  stream.destroyed = false
+  stream.setEncoding = () => {}
+  stream.destroy = () => {
+    stream.destroyed = true
+  }
+  return stream
+}
+
+/** 假 spawn（仅用于「收尾 / 降级可观测」用例）：流带 destroy 追踪。 */
+function trackedFakeSpawn() {
+  const calls = []
+  const children = []
+  const spawn = (command, args, options) => {
+    const child = new EventEmitter()
+    child.stdout = trackedStream()
+    child.stderr = trackedStream()
+    child.stdin = new EventEmitter()
+    child.stdin.write = () => true
+    child.stdin.end = () => {}
+    child.pid = 5300 + children.length
+    child.killed = false
+    child.killSignals = []
+    child.kill = (signal) => {
+      child.killed = true
+      child.killSignals.push(signal || 'SIGTERM')
+      return true
+    }
+    calls.push({ command, args, options })
+    children.push(child)
+    return child
+  }
+  return { spawn, calls, children }
+}
+
+/** 派生孙进程的命令：后台 sleep 600 + 打印它的 pid，然后 wait 把它挂住。 */
+const GRANDCHILD_COMMAND = 'sleep 600 & echo "grandchild:$!"; wait'
+
+/** 从执行器事件里抓 `grandchild:<pid>`。 */
+function makeGrandchildTracker() {
+  const state = { pid: null }
+  const onEvent = (event) => {
+    const text = event && typeof event.text === 'string' ? event.text : ''
+    const matched = /grandchild:(\d+)/.exec(text)
+    if (matched) state.pid = Number(matched[1])
+  }
+  return { state, onEvent }
+}
+
+await check('真实进程组：abort 杀掉 sh -c 派生的孙进程（sleep 600），killScope=group', async () => {
+  const controller = new AbortController()
+  const { state: spawnState, spawn } = captureChildSpawn()
+  const tracker = makeGrandchildTracker()
+  let aliveBeforeAbort = null
+  let pgidBeforeAbort = null
+  let result = null
+  const run = runExternalExecutor({
+    spec: { kind: 'custom', command: GRANDCHILD_COMMAND },
+    prompt: '进程组 abort 用例',
+    cwd: repoRoot,
+    signal: controller.signal,
+    spawn,
+    onEvent: tracker.onEvent,
+  })
+  const abortTimer = setTimeout(() => {
+    // 证据必须在 abort 之前取：abort 之后进程组可能已经消失，读不到 pgid。
+    aliveBeforeAbort = tracker.state.pid !== null && isAlive(tracker.state.pid)
+    pgidBeforeAbort = tracker.state.pid === null ? null : readPgid(tracker.state.pid)
+    controller.abort()
+  }, 300)
+  try {
+    result = await within(run, 15000, '进程组 abort')
+    const grandchildPid = tracker.state.pid
+    const directPid = spawnState.child ? spawnState.child.pid : null
+    A.equal(result.ok, false)
+    A.equal(result.reason, 'aborted')
+    A.equal(result.killScope, 'group', 'abort 必须按进程组终止（整组）')
+    A.equal(result.orphanWarning, null, 'POSIX 真实子进程不该有降级告警')
+    A.ok(Number.isInteger(grandchildPid), '必须从 stdout 拿到孙进程 pid')
+    A.equal(aliveBeforeAbort, true, `孙进程 ${grandchildPid} 在 abort 前必须存活`)
+    A.equal(pgidBeforeAbort, directPid, '孙进程必须与直接子进程（sh）同属一个进程组（pgid = sh pid）')
+    A.equal(await waitGone(grandchildPid, 3000), true, `abort 后孙进程 ${grandchildPid} 必须不存在`)
+    console.log(`    · 孙进程 pid=${grandchildPid}：abort 前存活 → abort 后不存在（pgid=${pgidBeforeAbort}）`)
+  } finally {
+    clearTimeout(abortTimer)
+    killLeftover(tracker.state.pid)
+  }
+})
+
+await check('真实进程组：timeout 同样按整组终止（孙进程一并消失）', async () => {
+  const tracker = makeGrandchildTracker()
+  const result = await within(runExternalExecutor({
+    spec: { kind: 'custom', command: GRANDCHILD_COMMAND },
+    prompt: '进程组 timeout 用例',
+    cwd: repoRoot,
+    timeoutMs: 300,
+    onEvent: tracker.onEvent,
+  }), 15000, '进程组 timeout')
+  try {
+    A.equal(result.ok, false)
+    A.equal(result.reason, 'timeout')
+    A.equal(result.killScope, 'group', 'timeout 必须按进程组终止（整组）')
+    A.equal(result.orphanWarning, null)
+    A.ok(Number.isInteger(tracker.state.pid), '必须拿到孙进程 pid')
+    A.equal(await waitGone(tracker.state.pid, 3000), true, `timeout 后孙进程 ${tracker.state.pid} 必须不存在`)
+    console.log(`    · timeout 后孙进程 pid=${tracker.state.pid} 已不存在`)
+  } finally {
+    killLeftover(tracker.state.pid)
+  }
+})
+
+await check('真实进程：abort 后宿主能自然退出（无遗留 fd），stdout/stderr 已 destroy', async () => {
+  const dir = makeTmpDir('executor-nohang')
+  const helper = join(dir, 'no-hang.mjs')
+  const evidenceFile = join(dir, 'evidence.json')
+  const executorUrl = pathToFileURL(join(repoRoot, 'src', 'executor.js')).href
+  // 宿主脚本：真跑一次 custom executor，300ms 后 abort，把证据写文件后什么都不做。
+  // 故意不调用 process.exit()——「能不能自然退出」本身就是被测行为：
+  // 孙进程继承的 stdout/stderr 管道若没被 destroy，脚本会被吊住直到 sleep 600 结束。
+  const helperSource = [
+    "import { spawn as realSpawn } from 'node:child_process'",
+    "import { writeFileSync } from 'node:fs'",
+    `import { runExternalExecutor } from ${JSON.stringify(executorUrl)}`,
+    '',
+    'const [outFile, cwd] = process.argv.slice(2)',
+    'const controller = new AbortController()',
+    'let grandchildPid = null',
+    'let observed = null',
+    'const spawn = (command, args, options) => {',
+    '  observed = realSpawn(command, args, options)',
+    '  return observed',
+    '}',
+    'const run = runExternalExecutor({',
+    `  spec: { kind: 'custom', command: ${JSON.stringify(GRANDCHILD_COMMAND)} },`,
+    "  prompt: '宿主退出用例',",
+    '  cwd,',
+    '  signal: controller.signal,',
+    '  spawn,',
+    '  onEvent: (event) => {',
+    "    const matched = /grandchild:(\\d+)/.exec(event && typeof event.text === 'string' ? event.text : '')",
+    '    if (matched) grandchildPid = Number(matched[1])',
+    '  },',
+    '})',
+    'setTimeout(() => controller.abort(), 300)',
+    'const result = await run',
+    'writeFileSync(outFile, JSON.stringify({',
+    '  grandchildPid,',
+    '  ok: result.ok,',
+    '  reason: result.reason,',
+    '  killScope: result.killScope,',
+    '  orphanWarning: result.orphanWarning,',
+    '  stdoutDestroyed: !!(observed && observed.stdout && observed.stdout.destroyed),',
+    '  stderrDestroyed: !!(observed && observed.stderr && observed.stderr.destroyed),',
+    '}))',
+    '// 不 process.exit()：自然退出即通过。',
+    '',
+  ].join('\n')
+
+  let helperChild = null
+  let grandchildPid = null
+  let output = ''
+  try {
+    writeFileSync(helper, helperSource)
+    helperChild = realSpawn(process.execPath, [helper, evidenceFile, repoRoot], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    helperChild.stdout.setEncoding('utf8')
+    helperChild.stderr.setEncoding('utf8')
+    const collect = (chunk) => {
+      output += chunk
+      const matched = /grandchild:(\d+)/.exec(output)
+      if (matched) grandchildPid = Number(matched[1])
+    }
+    helperChild.stdout.on('data', collect)
+    helperChild.stderr.on('data', collect)
+
+    const started = Date.now()
+    const exit = await within(new Promise((resolve) => {
+      helperChild.on('exit', (code, signal) => resolve({ code, signal }))
+    }), 8000, '宿主脚本自然退出')
+    const elapsedMs = Date.now() - started
+    A.equal(exit.code, 0, '宿主脚本必须自己退出（exit 0），不能被遗留管道吊住')
+    A.ok(elapsedMs < 8000, `宿主脚本应在超时前退出（实际 ${elapsedMs}ms）`)
+
+    const evidence = JSON.parse(readFileSync(evidenceFile, 'utf8'))
+    A.equal(evidence.reason, 'aborted')
+    A.equal(evidence.killScope, 'group')
+    A.equal(evidence.orphanWarning, null)
+    A.equal(evidence.stdoutDestroyed, true, 'abort 收口时 stdout 必须被 destroy')
+    A.equal(evidence.stderrDestroyed, true, 'abort 收口时 stderr 必须被 destroy')
+    if (Number.isInteger(evidence.grandchildPid)) grandchildPid = evidence.grandchildPid
+    A.equal(await waitGone(grandchildPid, 3000), true, `孙进程 ${grandchildPid} 必须不存在`)
+    console.log(`    · 宿主脚本 ${elapsedMs}ms 自然退出；孙进程 pid=${grandchildPid} 已消失；stdout/stderr destroyed=true`)
+  } finally {
+    if (helperChild && helperChild.exitCode === null && helperChild.signalCode === null) {
+      try {
+        helperChild.kill('SIGKILL')
+      } catch {
+        // 已退出。
+      }
+    }
+    killLeftover(grandchildPid)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('codex 路径语义不变：argv / stdio / env 保持，成功收口 killScope=null 且管道已 destroy', async () => {
+  const fake = trackedFakeSpawn()
+  const promise = runExternalExecutor({
+    spec: { kind: 'codex', command: 'codex', model: 'gpt-5.1-codex', schemaPath: '/repo/schema.json' },
+    prompt: '把事做完',
+    cwd: '/repo',
+    spawn: fake.spawn,
+  })
+  const child = fake.children[0]
+  const call = fake.calls[0]
+  A.equal(call.command, 'codex')
+  A.deepEqual(call.options.stdio, ['ignore', 'pipe', 'pipe'], 'codex 的 stdio 语义必须保持不变')
+  A.equal(call.options.env, undefined, 'codex 不注入 custom 的环境变量')
+  A.equal(call.options.detached, true, 'POSIX 上必须用 detached 建立进程组')
+  A.equal(call.args[call.args.length - 1], '把事做完')
+  A.deepEqual(call.args.slice(0, 5), ['exec', '--json', '--output-schema', '/repo/schema.json', '-C'])
+
+  child.stdout.emit('data', '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n')
+  child.emit('close', 0, null)
+  const result = await promise
+  A.equal(result.ok, true)
+  A.equal(result.killScope, null, '没有发生终止时 killScope 必须是 null')
+  A.equal(result.orphanWarning, null, '真实子进程的 POSIX 路径不该有降级告警')
+  A.equal(child.stdout.destroyed, true, '正常完成也必须 destroy stdout')
+  A.equal(child.stderr.destroyed, true, '正常完成也必须 destroy stderr')
+})
+
+await check('降级路径可观测：无真实进程组时只杀直接子进程（killScope=process + orphanWarning）', async () => {
+  const controller = new AbortController()
+  const fake = trackedFakeSpawn()
+  const promise = runExternalExecutor({
+    spec: { kind: 'custom', command: 'sleep 600 & wait' },
+    prompt: 'p',
+    cwd: '/repo',
+    signal: controller.signal,
+    spawn: fake.spawn,
+  })
+  const child = fake.children[0]
+  controller.abort()
+  const result = await promise
+  A.equal(result.ok, false)
+  A.equal(result.reason, 'aborted')
+  A.equal(result.killScope, 'process', '没有可信进程组时只能标成「只杀直接子进程」')
+  A.match(result.orphanWarning, /ChildProcess|进程组/, '必须明确写出降级原因')
+  A.equal(child.killSignals[0], 'SIGTERM', '降级路径仍要对直接子进程发 SIGTERM')
+  A.ok(
+    result.events.some(event => event.kind === 'log' && event.level === 'warn'),
+    '降级必须留一条 warn 日志',
+  )
+  A.equal(child.stdout.destroyed, true, '降级收口也必须 destroy stdout')
+  A.equal(child.stderr.destroyed, true, '降级收口也必须 destroy stderr')
+})
+
+await check('真实进程组：忽略 SIGTERM 的孙进程在宽限期后被 SIGKILL（整组）', async () => {
+  const tracker = makeGrandchildTracker()
+  // 孙进程 sh 忽略 SIGTERM 并无限循环：SIGTERM 之后仍活着，只有宽限期后的组 SIGKILL 能收掉它。
+  const command = 'sh -c \'trap "" TERM; while :; do sleep 1; done\' & echo "grandchild:$!"; wait'
+  const result = await within(runExternalExecutor({
+    spec: { kind: 'custom', command },
+    prompt: 'SIGKILL 宽限用例',
+    cwd: repoRoot,
+    timeoutMs: 300,
+    onEvent: tracker.onEvent,
+  }), 15000, 'SIGKILL 宽限')
+  try {
+    A.equal(result.reason, 'timeout')
+    A.equal(result.killScope, 'group')
+    A.ok(Number.isInteger(tracker.state.pid), '必须拿到孙进程 pid')
+    A.equal(
+      await waitGone(tracker.state.pid, 3000),
+      true,
+      `忽略 SIGTERM 的孙进程 ${tracker.state.pid} 必须在 SIGKILL 后消失`,
+    )
+    console.log(`    · 忽略 SIGTERM 的孙进程 pid=${tracker.state.pid} 已被组 SIGKILL 收掉`)
+  } finally {
+    killLeftover(tracker.state.pid)
+  }
 })
 
 console.log(`\n${checks} 组通过，${assertionCount} 条断言`)

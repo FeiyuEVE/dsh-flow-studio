@@ -11,7 +11,7 @@
 import {
   EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, runBlockers, summarize, validateFlow,
 } from '../model.js'
-import { api, runActionFailureText } from './api.js'
+import { api, createRunsSource, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
@@ -271,6 +271,74 @@ export function startFailurePlan(action, failure, run, created) {
 }
 
 /**
+ * G5-b：删除流程的安全序列（可单测）。
+ *
+ * 顺序是硬性的：**先拿完整快照 → 先落草稿 → 再 DELETE → 服务器成功后才清草稿**。
+ *  - 拿不到快照就不删（没有备份的删除等于单点毁灭）；
+ *  - DELETE 失败时草稿原样保留，`backup` 也在返回值里，调用方可重试或保留撤销入口；
+ *  - DELETE 成功才调用 `drafts.clear`。
+ *
+ * @param {{ api: object, id: string, snapshot?: object|null,
+ *   drafts?: { write?: (flow: object) => void, clear?: (id: string) => void }|null }} input
+ */
+export async function deleteFlowRequest({ api: apiClient, id, snapshot = null, drafts = null } = {}) {
+  if (!isObject(apiClient) || typeof apiClient.deleteFlow !== 'function') {
+    return { ok: false, error: new Error('缺少删除接口'), backup: null, draftKept: false, stage: 'api' }
+  }
+  let backup = isObject(snapshot) && snapshot.id === id ? snapshot : null
+  if (!backup) {
+    try {
+      const result = await apiClient.readFlow(id)
+      backup = result && isObject(result.flow) ? result.flow : null
+    } catch (error) {
+      return { ok: false, error, backup: null, draftKept: false, stage: 'snapshot' }
+    }
+  }
+  if (!backup) {
+    return { ok: false, error: new Error('拿不到流程快照，已取消删除'), backup: null, draftKept: false, stage: 'snapshot' }
+  }
+  if (drafts && typeof drafts.write === 'function') {
+    try {
+      drafts.write(backup)
+    } catch {
+      // 草稿写失败不阻塞删除，但内存快照仍然在，撤销入口还能用。
+    }
+  }
+  try {
+    await apiClient.deleteFlow(id)
+  } catch (error) {
+    return { ok: false, error, backup, draftKept: true, stage: 'delete' }
+  }
+  if (drafts && typeof drafts.clear === 'function') {
+    try {
+      drafts.clear(id)
+    } catch {
+      // 清理失败不影响「服务器已经删掉」这个事实。
+    }
+  }
+  return { ok: true, error: null, backup, draftKept: false, stage: 'done' }
+}
+
+/**
+ * G5-b：撤销删除——把内存快照按原 id 写回（Host 的 PUT /flows/<id> 是 upsert，
+ * 磁盘上没有该文件就按 version=1 新建，所以 id 不会变）。
+ */
+export async function restoreFlowRequest({ api: apiClient, backup } = {}) {
+  if (!isObject(apiClient) || typeof apiClient.saveFlow !== 'function') {
+    return { ok: false, error: new Error('缺少保存接口'), flow: null }
+  }
+  if (!isObject(backup) || typeof backup.id !== 'string' || backup.id === '') {
+    return { ok: false, error: new Error('没有可撤销的流程快照'), flow: null }
+  }
+  try {
+    const result = await apiClient.saveFlow(backup.id, { ...backup })
+    return { ok: true, error: null, flow: result && result.flow ? result.flow : null }
+  } catch (error) {
+    return { ok: false, error, flow: null }
+  }
+}
+
+/**
  * 运行收口 / 失败的 aria-live 文案（m6）：只在 running → done/failed/aborted 时产生。
  * 纯函数，便于在 SSR 测试里直接断言。
  */
@@ -430,6 +498,18 @@ export function FlowStudioPage({
   const [runRows, setRunRows] = useState(() => (
     initialRunView && Array.isArray(initialRunView.runs) ? initialRunView.runs : []
   ))
+  const [runRowsLoaded, setRunRowsLoaded] = useState(() => Boolean(
+    initialRunView && Array.isArray(initialRunView.runs),
+  ))
+  /**
+   * G5-d：左栏与抽屉共用同一个 runs 数据源（一份轮询结果 + 一个 tick）。
+   * 空闲也按 15s 轮询（降频而不是停），切前台 / 重新打开面板立即刷新一次。
+   */
+  const runsSource = useMemo(() => createRunsSource({ read: () => api.listRuns(20) }), [])
+  /** G5-b：删除成功后保留的内存快照，供「撤销」原 id 写回。 */
+  const [deletedFlow, setDeletedFlow] = useState(null)
+  /** G5-b：删除失败时保留的快照（下次重试复用，不用重新读盘）。 */
+  const deleteSnapshots = useRef(new Map())
   /**
    * v0.8 §11.4：节点状态行要显示节点标题，标题只在 `GET /runs/<id>` 的 `nodes` 里
    *（列表行没有）。只对确实上报过 nodeStatus 的 run 拉一次；拉不到就退回显示 nodeId。
@@ -792,21 +872,61 @@ export function FlowStudioPage({
     }
   }, [busy, flushBeforeLeave])
 
+  /**
+   * G5-b：删除流程。确认由 FlowList 的二次确认负责；这里保证「先备份（草稿 + 内存快照）
+   * → 再删 → 服务器成功后才清草稿」，失败时草稿原样保留。
+   */
   const removeFlow = useCallback(async id => {
     if (busy) return
+    const target = (flows || []).find(item => item.id === id)
+    const name = (flowRef.current && flowRef.current.id === id ? flowRef.current.name : '')
+      || (target && target.name) || id
     setBusy(true)
+    setError('')
     try {
-      await api.deleteFlow(id)
-      clearDraft(id)
-      draftScheduler.cancel(id)
+      const outcome = await deleteFlowRequest({
+        api,
+        id,
+        // 当前打开且未保存的版本优先；非活动流程用上次失败时留下的内存快照，再退回读盘。
+        snapshot: flowRef.current && flowRef.current.id === id
+          ? flowRef.current
+          : (deleteSnapshots.current.get(id) || null),
+        drafts: {
+          write: snapshot => { persistDraft(snapshot) },
+          clear: flowId => {
+            clearDraft(flowId)
+            draftScheduler.cancel(flowId)
+          },
+        },
+      })
+      if (!outcome.ok) {
+        // 删除失败也要留住内存快照：重试不必重新读盘，用户的唯一副本也还在。
+        if (outcome.backup) deleteSnapshots.current.set(id, outcome.backup)
+        const detail = outcome.error && outcome.error.message ? outcome.error.message : '未知原因'
+        const prefix = outcome.stage === 'snapshot' ? '删除已取消：' : '删除失败：'
+        setError(prefix + detail + '。删除前的本地草稿与内存快照都保留着，可以重试；服务器上这份流程没有被改动。')
+        setAnnounce(prefix + name)
+        return
+      }
+      deleteSnapshots.current.delete(id)
+      // 只有服务器删除成功，才把「可撤销快照」挂出来并清草稿（clear 已在 deleteFlowRequest 里做）。
+      setDeletedFlow({ flow: outcome.backup, id: outcome.backup.id || id, name })
       setDraftNotice(current => (current && current.flowId === id ? null : current))
       const remaining = flows.filter(item => item.id !== id)
       setFlows(remaining)
       if (flowRef.current && flowRef.current.id === id) {
         if (remaining.length > 0) {
-          const next = await api.readFlow(remaining[0].id)
-          setFlow(next.flow)
-          setIssues(next.validation)
+          // 服务器删除已经成功；打开下一条失败不能误报成「删除失败」。
+          try {
+            const next = await api.readFlow(remaining[0].id)
+            setFlow(next.flow)
+            setIssues(next.validation)
+          } catch (failure) {
+            setFlow(null)
+            setIssues({ ok: true, errors: [], warnings: [] })
+            setError('流程已删除，但打开下一条流程失败：'
+              + (failure && failure.message ? failure.message : '未知原因') + '。可用「撤销」恢复刚删的流程。')
+          }
         } else {
           setFlow(null)
           setIssues({ ok: true, errors: [], warnings: [] })
@@ -817,12 +937,48 @@ export function FlowStudioPage({
         savedVersion.current = 0
         setSaveState('idle')
       }
+      setAnnounce('已删除流程「' + name + '」，可用「撤销」恢复')
     } catch (failure) {
       setError('删除失败：' + (failure && failure.message ? failure.message : '未知原因'))
     } finally {
       setBusy(false)
     }
-  }, [busy, draftScheduler, flows])
+  }, [busy, draftScheduler, flows, persistDraft])
+
+  /** G5-b：撤销删除——把删除前的内存快照按原 id 写回服务器。 */
+  const undoDeleteFlow = useCallback(async () => {
+    if (!deletedFlow || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const outcome = await restoreFlowRequest({ api, backup: deletedFlow.flow })
+      if (!outcome.ok || !outcome.flow) {
+        const detail = outcome.error && outcome.error.message ? outcome.error.message : '未知原因'
+        setError('撤销删除失败：' + detail + '。快照仍保留，可以再试一次。')
+        setAnnounce('撤销删除失败')
+        return
+      }
+      const restored = outcome.flow
+      setFlows(previous => {
+        const without = previous.filter(item => item.id !== restored.id)
+        return [summarize(restored), ...without]
+      })
+      setFlow(restored)
+      setIssues(validateFlow(restored))
+      setSelection(null)
+      setKeyboardLink(null)
+      setSaveState('idle')
+      editVersion.current = 0
+      savedVersion.current = 0
+      setDraftNotice(null)
+      setDeletedFlow(null)
+      setAnnounce('已撤销删除，恢复流程「' + (restored.name || restored.id) + '」')
+    } catch (failure) {
+      setError('撤销删除失败：' + (failure && failure.message ? failure.message : '未知原因'))
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, deletedFlow])
 
   const addNodeAt = useCallback((x, y) => {
     if (refuseWhenLocked()) return null
@@ -1068,34 +1224,57 @@ export function FlowStudioPage({
 
   const handleRunSnapshot = useCallback(snapshot => { setRunView(snapshot) }, [])
 
+  /** G5-d：抽屉刷新列表时走同一个共享数据源，返回 Host 原始 payload（不是第二份轮询）。 */
+  const refreshRunRows = useCallback(async options => {
+    const snapshot = await runsSource.refresh({ force: Boolean(options && options.force) })
+    // 首次就失败（还没有任何成功 payload）时把错误交给抽屉，让「运行日志读取失败 + 重试」照常出现；
+    // 已有旧数据时不抛，列表保留上一份（与旧行为一致）。
+    if (snapshot.payload === null && snapshot.error) throw new Error(snapshot.error)
+    return snapshot.payload
+  }, [runsSource])
+
   /**
-   * 运行列表的 raw 数据：抽屉快照里的 runs 已被归一化（只剩旧字段），分组与 supervision
-   * 都要靠 Host 的原始行。失败不冒泡成页面错误——列表保留上一份数据即可。
+   * G5-d：运行列表只有一个数据源。
+   *  - 左栏与抽屉都吃 `runRows`（同一份 payload / 同一个 tick）；
+   *  - 空闲也按 15s 轮询（createRunsSource 内建），不是「没在跑就完全不刷新」；
+   *  - 切回前台、重新打开抽屉立即刷新一次。
    */
-  const loadRunRows = useCallback(async () => {
-    try {
-      const payload = await api.listRuns(20)
-      setRunRows(extractRunRows(payload))
-    } catch {
-      // 旧 Host 没有 /runs 或网络抖动：保留现状，分组退化为「未标注工作区」。
-    }
-  }, [])
-
-  /** 抽屉的 run 列表状态变化（开始 / 收口 / 切换）时同步一次 raw 行，避免列表状态落后。 */
-  const runDigest = useMemo(() => {
-    const list = runView && Array.isArray(runView.runs) ? runView.runs : []
-    return list.map(run => [
-      run && run.id,
-      run && run.status,
-      run && run.started,
-      run && run.startedAt,
-      run && run.endedAt,
-    ].join(':')).join('|')
-  }, [runView])
-
   useEffect(() => {
-    void loadRunRows()
-  }, [loadRunRows, logSync, runDigest])
+    const unsubscribe = runsSource.subscribe(snapshot => {
+      if (snapshot.payload !== null && snapshot.payload !== undefined) {
+        setRunRows(extractRunRows(snapshot.payload))
+        setRunRowsLoaded(true)
+      }
+      // 首次加载就失败时保持 loaded=false：抽屉会按自己的错误态显示「读取失败 + 重试」，
+      // 不能被一份空的 externalRuns 覆盖成「还没有运行记录」。
+    })
+    runsSource.start()
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') runsSource.foreground()
+    }
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', onVisibility)
+    }
+    return () => {
+      unsubscribe()
+      if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+        document.removeEventListener('visibilitychange', onVisibility)
+      }
+      runsSource.stop()
+    }
+  }, [runsSource])
+
+  // 开始 / 停止后的强制刷新仍然只打一次数据源（force 跳过 1s 新鲜度保护）。
+  useEffect(() => {
+    if (!logSync) return
+    void runsSource.refresh({ force: true })
+  }, [logSync, runsSource])
+
+  // G5-d：重新打开面板（抽屉）时立即刷新一次，不必等下一个 15s tick。
+  useEffect(() => {
+    if (!logOpen) return
+    void runsSource.refresh({ force: true })
+  }, [logOpen, runsSource])
 
   /**
    * v0.8 §11.4：详情里的节点标题（`nodes: [{id,title}]`）只用于把 nodeId 显示成人话。
@@ -1124,14 +1303,6 @@ export function FlowStudioPage({
       cancelled = true
     }
   }, [selectedRunId, runRows])
-
-  /** 有 run 在跑时慢轮询：supervision 的 nextDueAt / wakes 会随调度变化（默认 tick 15s）。 */
-  const hasActiveRun = Boolean(runView && runView.activeRun && runIsActive(runView.activeRun))
-  useEffect(() => {
-    if (!hasActiveRun) return undefined
-    const timer = setInterval(() => { void loadRunRows() }, 15000)
-    return () => clearInterval(timer)
-  }, [hasActiveRun, loadRunRows])
 
   // M6：第一次点停止只 arm；确认按钮 400ms 后才可用，5s 内不确认自动解除并播报。
   useEffect(() => {
@@ -1498,6 +1669,9 @@ export function FlowStudioPage({
           nodes: selectedRunId === '' ? null : (runNodesById[selectedRunId] || null),
           selectedRunId,
           activeRunId,
+          // G5-b：删除成功后的撤销入口（快照在页面内存里）。
+          undoDelete: deletedFlow,
+          onUndoDelete: () => { void undoDeleteFlow() },
           onFocusRun: run => {
             if (!run || typeof run.id !== 'string' || run.id === '') return
             setLogFocus({ id: run.id, nonce: Date.now() })
@@ -1589,6 +1763,10 @@ export function FlowStudioPage({
       // 首帧（SSR / 预置快照）就带上抽屉数据，避免打开时先闪一下空态；
       // 浏览器里首次挂载 runView 为 null，抽屉仍走自己的加载路径。
       initialRuns: runView && Array.isArray(runView.runs) ? runView.runs : null,
+      // G5-d：抽屉的运行列表与左栏共用页面这一份（同一数据源 / 同一 tick），不再自己轮询。
+      externalRuns: runRows,
+      externalRunsLoaded: runRowsLoaded,
+      onRefreshRuns: refreshRunRows,
       initialRunId: runView && runView.run ? runView.run.id : '',
       initialSummary: runView ? runView.summary : null,
       initialDetail: runView ? runView.detail : null,

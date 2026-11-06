@@ -78,6 +78,16 @@ const START_OPTIONS_KEYS = ['workspace', 'worktree']
 const START_OPTION_TEXT_MAX_CHARS = 2048
 
 /**
+ * G2 额外契约：`run.json.limits`（引擎侧通过 writeRunMeta 写入的超时配置）。
+ *
+ * 只接受两个可选正整数键，形状收敛与 workspace / worktree 一样：
+ *   - 读路径宽松：非对象 / 非法值丢弃（不能让手改坏的 run.json 让整个 run 不可读）；
+ *   - 写路径严格：类型错 → 400（`validateMetaPatch`）；
+ *   - 未传就不出现（绝不凭空造一个 `{}`）。
+ */
+const LIMITS_KEYS = ['runTimeoutMs', 'nodeTimeoutMs']
+
+/**
  * 06 §13.4：给 `run/start` / `run/end` 留的保留额度。
  * 普通事件最多用到 `MAX_RUN_EVENTS - 64`，保证任何致命失败都还有位置落终态。
  */
@@ -88,6 +98,23 @@ const NORMAL_EVENT_LIMIT = MAX_RUN_EVENTS - RESERVED_TERMINAL_EVENTS
 const LEASE_FILE = 'lock.json'
 /** 进程间互斥用的短锁文件（startRun 的读-改-写）：不参与租约语义。 */
 const START_LOCK_FILE = 'start.lock'
+/**
+ * G2-b：run.json 的跨进程写锁。
+ *
+ * 与 `lock.json`（单写者**执行**租约）是两件不同的事：租约只在 `engine.start` 抢、
+ * 运行期续租，而 run.json 的写路径（appendEvents / writeRunMeta / messages /
+ * sessions …）以前只有进程内 `withLock`，两个进程各自「读 meta → +1 → 写回」就会
+ * 产生重复 seq。这里用一把独立的 `meta.lock`（O_EXCL）把**所有** run.json 写路径
+ * 串起来；两把锁不会互相嵌套（不持 meta.lock 去抢租约），所以不会死锁。
+ */
+const META_LOCK_FILE = 'meta.lock'
+/**
+ * meta.lock 的 ttl：临界区只有本地文件读写（毫秒级），10s 足够宽松；持有者崩溃时
+ * mtime 超过 ttl 即按陈旧锁接管。wait 必须 > ttl，否则一次调用永远等不到接管窗口。
+ */
+const META_LOCK_TTL_MS = 10 * 1000
+/** 等 meta.lock 的上限：超时抛可读 409（调用方可重试），绝不静默丢写。 */
+const META_LOCK_WAIT_MS = 15 * 1000
 /** 写盘失败的侧车文件（GET /runs/<id> 会把它作为 storageError 返回）。 */
 const ERROR_FILE = '.error'
 /** startRun 短锁：崩溃残留的锁 mtime 超过这个值就当作陈旧锁挪走。 */
@@ -442,7 +469,7 @@ function normalizeMeta(raw, id) {
     // 在这里收敛一次，读写两条路就都稳了。形状收敛、超长文本截断，不认识的键丢弃。
     ...(source.sessionMode === undefined ? {} : { sessionMode: normalizeSessionMode(source.sessionMode) }),
     ...(source.workspace === undefined ? {} : { workspace: normalizeBinding(source.workspace, WORKSPACE_KEYS) }),
-    ...(source.worktree === undefined ? {} : { worktree: normalizeBinding(source.worktree, WORKTREE_KEYS) }),
+    ...(source.worktree === undefined ? {} : { worktree: normalizeWorktree(source.worktree) }),
     ...(source.supervision === undefined ? {} : { supervision: normalizeBinding(source.supervision, SUPERVISION_KEYS) }),
     ...(nodeStatus === null ? {} : { nodeStatus: nodeStatus.value }),
     // D2：预算裁剪必须可观测（绝不静默）；一旦发生过裁剪就持久化这个标志。
@@ -454,6 +481,9 @@ function normalizeMeta(raw, id) {
     // D3：创建 run 时记下的发起参数（06 §13.8）。只保留 { workspace?, worktree? }；
     // 未传就不出现（绝不凭空造一个空对象），传了空对象则保留为空对象。
     ...(source.startOptions === undefined ? {} : { startOptions: normalizeStartOptions(source.startOptions) }),
+    // G2 额外契约：limits（{ runTimeoutMs?, nodeTimeoutMs? }，两个可选正整数）。
+    // 未传不出现；读侧非法值直接丢弃，写侧由 validateMetaPatch 严格 400。
+    ...(source.limits === undefined ? {} : { limits: normalizeLimits(source.limits) }),
   }
   if (nodeStatus !== null && nodeStatus.truncated && nodeStatus.stats) {
     // 诊断细节不落盘（不进 JSON），但写回值上能直接读到裁了多少，便于测试与排障。
@@ -465,7 +495,9 @@ function normalizeMeta(raw, id) {
 }
 
 /** 节点状态表：每个节点只留最新一条，最多 200 个节点，字段逐个收敛。 */
-const NODE_STATUS_KEYS = ['state', 'progress', 'summary', 'verdict', 'at']
+// `attempt`：runtime 重启后靠它恢复节点闹钟（真实 attempt 而不是一律 1）。
+// 只接受非负整数，坏值在下面单独剔除（其它字段照常保留，不整条丢节点）。
+const NODE_STATUS_KEYS = ['state', 'progress', 'summary', 'verdict', 'attempt', 'at']
 const NODE_STATUS_STATES = new Set(['working', 'done', 'blocked', 'failed'])
 
 function measureJsonBytes(value) {
@@ -548,6 +580,10 @@ function normalizeNodeStatus(raw) {
     if (!isPlainObject(value)) continue
     const entry = normalizeBinding(value, NODE_STATUS_KEYS)
     if (!entry) continue
+    // runtime 重启恢复节点闹钟只看 `attempt`：非负整数才保留，否则只丢这一个键。
+    if (entry.attempt !== undefined && (!Number.isInteger(entry.attempt) || entry.attempt < 0)) {
+      delete entry.attempt
+    }
     if (!NODE_STATUS_STATES.has(entry.state)) entry.state = 'working'
     if (!Number.isInteger(entry.progress) || entry.progress < 0) entry.progress = 0
     if (entry.progress > 100) entry.progress = 100
@@ -764,10 +800,31 @@ function normalizeStartOptions(raw) {
   return out
 }
 
+/**
+ * G2 额外契约：`run.json.limits` 的形状收敛（读路径宽松口径）。
+ *
+ * 只保留两个可选正整数键；不是对象返回 null（与 workspace / worktree 一样：
+ * 显式存在但坏掉时落成 null，而不是悄悄变成 `{}`）。
+ */
+function normalizeLimits(raw) {
+  if (!isPlainObject(raw)) return null
+  const out = {}
+  for (const key of LIMITS_KEYS) {
+    const value = raw[key]
+    if (Number.isInteger(value) && value > 0) out[key] = value
+  }
+  return out
+}
+
 /** 节点会话模式（07 §3）：未知值一律 null，不猜一个看起来合理的。 */
 const SESSION_MODES = new Set(['top-level', 'legacy-subagent', 'injected', 'stub', 'unavailable'])
 const WORKSPACE_KEYS = ['id', 'path', 'realpath', 'isGit', 'gitRoot']
 const WORKTREE_KEYS = ['enabled', 'reason', 'decidedBy', 'path', 'branch', 'baseCommit', 'createdAt']
+/** worktree.warnings 的边界：最多 20 条、每条 ≤500 字符（worktree 模块的告警透传）。 */
+const WORKTREE_WARNINGS_MAX = 20
+const WORKTREE_WARNING_MAX_CHARS = 500
+/** worktree.root 的长度上限（超过就整键丢弃：截断后的绝对路径会变成错误的删除前缀）。 */
+const WORKTREE_ROOT_MAX_CHARS = 2048
 const SUPERVISION_KEYS = ['enabled', 'wakerSessionId', 'lastWokeAt', 'nextDueAt', 'wakes', 'failures', 'reason']
 
 function normalizeSessionMode(value) {
@@ -784,6 +841,35 @@ function normalizeBinding(value, keys) {
     if (raw === null || typeof raw === 'boolean') out[key] = raw
     else if (typeof raw === 'number' && Number.isFinite(raw)) out[key] = raw
     else if (typeof raw === 'string') out[key] = raw.length > 2048 ? raw.slice(0, 2048) : raw
+  }
+  return out
+}
+
+/**
+ * `run.json.worktree` 的归一化：固定标量字段之外，还透传两个 worktree 模块新增的键：
+ *   - `root`：**绝对路径**字符串（删除时的严格路径前缀校验依据）。非字符串 / 相对路径 /
+ *     超长一律丢弃该键——截断一个绝对路径会变成错误的删除前缀，比丢掉更危险；
+ *   - `warnings`：字符串数组（工作区有未提交修改 / 敏感文件不会复制等告警），
+ *     非数组忽略整键；非法项（非字符串 / 空串）过滤，每条 ≤500 字符，最多 20 条。
+ * 两者都可缺省；坏值只丢该键，不整条丢 worktree。
+ */
+function normalizeWorktree(raw) {
+  if (!isPlainObject(raw)) return null
+  const out = normalizeBinding(raw, WORKTREE_KEYS)
+  if (typeof raw.root === 'string' && raw.root !== '' && isAbsolute(raw.root)
+    && raw.root.length <= WORKTREE_ROOT_MAX_CHARS) {
+    out.root = raw.root
+  }
+  if (Array.isArray(raw.warnings)) {
+    const warnings = []
+    for (const item of raw.warnings) {
+      if (warnings.length >= WORKTREE_WARNINGS_MAX) break
+      if (typeof item !== 'string' || item.trim() === '') continue
+      warnings.push(item.length > WORKTREE_WARNING_MAX_CHARS
+        ? item.slice(0, WORKTREE_WARNING_MAX_CHARS)
+        : item)
+    }
+    out.warnings = warnings
   }
   return out
 }
@@ -843,21 +929,82 @@ const CORRUPT_META_PREFIX = 'run.json.corrupt-'
 
 let tmpCounter = 0
 
+/**
+ * G2-c：原子写临时文件的名字特征。崩溃 / 满盘后可能留下 0600 的 `*.tmp-*`，
+ * 启动恢复要把它们清掉（每次失败都留一份会放大满盘）。
+ */
+const TMP_FILE_RE = /\.tmp-\d+-\d+$/
+
+/**
+ * G2-c：可注入的写函数（**只给测试用**，生产不调用）。
+ *
+ * 满盘（ENOSPC / EFBIG）没法在单元测试里可靠复现：`ulimit -f` 触发的是 SIGXFSZ，
+ * 直接杀进程，测不到「catch 里的两条写也失败」这条分支。这里留一个显式注入点，
+ * 让测试把 `writeFile(tmp)` 换成「抛 ENOSPC 的假写函数」。默认 null = 走真实 fs。
+ */
+let writeFileHook = null
+export function __setWriteFileHook(hook) {
+  writeFileHook = typeof hook === 'function' ? hook : null
+}
+
+async function writeFileWith(path, data, options) {
+  if (writeFileHook) return writeFileHook(path, data, options)
+  return writeFile(path, data, options)
+}
+
+/**
+ * G2-c：原子写（临时文件 + rename），**任何一步失败都 unlink 临时文件**。
+ *
+ * 旧实现把 `writeFile(tmp)` 放在 try 之外：写一半失败（满盘）就把 0600 的
+ * `*.tmp-*` 永久留在 run 目录里，下一次再写再留一份。
+ */
+async function writeTempAtomic(path, text) {
+  const tmp = `${path}.tmp-${process.pid}-${tmpCounter++}`
+  let renamed = false
+  try {
+    await writeFileWith(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
+    await rename(tmp, path)
+    renamed = true
+  } finally {
+    if (!renamed) await unlink(tmp).catch(() => {})
+  }
+  await chmod(path, FILE_MODE).catch(() => {})
+  return path
+}
+
+/**
+ * G2-a：目标 JSONL 文件末尾是不是缺一个换行？
+ *
+ * 崩溃 / 写满可能留下「半行」（最后一个字节不是 `\n`）。以前 `open('a')` 直接追加整行，
+ * 新事件会粘在坏行后面一起被读侧 skip；现在追加前先看最后一个字节，缺就先补 `\n`。
+ * 文件不存在 / 为空不补（不需要凭空造一个空行）。
+ */
+async function needsLeadingNewline(path) {
+  let info
+  try {
+    info = await stat(path)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false
+    throw error
+  }
+  if (!info.isFile() || info.size === 0) return false
+  const handle = await open(path, 'r')
+  try {
+    const buffer = Buffer.alloc(1)
+    const { bytesRead } = await handle.read(buffer, 0, 1, info.size - 1)
+    return bytesRead === 1 && buffer[0] !== 0x0a
+  } finally {
+    await handle.close()
+  }
+}
+
 async function writeMetaUnlocked(loc, meta) {
   await ensureDirMode(loc.dir)
   const text = `${JSON.stringify(meta, null, 2)}\n`
   if (Buffer.byteLength(text, 'utf8') > MAX_META_BYTES) {
     throw new RunError(500, 'run', 'run.json 超过 1MiB，元数据异常')
   }
-  const tmp = `${metaPath(loc.dir)}.tmp-${process.pid}-${tmpCounter++}`
-  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-  try {
-    await rename(tmp, metaPath(loc.dir))
-  } catch (error) {
-    await unlink(tmp).catch(() => {})
-    throw error
-  }
-  await chmod(metaPath(loc.dir), FILE_MODE).catch(() => {})
+  await writeTempAtomic(metaPath(loc.dir), text)
   return meta
 }
 
@@ -930,6 +1077,8 @@ const META_FIELD_KEYS = new Set([
   'nodeStatusTruncated', 'sessions',
   // 06 §13.8：创建 run 时记下的发起参数（runtime.patchRunJson 的唯一写路径）
   'startOptions',
+  // G2 额外契约：引擎侧写入的超时配置（{ runTimeoutMs?, nodeTimeoutMs? }，可选正整数）
+  'limits',
 ])
 
 function hasOwn(object, key) {
@@ -974,6 +1123,19 @@ function validateMetaPatch(patch) {
     if (options.worktree !== undefined && options.worktree !== null) {
       if (typeof options.worktree !== 'string') {
         throw new RunError(400, 'startOptions', 'startOptions.worktree 必须是字符串')
+      }
+    }
+  }
+  // G2 额外契约：limits 只接受 { runTimeoutMs?: 正整数, nodeTimeoutMs?: 正整数 } 或 null。
+  if (hasOwn(patch, 'limits') && patch.limits !== null) {
+    if (!isPlainObject(patch.limits)) {
+      throw new RunError(400, 'limits', 'limits 必须是 { runTimeoutMs?, nodeTimeoutMs? } 对象或 null')
+    }
+    for (const key of LIMITS_KEYS) {
+      const value = patch.limits[key]
+      if (value === undefined) continue
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new RunError(400, 'limits', `limits.${key} 必须是正整数（毫秒）`)
       }
     }
   }
@@ -1108,8 +1270,10 @@ export async function createRun(runsRoot, input = {}) {
  */
 export async function startRun(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
-  // 两条并发防线：进程内 withLock（快），进程间 start.lock（O_EXCL，跨 host / 跨进程也只有一个赢家）。
-  return withLock(loc.id, () => withRunFileLock(loc.dir, START_LOCK_FILE, async () => {
+  // 三层并发防线：进程内 withLock（快）→ 进程间 start.lock（O_EXCL，跨进程也只有一个
+  // 赢家）→ 跨进程 meta.lock（与 appendEvents / writeRunMeta 串起来，避免它从旧快照
+  // 写回 run.json 时把新的 started 覆盖掉）。
+  return withLock(loc.id, () => withRunFileLock(loc.dir, START_LOCK_FILE, () => withMetaLock(loc, async () => {
     const meta = await readMetaUnlocked(loc)
     if (!meta) throw new RunError(404, 'runId', 'run 不存在')
     if (meta.started === true || meta.status !== 'pending') {
@@ -1132,12 +1296,12 @@ export async function startRun(runsRoot, runId, options = {}) {
       updatedAt: now.toISOString(),
     }, loc.id)
     return writeMetaUnlocked(loc, next)
-  }))
+  })))
 }
 
 /**
  * 06 §13.3 单写者租约：`runs/<runId>/lock.json`（pid / host / heartbeatAt / ttlMs）。
- * 过期由读取方清理；`sweepExpiredLeases()` 会把过期租约的 running run 标 failed。
+ * 过期租约由 claimLease 的接管选举 / sweepExpiredLeases 的崩溃收口清理（读接口不再删文件）。
  */
 
 function sleep(ms) {
@@ -1198,10 +1362,19 @@ async function createExclusive(path, text) {
       throw error
     }
   }
+  let writeError = null
   try {
     await handle.writeFile(text)
+  } catch (error) {
+    writeError = error
   } finally {
-    await handle.close()
+    await handle.close().catch(() => {})
+  }
+  if (writeError) {
+    // G2-c：写锁内容失败（满盘等）不能留下一个 0 字节锁文件——那会让下一个持有者
+    // 解析失败、把锁当成「不可用」。失败即删，错误照常抛出。
+    await unlink(path).catch(() => {})
+    throw writeError
   }
   await chmod(path, FILE_MODE).catch(() => {})
   return true
@@ -1288,11 +1461,17 @@ async function withRunFileLock(dir, name, task, options = {}) {
   const path = join(dir, name)
   const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : FILE_LOCK_TTL_MS
   const waitMs = Number.isInteger(options.waitMs) && options.waitMs >= 0 ? options.waitMs : FILE_LOCK_WAIT_MS
+  const settleMs = Number.isInteger(options.settleMs) && options.settleMs >= 0
+    ? options.settleMs
+    : LOCK_SETTLE_MS
+  const conflictReason = typeof options.conflictReason === 'string' && options.conflictReason !== ''
+    ? options.conflictReason
+    : '另一个进程正在处理这个 run，请稍后重试'
   const deadline = Date.now() + waitMs
   const nonce = `${process.pid}-${Date.now().toString(36)}-${tmpCounter++}-${Math.random().toString(36).slice(2, 8)}`
   for (;;) {
     if (await createExclusive(path, `${nonce}\n`)) {
-      await sleep(LOCK_SETTLE_MS)
+      if (settleMs > 0) await sleep(settleMs)
       const holder = await readFile(path, 'utf8').catch(() => null)
       if (holder !== null && holder.trim() === nonce) {
         try {
@@ -1307,45 +1486,99 @@ async function withRunFileLock(dir, name, task, options = {}) {
       continue
     }
     if (Date.now() > deadline) {
-      throw new RunError(409, 'runId', '另一个进程正在处理这个 run，请稍后重试')
+      throw new RunError(409, 'runId', conflictReason)
     }
     await sleep(8)
   }
 }
 
-async function readLeaseFile(dir) {
+/**
+ * G2-b：run.json 的跨进程写锁（进程内 `withLock` 之外的二层）。
+ *
+ * 目录不存在时直接 404，**不**像 `createExclusive` 那样顺手把目录建回来——
+ * 否则对已删除 run 的 append / writeRunMeta 会「复活」一个空目录。
+ */
+async function withMetaLock(loc, task) {
+  let info
+  try {
+    info = await stat(loc.dir)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') throw new RunError(404, 'runId', 'run 不存在')
+    throw error
+  }
+  if (!info.isDirectory()) throw new RunError(404, 'runId', 'run 不存在')
+  return withRunFileLock(loc.dir, META_LOCK_FILE, task, {
+    ttlMs: META_LOCK_TTL_MS,
+    waitMs: META_LOCK_WAIT_MS,
+    // meta.lock 的接管只可能发生在「陈旧锁」路径（ttl 30s），刚建好的锁不可能被接管，
+    // 所以不需要 start.lock 那样的 settle 复核窗口，省掉每次写 4ms。
+    settleMs: 0,
+    conflictReason: 'run.json 正被另一个进程写入（跨进程锁等待超时），请稍后重试',
+  })
+}
+
+/**
+ * G2-d：读租约文件，**区分 ENOENT 与不可解析**。
+ *
+ * 旧实现把两者都折成 `null`：进程在 `open('wx')` 与写入之间被杀留下的 0 字节
+ * lock.json 会被当成「没有租约」——claimLease 五次后 409、sweep 又跳过，run 永远
+ * 无法重开或自动收口。现在不可解析返回 `{ kind: 'corrupt' }`，调用方按「可接管」
+ * （claimLease 走 takeover 选举）或「崩溃残留」（sweep 收口）处理。
+ *
+ * @returns {Promise<{ kind: 'missing' } | { kind: 'corrupt', reason: string } | { kind: 'ok', lease: object }>}
+ */
+async function readLeaseState(dir) {
   let text
   try {
     text = await readFile(leasePath(dir), 'utf8')
   } catch (error) {
-    if (error && error.code === 'ENOENT') return null
+    if (error && error.code === 'ENOENT') return { kind: 'missing' }
     throw error
   }
+  let parsed
   try {
-    return normalizeLease(JSON.parse(text))
+    parsed = JSON.parse(text)
   } catch {
-    return null
+    return { kind: 'corrupt', reason: 'lock.json 不是合法 JSON' }
   }
+  const lease = normalizeLease(parsed)
+  if (!lease) return { kind: 'corrupt', reason: 'lock.json 字段不完整（pid / host / heartbeatAt）' }
+  return { kind: 'ok', lease }
+}
+
+/** 兼容旧调用点：只关心「能不能拿到一份可解析的租约」。 */
+async function readLeaseFile(dir) {
+  const state = await readLeaseState(dir)
+  return state.kind === 'ok' ? state.lease : null
 }
 
 async function writeLeaseFile(dir, lease) {
   await ensureDirMode(dir)
   const text = `${JSON.stringify(lease, null, 2)}\n`
-  const tmp = `${leasePath(dir)}.tmp-${process.pid}-${tmpCounter++}`
-  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-  try {
-    await rename(tmp, leasePath(dir))
-  } catch (error) {
-    await unlink(tmp).catch(() => {})
-    throw error
-  }
-  await chmod(leasePath(dir), FILE_MODE).catch(() => {})
+  await writeTempAtomic(leasePath(dir), text)
 }
 
-async function removeLeaseFile(dir, lease) {
+/**
+ * 删除租约文件。给了 `lease` 时先核对当前内容（避免删掉别人刚接管的新租约）：
+ *   - 默认只核对持有者（pid@host）——续租会刷新 heartbeatAt，但持有者不变；
+ *   - `exact: true` 还要求 acquiredAt / heartbeatAt 都与传入值一致（sweep 收口用：
+ *     期间若有人重新抢占过，文件已经不是它读到的那一份，不能删）。
+ * 文件已经不存在 / 不可解析且没给 exact 时返回 false（不动来路不明的文件）。
+ */
+async function removeLeaseFile(dir, lease, options = {}) {
   if (lease) {
-    const current = await readLeaseFile(dir).catch(() => null)
-    if (current && leaseOwner(current) !== leaseOwner(lease)) return false
+    let current
+    try {
+      current = await readLeaseFile(dir)
+    } catch {
+      return false
+    }
+    if (!current) return false
+    if (leaseOwner(current) !== leaseOwner(lease)) return false
+    if (options.exact === true
+      && (current.acquiredAt !== lease.acquiredAt || current.heartbeatAt !== lease.heartbeatAt)) {
+      return false
+    }
   }
   try {
     await unlink(leasePath(dir))
@@ -1372,20 +1605,28 @@ function leaseOptions(options = {}) {
 }
 
 /**
- * 读当前租约。过期租约视为不存在并顺手清掉；没有租约返回 null。
+ * 读当前租约。过期 / 不可解析都视为「没有有效租约」返回 null。
+ *
+ * G2-d：**不再顺手删文件**。以前读到过期就 unlink，后果是：
+ *   - 持有者刚好在续租（就地 re-claim）时，读方把新租约删了；
+ *   - sweep 再读时 `if (!lease) continue`，于是过期租约的 run 永远停在 running。
+ * 过期租约的清理交给两条已具备选举/收口语义的路径：claimLease（接管选举）与
+ * sweepExpiredLeases（崩溃残留收口）。
  * @returns {Promise<object | null>}
  */
 export async function readLease(runsRoot, runId, options = {}) {
   const loc = locate(runsRoot, runId)
   if (!loc) return null
   const now = options.now instanceof Date && !Number.isNaN(options.now.getTime()) ? options.now : new Date()
-  const lease = await readLeaseFile(loc.dir).catch(() => null)
-  if (!lease) return null
-  if (leaseExpired(lease, now)) {
-    await removeLeaseFile(loc.dir).catch(() => {})
+  let state
+  try {
+    state = await readLeaseState(loc.dir)
+  } catch {
     return null
   }
-  return lease
+  if (state.kind !== 'ok') return null
+  if (leaseExpired(state.lease, now)) return null
+  return state.lease
 }
 
 /**
@@ -1424,18 +1665,21 @@ export async function claimLease(runsRoot, runId, options = {}) {
         if (await owned()) return lease
         throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
       }
-      const existing = await readLeaseFile(loc.dir)
+      const state = await readLeaseState(loc.dir)
       // 持有者刚好释放：直接重试创建。
-      if (!existing) continue
-      if (!leaseExpired(existing, now)) throw busy(existing)
+      if (state.kind === 'missing') continue
+      const existing = state.kind === 'ok' ? state.lease : null
+      // 未过期的有效租约：409。不可解析（0 字节 / 坏 JSON）按「可接管」处理，
+      // 但必须走下面的接管选举，不能直接 unlink——否则并发接管会出现两个赢家。
+      if (existing && !leaseExpired(existing, now)) throw busy(existing)
       if (!await winTakeoverElection(loc.dir)) {
         // 输掉选举：等赢家落定，再重读（通常已经被新租约挡住）。
         await sleep(TAKEOVER_ELECTION_MS)
         continue
       }
-      const again = await readLeaseFile(loc.dir)
-      if (!again) continue
-      if (!leaseExpired(again, now)) throw busy(again)
+      const again = await readLeaseState(loc.dir)
+      if (again.kind === 'missing') continue
+      if (again.kind === 'ok' && !leaseExpired(again.lease, now)) throw busy(again.lease)
       await unlink(path).catch(() => {})
       if (await createExclusive(path, text)) {
         if (await owned()) return lease
@@ -1447,21 +1691,32 @@ export async function claimLease(runsRoot, runId, options = {}) {
 }
 
 /**
- * 续租。租约不存在 / 已过期 / 不是本进程持有 → 409。
+ * 续租。租约不存在 / 已过期且不是本实例持有 / 不是本实例持有 → 409。
+ *
+ * G2-d：**过期但持有者匹配时就地 re-claim**（只刷新 heartbeatAt，保留 acquiredAt），
+ * 绝不先删文件。旧实现「先 removeLeaseFile 再抛 409」会留下一个没有租约的 running run：
+ * 引擎只 log warn 继续跑，sweep 因为 `if (!lease) continue` 永不收口。
  * @returns {Promise<object>} 续租后的租约
  */
 export async function renewLease(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
   const { now, ttlMs, pid, host } = leaseOptions(options)
   return withLock(loc.id, async () => {
-    const existing = await readLeaseFile(loc.dir)
-    if (!existing) throw new RunError(409, 'runId', '该 run 没有执行租约，无法续租')
-    if (leaseExpired(existing, now)) {
-      await removeLeaseFile(loc.dir).catch(() => {})
-      throw new RunError(409, 'runId', '执行租约已过期（引擎可能已中断），不能续租')
+    const state = await readLeaseState(loc.dir)
+    if (state.kind === 'missing') throw new RunError(409, 'runId', '该 run 没有执行租约，无法续租')
+    if (state.kind === 'corrupt') {
+      throw new RunError(409, 'runId', '执行租约文件不可解析（lock.json 损坏），不能续租；请重新启动该 run')
     }
+    const existing = state.lease
     if (!leaseOwnerMatches(existing, { pid, host })) {
       throw new RunError(409, 'runId', `执行租约由 ${leaseOwner(existing)} 持有，本实例无权续租`)
+    }
+    // 写回前再核对一次：这段时间里租约可能已被别的实例接管（acquiredAt 变了）或被清掉。
+    // 不核对就 rename 会把别人的新租约覆盖成自己的——「两个赢家」。
+    const check = await readLeaseState(loc.dir)
+    if (check.kind !== 'ok' || !leaseOwnerMatches(check.lease, { pid, host })
+      || check.lease.acquiredAt !== existing.acquiredAt) {
+      throw new RunError(409, 'runId', '执行租约已被其它实例接管或释放，本实例不能续租')
     }
     const lease = {
       ...existing,
@@ -1475,24 +1730,182 @@ export async function renewLease(runsRoot, runId, options = {}) {
 
 /**
  * 释放租约；只能释放本实例持有的（`force:true` 可强制清）。
+ * 租约文件不可解析时：非 force 返回 false（无法核对持有者），force 则清掉。
  * @returns {Promise<boolean>} 是否真的删掉
  */
 export async function releaseLease(runsRoot, runId, options = {}) {
   const loc = locate(runsRoot, runId)
   if (!loc) return false
   return withLock(loc.id, async () => {
-    const existing = await readLeaseFile(loc.dir)
-    if (!existing) return false
-    if (options.force !== true && !leaseOwnerMatches(existing, options)) {
-      throw new RunError(409, 'runId', `执行租约由 ${leaseOwner(existing)} 持有，不能由本实例释放`)
+    let state
+    try {
+      state = await readLeaseState(loc.dir)
+    } catch {
+      return false
     }
-    return removeLeaseFile(loc.dir)
+    if (state.kind === 'missing') return false
+    if (state.kind === 'corrupt') {
+      if (options.force !== true) return false
+      return removeLeaseFile(loc.dir)
+    }
+    if (options.force !== true && !leaseOwnerMatches(state.lease, options)) {
+      throw new RunError(409, 'runId', `执行租约由 ${leaseOwner(state.lease)} 持有，不能由本实例释放`)
+    }
+    // 传入手上的这份租约：如果期间已被别人接管/释放，removeLeaseFile 会拒绝删除。
+    return removeLeaseFile(loc.dir, state.lease)
   })
 }
 
 /**
- * 启动时清理过期租约：**只扫 `running`**，把租约过期（引擎崩溃）的 run 标 failed，
+ * G2-c：清理 run 目录下遗留的 `*.tmp-*`（崩溃 / 满盘留下的 0600 临时文件）。
+ *
+ * 只扫 run 根目录与一层节点目录；临时文件的生命周期是毫秒级，清理只在启动恢复阶段
+ * 调用（sweep / repairRunStates），不会和正常写入抢同一个文件。
+ *
+ * @param {string} runsRoot
+ * @param {string} [runId] 省略时清理 runsRoot 下所有 run
+ * @returns {Promise<string[]>} 被删掉的相对路径（`<runId>/<name>`）
+ */
+export async function cleanupTempFiles(runsRoot, runId) {
+  const root = resolve(runsRoot)
+  const targets = []
+  if (runId !== undefined && runId !== null) {
+    const loc = locate(root, runId)
+    if (!loc) return []
+    targets.push(loc)
+  } else {
+    let dirents = []
+    try {
+      dirents = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return []
+      throw error
+    }
+    for (const entry of dirents) {
+      if (!entry.isDirectory() || !checkRunId(entry.name)) continue
+      const loc = locate(root, entry.name)
+      if (loc) targets.push(loc)
+    }
+  }
+  const removed = []
+  const sweepDir = async (dir, prefix) => {
+    let names = []
+    try {
+      names = await readdir(dir)
+    } catch (error) {
+      // ENOENT：目录已被删；ENOTDIR：同名路径是个普通文件（坏 run 的常见形态）。
+      // 都不是清理失败，跳过即可。
+      if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return
+      throw error
+    }
+    for (const name of names) {
+      if (!TMP_FILE_RE.test(name)) continue
+      try {
+        await unlink(join(dir, name))
+        removed.push(`${prefix}${name}`)
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') throw error
+      }
+    }
+  }
+  for (const loc of targets) {
+    await sweepDir(loc.dir, `${loc.id}/`)
+    let names = []
+    try {
+      names = await readdir(loc.dir)
+    } catch (error) {
+      if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) continue
+      throw error
+    }
+    for (const name of names) {
+      if (!checkRunId(name)) continue
+      await sweepDir(join(loc.dir, name), `${loc.id}/${name}/`)
+    }
+  }
+  return removed
+}
+
+/**
+ * G2-a：扫事件文件，把 `run.json.seq` / `lastSeq` / `eventCount` 修到磁盘真实值。
+ *
+ * 为什么要修：`appendEvents` 以前先写事件、最后写 meta，进程在两步之间被杀时磁盘
+ * 上事件的 seq 已超前于 `meta.seq`；启动时若直接用旧 `meta.seq` 续写 run/end，就会
+ * 产生重复 seq（读侧按「文件内 seq 单调」增量读，重复后会永久丢一条）。
+ *
+ * 现在的口径：
+ *   - `eventCount` = 磁盘上**实际可解析的事件行数**（坏行只进 `skipped`）；
+ *   - `seq` / `lastSeq` = `max(meta 里已有的 seq, 磁盘事件 max(seq))`——既修「事件超前」
+ *     也绝不回退，避免复用「已分配但还没落事件」的 seq 区间（允许空洞，禁止重复）。
+ *
+ * @param {string} runsRoot
+ * @param {string} runId
+ * @returns {Promise<{ repaired: boolean, seq: number, eventCount: number, skipped: number, files: number }>}
+ */
+export async function repairRunCounters(runsRoot, runId) {
+  const loc = requireLoc(runsRoot, runId)
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
+    const meta = await readMetaUnlocked(loc)
+    if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+    const scan = await scanEventFiles(loc)
+    const nextSeq = Math.max(meta.seq, meta.lastSeq, scan.maxSeq)
+    const repaired = meta.eventCount !== scan.count || meta.seq !== nextSeq || meta.lastSeq !== nextSeq
+    if (!repaired) {
+      return { repaired: false, seq: nextSeq, eventCount: scan.count, skipped: scan.skipped, files: scan.files }
+    }
+    const next = normalizeMeta({
+      ...meta,
+      seq: nextSeq,
+      lastSeq: nextSeq,
+      eventCount: scan.count,
+    }, loc.id)
+    await writeMetaUnlocked(loc, next)
+    return { repaired: true, seq: nextSeq, eventCount: scan.count, skipped: scan.skipped, files: scan.files }
+  }))
+}
+
+/** G2-a：只读扫一遍事件文件，数「可解析事件行数」与 max(seq)。 */
+async function scanEventFiles(loc) {
+  const files = await listEventFiles(loc)
+  let count = 0
+  let skipped = 0
+  let maxSeq = 0
+  for (const file of files) {
+    let text
+    try {
+      text = await readFile(file, 'utf8')
+    } catch (error) {
+      if (error && error.code === 'ENOENT') continue
+      throw error
+    }
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      let event
+      try {
+        event = JSON.parse(trimmed)
+      } catch {
+        skipped += 1
+        continue
+      }
+      if (event === null || typeof event !== 'object' || Array.isArray(event)) {
+        skipped += 1
+        continue
+      }
+      count += 1
+      if (Number.isInteger(event.seq) && event.seq > maxSeq) maxSeq = event.seq
+    }
+  }
+  return { count, skipped, maxSeq, files: files.length }
+}
+
+/**
+ * 启动时清理过期租约：**只扫 `running`**，把「引擎崩溃」的 run 标 failed，
  * reason 含「引擎中断」。返回被处理的 runId。
+ *
+ * G2-d：收口条件不止「租约有但过期」：
+ *   - 无租约文件（started=true）→ 崩溃残留（旧实现 `if (!lease) continue` 永不收口）；
+ *   - 租约不可解析（0 字节 / 坏 JSON，started=true）→ 同样按崩溃残留收口，并把坏文件删掉。
+ * 另外收口前先 `repairRunCounters()`，否则续写 run/end 会沿用超前的旧 meta.seq 产生重复。
  * @returns {Promise<string[]>}
  */
 export async function sweepExpiredLeases(runsRoot, options = {}) {
@@ -1510,18 +1923,40 @@ export async function sweepExpiredLeases(runsRoot, options = {}) {
     if (!entry.isDirectory() || !checkRunId(entry.name)) continue
     const loc = locate(root, entry.name)
     if (!loc) continue
+    await cleanupTempFiles(root, loc.id).catch(() => {})
     const meta = await readMetaUnlocked(loc).catch(() => null)
     if (!meta || meta.status !== 'running') continue
-    const lease = await readLeaseFile(loc.dir).catch(() => null)
-    if (!lease || !leaseExpired(lease, now)) continue
-    const reason = `引擎中断：执行租约过期（${leaseOwner(lease)}，心跳 ${lease.heartbeatAt}），不自动续跑`
+    let state
     try {
+      state = await readLeaseState(loc.dir)
+    } catch {
+      // 租约文件读不出来（EACCES 等）：不猜，交给人工 / 下一轮。
+      continue
+    }
+    let lease = null
+    let reason = ''
+    if (state.kind === 'ok') {
+      if (!leaseExpired(state.lease, now)) continue
+      lease = state.lease
+      reason = `引擎中断：执行租约过期（${leaseOwner(lease)}，心跳 ${lease.heartbeatAt}），不自动续跑`
+    } else {
+      // `started !== true` 的 running 壳子不是崩溃残留（与旧口径一致：只收 started 的 run）。
+      if (meta.started !== true) continue
+      if (state.kind === 'missing') {
+        reason = '引擎中断：run 处于 running 但执行租约文件缺失（崩溃残留），不自动续跑'
+      } else {
+        reason = `引擎中断：执行租约文件不可解析（${state.reason || 'lock.json 损坏'}），按崩溃残留收口，不自动续跑`
+      }
+    }
+    try {
+      // G2-a：先修正计数器，再允许续写终态事件（否则 seq 会从旧值重复）。
+      await repairRunCounters(root, loc.id).catch(() => null)
       await appendEvents(runsRoot, loc.id, [{
         v: 1,
         kind: 'run/end',
         traceId: `tr-${loc.id.slice(0, 80)}-sweep`,
         data: { status: 'failed', reason: reason.slice(0, 2000) },
-        extra: { recovered: true, engineInterrupted: true, leaseExpired: true },
+        extra: { recovered: true, engineInterrupted: true, leaseExpired: Boolean(lease) },
       }], { now })
     } catch (error) {
       await markStorageFailure(loc, error).catch(() => {})
@@ -1531,7 +1966,14 @@ export async function sweepExpiredLeases(runsRoot, options = {}) {
         live: null,
       }).catch(() => {})
     }
-    await removeLeaseFile(loc.dir, lease).catch(() => {})
+    if (lease) {
+      // 只删「它当时读到的那一份」：期间若被别的实例重新抢占，新租约必须留着。
+      await removeLeaseFile(loc.dir, lease, { exact: true }).catch(() => {})
+    } else {
+      // 无租约 / 坏租约：收口后再确认一次——期间若有人合法接管了，不删它的新租约。
+      const now2 = await readLeaseState(loc.dir).catch(() => null)
+      if (!now2 || now2.kind !== 'ok') await removeLeaseFile(loc.dir).catch(() => {})
+    }
     recovered.push(loc.id)
   }
   return recovered
@@ -1557,8 +1999,12 @@ export async function repairRunStates(runsRoot, options = {}) {
     if (!entry.isDirectory() || !checkRunId(entry.name)) continue
     const loc = locate(root, entry.name)
     if (!loc) continue
+    // G2-c：顺手清掉上次崩溃 / 满盘留下的 *.tmp-*（只在这个启动恢复入口做）。
+    await cleanupTempFiles(root, loc.id).catch(() => {})
     const meta = await readMetaUnlocked(loc).catch(() => null)
     if (!meta || TERMINAL_STATUS.has(meta.status)) continue
+    // G2-a：先按磁盘事件修正 seq / eventCount，再决定是否续写终态。
+    await repairRunCounters(root, loc.id).catch(() => null)
     let text
     try {
       text = await readFile(join(loc.dir, 'run.jsonl'), 'utf8')
@@ -1611,10 +2057,7 @@ async function markStorageFailure(loc, error) {
     code: error && typeof error.code === 'string' ? error.code : null,
   }
   const text = `${JSON.stringify(payload)}\n`
-  const tmp = join(loc.dir, `${ERROR_FILE}.tmp-${process.pid}-${tmpCounter++}`)
-  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-  await rename(tmp, join(loc.dir, ERROR_FILE))
-  await chmod(join(loc.dir, ERROR_FILE), FILE_MODE).catch(() => {})
+  await writeTempAtomic(join(loc.dir, ERROR_FILE), text)
 }
 
 async function readStorageError(dir) {
@@ -1669,7 +2112,8 @@ export async function readRunMeta(runsRoot, runId) {
  */
 export async function writeRunMeta(runsRoot, runId, patch = {}) {
   const loc = requireLoc(runsRoot, runId)
-  return withLock(loc.id, async () => {
+  // 进程内 withLock → 跨进程 meta.lock：两个 dsh 进程并发 patch 也不会互相覆盖。
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     try {
       const info = await stat(loc.dir)
       if (!info.isDirectory()) throw new RunError(404, 'runId', 'run 不存在')
@@ -1685,6 +2129,12 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
     if (isPlainObject(source.startOptions)) {
       for (const key of Object.keys(source.startOptions)) {
         if (!START_OPTIONS_KEYS.includes(key)) droppedKeys.push(`startOptions.${key}`)
+      }
+    }
+    // limits 同理：内层多余键丢弃但可见（`limits.<key>`）。
+    if (isPlainObject(source.limits)) {
+      for (const key of Object.keys(source.limits)) {
+        if (!LIMITS_KEYS.includes(key)) droppedKeys.push(`limits.${key}`)
       }
     }
     let existing
@@ -1705,7 +2155,7 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
       })
     }
     return written
-  })
+  }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1909,8 +2359,9 @@ export async function appendRunMessages(runsRoot, runId, records) {
     lines.push(`${line}\n`)
   }
   if (lines.length === 0) throw new RunError(400, 'message', '至少需要一条消息记录')
-  return withLock(loc.id, async () => {
-    await ensureDirMode(loc.dir)
+  // G2-b：收件箱也是同一个 run 的持久状态，run.json 写锁把跨进程追加串起来（避免半行 /
+  // 上限判断竞态）。G2-a：追加前补换行，坏半行不会把下一条记录粘进去。
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     const path = messagesPath(loc.dir)
     // 文件体积闸门：超限时不再追加（读取侧仍能读旧记录）。
     try {
@@ -1921,15 +2372,16 @@ export async function appendRunMessages(runsRoot, runId, records) {
     } catch (error) {
       if (error && error.code !== 'ENOENT') throw error
     }
+    const prefix = await needsLeadingNewline(path) ? '\n' : ''
     const handle = await open(path, 'a', FILE_MODE)
     try {
-      await handle.writeFile(lines.join(''), 'utf8')
+      await handle.writeFile(`${prefix}${lines.join('')}`, 'utf8')
     } finally {
       await handle.close()
     }
     await chmod(path, FILE_MODE).catch(() => {})
     return { appended: lines.length }
-  })
+  }))
 }
 
 /**
@@ -2002,26 +2454,19 @@ async function writeSessionsUnlocked(loc, sessions) {
   }
   await ensureDirMode(loc.dir)
   const path = sessionsPath(loc.dir)
-  const tmp = `${path}.tmp-${process.pid}-${tmpCounter++}`
-  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-  try {
-    await rename(tmp, path)
-  } catch (error) {
-    await unlink(tmp).catch(() => {})
-    throw error
-  }
-  await chmod(path, FILE_MODE).catch(() => {})
+  await writeTempAtomic(path, text)
   return normalized
 }
 
 /** 原子整写节点会话表（临时文件 + rename，0600）。 */
 export async function writeNodeSessions(runsRoot, runId, sessions) {
   const loc = requireLoc(runsRoot, runId)
-  return withLock(loc.id, () => writeSessionsUnlocked(loc, sessions))
+  return withLock(loc.id, () => withMetaLock(loc, () => writeSessionsUnlocked(loc, sessions)))
 }
 
 /**
- * 写入/更新一个节点的会话（读-改-写在同一把进程内锁里完成）。
+ * 写入/更新一个节点的会话（读-改-写在同一把进程内锁 + 跨进程 meta.lock 里完成，
+ * 两个进程同时 upsert 不会丢对方的条目）。
  * @returns {Promise<Record<string, object>>} 写入后的会话表
  */
 export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, options = {}) {
@@ -2033,7 +2478,7 @@ export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, opti
   const now = options.now instanceof Date && !Number.isNaN(options.now.getTime())
     ? options.now
     : new Date()
-  return withLock(loc.id, async () => {
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     const current = await readNodeSessions(runsRoot, runId)
     const previous = current[nodeId]
     const entry = {
@@ -2045,7 +2490,7 @@ export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, opti
     }
     current[nodeId] = entry
     return writeSessionsUnlocked(loc, current)
-  })
+  }))
 }
 
 /** 运行中动态配置回复目标（写 run.json.inbox）。 */
@@ -2067,7 +2512,7 @@ export async function appendRunInputMessages(runsRoot, runId, messages) {
   const loc = requireLoc(runsRoot, runId)
   const incoming = normalizeRunInput({ messages })
   if (!incoming) return readRunMeta(runsRoot, runId)
-  return withLock(loc.id, async () => {
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     const meta = await readMetaUnlocked(loc)
     if (!meta) throw new RunError(404, 'runId', 'run 不存在')
     const existing = normalizeRunInput(meta.input)
@@ -2078,7 +2523,7 @@ export async function appendRunInputMessages(runsRoot, runId, messages) {
     const next = normalizeMeta({ ...meta, input: { messages: list } }, loc.id)
     next.updatedAt = new Date().toISOString()
     return writeMetaUnlocked(loc, next)
-  })
+  }))
 }
 
 
@@ -2539,15 +2984,7 @@ async function readUsageLedger(dir) {
 
 async function writeUsageLedger(dir, ledger) {
   const text = `${JSON.stringify(ledger)}\n`
-  const tmp = join(dir, `${USAGE_FILE}.tmp-${process.pid}-${tmpCounter++}`)
-  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-  try {
-    await rename(tmp, join(dir, USAGE_FILE))
-  } catch (error) {
-    await unlink(tmp).catch(() => {})
-    throw error
-  }
-  await chmod(join(dir, USAGE_FILE), FILE_MODE).catch(() => {})
+  await writeTempAtomic(join(dir, USAGE_FILE), text)
 }
 
 /** 追加时按事件顺序增量维护 run.json 里的进度计数器（与 runlog.computeProgress 同口径）。 */
@@ -2594,17 +3031,33 @@ function applyProgressEvent(progress, event) {
 }
 
 /**
+ * G2-c：写盘失败时对外文案**必须与 run.json 的真实状态一致**。
+ * 只有 failedMeta 真的落盘成功才说「已标记 failed」；否则明确说「状态未知」。
+ */
+function storageFailureMessage({ failedOk, sidecarOk }) {
+  if (failedOk) {
+    return sidecarOk
+      ? '事件追加失败，run 已被原子标记为 failed（细节见 .error 侧车文件）'
+      : '事件追加失败，run 已被原子标记为 failed（.error 侧车文件也写不进去）'
+  }
+  return sidecarOk
+    ? '事件追加失败，且 run.json 也写不进去，run 状态未知（细节见 .error 侧车文件）'
+    : '事件追加失败，且 run.json 与 .error 都写不进去，run 状态未知'
+}
+
+/**
  * 追加一批事件。整批校验：任何一条不合法就一条都不写。
  *
- * **并发边界（重要，别当成通用并发安全）**：
- *   - 进程内由 `withLock(runId)` 串行化：同一进程里并发 `appendEvents` / `writeRunMeta`
- *     不会丢计数、seq 单调不回退；
- *   - 跨进程**没有文件锁**：同一 `DSH_HOME` 起多个 dsh 进程、多个引擎实例同时写同一个
- *     run 时，两边会各自读到同一个 `meta.seq` 再各自 +1，落盘出现**重复 seq**，
- *     `eventCount` 也会互相覆盖。这里依赖 06 §13.3 的**单写者租约**（同一 run 同时
- *     只有一个持有 `lock.json` 的引擎在写）。
- *   - 需要多进程并发写同一 run 时，必须另加跨进程锁域（或按 run 分片），
- *     不要直接在这里加并发调用方。
+ * **并发边界**（G2-b 之后）：
+ *   - 进程内由 `withLock(runId)` 串行化；
+ *   - 跨进程由 `meta.lock`（O_EXCL，见 {@link withMetaLock}）串行化——同一 `DSH_HOME`
+ *     起多个 dsh 进程同时写同一个 run 时，`读 meta → 分配 seq → 写 meta` 整体在锁内，
+ *     不会再各自读到同一个 seq 各写一遍。它与 `lock.json` 执行租约是两把独立的锁
+ *     （不在持有租约的前提下再抢 meta.lock，反之亦然），不会死锁。
+ *
+ * **seq 口径（G2-a）**：**先分配后写事件**——先把 `seq .. seq+N-1` 原子写进 run.json，
+ * 再追加事件行。进程在两步之间被杀只会留下「空洞」（seq 已分配、事件没写），
+ * 启动恢复由 {@link repairRunCounters} 按磁盘真实值修正；**绝不重复**。
  *
  * @param {string} runsRoot
  * @param {string} runId
@@ -2614,7 +3067,7 @@ function applyProgressEvent(progress, event) {
  */
 export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
   const loc = requireLoc(runsRoot, runId)
-  return withLock(loc.id, async () => {
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     const meta = await readMetaUnlocked(loc)
     if (!meta) throw new RunError(404, 'runId', 'run 不存在')
 
@@ -2677,21 +3130,30 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
     }
 
     try {
+      // G2-a ①：**先**原子分配 seq 区间（run.json 写不进去就整批不写，绝不只写事件）。
+      meta.seq = lastSeq
+      meta.lastSeq = lastSeq
+      meta.updatedAt = now.toISOString()
+      await writeMetaUnlocked(loc, meta)
+
+      // G2-a ②：再追加事件行。文件末尾是半行（崩溃 / 写满）时先补一个换行，
+      // 否则新事件会粘进坏行被读侧整条 skip。
       for (const [rel, events] of groups) {
         const abs = resolve(loc.dir, rel)
         if (!isInside(loc.dir, abs)) throw new RunError(500, 'runId', '事件路径越出 run 目录')
         await ensureDirMode(dirname(abs))
+        const prefix = await needsLeadingNewline(abs) ? '\n' : ''
         const text = events.map(event => `${JSON.stringify(event)}\n`).join('')
         const handle = await open(abs, 'a', FILE_MODE)
         try {
-          await handle.writeFile(text, 'utf8')
+          await handle.writeFile(`${prefix}${text}`, 'utf8')
         } finally {
           await handle.close()
         }
         await chmod(abs, FILE_MODE).catch(() => {})
       }
 
-      // §8.6：计数器在追加时原子更新，列表只需读 run.json。
+      // G2-a ③：事件落盘后再更新计数器（§8.6：列表只读 run.json）。
       const progress = meta.progress
       let tokenTotal = meta.tokenTotal
       let unkeyedCalls = meta.unkeyedCalls
@@ -2750,8 +3212,6 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
       }
 
       meta.eventCount += normalized.length
-      meta.lastSeq = lastSeq
-      meta.seq = lastSeq
       meta.nodeDone = countPassed(progress)
       meta.tokenTotal = tokenTotal
       meta.unkeyedCalls = unkeyedCalls
@@ -2763,8 +3223,10 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
         await writeUsageLedger(loc.dir, ledger).catch(() => {})
       }
     } catch (error) {
-      // 06 §13.4：写盘失败也必须能落终态——原子改 run.json 为 failed + 写 .error 侧车。
-      await markStorageFailure(loc, error).catch(() => {})
+      // 06 §13.4：写盘失败也要尽量落终态——写 .error 侧车 + 原子改 run.json 为 failed。
+      // G2-c：**只有 failedMeta 真的写成功才能对外宣称「已标记 failed」**；满盘时两条写
+      // 都可能失败，以前把它们 .catch(()=>{}) 吞掉后仍然谎报状态。
+      const sidecarOk = await markStorageFailure(loc, error).then(() => true, () => false)
       const failedMeta = normalizeMeta({
         ...meta,
         status: 'failed',
@@ -2773,14 +3235,14 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
         live: null,
         updatedAt: now.toISOString(),
       }, loc.id)
-      await writeMetaUnlocked(loc, failedMeta).catch(() => {})
+      const failedOk = await writeMetaUnlocked(loc, failedMeta).then(() => true, () => false)
       if (error instanceof RunError) throw error
       // 不回原始错误信息（可能带宿主绝对路径），细节在 .error 侧车里。
-      throw new RunError(500, 'storage', '事件写盘失败，run 已被原子标记为 failed（细节见 .error 侧车文件）')
+      throw new RunError(500, 'storage', storageFailureMessage({ failedOk, sidecarOk }))
     }
 
     return { events: normalized, run: meta, firstSeq, lastSeq }
-  })
+  }))
 }
 
 /**

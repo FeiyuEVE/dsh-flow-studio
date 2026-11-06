@@ -20,6 +20,8 @@ GUEST_PREFIX="$GUEST_ROOT/prefix"
 BASE="http://127.0.0.1:$PORT/api/flow-studio"
 # 鉴权：v1.1 起插件路由接回宿主鉴权，无凭据一律 401；测试台用 FLOW_STUDIO_TOKEN 走 Bearer。
 TOKEN="${TESTBED_FS_TOKEN:-fs-$(openssl rand -hex 16 2>/dev/null || node -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')}"
+# 0.8.2：只读令牌 + custom executor 主机开关（开关打开才能存/跑 custom 流程，见 0.8.2 行为）
+READ_TOKEN="rd-$(openssl rand -hex 16 2>/dev/null || node -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
 VERSION="$(node -p "require('$REPO/package.json').version")"
 TGZ="$REPO/.tmp/feiyueve-dsh-flow-studio-$VERSION.tgz"
 # 宿主登录 cookie（v1.1 起插件路由与 /api 同口径，光有插件令牌不够）。
@@ -97,7 +99,8 @@ dex sh -c 'for p in /proc/[0-9]*; do n=$(cat "$p/comm" 2>/dev/null) || continue;
 sleep 1
 # FLOW_STUDIO_STUB_ENGINE=1：不调模型，桩按节点标题出 pass/reject
 dex_sh "cd $GUEST_ROOT/workspace && setsid nohup dsh --profile web --port 3080 --no-open > $GUEST_ROOT/logs/dsh-web.log 2>&1 < /dev/null & echo started" \
-  -e FLOW_STUDIO_TESTBED=1 -e FLOW_STUDIO_STUB_ENGINE=1 -e FLOW_STUDIO_TOKEN="$TOKEN" >/dev/null
+  -e FLOW_STUDIO_TESTBED=1 -e FLOW_STUDIO_STUB_ENGINE=1 -e FLOW_STUDIO_TOKEN="$TOKEN" \
+  -e FLOW_STUDIO_READ_TOKEN="$READ_TOKEN" -e FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR=1 >/dev/null
 for _ in $(seq 1 30); do
   dex_sh "grep -q '^dsh web: http' $GUEST_ROOT/logs/dsh-web.log" 2>/dev/null && break
   sleep 1
@@ -119,6 +122,7 @@ ok "无凭据访问被拒：$UNAUTH"
 NO_PLUGIN_TOKEN="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/runs" || true)"
 [ "$NO_PLUGIN_TOKEN" = "401" ] || [ "$NO_PLUGIN_TOKEN" = "403" ] || die "缺插件令牌竟然返回 $NO_PLUGIN_TOKEN（期望 401/403）"
 ok "缺插件令牌被拒：$NO_PLUGIN_TOKEN"
+printf '%s' "$HEALTH" > "$REPO/.tmp/e2e-health.json"
 ENGINE="$(printf '%s' "$HEALTH" | jqr 'j.engine')"
 [ "$ENGINE" = "stub" ] || die "health 里 engine=$ENGINE，期望 stub（health: $HEALTH）"
 ok "health 就位：$(printf '%s' "$HEALTH" | jqr 'j.version+" / "+j.engine+" / "+j.auth')"
@@ -522,6 +526,37 @@ printf '%s\n' "$FILTER_JSON" > "$EVIDENCE_DIR/workspace-filter.json"
 } > "$EVIDENCE_DIR/worktree-git.txt" 2>&1
 cp "$REPO/.tmp/e2e-concurrency.log" "$EVIDENCE_DIR/concurrency.log"
 ok "证据留档到 .tmp/e2e-v07-evidence/（worktree run.json / git HEAD / 并发快照 / supervision）"
+
+# ── 6c 权限 / 轻量接口 / worktree 回收（0.8.2）─────────────────────────────────
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const f=(m)=>{console.error("health 能力位断言失败: "+m);process.exit(1)};if(j.authMode!=="full")f("authMode="+j.authMode);if(j.readOnly!==false)f("readOnly="+j.readOnly);if(j.customExecutor!==true)f("customExecutor="+j.customExecutor);if(!j.limits||j.limits.defaultRunTimeoutMs!==7200000||j.limits.defaultNodeTimeoutMs!==1200000)f("limits="+JSON.stringify(j.limits))' "$REPO/.tmp/e2e-health.json"
+ok "health 能力位：authMode=full / readOnly=false / customExecutor=true / limits.runTimeoutMs=7200000"
+
+# 只读令牌：GET 放行，写请求 403 + 可读 code
+RO_GET="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -b "$JAR" -H "Authorization: Bearer $READ_TOKEN" "$BASE/runs")"
+[ "$RO_GET" = "200" ] || die "只读令牌 GET /runs 返回 $RO_GET（期望 200）"
+RO_POST_CODE="$(curl -s -m 10 -o "$REPO/.tmp/e2e-ro-post.json" -w '%{http_code}' -b "$JAR" \
+  -H "Authorization: Bearer $READ_TOKEN" -H 'content-type: application/json' \
+  -X POST "$BASE/flows" -d '{"name":"ro probe","nodes":[],"edges":[]}')"
+[ "$RO_POST_CODE" = "403" ] || die "只读令牌 POST /flows 返回 $RO_POST_CODE（期望 403）：$(cat "$REPO/.tmp/e2e-ro-post.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(!/READ_ONLY_TOKEN/.test(String(j.code||""))){console.error("403 缺 code=READ_ONLY_TOKEN："+JSON.stringify(j));process.exit(1)}if(!/只读/.test(String(j.error||""))){console.error("403 文案不可读："+j.error);process.exit(1)}' "$REPO/.tmp/e2e-ro-post.json"
+ok "只读令牌：GET 200 / 写请求 403（code=READ_ONLY_TOKEN，文案可读）"
+
+# ?light=1：不返回 nodes/events，但必须有 live 与 nodeStatus 投影
+req "$BASE/runs/$WT_ID?light=1" > "$REPO/.tmp/e2e-light.json"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const f=(m)=>{console.error("light 断言失败: "+m);process.exit(1)};const r=j.run||{};if(!r.id)f("缺 run.id");if("nodes" in r)f("light 里不该有 nodes");if("events" in r)f("light 里不该有 events");if(!("live" in r))f("light 里必须有 live（可为 null）");if(!("nodeStatus" in r))f("light 里必须有 nodeStatus");if(!("worktree" in r))f("light 里必须有 worktree 摘要");if(typeof r.eventCount!=="number")f("light 里 eventCount 应为数字，实际 "+typeof r.eventCount)' "$REPO/.tmp/e2e-light.json"
+ok "?light=1 返回元信息 + live + nodeStatus + worktree 摘要，且不含 nodes/events"
+
+# worktree 回收：DELETE 路由 + 分支真的被删
+WT_DEL_CODE="$(req -o "$REPO/.tmp/e2e-wt-del.json" -w '%{http_code}' -X DELETE "$BASE/runs/$WT_ID/worktree")"
+[ "$WT_DEL_CODE" = "200" ] || die "DELETE /runs/<id>/worktree 返回 $WT_DEL_CODE：$(cat "$REPO/.tmp/e2e-wt-del.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const f=(m)=>{console.error("worktree 删除断言失败: "+m);process.exit(1)};if(j.ok!==true)f("ok!=true");if(j.removed!==true)f("removed!=true（reason="+j.reason+"）");if(j.branchRemoved!==true)f("branchRemoved!=true（warning="+j.branchWarning+"）")' "$REPO/.tmp/e2e-wt-del.json"
+[ "$(dex sh -c "test -e '$WT_PATH' && echo yes || echo no" | tr -d '\r')" = "no" ] || die "worktree 目录仍在：$WT_PATH"
+WT_BRANCH_LEFT="$(dex_sh "git -C /testbed/e2e-repo branch --list 'flow/$WT_ID' | tr -d ' *'" | tr -d '\r')"
+[ -z "$WT_BRANCH_LEFT" ] || die "分支 flow/$WT_ID 仍存在：$WT_BRANCH_LEFT"
+ok "worktree 回收：目录已删、分支 flow/$WT_ID 已删（branchRemoved=true）"
+req "$BASE/worktrees" > "$REPO/.tmp/e2e-worktrees.json"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(j.ok!==true){console.error("GET /worktrees 失败："+JSON.stringify(j));process.exit(1)}' "$REPO/.tmp/e2e-worktrees.json"
+ok "GET /worktrees → 200（孤儿清单可查）"
 
 # ── 6b 清理：本段造的 run / 流程 / worktree / 临时仓库 ─────────────────────────
 for id in "$CONC_A_ID" "$CONC_B_ID" "$WT_ID" "$SUP_RUN_ID" "$BAD_WT_ID" "$INV_RUN_ID"; do

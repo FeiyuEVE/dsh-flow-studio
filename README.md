@@ -1,6 +1,6 @@
 # dsh-flow-studio
 
-**当前版本：0.8.1**
+**当前版本：0.8.2**
 
 > DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 端用画布拖拽节点，把一条研发流水线画出来，
 > 每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来，
@@ -87,6 +87,33 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
   pending 30s），到点自动唤醒发起会话；连续 3 次唤醒失败降级关闭。HTTP 起的 run 默认不开，
   可用 `flow_supervise` 或 `POST /runs/<id>/supervision` 打开。
 
+**0.8.2 把审计里剩下的 MAJOR 也收了**（12 条，逐条有回归）：
+
+- **收尾封口**：写 `run/end` 前先封口，之后到达的 `session/event` 一律丢弃并计数——修掉「`run/end`
+  之后还有事件、`run.json.live` 被写回非 null」。
+- **结论解析**：节点结论取「本 attempt 最近一条能解析出正式结论的消息」，不再取最后一条；闹钟的
+  自审状态块不会顶掉同一回合更早的正式 verdict。打回上下文改印**原始 id**（模型照抄不再变成
+  `n_a:n_a:R1`）。
+- **超时可配**：`start` / `POST /start` / `flow_start` 都接受 `runTimeoutMs` / `nodeTimeoutMs`
+  （默认 2h / 20min），生效值写进 `run.json.limits`。
+- **持久化**：`appendEvents` 先分配 seq 再写事件（崩溃不再产生重复 seq）、半行自动断开、
+  启动用 `repairRunCounters` 修计数；run.json 的写路径加**跨进程** `meta.lock`（两个真子进程
+  各写 40 条 → 磁盘 80 / 计数 80 / 重复 0）；写盘失败时错误文案与实际状态一致、不再留 `*.tmp-*`；
+  租约过期就地 re-claim、0 字节锁可接管。
+- **外部 executor 进程组**：`detached` + 整组 `SIGTERM→SIGKILL`，abort 后孙进程不再存活；
+  结果带 `killScope` / `orphanWarning`。
+- **worktree 生命周期**：残留路径自愈、失败不累积分支、locked 也能删、dirty/敏感文件给告警、
+  空仓库能建（`baseCommit:null`）；新增 `GET /worktrees` / `POST /worktrees/prune` /
+  `DELETE /runs/<id>/worktree`，**连 `flow/<runId>` 分支一起回收**（只删 `flow/` 前缀）。
+- **调度**：同一发起会话的多个 run **合并成一次唤醒**（10 个 run 只发 1 条 followup），
+  每会话 30 次/小时 + 最小间隔 120s，被限流的 run 保留 due 不丢；节点闹钟**重启后恢复**登记。
+- **Host 面**：只读令牌 `FLOW_STUDIO_READ_TOKEN`（写请求 403）、`FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR`
+  主机开关（默认关，custom executor 会在宿主执行任意命令）、`FLOW_STUDIO_WORKSPACE_ROOTS` 白名单、
+  `?light=1` 轻量投影（不解析事件，客户端 2s 轮询改用它）、`flow_watch runIds` 一次审多个 run、
+  `/health` 报 `authMode` / `readOnly` / `customExecutor` / `limits`。
+- **前端**：删流程二次确认 + 撤销（删成功才清草稿）、`sessionMode` 与 worktree 原因进运行详情、
+  左栏与抽屉共用一份 runs 数据源、`Alt` 拖动绕过 4px 吸附（README 早就写了，现在真实现）。
+
 **0.8.1 是一轮「10 路独立审计 → 修 BLOCKER」的收口**，重点不是加功能而是堵漏：
 
 - **发布链补门禁**：`prepack` / `pretest` 强制 `build`，`build.mjs` 逐字节比对 `src` 与 `lib`；
@@ -106,8 +133,12 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
 **0.8.0 给每个节点主管会话加了自审闹钟**（[07 §11](docs/design/07-runtime-0.7.md) /
 [06 §19](docs/design/06-execution-engine.md)）：建会话即登记、attempt 结束注销，到点让节点用
 结构化 `node/status` 回报状态；`state=done` + 合法 verdict 可与 `whenIdle` 竞速提前完成，
-`blocked` 且进度不变会在 `flow_watch` 里给建议。闹钟状态只在内存，进程重启不恢复；
-外部 executor 节点没有会话，不挂闹钟。
+`blocked` 且进度不变会在 `flow_watch` 里给建议。外部 executor 节点没有会话，不挂闹钟。
+
+**0.8.2 起节点闹钟会在重启后恢复**：runtime 初始化时扫「本进程有 Engine 实例的 running run」，
+按 `run.json.nodeStatus`（非终态节点）+ `sessions.json` 的 sessionId 重新登记，首轮
+`now + 10min` 排期（重启瞬间不刷一轮）；缺 sessionId 的节点跳过并计数，重复初始化幂等。
+调度器状态本身仍是内存态。
 
 ## 在会话里开流程，让主 agent 自己盯着
 
@@ -119,7 +150,12 @@ flow_start      → 在**当前会话**里开跑，并自动开启内建 supervi
 flow_watch      → 审查整个工作流：偏航 / 卡死 / 打回死循环 / 并发乱序 / 超时风险 / 质量结论
 flow_stop       → 停掉这次运行
 flow_supervise  → 手动开 / 关某个 run 的内建定时自审
+flow_send_message / flow_reply → 往节点会话发外部消息 / 回复外部通道
+flow_worktrees  → 列出孤儿 worktree，或按 keepRunIds 回收（连 flow/<runId> 分支一起删）
 ```
+
+`flow_watch` 支持 `runIds: string[]`（≤20）一次审多个 run：每个 run 一份结论 + 一份合并建议，
+且同一次调用里每个 run 的事件只读一次。
 
 `flow_start` 启动成功后**默认开启内建 supervision**，到点由 runtime 唤醒发起会话，
 不需要再挂 `proactive_set`；返回的 `supervision.alarmPrompt` / `nextCheckSeconds` 从 0.5.0 保留，
@@ -128,7 +164,10 @@ flow_supervise  → 手动开 / 关某个 run 的内建定时自审
 
 工作区的答案是**不用手填**：模板存在 `$DSH_HOME/flow-studio/flows/`（全局）；
 `flow_start` 默认取当前会话的 `header.cwd` 作工作区，`engine.start` 再按 `worktree` 策略决定是否
-建隔离副本，最终写进 `run.json.workspace / worktree`。节点主管会话是顶层会话（不是挂在父会话下的
+建隔离副本，最终写进 `run.json.workspace / worktree`。**工作区是必填的**（0.8.1 起）：
+`POST /runs`、`POST /runs/<id>/start`、`flow_start` 都要求显式给出，引擎不再回落服务进程的 `process.cwd()`；
+配置了 `FLOW_STUDIO_WORKSPACE_ROOTS` 时还必须落在允许的根目录内。`flow_start` 与 `POST /start`
+都可传 `runTimeoutMs` / `nodeTimeoutMs`（默认 2 小时 / 20 分钟），生效值写进 `run.json.limits`。节点主管会话是顶层会话（不是挂在父会话下的
 子 agent），它的 `cwd` 用 worktree 路径或工作区路径；外部 executor 同理。
 
 ## 流程能收外部消息，一个节点只有一个会话
@@ -200,7 +239,7 @@ POST /api/flow-studio/runs/<runId>/messages
 
 | 区域 | 做什么 |
 |---|---|
-| 左侧 | 流程模板列表：新建 / 打开 / 删除 |
+| 左侧 | 流程模板列表：新建 / 打开 / 删除（删除有二次确认；服务器删成功后才清本地草稿，删完可从左栏「撤销」按原 id 写回） |
 | 中间 | 画布：拖动节点、从右侧圆点拖到另一个节点建连线、双击空白处新增节点、裸滚轮缩放（指针锚定）、Shift+滚轮横移、中键/空格拖平移、`Alt` 拖动绕过 4px 吸附；双击空白以外的「全览」把整张图装进视口 |
 | 右侧 | 检查器：选中节点或连线后配置；带「位置与连线」组——X/Y 坐标、四向 4px 微调（Shift 20px）、「连接到…」下拉 |
 | 底栏 | 节点 / 连线 / 打回统计 + 结构校验结论（点开看逐条问题，可跳转到对应节点）+ 保存状态（含「本地草稿」） |
@@ -284,9 +323,11 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 | GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` / `nodeStatus` |
 | POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；同一 runId 已在跑 → 409；流程非法 → 400） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
-| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision / nodeStatus）/ 删除整个 run（租约持有中 → 409） |
+| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision / nodeStatus）；`?light=1` 走轻量分支（run 元信息 + `live` + `nodeStatus` + 工作区/worktree 摘要，**不读取也不解析事件**，客户端运行中 2s 轮询用它）/ 删除整个 run（租约持有中 → 409） |
 | GET/POST | `/runs/<runId>/supervision` | 读 `run.json.supervision` + 调度器状态 / 开或关内建 supervision（`{enabled, wakerSessionId?}`；对已收尾 run 开启 → 400） |
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验） |
+| GET/POST | `/worktrees` | 孤儿 worktree 清单（`listWorktrees` + 已记录的删除指针）/ `{action:'prune', keepRunIds?}` 回收（`pruneWorktrees`，连 `flow/<runId>` 分支一起清） |
+| DELETE | `/runs/<runId>/worktree` | 删该 run 的 worktree（显式传 `root`、`force` 恒 true；返回 `{ok, removed, reason, branchRemoved}`） |
 | GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论）+ `nodeStatus` |
 | GET | `/runs/<runId>/export` | 导出 markdown |
 
@@ -296,14 +337,30 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 `FLOW_STUDIO_TOKEN`（≥16 字符，只认 `Authorization: Bearer`；`?token=` 仅导出接口允许）。
 `/health` 在未鉴权时只说「认证档位」，不报内部路径。
 
+### 权限与安全开关（0.8.2）
+
+| 环境变量 | 作用 |
+|---|---|
+| `FLOW_STUDIO_TOKEN` | **全权**令牌（≥16 字符，`Authorization: Bearer`） |
+| `FLOW_STUDIO_READ_TOKEN` | **只读**令牌：只允许 `GET`，任何写请求 → 403（`code:"READ_ONLY_TOKEN"`） |
+| `FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR` | 默认关。关闭时保存/启动含 `executor:'custom'` 的流程 → 400（`code:"CUSTOM_EXECUTOR_DISABLED"`）——custom 会在宿主 `sh -c` 执行任意命令，等价宿主 RCE，**只能由运维在主机上打开** |
+| `FLOW_STUDIO_WORKSPACE_ROOTS` | 可选，冒号分隔的绝对路径；配置后 `workspace` 必须落在其中之一（realpath 比较，防 symlink 绕过），否则 400 |
+| `FLOW_STUDIO_RUN_TIMEOUT_MS` / `FLOW_STUDIO_NODE_TIMEOUT_MS` | 墙钟上限默认 2h / 单节点 20min；`start` 的显式参数优先于它 |
+| `FLOW_STUDIO_NODE_ALARM_MS` | 节点自审闹钟间隔（默认 600000 = 10 分钟） |
+| `FLOW_STUDIO_NODE_RETRIES` | 节点重试次数（0–5，默认 1） |
+| `FLOW_STUDIO_WAKER_HOURLY_LIMIT` / `FLOW_STUDIO_WAKER_MIN_INTERVAL_MS` | 同一发起会话的 run 级唤醒预算（默认 30 次/小时、最小间隔 120s） |
+
+`/health` 会报 `authMode`（`full` / `read`）、`readOnly`、`customExecutor`、`workspaceAllowlist`（只报条数）、
+`limits`（默认超时）等能力位，让调用方知道自己的令牌能干什么。
+
 ## 开发
 
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 20 个自检文件，共 627 组（其中 8 个套件显式计数，合计 2783 条断言）
+npm test           # 20 个自检文件，共 713 组（其中 8 个套件显式计数，合计 3525 条断言）
 node scripts/verify-build.mjs  # 只读发布前校验：src↔lib 逐字节一致 + main 入口存在（npm pack 前也会自动 build）
-node test/render.test.mjs   # SSR + 构建产物加载，71 组
+node test/render.test.mjs   # SSR + 构建产物加载，78 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 

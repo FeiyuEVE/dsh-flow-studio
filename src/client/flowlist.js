@@ -95,12 +95,78 @@ export function nextGroupToggles(toggles, key, currentlyOpen) {
   return next
 }
 
-/** `run.worktree` / `run.worktreeEnabled` → `{ enabled, branch }`；字段缺失一律未启用。 */
+/**
+ * `run.worktree` / `run.worktreeEnabled` → `{ enabled, branch, path, reason }`；
+ * 字段缺失一律未启用。G5-c：reason 也要带到 UI（不能只显示「未启用」）。
+ */
 export function worktreeOf(run) {
   const record = run && isObject(run.worktree) ? run.worktree : null
   const enabled = Boolean((run && run.worktreeEnabled === true) || (record && record.enabled === true))
   const branch = record && typeof record.branch === 'string' ? record.branch.trim() : ''
-  return { enabled, branch }
+  const path = record && typeof record.path === 'string' ? record.path.trim() : ''
+  const reason = record && typeof record.reason === 'string' ? record.reason.trim() : ''
+  return { enabled, branch, path, reason }
+}
+
+/**
+ * G5-c：sessionMode 的中文词表（top-level / legacy-subagent / injected / stub / unavailable）。
+ * 未知值返回「未知（原始值）」——绝不返回空串，否则用户只看到「未启用」却不知道原因。
+ */
+export const SESSION_MODE_TEXT = {
+  'top-level': '顶层会话',
+  'legacy-subagent': '旧版子 agent',
+  injected: '注入式会话',
+  stub: '桩引擎',
+  unavailable: '会话不可用',
+}
+
+/** sessionMode 可读文案；缺失 → 「未标注（旧 run）」，未知 → 带原始值。 */
+export function sessionModeText(value) {
+  const raw = text(value).trim()
+  if (raw === '') return '未标注（旧 run）'
+  return SESSION_MODE_TEXT[raw] || '未知（' + raw + '）'
+}
+
+/** G5-c：worktree 未启用原因的常用值 → 中文；`create-failed: …` 前缀单独展开。 */
+export const WORKTREE_REASON_TEXT = {
+  'not-a-git-repo': '工作区不是 git 仓库',
+  'disabled-by-initiator': '发起方关闭了 worktree',
+  'stub-engine': '桩引擎不创建 worktree',
+  'no-workspace': '没有工作区',
+  'git-workspace': 'git 工作区',
+}
+
+/** worktree 原因可读文案；未知值带原始值，缺失明确写「原因未标注」。 */
+export function worktreeReasonText(reason) {
+  const raw = text(reason).trim()
+  if (raw === '') return '原因未标注'
+  if (WORKTREE_REASON_TEXT[raw]) return WORKTREE_REASON_TEXT[raw]
+  if (raw.startsWith('create-failed')) {
+    const detail = raw.slice('create-failed'.length).replace(/^[:：]\s*/, '').trim()
+    return detail === '' ? '创建 worktree 失败' : '创建 worktree 失败：' + detail
+  }
+  return '未知原因（' + raw + '）'
+}
+
+/**
+ * G5-c：运行详情里的 worktree 一行。
+ * enabled=true 时显示路径与分支；未启用时显示原因（未知值也带原始值）。
+ */
+export function worktreeDetailText(worktree) {
+  const record = worktree && typeof worktree === 'object' ? worktree : {}
+  if (record.enabled === true) {
+    const parts = []
+    if (record.branch) parts.push('分支 ' + record.branch)
+    if (record.path) parts.push('路径 ' + record.path)
+    return parts.length === 0 ? '已启用' : '已启用（' + parts.join(' · ') + '）'
+  }
+  return '未启用（原因：' + worktreeReasonText(record.reason) + '）'
+}
+
+/** G5-b：删除流程的二次确认文案（必须带流程名，并说明可撤销 / 草稿何时清）。 */
+export function deleteConfirmText(name) {
+  const shown = text(name).trim() || '未命名流程'
+  return '确认删除「' + shown + '」？删除后可用「撤销」恢复；本地草稿只有在服务器删除成功后才清理。'
 }
 
 /** 次数类字段：数字或数字字符串都收；坏值按 0（不编造唤醒记录）。 */
@@ -362,8 +428,17 @@ function RunDetail({ run, active, nodes }) {
     h('div', { className: 'fs-run-detail-name', title: text(run.id) || name }, name),
     h('div', { className: 'fs-run-detail-line', title: path === '' ? UNKNOWN_WORKSPACE : path },
       '工作区 · ' + (path === '' ? UNKNOWN_WORKSPACE : workspaceTail(path))),
-    h('div', { className: 'fs-run-detail-line' },
-      'worktree · ' + (worktree.enabled ? (worktree.branch === '' ? '已启用' : '⎇ ' + worktree.branch) : '未启用')),
+    // G5-c：sessionMode / worktree.reason 不能只留在 API 里——运行详情必须能读到中文原因。
+    h('div', {
+      className: 'fs-run-detail-line',
+      'data-session-mode': text(run && run.sessionMode) || undefined,
+      title: '会话模式：' + sessionModeText(run && run.sessionMode),
+    }, '会话模式 · ' + sessionModeText(run && run.sessionMode)),
+    h('div', {
+      className: 'fs-run-detail-line',
+      'data-worktree-reason': worktree.reason || undefined,
+      title: worktree.enabled ? worktreeDetailText(worktree) : 'worktree 未启用原因：' + worktreeReasonText(worktree.reason),
+    }, 'worktree · ' + worktreeDetailText(worktree)),
     h(SupervisionLine, { run }),
     h(NodeStatusBlock, { run, nodes }))
 }
@@ -429,10 +504,16 @@ export function FlowList({
   // v0.8 §11.4：`GET /runs/<id>` 的节点表（`{id,title}`），只用于把 nodeId 显示成标题。
   nodes = null,
   onFocusRun = null,
+  // G5-b：删除二次确认 / 撤销。initialDeleteId 只给 SSR 测试预置确认态。
+  initialDeleteId = '',
+  undoDelete = null,
+  onUndoDelete = null,
 }) {
   const { useState } = rt.React
   // 显式点过的分组才记状态；没点过的第一组默认展开（其余收起）。
   const [groupToggles, setGroupToggles] = useState(() => new Map())
+  /** G5-b：第一次点「删除」只进入确认态，确认后才回调 onDelete。 */
+  const [deleteArmed, setDeleteArmed] = useState(() => text(initialDeleteId))
   const runRows = Array.isArray(runs) ? runs.filter(isObject) : null
   const groups = runRows === null ? [] : groupRunsByWorkspace(runRows)
   const selected = runRows === null
@@ -462,6 +543,21 @@ export function FlowList({
       disabled: busy,
       onClick: onCreate,
     }, '+ 新建'),
+    // G5-b：删除成功后的「撤销」入口——快照还在内存里，可以原 id 写回。
+    undoDelete
+      ? h('div', { className: 'fs-draft fs-rail-undo', role: 'status' },
+        h('span', { className: 'fs-draft-text fs-rail-undo-text' },
+          '已删除「' + (text(undoDelete.name) || text(undoDelete.id) || '未命名流程') + '」'),
+        h('button', {
+          type: 'button',
+          className: 'fs-btn ghost sm fs-rail-undo-btn',
+          disabled: busy,
+          title: '把删除前的流程快照重新写回服务器',
+          onClick: () => {
+            if (onUndoDelete) onUndoDelete(undoDelete)
+          },
+        }, '撤销'))
+      : null,
     h('div', { className: 'fs-rail-list' },
       flows.length === 0
         ? h('div', { className: 'fs-empty-panel' }, '还没有流程模板')
@@ -484,14 +580,39 @@ export function FlowList({
           (item.updatedAt ? ' · ' + relativeTime(item.updatedAt) : '')),
         item.id === activeId
           ? h('div', { className: 'fs-flow-actions' },
-            h('button', {
-              type: 'button',
-              className: 'fs-btn ghost sm',
-              onClick: event => {
-                event.stopPropagation()
-                onDelete(item.id)
-              },
-            }, '删除'))
+            deleteArmed === item.id
+              // G5-b：确认文案带流程名，并说明「删除后可撤销 / 草稿何时清」。
+              ? [
+                h('span', { key: 'confirm-text', className: 'fs-flow-meta fs-flow-confirm-text' }, deleteConfirmText(item.name)),
+                h('button', {
+                  key: 'confirm',
+                  type: 'button',
+                  className: 'fs-btn danger sm fs-flow-confirm',
+                  disabled: busy,
+                  onClick: event => {
+                    event.stopPropagation()
+                    setDeleteArmed('')
+                    onDelete(item.id)
+                  },
+                }, '确认删除'),
+                h('button', {
+                  key: 'cancel',
+                  type: 'button',
+                  className: 'fs-btn ghost sm',
+                  onClick: event => {
+                    event.stopPropagation()
+                    setDeleteArmed('')
+                  },
+                }, '取消'),
+              ]
+              : h('button', {
+                type: 'button',
+                className: 'fs-btn ghost sm',
+                onClick: event => {
+                  event.stopPropagation()
+                  setDeleteArmed(item.id)
+                },
+              }, '删除'))
           : null))),
     runRows === null
       ? null

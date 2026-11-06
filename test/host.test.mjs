@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -19,7 +19,10 @@ mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 process.env.DSH_HOME = mkdtempSync(join(repoRoot, '.tmp', 'home-'))
 const home = process.env.DSH_HOME
 
-const { apply, AUTH_ENV, createHandler } = await import('../src/index.js')
+const {
+  apply, AUTH_ENV, READ_AUTH_ENV, CUSTOM_EXECUTOR_ENV, WORKSPACE_ROOTS_ENV, createHandler,
+} = await import('../src/index.js')
+const { MAX_TIMEOUT_MS } = await import('../src/tools.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
 const { validateFlow } = await import('../src/model.js')
@@ -438,16 +441,19 @@ await check('§13.1 connection 返回 401/403 时原样返回，不再只靠 Ori
   assert.equal(result.status, 503)
 })
 
-await check('§13.1 FLOW_STUDIO_TOKEN < 16 字符 → 启动即拒绝并告警', async () => {
-  const warnings = []
-  const strictCtx = makeCtx()
-  strictCtx.logger.warn = message => warnings.push(message)
-  process.env[AUTH_ENV] = 'too-short'
-  try {
-    assert.throws(() => apply(strictCtx), /至少 16 个字符/)
-    assert.ok(warnings.some(message => message.includes('拒绝启动')))
-  } finally {
-    delete process.env[AUTH_ENV]
+await check('§13.1 两档令牌 < 16 字符 → 启动即拒绝并告警（全权 / 只读同口径）', async () => {
+  for (const envName of [AUTH_ENV, READ_AUTH_ENV]) {
+    const warnings = []
+    const strictCtx = makeCtx()
+    strictCtx.logger.warn = message => warnings.push(message)
+    process.env[envName] = 'too-short'
+    try {
+      assert.throws(() => apply(strictCtx), /至少 16 个字符/)
+      assert.ok(warnings.some(message => message.includes('拒绝启动')), envName)
+      assert.ok(warnings.some(message => message.includes(envName)), `${envName} 的告警要点名变量`)
+    } finally {
+      delete process.env[envName]
+    }
   }
 })
 
@@ -473,7 +479,7 @@ await check('§13.3 DELETE /runs/<id> 在持有租约时 409', async () => {
 
 console.log('v0.7 · 保存门禁 / 工作区 / supervision')
 
-await check('PUT 非法流程 → 200 + validation.errors（executor 两条新规则只报告不拦保存）', async () => {
+await check('G6-a/PUT 非法流程：custom executor 默认保存即 400；其它违规仍 200 + validation.errors', async () => {
   const created = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('门禁'))
   const id = created.json.flow.id
   const version = created.json.flow.version
@@ -491,20 +497,22 @@ await check('PUT 非法流程 → 200 + validation.errors（executor 两条新�
     ],
   }
 
-  // ① custom 缺 executorCommand：保存成功，校验报告里带这条 error。
-  const missingCommand = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, base)
-  assert.equal(missingCommand.status, 200, JSON.stringify(missingCommand.json))
-  assert.equal(missingCommand.json.ok, true)
-  assert.equal(missingCommand.json.validation.ok, false)
-  const executorError = missingCommand.json.validation.errors
-    .find(item => /executorCommand/.test(item.message))
-  assert.ok(executorError, JSON.stringify(missingCommand.json.validation.errors))
-  assert.equal(missingCommand.json.flow.version, version + 1, '保存成功就要推进版本（不是拒绝）')
+  // ① custom（缺 executorCommand）：G6-a ② 主机开关默认关 → 保存直接 400，
+  // 且磁盘一个字节都不动（不是「报告后照样存」）。
+  const blocked = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, base)
+  assert.equal(blocked.status, 400, JSON.stringify(blocked.json))
+  assert.equal(blocked.json.ok, false)
+  assert.equal(blocked.json.code, 'CUSTOM_EXECUTOR_DISABLED')
+  assert.match(blocked.json.error, /FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR/)
+  assert.match(blocked.json.error, /executor/)
+  const untouched = (await call(route, 'GET', `/api/flow-studio/flows/${id}`)).json.flow
+  assert.equal(untouched.version, version, '被拒绝的保存不能推进版本')
+  assert.ok(!untouched.nodes.some(node => node.executor === 'custom'), '磁盘上不能留下 custom 节点')
 
-  // ② executor=codex + mode=team：同样 200，validation 里带「必须是单个 agent」。
+  // ② 非 custom 的 executor 违规（codex + team）仍然 200 + validation 报告（自动保存语义不变）。
   const codexTeam = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
     ...base,
-    version: missingCommand.json.flow.version,
+    version,
     nodes: base.nodes.map(node => (node.id === 'b'
       ? { ...node, executor: 'codex', executorCommand: '', mode: 'team' }
       : node)),
@@ -519,9 +527,25 @@ await check('PUT 非法流程 → 200 + validation.errors（executor 两条新�
   assert.equal(got.status, 200)
   assert.equal(got.json.flow.nodes.find(node => node.id === 'b').executor, 'codex')
 
+  // ③ 主机开关打开后：custom 缺 executorCommand 仍能保存（自动保存），validation 报告这条 error。
+  process.env.FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR = '1'
+  try {
+    const allowed = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+      ...base,
+      version: codexTeam.json.flow.version,
+    })
+    assert.equal(allowed.status, 200, JSON.stringify(allowed.json))
+    assert.equal(allowed.json.validation.ok, false)
+    assert.ok(allowed.json.validation.errors.some(item => /executorCommand/.test(item.message)),
+      JSON.stringify(allowed.json.validation.errors))
+  } finally {
+    delete process.env.FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR
+  }
+
   // warnings 不影响保存：合法流程照常 200。
+  const currentVersion = (await call(route, 'GET', `/api/flow-studio/flows/${id}`)).json.flow.version
   const ok = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, validFlowBody('门禁', {
-    version: codexTeam.json.flow.version,
+    version: currentVersion,
   }))
   assert.equal(ok.status, 200)
   assert.equal(ok.json.validation.errors.length, 0)
@@ -908,8 +932,9 @@ await check('POST /runs/<id>/start 把 {workspace, worktree} 透传给 engine.st
   assert.deepEqual(stubCalls[0].options, {}, 'stub 不补默认 workspace')
 })
 
-await check('启动 run 前拦非法 executor（保存能存，但开不了跑）：400 且不调 engine.start', async () => {
+await check('启动 run 前拦非法 executor（保存被 custom 开关拦下）：400 且不调 engine.start', async () => {
   const runsRoot = runstore.runsDir(home)
+  // 直接写盘（模拟旧版本留下的非法流程），绕过保存门禁，验证启动侧仍然拦得住。
   const bad = await store.saveFlow(store.flowsDir(home), 'flow-bad-executor', {
     name: '非法 executor',
     nodes: [
@@ -922,11 +947,13 @@ await check('启动 run 前拦非法 executor（保存能存，但开不了跑�
       { id: 'e2', from: 'b', to: 'c', kind: 'next' },
     ],
   })
-  // 保存侧只报告（validateFlow 有 executor 规则），不拦。
+  // 保存侧：custom executor 现在也被主机开关拦下（G6-a ②）→ 400。
   const saved = await call(route, 'PUT', `/api/flow-studio/flows/${bad.id}`, {
     ...bad, version: bad.version,
   })
-  assert.equal(saved.status, 200)
+  assert.equal(saved.status, 400, JSON.stringify(saved.json))
+  assert.equal(saved.json.code, 'CUSTOM_EXECUTOR_DISABLED')
+  assert.match(saved.json.error, /FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR/)
 
   const calls = []
   const injected = { handler: createHandler({
@@ -949,6 +976,697 @@ await check('启动 run 前拦非法 executor（保存能存，但开不了跑�
   assert.match(started.json.error, /executor/)
   assert.equal(calls.length, 0, '非法 executor 必须在 engine.start 之前挡下')
   assert.equal((await runstore.readRunMeta(runsRoot, run.id)).status, 'pending')
+})
+
+console.log('G6-a · 最小权限（只读令牌 / custom executor / workspace 白名单 / health）')
+
+/** 造一个「已绑定工作区 +（可选）worktree 记录」的 run，G6-b / G7 共用。 */
+async function seedWorktreeRun(label, { record = true } = {}) {
+  const runsRoot = runstore.runsDir(home)
+  const workspace = makeWorkspace(label)
+  const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 1 })
+  const worktreePath = join(repoRoot, '.tmp', `wt-${label}-${run.id}`)
+  const worktree = record
+    ? {
+        enabled: true,
+        reason: 'git-workspace',
+        decidedBy: 'initiator',
+        path: worktreePath,
+        branch: `flow/${run.id}`,
+        baseCommit: 'abc1234',
+        // worktree 模块新增字段：root（删除时的严格前缀依据）与 warnings（用户要看的告警）。
+        root: join(repoRoot, '.tmp', 'worktrees-root'),
+        warnings: ['工作区有 2 项未提交修改，不会带入 worktree'],
+        createdAt: new Date().toISOString(),
+      }
+    : undefined
+  await runstore.writeRunMeta(runsRoot, run.id, {
+    workspace: { id: '0123456789ab', path: workspace, realpath: workspace, isGit: true, gitRoot: workspace },
+    ...(worktree ? { worktree } : {}),
+  })
+  return { runsRoot, run, workspace, worktree, worktreePath }
+}
+
+/** 最小假引擎：createHandler 只要有 start / stop 就能跑路由（不做真执行）。 */
+function fakeRuntimeEngine(calls) {
+  const startCalls = calls || { start: [] }
+  return {
+    engineName: 'real',
+    async start(runId, options) { startCalls.start.push({ runId, options }); return { id: runId, status: 'running' } },
+    async stop() { return {} },
+    supervision: { register() { return {} }, unregister() { return true }, status() { return {} } },
+  }
+}
+
+await check('G6-a 只读令牌：GET 放行；POST / PUT / DELETE 一律 403（可读原因）', async () => {
+  const fullToken = 'fs-full-token-0123456789abcdef'
+  const readToken = 'fs-read-token-0123456789abcdef'
+  // 阶段一：只配只读令牌 —— 没有全权令牌也绝不能退回「同源放行」。
+  process.env[READ_AUTH_ENV] = readToken
+  try {
+    const readHeaders = { authorization: `Bearer ${readToken}` }
+    const missing = await call(route, 'GET', '/api/flow-studio/flows')
+    assert.equal(missing.status, 401, '配了只读令牌就必须带令牌')
+    const listed = await call(route, 'GET', '/api/flow-studio/flows', undefined, readHeaders)
+    assert.equal(listed.status, 200)
+    const health = await call(route, 'GET', '/api/flow-studio/health', undefined, readHeaders)
+    assert.equal(health.status, 200)
+    assert.equal(health.json.auth, 'token')
+    assert.equal(health.json.authMode, 'read')
+    assert.equal(health.json.readOnly, true)
+    assert.equal(health.json.capabilities.mode, 'read')
+    assert.equal(health.json.capabilities.write, false)
+    assert.equal(health.json.customExecutor, false)
+
+    const readCreate = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('只读令牌不该建出来'), readHeaders)
+    assert.equal(readCreate.status, 403)
+    assert.equal(readCreate.json.ok, false)
+    assert.equal(readCreate.json.code, 'READ_ONLY_TOKEN')
+    assert.match(readCreate.json.error, /只读令牌/)
+    assert.match(readCreate.json.error, /POST/)
+    // 没令牌的写请求同样是 401（不是 200）。
+    const anonymousWrite = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('匿名写'))
+    assert.equal(anonymousWrite.status, 401)
+  } finally {
+    delete process.env[READ_AUTH_ENV]
+  }
+
+  // 阶段二：全权 + 只读同时配置 —— 写请求的口径由「出示了哪个令牌」决定。
+  process.env[AUTH_ENV] = fullToken
+  process.env[READ_AUTH_ENV] = readToken
+  try {
+    const readHeaders = { authorization: `Bearer ${readToken}` }
+    const fullHeaders = { authorization: `Bearer ${fullToken}` }
+    const fullHealth = await call(route, 'GET', '/api/flow-studio/health', undefined, fullHeaders)
+    assert.equal(fullHealth.json.authMode, 'full')
+    assert.equal(fullHealth.json.readOnly, false)
+
+    const before = (await call(route, 'GET', '/api/flow-studio/flows?limit=100', undefined, fullHeaders)).json.flows.length
+    for (const [method, url, payload] of [
+      ['POST', '/api/flow-studio/flows', validFlowBody('只读令牌不该建出来')],
+      ['PUT', '/api/flow-studio/flows/flow-readonly-probe', validFlowBody('只读令牌不该改')],
+      ['DELETE', '/api/flow-studio/flows/flow-readonly-probe', undefined],
+      ['POST', '/api/flow-studio/runs', { flowId: 'flow-a', workspace: makeWorkspace('readonly') }],
+      ['POST', '/api/flow-studio/worktrees/prune', {}],
+    ]) {
+      const rejected = await call(route, method, url, payload, readHeaders)
+      assert.equal(rejected.status, 403, `${method} ${url}`)
+      assert.equal(rejected.json.code, 'READ_ONLY_TOKEN')
+      assert.match(rejected.json.error, /只读令牌/)
+      // 写请求没有产生任何副作用（列表条数不变）。
+      const now = (await call(route, 'GET', '/api/flow-studio/flows?limit=100', undefined, fullHeaders)).json.flows.length
+      assert.equal(now, before, `${method} ${url} 不能写成功`)
+    }
+
+    // 全权令牌照旧放行写请求。
+    const created = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('全权令牌写'), fullHeaders)
+    assert.equal(created.status, 200)
+    const after = (await call(route, 'GET', '/api/flow-studio/flows?limit=100', undefined, fullHeaders)).json.flows.length
+    assert.equal(after, before + 1)
+    // 只读令牌的 GET 仍然 200。
+    const readList = await call(route, 'GET', '/api/flow-studio/flows', undefined, readHeaders)
+    assert.equal(readList.status, 200)
+  } finally {
+    delete process.env[AUTH_ENV]
+    delete process.env[READ_AUTH_ENV]
+  }
+})
+
+await check('G6-a custom executor 默认被拒（保存 400 / 启动 400），主机开关打开后才放行', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const customFlowBody = {
+    name: 'custom 流程',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' },
+      {
+        id: 'b', kind: 'stage', title: '自定义执行', x: 200, y: 0, task: '做',
+        mode: 'single', executor: 'custom', executorCommand: 'echo hi',
+      },
+      { id: 'c', kind: 'end', title: '完成', x: 400, y: 0, task: 't' },
+    ],
+    edges: [
+      { id: 'e1', from: 'a', to: 'b', kind: 'next' },
+      { id: 'e2', from: 'b', to: 'c', kind: 'next' },
+    ],
+  }
+
+  // ① 保存：默认被拒（不能只在前端拦；HTTP 调用方可以绕过画布直接 POST）。
+  const blockedSave = await call(route, 'POST', '/api/flow-studio/flows', customFlowBody)
+  assert.equal(blockedSave.status, 400, JSON.stringify(blockedSave.json))
+  assert.equal(blockedSave.json.ok, false)
+  assert.equal(blockedSave.json.code, 'CUSTOM_EXECUTOR_DISABLED')
+  assert.match(blockedSave.json.error, /FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR/)
+  assert.match(blockedSave.json.error, /宿主 RCE/)
+  const unpersisted = (await call(route, 'GET', '/api/flow-studio/flows?limit=100')).json.flows
+  assert.ok(!unpersisted.some(item => item.name === 'custom 流程'), '被拒绝的保存不能落盘')
+
+  // ② 直接写盘（模拟旧数据），启动同样被拒，且不调 engine.start。
+  const saved = await store.saveFlow(store.flowsDir(home), 'flow-custom-gate', customFlowBody)
+  const calls = { start: [] }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(), engine: fakeRuntimeEngine(calls),
+    }),
+  }
+  const run = (await call(injected, 'POST', '/api/flow-studio/runs', {
+    flowId: saved.id, name: 'custom 启动', workspace: makeWorkspace('custom-gate'),
+  })).json.run
+  const blockedStart = await call(injected, 'POST', `/api/flow-studio/runs/${run.id}/start`)
+  assert.equal(blockedStart.status, 400, JSON.stringify(blockedStart.json))
+  assert.equal(blockedStart.json.code, 'CUSTOM_EXECUTOR_DISABLED')
+  assert.match(blockedStart.json.error, /FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR/)
+  assert.equal(calls.start.length, 0, '被开关拦下的流程绝不能进 engine.start')
+  assert.equal((await runstore.readRunMeta(runsRoot, run.id)).status, 'pending')
+
+  // ③ 主机开关打开：保存 200、启动 202，/health 如实报 customExecutor=true。
+  process.env[CUSTOM_EXECUTOR_ENV] = '1'
+  try {
+    const health = await call(route, 'GET', '/api/flow-studio/health')
+    assert.equal(health.json.customExecutor, true)
+    assert.equal(health.json.capabilities.customExecutor, true)
+    const allowedSave = await call(route, 'POST', '/api/flow-studio/flows', customFlowBody)
+    assert.equal(allowedSave.status, 200, JSON.stringify(allowedSave.json))
+    const allowedStart = await call(injected, 'POST', `/api/flow-studio/runs/${run.id}/start`)
+    assert.equal(allowedStart.status, 202, JSON.stringify(allowedStart.json))
+    assert.equal(calls.start.length, 1)
+  } finally {
+    delete process.env[CUSTOM_EXECUTOR_ENV]
+  }
+})
+
+await check('G6-a workspace 白名单：配置后越界创建 / 启动 → 400；根内放行；不配置维持现状', async () => {
+  const flow = (await call(route, 'GET', '/api/flow-studio/flows?limit=1')).json.flows[0]
+  const allowed = makeWorkspace('allow-root')
+  const outside = makeWorkspace('outside-root')
+  const nested = join(allowed, 'nested')
+  mkdirSync(nested, { recursive: true })
+
+  process.env[WORKSPACE_ROOTS_ENV] = `${allowed}:${join(repoRoot, '.tmp', 'no-such-root')}`
+  try {
+    const rejected = await call(route, 'POST', '/api/flow-studio/runs', { flowId: flow.id, workspace: outside })
+    assert.equal(rejected.status, 400, JSON.stringify(rejected.json))
+    assert.equal(rejected.json.code, 'workspace')
+    assert.equal(rejected.json.field, 'workspace')
+    assert.match(rejected.json.error, /允许的根目录/)
+
+    // 根自己 / 根内子目录都放行。
+    for (const workspacePath of [allowed, nested]) {
+      const ok = await call(route, 'POST', '/api/flow-studio/runs', { flowId: flow.id, workspace: workspacePath })
+      assert.equal(ok.status, 200, `${workspacePath}: ${JSON.stringify(ok.json)}`)
+    }
+
+    // 启动路径同样拦：造一个未绑定工作区的 run，再拿越界 workspace 启动。
+    const run = await runstore.createRun(runstore.runsDir(home), {
+      flowId: 'flow-a', flowName: 'A', nodeTotal: 0,
+    })
+    const startRejected = await call(route, 'POST', `/api/flow-studio/runs/${run.id}/start`, { workspace: outside })
+    assert.equal(startRejected.status, 400, JSON.stringify(startRejected.json))
+    assert.equal(startRejected.json.code, 'workspace')
+    assert.match(startRejected.json.error, /允许的根目录/)
+
+    // /health 只报「配置了几个根」，不把绝对路径泄露给 LAN。
+    const health = await call(route, 'GET', '/api/flow-studio/health')
+    assert.deepEqual(health.json.capabilities.workspaceAllowlist, { configured: true, count: 2 })
+    assert.ok(!health.body.includes(allowed), 'health 不能泄露白名单绝对路径')
+  } finally {
+    delete process.env[WORKSPACE_ROOTS_ENV]
+  }
+
+  // 不配置 = 维持现状（越界 workspace 照常 200，不打断现有部署）。
+  const after = await call(route, 'POST', '/api/flow-studio/runs', { flowId: flow.id, workspace: outside })
+  assert.equal(after.status, 200, JSON.stringify(after.json))
+})
+
+await check('G6-a /health 反映能力：authMode / readOnly / customExecutor / workspaceAllowlist / 默认时限', async () => {
+  const plain = await call(route, 'GET', '/api/flow-studio/health')
+  assert.equal(plain.status, 200)
+  assert.equal(plain.json.auth, 'connection', '未配置 token 时旧字段保持 connection')
+  assert.equal(plain.json.authMode, 'connection')
+  assert.equal(plain.json.readOnly, false)
+  assert.equal(plain.json.customExecutor, false)
+  assert.equal(plain.json.capabilities.write, true)
+  assert.deepEqual(plain.json.capabilities.workspaceAllowlist, { configured: false, count: 0 })
+  assert.equal(plain.json.limits.defaultRunTimeoutMs, 2 * 60 * 60 * 1000)
+  assert.equal(plain.json.limits.defaultNodeTimeoutMs, 20 * 60 * 1000)
+
+  process.env[CUSTOM_EXECUTOR_ENV] = '1'
+  process.env[WORKSPACE_ROOTS_ENV] = repoRoot
+  try {
+    const on = await call(route, 'GET', '/api/flow-studio/health')
+    assert.equal(on.json.customExecutor, true)
+    assert.deepEqual(on.json.capabilities.workspaceAllowlist, { configured: true, count: 1 })
+  } finally {
+    delete process.env[CUSTOM_EXECUTOR_ENV]
+    delete process.env[WORKSPACE_ROOTS_ENV]
+  }
+})
+
+console.log('G6-b · worktree 生命周期入口')
+
+await check('G6-b GET /runs/<id> 带 worktreeStatus（inspectWorktree 桩；失败 → unknown）', async () => {
+  const { runsRoot, run, workspace, worktree } = await seedWorktreeRun('wt-status')
+  const inspected = []
+  const stub = {
+    async inspectWorktree(input) {
+      inspected.push(input)
+      return { exists: true, dirty: true, head: 'deadbeef' }
+    },
+  }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: stub,
+    }),
+  }
+  const detail = await call(injected, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(detail.status, 200)
+  assert.deepEqual(detail.json.worktreeStatus, {
+    enabled: true, exists: true, dirty: true, head: 'deadbeef',
+  })
+  assert.equal(inspected.length, 1)
+  assert.equal(inspected[0].record.path, worktree.path)
+  assert.equal(inspected[0].workspace.realpath, workspace)
+  // GET /runs/<id> 的 run.worktree 要带上模块新增的 root / warnings（前端展示原因与告警）。
+  assert.equal(detail.json.run.worktree.root, join(repoRoot, '.tmp', 'worktrees-root'))
+  assert.deepEqual(detail.json.run.worktree.warnings, ['工作区有 2 项未提交修改，不会带入 worktree'])
+
+  // inspectWorktree 抛错 / 返回非法 → {unknown:true, reason}，不假装「目录不存在」。
+  const broken = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(),
+      worktree: { async inspectWorktree() { throw new Error('git 不可用') } },
+    }),
+  }
+  const failed = await call(broken, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(failed.status, 200)
+  assert.equal(failed.json.worktreeStatus.unknown, true)
+  assert.match(failed.json.worktreeStatus.reason, /git 不可用/)
+
+  // 没有 worktree 记录的 run：unknown + 可读 reason（真实模块路径）。
+  const { run: bare } = await seedWorktreeRun('wt-bare', { record: false })
+  const bareDetail = await call(route, 'GET', `/api/flow-studio/runs/${bare.id}`)
+  assert.equal(bareDetail.status, 200)
+  assert.equal(bareDetail.json.worktreeStatus.unknown, true)
+  assert.equal(bareDetail.json.worktreeStatus.reason, 'no-worktree-record')
+})
+
+await check('G6-b DELETE /runs/<id>/worktree：调 removeWorktree 返回 {ok, removed, reason}；404 / 租约 409 / 无记录给可读原因', async () => {
+  const { runsRoot, run, worktree } = await seedWorktreeRun('wt-delete')
+  const calls = []
+  const stub = {
+    async removeWorktree(input) {
+      calls.push(input)
+      return { removed: true, reason: 'removed', path: input.record.path }
+    },
+  }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: stub,
+    }),
+  }
+  const removed = await call(injected, 'DELETE', `/api/flow-studio/runs/${run.id}/worktree`)
+  assert.equal(removed.status, 200, JSON.stringify(removed.json))
+  assert.equal(removed.json.ok, true)
+  assert.equal(removed.json.removed, true)
+  assert.equal(removed.json.reason, 'removed')
+  assert.equal(removed.json.branch, worktree.branch)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].record.path, worktree.path)
+  assert.equal(calls[0].root, join(dirname(runsRoot), 'worktrees'), '显式传 worktrees 根做前缀校验')
+  assert.equal(calls[0].force, true, '路由语义是「明确删除」→ 必须 force:true（脏 / 被 lock 也删）')
+  assert.equal(calls[0].workspace.id, '0123456789ab', '传 run.json.workspace')
+
+  // run 不存在 → 404。
+  const missing = await call(injected, 'DELETE', '/api/flow-studio/runs/r-does-not-exist/worktree')
+  assert.equal(missing.status, 404)
+  assert.match(missing.json.error, /run 不存在/)
+
+  // 没有 worktree 记录 → 200 + removed:false + 可读原因（不是静默成功）。
+  const { run: bare } = await seedWorktreeRun('wt-delete-bare', { record: false })
+  const noRecord = await call(injected, 'DELETE', `/api/flow-studio/runs/${bare.id}/worktree`)
+  assert.equal(noRecord.status, 200)
+  assert.equal(noRecord.json.ok, true)
+  assert.equal(noRecord.json.removed, false)
+  assert.equal(noRecord.json.reason, 'no-worktree')
+  assert.match(noRecord.json.error, /没有可删除的 worktree 记录/)
+
+  // 持租约（正在跑）→ 409 + 可读原因，不调 removeWorktree。
+  const { run: leased } = await seedWorktreeRun('wt-delete-lease')
+  await runstore.claimLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  try {
+    const blocked = await call(injected, 'DELETE', `/api/flow-studio/runs/${leased.id}/worktree`)
+    assert.equal(blocked.status, 409)
+    assert.match(blocked.json.error, /租约/)
+    assert.equal(calls.length, 1, '运行中的 run 不能删 worktree')
+  } finally {
+    await runstore.releaseLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host' })
+  }
+
+  // 模块没有 removeWorktree 导出 → 501（不假装删过）。
+  const unsupported = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: {},
+    }),
+  }
+  const notImplemented = await call(unsupported, 'DELETE', `/api/flow-studio/runs/${run.id}/worktree`)
+  assert.equal(notImplemented.status, 501)
+  assert.match(notImplemented.json.error, /removeWorktree/)
+})
+
+await check('G6-b DELETE /runs/<id>/worktree：目录已被手工删过（not-found）时补一刀清分支', async () => {
+  // 审计点名的「只增不减」最后一条尾巴：目录没了、flow/<runId> 分支还在。
+  // 路由在 removeWorktree 返回 not-found 时会再调 removeRunBranch，且分支清理失败不影响删除结论。
+  const { runsRoot, run, worktree } = await seedWorktreeRun('wt-delete-gone')
+  const branchCalls = []
+  const stub = {
+    async removeWorktree() {
+      return { removed: false, reason: 'not-found' }
+    },
+    async removeRunBranch(input) {
+      branchCalls.push(input)
+      return { removed: true, branch: input.branch, warning: null }
+    },
+  }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: stub,
+    }),
+  }
+  const response = await call(injected, 'DELETE', `/api/flow-studio/runs/${run.id}/worktree`)
+  assert.equal(response.status, 200, JSON.stringify(response.json))
+  assert.equal(response.json.removed, false)
+  assert.equal(response.json.reason, 'not-found')
+  assert.equal(response.json.branchRemoved, true, '目录已不在时必须补删分支')
+  assert.equal(branchCalls.length, 1)
+  assert.equal(branchCalls[0].branch, worktree.branch)
+  assert.equal(branchCalls[0].workspace.id, '0123456789ab', '传 run.json.workspace（{path} 形状也可）')
+
+  // 分支删不掉（非 flow/ 前缀 / 主仓库已删）→ 只给 warning，不让接口失败。
+  const warningStub = {
+    async removeWorktree() {
+      return { removed: false, reason: 'not-found' }
+    },
+    async removeRunBranch(input) {
+      return { removed: false, branch: input.branch, warning: '分支 flow/x 不存在，未删除' }
+    },
+  }
+  const withWarning = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot: join(home, 'runs-wt-warning'), ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: warningStub,
+    }),
+  }
+  const runsRoot2 = join(home, 'runs-wt-warning')
+  const seeded = await runstore.createRun(runsRoot2, { flowId: 'flow-w', flowName: 'W', nodeTotal: 1 })
+  await runstore.writeRunMeta(runsRoot2, seeded.id, {
+    workspace: { id: '0123456789ab', path: '/repo', realpath: '/repo', isGit: true, gitRoot: '/repo' },
+    worktree: { enabled: true, reason: 'git-workspace', decidedBy: 'initiator', path: '/wt/w', branch: 'flow/w', root: join(home, 'worktrees') },
+  })
+  const warned = await call(withWarning, 'DELETE', `/api/flow-studio/runs/${seeded.id}/worktree`)
+  assert.equal(warned.status, 200)
+  assert.equal(warned.json.removed, false)
+  assert.equal(warned.json.branchRemoved, false)
+  assert.match(String(warned.json.branchWarning || ''), /不存在/)
+})
+
+await check('G6-b GET /worktrees 与 POST /worktrees/prune（listWorktrees / pruneWorktrees 桩）', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const existing = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 1 })
+  const listCalls = []
+  const pruneCalls = []
+  const stub = {
+    async listWorktrees(input) {
+      listCalls.push(input)
+      return [
+        {
+          path: `/wt/${existing.id}`, workspaceId: '0123456789ab', runId: existing.id,
+          exists: true, dirty: false, head: 'aaa111', registered: true,
+        },
+        {
+          path: '/wt/r-orphan-probe', workspaceId: '0123456789ab', runId: 'r-orphan-probe',
+          exists: false, dirty: null, head: null, registered: false,
+        },
+      ]
+    },
+    async pruneWorktrees(input) {
+      pruneCalls.push(input)
+      return {
+        removed: [{ path: '/wt/r-orphan-probe', workspaceId: '0123456789ab', runId: 'r-orphan-probe' }],
+        skipped: [{ path: '/wt/r-keep', reason: 'remove-failed' }],
+      }
+    },
+  }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(), worktree: stub,
+    }),
+  }
+
+  const listed = await call(injected, 'GET', '/api/flow-studio/worktrees')
+  assert.equal(listed.status, 200, JSON.stringify(listed.json))
+  assert.equal(listed.json.ok, true)
+  assert.equal(listed.json.available, true)
+  assert.equal(listed.json.worktrees.length, 2)
+  assert.equal(listed.json.worktrees.find(row => row.runId === existing.id).orphan, false)
+  assert.equal(listed.json.worktrees.find(row => row.runId === 'r-orphan-probe').orphan, true)
+  assert.deepEqual(listed.json.orphans.map(row => row.runId), ['r-orphan-probe'])
+  assert.equal(listCalls.length, 1)
+  assert.equal(listCalls[0].root, join(dirname(runsRoot), 'worktrees'))
+
+  const pruned = await call(injected, 'POST', '/api/flow-studio/worktrees/prune', {
+    keepRunIds: ['r-manual-keep'],
+  })
+  assert.equal(pruned.status, 200, JSON.stringify(pruned.json))
+  assert.equal(pruned.json.ok, true)
+  assert.deepEqual(pruned.json.removed.map(item => item.path), ['/wt/r-orphan-probe'])
+  assert.equal(pruned.json.skipped.length, 1)
+  assert.equal(pruneCalls.length, 1)
+  assert.equal(pruneCalls[0].root, join(dirname(runsRoot), 'worktrees'))
+  assert.ok(pruneCalls[0].keepRunIds.includes(existing.id), '现有 run 必须自动保留')
+  assert.ok(pruneCalls[0].keepRunIds.includes('r-manual-keep'), '额外 keepRunIds 要透传')
+  assert.equal(pruned.json.keepRunIds, pruneCalls[0].keepRunIds.length)
+
+  // 非法 keepRunIds → 400（可读），不调 pruneWorktrees。
+  const bad = await call(injected, 'POST', '/api/flow-studio/worktrees/prune', { keepRunIds: ['../etc/passwd'] })
+  assert.equal(bad.status, 400)
+  assert.equal(bad.json.field, 'keepRunIds')
+  assert.equal(pruneCalls.length, 1)
+})
+
+await check('G6-b DELETE /runs/<id> 保留 worktree 指针进孤儿清单，并在响应提示单独清理', async () => {
+  const { runsRoot, run, worktree, worktreePath } = await seedWorktreeRun('wt-orphan')
+  const deleted = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(deleted.status, 200, JSON.stringify(deleted.json))
+  assert.equal(deleted.json.ok, true)
+  assert.equal(deleted.json.worktree.path, worktreePath)
+  assert.equal(deleted.json.worktree.branch, worktree.branch)
+  assert.equal(deleted.json.worktree.workspaceId, '0123456789ab')
+  assert.equal(deleted.json.worktree.orphaned, true)
+  assert.match(deleted.json.hint, /单独清理/)
+  assert.match(deleted.json.hint, /worktrees\/prune/)
+  assert.ok(!existsSync(join(runsRoot, run.id)), 'run 目录照常删除')
+
+  // 孤儿指针可查询（即使 listWorktrees 还没落地，recorded 也必须在）。
+  const listed = await call(route, 'GET', '/api/flow-studio/worktrees')
+  assert.equal(listed.status, 200)
+  assert.equal(typeof listed.json.available, 'boolean')
+  if (listed.json.available === false) {
+    assert.match(listed.json.reason, /listWorktrees|尚未落地/)
+  }
+  const recorded = listed.json.recorded.find(item => item.runId === run.id)
+  assert.ok(recorded, 'worktree 指针不能跟着 run 目录一起消失')
+  assert.equal(recorded.path, worktreePath)
+  assert.equal(recorded.branch, worktree.branch)
+  assert.equal(recorded.workspaceId, '0123456789ab')
+
+  // 真实模块已导出 pruneWorktrees：prune 路由能跑通；这个孤儿目录本来就不存在，
+  // 清理后 recorded 指针同步移除（不再需要人工清理）。
+  const pruned = await call(route, 'POST', '/api/flow-studio/worktrees/prune', {})
+  assert.equal(pruned.status, 200, JSON.stringify(pruned.json))
+  assert.ok(Array.isArray(pruned.json.removed))
+  assert.ok(Array.isArray(pruned.json.skipped))
+  assert.deepEqual(pruned.json.recorded.map(item => item.runId), [])
+
+  // 没有 worktree 的 run：不写孤儿、不提示。
+  const { run: bare } = await seedWorktreeRun('wt-orphan-bare', { record: false })
+  const plain = await call(route, 'DELETE', `/api/flow-studio/runs/${bare.id}`)
+  assert.equal(plain.status, 200)
+  assert.equal(plain.json.worktree, undefined)
+  assert.equal(plain.json.hint, undefined)
+})
+
+console.log('G6-c · runTimeoutMs / nodeTimeoutMs 透传')
+
+await check('G6-c POST /runs/<id>/start 接受 runTimeoutMs / nodeTimeoutMs 并透传；非法值 400', async () => {
+  const runsRoot = runstore.runsDir(home)
+  // 用一份「开始 → 阶段 → 完成」的合法流程（默认 dsh executor；不能借用上面刚建的 custom 流程）。
+  const flow = await store.saveFlow(store.flowsDir(home), 'flow-timeout-probe', {
+    name: '超时透传',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' },
+      { id: 'b', kind: 'stage', title: '阶段', x: 200, y: 0, task: '做', mode: 'single' },
+      { id: 'c', kind: 'end', title: '完成', x: 400, y: 0, task: '' },
+    ],
+    edges: [
+      { id: 'e1', from: 'a', to: 'b', kind: 'next' },
+      { id: 'e2', from: 'b', to: 'c', kind: 'next' },
+    ],
+  })
+  const calls = { start: [] }
+  const injected = {
+    handler: createHandler({
+      dir: store.flowsDir(home), runsRoot, ctx, startOptions: new Map(),
+      engine: fakeRuntimeEngine(calls),
+    }),
+  }
+  const workspace = makeWorkspace('timeouts')
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  const started = await call(injected, 'POST', `/api/flow-studio/runs/${run.id}/start`, {
+    workspace,
+    runTimeoutMs: 6 * 60 * 60 * 1000,
+    nodeTimeoutMs: 30 * 60 * 1000,
+  })
+  assert.equal(started.status, 202, JSON.stringify(started.json))
+  assert.equal(calls.start.length, 1)
+  assert.deepEqual(calls.start[0].options, {
+    workspace,
+    runTimeoutMs: 6 * 60 * 60 * 1000,
+    nodeTimeoutMs: 30 * 60 * 1000,
+  })
+
+  // 非法值：一律 400（可读原因），不调 engine.start，run 保持 pending。
+  const rejectedRun = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  const cases = [
+    ['runTimeoutMs', 0],
+    ['runTimeoutMs', -5],
+    ['runTimeoutMs', 1.5],
+    ['runTimeoutMs', '60000'],
+    ['runTimeoutMs', MAX_TIMEOUT_MS + 1],
+    ['nodeTimeoutMs', true],
+  ]
+  for (const [field, value] of cases) {
+    const rejected = await call(injected, 'POST', `/api/flow-studio/runs/${rejectedRun.id}/start`, {
+      workspace, [field]: value,
+    })
+    assert.equal(rejected.status, 400, `${field}=${String(value)}`)
+    assert.equal(rejected.json.ok, false)
+    assert.equal(rejected.json.field, field)
+    assert.match(rejected.json.error, /正整数|上限/)
+    assert.equal(calls.start.length, 1, `${field}=${String(value)} 不能进 engine.start`)
+    assert.equal((await runstore.readRunMeta(runsRoot, rejectedRun.id)).status, 'pending')
+  }
+})
+
+console.log('G7 · GET /runs/<id>?light=1（只读 run.json，不解析事件）')
+
+await check('G7 light=1 不读事件文件：run.jsonl 不可读时仍 200，完整接口 500；字段集与老接口不变', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const { run, worktreePath } = await seedWorktreeRun('light')
+  const runDir = join(runsRoot, run.id)
+  // 先造一条真实事件（run.jsonl），再把 run.jsonl 换成目录：
+  // 任何事件读取都会 EISDIR 抛错 —— 这正是「light 有没有偷偷读事件」的探针。
+  writeFileSync(join(runDir, 'run.jsonl'), `${JSON.stringify({
+    v: 1,
+    ts: '2026-11-06T00:00:00.000Z',
+    kind: 'message/in',
+    traceId: 'probe',
+    data: { text: 'hi' },
+  })}\n`)
+  await runstore.writeRunMeta(runsRoot, run.id, {
+    status: 'running',
+    started: true,
+    startedAt: '2026-11-06T00:00:00.000Z',
+    eventCount: 1,
+    live: {
+      currentNodeId: 'n_a',
+      nodeTitle: '阶段 A',
+      nodeMode: 'single',
+      attempt: 1,
+      round: 1,
+      since: '2026-11-06T00:00:00.000Z',
+      lastEventSeq: 1,
+      phase: 'model',
+    },
+    nodeStatus: {
+      n_a: { state: 'working', progress: 30, summary: '正在做', verdict: null, at: '2026-11-06T00:00:00.000Z' },
+    },
+    sessionMode: 'top-level',
+    supervision: { enabled: true, wakerSessionId: 'session-light', wakes: 1 },
+  })
+  rmSync(join(runDir, 'run.jsonl'), { force: true })
+  mkdirSync(join(runDir, 'run.jsonl'))
+
+  const light = await call(route, 'GET', `/api/flow-studio/runs/${run.id}?light=1`)
+  assert.equal(light.status, 200, JSON.stringify(light.json))
+  assert.equal(light.json.ok, true)
+  const lightRun = light.json.run
+  const requiredFields = [
+    'id', 'flowId', 'flowName', 'name', 'status', 'started', 'startedAt', 'endedAt',
+    'nodeDone', 'nodeTotal', 'tokenTotal', 'engine', 'live', 'nodeStatus', 'workspace',
+    'worktree', 'sessionMode', 'supervision',
+  ]
+  for (const field of requiredFields) {
+    assert.ok(Object.hasOwn(lightRun, field), `light run 缺少字段 ${field}`)
+  }
+  // 不返回 nodes / events，也不返回完整接口的 nodes / eventCount 顶层字段。
+  assert.equal(Object.hasOwn(lightRun, 'nodes'), false)
+  assert.equal(Object.hasOwn(lightRun, 'events'), false)
+  assert.equal(Object.hasOwn(light.json, 'nodes'), false)
+  // live 原样来自 run.json。
+  assert.equal(lightRun.live.currentNodeId, 'n_a')
+  assert.equal(lightRun.live.phase, 'model')
+  // nodeStatus / workspace / worktree 都在。
+  assert.equal(lightRun.nodeStatus.n_a.state, 'working')
+  assert.equal(lightRun.workspace.realpath, lightRun.workspace.path)
+  assert.deepEqual(lightRun.worktree, {
+    enabled: true,
+    reason: 'git-workspace',
+    path: worktreePath,
+    branch: `flow/${run.id}`,
+    // worktree 模块新增字段：前端要展示「为什么需要单独清理 / 有哪些告警」。
+    root: join(repoRoot, '.tmp', 'worktrees-root'),
+    baseCommit: 'abc1234',
+    warnings: ['工作区有 2 项未提交修改，不会带入 worktree'],
+  })
+  assert.equal(lightRun.sessionMode, 'top-level')
+  assert.equal(lightRun.supervision.enabled, true)
+  // eventCount 来自 run.json 计数器（不解析事件）。
+  assert.equal(lightRun.eventCount, 1)
+
+  // 空仓库：worktree.baseCommit 可能是 null —— light 必须容忍（不做 40 位 hex 校验）。
+  const { run: emptyRepoRun, worktree: emptyRepoWorktree } = await seedWorktreeRun('light-empty-repo')
+  await runstore.writeRunMeta(runsRoot, emptyRepoRun.id, {
+    worktree: { ...emptyRepoWorktree, baseCommit: null },
+  })
+  const emptyLight = await call(route, 'GET', `/api/flow-studio/runs/${emptyRepoRun.id}?light=1`)
+  assert.equal(emptyLight.status, 200)
+  assert.equal(emptyLight.json.run.worktree.baseCommit, null)
+
+  // 完整接口要读事件 → run.jsonl 是目录 → 500（证明 light 确实绕开了事件读取）。
+  const full = await call(route, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(full.status, 500)
+
+  // 恢复后老接口行为不变（nodes 照旧返回）。
+  rmSync(join(runDir, 'run.jsonl'), { recursive: true, force: true })
+  writeFileSync(join(runDir, 'run.jsonl'), `${JSON.stringify({
+    v: 1,
+    ts: '2026-11-06T00:00:00.000Z',
+    kind: 'message/in',
+    traceId: 'probe',
+    data: { text: 'hi' },
+  })}\n`)
+  const fullOk = await call(route, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(fullOk.status, 200)
+  assert.ok(Array.isArray(fullOk.json.nodes), '老接口仍然返回 nodes')
+
+  // 不存在的 run → 404（light 同样）。
+  const missing = await call(route, 'GET', '/api/flow-studio/runs/r-nope-404?light=1')
+  assert.equal(missing.status, 404)
 })
 
 console.log('E3-b · 外部 events 通道只收观测类事件')

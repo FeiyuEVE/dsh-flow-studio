@@ -490,8 +490,13 @@ try {
     const tools = createFlowTools({
       flowsRoot, runsRoot, engine, ctx: makeCtxWithAgents(agents),
     })
-    // v0.7 新增 flow_supervise（内建 supervision 开关）：工具数 6 → 7。
-    A.equal(tools.length, 7)
+    // 断言完整工具集合（比数字更强）：v0.7 加 flow_supervise、v0.8.2 加 flow_worktrees。
+    // 用集合比对，以后新增工具不会因为一条计数断言就红。
+    A.deepEqual(
+      tools.map(tool => tool.name).sort(),
+      ['flow_list', 'flow_reply', 'flow_send_message', 'flow_start',
+        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+    )
     const reply = tools.find(tool => tool.name === 'flow_reply')
     const send = tools.find(tool => tool.name === 'flow_send_message')
     A.ok(reply && send)

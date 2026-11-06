@@ -39,10 +39,26 @@
  *   2. codex 参数：只按 `codex exec --help`（0.166.0）真实支持的写法拼 argv；
  *   3. 运行：逐行消费 JSONL、归一化事件与用量、超时 / abort / 非 0 退出各自收口。
  *
+ * ## 进程组与收尾（外部 executor 的生命周期契约）
+ *
+ * custom 是 `sh -c <模板>`：模板里的管道 / 后台命令会派生**孙进程**，它们同样继承
+ * stdout / stderr 管道。历史缺陷：timeout / abort 只对直接子进程发 SIGTERM（250ms 后
+ * SIGKILL），孙进程会变成孤儿继续跑（继续改 worktree、占 CPU），遗留的管道还会让宿主
+ * 进程一直持有 fd、吊住事件循环。
+ *
+ * 现在的做法：
+ *   - spawn 时 `detached: true`（POSIX）：子进程 `setsid()` 成为新会话 / 新进程组的组长，
+ *     `sh -c` 派生的所有孙进程都落在同一个进程组（pgid = 直接子进程 pid）；
+ *   - abort / timeout 时 `process.kill(-child.pid, 'SIGTERM')`，`KILL_GRACE_MS` 后
+ *     `process.kill(-child.pid, 'SIGKILL')`；
+ *   - 无法用进程组时优雅退化（Windows、无权限、注入的非真实 ChildProcess）：只杀直接
+ *     子进程，不抛错，但把降级原因记进结果（`killScope` / `orphanWarning`）与一条 warn 日志；
+ *   - `finish()` 统一 `destroy()` 子进程的 stdout / stderr，任何收口路径都不把管道留给宿主。
+ *
  * @module @feiyueve/dsh-flow-studio/executor
  */
 
-import { spawn as spawnProcess } from 'node:child_process'
+import { ChildProcess, spawn as spawnProcess } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -61,6 +77,16 @@ const STDERR_TAIL_MAX = 2000
 
 /** 超时 / abort 后先 SIGTERM，再给 250ms 宽限 SIGKILL。 */
 const KILL_GRACE_MS = 250
+
+/**
+ * 是否用 `detached: true` 让子进程成为新进程组的组长。
+ *
+ * POSIX：`detached` 让子进程 `setsid()`，`sh -c` 派生的孙进程全部继承同一个 pgid，
+ * 终止时 `process.kill(-pid, …)` 才能一次杀干净整组。
+ * Windows：没有 POSIX 进程组语义，`detached` 只会另开控制台窗口，反而改变行为；
+ * 这里显式退化——只杀直接子进程，并在结果里记 `orphanWarning`。
+ */
+const CAN_DETACH = process.platform !== 'win32'
 
 /** 构造带 code 的非法配置错误；上层按 `error.code === 'EXECUTOR_INVALID'` 分流。 */
 function executorInvalid(message) {
@@ -515,8 +541,10 @@ function tailOf(value, max) {
  * 小 prompt 的 `FLOW_STUDIO_PROMPT`（≤64KiB 兼容）/ 子进程 stdin（全文兜底）；
  * 命令模板里只有读文件的命令替换 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`，
  * 绝无 prompt 文本参与 shell 解析。临时文件在本次执行收口时删除。
- * 返回 `{ ok, text, structured, exitCode, usage, events }`；失败时追加
- * `reason`（timeout / aborted / exit / spawn），非 0 退出再带 `tail`。
+ * 返回 `{ ok, text, structured, exitCode, usage, events, killScope, orphanWarning }`；
+ * 失败时追加 `reason`（timeout / aborted / exit / spawn），非 0 退出再带 `tail`。
+ * `killScope`：`'group'` = 按进程组终止（孙进程一起），`'process'` = 只终止了直接子进程，
+ * `null` = 本次没有发生终止；`orphanWarning`：非 null 时说明进程组不可用、孙进程可能残留。
  *
  * @param {{
  *   spec: {kind:string, command?:string, model?:string, schemaPath?:string, sandbox?:string},
@@ -529,7 +557,7 @@ function tailOf(value, max) {
  * }} options
  * @returns {Promise<{ok:boolean, text:string, structured:object|null, exitCode:number|null,
  *   usage:{input:number,output:number,total:number}|null, events:object[], reason?:string,
- *   tail?:string, message?:string}>}
+ *   tail?:string, message?:string, killScope:'group'|'process'|null, orphanWarning:string|null}>}
  */
 export async function runExternalExecutor({
   spec,
@@ -564,6 +592,18 @@ export async function runExternalExecutor({
   let interruptReason = null
   let child = null
   let timer = null
+  /**
+   * 本次终止的范围：`'group'` = 杀了整组（含孙进程），`'process'` = 只杀了直接子进程，
+   * `null` = 没有发生终止（成功 / 非 0 退出等自然收口）。结果对象里原样透出。
+   */
+  let killScope = null
+  /**
+   * 进程组不可用时的降级说明（中文，null 表示本次执行对整组有把握）。
+   * Windows / 注入的非真实 ChildProcess / 组信号失败都会记在这里，绝不抛错。
+   */
+  let orphanWarning = CAN_DETACH
+    ? null
+    : '当前平台（Windows）不支持 POSIX 进程组：abort / 超时只能终止直接子进程，孙进程可能残留。'
 
   const emit = (event) => {
     events.push(event)
@@ -594,14 +634,78 @@ export async function runExternalExecutor({
     }
   }
 
+  /**
+   * 本次子进程能否按「整组」终止。
+   *
+   * 三个条件缺一不可：
+   *   1. POSIX 且 spawn 时传了 `detached: true`（子进程才是新会话 / 进程组组长）；
+   *   2. `pid` 是有效正整数；
+   *   3. 是真 `ChildProcess`——注入的测试桩（EventEmitter 形状）没有真实进程组，
+   *      贸然 `process.kill(-pid)` 可能误伤同号的无关系进程组。
+   */
+  const groupKillCapable = () => CAN_DETACH
+    && Boolean(child)
+    && Number.isInteger(child.pid)
+    && child.pid > 0
+    && child instanceof ChildProcess
+
+  /** 向子进程所在进程组发信号；只回报结果，绝不抛错。 */
+  const signalGroup = (signalName) => {
+    try {
+      process.kill(-child.pid, signalName)
+      return { ok: true, code: null }
+    } catch (error) {
+      return {
+        ok: false,
+        code: error && error.code ? String(error.code) : 'UNKNOWN',
+        message: error && error.message ? String(error.message) : String(error),
+      }
+    }
+  }
+
   const killChild = () => {
     if (!child || typeof child.kill !== 'function') return
-    try {
-      child.kill('SIGTERM')
-    } catch {
-      // 已经退出就忽略。
+    // 先按整组杀：custom 是 `sh -c`，孙进程和直接子进程在同一个 pgid 里。
+    let groupOk = false
+    if (groupKillCapable()) {
+      const term = signalGroup('SIGTERM')
+      if (term.ok) {
+        groupOk = true
+        killScope = 'group'
+      } else if (term.code !== 'ESRCH') {
+        // ESRCH = 组已经不存在（子进程先一步退出），不算降级；其余（EPERM / EINVAL …）
+        // 才说明进程组不可用，退回只杀直接子进程并明确记下来。
+        orphanWarning = `无法按进程组发送 SIGTERM（${term.code}）：已降级为只终止直接子进程，孙进程可能残留。`
+        emit({ kind: 'log', text: orphanWarning, level: 'warn' })
+      }
+    } else if (!orphanWarning) {
+      // 平台能 detach、但拿到的不是真实 ChildProcess（例如注入了自定义 spawn 桩）：
+      // 没有可信的进程组可杀，只能退化并留痕。
+      orphanWarning = '子进程不是真实的 ChildProcess（注入了自定义 spawn）：无法按进程组终止，只能终止直接子进程，孙进程可能残留。'
+      emit({ kind: 'log', text: orphanWarning, level: 'warn' })
+    }
+
+    if (!groupOk) {
+      killScope = 'process'
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        // 已经退出就忽略。
+      }
     }
     const killer = setTimeout(() => {
+      if (groupOk) {
+        const hard = signalGroup('SIGKILL')
+        // 组信号失败时仍兜底打直接子进程（尽力而为，不改变已经记下的 killScope）。
+        if (!hard.ok) {
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // 已经退出就忽略。
+          }
+        }
+        return
+      }
       try {
         child.kill('SIGKILL')
       } catch {
@@ -609,6 +713,25 @@ export async function runExternalExecutor({
       }
     }, KILL_GRACE_MS)
     if (killer && typeof killer.unref === 'function') killer.unref()
+  }
+
+  /**
+   * 收尾时断开子进程的 stdout / stderr 管道。
+   *
+   * 为什么必须做：管道读端是宿主的 fd。孙进程若还活着（降级路径）或进程组信号尚未落地，
+   * 一直开着的读端会让宿主的事件循环无法退出（实测能吊住 60s+）。destroy 之后宿主不再
+   * 持有这些 fd，与子进程 / 孙进程是否仍在完全解耦。
+   */
+  const destroyStdio = () => {
+    if (!child) return
+    for (const stream of [child.stdout, child.stderr]) {
+      if (!stream || typeof stream.destroy !== 'function') continue
+      try {
+        stream.destroy()
+      } catch {
+        // 已经关闭的流再 destroy 无害，失败也不影响结果。
+      }
+    }
   }
 
   // 先把命令与 argv 算好：配置错误在起进程之前就以 EXECUTOR_INVALID 抛出。
@@ -660,9 +783,14 @@ export async function runExternalExecutor({
         signal.removeEventListener('abort', onAbort)
       }
       // 所有收口路径都经过这里：成功 / 非 0 退出 / 超时 / abort / spawn 失败。
+      // 先断开 stdout / stderr 管道，再删 prompt 临时文件，最后 resolve：
+      // 任何路径都不把子进程的 fd 留给宿主事件循环（见 destroyStdio 注释）。
+      destroyStdio()
       removePromptFile(promptFile)
       promptFile = null
-      resolve(result)
+      // killScope / orphanWarning 是本次执行的可观测结论：杀的是整组还是只杀了直接
+      // 子进程、有没有可能残留孙进程。调用方（及日志）据此判断收尾是否彻底。
+      resolve({ ...result, killScope, orphanWarning })
     }
 
     const failWith = (reason, extra = {}) => {
@@ -727,10 +855,13 @@ export async function runExternalExecutor({
           // 这里显式 delete，防止父进程同名变量泄漏进来。
           delete env[CUSTOM_PROMPT_ENV]
         }
-        child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+        // detached：POSIX 上把子进程变成新进程组组长，`sh -c` 派生的孙进程共享
+        // 这个 pgid，abort / timeout 时才能真正「杀整组」（见模块顶部进程组契约）。
+        child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: CAN_DETACH })
       } else {
-        // codex 行为保持不变：prompt 走 argv，不写 stdin、不注入 custom 的环境变量。
-        child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        // codex 行为保持不变：prompt 走 argv，不写 stdin、不注入 custom 的环境变量；
+        // 只额外加 detached（进程组）与统一的管道收尾。
+        child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: CAN_DETACH })
       }
     } catch (error) {
       failWith('spawn', { message: error && error.message ? error.message : String(error) })

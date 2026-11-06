@@ -19,14 +19,14 @@ import {
 
 import { EDGE_KIND, EXEC_MODE, NODE_KIND, NODE_W } from '../model.js'
 import {
-  COL_STEP, FIT_MAX, FIT_MIN, assignRejectLanes, hiddenColumnsOf, lodOf,
-  nextPath, nodeHeight, rejectPath, rejectPathRects,
+  COL_STEP, FIT_MAX, FIT_MIN, SNAP_GRID, assignRejectLanes, hiddenColumnsOf, lodOf,
+  nextPath, nodeHeight, rejectPath, rejectPathRects, snapPosition,
 } from './geometry.js'
 import { cx, h, rt } from './runtime.js'
 
 /** 与旧画布一致的缩放上限；下限与 fit 地板同源。 */
 const ZOOM_MAX = 2
-const SNAP = 4
+const SNAP = SNAP_GRID
 /** 静态回退用固定视口，保证 SSR 字符串确定（不读任何 DOM 度量）。 */
 const STATIC_VIEW = { x: 48, y: 24, z: 0.92 }
 const LOD_LABEL = { near: '完整视图', mid: '紧凑视图', far: '精简视图' }
@@ -50,6 +50,14 @@ export function guardStructureEdit(locked, run) {
     if (locked) return undefined
     return run(...args)
   }
+}
+
+/**
+ * G5-e：Alt（macOS 的 Option）按下时临时关闭网格吸附。
+ * 返回 React Flow 的 `snapToGrid` 开关；拖拽落位（createDragHandlers）与这个开关同源。
+ */
+export function snapToGridEnabled(altHeld) {
+  return altHeld !== true
 }
 
 /** 运行中锁结构时，React Flow 的交互开关必须整体一致（测试与组件共用同一份口径）。 */
@@ -806,31 +814,53 @@ export function createNodeDecorator(options = {}) {
 }
 
 /**
- * 拖拽提交器（缺陷 7）。
+ * 拖拽提交器（缺陷 7 + G5-e）。
  *
  * React Flow 在拖动中通过 onNodesChange 更新自己的受控节点数组，**不经过这里**；
  * `onNodeDrag` 只记最新位置，绝不调用页面回调，所以拖动多少帧都不会写顶层 flow、
- * 不会触发自动保存 / localStorage。`onNodeDragStop` 恰好提交一次最终位置（取整）。
+ * 不会触发自动保存 / localStorage。`onNodeDragStop` 恰好提交一次最终位置。
+ *
+ * G5-e：按住 Alt（macOS 的 Option）时绕过 4px 吸附，自由落位但取整到 1px；
+ * 松开 Alt 后恢复吸附。React Flow 自己的 `snapToGrid` 由调用方按同一状态切换，
+ * 这里再用 `snapPosition` 兜一次最终落位（`snap` 可选；不传则保持旧的取整语义）。
  * 运行中锁定（locked）时即使收到 stop 也不提交，与 guardStructureEdit 同口径。
  */
 export function createDragHandlers(options = {}) {
   const isLocked = typeof options.isLocked === 'function' ? options.isLocked : () => false
   const onMoveNode = typeof options.onMoveNode === 'function' ? options.onMoveNode : null
+  const snap = typeof options.snap === 'function' ? options.snap : null
+  const onBypassChange = typeof options.onBypassChange === 'function' ? options.onBypassChange : null
   const last = { id: '', x: 0, y: 0 }
+  let lastBypass = null
+
+  /** Alt 状态变化同步给 React Flow 的 snapToGrid（只在变化时回调，拖动帧不会刷 state）。 */
+  const trackBypass = event => {
+    if (!onBypassChange) return
+    const bypass = Boolean(event && event.altKey)
+    if (bypass === lastBypass) return
+    lastBypass = bypass
+    onBypassChange(bypass)
+  }
 
   return {
     onNodeDrag(event, node) {
+      trackBypass(event)
       if (!node || !node.id || !node.position) return
       last.id = node.id
       last.x = node.position.x
       last.y = node.position.y
     },
     onNodeDragStop(event, node) {
+      trackBypass(event)
       if (!node || !node.id) return
       if (isLocked()) return
-      const x = Math.round(node.position ? node.position.x : last.x)
-      const y = Math.round(node.position ? node.position.y : last.y)
-      if (onMoveNode) onMoveNode(node.id, x, y)
+      const rawX = node.position ? node.position.x : last.x
+      const rawY = node.position ? node.position.y : last.y
+      const bypassSnap = Boolean(event && event.altKey)
+      const point = snap
+        ? snap({ x: rawX, y: rawY }, { bypassSnap })
+        : { x: Math.round(rawX), y: Math.round(rawY) }
+      if (onMoveNode) onMoveNode(node.id, point.x, point.y)
     },
   }
 }
@@ -848,6 +878,8 @@ function FlowCanvasInner(props) {
   const [zoomPercent, setZoomPercent] = useState(92)
   const [lod, setLod] = useState('near')
   const [hiddenColumns, setHiddenColumns] = useState(0)
+  /** G5-e：Alt 按下期间关闭 React Flow 的网格吸附（松开即恢复）。 */
+  const [snapBypass, setSnapBypass] = useState(false)
   const zoomRef = useRef(92)
   const lodRef = useRef('near')
   const hiddenRef = useRef(0)
@@ -1022,6 +1054,28 @@ function FlowCanvasInner(props) {
     return () => element.removeEventListener('wheel', onWheel, { capture: true })
   }, [rf])
 
+  // G5-e：Alt（macOS Option）按下时绕过吸附，松开 / 窗口失焦即恢复。
+  // 拖拽中按下 Alt 时 window 的 keydown 也会命中；onNodeDrag 再用 event.altKey 兜一次。
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    const onKeyDown = event => {
+      if (event.key === 'Alt' || event.altKey === true) setSnapBypass(true)
+    }
+    const onKeyUp = event => {
+      // 只认 Alt 抬起；按住 Alt 时松其它键不能恢复吸附。
+      if (event.key === 'Alt' || event.altKey !== true) setSnapBypass(false)
+    }
+    const onBlur = () => setSnapBypass(false)
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [])
+
   const onMove = useCallback((event, viewport) => {
     const percent = Math.round(viewport.zoom * 100)
     if (percent !== zoomRef.current) {
@@ -1047,6 +1101,9 @@ function FlowCanvasInner(props) {
   // 松手（onNodeDragStop）时才提交一次最终位置。
   const dragHandlers = useMemo(() => createDragHandlers({
     isLocked: () => Boolean(latest.current.locked),
+    snap: snapPosition,
+    // 拖拽事件里的 altKey 比 window keydown 更贴近指针手势（窗口失焦也能兜住）。
+    onBypassChange: bypass => setSnapBypass(bypass),
     onMoveNode: (id, x, y) => {
       if (latest.current.onMoveNode) latest.current.onMoveNode(id, x, y)
     },
@@ -1194,7 +1251,7 @@ function FlowCanvasInner(props) {
     panOnDrag: true,
     selectionOnDrag: false,
     selectionKeyCode: 'Shift',
-    snapToGrid: true,
+    snapToGrid: snapToGridEnabled(snapBypass),
     snapGrid: [SNAP, SNAP],
     connectionLineType: 'smoothstep',
     connectionLineStyle: { stroke: 'var(--dsw-alias-state-business-primary)', strokeWidth: 1.5, strokeDasharray: '4 3' },

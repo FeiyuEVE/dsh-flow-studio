@@ -11,6 +11,7 @@ import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync,
   statSync, utimesSync, writeFileSync,
 } from 'node:fs'
+import { writeFile as writeFileAsync } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -753,17 +754,28 @@ try {
     created.push(meta.id)
     // 用一个普通文件占住 n_a 目录路径，让节点事件写盘必然失败。
     writeFileSync(join(runsRoot, meta.id, 'n_a'), 'not a dir')
-    await assert.rejects(
-      () => store.appendEvents(runsRoot, meta.id, [event('node/start', { runId: meta.id, nodeId: 'n_a' })], { now: NOW }),
-      error => error.status === 500 && error.field === 'storage',
-    )
+    let failure = null
+    try {
+      await store.appendEvents(runsRoot, meta.id, [event('node/start', { runId: meta.id, nodeId: 'n_a' })], { now: NOW })
+    } catch (error) {
+      failure = error
+    }
+    assert.ok(failure, '写盘失败必须抛出')
+    assert.equal(failure.status, 500)
+    assert.equal(failure.field, 'storage')
+    // G2-c：run.json 确实写得进去 → 文案才可以宣称「已标记 failed」。
+    assert.match(failure.reason, /run 已被原子标记为 failed/)
+    assert.match(failure.reason, /\.error 侧车文件/)
     const after = await store.readRunMeta(runsRoot, meta.id)
-    assert.equal(after.status, 'failed')
+    assert.equal(after.status, 'failed', '文案与真实状态必须一致')
     assert.ok(existsSync(join(runsRoot, meta.id, '.error')))
     const detail = await store.readRunDetail(runsRoot, meta.id)
     assert.ok(detail.run.storageError)
     assert.equal(detail.run.storageError.code, 'EEXIST')
     assert.ok(!detail.run.storageError.error.includes(runsRoot), 'storageError 不暴露 runs 绝对路径')
+    // G2-c：失败路径不能留下 0600 的 *.tmp-*（同一块盘满盘时会被放大）。
+    const tmpLeft = readdirSync(join(runsRoot, meta.id)).filter(name => /\.tmp-\d+-\d+$/.test(name))
+    assert.deepEqual(tmpLeft, [], `失败后不能残留临时文件：${tmpLeft.join(',')}`)
     console.log(`  · storageError=${JSON.stringify(detail.run.storageError)}`)
   })
 
@@ -1333,6 +1345,562 @@ try {
     await store.writeRunMeta(runsRoot, clean.id, { startOptions: null })
     assert.equal((await store.readRunMeta(runsRoot, clean.id)).startOptions, null)
     console.log('  · startOptions 落盘/读回 deepEqual；内层多余键进 droppedKeys；7 类类型错 400 且未落盘')
+  })
+
+  console.log('runstore.js · G2 额外契约 limits')
+
+  await check('limits 白名单：正整数键落盘/读回；类型错 400；未传不凭空出现', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    // 未传过 → run.json 里不该出现 limits（不能凭空造一个空对象）。
+    assert.ok(!('limits' in JSON.parse(readFileSync(metaPath, 'utf8'))))
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, {
+      limits: { runTimeoutMs: 600_000, nodeTimeoutMs: 120_000 },
+      bogus: 1,
+    })
+    assert.deepEqual(written.limits, { runTimeoutMs: 600_000, nodeTimeoutMs: 120_000 })
+    assert.deepEqual(written.droppedKeys, ['bogus'])
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).limits,
+      { runTimeoutMs: 600_000, nodeTimeoutMs: 120_000 })
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).limits,
+      { runTimeoutMs: 600_000, nodeTimeoutMs: 120_000 })
+
+    // 只给一个键 → 另一个不出现；内层多余键丢弃但可见（不静默）。
+    await store.writeRunMeta(runsRoot, meta.id, { limits: { nodeTimeoutMs: 5_000 } })
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).limits, { nodeTimeoutMs: 5_000 })
+    const extra = await store.writeRunMeta(runsRoot, meta.id, {
+      limits: { runTimeoutMs: 1, nodeTimeoutMs: 2, unknown: 3 },
+    })
+    assert.deepEqual(extra.droppedKeys, ['limits.unknown'])
+    assert.deepEqual(extra.limits, { runTimeoutMs: 1, nodeTimeoutMs: 2 })
+
+    // 类型错一律 400，且不落盘。
+    const before = readFileSync(metaPath, 'utf8')
+    const badCases = [
+      [{ limits: 'nope' }, /limits/],
+      [{ limits: 5 }, /limits/],
+      [{ limits: [] }, /limits/],
+      [{ limits: { runTimeoutMs: 0 } }, /runTimeoutMs/],
+      [{ limits: { nodeTimeoutMs: -1 } }, /nodeTimeoutMs/],
+      [{ limits: { runTimeoutMs: 1.5 } }, /runTimeoutMs/],
+      [{ limits: { nodeTimeoutMs: '600' } }, /nodeTimeoutMs/],
+      [{ limits: { runTimeoutMs: null } }, /runTimeoutMs/],
+    ]
+    for (const [patch, pattern] of badCases) {
+      await assert.rejects(
+        () => store.writeRunMeta(runsRoot, meta.id, patch),
+        error => error.status === 400 && error.field === 'limits' && pattern.test(error.reason),
+        `应拒绝：${JSON.stringify(patch)}`,
+      )
+    }
+    assert.equal(readFileSync(metaPath, 'utf8'), before, '被拒的 limits 不能写盘')
+
+    // null 表示清除（键保留、值为 null，与 sessions / startOptions 同口径）。
+    await store.writeRunMeta(runsRoot, meta.id, { limits: null })
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).limits, null)
+    console.log('  · limits 落盘/读回 deepEqual；内层多余键进 droppedKeys；8 类类型错 400 且未落盘')
+  })
+
+  console.log('runstore.js · G2-a 先分配后写事件 / 半行 / 空洞 / 启动修复')
+
+  await check('G2-a 事件已写、meta 未写：repairRunCounters 修正后 seq 不重复、增量读取不漏', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    await store.appendEvents(runsRoot, meta.id, [
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }),
+      event('node/end', { runId: meta.id, nodeId: 'n_1', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ], { now: NOW })
+    // 人为制造审计里的崩溃形态：事件 seq=2 已在磁盘，run.json 还停在 seq=1。
+    const stale = JSON.parse(readFileSync(metaPath, 'utf8'))
+    stale.seq = 1
+    stale.lastSeq = 1
+    stale.eventCount = 1
+    writeFileSync(metaPath, `${JSON.stringify(stale, null, 2)}\n`)
+
+    const repaired = await store.repairRunCounters(runsRoot, meta.id)
+    assert.equal(repaired.repaired, true)
+    assert.equal(repaired.seq, 2)
+    assert.equal(repaired.eventCount, 2)
+    const afterRepair = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(afterRepair.seq, 2)
+    assert.equal(afterRepair.eventCount, 2)
+
+    // 恢复后续写：必须是 seq=3，不能复用 2（旧实现的 bug）。
+    const next = await store.appendEvents(runsRoot, meta.id,
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 2 }), { now: NOW })
+    assert.equal(next.events[0].seq, 3)
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    assert.deepEqual(all.events.map(item => item.seq), [1, 2, 3], 'seq 不得重复')
+    const incremental = await store.readEvents(runsRoot, meta.id, { since: 1, limit: 100 })
+    assert.deepEqual(incremental.events.map(item => item.seq), [2, 3], '增量读取不能漏掉 seq=2')
+    const tail = await store.readEvents(runsRoot, meta.id, { since: 2, order: 'desc', limit: 10 })
+    assert.deepEqual(tail.events.map(item => item.seq), [3], '尾部倒读也要看到最新一条')
+    console.log(`  · repair: seq ${stale.seq}→${repaired.seq}, eventCount ${stale.eventCount}→${repaired.eventCount}；续写 seq=${next.events[0].seq}`)
+  })
+
+  await check('G2-a sweep 恢复：旧 meta.seq 续写 run/end 不再产生重复 seq', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    await store.appendEvents(runsRoot, meta.id, [
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }),
+      event('node/end', { runId: meta.id, nodeId: 'n_1', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ], { now: NOW })
+    const stale = JSON.parse(readFileSync(metaPath, 'utf8'))
+    stale.seq = 1
+    stale.lastSeq = 1
+    stale.eventCount = 1
+    writeFileSync(metaPath, `${JSON.stringify(stale, null, 2)}\n`)
+    // 一个 90s 前心跳的过期租约（模拟引擎崩溃）。
+    writeFileSync(join(runsRoot, meta.id, 'lock.json'), JSON.stringify({
+      pid: 999_999,
+      host: 'dead-host',
+      ttlMs: 90_000,
+      acquiredAt: '2026-11-06T08:00:00.000Z',
+      heartbeatAt: '2026-11-06T08:00:00.000Z',
+    }, null, 2), { mode: 0o600 })
+
+    const swept = await store.sweepExpiredLeases(runsRoot, { now: new Date('2026-11-06T12:00:00.000Z') })
+    assert.ok(swept.includes(meta.id))
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const seqs = all.events.map(item => item.seq)
+    assert.deepEqual(seqs, [1, 2, 3], `恢复续写不得重复 seq（实际 ${seqs.join(',')}）`)
+    assert.equal(new Set(seqs).size, seqs.length)
+    const runEnd = all.events.find(item => item.kind === 'run/end')
+    assert.equal(runEnd.seq, 3)
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.equal(after.seq, 3)
+    assert.equal(after.eventCount, 3)
+    console.log(`  · sweep 续写 seq=${seqs.join(',')}（无重复），run/end@${runEnd.seq}`)
+  })
+
+  await check('G2-a 文件末尾半行：新事件另起一行、坏行只 skip 一条', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.appendEvents(runsRoot, meta.id,
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }), { now: NOW })
+    const nodeFile = join(runsRoot, meta.id, 'n_1', '1.jsonl')
+    // 模拟「seq=2 已经分配进 run.json，但事件只写了半行」：先抬 meta.seq，再留半行。
+    const reserved = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    reserved.seq = 2
+    reserved.lastSeq = 2
+    writeFileSync(join(runsRoot, meta.id, 'run.json'), `${JSON.stringify(reserved, null, 2)}\n`)
+    // 崩溃 / 写满留下的半行：最后一个字节不是换行。
+    appendFileSync(nodeFile, '{"v":1,"seq":2,"kind":"node/end"')
+    const beforeBytes = readFileSync(nodeFile)
+    assert.notEqual(beforeBytes[beforeBytes.length - 1], 0x0a)
+
+    const appended = await store.appendEvents(runsRoot, meta.id,
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }), { now: NOW })
+    assert.equal(appended.events[0].seq, 3)
+    const bytes = readFileSync(nodeFile)
+    assert.equal(bytes[bytes.length - 1], 0x0a, '追加后文件必须以换行结尾')
+    const text = readFileSync(nodeFile, 'utf8')
+    // 三个 `{"v":1` 各自一行：半行没有被新事件粘进去（否则只会有两处 JSON 起点）。
+    assert.equal(text.split('{"v":1').length - 1, 3, '半行与新事件不能粘连')
+    const lines = text.trim().split('\n')
+    assert.equal(lines.length, 3)
+    assert.ok(lines[1].startsWith('{"v":1,"seq":2'), '坏半行应保持原样独立成行')
+    assert.equal(JSON.parse(lines[2]).seq, 3)
+
+    const page = await store.readEvents(runsRoot, meta.id, { limit: 10 })
+    assert.deepEqual(page.events.map(item => item.seq), [1, 3])
+    assert.equal(page.skipped, 1, '只有那条坏半行被 skip')
+    const desc = await store.readEvents(runsRoot, meta.id, { order: 'desc', limit: 2 })
+    assert.equal(desc.events[0].seq, 3, '尾部倒读仍能看到新事件')
+    console.log(`  · 半行 → 新事件 seq=${appended.events[0].seq}；readAll seqs=[1,3]，skipped=1`)
+  })
+
+  await check('G2-a 空洞（跳过 seq=2 写 3）：读取侧容忍、repair 把 seq 抬到 max(seq)', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.appendEvents(runsRoot, meta.id, [
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }),
+      event('node/end', { runId: meta.id, nodeId: 'n_1', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ], { now: NOW })
+    const nodeFile = join(runsRoot, meta.id, 'n_1', '1.jsonl')
+    const events = readFileSync(nodeFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    assert.deepEqual(events.map(item => item.seq), [1, 2])
+    // 把第 2 条改写成 seq=3：磁盘出现 [1,3] 的空洞，而 meta 里 seq 还是 2。
+    events[1].seq = 3
+    writeFileSync(nodeFile, events.map(item => `${JSON.stringify(item)}\n`).join(''))
+
+    const page = await store.readEvents(runsRoot, meta.id, { limit: 10 })
+    assert.deepEqual(page.events.map(item => item.seq), [1, 3], '空洞不能让读取报错')
+    assert.equal(page.total, 2)
+    assert.equal(page.skipped, 0)
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    assert.deepEqual(all.events.map(item => item.seq), [1, 3])
+    const desc = await store.readEvents(runsRoot, meta.id, { order: 'desc', limit: 10 })
+    assert.deepEqual(desc.events.map(item => item.seq), [3, 1])
+
+    const repaired = await store.repairRunCounters(runsRoot, meta.id)
+    assert.equal(repaired.seq, 3, 'meta.seq 要抬到磁盘 max(seq)')
+    assert.equal(repaired.eventCount, 2)
+    const next = await store.appendEvents(runsRoot, meta.id,
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 2 }), { now: NOW })
+    assert.equal(next.events[0].seq, 4)
+    console.log('  · 磁盘 seq=[1,3] 读取正常；repair seq=3；续写 seq=4（空洞保留、不重复）')
+  })
+
+  console.log('runstore.js · G2-b 跨进程 meta.lock')
+
+  await check('G2-b 跨进程：2 个真实子进程各写 40 条 → 磁盘 80 / eventCount 80 / 重复 0', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 这条必须真跨进程：同进程的 Promise.all 会被 withLock 兜住，测不到跨进程丢写。
+    const childCode = `
+const [root, id, nodeId, count] = process.argv.slice(1)
+const store = await import(${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)})
+const total = Number(count)
+for (let i = 0; i < total; i += 1) {
+  await store.appendEvents(root, id, {
+    v: 1,
+    ts: new Date().toISOString(),
+    kind: 'tool/call',
+    traceId: 'tr-' + nodeId,
+    memberId: null,
+    nodeId,
+    attemptId: 1,
+    data: { name: 'bash', ok: true },
+  })
+}
+process.stdout.write('OK:' + total)
+`
+    const runChild = nodeId => new Promise((resolveChild, rejectChild) => {
+      const proc = spawn(
+        process.execPath,
+        ['--input-type=module', '-e', childCode, runsRoot, meta.id, nodeId, '40'],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      )
+      let out = ''
+      let err = ''
+      proc.stdout.on('data', chunk => { out += chunk })
+      proc.stderr.on('data', chunk => { err += chunk })
+      proc.on('error', rejectChild)
+      proc.on('close', code => {
+        resolveChild(out.trim() || `EXIT:${code}:${err.slice(0, 400)}`)
+      })
+    })
+    const results = await Promise.all([runChild('n_a'), runChild('n_b')])
+    assert.deepEqual(results, ['OK:40', 'OK:40'])
+
+    const diskSeqs = []
+    for (const nodeId of ['n_a', 'n_b']) {
+      const file = join(runsRoot, meta.id, nodeId, '1.jsonl')
+      for (const line of readFileSync(file, 'utf8').trim().split('\n')) {
+        diskSeqs.push(JSON.parse(line).seq)
+      }
+    }
+    const metaNow = await store.readRunMeta(runsRoot, meta.id)
+    const duplicates = diskSeqs.length - new Set(diskSeqs).size
+    console.log(`  · 磁盘 ${diskSeqs.length} 条 / eventCount ${metaNow.eventCount} / 重复 seq ${duplicates}`)
+    assert.equal(diskSeqs.length, 80)
+    assert.equal(metaNow.eventCount, 80, 'eventCount 必须与磁盘条数一致')
+    assert.equal(metaNow.seq, 80)
+    assert.equal(duplicates, 0, `跨进程写入出现重复 seq：${[...diskSeqs].sort((a, b) => a - b).join(',')}`)
+    assert.equal(Math.min(...diskSeqs), 1)
+    assert.equal(Math.max(...diskSeqs), 80)
+    // 无空洞：跨进程锁内完成分配，seq 就是 1..80 的不重不漏一份。
+    assert.deepEqual([...diskSeqs].sort((a, b) => a - b), Array.from({ length: 80 }, (_, index) => index + 1))
+  })
+
+  console.log('runstore.js · G2-c 满盘失败路径与临时文件')
+
+  await check('G2-c 满盘（ENOSPC 注入）：文案与实际状态一致、.error 保留、无 *.tmp-* 残留', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const dir = join(runsRoot, meta.id)
+    const enospc = () => {
+      const error = new Error('ENOSPC: no space left on device, write')
+      error.code = 'ENOSPC'
+      return error
+    }
+    // 变体 A：run.json 写不进去，但 .error 侧车还能写 → 文案必须说「状态未知」并保留 .error。
+    store.__setWriteFileHook(async (path, data, options) => {
+      if (String(path).startsWith(dir) && String(path).includes('run.json.tmp-')) throw enospc()
+      return writeFileAsync(path, data, options)
+    })
+    let failureA = null
+    try {
+      await store.appendEvents(runsRoot, meta.id, event('node/start', { runId: meta.id }), { now: NOW })
+    } catch (error) {
+      failureA = error
+    } finally {
+      store.__setWriteFileHook(null)
+    }
+    assert.ok(failureA)
+    assert.equal(failureA.status, 500)
+    assert.equal(failureA.field, 'storage')
+    assert.match(failureA.reason, /run\.json 也写不进去/)
+    assert.match(failureA.reason, /run 状态未知/)
+    assert.ok(!/已标记为 failed/.test(failureA.reason), 'run.json 没写成时不能谎报已标记 failed')
+    const afterA = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(afterA.status, 'pending', '文案说状态未知时 run.json 必须还是原状态')
+    assert.equal(afterA.seq, 0)
+    assert.equal(afterA.eventCount, 0)
+    assert.ok(existsSync(join(dir, '.error')), '.error 写成功了就必须保留')
+    assert.equal(JSON.parse(readFileSync(join(dir, '.error'), 'utf8')).code, 'ENOSPC')
+    const tmpA = readdirSync(dir).filter(name => /\.tmp-\d+-\d+$/.test(name))
+    assert.deepEqual(tmpA, [], `失败后不能残留 *.tmp-*：${tmpA.join(',')}`)
+    console.log(`  · 变体 A 文案=${failureA.reason} / 实际 status=${afterA.status}`)
+
+    // 变体 B：连 .error 都写不进去（同一块满盘）→ 文案必须同时承认两者都失败。
+    const metaB = await makeRun()
+    created.push(metaB.id)
+    const dirB = join(runsRoot, metaB.id)
+    store.__setWriteFileHook(async (path, data, options) => {
+      if (String(path).startsWith(dirB) && String(path).includes('.tmp-')) throw enospc()
+      return writeFileAsync(path, data, options)
+    })
+    let failureB = null
+    try {
+      await store.appendEvents(runsRoot, metaB.id, event('node/start', { runId: metaB.id }), { now: NOW })
+    } catch (error) {
+      failureB = error
+    } finally {
+      store.__setWriteFileHook(null)
+    }
+    assert.ok(failureB)
+    assert.match(failureB.reason, /run\.json 与 \.error 都写不进去/)
+    assert.match(failureB.reason, /run 状态未知/)
+    const afterB = await store.readRunMeta(runsRoot, metaB.id)
+    assert.equal(afterB.status, 'pending')
+    assert.equal(afterB.seq, 0)
+    assert.ok(!existsSync(join(dirB, '.error')), '.error 没写成时不能凭空出现')
+    const tmpB = readdirSync(dirB).filter(name => /\.tmp-\d+-\d+$/.test(name))
+    assert.deepEqual(tmpB, [], `失败后不能残留 *.tmp-*：${tmpB.join(',')}`)
+    console.log(`  · 变体 B 文案=${failureB.reason} / 实际 status=${afterB.status}`)
+  })
+
+  await check('G2-c 启动清理：遗留的 *.tmp-* 被 cleanupTempFiles 清掉，正常文件不动', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const dir = join(runsRoot, meta.id)
+    mkdirSync(join(dir, 'n_1'), { recursive: true })
+    const stale = [
+      join(dir, 'run.json.tmp-1234-0'),
+      join(dir, 'lock.json.tmp-1234-1'),
+      join(dir, 'n_1', '1.jsonl.tmp-1234-2'),
+    ]
+    for (const path of stale) writeFileSync(path, 'partial')
+    const removed = await store.cleanupTempFiles(runsRoot, meta.id)
+    assert.equal(removed.length, 3, `应清掉 3 个临时文件：${removed.join(',')}`)
+    for (const path of stale) assert.ok(!existsSync(path), `${path} 应被清掉`)
+    assert.ok(existsSync(join(dir, 'run.json')), '正常文件不能被误删')
+
+    // 不带 runId 的整目录清理也能命中。
+    const allTmp = join(dir, '.usage.json.tmp-99-0')
+    writeFileSync(allTmp, 'x')
+    const allRemoved = await store.cleanupTempFiles(runsRoot)
+    assert.ok(allRemoved.some(name => name.includes('.usage.json.tmp-')), '整目录清理应命中最新的临时文件')
+    assert.ok(!existsSync(allTmp))
+    console.log(`  · 清理 ${removed.length} 个 + 整目录扫描命中；run.json 未受影响`)
+  })
+
+  console.log('runstore.js · G2-d 租约自愈')
+
+  await check('G2-d 过期租约：持有者 renew 就地 re-claim（不删文件），非持有者 409 且不删', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ttlMs: 1_000, now: t0 })
+    const later = new Date(t0.getTime() + 5_000)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+
+    // 非持有者续租过期租约：409，且租约文件必须还在（旧实现「先删再抛」）。
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, { pid: 222, host: 'h2', now: later }),
+      error => error.status === 409,
+    )
+    assert.ok(existsSync(lockPath), '非持有者续租失败不能删掉租约文件')
+
+    // 持有者自己：就地 re-claim（心跳刷新、acquiredAt 保留、文件始终在）。
+    const renewed = await store.renewLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 60_000, now: later,
+    })
+    assert.equal(renewed.pid, 111)
+    assert.equal(renewed.heartbeatAt, later.toISOString())
+    assert.equal(renewed.acquiredAt, t0.toISOString(), 're-claim 保留 acquiredAt')
+    assert.ok(existsSync(lockPath))
+    const read = await store.readLease(runsRoot, meta.id, { now: later })
+    assert.ok(read, 're-claim 后租约必须立刻可读（run 不会卡 running）')
+    assert.equal(read.heartbeatAt, later.toISOString())
+
+    // 租约未过期 → sweep 不能把这个 run 当崩溃残留。
+    const notSwept = await store.sweepExpiredLeases(runsRoot, { now: new Date(later.getTime() + 1_000) })
+    assert.ok(!notSwept.includes(meta.id))
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).status, 'running')
+    console.log(`  · 过期租约 re-claim：heartbeat ${t0.toISOString()} → ${renewed.heartbeatAt}；sweep 未误收`)
+  })
+
+  await check('G2-d 0 字节 lock.json：可被接管（不再是五次后 409）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    // 进程在 open('wx') 与写内容之间被杀：0 字节 lock.json（旧实现解析失败 = 永远无法接管）。
+    writeFileSync(lockPath, '')
+    const claimed = await store.claimLease(runsRoot, meta.id, {
+      pid: 444, host: 'h4', now: new Date('2026-11-06T12:00:00.000Z'),
+    })
+    assert.equal(claimed.pid, 444)
+    const disk = JSON.parse(readFileSync(lockPath, 'utf8'))
+    assert.equal(disk.pid, 444, '接管后 lock.json 必须是完整可解析内容')
+    assert.equal((await store.readLease(runsRoot, meta.id,
+      { now: new Date('2026-11-06T12:00:00.000Z') })).pid, 444)
+    console.log(`  · 0 字节 lock.json → 接管成功 pid=${disk.pid}，内容可解析`)
+  })
+
+  await check('G2-d started=true 无租约 / 租约坏掉：sweep 都按崩溃残留收口 failed', async () => {
+    // ① started=true 但根本没有 lock.json（旧实现 `if (!lease) continue` 永不收口）。
+    const missing = await makeRun()
+    created.push(missing.id)
+    await store.startRun(runsRoot, missing.id, { now: NOW })
+    assert.ok(!existsSync(join(runsRoot, missing.id, 'lock.json')))
+    const swept = await store.sweepExpiredLeases(runsRoot, { now: NOW })
+    assert.ok(swept.includes(missing.id), 'started=true 且无租约的 running run 必须被收口')
+    const afterMissing = await store.readRunMeta(runsRoot, missing.id)
+    assert.equal(afterMissing.status, 'failed')
+    const allMissing = await store.readAllEvents(runsRoot, missing.id)
+    const runEndMissing = allMissing.events.find(item => item.kind === 'run/end')
+    assert.ok(runEndMissing)
+    assert.match(runEndMissing.data.reason, /引擎中断/)
+    assert.match(runEndMissing.data.reason, /租约文件缺失/)
+
+    // ② lock.json 不可解析（半写 JSON）→ 也收口，并把坏文件清掉。
+    const corrupt = await makeRun()
+    created.push(corrupt.id)
+    await store.startRun(runsRoot, corrupt.id, { now: NOW })
+    const corruptLock = join(runsRoot, corrupt.id, 'lock.json')
+    writeFileSync(corruptLock, '{"pid":')
+    const sweptCorrupt = await store.sweepExpiredLeases(runsRoot, { now: NOW })
+    assert.ok(sweptCorrupt.includes(corrupt.id))
+    assert.equal((await store.readRunMeta(runsRoot, corrupt.id)).status, 'failed')
+    assert.ok(!existsSync(corruptLock), '不可解析的租约文件应被清掉')
+    const allCorrupt = await store.readAllEvents(runsRoot, corrupt.id)
+    const runEndCorrupt = allCorrupt.events.find(item => item.kind === 'run/end')
+    assert.match(runEndCorrupt.data.reason, /不可解析/)
+
+    // ③ started=false 的 running 壳子不在收口范围（保持只收 started 的旧口径）。
+    const shell = await makeRun()
+    created.push(shell.id)
+    await store.writeRunMeta(runsRoot, shell.id, { status: 'running' })
+    const sweptShell = await store.sweepExpiredLeases(runsRoot, { now: NOW })
+    assert.ok(!sweptShell.includes(shell.id))
+    assert.equal((await store.readRunMeta(runsRoot, shell.id)).status, 'running')
+    console.log('  · 无租约 / 坏租约的 started run 均收口 failed；started=false 的壳子未被误收')
+  })
+
+  await check('nodeStatus 白名单 attempt：非负整数保留，坏值只丢该键、节点其它字段照常', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const nodeStatus = {
+      n_good: { state: 'working', progress: 40, summary: '进行中', attempt: 3, at: '2026-11-06T10:00:00.000Z' },
+      n_zero: { state: 'done', progress: 100, attempt: 0 },
+      n_str: { state: 'done', progress: 100, attempt: 'x' },
+      n_neg: { state: 'working', progress: 10, attempt: -2 },
+      n_frac: { state: 'working', progress: 20, attempt: 1.5 },
+      n_null: { state: 'blocked', progress: 0, attempt: null },
+      n_bool: { state: 'working', progress: 5, attempt: true },
+      n_none: { state: 'working', progress: 0 },
+    }
+    const written = await store.writeRunMeta(runsRoot, meta.id, { nodeStatus })
+    assert.equal(written.nodeStatus.n_good.attempt, 3, 'writeRunMeta 返回值应保留 attempt')
+    assert.equal(written.nodeStatus.n_zero.attempt, 0)
+
+    const disk = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    assert.equal(disk.nodeStatus.n_good.attempt, 3)
+    assert.equal(disk.nodeStatus.n_good.summary, '进行中', '其它字段必须保留')
+    assert.equal(disk.nodeStatus.n_zero.attempt, 0, 'attempt=0 是合法的非负整数')
+    for (const [nodeId, expected] of [
+      ['n_str', { state: 'done', progress: 100 }],
+      ['n_neg', { state: 'working', progress: 10 }],
+      ['n_frac', { state: 'working', progress: 20 }],
+      ['n_null', { state: 'blocked', progress: 0 }],
+      ['n_bool', { state: 'working', progress: 5 }],
+    ]) {
+      assert.ok(!('attempt' in disk.nodeStatus[nodeId]), `${nodeId}.attempt 应被丢弃：${JSON.stringify(disk.nodeStatus[nodeId])}`)
+      // 只丢 attempt 一个键，节点本身与其它字段照常保留。
+      assert.equal(disk.nodeStatus[nodeId].state, expected.state)
+      assert.equal(disk.nodeStatus[nodeId].progress, expected.progress)
+    }
+    assert.ok(!('attempt' in disk.nodeStatus.n_none))
+
+    // 读回（readMetaUnlocked 再归一化一次）结果一致。
+    const reread = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(reread.nodeStatus.n_good.attempt, 3)
+    assert.equal(reread.nodeStatus.n_zero.attempt, 0)
+    assert.ok(!('attempt' in reread.nodeStatus.n_str))
+    assert.equal(reread.nodeStatus.n_str.state, 'done', '坏 attempt 不能连节点一起丢')
+    assert.equal(reread.nodeStatus.n_neg.progress, 10)
+    console.log('  · attempt=3 / 0 保留；\'x\' / -2 / 1.5 / null / true 只丢该键，节点与其它字段保留')
+  })
+
+  await check('worktree 嵌套白名单：root(绝对路径) / warnings(字符串数组) 透传，坏值只丢该键', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const good = {
+      enabled: true,
+      reason: 'ok',
+      decidedBy: 'auto',
+      path: '/repo/demo/.wt/run-1',
+      branch: 'flow/run-1',
+      baseCommit: 'abc123',
+      root: '/repo/demo/.wt/run-1',
+      warnings: ['工作区有未提交修改，已按快照执行', '敏感文件 .env 不会复制'],
+    }
+    const written = await store.writeRunMeta(runsRoot, meta.id, { worktree: good })
+    assert.deepEqual(written.worktree, good)
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).worktree, good)
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).worktree, good, '读回必须原样保留')
+
+    // 坏值只丢该键：root 非字符串 / 相对路径、warnings 非数组 → 两个键都不出现，其它字段照常。
+    const bad = await store.writeRunMeta(runsRoot, meta.id, {
+      worktree: {
+        root: 123,
+        warnings: 'oops',
+        enabled: true,
+        reason: 'dirty',
+        path: '/repo/demo',
+        branch: 'feat',
+      },
+    })
+    assert.ok(!('root' in bad.worktree), 'root 非字符串必须丢弃')
+    assert.ok(!('warnings' in bad.worktree), 'warnings 非数组必须忽略')
+    assert.deepEqual(bad.worktree, {
+      enabled: true, reason: 'dirty', path: '/repo/demo', branch: 'feat',
+    })
+    const diskBad = JSON.parse(readFileSync(metaPath, 'utf8')).worktree
+    assert.deepEqual(diskBad, { enabled: true, reason: 'dirty', path: '/repo/demo', branch: 'feat' })
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).worktree, diskBad)
+
+    // root 必须是绝对路径：相对路径丢弃；字符串数组以外的 warning 项被过滤、每条截到 500、最多 20 条。
+    const noisy = Array.from({ length: 25 }, (_, index) => `w${index}`)
+    noisy[1] = 42
+    noisy[2] = ''
+    noisy[3] = '   '
+    noisy[4] = 'x'.repeat(600)
+    const mixed = await store.writeRunMeta(runsRoot, meta.id, {
+      worktree: { enabled: true, root: 'relative/path', warnings: noisy },
+    })
+    assert.ok(!('root' in mixed.worktree), '相对路径的 root 必须丢弃')
+    assert.equal(mixed.worktree.warnings.length, 20, 'warnings 最多 20 条')
+    assert.deepEqual(mixed.worktree.warnings.slice(0, 3), ['w0', 'x'.repeat(500), 'w5'])
+    assert.ok(mixed.worktree.warnings.every(item => item.length <= 500 && item.trim() !== ''))
+
+    // 两者都可缺省：不写就不出现。
+    const plain = await store.writeRunMeta(runsRoot, meta.id, { worktree: { enabled: false } })
+    assert.ok(!('root' in plain.worktree))
+    assert.ok(!('warnings' in plain.worktree))
+    console.log('  · root/warnings 透传；root=123 / 相对路径 → 丢键；warnings 非数组 → 忽略、非法项过滤、每条≤500、最多 20')
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

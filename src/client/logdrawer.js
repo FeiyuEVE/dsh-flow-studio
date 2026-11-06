@@ -18,7 +18,7 @@
  * @module @feiyueve/dsh-flow-studio/client/logdrawer
  */
 
-import { api, exportUrl } from './api.js'
+import { api, createLightRunReader, exportUrl } from './api.js'
 import { h, rt } from './runtime.js'
 
 /** 收起条高度（DESIGN §7）。 */
@@ -2041,6 +2041,10 @@ export function FsLogDrawer({
   flowId = '',
   flowName = '',
   initialRuns = null,
+  // G5-d：外部共享的 runs 数据源（页面左栏与抽屉共用同一份）。为 null 时保持独立加载。
+  externalRuns = null,
+  externalRunsLoaded = false,
+  onRefreshRuns = null,
   initialRunId = '',
   initialSummary = null,
   initialDetail = null,
@@ -2067,6 +2071,8 @@ export function FsLogDrawer({
   const [loaded, setLoaded] = useState(initialRuns !== null && initialRuns !== undefined)
   const [loading, setLoading] = useState(false)
   const [runError, setRunError] = useState(text(initialError, ''))
+  /** G5-a：light=1 不被 Host 支持时的一次性提示（降级后不再静默重试）。 */
+  const [lightNotice, setLightNotice] = useState('')
   const [selectedRunId, setSelectedRunId] = useState(initialSelectedRun)
   const [detail, setDetail] = useState(initialDetail)
   const [summary, setSummary] = useState(initialSummary)
@@ -2133,6 +2139,19 @@ export function FsLogDrawer({
   /** 选中 run 的事件增量游标；切 run 时清空，避免把上一条 run 的 seq 当 since。 */
   const selectedCursor = useRef(null)
   const selectedFailures = useRef(0)
+  /**
+   * G5-a：轻量轮询读取器。运行中 2s 一轮走 `?light=1`（Host 不解析事件文件）；
+   * 第一次 400/404 后永久降级到完整详情接口，且只提示一次。
+   */
+  const lightReader = useRef(null)
+  if (!lightReader.current) {
+    lightReader.current = createLightRunReader({
+      readRun: (id, readOptions) => api.readRun(id, readOptions),
+      warn: message => {
+        if (mounted.current) setLightNotice(message)
+      },
+    })
+  }
 
   // ── 选中 run 的合并视图：列表摘要 + 详情（详情里有 live / 最新状态）──────
   const selectedRun = useMemo(
@@ -2191,31 +2210,53 @@ export function FsLogDrawer({
     return () => { mounted.current = false }
   }, [])
 
+  /**
+   * 应用一份 run 列表（共享数据源与独立加载共用）：保持选中项 / 刚聚焦 run 的优先级。
+   * 返回实际选中的 runId。
+   */
+  const applyRunList = useCallback(list => {
+    const rows = Array.isArray(list) ? list : []
+    setRuns(rows)
+    setLoaded(true)
+    setRunError('')
+    const current = stateRef.current.selectedRunId
+    const hold = holdSelection.current
+    const held = hold.id !== '' && hold.id === current && Date.now() < hold.until
+    const inList = current !== '' && rows.some(run => run.id === current)
+    if (inList) holdSelection.current = { id: '', until: 0 }
+    // 没有选中项时优先盯住正在跑的 run：顶栏的「停止」与实时节点要对准它，
+    // 而不是列表第一条（可能是一条已结束的记录）。
+    const activeRun = rows.find(run => runIsActive(run))
+    const nextId = current !== '' && (inList || held)
+      ? current
+      : (activeRun ? activeRun.id : (rows.length > 0 ? rows[0].id : ''))
+    stateRef.current.selectedRunId = nextId
+    setSelectedRunId(nextId)
+    return nextId
+  }, [])
+
+  /**
+   * G5-d：抽屉的运行列表来自页面共享数据源（externalRuns 与左栏是同一份 payload / 同一个
+   * tick）。externalRuns 为 null 时保持旧的独立加载行为（SSR / 单测）。
+   */
+  useEffect(() => {
+    if (!Array.isArray(externalRuns)) return
+    if (!externalRunsLoaded && externalRuns.length === 0) return
+    applyRunList(normalizeRuns(externalRuns))
+  }, [externalRuns, externalRunsLoaded, applyRunList])
+
   /** 拉 run 列表；返回实际选中的 runId，供同一次刷新继续拉详情。 */
-  const loadRuns = useCallback(async ({ silent = false } = {}) => {
+  const loadRuns = useCallback(async ({ silent = false, force = false } = {}) => {
     const requestId = ++listRequest.current
     if (!silent) setLoading(true)
     try {
-      const payload = await api.listRuns(20)
+      // 有共享数据源时走它（并发刷新由数据源合并，两处同时挂载只发一次请求）。
+      const payload = onRefreshRuns
+        ? await onRefreshRuns({ force })
+        : await api.listRuns(20)
       if (!mounted.current || requestId !== listRequest.current) return ''
-      const list = normalizeRuns(payload)
-      setRuns(list)
-      setLoaded(true)
-      setRunError('')
-      const current = stateRef.current.selectedRunId
-      const hold = holdSelection.current
-      const held = hold.id !== '' && hold.id === current && Date.now() < hold.until
-      const inList = current !== '' && list.some(run => run.id === current)
-      if (inList) holdSelection.current = { id: '', until: 0 }
-      // 没有选中项时优先盯住正在跑的 run：顶栏的「停止」与实时节点要对准它，
-      // 而不是列表第一条（可能是一条已结束的记录）。
-      const activeRun = list.find(run => runIsActive(run))
-      const nextId = current !== '' && (inList || held)
-        ? current
-        : (activeRun ? activeRun.id : (list.length > 0 ? list[0].id : ''))
-      stateRef.current.selectedRunId = nextId
-      setSelectedRunId(nextId)
-      return nextId
+      if (payload !== null && payload !== undefined) applyRunList(normalizeRuns(payload))
+      return stateRef.current.selectedRunId
     } catch (failure) {
       if (!mounted.current || requestId !== listRequest.current) return ''
       setLoaded(true)
@@ -2224,7 +2265,7 @@ export function FsLogDrawer({
     } finally {
       if (mounted.current && !silent) setLoading(false)
     }
-  }, [])
+  }, [applyRunList, onRefreshRuns])
 
   const loadDetail = useCallback(async runId => {
     const requestId = ++detailRequest.current
@@ -2241,7 +2282,9 @@ export function FsLogDrawer({
       return
     }
     try {
-      const result = await api.readRun(runId)
+      // G5-a：打开抽屉 / 选中 run 需要完整详情（含 events 派生的节点表），
+      // 这里显式用完整接口；只有后台 2s 轮询走 `?light=1`。
+      const result = await api.readRun(runId, { light: false })
       if (!mounted.current || stale()) return
       setDetail(result)
       setDetailError('')
@@ -2319,7 +2362,7 @@ export function FsLogDrawer({
     const now = Date.now()
     if (!force && now - lastRefresh.current < 1000) return
     lastRefresh.current = now
-    const runId = await loadRuns({ silent })
+    const runId = await loadRuns({ silent, force })
     if (runId !== '') await Promise.all([loadDetail(runId), loadEvents(runId, { silent, full: true })])
   }, [loadRuns, loadDetail, loadEvents])
 
@@ -2335,7 +2378,10 @@ export function FsLogDrawer({
     const requestId = ++watchRequest.current
     const current = () => mounted.current && requestId === watchRequest.current
     try {
-      const detailResult = await api.readRun(runId)
+      // G5-a：2s 一轮的轻量读取——Host 不返回 / 不解析事件；需要事件时下面按 since 增量拉。
+      // 第一次 400/404 后由 lightReader 永久降级到完整详情，并只提示一次。
+      const outcome = await lightReader.current.read(runId)
+      const detailResult = outcome.data
       if (!current()) return true
       setWatchDetail(detailResult)
       const watched = normalizeRun(detailResult && detailResult.run ? detailResult.run : {})
@@ -2383,7 +2429,14 @@ export function FsLogDrawer({
       watchFailures.current = 0
       if (forSelected) {
         detailRequest.current += 1
-        setDetail(detailResult)
+        if (outcome.light) {
+          // 轻量响应没有事件派生的节点表：只合入 run 元信息 / live，别把完整详情覆盖成半份。
+          setDetail(previous => (isObject(previous)
+            ? { ...previous, run: { ...(isObject(previous.run) ? previous.run : {}), ...(isObject(detailResult.run) ? detailResult.run : {}) } }
+            : detailResult))
+        } else {
+          setDetail(detailResult)
+        }
         setDetailError('')
       }
       if (!runIsActive(watched) && watchSummaryFor.current !== runId) {
@@ -3274,6 +3327,14 @@ export function FsLogDrawer({
       ? h('div', { className: 'fs-log-banner', role: 'alert' },
         h('span', null, runError),
         h('button', { type: 'button', className: 'fs-log-mini', onClick: refresh }, '重试'))
+      : null,
+    lightNotice !== ''
+      ? h('div', {
+        className: 'fs-log-banner fs-log-notice',
+        role: 'status',
+        'data-light-fallback': 'true',
+        title: '轻量轮询不可用时只降级一次，不会每轮重试',
+      }, lightNotice)
       : null,
     watchError !== '' && watchRunId !== '' && !watchIsSelected
       ? h('div', { className: 'fs-log-banner', role: 'alert' }, watchError)

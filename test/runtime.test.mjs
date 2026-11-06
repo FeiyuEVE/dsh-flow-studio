@@ -12,7 +12,9 @@
  *   E2-b dispose abort 在飞 Engine + 有界等待 + 定时器清理、
  *   E2-c session/event 归属过滤 + 字节/条数双上限缓冲、
  *   E2-d patchRunJson 走 runstore.writeRunMeta 单一写路径（并发不丢字段 / seq 不回退）；
- *   C2 节点自审凭证：提示词回显 attempt+nonce、无 Engine/凭证时不发、真实 Engine 端到端接受/丢弃。
+ *   C2 节点自审凭证：提示词回显 attempt+nonce、无 Engine/凭证时不发、真实 Engine 端到端接受/丢弃；
+ *   G7-a 按发起会话合并唤醒（10 run → 1 条 followup / 预算限流不丢 due）、
+ *   G7-b 重启恢复节点闹钟（2 条恢复 / 缺 sessionId 跳过 / 终态不恢复 / 幂等）。
  */
 
 import assert from 'node:assert/strict'
@@ -1421,6 +1423,285 @@ try {
     // 返回值兼容旧契约：run 不存在 / runId 非法 → null（不抛错）。
     A.equal(await runtimeModule.patchRunJson(runsRoot, 'r-no-such-run', { status: 'done' }), null)
     A.equal(await runtimeModule.patchRunJson(runsRoot, 'bad/id', { status: 'done' }), null)
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runtime · v0.8.2 G7-a：按发起会话合并唤醒')
+
+  await check('G7-a：10 个 run 同一个发起会话 → 只发 1 条 followup，正文列出 10 个 runId，另 9 个合并而非丢弃', async () => {
+    await saveFlow(oneStageFlow('flow-rt-g7a'))
+    const sent = []
+    const fakeAgent = {
+      status: 'idle',
+      followup(payload) { sent.push(payload) },
+    }
+    const agents = { get: () => fakeAgent }
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      ctx: { get: () => agents },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      // 固定 verdict，免得依赖真实审计对「没有事件」的判断。
+      auditWorkflow: () => ({ verdict: 'healthy', nextCheckSeconds: 180 }),
+    })
+    const runIds = []
+    for (let index = 0; index < 10; index += 1) {
+      const run = await makeRun('flow-rt-g7a')
+      await store.writeRunMeta(runsRoot, run.id, {
+        status: 'running',
+        started: true,
+        // 很早开始：healthy 的 nextDueAt（startedAt + 180s）已经过点。
+        startedAt: '2020-01-01T00:00:00.000Z',
+      })
+      await runtime.enableSupervision(run.id, { enabled: true, wakerSessionId: 'sess-g7a-shared' })
+      runIds.push(run.id)
+    }
+    A.equal(runtime.supervision.snapshot().entries.length, 10)
+
+    const stats = await runtime.supervision.tick()
+    A.equal(sent.length, 1, '10 个 run 同 waker 只能发 1 条 followup')
+    A.equal(stats.runs, 10)
+    A.equal(stats.woken, 10, '10 个 run 都算被唤醒（合并而不是丢弃）')
+    A.equal(stats.failed, 0)
+
+    // 正文必须把 10 个 runId 都列出来，且是一条有界长度的提示词（不是一万字）。
+    const text = sent[0].content[0].text
+    for (const runId of runIds) {
+      A.ok(text.includes(runId), `合并提示词要列出 ${runId}`)
+    }
+    A.ok(text.length < 4000, `合并提示词必须有界（实际 ${text.length} 字）`)
+    A.match(text, /不需要你再手动挂 proactive_set 闹钟/)
+    A.match(text, /flow_watch/)
+    A.equal(sent[0].source.room, runIds[0], 'payload 的 room 用主 runId（本组第一个）')
+    // 单 run 的正文与旧版逐字一致（向后兼容）；超过上限只给摘要，别发一条上万字。
+    A.equal(
+      runtimeModule.supervisionWakePromptBatch([runIds[0]]),
+      runtimeModule.supervisionWakePrompt(runIds[0]),
+      '单 run 的合并提示词必须与旧版逐字相同',
+    )
+    const many = Array.from({ length: 25 }, (_, index) => `r-many-${index}`)
+    const manyText = runtimeModule.supervisionWakePromptBatch(many)
+    A.ok(manyText.includes('r-many-19'), '前 20 个逐个列出')
+    A.ok(!manyText.includes('r-many-20'), '超过上限的只给摘要')
+    A.match(manyText, /另有 5 个同批到期的 run/)
+    A.ok(manyText.length < 4000, `超大批次提示词必须有界（实际 ${manyText.length} 字）`)
+
+    // 可观测：1 次唤醒 + 9 个被合并；每条 run 的落盘计数都真的 +1（不是丢弃）。
+    const snapshot = runtime.supervision.snapshot()
+    A.equal(snapshot.wokenThisHour, 1, '预算口径按「真的发出去的提醒次数」计')
+    A.equal(snapshot.coalesced, 9, '9 个 run 被合并')
+    A.equal(snapshot.throttled, 0)
+    A.equal(snapshot.waker.sessions.length, 1)
+    A.equal(snapshot.waker.sessions[0].sessionId, 'sess-g7a-shared')
+    A.equal(snapshot.waker.sessions[0].coalesced, 9)
+    for (const runId of runIds) {
+      A.equal(runtime.supervision.status(runId).wakes, 1, `${runId} 不能被丢`)
+      const meta = await store.readRunMeta(runsRoot, runId)
+      A.equal(meta.supervision.wakes, 1, `${runId} 的 supervision.wakes 已落盘`)
+      A.ok(typeof meta.supervision.nextDueAt === 'string', `${runId} 的 nextDueAt 已推进`)
+    }
+    runtime.dispose()
+  })
+
+  await check('G7-a：同一会话最小唤醒间隔内到点的 run 被限流 —— 不发第二条、保留 due、计数可见', async () => {
+    await saveFlow(oneStageFlow('flow-rt-g7a-throttle'))
+    const sent = []
+    const fakeAgent = { status: 'idle', followup(payload) { sent.push(payload) } }
+    const agents = { get: () => fakeAgent }
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      ctx: { get: () => agents },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      wakerMinIntervalMs: 120_000,
+      auditWorkflow: () => ({ verdict: 'healthy', nextCheckSeconds: 180 }),
+    })
+    const makeDue = async () => {
+      const run = await makeRun('flow-rt-g7a-throttle')
+      await store.writeRunMeta(runsRoot, run.id, {
+        status: 'running',
+        started: true,
+        startedAt: '2020-01-01T00:00:00.000Z',
+      })
+      await runtime.enableSupervision(run.id, { enabled: true, wakerSessionId: 'sess-g7a-throttle' })
+      return run.id
+    }
+
+    // 第一个 run 先唤醒一次，消耗掉该会话本轮预算（lastWokeAt = now）。
+    const first = await makeDue()
+    await runtime.supervision.tick()
+    A.equal(sent.length, 1)
+    A.equal(runtime.supervision.status(first).wakes, 1)
+
+    // 立刻再登记一个同会话、且已过点的 run：最小间隔内 → 限流（不丢）。
+    const second = await makeDue()
+    await runtime.supervision.tick()
+    A.equal(sent.length, 1, '最小间隔内不得再发第二条 followup')
+    A.equal(runtime.supervision.status(second).wakes, 0, '被限流的 run 没被唤醒（但也没被丢掉）')
+    A.equal(runtime.supervision.status(second).enabled, true, '限流不是失败，不能降级')
+    A.equal(runtime.supervision.status(second).failures, 0)
+    A.match(runtime.supervision.status(second).lastReason, /^throttled: /)
+
+    const snapshot = runtime.supervision.snapshot()
+    A.ok(snapshot.throttled >= 1, '限流要记进可观测计数')
+    const throttledEntry = snapshot.entries.find(entry => entry.runId === second)
+    A.equal(throttledEntry.lastOutcome, 'throttled')
+    A.equal(throttledEntry.throttled, 1)
+    const meta = await store.readRunMeta(runsRoot, second)
+    A.equal(meta.supervision.wakes, 0)
+    A.ok(
+      typeof meta.supervision.nextDueAt === 'string'
+        && Date.parse(meta.supervision.nextDueAt) <= Date.now(),
+      '被限流的 run 必须保留 due（nextDueAt ≤ now，下一轮再来）',
+    )
+    runtime.dispose()
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runtime · v0.8.2 G7-b：重启恢复节点自审闹钟')
+
+  /**
+   * 造一个「running + 本进程有 Engine 实例」的 run，写入 nodeStatus / sessions.json，
+   * 再显式跑一次节点闹钟恢复。activate 挂住让 run 一直 running。
+   */
+  async function stagedRunningRun(flowId, { nodeStatus, sessions } = {}) {
+    await saveFlow(oneStageFlow(flowId))
+    const run = await makeRun(flowId)
+    const gate = deferred()
+    const logs = []
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      log: (level, message) => logs.push(`${level}:${message}`),
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      activate: async ({ node }) => {
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    // 先让初始化扫描跑完（此时还没有本进程实例，不会误扫），再 start。
+    await runtime.nodeAlarmsReady
+    await runtime.start(run.id)
+    A.equal((await store.readRunMeta(runsRoot, run.id)).status, 'running')
+    if (nodeStatus !== undefined) await store.writeRunMeta(runsRoot, run.id, { nodeStatus })
+    if (sessions !== undefined) await store.writeNodeSessions(runsRoot, run.id, sessions)
+    const close = async () => {
+      gate.resolve()
+      await runtime.wait(run.id).catch(() => {})
+      await runtime.dispose()
+    }
+    return { runtime, run, logs, close }
+  }
+
+  const iso = secondsAgo => new Date(Date.now() - secondsAgo * 1000).toISOString()
+
+  await check('G7-b：重启恢复 2 条非终态节点闹钟（nextDueAt > now）；终态节点不恢复', async () => {
+    const { runtime, run, logs, close } = await stagedRunningRun('flow-rt-g7b-basic', {
+      nodeStatus: {
+        n_a: { state: 'working', progress: 10, at: iso(60) },
+        n_b: { state: 'blocked', progress: 20, at: iso(30) },
+        n_done: { state: 'done', progress: 100, at: iso(10) },
+        n_failed: { state: 'failed', progress: 100, at: iso(5) },
+      },
+      sessions: {
+        n_a: { sessionId: 'sess-g7b-a', createdAt: iso(600), lastUsedAt: iso(60) },
+        n_b: { sessionId: 'sess-g7b-b', createdAt: iso(600), lastUsedAt: iso(30) },
+        n_done: { sessionId: 'sess-g7b-done', createdAt: iso(600), lastUsedAt: iso(10) },
+        n_failed: { sessionId: 'sess-g7b-failed', createdAt: iso(600), lastUsedAt: iso(5) },
+      },
+    })
+
+    const before = Date.now()
+    const summary = await runtime.recoverNodeAlarms()
+    A.equal(summary.runsScanned, 1)
+    A.equal(summary.runsRecovered, 1)
+    A.equal(summary.restored, 2, '只恢复两个非终态节点')
+    A.equal(summary.skippedTerminal, 2, 'done / failed 是终态，不恢复')
+    A.equal(summary.missingSession, 0)
+    A.equal(summary.missingAttempt, 2, 'nodeStatus 没有 attempt → 按 1 处理并计数')
+
+    const listed = runtime.nodeSupervision.list()
+    A.equal(listed.length, 2, '调度器里正好两条')
+    A.deepEqual(listed.map(entry => entry.nodeId).sort(), ['n_a', 'n_b'])
+    A.deepEqual(listed.map(entry => entry.sessionId).sort(), ['sess-g7b-a', 'sess-g7b-b'])
+    for (const entry of listed) {
+      A.equal(entry.runId, run.id)
+      A.equal(entry.attempt, 1, '缺 attempt 时按 1 处理')
+      A.ok(Date.parse(entry.nextDueAt) > before, `${entry.nodeId} 的 nextDueAt 必须 > now（重启瞬间不唤醒）`)
+      // 默认恢复间隔 = NODE_ALARM_DEFAULT_MS（600s）。
+      A.ok(Date.parse(entry.nextDueAt) - before >= 590_000, '恢复后首轮按 600s 重排')
+    }
+    // 缺 attempt 要留 warn。
+    A.ok(logs.some(line => line.startsWith('warn:') && /没有 attempt/.test(line)), '缺 attempt 要记 warn')
+
+    // 可观测：恢复统计进 snapshot().recovery。
+    const recovery = runtime.nodeSupervision.snapshot().recovery
+    A.equal(recovery.restored, 2)
+    A.equal(recovery.skippedTerminal, 2)
+    A.equal(recovery.missingAttempt, 2)
+    A.deepEqual(runtime.nodeRecovery, recovery)
+    await close()
+  })
+
+  await check('G7-b：缺 sessionId 的节点被跳过并计数；重复恢复幂等（不重复登记、不重排 due）', async () => {
+    const { runtime, logs, close } = await stagedRunningRun('flow-rt-g7b-missing', {
+      nodeStatus: {
+        n_has: { state: 'working', at: iso(10) },
+        n_missing: { state: 'working', at: iso(10) },
+        n_done: { state: 'done', at: iso(5) },
+      },
+      sessions: {
+        n_has: { sessionId: 'sess-g7b-has', createdAt: iso(600), lastUsedAt: iso(10) },
+        n_done: { sessionId: 'sess-g7b-done', createdAt: iso(600), lastUsedAt: iso(5) },
+      },
+    })
+
+    const first = await runtime.recoverNodeAlarms()
+    A.equal(first.restored, 1)
+    A.equal(first.missingSession, 1, '缺 sessionId 的节点跳过并计数')
+    A.equal(first.skippedTerminal, 1)
+    A.equal(runtime.nodeSupervision.list().length, 1, '不造一个叫不醒的条目')
+    A.equal(runtime.nodeSupervision.list()[0].sessionId, 'sess-g7b-has')
+    A.ok(logs.some(line => line.startsWith('warn:') && /没有 sessionId/.test(line)), '缺 sessionId 要留 warn')
+    const before = runtime.nodeSupervision.list()[0].nextDueAt
+
+    // 重复调用：已登记的不再 register（不会把 nextDueAt 往后推）、不产生重复条目。
+    const second = await runtime.recoverNodeAlarms()
+    A.equal(second.restored, 0)
+    A.equal(second.alreadyRegistered, 1)
+    A.equal(second.missingSession, 1)
+    A.equal(runtime.nodeSupervision.list().length, 1, '幂等：不重复登记')
+    A.equal(runtime.nodeSupervision.list()[0].nextDueAt, before, '幂等：已排好的 due 不被重排')
+    await close()
+  })
+
+  await check('G7-b：本进程没有 Engine 实例的 running run 不恢复（不叫醒别的进程的会话）', async () => {
+    await saveFlow(oneStageFlow('flow-rt-g7b-no-engine'))
+    const run = await makeRun('flow-rt-g7b-no-engine')
+    await store.writeRunMeta(runsRoot, run.id, {
+      status: 'running',
+      started: true,
+      startedAt: '2020-01-01T00:00:00.000Z',
+      nodeStatus: { n_a: { state: 'working', at: iso(10) } },
+    })
+    await store.writeNodeSessions(runsRoot, run.id, {
+      n_a: { sessionId: 'sess-g7b-orphan', createdAt: iso(600), lastUsedAt: iso(10) },
+    })
+    const runtime = createRuntime({
+      runsRoot,
+      flowsRoot,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    await runtime.nodeAlarmsReady
+    const summary = await runtime.recoverNodeAlarms()
+    A.equal(summary.runsScanned, 0)
+    A.equal(summary.restored, 0)
+    A.equal(runtime.nodeSupervision.list().length, 0, '没有 Engine 实例的 run 不登记任何节点闹钟')
+    runtime.dispose()
   })
 
 } finally {

@@ -265,15 +265,35 @@ function disabledWorktree(reason) {
 function normalizeWorktreeRecord(saved) {
   if (!saved || typeof saved !== 'object') return disabledWorktree('not-a-git-repo')
   if (saved.enabled !== true) return disabledWorktree(saved.reason)
-  return {
+  const record = {
     enabled: true,
     reason: typeof saved.reason === 'string' && saved.reason !== '' ? saved.reason : 'git-workspace',
     decidedBy: 'initiator',
     path: typeof saved.path === 'string' ? saved.path : null,
     branch: typeof saved.branch === 'string' ? saved.branch : null,
-    baseCommit: typeof saved.baseCommit === 'string' ? saved.baseCommit : null,
+    // 空仓库（`git worktree add --orphan`）没有 base commit：null 是**合法值**，
+    // 不按 40 位 hex 兜底，也不拿别的 commit 冒充「这个 worktree 的基线」。
+    baseCommit: typeof saved.baseCommit === 'string' && saved.baseCommit !== '' ? saved.baseCommit : null,
     createdAt: typeof saved.createdAt === 'string' ? saved.createdAt : null,
   }
+  // worktrees 根：删除入口的严格前缀校验（必须落在 <root>/<workspaceId>/<runId>）依赖它。
+  // 重读 run.json 时丢了就会退回结构校验，等于削弱删除保护，所以这里必须保留。
+  if (typeof saved.root === 'string' && saved.root !== '') record.root = saved.root
+  // 建 worktree 时算出的「不会带过去的改动」告警：重读后同样要能再看一遍。
+  if (Array.isArray(saved.warnings)) {
+    const warnings = saved.warnings.filter(item => typeof item === 'string' && item !== '').slice(0, 20)
+    if (warnings.length > 0) record.warnings = warnings
+  }
+  return record
+}
+
+/** worktree 模块抛出的结构化 reason（not-a-repo / subdirectory / git-unavailable / …）。 */
+function worktreeErrorReason(error) {
+  if (error && typeof error.reason === 'string' && error.reason !== '') return error.reason
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  if (code === 'WORKTREE_POLICY_INVALID') return 'policy-invalid'
+  if (code === 'WORKTREE_UNAVAILABLE') return 'not-a-repo'
+  return 'create-failed'
 }
 
 function intOr(value, fallback = 0) {
@@ -338,6 +358,8 @@ export const LIVE_NODE_TITLE_MAX_CHARS = 200
 export const LIVE_MEMBERS_MAX = 16
 /** §8.2：同会话连续相同文本去重表的上限。 */
 const ASSISTANT_TEXT_CACHE_MAX = 64
+/** C2 / G1-b：每个会话最近一条正式结论的缓存上限（LRU，有界）。 */
+const STRUCTURED_VERDICT_CACHE_MAX = 64
 
 function textOfContentBlock(block) {
   if (typeof block === 'string') return block
@@ -882,12 +904,23 @@ function isOpenFinding(finding) {
   return finding && finding.status !== 'verified' && finding.status !== 'dismissed'
 }
 
-function findingLine(finding) {
-  const id = typeof finding.id === 'string' && finding.id !== '' ? finding.id : '（无 id）'
+function findingLine(finding, displayId) {
+  const id = typeof displayId === 'string' && displayId !== ''
+    ? displayId
+    : (typeof finding.id === 'string' && finding.id !== '' ? finding.id : '（无 id）')
   return `  - [${finding.severity || '?'}] ${id} ${finding.title || '（未命名问题）'}（${finding.status || 'unknown'}）`
 }
 
-function rejectText(previous, rejectContext) {
+/**
+ * 打回上下文（06 §13.7 B4）。
+ *
+ * G1-c：这里打印的是**原始 id**（去掉各自的节点命名空间前缀）。模型被要求
+ * 「复用同一 id、全量重报」，照抄原文后引擎按接收方节点重新加前缀：
+ *   - 本节点上一轮的 id `n_a:R1` → 提示词里 `R1` → 复报后仍是 `n_a:R1`；
+ *   - 打回方的 id `n_b:BF1` → 提示词里 `BF1` → 复报后是 `n_a:BF1`（本节点自己的
+ *     命名空间，不再变成 `n_a:n_b:BF1`）。
+ */
+function rejectText(previous, rejectContext, nodeId = '') {
   const lines = []
   const seen = new Set()
   const openFromReject = Array.isArray(rejectContext && rejectContext.findings)
@@ -900,7 +933,7 @@ function rejectText(previous, rejectContext) {
       lines.push('- 打回方列出的未关闭问题（本轮必须**复用同一 id 更新 status**，不要新造 id）：')
       for (const finding of openFromReject.slice(0, 12)) {
         if (finding.id) seen.add(finding.id)
-        lines.push(findingLine(finding))
+        lines.push(findingLine(finding, unnamespaceId(rejectContext.fromNodeId, finding.id)))
       }
     }
     if (typeof rejectContext.rejectTarget === 'string' && rejectContext.rejectTarget !== '') {
@@ -915,15 +948,16 @@ function rejectText(previous, rejectContext) {
     if (previous.summary) lines.push(`- 你上一轮的结论：${previous.summary}`)
     if (previousOpen.length > 0) {
       lines.push('- 你上一轮未关闭的问题（本轮必须**复用同一 id 更新 status**，不要新造 id）：')
-      for (const finding of previousOpen.slice(0, 12)) lines.push(findingLine(finding))
+      for (const finding of previousOpen.slice(0, 12)) lines.push(findingLine(finding, unnamespaceId(nodeId, finding.id)))
     }
   }
   // 06 §13.7 B4：上一轮的证据标识必须随打回上下文下传，本轮全量重报。
   const evidence = (rejectContext && rejectContext.previousEvidence) || (previous && previous.evidence) || null
   if (evidence) {
-    const acceptanceIds = Array.isArray(evidence.acceptance) ? evidence.acceptance : []
-    const suites = Array.isArray(evidence.testsSuites) ? evidence.testsSuites : []
-    const ruleSets = Array.isArray(evidence.ruleSetIds) ? evidence.ruleSetIds : []
+    const bare = list => list.map(item => unnamespaceId(nodeId, item))
+    const acceptanceIds = Array.isArray(evidence.acceptance) ? bare(evidence.acceptance) : []
+    const suites = Array.isArray(evidence.testsSuites) ? bare(evidence.testsSuites) : []
+    const ruleSets = Array.isArray(evidence.ruleSetIds) ? bare(evidence.ruleSetIds) : []
     if (acceptanceIds.length > 0 || suites.length > 0 || ruleSets.length > 0) {
       lines.push('- 上一轮已报的证据标识（本轮必须**全量重报**；漏报的旧 fail 项会被聚合层判 unknown，不允许靠少报洗绿）：')
       if (acceptanceIds.length > 0) lines.push(`  - 验收条目 itemId：${acceptanceIds.slice(0, 50).join('、')}`)
@@ -1010,7 +1044,7 @@ export function buildPrompt({
   let upstreamBody = upstreamText(upstream)
 
   const formatSection = section('输出格式', outputFormatText())
-  const rejectBody = attempt > 1 || rejectContext || previous ? rejectText(previous, rejectContext) : ''
+  const rejectBody = attempt > 1 || rejectContext || previous ? rejectText(previous, rejectContext, node.id) : ''
   // 06 §16：外部消息段（宿主侧已拼好并有界；空串时不占提示词预算）。
   let inboxBody = String(inboxText || '').trim()
 
@@ -1141,10 +1175,31 @@ export function stubStructured(node, attempt, flow, now) {
 // 结构化产物 → 05 事件
 // ---------------------------------------------------------------------------
 
-/** 证据命名空间（06 §13.7 B3）：`<nodeId>:<原始 id>`；缺省 ruleSetId 也带前缀。 */
+/**
+ * 证据命名空间（06 §13.7 B3）：`<nodeId>:<原始 id>`；缺省 ruleSetId 也带前缀。
+ *
+ * G1-c：**幂等**。打回上下文要求模型「复用同一 id、全量重报」，模型照抄的正是
+ * 上一轮那个（已带本节点前缀的）id —— 再套一层就变成 `n_a:n_a:R1`，与旧的
+ * `n_a:R1` 对不上，旧 fail 永远复判不成通过（聚合层判 staleFails）。所以已经带
+ * `<nodeId>:` 前缀的 id 原样保留。
+ */
 function namespaceEvidenceId(nodeId, rawId, fallback) {
   const base = typeof rawId === 'string' && rawId.trim() !== '' ? rawId.trim() : fallback
+  if (typeof nodeId === 'string' && nodeId !== '' && typeof base === 'string' && base.startsWith(`${nodeId}:`)) {
+    return clip(base, 128)
+  }
   return clip(`${nodeId}:${base}`, 128)
+}
+
+/**
+ * G1-c：去掉某个节点的命名空间前缀，拿到「原始 id」。
+ * 提示词里只打印原始 id，模型照抄后由引擎按接收方节点重新加前缀，不会二次前缀。
+ */
+function unnamespaceId(nodeId, id) {
+  if (typeof id !== 'string' || id === '') return id
+  if (typeof nodeId !== 'string' || nodeId === '') return id
+  const prefix = `${nodeId}:`
+  return id.startsWith(prefix) && id.length > prefix.length ? id.slice(prefix.length) : id
 }
 
 function normalizeFindings(input, nodeId) {
@@ -1495,6 +1550,11 @@ class FlowEngine {
       ? options.maxTotalSteps
       : null
     this.configuredMaxTotalSteps = this.maxTotalSteps
+    // G1-d：本次 run 实际生效的墙钟上限（显式 start 参数 > 环境变量 > 默认）。
+    // 构造级的 runTimeoutMs / nodeTimeoutMs 已经按「构造参数 > 环境变量 > 默认」算好，
+    // 这里只是 per-run 覆盖层；start() 当场算、写进 run.json.limits、run 内只读。
+    // 收尾后仍保留（供诊断 / 路由回报「这次跑的是哪套上限」），下一次 start 覆盖。
+    this.runLimits = null
     // 06 §13.9：单产物 1 MiB / 单 run 64 MiB（测试可注入更小值）。
     this.maxArtifactBytes = Number.isInteger(options.maxArtifactBytes) && options.maxArtifactBytes >= 0
       ? options.maxArtifactBytes
@@ -1556,6 +1616,9 @@ class FlowEngine {
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
+    // G1-a：新 run 重新开封（上一次收尾的封口只属于那一次 run）。
+    this.closing = false
+    this.sealedSessionEventDrops = 0
     this.failedNode = null
     this.sessionBindings = new Map()
     this.pendingSessionEvents = []
@@ -1576,9 +1639,12 @@ class FlowEngine {
     // 07 §11.3（C2）：sessionId → 本轮下发的 { attempt, nonce }。正式结论与自审状态块
     // 都必须原样回显，否则视为旧 attempt 的迟到回报并丢弃。
     this.attemptEnvelopes = new Map()
-    // C2：sessionId → 本 attempt 最近一条**合法正式结论**。若后续又被一条只有状态块
-    // 的消息覆盖了 lastAssistant，收口时仍以正式结论为准（正式结论 > 状态块）。
-    this.lastFormalBySession = new Map()
+    // C2 / G1-b：sessionId → 本 attempt **最近一条能解析出正式结论**的 assistant 回报。
+    // 结构：{ attempt, nonce, structured }。解析成功才更新（状态块 / 普通文本永不覆盖），
+    // attempt 结束时清掉。收口时优先用它，而不是「最后一条消息」——闹钟注入的自审回报
+    // 一旦成为最后一条，不能把同一回合里更早的合法 verdict 顶掉。
+    // 有界：最多 STRUCTURED_CACHE_MAX 个会话（LRU 淘汰，防内存泄漏）。
+    this.lastStructuredBySession = new Map()
     // 自审状态块里夹带的证据只落盘一次（内容指纹去重），避免每次心跳都覆写同一文件。
     this.selfCheckEvidenceKeys = new Set()
     // C1：run.json 绑定补写串行化。writeRunMeta 自己有文件锁，但同一引擎内两次
@@ -1598,6 +1664,10 @@ class FlowEngine {
     this.startedBy = options.startedBy instanceof Map ? options.startedBy : new Map()
     this.lastStartedRunId = null
     this.eventQueue = Promise.resolve()
+    // G1-a：收尾封口。closing=true 之后到达的 session/event 一律丢弃，并计入
+    // `sealedSessionEventDrops`（可读，不静默丢）；下一次 start 归零。
+    this.closing = false
+    this.sealedSessionEventDrops = 0
     this._resetInboxState()
 
     if (this.ctx && typeof this.ctx.on === 'function') {
@@ -2019,6 +2089,10 @@ class FlowEngine {
         : [],
       blockers: Array.isArray(parsed.blockers) ? [...parsed.blockers] : [],
       verdict: parsed.verdict,
+      // 权威归属：这条状态是**哪个 attempt** 上报的（不受模型自报 attempt 影响）。
+      // runtime 重启后靠 run.json.nodeStatus[nodeId].attempt 恢复节点闹钟；缺了它只能
+      // 按 1 处理并 warn，打回后的 attempt=2 会恢复错。
+      attempt: binding.attemptId,
       at: nowIso,
     }
     this.nodeStatus.delete(nodeId)
@@ -2119,10 +2193,14 @@ class FlowEngine {
   }
 
   /**
-   * C2：记住本 attempt 最近一条合法正式结论（attempt + nonce 必须匹配）。
-   * 自审状态块永远不能覆盖它；收口时若最后一条消息只有状态块，用它兜底。
+   * C2 / G1-b：记住本 attempt **最近一条能解析出正式结论**的回报（attempt + nonce 必须匹配）。
+   *
+   * 只有解析成功（verdict=pass/reject）才更新；自审状态块、普通对话文本、旧 attempt 的
+   * 迟到回报都不能覆盖它。收口解析以它为准（而不是「最后一条 assistant 消息」）：
+   * 闹钟注入的自审回报成为最后一条时，同一回合更早的正式结论依然生效，不会被判
+   * StructuredOutputError 并重试 / 失败。缓存有界（LRU ≤ STRUCTURED_VERDICT_CACHE_MAX）。
    */
-  _captureFormalVerdict(binding, rawText) {
+  _captureStructuredVerdict(binding, rawText) {
     const expected = this.attemptEnvelopes.get(binding.sessionId)
     if (!expected || expected.attempt !== binding.attemptId) return
     const structured = parseAssistantStructured(rawText, {
@@ -2133,7 +2211,13 @@ class FlowEngine {
       },
     })
     if (!structured || (structured.verdict !== 'pass' && structured.verdict !== 'reject')) return
-    this.lastFormalBySession.set(binding.sessionId, {
+    const map = this.lastStructuredBySession
+    if (map.has(binding.sessionId)) map.delete(binding.sessionId)
+    else if (map.size >= STRUCTURED_VERDICT_CACHE_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+    map.set(binding.sessionId, {
       structured,
       attempt: expected.attempt,
       nonce: expected.nonce,
@@ -2232,7 +2316,7 @@ class FlowEngine {
   async _promptNodeSession({ agent, sessionId, prompt, runId, node, attempt, traceId, signal }) {
     // 清掉上一条 assistant 文本 / 正式结论缓存，避免把上一轮的结果误当成本轮输出。
     this.lastAssistantBySession.delete(sessionId)
-    this.lastFormalBySession.delete(sessionId)
+    this.lastStructuredBySession.delete(sessionId)
     // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
     this.bindSession(sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId }, { rebind: true })
     // C2：先登记本轮凭证再 followup —— 注入式宿主可能同步把回报喂进 handleSessionEvent。
@@ -2292,24 +2376,37 @@ class FlowEngine {
       // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
       await new Promise(resolve => setTimeout(resolve, 0))
       const raw = this.lastAssistantBySession.get(sessionId)
-      let structured = parseAssistantStructured(raw, {
+      // G1-b：结论取自「本 attempt 最近一条**能解析出正式结论**的 assistant 消息」，
+      // 而不是「最后一条消息」。闹钟注入的自审回报一旦成为最后一条（状态块 / 普通
+      // JSON / 附带证据），都不能顶掉同一回合里更早的合法 verdict——否则完成节点被
+      // 判 StructuredOutputError 并重试 / 失败。
+      const cached = this.lastStructuredBySession.get(sessionId)
+      const cachedVerdict = cached
+        && cached.attempt === attempt
+        && cached.nonce === envelope.nonce
+        && (cached.structured.verdict === 'pass' || cached.structured.verdict === 'reject')
+        ? cached.structured
+        : null
+      const lastParsed = parseAssistantStructured(raw, {
         attempt,
         nonce: envelope.nonce,
         onReject: rejectEnvelope,
       })
-      // C2：最后一条消息只有状态块时，退回本 attempt 最近一条合法正式结论；
-      // 正式结论 > 自审状态块，不能因为状态块把真实 reject 弄丢或翻成 pass。
-      if (!structured) {
-        const cached = this.lastFormalBySession.get(sessionId)
-        if (cached && cached.attempt === attempt && cached.nonce === envelope.nonce
-          && (cached.structured.verdict === 'pass' || cached.structured.verdict === 'reject')) {
-          structured = cached.structured
-          this.log(
-            'warn',
-            `flow-studio: 节点「${node.id}」最后一条消息只有自审状态块；改用本 attempt 最近一条正式结论（${structured.verdict}）`,
-          )
-        }
+      const lastIsFormal = Boolean(lastParsed)
+        && (lastParsed.verdict === 'pass' || lastParsed.verdict === 'reject')
+      let structured = lastIsFormal ? lastParsed : null
+      if (!structured && cachedVerdict) {
+        // 正式结论 > 自审状态块：最后一条不是正式结论时用缓存里的那一条
+        //（顺序上它一定早于最后一条，所以是「更早的正式结论不被后来的状态块顶掉」）。
+        structured = cachedVerdict
+        this.log(
+          'warn',
+          `flow-studio: 节点「${node.id}」最后一条消息不是正式结论；改用本 attempt 最近一条正式结论（${structured.verdict}）`,
+        )
       }
+      // 既没有正式结论、也没有本 attempt 的正式结论缓存时，把最后一条消息里的可解析
+      // 对象原样交给 normalizeStructured 报「缺少 verdict」（保持既有失败语义）。
+      if (!structured && lastParsed) structured = lastParsed
       if (!structured) {
         throw new StructuredOutputError(
           `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的正式 JSON 结论`
@@ -2320,6 +2417,9 @@ class FlowEngine {
     } finally {
       this._disarmSelfCheck(sessionId, selfCheck)
       if (this.attemptEnvelopes.get(sessionId) === envelope) this.attemptEnvelopes.delete(sessionId)
+      // G1-b：attempt 结束即清理正式结论缓存（不跨轮使用；迟到的回报已被 attemptEnvelopes 挡住）。
+      const settled = this.lastStructuredBySession.get(sessionId)
+      if (settled && settled.attempt === attempt) this.lastStructuredBySession.delete(sessionId)
     }
   }
 
@@ -2539,6 +2639,10 @@ class FlowEngine {
     if (this.workspaceRecord) binding.workspace = this.workspaceRecord
     if (this.worktreeRecord) binding.worktree = this.worktreeRecord
     if (this.sessionMode) binding.sessionMode = this.sessionMode
+    // G1-d：本次 run 实际生效的墙钟上限（`run.json.limits`）。runstore 的
+    // normalizeMeta 白名单里已有 `limits`（G2 契约），所以 readRunMeta 也能读回；
+    // 形状由 runstore 收敛（两个可选正整数）。
+    if (this.runLimits) binding.limits = { ...this.runLimits }
     const nodeStatus = this._nodeStatusSnapshot()
     // 自审状态可能很大（模型自报的 blockers / summary）；交给 runstore 的
     // normalizeNodeStatus 做字段收敛，绝不绕过 1MiB 守卫。
@@ -2701,7 +2805,9 @@ class FlowEngine {
       decision = decideWorktree({ workspace, policy })
     } catch (error) {
       // WORKTREE_UNAVAILABLE / WORKTREE_POLICY_INVALID：按 400 拒绝启动，不静默降级。
-      throw new EngineError(400, error && error.message ? error.message : 'worktree 策略不合法')
+      // 文案：可读中文在前，结构化 reason 放括号里（not-a-repo / subdirectory / policy-invalid）。
+      const message = error && error.message ? error.message : 'worktree 策略不合法'
+      throw new EngineError(400, `${message}（${worktreeErrorReason(error)}）`)
     }
 
     // C3：工作区是显式解析出来的（没有 process.cwd 兜底），不存在「auto-without-initiator」
@@ -2739,17 +2845,33 @@ class FlowEngine {
           decidedBy: 'initiator',
           path: created.path,
           branch: created.branch,
-          baseCommit: created.baseCommit,
+          // 空仓库走 --orphan：baseCommit 为 null（合法值，不按 40 位 hex 兜底）。
+          baseCommit: typeof created.baseCommit === 'string' && created.baseCommit !== ''
+            ? created.baseCommit
+            : null,
           createdAt: created.createdAt,
+          // worktrees 根：删除入口的严格前缀校验依赖它。
+          ...(typeof created.root === 'string' && created.root !== '' ? { root: created.root } : {}),
+          // 「不会带过去的改动」（dirty / 敏感文件 / node_modules / 清理了残留）随记录落盘。
+          ...(Array.isArray(created.warnings) && created.warnings.length > 0
+            ? { warnings: [...created.warnings] }
+            : {}),
+        }
+        // 创建前的告警必须上浮：run/start.data.worktreeWarning + 宿主日志（宿主按 warn 打印）。
+        for (const warning of Array.isArray(created.warnings) ? created.warnings : []) {
+          if (typeof warning === 'string' && warning !== '') warnings.push(warning)
         }
       } catch (error) {
         const detail = error && error.message ? error.message : String(error)
+        // 结构化 reason：not-a-repo / subdirectory / git-unavailable / empty-repo /
+        // path-exists / registered-elsewhere / locked / create-failed。
+        const reason = worktreeErrorReason(error)
         if (policy === 'on') {
-          throw new EngineError(400, `按 on 创建 worktree 失败：${detail}`)
+          throw new EngineError(400, `按 on 创建 worktree 失败（${reason}）：${detail}`)
         }
-        // auto：不假装隔离，落 enabled:false + 原因，并留一条 warn。
-        worktree = disabledWorktree(`create-failed: ${detail}`)
-        warnings.push(`worktree 创建失败，已按不隔离继续：${detail}`)
+        // auto：不假装隔离，落 enabled:false + `create-failed:<reason>`，并留一条 warn。
+        worktree = disabledWorktree(`create-failed:${reason}`)
+        warnings.push(`worktree 创建失败（${reason}），已按不隔离继续：${detail}`)
       }
     }
 
@@ -2975,9 +3097,14 @@ class FlowEngine {
    * `options.cwd` 既可作为工作区路径候选（优先于构造时 cwd），也继续作为节点主管
    * 会话的工作目录；`options.agentPreset` 透传给节点主管会话。
    *
+   * G1-d：`options.runTimeoutMs` / `options.nodeTimeoutMs` 是**本次 run** 的墙钟上限
+   * （毫秒，正整数）。优先级：显式参数 > 环境变量 `FLOW_STUDIO_RUN_TIMEOUT_MS` /
+   * `FLOW_STUDIO_NODE_TIMEOUT_MS` > 默认值（2 小时 / 20 分钟）。生效值写进
+   * `run.json.limits`。非正整数 → 400，且发生在写 run/start 之前。
+   *
    * @param {string} runId
    * @param {{ parent?: object | null, workspace?: string | object, worktree?: 'auto'|'on'|'off',
-   *   cwd?: string, agentPreset?: string }} [options]
+   *   cwd?: string, agentPreset?: string, runTimeoutMs?: number, nodeTimeoutMs?: number }} [options]
    */
   async start(runId, options = {}) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
@@ -2986,6 +3113,9 @@ class FlowEngine {
     if (parentOverride !== undefined && parentOverride !== null && typeof parentOverride !== 'object') {
       throw new EngineError(400, 'parent 必须是 Agent 对象（或省略以沿用既有父会话解析）')
     }
+    // G1-d：显式 timeout 参数在校验后就地生效；非法值（非正整数）必须 400，且发生在
+    // 占位 / 写 run.json / 写 run/start 之前（不留下半开跑的 run）。
+    const limits = this._resolveRunLimits(options)
     // —— 同步占位：这一行之前不许有任何 await ——
     // 07 §5：实例级占位（一个实例只服务一个 run）。跨 run 的并发由 runtime 管，
     // 这里只防「同一个实例被同时塞两个 run」这种误用。
@@ -2996,6 +3126,8 @@ class FlowEngine {
     const active = { runId, flow: null, controller, promise: null, starting: true, engine: this }
     this.active = active
     this._resetRunState()
+    // G1-d：本次 run 实际生效的墙钟上限（run.json.limits 的唯一来源）。
+    this.runLimits = limits
     // 06 §15：把本次 start 的父会话覆盖挂到运行态上；_cleanupActive() 负责清掉。
     this.startParent = parentOverride || null
     this.startCwd = typeof options.cwd === 'string' && options.cwd !== '' ? options.cwd : null
@@ -3127,7 +3259,15 @@ class FlowEngine {
           engine: this.engineName,
           // 07 §4（R4）/§3：工作区与 worktree 决策贴在同一处，客户端不用再读 run.json。
           ...(this.workspaceRecord
-            ? { workspaceId: this.workspaceRecord.id, worktreeEnabled: this.worktreeRecord ? this.worktreeRecord.enabled === true : false }
+            ? {
+              workspaceId: this.workspaceRecord.id,
+              worktreeEnabled: this.worktreeRecord ? this.worktreeRecord.enabled === true : false,
+              // 决策原因（09 §4）：`disabled-by-initiator` = 用户主动关的（off），
+              // 与 `not-a-git-repo` / `create-failed:<reason>` 这类降级不同，UI 要能区分。
+              ...(this.worktreeRecord && typeof this.worktreeRecord.reason === 'string' && this.worktreeRecord.reason !== ''
+                ? { worktreeReason: clip(this.worktreeRecord.reason, 128) }
+                : {}),
+            }
             : {}),
           ...(this.sessionMode ? { sessionMode: this.sessionMode } : {}),
           // 降级原因（git 不可用 / worktree 建失败）：不新造 kind，挂在 run/start.data 上。
@@ -3149,9 +3289,49 @@ class FlowEngine {
       if (active.lease && typeof runstoreModule.releaseLease === 'function') {
         await runstoreModule.releaseLease(this.runsRoot, runId).catch(() => {})
       }
-      if (this.active === active) this._cleanupActive()
+      if (this.active === active) await this._cleanupActive()
       throw error
     }
+  }
+
+  /**
+   * G1-d：本次 run 的墙钟上限（run 级 / 节点级）。
+   *
+   * 优先级：`start(runId, { runTimeoutMs, nodeTimeoutMs })` 显式参数 >
+   * 环境变量（`FLOW_STUDIO_RUN_TIMEOUT_MS` / `FLOW_STUDIO_NODE_TIMEOUT_MS`；构造时
+   * 已按「构造参数 > 环境变量 > 默认值」读进 `this.runTimeoutMs` / `this.nodeTimeoutMs`）>
+   * 默认值。显式参数非法（非正整数）→ EngineError(400)，在开跑之前抛出。
+   *
+   * 为什么默认 2 小时会打断「跑 6 小时」：以前只有进程环境变量能改；现在这条 per-run
+   * 覆盖（路由 / 模型工具透传由上层负责）让一次长 run 可以显式放宽，且生效值会写进
+   * `run.json.limits`，事后可核对跑的是哪套上限。
+   */
+  _resolveRunLimits(options = {}) {
+    const source = options && typeof options === 'object' ? options : {}
+    const pick = (key, fallback) => {
+      const value = source[key]
+      if (value === undefined || value === null) return fallback
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new EngineError(400, `${key} 必须是正整数（毫秒），收到：${String(value)}`)
+      }
+      return value
+    }
+    return {
+      runTimeoutMs: pick('runTimeoutMs', this.runTimeoutMs),
+      nodeTimeoutMs: pick('nodeTimeoutMs', this.nodeTimeoutMs),
+    }
+  }
+
+  /** G1-d：本次 run 生效的 run 墙钟上限（没有 per-run 覆盖时回落到构造级配置）。 */
+  _effectiveRunTimeoutMs() {
+    const value = this.runLimits && this.runLimits.runTimeoutMs
+    return Number.isInteger(value) && value > 0 ? value : this.runTimeoutMs
+  }
+
+  /** G1-d：本次 run 生效的节点超时（没有 per-run 覆盖时回落到构造级配置）。 */
+  _effectiveNodeTimeoutMs() {
+    const value = this.runLimits && this.runLimits.nodeTimeoutMs
+    return Number.isInteger(value) && value > 0 ? value : this.nodeTimeoutMs
   }
 
   /** 每个 run 从零开始的运行态（一个引擎实例可以依次跑多个 run）。 */
@@ -3163,6 +3343,9 @@ class FlowEngine {
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
+    // G1-a：新 run 重新开封（上一次收尾的封口只属于那一次 run）。
+    this.closing = false
+    this.sealedSessionEventDrops = 0
     // 06 §9：最近一次节点级失败的坐标；run/end failed 用 failedNodeId 指认「死在哪」。
     this.failedNode = null
     this.maxTotalSteps = this.configuredMaxTotalSteps
@@ -3180,7 +3363,7 @@ class FlowEngine {
     this.nodeStatus = new Map()
     this.selfChecks.clear()
     this.attemptEnvelopes.clear()
-    this.lastFormalBySession.clear()
+    this.lastStructuredBySession.clear()
     this.selfCheckEvidenceKeys.clear()
     this.bindingPatchQueue = Promise.resolve()
     this.sessionsPatchWarned = false
@@ -3195,7 +3378,7 @@ class FlowEngine {
     this.entryStageId = null
     this.sessionDegraded = false
     this.lastAssistantBySession = new Map()
-    this.lastFormalBySession = new Map()
+    this.lastStructuredBySession = new Map()
   }
 
   /** 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。 */
@@ -3299,10 +3482,13 @@ class FlowEngine {
     let aborted = false
     let arrivedByReject = false
     let steps = 0
+    // G1-d：用本次 run 实际生效的墙钟上限（显式 start 参数 > 环境变量 > 默认），
+    // 收口时 live 已清空，所以这里先取本地值，别在定时器里再读 this。
+    const runTimeoutMs = this._effectiveRunTimeoutMs()
     const deadline = setTimeout(() => {
       this.runTimedOut = true
-      active.controller.abort(new Error(`run 超过墙钟上限（${this.runTimeoutMs}ms）`))
-    }, this.runTimeoutMs)
+      active.controller.abort(new Error(`run 超过墙钟上限（${runTimeoutMs}ms）`))
+    }, runTimeoutMs)
     // 06 §13.3：每 30s 续租；续租失败只告警（租约过期由 Host sweep 收尾）。
     const leaseTimer = active.lease && typeof runstoreModule.renewLease === 'function'
       ? setInterval(() => {
@@ -3312,11 +3498,14 @@ class FlowEngine {
       }, 30000)
       : null
     if (leaseTimer && typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    // G1-a：run/end 的载荷先算出来，实际落盘挪到 finally（封口 + dispose + 最终 drain 之后），
+    // 保证「run/end 之后不再有任何事件」。
+    let endPatch = null
     try {
       node = selectFirstNode(flow)
       if (!node) throw new Error('流程没有可执行节点：开始节点没有 next 出边')
       while (node && node.kind !== NODE_KIND.END) {
-        if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${this.runTimeoutMs}ms）`)
+        if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
         if (signal.aborted) {
           aborted = true
           break
@@ -3563,13 +3752,13 @@ class FlowEngine {
         node = nextNode
       }
 
-      if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${this.runTimeoutMs}ms）`)
+      if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
       if (signal.aborted) aborted = true
       if (this.failedNode && !aborted) {
         // 06 §9 失败隔离：节点失败收口为 run failed，但已通过节点的事件 / 产物一条不动；
         // failedNodeId 明确告诉查看者「死在哪」，而不是只有一个笼统 reason。
         const failure = this.failedNode
-        await this._append(runId, [{
+        endPatch = [{
           kind: 'run/end',
           traceId: runTraceId(runId),
           data: {
@@ -3583,13 +3772,13 @@ class FlowEngine {
             nodeId: failure.nodeId,
             ...(Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
           },
-        }])
+        }]
       } else {
-        await this._append(runId, [{
+        endPatch = [{
           kind: 'run/end',
           traceId: runTraceId(runId),
           data: aborted ? { status: 'aborted', reason: '已停止' } : { status: 'done' },
-        }])
+        }]
       }
     } catch (error) {
       const timedOut = this.runTimedOut
@@ -3597,36 +3786,52 @@ class FlowEngine {
       // 06 §9：失败坐标为 null 时退回 this.current（例如在主循环外抛错时仍尽量指认节点）。
       const failure = this.failedNode
         || (this.current ? { nodeId: this.current.node.id, attempt: this.current.attempt } : null)
-      try {
-        await this._append(runId, [{
-          kind: 'run/end',
-          traceId: runTraceId(runId),
-          data: abortedNow
-            ? { status: 'aborted', reason: '已停止' }
-            : {
-              status: 'failed',
-              reason: clip(error.message || String(error), 2000),
-              ...(failure ? { failedNodeId: failure.nodeId } : {}),
-            },
-          ...(abortedNow ? {} : {
-            extra: {
-              error: clip(error.name || 'Error', 64),
-              detail: clip(error.message || String(error), 256),
-              ...(failure ? { nodeId: failure.nodeId } : {}),
-              ...(failure && Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
-              ...(error instanceof StructuredOutputError ? { validationError: clip(error.validationError, 256) } : {}),
-              ...(error instanceof NodeTimeoutError ? { timeout: true } : {}),
-              ...(timedOut ? { runTimeout: true } : {}),
-            },
-          }),
-        }])
-      } catch (writeError) {
-        this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
-      }
+      endPatch = [{
+        kind: 'run/end',
+        traceId: runTraceId(runId),
+        data: abortedNow
+          ? { status: 'aborted', reason: '已停止' }
+          : {
+            status: 'failed',
+            reason: clip(error.message || String(error), 2000),
+            ...(failure ? { failedNodeId: failure.nodeId } : {}),
+          },
+        ...(abortedNow ? {} : {
+          extra: {
+            error: clip(error.name || 'Error', 64),
+            detail: clip(error.message || String(error), 256),
+            ...(failure ? { nodeId: failure.nodeId } : {}),
+            ...(failure && Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
+            ...(error instanceof StructuredOutputError ? { validationError: clip(error.validationError, 256) } : {}),
+            ...(error instanceof NodeTimeoutError ? { timeout: true } : {}),
+            ...(timedOut ? { runTimeout: true } : {}),
+          },
+        }),
+      }]
     } finally {
       clearTimeout(deadline)
       if (leaseTimer) clearInterval(leaseTimer)
+      // -------------------------------------------------------------------
+      // G1-a 收尾顺序（顺序本身就是这段代码的正确性）：
+      //   ① 封口：之后到达的 session/event 一律丢弃并计数（不再写事件 / 不再刷 live）；
+      //   ② dispose 节点会话：宿主要在 dispose 里 cancel / drain 正在跑的回合，这期间
+      //      仍可能派发 session/event —— 此时已封口，不会再挂到 run/end 之后；
+      //   ③ 等一次 eventQueue：封口前排队的写入必须落盘完；
+      //   ④ 最后才写 run/end，再写 live:null（live:null 一定晚于 dispose 与最终 drain）；
+      //   ⑤ 释放租约 → 再等一次 eventQueue → _cleanupActive。
+      // 旧顺序（run/end → drain → live:null → releaseLease → dispose → cleanup）会让
+      // dispose 期间的事件写到 run/end 之后，并把 run.json.live 写回非 null。
+      // -------------------------------------------------------------------
+      this._sealSessionEvents(runId)
+      await this._disposeRunSessions(runId)
       await this.eventQueue.catch(() => {})
+      if (endPatch) {
+        try {
+          await this._append(runId, endPatch)
+        } catch (writeError) {
+          this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+        }
+      }
       await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
       // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
       await this._patchRunBinding(runId)
@@ -3635,9 +3840,9 @@ class FlowEngine {
           this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
         })
       }
-      // 06 §16：run 结束（done/failed/aborted）或 stop 收口时，统一释放本次 run 的会话。
-      await this._disposeRunSessions(runId)
-      this._cleanupActive()
+      // 06 §16：run 结束（done/failed/aborted）或 stop 收口时统一释放会话——已在上面
+      // 「封口 → dispose」里做过；这里只剩清运行态（清 eventQueue 前会再等一次）。
+      await this._cleanupActive()
       // 07 §5：由 runtime 创建的实例，收尾后通知 runtime 把本实例从注册表摘掉（不轮询）。
       this._notifySettled(runId)
     }
@@ -3788,7 +3993,7 @@ class FlowEngine {
       spec: runnable,
       prompt,
       cwd: executorCwd,
-      timeoutMs: this.nodeTimeoutMs,
+      timeoutMs: this._effectiveNodeTimeoutMs(),
       signal,
       onEvent: event => {
         if (!event || typeof event !== 'object') return
@@ -3838,7 +4043,7 @@ class FlowEngine {
 
     if (!result.ok) {
       if (result.reason === 'timeout' || (result.reason === 'aborted' && typeof isTimedOut === 'function' && isTimedOut())) {
-        throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+        throw new NodeTimeoutError(node.id, this._effectiveNodeTimeoutMs())
       }
       if (result.reason === 'aborted') throw abortError(signal)
       if (result.reason === 'spawn') {
@@ -3913,10 +4118,12 @@ class FlowEngine {
     let externalExecutor = false
     const timeoutController = new AbortController()
     let timedOut = false
+    // G1-d：本次 run 实际生效的节点超时（显式 start 参数 > 环境变量 > 默认）。
+    const nodeTimeoutMs = this._effectiveNodeTimeoutMs()
     const timer = setTimeout(() => {
       timedOut = true
-      timeoutController.abort(new NodeTimeoutError(node.id, this.nodeTimeoutMs))
-    }, this.nodeTimeoutMs)
+      timeoutController.abort(new NodeTimeoutError(node.id, nodeTimeoutMs))
+    }, nodeTimeoutMs)
     const combined = combineSignals([signal, timeoutController.signal])
 
     try {
@@ -3960,7 +4167,7 @@ class FlowEngine {
             })
             await this._persistNodeSessions(runId)
           } catch (error) {
-            if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+            if (timedOut) throw new NodeTimeoutError(node.id, this._effectiveNodeTimeoutMs())
             throw error
           }
         } else {
@@ -3991,7 +4198,7 @@ class FlowEngine {
               ...(agentOptions ? { agentOptions } : {}),
             }), combined)
           } catch (error) {
-            if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+            if (timedOut) throw new NodeTimeoutError(node.id, this._effectiveNodeTimeoutMs())
             throw error
           }
           // 06 §16：**不**在节点结束时 dispose —— 句柄留到 run 结束（done/failed/aborted）
@@ -4019,7 +4226,7 @@ class FlowEngine {
         }
       }
 
-      if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+      if (timedOut) throw new NodeTimeoutError(node.id, this._effectiveNodeTimeoutMs())
       if (signal.aborted) throw abortError(signal)
 
       const structured = normalizeStructured(structuredRaw)
@@ -4398,6 +4605,13 @@ class FlowEngine {
   handleSessionEvent(session, event) {
     const sessionId = session && typeof session.id === 'string' ? session.id : null
     if (!sessionId || !event || typeof event.type !== 'string') return
+    // G1-a：run 已进入收尾（封口）后，宿主的 dispose 仍可能 cancel/drain 回合并派发
+    // session/event。这些事件一律丢弃并计数——绝不写到 run/end 之后，也绝不把
+    // run.json.live 写回非 null。
+    if (this.closing) {
+      this._noteSealedSessionEvent()
+      return
+    }
     // 06 §16：复用会话要靠「最后一条 assistant 消息」拿结构化输出，所以这里先留存原文
     //（有界 LRU；只在本进程内存里，不落盘）。
     let assistantText = ''
@@ -4427,9 +4641,10 @@ class FlowEngine {
     // verdict 并行解析：同一条文本里既有 verdict 又有 status 块时两者都要处理。
     // 未注入 nodeSupervision 时整条采集链路关闭（v0.7 行为完全不变）。
     if (assistantText !== '' && binding.memberId === null) {
-      // C2：先记住本 attempt 最近一条合法正式结论；后续即使被状态块覆盖了
-      // lastAssistant，收口时仍以正式结论为准（正式结论 > 自审状态块）。
-      this._captureFormalVerdict(binding, assistantText)
+      // C2 / G1-b：先记住本 attempt 最近一条**能解析出正式结论**的回报；后续即使
+      // 被自审回报覆盖了 lastAssistant，收口时仍以正式结论为准
+      //（正式结论 > 自审状态块，且更早的正式结论不会被后来的状态块顶掉）。
+      this._captureStructuredVerdict(binding, assistantText)
       // 07 §11.2：只采节点主管会话（memberId === null）的 assistant 消息。与结构化
       // verdict 并行解析：同一条文本里既有 verdict 又有 status 块时两者都要处理。
       // 未注入 nodeSupervision 时整条采集链路关闭（v0.7 行为完全不变）。
@@ -4575,6 +4790,12 @@ class FlowEngine {
   }
 
   _queueSessionEvent(sessionId, binding, event, session) {
+    // G1-a：封口后派发的事件（含 dispose 期间 drain 出来的）在这里就丢掉并计数。
+    // 入队**早于**封口的任务照常执行——收尾顺序保证队列在写 run/end 之前 drain 干净。
+    if (this.closing) {
+      this._noteSealedSessionEvent()
+      return
+    }
     this._queueSessionWrite(async () => {
       const mapped = this._mapSessionEvent(sessionId, binding, event, session)
       if (!mapped) return
@@ -4919,7 +5140,40 @@ class FlowEngine {
     return membersPartial
   }
 
-  _cleanupActive() {
+  /**
+   * G1-a：给本次 run 封口（收尾第一步）。
+   *
+   * 封口后 `handleSessionEvent` / `_queueSessionEvent` 一律丢弃并计数：不再 `_append`、
+   * 不再 `_persistLive`。这样 dispose 会话期间（宿主要在 dispose 里 cancel / drain
+   * 正在跑的回合）派发出来的事件不会写到 run/end 之后，也不会把 run.json.live 写回
+   * 非 null。计数在 `sealedSessionEventDrops` 上可读（不静默丢）。
+   */
+  _sealSessionEvents(runId) {
+    this.closing = true
+    if (this.active && (runId === undefined || this.active.runId === runId)) {
+      this.active.settling = true
+    }
+  }
+
+  /** G1-a：丢弃一条封口后的会话事件并计数（可观测，不静默）。 */
+  _noteSealedSessionEvent() {
+    this.sealedSessionEventDrops += 1
+    // 只在前若干条留痕，避免宿主反复派发时刷屏。
+    if (this.sealedSessionEventDrops <= 3) {
+      this.log('warn', `flow-studio: run 收尾中，丢弃一条迟到的 session/event（累计 ${this.sealedSessionEventDrops} 条）`)
+    }
+    return this.sealedSessionEventDrops
+  }
+
+  /** G1-a：封口后丢弃的会话事件数（收尾结束后仍可读，用于诊断 / 测试）。 */
+  get droppedSessionEventsAfterSeal() {
+    return this.sealedSessionEventDrops
+  }
+
+  async _cleanupActive() {
+    // G1-a：清 eventQueue 之前先等一次——在飞 / 已排队的任务不许被
+    // `this.eventQueue = Promise.resolve()` 直接静默丢掉。
+    await this.eventQueue.catch(() => {})
     // 07 §5：没有模块级锁；只释放本实例的占位（一个实例只服务一个 run）。
     this.active = null
     // 06 §15：父会话覆盖只属于刚结束的这一次 start，必须清掉，避免影响下一次 start。
@@ -4944,6 +5198,7 @@ class FlowEngine {
     this.selfChecks.clear()
     // 06 §16：run 级收件箱 / 节点会话运行态归零；跨 run 的 sessionIndex 保留。
     this._resetInboxState()
+    // G1-a：队列已经 await 过（上面），这里才允许换成空 Promise；new start 会重新开封。
     this.eventQueue = Promise.resolve()
   }
 

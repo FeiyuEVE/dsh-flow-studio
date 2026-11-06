@@ -194,6 +194,219 @@ export function readEventsPath(id, options = {}) {
   })
 }
 
+/**
+ * G5-a：run 详情路径。`light: true` 只取运行元信息（live / nodeStatus / workspace /
+ * worktree 摘要），Host 侧**不读、不解析事件文件**——运行中 2s 轮询用它，
+ * 避免长 run（实测 20k 事件约 113ms/次）把单线程 Host 拖住。
+ *
+ * 需要完整事件明细（打开日志抽屉、节点标题）时不要带 light，仍走原来的详情接口。
+ */
+export function readRunPath(id, options = {}) {
+  return withQuery(`/runs/${segment(id)}`, {
+    light: options && options.light === true ? 1 : undefined,
+  })
+}
+
+/** G5-a：只有「Host 不认这个接口」才算能力降级；网络错误 / 5xx 照常抛。 */
+export function isLightPollUnsupported(error) {
+  return Boolean(error && (error.status === 400 || error.status === 404))
+}
+
+/** G5-a：降级一次的提示文案（给用户看，不是控制台静默）。 */
+export const LIGHT_POLL_FALLBACK_NOTICE =
+  'Host 不支持轻量轮询（GET /runs/<id>?light=1），已回退到完整详情接口；本次会话不再尝试 light=1。'
+
+/**
+ * G5-a：轻量轮询读取器。第一次撞上 400/404 就永久降级到旧详情接口，并只警告一次；
+ * 之后每一轮直接走旧接口（不会每轮再先试一次 light、也不会无限重试）。
+ *
+ * @param {object} [options]
+ * @param {(id: string, options?: object) => Promise<object>} [options.readRun]
+ * @param {(message: string) => void} [options.warn]
+ */
+export function createLightRunReader(options = {}) {
+  const readRun = typeof options.readRun === 'function'
+    ? options.readRun
+    : (id, readOptions) => api.readRun(id, readOptions)
+  const warn = typeof options.warn === 'function' ? options.warn : () => {}
+  let supported = true
+  let warned = false
+
+  return {
+    async read(id) {
+      if (supported) {
+        try {
+          const data = await readRun(id, { light: true })
+          return { data, light: true, degraded: false }
+        } catch (error) {
+          if (!isLightPollUnsupported(error)) throw error
+          supported = false
+          if (!warned) {
+            warned = true
+            warn(LIGHT_POLL_FALLBACK_NOTICE)
+          }
+        }
+      }
+      const data = await readRun(id)
+      return { data, light: false, degraded: true }
+    },
+    get lightSupported() {
+      return supported
+    },
+    get warned() {
+      return warned
+    },
+  }
+}
+
+/** G5-d：无运行中 run 时的列表轮询间隔（降频，不是完全停）。 */
+export const RUNS_IDLE_POLL_MS = 15000
+/** G5-d：列表轮询失败后的退避上限；避免 Host 抖动时把 15s 档打成 0.5s 档。 */
+export const RUNS_MAX_BACKOFF_MS = 60000
+
+/**
+ * G5-d：共享 runs 数据源。
+ *
+ * 左栏「运行记录」和日志抽屉里的 run 列表必须吃**同一份轮询结果 + 同一个 tick**：
+ *  - `subscribe(fn)` 的所有订阅方拿到同一个快照对象，不会各拉各的；
+ *  - 并发 `refresh()` 共用同一个在飞 promise（两处同时挂载只发一次请求）；
+ *  - `start()` 立即刷新一次，之后按 `idleMs`（默认 15s）定时刷新；
+ *  - `foreground()` 供切回前台 / 重新打开面板时立即刷新一次；
+ *  - 失败按 2 倍退避（15s→30s→60s），成功后清零。
+ *
+ * 纯逻辑 + 注入 reader / 定时器，SSR 与单测都能直接使用。
+ */
+export function createRunsSource(options = {}) {
+  const read = typeof options.read === 'function' ? options.read : () => api.listRuns(20)
+  const configuredIdle = Number(options.idleMs)
+  const idleMs = Number.isFinite(configuredIdle) && configuredIdle >= 1000
+    ? Math.floor(configuredIdle)
+    : RUNS_IDLE_POLL_MS
+  const maxBackoffMs = Number.isFinite(Number(options.maxBackoffMs)) && Number(options.maxBackoffMs) >= idleMs
+    ? Math.floor(Number(options.maxBackoffMs))
+    : RUNS_MAX_BACKOFF_MS
+  const setTimer = typeof options.setTimeout === 'function'
+    ? options.setTimeout
+    : (fn, ms) => setTimeout(fn, ms)
+  const clearTimer = typeof options.clearTimeout === 'function'
+    ? options.clearTimeout
+    : id => clearTimeout(id)
+  const now = typeof options.now === 'function' ? options.now : () => Date.now()
+  const minRefreshMs = Number.isFinite(Number(options.minRefreshMs)) && Number(options.minRefreshMs) >= 0
+    ? Math.floor(Number(options.minRefreshMs))
+    : 1000
+
+  /** 快照不可变：每次更新换一个新对象，订阅方按引用比较就能判断是否同一 tick。 */
+  let snapshot = { payload: null, loaded: false, error: '', tick: 0, updatedAt: 0 }
+  const listeners = new Set()
+  let inflight = null
+  let timer = null
+  let running = false
+  let failures = 0
+
+  function emit() {
+    const current = snapshot
+    for (const listener of [...listeners]) {
+      try {
+        listener(current)
+      } catch {
+        // 单个订阅方渲染出错不能拖垮其它订阅方（也不该让轮询停止）。
+      }
+    }
+  }
+
+  function clearScheduled() {
+    if (timer === null) return
+    clearTimer(timer)
+    timer = null
+  }
+
+  function schedule() {
+    clearScheduled()
+    if (!running) return
+    const delay = Math.min(maxBackoffMs, idleMs * 2 ** Math.min(failures, 3))
+    timer = setTimer(() => {
+      timer = null
+      void refresh({ force: true })
+    }, delay)
+  }
+
+  function refresh(refreshOptions = {}) {
+    if (inflight) return inflight
+    const force = refreshOptions && refreshOptions.force === true
+    if (!force && snapshot.updatedAt > 0 && now() - snapshot.updatedAt < minRefreshMs) {
+      return Promise.resolve(snapshot)
+    }
+    inflight = (async () => {
+      try {
+        const payload = await read()
+        failures = 0
+        snapshot = {
+          payload,
+          loaded: true,
+          error: '',
+          tick: snapshot.tick + 1,
+          updatedAt: now(),
+        }
+      } catch (error) {
+        failures += 1
+        snapshot = {
+          ...snapshot,
+          loaded: true,
+          error: error && error.message ? error.message : String(error),
+          tick: snapshot.tick + 1,
+          updatedAt: now(),
+        }
+      } finally {
+        inflight = null
+        emit()
+        schedule()
+      }
+      return snapshot
+    })()
+    return inflight
+  }
+
+  return {
+    getSnapshot: () => snapshot,
+    subscribe(listener) {
+      if (typeof listener !== 'function') return () => {}
+      listeners.add(listener)
+      if (snapshot.loaded) {
+        try {
+          listener(snapshot)
+        } catch {
+          // 首帧回调失败不影响后续 tick。
+        }
+      }
+      return () => listeners.delete(listener)
+    },
+    refresh,
+    start() {
+      if (running) return
+      running = true
+      void refresh({ force: true })
+    },
+    stop() {
+      running = false
+      clearScheduled()
+    },
+    foreground() {
+      if (!running) return
+      void refresh({ force: true })
+    },
+    get running() {
+      return running
+    },
+    get idleMs() {
+      return idleMs
+    },
+    get listenerCount() {
+      return listeners.size
+    },
+  }
+}
+
 export const api = {
   health: () => request('GET', '/health'),
   listFlows: () => request('GET', '/flows'),
@@ -208,7 +421,7 @@ export const api = {
   // 这样 Host 换信封（runs / list / data.runs）时客户端不会白屏。
   listRuns: (limit = 20) => request('GET', withQuery('/runs', { limit })),
   createRun: body => request('POST', '/runs', body || {}),
-  readRun: id => request('GET', `/runs/${segment(id)}`),
+  readRun: (id, options) => request('GET', readRunPath(id, options)),
   readEvents: (id, options) => request('GET', readEventsPath(id, options)),
   readSummary: id => request('GET', `/runs/${segment(id)}/summary`),
   deleteRun: id => request('DELETE', `/runs/${segment(id)}`),

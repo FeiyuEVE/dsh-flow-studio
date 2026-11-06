@@ -24,6 +24,17 @@
  *     每次唤醒先从该 run 的 Engine 取本轮 `{attempt, nonce}`（`attemptEnvelopeFor`）并
  *     写进自审提示词；拿不到凭证就 skip（不发注定被引擎丢弃的回报），skip 原因在
  *     `nodeSupervision.snapshot()` 可见。
+ *   - **G7-a 按发起会话合并唤醒**：`wakeRun(runId, { wakerSessionId, runIds })` 接收
+ *     调度器合并后的一批 runId，正文列出全部 runId（超过阈值只留摘要），只发**一条**
+ *     followup；每会话的小时预算 / 最小间隔由 `SupervisionScheduler` 负责，被限流的
+ *     run 保留 due、下一轮再来。旋钮：`wakerHourlyLimit` / `wakerMinIntervalMs`
+ *     （或 `FLOW_STUDIO_WAKER_HOURLY_LIMIT` / `FLOW_STUDIO_WAKER_MIN_INTERVAL_MS`）。
+ *   - **G7-b 重启恢复节点闹钟**：`supervisionReady` 之后跑一次 `recoverNodeAlarms()`，
+ *     对 `status === 'running'` 且**本进程有 Engine 实例**的 run，从
+ *     `run.json.nodeStatus` 取非终态节点 + `sessions.json` 的 sessionId 重新登记节点
+ *     闹钟（`nextDueAt = now + nodeAlarmMs`，默认 600s，重启瞬间不刷一轮）；缺 sessionId
+ *     的节点跳过并计入 `nodeSupervision.snapshot().recovery`，缺 attempt 按 1 处理并
+ *     记 warn；重复调用幂等（已登记的 session 不再 register）。
  *   - **额外键单一写路径（E2-d）**：`workspace` / `worktree` / `sessionMode` / `supervision` /
  *     `nodeStatus` / `startOptions` 等 v0.7 字段都已进 `runstore.normalizeMeta()` 白名单，
  *     一律走 `readRunMeta` / `writeRunMeta`；`patchRunJson()` 只是 `writeRunMeta` 的薄封装
@@ -49,17 +60,19 @@ import { Engine, EngineError, createEngine } from './engine.js'
 import { buildFollowupPayload } from './inbox.js'
 import { checkRunId } from './runlog.js'
 import {
-  appendEvents, claimLease, listRuns, readAllEvents, readLease, readRunMeta, releaseLease, runsDir,
-  writeRunMeta,
+  appendEvents, claimLease, listRuns, readAllEvents, readLease, readNodeSessions, readRunMeta,
+  releaseLease, runsDir, writeRunMeta,
 } from './runstore.js'
 import { flowsDir, readFlow } from './store.js'
-import { NodeSupervisionScheduler, SupervisionScheduler } from './supervise.js'
+import { NODE_ALARM_DEFAULT_MS, NodeSupervisionScheduler, SupervisionScheduler } from './supervise.js'
 
 /** runtime 自己消费、不往 Engine 透传的选项。 */
 const RUNTIME_ONLY_KEYS = new Set([
   'createEngine', 'logger', 'onSettled', 'sessionIndex', 'startedBy',
   'auditWorkflow', 'intervalMs', 'supervisionIntervalMs',
   'nodeSupervisionIntervalMs', 'nodeAlarmMs',
+  // G7-a：run 级唤醒的每会话预算（runtime 只透传给 SupervisionScheduler）。
+  'wakerHourlyLimit', 'wakerMinIntervalMs',
   'setInterval', 'clearInterval',
   // E2-a / E2-b / E2-c：运行时自己消费的收口 / 卸载 / 事件缓冲旋钮。
   'disposeTimeoutMs', 'sessionEventByteLimit', 'sessionEventLimit',
@@ -503,6 +516,12 @@ export async function saveSupervision(runsRoot, runId, patch = {}) {
 // supervision 的唤醒提示词（原文见交付说明；只写 runId，不写环境事实）
 // ---------------------------------------------------------------------------
 
+/** 合并唤醒提示词里最多逐个列出的 runId 数；超出的只给摘要（避免一条上万字）。 */
+export const SUPERVISION_WAKE_PROMPT_MAX_RUNS = 20
+
+/** 单个 runId 在提示词里的渲染上限（runId 有长度上限，这里只是防御坏数据）。 */
+const WAKE_PROMPT_RUN_ID_MAX = 80
+
 /**
  * 内建 supervision 到点唤醒发起会话时的提示词。
  * 必须包含三要素：runId、`flow_watch`、以及「不要重复挂手动闹钟」。
@@ -516,6 +535,54 @@ export function supervisionWakePrompt(runId) {
       + '才把结论、异常点和需要主人决策的地方通知主人；',
     '③ 之后仍由内置调度按 60 / 180 秒的间隔继续唤醒你，直到这个 run 收尾为止。',
   ].join('')
+}
+
+/** 把 runIds 收敛成非空、去重、有序的字符串数组（保持传入顺序）。 */
+function normalizeWakeRunIds(runIds) {
+  const out = []
+  const seen = new Set()
+  for (const value of Array.isArray(runIds) ? runIds : [runIds]) {
+    if (typeof value !== 'string') continue
+    const id = value.trim()
+    if (id === '' || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+/**
+ * G7-a：一次唤醒服务多个 run 时的提示词。
+ *
+ * 单个 run → 逐字沿用 {@link supervisionWakePrompt}（既有行为不变）；多个 run → 一条
+ * 提示词列出全部 runId（最多 `SUPERVISION_WAKE_PROMPT_MAX_RUNS` 个，超出的给摘要），
+ * 让发起会话用一条 followup 逐个 `flow_watch`，而不是每个 run 各叫一次。
+ *
+ * @param {string|string[]} runIds
+ * @returns {string}
+ */
+export function supervisionWakePromptBatch(runIds) {
+  const ids = normalizeWakeRunIds(runIds)
+  if (ids.length === 0) return supervisionWakePrompt('')
+  if (ids.length === 1) return supervisionWakePrompt(ids[0])
+  const listed = ids.slice(0, SUPERVISION_WAKE_PROMPT_MAX_RUNS)
+  const rest = ids.length - listed.length
+  const lines = [
+    `【工作流自动复查】本轮有 ${ids.length} 个 run 到了定时审查点，已合并成这一次唤醒`
+      + '（内置 supervision 调度发起，不需要你再手动挂 proactive_set 闹钟）。runId：',
+    ...listed.map(id => `- ${id.slice(0, WAKE_PROMPT_RUN_ID_MAX)}`),
+  ]
+  if (rest > 0) {
+    lines.push(`- …另有 ${rest} 个同批到期的 run 未逐个列出（本次已合并唤醒，可按需处理）`)
+  }
+  lines.push(
+    '请对上面列出的每个 run 分别调用一次 flow_watch（runId 用列表里的 id）审查它是否在正常运转：',
+    '① 若 verdict 表示运行正常且没有停滞，直接结束该 run 的复查，不要打扰主人；',
+    '② 只有出现异常（节点停滞、打回过多、节点失败）或该 run 已经跑完（done/failed/aborted），'
+      + '才把结论、异常点和需要主人决策的地方通知主人；',
+    '③ 之后仍由内置调度按 60 / 180 秒的间隔继续唤醒你，直到这些 run 收尾为止。',
+  )
+  return lines.join('\n')
 }
 
 /**
@@ -576,6 +643,9 @@ export function nodeSelfCheckPrompt(entry = {}) {
  *   onSettled?: (runId: string) => void,
  *   auditWorkflow?: Function,
  *   intervalMs?: number,
+ *   nodeAlarmMs?: number, nodeSupervisionIntervalMs?: number,
+ *   supervisionIntervalMs?: number,
+ *   wakerHourlyLimit?: number, wakerMinIntervalMs?: number,
  *   setInterval?: Function, clearInterval?: Function,
  *   disposeTimeoutMs?: number,
  *   sessionEventByteLimit?: number, sessionEventLimit?: number,
@@ -586,6 +656,8 @@ export function createRuntime(options = {}) {
   const runs = new Map()
   const sessionIndex = new Map()
   const startedBy = new Map()
+  /** G7-b：dispose 之后恢复扫描不再往调度器里登记新闹钟。 */
+  let disposedRuntime = false
   const now = typeof options.now === 'function' ? options.now : () => new Date()
   const logger = typeof options.logger === 'function'
     ? options.logger
@@ -642,8 +714,14 @@ export function createRuntime(options = {}) {
   /**
    * 到点唤醒发起会话：`agents.get` 优先，冷会话 `agents.resume`，再 `followup`。
    * 失败一律抛错 / 返回 false——连续 3 次由 scheduler 降级并停止调度。
+   *
+   * G7-a：调度器把「同一会话本轮到期的 run」合并后调用一次，`runIds` 带全部 runId；
+   * 正文由 `supervisionWakePromptBatch` 生成（单个 run 的正文与旧版逐字相同）。
+   *
+   * @param {string} runId 主 run（payload 的 room / id 用它）
+   * @param {{ wakerSessionId?: string, runIds?: string[] }} [options]
    */
-  async function wakeRun(runId, { wakerSessionId } = {}) {
+  async function wakeRun(runId, { wakerSessionId, runIds } = {}) {
     const ctx = options.ctx
     let agents = null
     try {
@@ -673,9 +751,12 @@ export function createRuntime(options = {}) {
     if (!agent || typeof agent.followup !== 'function') {
       throw new Error(`发起会话 ${wakerSessionId} 无法接收消息（没有 followup）`)
     }
+    // 合并批次：runId 作为主 id，runIds 缺省时就是它自己（单 run 行为不变）。
+    const batch = normalizeWakeRunIds(Array.isArray(runIds) && runIds.length > 0 ? runIds : [runId])
+    const primaryRunId = batch.length > 0 ? batch[0] : runId
     agent.followup(buildFollowupPayload({
-      text: supervisionWakePrompt(runId),
-      runId,
+      text: supervisionWakePromptBatch(batch.length > 0 ? batch : [runId]),
+      runId: primaryRunId,
       nodeId: null,
       from: 'flow-studio',
     }))
@@ -723,19 +804,34 @@ export function createRuntime(options = {}) {
   // 环境变量兜底：默认值太频繁时可以不改代码，起进程前设一下就行。
   //   扫描粒度：FLOW_STUDIO_SUPERVISION_INTERVAL_MS（两个调度器共用）
   //   节点自审：FLOW_STUDIO_NODE_ALARM_MS
+  //   G7-a 会话预算：FLOW_STUDIO_WAKER_HOURLY_LIMIT / FLOW_STUDIO_WAKER_MIN_INTERVAL_MS
   const envMs = name => {
     const raw = process.env && process.env[name]
     const value = Number(raw)
     return Number.isInteger(value) && value > 0 ? value : undefined
   }
+  // 最小间隔允许 0（显式关掉间隔限制），所以单独一个「非负整数」读法。
+  const envNonNegativeInt = name => {
+    const raw = process.env && process.env[name]
+    const value = Number(raw)
+    return Number.isInteger(value) && value >= 0 ? value : undefined
+  }
   const intervalMs = Number.isFinite(options.supervisionIntervalMs) && options.supervisionIntervalMs > 0
     ? options.supervisionIntervalMs
     : (envMs('FLOW_STUDIO_SUPERVISION_INTERVAL_MS')
       ?? (Number.isFinite(options.intervalMs) && options.intervalMs > 0 ? options.intervalMs : undefined))
+  const wakerHourlyLimit = Number.isInteger(options.wakerHourlyLimit) && options.wakerHourlyLimit > 0
+    ? options.wakerHourlyLimit
+    : (envMs('FLOW_STUDIO_WAKER_HOURLY_LIMIT') ?? undefined)
+  const wakerMinIntervalMs = Number.isInteger(options.wakerMinIntervalMs) && options.wakerMinIntervalMs >= 0
+    ? options.wakerMinIntervalMs
+    : (envNonNegativeInt('FLOW_STUDIO_WAKER_MIN_INTERVAL_MS') ?? undefined)
 
   const supervision = new SupervisionScheduler({
     now,
     intervalMs,
+    ...(wakerHourlyLimit === undefined ? {} : { wakerHourlyLimit }),
+    ...(wakerMinIntervalMs === undefined ? {} : { wakerMinIntervalMs }),
     setInterval: typeof options.setInterval === 'function' ? options.setInterval : defaultSetInterval,
     clearInterval: typeof options.clearInterval === 'function' ? options.clearInterval : undefined,
     log,
@@ -1290,6 +1386,7 @@ export function createRuntime(options = {}) {
    * @returns {Promise<{ aborted: number, timedOut: boolean }>} 永不 reject
    */
   function dispose() {
+    disposedRuntime = true
     try {
       supervision.stop()
     } catch {
@@ -1425,6 +1522,158 @@ export function createRuntime(options = {}) {
     return registered
   })()
 
+  // ── G7-b：重启恢复节点自审闹钟（节点闹钟只在内存、重启会丢） ───────────────
+  //
+  // 节点闹钟是纯内存状态：进程重启后，仍在跑的 run 的节点自审闹钟全部消失，
+  // run.json.nodeStatus 停在旧值，flow_watch 的 blocked 建议也随之失效。
+  //
+  // 恢复口径（只对本进程**确实有 Engine 实例**的 running run 做，避免叫醒别的进程
+  // / 已收口 run 的会话）：
+  //   1. 从 run.json.nodeStatus 取 `state` 不是终态（done / failed）的节点；
+  //   2. 从 sessions.json（nodeId → { sessionId }）取该节点的会话；
+  //      没有会话的节点**跳过**并计数（不造一个叫不醒的条目）；
+  //   3. `register({ runId, nodeId, sessionId, attempt, intervalMs })`，`intervalMs`
+  //      用调度器的 nodeAlarmMs（默认 NODE_ALARM_DEFAULT_MS = 600s）→ 恢复后第一轮
+  //      不立刻唤醒，按 now + 间隔重排；
+  //   4. attempt 缺失按 1 处理并记 warn（runstore 目前不持久化 attempt，见文档）；
+  //   5. 幂等：已有登记的 session 直接跳过（`nodeSupervision.has()`），不重排 due。
+  const NODE_TERMINAL_STATES = new Set(['done', 'failed'])
+
+  /** 最近一次恢复扫描的统计（也是 `nodeSupervision.snapshot().recovery` 的最新值）。 */
+  let lastNodeRecovery = null
+
+  /**
+   * 扫一遍「本进程有 Engine 实例的 running run」，给非终态节点重新登记闹钟。
+   *
+   * @returns {Promise<{ runsScanned: number, runsRecovered: number, restored: number,
+   *   skipped: number, skippedTerminal: number, missingSession: number,
+   *   missingAttempt: number, alreadyRegistered: number }>}
+   */
+  async function recoverNodeAlarms() {
+    const summary = {
+      runsScanned: 0,
+      runsRecovered: 0,
+      restored: 0,
+      skipped: 0,
+      skippedTerminal: 0,
+      missingSession: 0,
+      missingAttempt: 0,
+      alreadyRegistered: 0,
+    }
+    const recoverIntervalMs = Number.isFinite(nodeSupervision.nodeAlarmMs) && nodeSupervision.nodeAlarmMs > 0
+      ? nodeSupervision.nodeAlarmMs
+      : NODE_ALARM_DEFAULT_MS
+    let entries = []
+    try {
+      entries = await readdir(runsRoot, { withFileTypes: true })
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        log('warn', `flow-studio: 节点闹钟恢复扫描失败：${error && error.message ? error.message : String(error)}`)
+      }
+      return summary
+    }
+    for (const entry of entries) {
+      if (disposedRuntime) break
+      if (!entry.isDirectory() || !checkRunId(entry.name)) continue
+      const runId = entry.name
+      // 只恢复「本进程有 Engine 实例」的 run：别的进程负责的 run 不该在本进程再挂一份闹钟。
+      if (!runs.has(runId)) continue
+      const meta = await readRunMeta(runsRoot, runId).catch(() => null)
+      if (!meta || meta.status !== 'running') continue
+      summary.runsScanned += 1
+      const nodeStatus = isPlainObject(meta.nodeStatus) ? meta.nodeStatus : {}
+      let sessions = {}
+      try {
+        sessions = await readNodeSessions(runsRoot, runId)
+      } catch (error) {
+        log('warn', `flow-studio: 节点闹钟恢复读 sessions.json 失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+        sessions = {}
+      }
+      let restoredThisRun = 0
+      for (const [nodeId, status] of Object.entries(nodeStatus)) {
+        if (disposedRuntime) break
+        if (!isPlainObject(status)) {
+          summary.skipped += 1
+          continue
+        }
+        const state = typeof status.state === 'string' ? status.state : 'working'
+        if (NODE_TERMINAL_STATES.has(state)) {
+          summary.skippedTerminal += 1
+          summary.skipped += 1
+          continue
+        }
+        const sessionEntry = sessions[nodeId]
+        const sessionId = sessionEntry && typeof sessionEntry.sessionId === 'string'
+          ? sessionEntry.sessionId
+          : ''
+        if (sessionId === '') {
+          // 没有会话就没人可叫：跳过并计数，不造一个叫不醒的条目。
+          summary.missingSession += 1
+          summary.skipped += 1
+          log('warn', `flow-studio: 节点闹钟恢复跳过 run ${runId} 的节点 ${nodeId}：sessions.json 里没有 sessionId`)
+          continue
+        }
+        if (nodeSupervision.has(sessionId)) {
+          // 幂等：已经登记过（含已停摆的）就不再 register，避免把 nextDueAt 重排。
+          summary.alreadyRegistered += 1
+          summary.skipped += 1
+          continue
+        }
+        let attempt = Number.isInteger(status.attempt) && status.attempt >= 1 ? status.attempt : null
+        if (attempt === null) {
+          attempt = 1
+          summary.missingAttempt += 1
+          log('warn', `flow-studio: 节点闹钟恢复：run ${runId} 节点 ${nodeId} 的 nodeStatus 没有 attempt，按 1 处理`)
+        }
+        try {
+          nodeSupervision.register({
+            runId,
+            nodeId,
+            sessionId,
+            attempt,
+            intervalMs: recoverIntervalMs,
+          })
+          restoredThisRun += 1
+        } catch (error) {
+          summary.skipped += 1
+          log('warn', `flow-studio: 节点闹钟恢复登记失败（${runId}/${nodeId}）：${error && error.message ? error.message : String(error)}`)
+        }
+      }
+      if (restoredThisRun > 0) {
+        summary.runsRecovered += 1
+        summary.restored += restoredThisRun
+        log('info', `flow-studio: 重启恢复 ${runId} 的 ${restoredThisRun} 个节点闹钟（${Math.round(recoverIntervalMs / 1000)}s 后首轮）`)
+      }
+    }
+    lastNodeRecovery = nodeSupervision.recordRecovery(summary)
+    if (summary.skipped > 0 || summary.restored > 0) {
+      log(
+        'info',
+        `flow-studio: 节点闹钟恢复扫描完成：恢复 ${summary.restored} 条，跳过 ${summary.skipped} 条`
+          + `（终态 ${summary.skippedTerminal} / 缺 sessionId ${summary.missingSession}`
+          + ` / 已登记 ${summary.alreadyRegistered}），缺 attempt 按 1 处理 ${summary.missingAttempt} 条`,
+      )
+    }
+    return summary
+  }
+
+  /** G7-b：`supervisionReady` 之后跑一次节点闹钟恢复（初始化扫描）。 */
+  const nodeAlarmsReady = (async () => {
+    try {
+      await supervisionReady
+    } catch (error) {
+      log('warn', `flow-studio: 节点闹钟恢复等待 supervisionReady 失败：${error && error.message ? error.message : String(error)}`)
+      return lastNodeRecovery
+    }
+    if (disposedRuntime) return lastNodeRecovery
+    try {
+      return await recoverNodeAlarms()
+    } catch (error) {
+      log('warn', `flow-studio: 节点闹钟恢复失败：${error && error.message ? error.message : String(error)}`)
+      return lastNodeRecovery
+    }
+  })()
+
   return {
     runs,
     start,
@@ -1439,6 +1688,14 @@ export function createRuntime(options = {}) {
     supervision,
     supervisionReady,
     nodeSupervision,
+    /** G7-b：初始化扫描（`supervisionReady` 之后跑一次）——恢复 running run 的非终态节点闹钟。 */
+    nodeAlarmsReady,
+    /** G7-b：显式再跑一次节点闹钟恢复（幂等：已登记的 session 跳过，返回本次统计）。 */
+    recoverNodeAlarms,
+    /** G7-b：最近一次恢复扫描的累计统计（同 `nodeSupervision.snapshot().recovery`）。 */
+    get nodeRecovery() {
+      return lastNodeRecovery === null ? { ...nodeSupervision.snapshot().recovery } : { ...lastNodeRecovery }
+    },
     /** v0.8 §11.1：节点闹钟到点动作（调度器注入的同一实现；导出便于测试 / 诊断）。 */
     wake: wakeNode,
     enableSupervision,

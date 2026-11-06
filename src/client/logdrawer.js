@@ -71,6 +71,12 @@ const STATUS_TEXT = {
   pending: '待运行',
   queued: '排队中',
   blocked: '超限',
+  // 节点 / 成员结论（06 §13.10：成员结论不可观测时引擎只写 partial，
+  // 这里必须显示成「无结论」——既不是通过，也不是失败）。
+  passed: '通过',
+  rejected: '打回',
+  skipped: '跳过',
+  partial: '无结论',
 }
 
 const EVENT_GLYPH = {

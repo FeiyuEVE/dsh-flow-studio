@@ -1,0 +1,290 @@
+npm notice run @feiyueve/dsh-flow-studio@0.4.0 test
+npm notice run node test/model.test.mjs && node test/geometry.test.mjs && node test/link.test.mjs && node test/draft.test.mjs && node test/host.test.mjs && node test/runlog.test.mjs && node test/runstore.test.mjs && node test/metrics.test.mjs && node test/engine.test.mjs
+model.js
+  ✓ 出厂模板通过校验，且包含六阶段与四处打回
+  ✓ describeFlow 把打回写进流转说明
+  ✓ normalizeFlow 丢弃悬空连线与自环
+  ✓ normalizeFlow 对垃圾输入不抛错
+  ✓ 未知字段进 extras：节点 / 边 / 团队成员往返保存都不丢
+  ✓ extras 有界：键数 / 字符串 / 总字节超限只丢弃，不膨胀也不抛错
+  ✓ extras 坏输入：函数 / undefined / NaN / BigInt / 循环引用 / 坏旧 extras 都不抛错
+  ✓ 没有未知字段时不挂 extras，既有形状不变
+  ✓ 校验抓出「没有开始节点」
+  ✓ 校验抓出「从开始走不到的孤立节点」
+  ✓ 校验抓出「打回目标不在上游」
+  ✓ 校验抓出「阶段节点没有内容」
+  ✓ 主从节点没配子 agent 只给提醒不给错误
+  ✓ summarize 只吐摘要字段
+
+14 组通过
+geometry.js
+  ✓ 节点尺寸是 208×96，主从节点 116
+  ✓ worldBounds 是唯一世界边界来源：8 列主干宽 2028
+  ✓ fitView 用屏幕 px 边距与 15% 地板，不再有第二套数学
+  ✓ 30 节点串行链：16.78% 装得下，600px 视口触发 15% 地板并报隐藏列
+  ✓ 航道槽位 6 个，入槽位与出槽位镜像
+  ✓ 第 7 条起并入最外航道：双线 0/1px，不静默丢弃
+  ✓ 同列并列按 flow.nodes 顺序 tie-break，且不依赖输入边顺序
+
+7 组通过
+link.js
+  ✓ 候选排除源节点，顺序等于 flow.nodes 顺序
+  ✓ 没有其他节点时 beginLink 返回 null
+  ✓ Tab 前进、Shift+Tab 后退，两端循环
+  ✓ Enter 确认返回边端点，Esc 由页面把状态清空
+  ✓ 方向规则：下游 next、上游 reject
+  ✓ 播报是「从 <源> 到 <目标>」的可读名字
+
+6 组通过
+drafts.js
+  ✓ 键名是 flow-studio:draft:<flowId>
+  ✓ 写入后能读回 flow / savedAt / baseSavedAt
+  ✓ localStorage 不可用时退化为内存草稿且不抛错
+  ✓ storage 抛异常（隐私模式/配额满）时仍然保住内存副本
+  ✓ 坏 JSON 的草稿读成 null，不影响打开流程
+  ✓ 内容指纹忽略时间戳，只比内容
+  ✓ 只有内容不同才提示恢复：时间戳差异不算
+  ✓ clearDraft 同时清掉 storage 与默认仓库
+  ✓ 默认导出在 Node（没有 localStorage）下也能写入/读回
+
+9 组通过
+store.js
+  ✓ 空目录种一份出厂模板
+  ✓ 保存后可读回，且整份替换生效
+  ✓ 非法 id 一律拒绝
+  ✓ 坏 JSON 文件跳过而不是整表失败
+  ✓ 删除返回是否存在
+routes
+  ✓ 注册了 /api/flow-studio 前缀路由
+  ✓ GET /flows 返回列表
+  ✓ POST /flows 建流程并回传校验结果
+  ✓ PUT 后 GET 拿到同一份内容
+  ✓ DELETE 后 GET 回归 404
+  ✓ 没有 skills 服务时 /skills 返回空表
+  ✓ 有 skills 服务时按名字排序输出
+  ✓ 跨站 Origin 被拒绝
+  ✓ §13.1 拿不到 connection 服务 → fail-closed 503（可读原因）
+  ✓ §13.1 connection 返回 401/403 时原样返回，不再只靠 Origin
+  ✓ §13.1 FLOW_STUDIO_TOKEN < 16 字符 → 启动即拒绝并告警
+  ✓ §13.7 flow 目录 0700、flow 文件 0600（与 run 日志同口径）
+  ✓ §13.3 DELETE /runs/<id> 在持有租约时 409
+  ✓ 未知接口 404，未知方法 405
+  ✓ 写入的文件真的落在 DSH_HOME 下
+  ✓ health 报出目录与 schema 版本（已通过 connection 鉴权）
+
+21 组通过
+runlog.js · 校验与归一化
+  ✓ kind 白名单是契约里的 16 种（§8.2 新增两类）
+  ✓ 合法 node/start 归一化：补齐 memberId=null、ts 转 UTC
+  ✓ run/start 不需要 nodeId/attemptId；runId 缺失时用上下文补
+  ✓ ts 缺失/非法 → 服务端当前时间；合法非 Z 偏移归一成 Z
+  ✓ v / kind / traceId / nodeId / attemptId / runId 的必填与类型
+  ✓ run 级事件（run/start、run/end）带 nodeId / attemptId 一律 400（§8.1）
+  ✓ member 事件必须带 memberId；member/end.status 白名单（§8.1）
+  ✓ usage 四桶缺字段/负数一律报错（不补 0），reasoning ≤ output
+  ✓ usage 的未知键被丢弃，callId 保留
+  ✓ extra 有界：键 ≤16、单串 ≤256、总字节 ≤2048，超限只丢弃不报错
+  ✓ 未识别的顶层字段折叠进 extra；客户端 seq 不被信任
+  ✓ artifact 路径必须是 run 目录内的相对路径
+  ✓ id 校验挡路径穿越：. / .. / 点开头 / 斜杠都拒绝
+  ✓ ref 结构校验：url 可选，且可以单独存在（§8.1）
+  ✓ 逐 kind 必填字段与取值校验
+  ✓ acceptance/verdict：必填与取值白名单（§8.2）
+  ✓ test/report：计数必填、failures 有界（§8.2）
+  ✓ artifact/write 支持可选 sha256，且路径规则不变（§8.1）
+  ✓ 单条事件 > 8KB 拒绝
+runlog.js · 聚合
+  ✓ tokens：四桶按 node/member 分组，reasoning 不进 total，callId 后到替换
+  ✓ skillUsage：coverage 分母是声明唯一 skill 数，加载次数单列
+  ✓ skillUsage：无声明时 coverage 为 null，不冒充 100%
+  ✓ findings：按 severity 计数，未解决与已复验分开，同 id 取最后状态
+  ✓ findings：同一 id 跨节点合并；total 是唯一数、reportedCount 是原始事件数
+  ✓ rejects：按边与目标节点两个维度
+  ✓ progress：passed /（总阶段 − skipped），同节点取最后一次 node/end
+  ✓ progress：没有 run/start 时退回观察到的节点；全 skipped 时 ratio=null
+  ✓ progress：打回后 A/B 的 passed 失效，ratio 不再虚高（§8.3）
+  ✓ progress：失效按「打回当时」的状态算——后来别的节点重跑不能把旧失效洗白
+  ✓ progress：旧 attempt 的 passed 不计；ratio 强制 ≤1
+  ✓ quality：五项证据齐全 + 进度 100% + P0=0（返工 0）→ pass「优：首轮通过」
+  ✓ quality：返工 1 轮 + P1=0 + 采纳率≥0.6 → pass「良：返工 1 轮后达标」
+  ✓ quality：P1 未解决不给良（返工 1 轮也只能 warn）
+  ✓ quality：半成品（证据全过但 ratio<1）至少 warn，不许绿
+  ✓ quality：缺验收 / 测试证据 → unknown，missing 准确列出缺项
+  ✓ quality：任一证据 fail → fail（验收 fail / 测试 fail）
+  ✓ quality：规范 state=pass 但计数 / 执行时间 / 报告链接不全 → checks unknown（§8.3）
+  ✓ quality：审查一致性取最后一次 verdict；旧 reject 不永久判死
+  ✓ quality：findingCount 与 finding 事件对不上 → review unknown（§8.3）
+  ✓ acceptance/test 只认当前 attempt；同一 id / suite 取 seq 最大者（§8.2）
+  ✓ summary 带 computedAt / eventCount 与全部聚合键
+  ✓ export markdown 含 run 头、指标小节与质量结论
+  ✓ §13.7 summarize.acceptance：当前有效 attempt 的通过率（passed / total / rate）
+  ✓ §13.7 model-claim 证据：artifact path+sha256 对不上 → unknown；对上 + 文件校验通过 → pass
+  ✓ §13.7 跨节点重复标识 → 对应指标 unknown，并返回 conflicts
+  ✓ §13.7 stub 引擎：quality 强制 unknown，label 前缀「桩」，summary.engine=stub
+  ✓ §8.1/§13.10 member/end.status=partial 合法：成员结论不可观测，不伪造 passed/failed
+  ✓ §8.3 summary.progress 带 nodes（B1）：每节点 attemptId/status/endSeq/invalidated
+  ✓ §8.4 B4 旧 fail 未复判 → unknown：不能被下一轮的「不再提」洗成绿灯
+  ✓ §8.4 B4 复判过就不算 stale：attempt 2 重判 R1/unit 通过后回到 pass
+
+50 组通过
+runstore.js · 建 run 与落盘
+  ✓ createRun：pending 未开始、id 形状、元数据、目录 0700 / 文件 0600
+  ✓ 连续新建的 runId 不重复
+  ✓ appendEvents：run 级写 run.jsonl，节点级写 <nodeId>/<attemptId>.jsonl
+  ✓ appendEvents：单条事件对象也能追加，ts 以服务端落盘为准
+runstore.js · 读取 / 分页 / 过滤
+  ✓ readEvents：limit / total / truncated / order=desc
+  ✓ readEvents：nodeId / attemptId / kind / since(seq) / since(ts) 过滤
+  ✓ readRunMeta / writeRunMeta：原子写、字段合并、id 以路径为准
+  ✓ listRuns：按 startedAt 倒序、limit 生效、tokenTotal 从事件重算
+  ✓ readRunDetail：节点 / attempt 索引含事件数与首末时间
+runstore.js · 边界与拒绝
+  ✓ 路径穿越：../、绝对路径、空串、点开头一律拒绝
+  ✓ 单条事件超过 8KB → 400 且不落盘
+  ✓ 单批 > 200 条 → 400；空批 → 400
+  ✓ 单 run 事件总数上限 200000 → 400 并给原因
+  ✓ 整批校验：一条非法则整批不写
+  ✓ 坏行跳过、坏 meta 的 run 不出现在列表里
+  ✓ 不存在的 run：读返回 null，追加 404，删除 false
+  ✓ deleteRun：删除整个目录，第二次返回 false
+runstore.js · §8.6 计数器与坏 run 鲁棒性
+  ✓ seq 由服务端单调分配，客户端 seq 一律忽略（§8.1）
+  ✓ run.json 计数器：eventCount / tokenTotal / nodeDone / lastSeq 追加时更新（§8.6）
+  ✓ tokenTotal 计数器遵守 callId 替换语义（跨批次）
+  ✓ GET /runs 只读 run.json：删掉节点事件文件后计数器仍然有效
+  ✓ 坏 run（run.json 是目录 / 坏 JSON / 权限拒绝）只进 skipped，不 500（§8.6）
+  ✓ 打回失效同步进 run.json 计数器（与 computeProgress 同口径）
+  ✓ 多次打回后 run.json 计数器与 summarize 的 progress 仍同值
+  ✓ §8.2 新 kind 能落盘并进 summary
+  ✓ 整批校验：run 级事件带 nodeId 也整批拒绝（§8.1）
+  ✓ runs 目录不存在时列表返回空且不抛错
+runstore.js · §13.2 / §13.3 生命周期、租约与启动修复
+  ✓ §13.2 startRun：pending → running，started 标志落盘；二次 startRun 409
+  · 并发 startRun: fulfilled / rejected
+  ✓ §13.2 并发两次 startRun 只有一个成功
+  ✓ §13.3 租约：第二实例 claim 409、续租/释放校验持有者
+  ✓ §13.3 租约过期后可被抢；sweep 只处理 running 并把过期租约 run 标 failed（含「引擎中断」）
+  · repaired=1 run → done
+  ✓ §13.4 启动修复：run.jsonl 有 run/end 但 run.json 非终态 → 修正为终态
+  · 普通事件 400（保留 64 条）；run/end 200 落终态
+  ✓ §13.4 事件额度：普通事件上限 = 总上限 − 64，run/end 仍能落终态
+  · storageError={"at":"2026-11-06T09:07:21.770Z","error":"EEXIST: file already exists, mkdir '<runs>/r-mw4r3wvd-71ai/n_a'","code":"EEXIST"}
+  ✓ §13.4 写盘失败 → run.json 原子 failed + .error 侧车，GET detail 带 storageError
+runstore.js · §13.7 尾部倒读
+  · desc limit=1000: scannedEvents=1000/2000, 8.8ms
+  · asc  limit=1000: scannedEvents=2000/2000, 8.3ms
+  · 造数耗时 72ms（2000 条 tool/call）
+  ✓ §13.7 desc 读 1000 条走尾部倒读：scannedEvents < total，不全量解析
+  ✓ §13.8 listRuns / run.json 带 engine 与 started
+  ✓ §13.3 / §13.2 run/start 兼容：老引擎不调 startRun 时也能把 pending 切成 running
+
+37 组通过
+metrics · quality 判定表探针（05 §8.4）
+  ✓ quality 能出 pass：返工 0 → 优；返工 1 + P1=0 + 采纳率 1 → 良
+  ✓ 缺证据 → unknown（列出缺项）；半成品 → warn；P1 未解决不给良
+  ✓ 打回后 ratio 下降（A/B passed 被打回 A）
+  · 返工 0: state=pass label=优：首轮通过
+  · 返工 1 + P1=0 + 采纳率 100%: state=pass label=良：返工 1 轮后达标
+  · 无事件: state=unknown label=证据不足：验收条目、测试、规范、审查一致性、P0/P1 未解决未检测，不能判定为通过
+  · 证据全过但进度 1/2: state=warn label=可：进度未完成（1/2）
+  · 返工 1 + P1 未解决: state=warn label=可：返工 1 轮、遗留 1 个 P1、采纳率 0%
+  · 打回前: state=2/2 label=ratio=1
+  · 打回后: state=0/2 label=ratio=0 invalidated=2
+metrics · Host HTTP 探针
+  ✓ GET /health 带 auth / runsDir / version（§8.5 + §13.1）
+  · GET /runs 200 · runs=1 skipped=[{"id":"r-bad-http","reason":"run.json 是目录"}]
+  ✓ 坏 run 目录下 GET /runs 仍 200，并带 skipped（§8.6）
+  · POST 2MiB → 413 {"ok":false,"error":"请求体过大（上限 2097152 字节）"}
+  ✓ 2 MiB 请求体返回可读 413（不是 ECONNRESET）
+  · GET /runs（runs 路径是文件）→ 500 {"ok":false,"error":"内部错误","traceId":"tr-41ac6bb3-e799-4eff-9fe6-f5a905dc1786"}
+  ✓ 500 只回通用文案 + traceId，不带 /home/... 路径（§8.5）
+  · list nodeDone=2/2 · detail nodeDone=2/2
+  ✓ GET /runs 与 GET /runs/<id> 的 nodeTotal / nodeDone 同口径同值（§8.6）
+  · summary.findings.byNode = {"n_a":{"total":1,"unresolved":1,"verified":0,"dismissed":0,"byStatus":{"open":1,"accepted":0,"fixed":0,"verified":0,"dismissed":0},"bySeverity":{"P0":0,"P1":1,"P2":0}}}
+  ✓ summary 声明 eventCount / truncated，并带 findings.byNode（§8.6 + 补充）
+  · export（未配置 token，?token 被忽略）→ 200 text/markdown; charset=utf-8
+  · export（token 档，错 token）→ 401；正确 ?token → 200 text/markdown; charset=utf-8
+  ✓ GET /export 接受 ?token（浏览器 <a download>），错 token 401；未配置时参数被忽略
+  · token 档位：缺 token 401 / 错 token 401 / Bearer 200 / 普通接口 ?token 401 / 跨站 403
+  ✓ 可选 token 两档：未设置同源放行；设置后缺/错 token 401、Bearer 放行、?token 只留 export（§8.5 + §13.1）
+  ✓ summary 在纯函数层也能独立复算（quality 与 HTTP 同一口径）
+  · summary.acceptance = {"passed":2,"total":3,"rate":0.6666666666666666}
+  ✓ §13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘要同口径
+  · 伪造引用 → acceptance=unknown
+  · 真产物 + sha256 对齐 → acceptance=pass
+  ✓ §13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ acceptance unknown
+  · stub run → quality=unknown label=桩：证据不足：验收条目、测试、规范、审查一致性、P0/P1 未解决未检测，不能判定为通过
+  ✓ §13.8 stub run：run.json.engine / 列表 / summary / health 全部体现，quality=unknown 且 label 以「桩」开头
+  · conflicts={"findings":[],"acceptance":[{"id":"R1","nodes":["n_a","n_b"]}],"tests":[],"checks":[]}
+  ✓ §13.7 跨节点重复 itemId → acceptance unknown 且返回 conflicts
+  · summary cache: miss → hit → miss（lastSeq 变化后重建）
+  ✓ §13.7 /summary 按 lastSeq 增量缓存：未变命中、追加后失效
+
+17 组通过
+engine · 单节点通过（产物 / 证据 / live / quality）
+  ✓ 单节点通过：run done、node/end passed、产物落盘、quality=pass、live 清空
+engine · 默认 activate 包装 ctx.subagents
+  ✓ 未注入 activate：用 provider=spawn / delivery=caller / outputSchema 启动，并 dispose
+engine · 两节点通过
+  ✓ 两节点通过：两个 node/end passed、progress=2/2、nodeDone=2
+engine · 同一引擎连跑两个 run
+  ✓ 第二次 start 从 attempt=1 重新计数，不继承上一个 run 的通过记录
+engine · 打回一轮后通过
+  ✓ 打回一轮后通过：reject/trigger 一次、目标 attemptId=2、quality 仍 pass（良）
+engine · 超 maxRounds 失败
+  ✓ 超 maxRounds 失败：目标执行到上限后 run/end failed（reason 含「超打回上限」）
+engine · stop 中止与 409 并发
+  ✓ stop 中止：run/end aborted、live 清空；非运行中 stop 与并发 start 都 409
+engine · 结构不合格
+  ✓ 结构不合格失败：node/end failed + extra.validationError、run/end failed
+engine · 用量归属与去重
+  ✓ 用量归属：lead→memberId=null、成员→<nodeId>:1；同 traceId+callId 后到替换；skill/tool 事件
+engine · 团队模式缺成员明细
+  ✓ 团队节点未观察到成员会话：node/end 与 summary.json 都标 membersPartial=true
+engine · readUsage 注入
+  ✓ readUsage 注入：宿主 TokenUsage 映射成四桶并写成 model/call
+engine · 提示词骨架
+  ✓ 提示词：七段骨架齐全、上游过长时先截上游、总长 ≤8000
+engine · 崩溃残留清理
+  ✓ 启动清理：30 分钟无新事件的 running run 标 failed，不自动续跑
+engine · 单节点超时
+  ✓ 节点超时（nodeTimeoutMs 可注入）：node/end failed + extra.timeout、run/end failed
+engine · 桩执行器
+  ✓ stub 模式：合成 usage 150/次、首轮测试节点打回、第二轮通过
+engine v1.1 · 并发启动 B1（§13.6）
+  ✓ 并发 start：恰好一个成功、一个 409、只有一个 run 拿到 attempt=1
+engine v1.1 · 主循环终止性 B2（§13.5）
+  ✓ 断头路：start 400 拒绝开跑、run 未被弄脏；修好流程后可正常开跑
+  ✓ next 成环：start 400（validateFlowForRun errors），不开跑
+  ✓ 多出边：start 400（v1.1 不取最左、直接拒绝）
+  ✓ reject → end（目标不在上游）：start 400
+  ✓ run 级步数上限（阶段数 × 3）：超限 failed，不 done
+  ✓ 墙钟上限（runTimeoutMs 可注入）：abort + failed，不是 aborted
+engine v1.1 · 证据命名空间 B3（§13.7）
+  ✓ 两节点都返回 F1/R1/unit：事件里是 n_a:F1 / n_b:F1（缺省 ruleSetId 也带前缀）
+  ✓ 同一份报告内重复 id：结构不合格（node failed，不静默去重）
+engine v1.1 · 打回上下文 B4（§13.7）
+  ✓ 打回上下文带上一轮未关闭 finding id、要求复用 id；带 acceptance/tests/checks 全量标识
+engine v1.1 · 打回语义 M2/M3/M4（§13.10）
+  ✓ maxRounds=1 表示允许重跑 1 次：A 执行 attempt 1、2 后才超限
+  ✓ 重跑节点的上游产物只取沿 next 可达且有效的 passed：A#2 不含 B/C/D，C#2 只含 A#2/B#2
+engine v1.1 · 预算与脱敏 M3/m3（§13.9）
+  ✓ 单产物 1 MiB 预算：超限截断写盘，artifact/write 标 truncated/originalBytes
+  ✓ 单 run 64 MiB 总预算（注入小值）：跨产物累计超限继续截断，总写盘不超预算
+  ✓ tool/call argumentsDigest 脱敏：Bearer / sk- / password / api_key / 超长串都不落原文
+engine v1.1 · 模型覆盖 M5（§13.11）
+  ✓ node.model：注入 activate 收到 agentOptions={model}，node/start 记录 model
+  ✓ node.model：默认 spawn 包装器把 model 放进 request.agentOptions
+engine v1.1 · 团队模式 M6（§13.10）
+  ✓ 配置 2 个成员只观察到 1 个：node/end 与 summary.json 三处 membersPartial 一致、不反推成员结论
+engine v1.1 · 提示词截断 m5（§13.9）
+  ✓ 超长 task + 超长上游：≤8000 字且输出格式段完整保留
+engine v1.1 · 严格归一 m6（§13.9）
+  ✓ 非法 severity/status：结构不合格（不默认 P2 / open）
+  ✓ tests 计数不自洽（passed+failed+skipped !== executed）：结构不合格
+  ✓ reject 缺 rejectReason：结构不合格
+engine v1.1 · 其他小项（§13.10）
+  ✓ memberIdFor 截断不碰撞：长 nodeId 前缀相同也拿到不同 memberId
+
+38 组通过（276 条断言）
+EXIT:0

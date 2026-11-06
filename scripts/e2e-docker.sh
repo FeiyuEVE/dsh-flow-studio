@@ -22,6 +22,8 @@ BASE="http://127.0.0.1:$PORT/api/flow-studio"
 TOKEN="${TESTBED_FS_TOKEN:-fs-$(openssl rand -hex 16 2>/dev/null || node -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')}"
 VERSION="$(node -p "require('$REPO/package.json').version")"
 TGZ="$REPO/.tmp/feiyueve-dsh-flow-studio-$VERSION.tgz"
+# 宿主登录 cookie（v1.1 起插件路由与 /api 同口径，光有插件令牌不够）。
+JAR="$REPO/.tmp/e2e-cookies.txt"
 
 say()  { printf '\033[1;34m==> \033[0m%s\n' "$*"; }
 ok()   { printf '\033[1;32m OK \033[0m%s\n' "$*"; }
@@ -36,8 +38,8 @@ dex_sh() {
     "$CONTAINER" sh -c "$script"
 }
 
-# 带鉴权头的请求
-req() { curl -s -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
+# 带鉴权头的请求：宿主登录 cookie（第一道，与 /api 同口径）+ 插件令牌（第二道，Bearer）。
+req() { curl -s -m 10 -b "$JAR" -H "Authorization: Bearer $TOKEN" "$@"; }
 jqr() { node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(String(eval(process.argv[1])))}catch(e){process.stdout.write("")}})' "$1"; }
 
 cleanup() {
@@ -82,14 +84,26 @@ sleep 1
 dex_sh "cd $GUEST_ROOT/workspace && setsid nohup dsh --profile web --port 3080 --no-open > $GUEST_ROOT/logs/dsh-web.log 2>&1 < /dev/null & echo started" \
   -e FLOW_STUDIO_TESTBED=1 -e FLOW_STUDIO_STUB_ENGINE=1 -e FLOW_STUDIO_TOKEN="$TOKEN" >/dev/null
 for _ in $(seq 1 30); do
-  grep -q '^dsh web: http' "$GUEST_ROOT/logs/dsh-web.log" 2>/dev/null && break
+  dex_sh "grep -q '^dsh web: http' $GUEST_ROOT/logs/dsh-web.log" 2>/dev/null && break
   sleep 1
 done
+# 宿主鉴权：启动日志里打印一次性登录令牌，先换成这个进程签发的登录 cookie；
+# Host 头必须与后续请求一致（这里都用 127.0.0.1:$PORT），否则 cookie 的 authority 对不上。
+LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_ROOT/logs/dsh-web.log | head -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n')"
+[ -n "$LOGIN_TOKEN" ] || die "没能从容器日志取到 dsh web 登录令牌"
+rm -f "$JAR"
+AUTH_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -c "$JAR" "http://127.0.0.1:$PORT/?token=$LOGIN_TOKEN" || true)"
+[ "$AUTH_CODE" = "303" ] || die "登录换 cookie 失败（HTTP $AUTH_CODE）"
+ok "宿主登录 cookie 就位（303）"
 HEALTH="$(req "$BASE/health")"
-# 无凭据必须被拒（v1.1 鉴权回归）
+# 无凭据必须被拒（v1.1 鉴权回归）：不带 cookie 也没有插件令牌
 UNAUTH="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BASE/runs" || true)"
 [ "$UNAUTH" = "401" ] || [ "$UNAUTH" = "403" ] || die "无凭据访问竟然返回 $UNAUTH（期望 401/403）"
 ok "无凭据访问被拒：$UNAUTH"
+# 只有宿主 cookie、没有插件令牌时，插件自己的第二道闸必须生效
+NO_PLUGIN_TOKEN="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/runs" || true)"
+[ "$NO_PLUGIN_TOKEN" = "401" ] || [ "$NO_PLUGIN_TOKEN" = "403" ] || die "缺插件令牌竟然返回 $NO_PLUGIN_TOKEN（期望 401/403）"
+ok "缺插件令牌被拒：$NO_PLUGIN_TOKEN"
 ENGINE="$(printf '%s' "$HEALTH" | jqr 'j.engine')"
 [ "$ENGINE" = "stub" ] || die "health 里 engine=$ENGINE，期望 stub（health: $HEALTH）"
 ok "health 就位：$(printf '%s' "$HEALTH" | jqr 'j.version+" / "+j.engine+" / "+j.auth')"
@@ -135,11 +149,13 @@ done
 [ "$STATUS" = "done" ] || die "run 最终状态是 $STATUS（期望 done）"
 SUMMARY="$(req "$BASE/runs/$RUN_ID/summary")"
 EVENTS="$(req "$BASE/runs/$RUN_ID/events?limit=1000&order=asc")"
+DETAIL="$(req "$BASE/runs/$RUN_ID")"
 
 say "6. 断言"
-node - "$SUMMARY" "$EVENTS" "$STATUS" <<'NODE'
-const [summaryRaw, eventsRaw, status] = process.argv.slice(2)
+node - "$SUMMARY" "$EVENTS" "$STATUS" "$DETAIL" <<'NODE'
+const [summaryRaw, eventsRaw, status, detailRaw] = process.argv.slice(2)
 const s = JSON.parse(summaryRaw).summary || JSON.parse(summaryRaw)
+const detail = JSON.parse(detailRaw).run || {}
 const ev = (JSON.parse(eventsRaw).events) || []
 const kinds = ev.map(e => e.kind)
 const fail = m => { console.error('断言失败: ' + m); process.exit(1) }
@@ -163,6 +179,20 @@ if (!s.skillUsage) fail('没有 skillUsage')
 if (!(s.skillUsage.declaredCount >= 2)) fail('skill 声明数没记上（' + (s.skillUsage && s.skillUsage.declaredCount) + '）')
 if (s.skillUsage.coverage !== 1) fail('skill 覆盖率应为 1（实得 ' + s.skillUsage.coverage + '）')
 if (!s.findings) fail('没有 findings')
+// B1 回归：progress 必须带每节点状态（只回计数会让客户端长跑时把已通过节点显示成未开始）
+const pn = s.progress.nodes
+if (!pn || typeof pn !== 'object') fail('summary.progress 缺 nodes')
+for (const id of ['n_start', 'n_a', 'n_b', 'n_end']) {
+  const entry = pn[id]
+  if (!entry || typeof entry.status !== 'string' || !Number.isInteger(entry.attemptId)) {
+    fail('progress.nodes 缺节点或字段不全：' + id + ' → ' + JSON.stringify(entry))
+  }
+}
+if (!Array.isArray(s.progress.invalidatedNodes)) fail('缺 invalidatedNodes')
+if (pn.n_b.attemptId !== 2) fail('n_b 当前 attempt 应为 2（打回后重跑），实得 ' + pn.n_b.attemptId)
+if (!detail.progress || !detail.progress.nodes) fail('详情接口没带 progress.nodes')
+if (detail.progress.nodes.n_b.attemptId !== 2) fail('详情接口的 progress.nodes 与 summary 不一致')
+console.log('  ✓ progress.nodes 就位（4 节点，n_b attempt=2，invalidated=' + s.progress.invalidatedNodes.length + '）')
 console.log('  ✓ 状态 done，事件 ' + ev.length + ' 条，打回 ' + rej.length + ' 次，attempt=' + [...attempts].filter(a => a.endsWith('#2')).length)
 console.log('  ✓ token 合计 ' + tok.total + ' = ' + tok.input + '+' + tok.cacheRead + '+' + tok.cacheWrite + '+' + tok.output)
 console.log('  ✓ quality=' + s.quality.state + ' · ' + (s.quality.label || ''))

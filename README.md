@@ -12,7 +12,7 @@
 LOD 三档（60% / 45%）、键盘也能连线（`C` → `Tab` → `Enter`）、保存失败落**本地草稿**并能恢复。
 设计依据在 [`docs/DESIGN.md`](docs/DESIGN.md)（四份分册 + [`docs/design/REVIEW.md`](docs/design/REVIEW.md) 的独立审核与逐条裁决）。
 
-执行引擎与指标看板仍在路线图里（见文末），数据模型已经按「可执行」的形态设计：
+数据模型已经按「可执行」的形态设计：
 未识别字段原样收进 `extras`（有界、坏输入不抛错），后续加字段不会被保存链静默丢掉。
 
 **0.3.0 加上了运行日志的骨架**（[`docs/design/05-run-log.md`](docs/design/05-run-log.md)）：
@@ -21,7 +21,14 @@ LOD 三档（60% / 45%）、键盘也能连线（`C` → `Tab` → `Enter`）、
 token 四段合计，也支持导出 markdown。指标按契约确定性聚合：token 四桶、skill 覆盖率（唯一 skill 去重）、
 findings 未解决/已复验、打回计数、阶段进度（打回后旧通过失效），以及**质量结论**——
 后者要求验收条目、测试报告、规范检查、审查结论、P0/P1 五类证据齐全且可复核，缺证据一律「未检测」，不给绿灯。
-**引擎本身还没接**：事件目前由 API 手工写入，执行引擎在 v0.4。
+**0.4.0 接上执行引擎**（[`docs/design/06-execution-engine.md`](docs/design/06-execution-engine.md)）：
+点「运行」把图编译成执行计划，每个节点起一个真实的子 agent 会话（单个 agent，或主管 + 子 agent），
+节点产物经结构化输出在节点之间传递，打回线按判定真的回退并累加 attempt。跑之前先把图校验一遍：
+成环、断头路、多出边、打回指向结束节点、缺角色/缺任务一律 400 拒跑，不会跑到一半才卡死。
+运行期间画布结构锁死、只读观察，可随时停止；单写者租约保证同一个 run 不会被两个进程同时写；
+写盘失败会把 run 标成 `failed` 并留 `.error` 侧车，不静默挂住；预算按 run 限步数 / 墙钟 / 产物字节。
+模型自述的证据（`provenance=model-claim`）必须对得上 `artifact/write` 的 path + sha256 且文件真实存在，
+对不上就降级成「未检测」——**质量结论不接受自证**。
 
 ## 它解决什么
 
@@ -68,7 +75,7 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 
 装完刷新页面，侧栏出现「流程编排」图标。Host 半边（路由）需要重启 `dsh web` 才挂载。
 
-数据目录可用 `FLOW_STUDIO_HOME` 覆盖（默认跟随 `$DSH_HOME`）。
+流程与 run 都落在 `$DSH_HOME/flow-studio/`（`flows/` 与 `runs/`，目录 0700、文件 0600）；没有另外的覆盖变量。
 
 ## 数据模型
 
@@ -116,22 +123,28 @@ dsh plugin --profile web add /home/feiyueve/文档/dsh/dsh-flow-studio
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
 | GET | `/health` | 目录、schema 版本、skills 服务是否在位、`auth` 档位（`origin-only` / `token`） |
-| GET/POST | `/runs` | run 列表（`limit`）/ 新建 run |
-| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引）/ 删除整个 run |
+| GET/POST | `/runs` | run 列表（`limit`）/ 新建 run（`pending`，不自动开跑） |
+| POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；已有 run 在写 → 409） |
+| POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
+| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes`）/ 删除整个 run（租约持有中 → 409） |
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验） |
 | GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论） |
 | GET | `/runs/<runId>/export` | 导出 markdown |
 
-插件路由不会被 webserver 的 `/api` 通用鉴权拦到（最长前缀优先，exact/prefix 会先命中插件自己），
-所以这里自己挡跨站请求：带了 `Origin` 且与 `Host` 不一致一律 403。
+**鉴权与 `/api` 同口径**：插件路由虽然绕过了 webserver 的 `/api` 通用鉴权（最长前缀优先），
+但每个 handler 入口都会调宿主 `ctx.get('connection')?.requestRejection(req)`，把判定权交回宿主
+（401/403 与 `/api` 一致；拿不到该服务时 **fail-closed 503**，绝不放行）。另有可选第二道闸
+`FLOW_STUDIO_TOKEN`（≥16 字符，只认 `Authorization: Bearer`；`?token=` 仅导出接口允许）。
+`/health` 在未鉴权时只说「认证档位」，不报内部路径。
 
 ## 开发
 
 ```sh
 npm install
-npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈110KB）+ 复制 Host 模块
-npm test           # 八组自检，共 133 个断言
-node test/render.test.mjs   # SSR + 构建产物加载，29 个断言
+npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈143KB）+ 复制 Host 模块
+npm test           # 九组自检，共 199 组
+node test/render.test.mjs   # SSR + 构建产物加载，49 组
+bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
 - `test/model.test.mjs` —— 出厂模板合法、坏数据收敛、四类结构错误能被抓出来、未知字段进 `extras` 不丢。
@@ -142,6 +155,8 @@ node test/render.test.mjs   # SSR + 构建产物加载，29 个断言
 - `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）。
 - `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
+- `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者开始锁（并发 start 只成功一个）、打回按 attempt 重跑、
+  预算中断、写盘失败终态、证据对账、桩模式双闸门。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
   `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点；
   运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言。
@@ -150,15 +165,10 @@ node test/render.test.mjs   # SSR + 构建产物加载，29 个断言
 
 ## 路线图
 
-- **v0.4 执行引擎**：把图编译成执行计划，每个节点起一个真实的子 agent 会话
-  （`ctx.subagents.startActivation({ provider: 'spawn', delivery: 'caller', request: { prompt, parent, outputSchema } })`），
-  节点产物用结构化 JSON 在节点之间传递，打回线按判定结果真的回退并累加轮次；
-  引擎只需按 [`05-run-log.md`](docs/design/05-run-log.md) 写事件，指标与抽屉自动有数据。
-  Run 数据契约（`runId` / `attemptId` / `nodeId` / `memberId` / 状态来源 / 去重重连）见
-  [`04-metrics.md`](docs/design/04-metrics.md) §3.13。
-- **v0.5 指标看板增强**：跨 run 对比、趋势图、团队汇总；把 `acceptance` / `test` / `check` 三类证据接上真实执行器
-  （目前 quality 只能在手工写入完整证据时才给结论）。
+- **v0.5 指标看板增强**：跨 run 对比、趋势图、团队汇总；把 `acceptance` / `test` / `check` 三类证据接上独立执行器
+  （引擎已经会写这三类事件，但报告内容目前取决于节点自己的结构化输出，还没有外部的检查器去跑）。
 - **v0.6 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
+- **v0.7 多人协作**：run 的单写者租约已经按「多浏览器同时看是安全的」设计；多人同时**编辑**同一份流程还没做。
 
 ## 先搜现成的（按 `PLUGIN-SEARCH.md`）
 

@@ -546,6 +546,41 @@ export function validateFlow(flow) {
 }
 
 /**
+ * 找一条 next 边构成的环（与 Host `engine.findNextCycle` 同一算法：只看 next 边、
+ * 目标节点必须存在，DFS 三色标记）。返回环上的节点 id 序列（首尾相同），没有环返回 null。
+ * 结束节点如果被手动改出一条 next 出边，也会构成环——这条判据不能只靠「阶段到不了结束」兜。
+ */
+function findNextCycle(flow, byId) {
+  const nextEdges = (flow.edges || []).filter(edge => edge.kind === EDGE_KIND.NEXT && byId.has(edge.to))
+  const color = new Map()
+  const trail = []
+  const visit = (nodeId) => {
+    const state = color.get(nodeId)
+    if (state === 'gray') {
+      const start = trail.indexOf(nodeId)
+      return [...trail.slice(start >= 0 ? start : 0), nodeId]
+    }
+    if (state === 'black') return null
+    color.set(nodeId, 'gray')
+    trail.push(nodeId)
+    for (const edge of nextEdges) {
+      if (edge.from !== nodeId) continue
+      const found = visit(edge.to)
+      if (found) return found
+    }
+    trail.pop()
+    color.set(nodeId, 'black')
+    return null
+  }
+  for (const node of byId.values()) {
+    if (color.get(node.id) === 'black') continue
+    const found = visit(node.id)
+    if (found) return found
+  }
+  return null
+}
+
+/**
  * 开跑前的硬门禁（B2）：与 Host `validateFlowForRun` 同一口径。
  *
  * `validateFlow` 的 error/warning 分级是给**画布编辑**用的（成环只算 warning——作者可能
@@ -646,6 +681,14 @@ export function runBlockers(flow) {
         })
       }
     }
+  }
+
+  // next 成环（含「结束节点被改出一条 next 出边」这种）：只靠「阶段到不了结束」兜不住，
+  // 引擎另有 findNextCycle 判据，这里必须同口径。
+  const cycle = findNextCycle(flow, byId)
+  if (cycle) {
+    const path = cycle.map(id => (byId.get(id) && byId.get(id).title) || id).join(' → ')
+    issues.push({ message: `next 边成环：${path}（引擎会拒绝执行）`, nodeId: cycle[0] })
   }
 
   return issues

@@ -678,6 +678,15 @@ check('B2：校验不过不起引擎；本次新建的 run 启动失败要 DELET
   const badRejectResult = runPreflight(badReject)
   assert.equal(badRejectResult.ok, false, '打回指向开始节点必须被拦下')
 
+  // 只有 findNextCycle 才能抓到的一条：结束节点被改出一条 next 出边（成环），
+  // 但所有阶段仍能到达结束节点 —— 不能靠「阶段到不了结束」兜过去。
+  const endCycle = model.defaultFlow()
+  endCycle.edges.push({ id: 'e_end_cycle', from: 'n_end', to: 'n_req', kind: 'next', label: '' })
+  const endCycleResult = runPreflight(endCycle)
+  assert.equal(endCycleResult.ok, false, '结束节点出边造成的环必须被拦下')
+  assert.ok(endCycleResult.issues.errors.some(item => /成环/.test(item.message)),
+    JSON.stringify(endCycleResult.issues.errors))
+
   const created = startFailurePlan('start', { status: 409, data: { error: '已有 run 正在运行' } }, { id: 'run-new' }, true)
   assert.equal(created.deleteRunId, 'run-new', '本次新建的 run 启动失败必须 DELETE')
   assert.ok(created.message.includes('已有 run 正在运行'))

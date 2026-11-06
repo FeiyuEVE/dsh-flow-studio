@@ -10,8 +10,14 @@
  * 本模块只做**纯函数 + 投递编排**：落盘全部委托给 `runstore.js`，
  * 流程模板读取委托给 `store.js`，不 import engine（避免 engine ↔ inbox 循环依赖）。
  *
- * 安全边界：外部文本一律按码点截断（正文 4000 / 事件 2000 / 提示词 1200），
- * URL 只允许 http/https，tokenEnv 只记环境变量名（绝不把令牌值落盘）。
+ * 安全边界：外部文本一律按码点截断（正文 4000 / 事件 2000 / 提示词 1200）；
+ * 回复通道（`reply`）的白名单校验**只在本模块实现一份**，所有入口共用：
+ *   - `tokenEnv` 只接受专用前缀 `FLOW_STUDIO_REPLY_TOKEN_*`（大小写敏感，后缀只用
+ *     大写字母 / 数字 / 下划线），其它变量名（`DSH_*` / `FLOW_STUDIO_TOKEN` / `PATH`…）
+ *     一律拒绝 —— 否则一条流程消息就能把 owner 级令牌当 Bearer 发到外部地址；
+ *   - `url` 只允许 `https:`，或回环地址（127.0.0.1 / ::1 / localhost）上的 `http:`，
+ *     且禁止带用户名密码（`user:pass@`）；
+ *   - 令牌值只以打码形式出现在日志 / 事件 / 错误信息里（`maskSecret` / `redactSecrets`）。
  *
  * @module @feiyueve/dsh-flow-studio/inbox
  */
@@ -67,6 +73,158 @@ function logWarn(deps, message) {
 }
 
 // ---------------------------------------------------------------------------
+// 纯函数：回复通道白名单（所有入口共用同一份实现）
+// ---------------------------------------------------------------------------
+
+/** 允许作为 Bearer 来源的环境变量名前缀（专用前缀；别的变量绝不能当令牌用）。 */
+export const REPLY_TOKEN_ENV_PREFIX = 'FLOW_STUDIO_REPLY_TOKEN_'
+
+/** 严格形态：前缀大小写敏感，后缀只允许大写字母 / 数字 / 下划线（非空）。 */
+const REPLY_TOKEN_ENV_PATTERN = /^FLOW_STUDIO_REPLY_TOKEN_[A-Z0-9_]+$/
+const REPLY_TOKEN_ENV_MAX_CHARS = 128
+const REPLY_URL_MAX_CHARS = 2048
+
+/** 允许走明文 http 的回环主机名（`new URL().hostname` 形式，IPv6 含方括号）。 */
+export const REPLY_LOOPBACK_HOSTS = Object.freeze(['127.0.0.1', '::1', 'localhost'])
+
+const REPLY_TOKEN_ENV_ALLOWED_FORM = `只接受 ${REPLY_TOKEN_ENV_PREFIX}<后缀> 形式的变量名`
+  + `（前缀大小写敏感；后缀只用大写字母 / 数字 / 下划线，例如 ${REPLY_TOKEN_ENV_PREFIX}OPS）；`
+  + '其它变量（含 DSH_*、FLOW_STUDIO_TOKEN、PATH）一律拒绝'
+
+/** 在错误信息里回显用户输入时先收口：去控制字符、按码点截断。 */
+function displayInput(value, max = 64) {
+  if (typeof value !== 'string') return String(value)
+  const chars = Array.from(value.replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, max * 2))
+  return chars.length <= max ? chars.join('') : `${chars.slice(0, max).join('')}…`
+}
+
+/**
+ * 令牌值打码：只保留前 2 / 后 2 位与长度；短令牌（≤8）整段隐藏。
+ * 任何日志 / 事件 / 返回体要用到令牌值的地方都必须先经过它。
+ */
+export function maskSecret(value) {
+  if (typeof value !== 'string' || value === '') return ''
+  const chars = Array.from(value)
+  const length = chars.length
+  if (length <= 8) return `***（长度 ${length}）`
+  return `${chars.slice(0, 2).join('')}***${chars.slice(-2).join('')}（长度 ${length}）`
+}
+
+/** 把文本里出现的令牌值替换成打码形式（错误信息兜底，防止上游把令牌带出来）。 */
+export function redactSecrets(text, secrets = []) {
+  let out = typeof text === 'string' ? text : String(text === undefined || text === null ? '' : text)
+  for (const secret of Array.isArray(secrets) ? secrets : []) {
+    if (typeof secret !== 'string' || secret === '') continue
+    out = out.split(secret).join(maskSecret(secret))
+  }
+  return out
+}
+
+/**
+ * 校验 `tokenEnv`：省略 = 不带令牌（合法）；给了就必须是专用前缀的白名单变量名。
+ * @returns {{ ok: true, tokenEnv?: string } | { ok: false, error: string }}
+ */
+export function validateReplyTokenEnv(value) {
+  if (value === undefined || value === null) return { ok: true }
+  if (typeof value !== 'string') {
+    return { ok: false, error: `tokenEnv 必须是环境变量名字符串；${REPLY_TOKEN_ENV_ALLOWED_FORM}` }
+  }
+  const name = value.trim()
+  if (name === '') {
+    return { ok: false, error: `tokenEnv 不能为空；${REPLY_TOKEN_ENV_ALLOWED_FORM}` }
+  }
+  if (name.length > REPLY_TOKEN_ENV_MAX_CHARS) {
+    return { ok: false, error: `tokenEnv 超过 ${REPLY_TOKEN_ENV_MAX_CHARS} 字符；${REPLY_TOKEN_ENV_ALLOWED_FORM}` }
+  }
+  if (!REPLY_TOKEN_ENV_PATTERN.test(name)) {
+    return {
+      ok: false,
+      error: `tokenEnv「${displayInput(name)}」不允许：${REPLY_TOKEN_ENV_ALLOWED_FORM}。`,
+    }
+  }
+  return { ok: true, tokenEnv: name }
+}
+
+/** 回环判断：URL hostname 去掉 IPv6 方括号后精确匹配（不做 DNS 解析，避免 TOCTOU）。 */
+function isReplyLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+  return REPLY_LOOPBACK_HOSTS.includes(host)
+}
+
+/**
+ * 校验 http 回复的 `url`：只允许 https，或回环地址上的 http；禁止 user:pass@。
+ * @returns {{ ok: true, url: string } | { ok: false, error: string }}
+ */
+export function validateReplyUrl(value) {
+  const allowed = 'http 回复地址只允许 https，或回环地址（127.0.0.1 / ::1 / localhost）上的 http'
+  if (typeof value !== 'string' || value.trim() === '') {
+    return { ok: false, error: `缺少 url：${allowed}。` }
+  }
+  if (value.length > REPLY_URL_MAX_CHARS) {
+    return { ok: false, error: `url 超过 ${REPLY_URL_MAX_CHARS} 字符；${allowed}。` }
+  }
+  let parsed
+  try {
+    parsed = new URL(value)
+  } catch {
+    return { ok: false, error: `url 不是合法地址：${allowed}。` }
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    return { ok: false, error: 'url 不允许带用户名 / 密码（user:pass@）；请改用令牌环境变量或去掉凭据。' }
+  }
+  if (parsed.protocol === 'https:') return { ok: true, url: parsed.toString() }
+  if (parsed.protocol !== 'http:') {
+    return { ok: false, error: `url 协议 ${displayInput(parsed.protocol)} 不允许：${allowed}。` }
+  }
+  if (!isReplyLoopbackHost(parsed.hostname)) {
+    return {
+      ok: false,
+      error: `http 只允许回环地址（127.0.0.1 / ::1 / localhost），不接受 ${displayInput(parsed.hostname)}；`
+        + '对外地址必须用 https。',
+    }
+  }
+  return { ok: true, url: parsed.toString() }
+}
+
+/**
+ * 严格版 reply 校验（HTTP 路由 / 模型工具 / 已保存的回复通道**共用这一份**）。
+ *
+ * - `session` / `none` 沿用 runstore 的归一化口径；
+ * - `http` 额外套上 url / tokenEnv 白名单；
+ * - 省略（undefined / null）= 未配置回复通道（合法，返回 reply: undefined）。
+ *
+ * @returns {{ ok: true, reply: object|undefined } | { ok: false, error: string }}
+ */
+export function validateReplyTargetStrict(raw) {
+  if (raw === undefined || raw === null) return { ok: true, reply: undefined }
+  if (!isPlainObject(raw)) {
+    return { ok: false, error: 'reply 必须是对象（kind 必填：session / http / none）。' }
+  }
+  if (raw.kind === 'http') {
+    const url = validateReplyUrl(raw.url)
+    if (!url.ok) return { ok: false, error: url.error }
+    const tokenEnv = validateReplyTokenEnv(raw.tokenEnv)
+    if (!tokenEnv.ok) return { ok: false, error: tokenEnv.error }
+    return {
+      ok: true,
+      reply: {
+        kind: 'http',
+        url: url.url,
+        ...(tokenEnv.tokenEnv === undefined ? {} : { tokenEnv: tokenEnv.tokenEnv }),
+      },
+    }
+  }
+  const normalized = normalizeReplyTarget(raw)
+  if (!normalized) {
+    return {
+      ok: false,
+      error: 'reply 不合法（kind 必须是 session / http / none；kind=session 必须给非空 sessionId）。',
+    }
+  }
+  return { ok: true, reply: normalized }
+}
+
+// ---------------------------------------------------------------------------
 // 纯函数：请求校验
 // ---------------------------------------------------------------------------
 
@@ -93,13 +251,10 @@ export function validateInboundBody(raw) {
   }
   let reply
   if (raw.reply !== undefined && raw.reply !== null) {
-    reply = normalizeReplyTarget(raw.reply)
-    if (!reply) {
-      return {
-        ok: false,
-        error: `reply 不合法（kind 必须是 ${MESSAGE_REPLY_KINDS.join(' / ')}；kind=http 时 url 只允许 http/https）`,
-      }
-    }
+    // F1：与 HTTP /inbox、flow_send_message 同一份严格校验（tokenEnv / url 白名单）。
+    const checked = validateReplyTargetStrict(raw.reply)
+    if (!checked.ok) return { ok: false, error: checked.error }
+    reply = checked.reply
   }
   return {
     ok: true,
@@ -113,18 +268,20 @@ export function validateInboundBody(raw) {
 }
 
 /**
- * 校验一个消息级回复目标（复用 runstore 的归一化；HTTP 只允许 http/https）。
+ * 校验一个消息级回复目标（HTTP `POST /runs/<id>/inbox` 与 flow_send_message 共用）。
+ * 与 `validateReplyTargetStrict` 同一口径，但要求**必须给出**一个目标（省略 → 不合法）。
  * @returns {{ ok: true, reply: object } | { ok: false, error: string }}
  */
 export function validateReplyTarget(raw) {
-  const reply = normalizeReplyTarget(raw)
-  if (!reply) {
+  const checked = validateReplyTargetStrict(raw)
+  if (!checked.ok) return checked
+  if (!checked.reply) {
     return {
       ok: false,
-      error: `reply 不合法（kind 必须是 ${MESSAGE_REPLY_KINDS.join(' / ')}；kind=http 时 url 只允许 http/https，tokenEnv 只写环境变量名）`,
+      error: `reply 不合法（kind 必须是 ${MESSAGE_REPLY_KINDS.join(' / ')}）`,
     }
   }
-  return { ok: true, reply }
+  return checked
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +804,13 @@ export async function deliverOutboundReply(deps, input) {
     target = normalizeReplyTarget(source.reply)
   }
   if (!target) target = normalizeReplyTarget(meta.inbox ? meta.inbox.reply : null)
+  // F1：投递前再做一次严格校验（防御旧版本 / 手工改 run.json 写进来的不合规通道）。
+  // 不合规直接 400，绝不读取令牌、绝不发请求。
+  if (target) {
+    const checked = validateReplyTargetStrict(target)
+    if (!checked.ok) throw new RunError(400, 'reply', `回复通道不合规：${checked.error}`)
+    target = checked.reply
+  }
 
   let flow = null
   try {
@@ -709,7 +873,9 @@ export async function deliverOutboundReply(deps, input) {
     }, { token, signal: input.signal })
     ok = posted.ok
     httpStatus = posted.status
-    if (!posted.ok) error = posted.error || `HTTP ${posted.status ?? 'error'}`
+    // F1：令牌值永远打码——上游（fetch / 代理）若把 Authorization 抄进错误文本，
+    // 写进 messages.jsonl / 返回体之前先脱敏。
+    if (!posted.ok) error = redactSecrets(posted.error || `HTTP ${posted.status ?? 'error'}`, [token])
   }
   eventRecord.delivery = delivery
 

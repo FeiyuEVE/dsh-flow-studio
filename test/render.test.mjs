@@ -264,6 +264,31 @@ check('页面骨架在没有流程时给出加载态', () => {
   assert.ok(html.includes('.fs-node'), '样式没有随组件一起渲染')
 })
 
+// F2（只增）：运行必须有显式工作区。SSR 直接渲染 src 组件即可验证，不依赖 lib 构建产物。
+check('F2：工作区回填进顶栏；空工作区标 invalid 且运行按钮写明「未选择工作区」', () => {
+  const withWorkspace = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialWorkspace: '/repo/a',
+  }))
+  assert.ok(withWorkspace.includes('aria-label="工作区绝对路径"'), '顶栏缺少工作区输入（无障碍名）')
+  assert.match(withWorkspace, /class="fs-workspace-input"[^>]*value="\/repo\/a"/, 'initialWorkspace 必须回填到输入框')
+  assert.match(withWorkspace, /class="fs-workspace-input"[^>]*aria-invalid="false"/, '合法工作区不能标成 invalid')
+
+  const withoutWorkspace = render(React.createElement(FlowStudioPage, { initialFlow: flow, initialSkills: [] }))
+  assert.match(withoutWorkspace, /class="fs-workspace-input"[^>]*aria-invalid="true"/, '空工作区必须标成 invalid')
+  assert.match(withoutWorkspace, /title="[^"]*未选择工作区[^"]*"/, '运行按钮 title 必须说明未选择工作区')
+  // 原有 m7 原因（运行列表没回来）不能被新原因吞掉，两条都要写出来。
+  assert.match(withoutWorkspace, /title="[^"]*正在读取运行记录[^"]*"/, '原有「运行列表未回」原因不能丢')
+  assert.ok(withoutWorkspace.includes('placeholder="/path/to/workspace（绝对路径）"'), '空态要有可读占位')
+
+  const blocked = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: false })
+  assert.equal(blocked.startDisabled, true, '没工作区时「运行」必须禁用')
+  assert.ok(blocked.startTitle.includes('未选择工作区'))
+  const ready = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: true })
+  assert.equal(ready.startDisabled, false, '有工作区时不能被新门禁误禁')
+})
+
 // ── 运行控制与实时状态（06 §10 / §11）────────────────────────────────────
 check('节点状态从事件 + live 推导：运行中 / 已通过 / 失败 / 未开始', () => {
   const nodes = [

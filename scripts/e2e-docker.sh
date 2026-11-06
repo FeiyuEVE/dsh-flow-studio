@@ -151,8 +151,11 @@ RUN_ID="$(printf '%s' "$RUN_JSON" | jqr 'j.run.id')"
 PENDING="$(printf '%s' "$RUN_JSON" | jqr 'j.run.status')"
 [ "$PENDING" = "pending" ] || die "新建 run 状态是 $PENDING（期望 pending）"
 ok "新建 run 为 pending"
-req -X POST "$BASE/runs/$RUN_ID/start" -H 'content-type: application/json' -d '{}' >/dev/null || true
-ok "run $RUN_ID 已启动（flow $FLOW_ID）"
+# v0.8.1：start 的错误不许再被 `|| true` 吞掉——曾经因为它静默 400，run 一直停在 pending。
+START_CODE="$(req -o "$REPO/.tmp/e2e-main-start.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$RUN_ID/start" -H 'content-type: application/json' -d '{}')"
+case "$START_CODE" in 200|202) ;; *) die "主 run start 返回 $START_CODE（期望 202）：$(cat "$REPO/.tmp/e2e-main-start.json")" ;; esac
+ok "run $RUN_ID 已启动（flow $FLOW_ID，HTTP $START_CODE）"
 
 say "5. 轮询到收口（最多 120s）"
 STATUS=""

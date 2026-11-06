@@ -95,8 +95,17 @@ structured = parseAssistantStructured(lastAssistantBySession.get(sessionId))
 ### 4.1 决策点在 start
 
 实际签名：`start(runId, { parent?, workspace?, worktree?, cwd?, agentPreset? })`——决策发生在
-`engine.start` 内部（**不是**发起方替引擎决定）；模型工具 `flow_start` 在未显式传 `workspace` 时
-取调用方会话的 `header.cwd` 作为候选，HTTP 路由只做形状校验并把 `{ workspace, worktree }` 透传。
+`engine.start` 内部（**不是**发起方替引擎决定）。
+**`workspace` 是必填项（v0.8.1）**：引擎不再回落 `process.cwd()`，缺显式工作区一律
+`RunError(400, 'workspace', …)`，且**不**写 `run/start`、run 保持 `pending`；相对路径必须有
+绝对基准。来源三选一：`POST /runs` 创建时传入（持久化进 `run.json.workspace`）→
+`start` 请求体 → `run.json.startOptions.workspace`；`flow_start` 未显式传时取调用方会话的
+`header.cwd`，仍没有就报错（不再静默落到服务进程目录）。
+**例外**：stub 引擎（测试桩 / 容器测试台）不绑定工作区——它不建真实会话、不读写节点工作
+目录，工作区对它没有语义；`run.json.worktree` 记 `{enabled:false, reason:'stub-engine'}`。
+这条必须在**路由层（`isStubRun`）与引擎层同时**成立，否则会出现「路由放行、引擎 400」，
+桩 run 永远停在 `pending`（0.8.1 的容器 e2e 正是这样抓到它的）。
+
 `decidedBy` 不是入参，写给 `run.json` 时恒为 `initiator`。结果一次性写进 `run.json`：
 
 ```json
@@ -114,10 +123,9 @@ structured = parseAssistantStructured(lastAssistantBySession.get(sessionId))
   `auto` 不建（`reason:'not-a-git-repo'`，并把 `gitRoot` 记进 `run.json.workspace` 供界面解释），
   `on` 直接 400 说明「请以仓库根为工作区」。**不做**「子目录映射进 worktree」的隐式魔法——
   那会让「已隔离」的声称与实际 cwd 对不上。
-- **`auto-without-initiator`**：没有发起方工作区（`options.workspace` / cwd / 会话 `header.cwd`
-  都没有），只能回落 `process.cwd()` 时，`auto` **不建** worktree（`reason:'auto-without-initiator'`
-  + 一条 warn）。连「这是谁的工作区」都没确定，隔离一份服务进程的 cwd 没有意义；
-  显式 `on` 仍照建。
+- **`auto-without-initiator` 已成历史**：0.7 曾在完全没有发起方工作区时回落 `process.cwd()` 并
+  记这个 reason；0.8.1 起缺工作区直接 400，所以正常情况下这个分支不可达，只剩「绕过路由直接构造
+  Engine」时的防御性判断。显式 `on` 仍照建，`auto` 在无绑定时不建。
 - 建失败：`auto` → `enabled:false, reason:'create-failed: <原因>'` 并把 warning 写进 run 日志；
   `on` → 400。**两种都不许**在 `enabled:true` 的同时其实没建（建完还会 `existsSync` 复核）。
 - run 一旦开始，`workspace`/`worktree` 不可再改：带不同 `workspace` 再 start → 400。
@@ -172,8 +180,11 @@ v0.7 之前：模块级 `START_LOCK` + 引擎实例上的一堆 per-run 字段 �
   `node.executorCommand` 对 codex 只作**可执行文件路径覆盖**（默认 `codex`），不是完整模板。
   逐行读 stdout JSONL，映射成节点日志事件 + 用量（有 usage 才记）+ 最终 `agent_message` 文本；
   文本按 `parseAssistantStructured` 解析，解析不出按既有 `StructuredOutputError` 处理。
-- custom：`executorCommand` 是 `sh -c` 模板，用 `{prompt}` / `{schema}` / `{cwd}` 占位
-  （shell 单引号转义）；三个都没写时把 prompt 追加为最后一个参数。stdout 同样逐行读。
+- custom：`executorCommand` 是 `sh -c` 模板，用 `{prompt}` / `{schema}` / `{cwd}` 占位。
+  `{schema}` / `{cwd}` 做 shell 单引号转义；**prompt 原文不拼进脚本**（v0.8.1 起）：
+  写进 0700 临时目录的文件、经 `FLOW_STUDIO_PROMPT_FILE` 交给子进程，`{prompt}` 替换为
+  `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`；≤64 KiB 另设 `FLOW_STUDIO_PROMPT`，全文同时写 stdin。
+  单引号内的 `{prompt}` 不展开（不支持位置）。细节见 06 §17.4。stdout 同样逐行读。
 - schema 固定写在 `<runsRoot>/<runId>/executors/<attemptId>.schema.json`（目录 0700、文件 0600），
   内容就是 `ENGINE_OUTPUT_SCHEMA`；失败语义 / 事件映射见 06 §17。
 - 超时/重试/abort 沿用现有节点语义（`MAX_NODE_RETRIES`、`signal`）。
@@ -183,6 +194,11 @@ v0.7 之前：模块级 `START_LOCK` + 引擎实例上的一堆 per-run 字段 �
 
 - 归属：`createRuntime()` 起**一个** `SupervisionScheduler` / 一个 `setInterval`（默认 15s；
   `supervisionIntervalMs` 优先，其次 `intervalMs`；定时器 `.unref()`），扫描在跑 run。
+- **单条独立超时 + 有界并发**（v0.8.1）：每条 run 的唤醒各自带 `wakeTimeoutMs`（默认 60s）与
+  epoch 守卫，`maxConcurrency`（默认 4）限制同轮并发。一条 `wake` 卡死不再拖停整轮巡检；
+  超时/stop 之后迟到的结果按 epoch 丢弃。`snapshot()` 暴露 `lastOutcome / lastDurationMs /
+  timeouts / tick.lastDurationMs`，`flow_watch` 的 `health{timeouts,invalidReports,warnings}`
+  会把「超时 / tick 疑似停摆 / 节点自审回报格式错」写进可读结论。
 - 每次 tick 对每个 run：`auditWorkflow(...)` → `nextDueAt` 规则
   `healthy 180s / 异常 60s / pending 30s / 终态 null（停）`；未知 verdict 按异常侧 60s。
 - 到点 → `agents.get(wakerSessionId)`；没有就 `agents.resume({resumeSessionId})`；然后
@@ -199,6 +215,16 @@ v0.7 之前：模块级 `START_LOCK` + 引擎实例上的一堆 per-run 字段 �
   登记失败只 warn，不拖垮 `flow_start`：返回 `supervision.enabled=false` 并给出手动回退提示。
 - **恢复只登记有 waker 的 run**：`enabled===true && wakerSessionId` 非空才 register；
   缺 waker 只记 info 跳过（不算失败，也不写 `enabled:false`）。
+- **重启收口（v0.8.1）**：`supervisionReady` 先 `reclaimOrphanRuns()`，把
+  `status==='running'` 但本进程无 `Engine` 实例的 run 收成 `failed`
+  （`supervision.reason='restarted'`、清 `nextDueAt/lastWokeAt`、释放租约、写 `run/end`）。
+  判定：本进程实例 → 租约 `pid/host/heartbeatAt/ttlMs` → 同机 `kill(pid,0)` 探活 → 异机保守跳过；
+  收口前 `claimLease()`（O_EXCL）抢权，抢不到跳过；整条动作幂等。这类 run 不再恢复审查登记。
+- **卸载即 abort**：`runtime.dispose()` 停两个调度器 → abort 活跃 Engine → 摘 `session/event`
+  订阅 → `disposeTimeoutMs`（默认 2000ms）有界等待，返回 `{aborted, timedOut}`。
+- **事件按归属过滤**：`session/event` 只缓冲属于本 run 的节点会话（+ 本 run waker）的事件，
+  外来事件只计 `sessionEventStats.foreign`；条数与字节双上限、丢最旧并置 `sessionEventOverflow`。
+  这是**组合层**职责（`Engine` 可单独构造，不承担跨 run 隔离）。
 
 ### 7.1 宽严分界（保存 vs 启动）
 
@@ -246,7 +272,7 @@ export class SupervisionScheduler {                              // 注入 now /
   constructor(opts); start(); stop(); async tick(); register(runId, { wakerSessionId }); unregister(runId); status(runId)
 }
 
-export const NODE_ALARM_DEFAULT_MS = 120_000                     // v0.8 §11
+export const NODE_ALARM_DEFAULT_MS = 600_000                     // v0.8 §11（10 分钟；可用 FLOW_STUDIO_NODE_ALARM_MS 覆盖）
 export function parseNodeStatus(text)                            // → 状态对象 | null（纯函数，不抛错）
 export class NodeSupervisionScheduler {                          // 注入 now / wake / log / intervalMs / nodeAlarmMs / maxFailures
   constructor(opts); start(); stop(); async tick()
@@ -280,19 +306,20 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
 
 ## 10 实现状态
 
-2026-11-06 按代码逐项核对；`npm test` 19 个文件 / 540 组全绿。状态口径按 §2 第 3 条：
+2026-11-07 按代码逐项核对（0.8.1：10 路独立审计后的 BLOCKER 修复批）；`npm test`
+**20 个文件 / 627 组全绿**（含新增的 `test/build.test.mjs` 发布门禁）。状态口径按 §2 第 3 条：
 `implemented` = 代码、测试或实测证据都在；本表没有 `partial / not-implemented`。
 
 | 编号 | 状态 | 落地位置（文件 · 函数 / 入口） | 复核证据 |
 |---|---|---|---|
 | R1 | `implemented` | `src/engine.js` `start()` → `_resolveWorkspaceBinding()` / `_resolveWorktreeRecord()`；`src/worktree.js` `resolveWorkspace()` / `decideWorktree()` / `createWorktree()` | `test/worktree.test.mjs`（20 组 / 92 条）；`test/engine.test.mjs`「engine v0.7 · 工作区与 worktree（R1+R4）」5 组 |
 | R2 | `implemented` | `src/engine.js` `_resolveSessionMode()` / `_defaultActivate()` / `_createNodeSession()` / `nodeSessionId()` / `_disposeRunSessions()`；`src/runstore.js` `normalizeSessionMode()` | `test/engine.test.mjs`「engine v0.7 · 会话降级可见（sessionMode）」2 组；容器 T2 实测（本册 §3.3） |
-| R3 | `implemented` | `src/runtime.js` `createRuntime()` / `start()` / `settleInstance()`；`src/engine.js` `start()` 的实例级 `active` 占位 | `test/runtime.test.mjs`（22 组 / 178 条，含「两个不同 runId 并发」「同 runId 409」） |
+| R3 | `implemented` | `src/runtime.js` `createRuntime()` / `start()` / `settleInstance()`；`src/engine.js` `start()` 的实例级 `active` 占位 | `test/runtime.test.mjs`（32 组 / 327 条，含「两个不同 runId 并发」「同 runId 409」、重启收口、dispose abort、事件归属过滤） |
 | R4 | `implemented` | `src/engine.js` `_resolveWorkspaceBinding()` / `_patchRunBinding()`；`src/index.js` `handleRuns()` 的 `?workspaceId=` 过滤与 `runWorkspaceFields()`；`src/client/flowlist.js` `groupRunsByWorkspace()` | `test/engine.test.mjs` R1+R4 组；`test/host.test.mjs` workspace 参数组；`test/render.test.mjs` 分组渲染组 |
 | R5 | `implemented` | `src/engine.js` `_resolveWorktreeRecord()`（建后 `existsSync` 复核、`auto` 失败落 `enabled:false`）、`_resolveSessionMode()`（降级可见）；`src/worktree.js` `removeWorktree()` 路径前缀校验 | `test/engine.test.mjs`「worktree:'on' + 非 git → 400」「auto 不擅自建」；`test/worktree.test.mjs` 路径越界拒绝 |
-| R6 | `implemented` | `src/executor.js` `normalizeExecutor()` / `buildCodexArgs()` / `parseCodexLine()` / `runExternalExecutor()`；`src/engine.js` `_executorSpecOf()` / `_writeExecutorSchema()` / `_runExternalNode()`；`src/model.js` `EXECUTOR` / `validateFlow()` | `test/executor.test.mjs`（13 组 / 81 条）；`test/engine.test.mjs`「engine v0.7 · 外部 executor（R6）」5 组 |
-| R7 | `implemented` | `src/supervise.js` `planWake()` / `SupervisionScheduler`；`src/runtime.js` `createRuntime()` 的 `wakeRun()` / `evaluateRun()` / `enableSupervision()` / `supervisionReady`；`src/tools.js` `flow_supervise`；`src/index.js` `POST/GET /runs/<id>/supervision` | `test/supervise.test.mjs`（52 组 / 410 条）；`test/runtime.test.mjs`（22 组 / 178 条）；`test/tools.test.mjs`（36 组 / 345 条）；`test/host.test.mjs` supervision 路由组 |
-| R8 | `implemented` | `src/supervise.js` `NODE_ALARM_DEFAULT_MS` / `parseNodeStatus()` / `NodeSupervisionScheduler`；`src/runtime.js` `nodeSelfCheckPrompt()` / `wakeNode()` / `nodeSupervision`；`src/engine.js` `_parseNodeStatus()` / `_rememberNodeStatus()` / `_armSelfCheck()` / `_registerNodeSupervision()` / `_unregisterNodeSupervision()` / `_unregisterRunSupervision()` / `parseAssistantStructured()`；`src/runlog.js` `NODE_STATUS_EVENT_KINDS` + `case 'node/status'`；`src/runstore.js` `normalizeNodeStatus()` / `readRunDetail()` 的节点 `title`；`src/tools.js` `nodeStatusOfRun()` / `blockedNodeAdvice()`；`src/index.js` `runNodeStatusOf()` / `runBindingFields()`；`src/client/flowlist.js` `nodeStatusOf()` / `nodeStatusEntries()` / `NodeStatusBlock()` | `test/supervise.test.mjs` 8.1–8.6（52 组 / 410 条）；`test/engine.test.mjs` ①–⑨（70 组 / 604 条中的节点闹钟组）；`test/runtime.test.mjs` 节点闹钟组（22 组 / 178 条）；`test/tools.test.mjs` `flow_watch` 组（36 组 / 345 条）；`test/runlog.test.mjs`（72 组，含 2 组 node/status）；`test/host.test.mjs`（41 组，含 GET /runs 三处 nodeStatus）；`test/render.test.mjs`（70 组，含节点状态区块）；`normalizeNodeStatus()` 暂无独立单测（由 host 组间接覆盖） |
+| R6 | `implemented` | `src/executor.js` `normalizeExecutor()` / `buildCodexArgs()` / `parseCodexLine()` / `runExternalExecutor()`；`src/engine.js` `_executorSpecOf()` / `_writeExecutorSchema()` / `_runExternalNode()`；`src/model.js` `EXECUTOR` / `validateFlow()` | `test/executor.test.mjs`（26 组 / 173 条，含 prompt 注入回归与三通道保真）；`test/engine.test.mjs`「engine v0.7 · 外部 executor（R6）」5 组 |
+| R7 | `implemented` | `src/supervise.js` `planWake()` / `SupervisionScheduler`；`src/runtime.js` `createRuntime()` 的 `wakeRun()` / `evaluateRun()` / `enableSupervision()` / `supervisionReady`；`src/tools.js` `flow_supervise`；`src/index.js` `POST/GET /runs/<id>/supervision` | `test/supervise.test.mjs`（63 组 / 580 条）；`test/runtime.test.mjs`（32 组 / 327 条）；`test/tools.test.mjs`（55 组 / 738 条）；`test/host.test.mjs`（43 组）supervision 路由组 |
+| R8 | `implemented` | `src/supervise.js` `NODE_ALARM_DEFAULT_MS` / `parseNodeStatus()` / `NodeSupervisionScheduler`；`src/runtime.js` `nodeSelfCheckPrompt()` / `wakeNode()` / `nodeSupervision`；`src/engine.js` `_parseNodeStatus()` / `_rememberNodeStatus()` / `_armSelfCheck()` / `_registerNodeSupervision()` / `_unregisterNodeSupervision()` / `_unregisterRunSupervision()` / `parseAssistantStructured()`；`src/runlog.js` `NODE_STATUS_EVENT_KINDS` + `case 'node/status'`；`src/runstore.js` `normalizeNodeStatus()` / `readRunDetail()` 的节点 `title`；`src/tools.js` `nodeStatusOfRun()` / `blockedNodeAdvice()`；`src/index.js` `runNodeStatusOf()` / `runBindingFields()`；`src/client/flowlist.js` `nodeStatusOf()` / `nodeStatusEntries()` / `NodeStatusBlock()` | `test/supervise.test.mjs`（63 组 / 580 条）；`test/engine.test.mjs`（82 组 / 682 条中的节点闹钟与 C2 自审凭证组）；`test/runtime.test.mjs` 节点闹钟组（32 组 / 327 条，含 attempt/nonce 端到端）；`test/tools.test.mjs` `flow_watch` 组（55 组 / 738 条）；`test/runlog.test.mjs`（72 组，含 2 组 node/status）；`test/host.test.mjs`（43 组，含 GET /runs 三处 nodeStatus）；`test/render.test.mjs`（71 组，含节点状态区块）；`normalizeNodeStatus()` 由 `test/runstore.test.mjs` D2 组直接覆盖（256 KiB 预算、裁剪顺序、truncated 标志） |
 
 **已知边界**（如实列出）：`removeWorktree()` 目前没有 HTTP / 模型工具入口；`injected` 会话形态由注入方
 负责，引擎不承诺其顶层性；跨进程 supervision 只按落盘 `lastWokeAt` 避重，不提供分布式锁。
@@ -311,7 +338,9 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
   （默认 15s，节点级可用 `nodeSupervisionIntervalMs` 覆盖），都 `.unref()`，
   `runtime.dispose()` 里两个都 `stop()`。它们共享 `now` / `log` / `setInterval` 注入，
   但**不是一个 tick**，扫描与失败计数互不影响。
-- **默认间隔**：`NODE_ALARM_DEFAULT_MS = 120_000`；`register()` 时
+- **默认间隔**：`NODE_ALARM_DEFAULT_MS = 600_000`（10 分钟；用户反馈 120s 太频繁——一轮自审要起一次
+  模型回合）。可用环境变量 `FLOW_STUDIO_NODE_ALARM_MS`（毫秒）覆盖；扫描粒度用
+  `FLOW_STUDIO_SUPERVISION_INTERVAL_MS`（默认 15s）。`register()` 时
   `nextDueAt = now + intervalMs`，对外字段一律 ISO-8601 字符串；单条登记可用 `intervalMs` 覆盖。
 - **登记**（只对节点主管会话）：
   - `_createNodeSession()` 在 `agents.create` 成功后立即
@@ -349,9 +378,14 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
 
 ### 11.2 自审提问与结构化回报
 
-`nodeSelfCheckPrompt(entry)` 固定包含 `runId` / `nodeId` / `attempt`，要求「只用一个 json 围栏
-代码块回报，不要做别的事」，并写明「state=done 且 verdict 有值表示你认为该节点已完成；
+`nodeSelfCheckPrompt(entry)` 固定包含 `runId` / `nodeId` / `attempt` / **`nonce`**，要求「只用一个
+json 围栏代码块回报，不要做别的事」，并写明「state=done 且 verdict 有值表示你认为该节点已完成；
 不确定就写 working，不要谎报完成」（全文 ≤500 字，测试有断言）。
+
+**凭证（v0.8.1）**：`nonce` 由引擎按 attempt 一次性生成（`engine.attemptEnvelopeFor(sessionId)`
+→ `{ attempt, nonce, nodeId }`），自审回报必须**原样回显 `attempt` + `nonce`**；不匹配的回报
+（包括上一轮 attempt 的迟到回报）一律丢弃并留痕。拿不到 envelope 时这一次唤醒**不发**（发了也
+注定被丢），runtime 记为 `skip` 且原因进 `snapshot()`。
 
 回报示例与 `parseNodeStatus`（`src/supervise.js`，纯函数，坏输入返回 `null`、绝不抛错）：
 
@@ -365,13 +399,27 @@ export function createRuntime({ ctx, runsRoot, flowsRoot, logger, now, ...engine
 | `verdict` | 只认 `pass` / `reject`（trim 后精确匹配），其它 → `null` |
 | `nodeId` | 非空字符串才保留，否则 `null` |
 | `attempt` | 非负整数才保留（含 0），否则 `null` |
+| `nonce` | 非空字符串才保留，否则 `null`；与 envelope 不符的整条回报丢弃 |
 
 - 解析顺序：先按出现顺序取 json 围栏 / 无语言围栏的正文；围栏都不成时，回落到「去掉围栏后
   首个 `{` 到末个 `}`」的裸 JSON。围栏语言大小写不敏感，非 `json` 围栏忽略。
 - **落三处**（`_rememberNodeStatus`）：
   1. `node/status` 事件（追加，历史可查；`traceId` / `nodeId` / `attemptId` 由引擎按当前绑定写）；
-  2. `live.nodeStatus` 与引擎内存 `nodeStatus`（同一节点只留最新，最多 200 个节点，超出淘汰最早登记的）；
-  3. `run.json.nodeStatus`（由 `_patchRunBinding` 在 live 刷新后补写，runstore 白名单已收）。
+  2. 引擎内存 `nodeStatus`（同一节点只留最新，最多 200 个节点，`members` 只留最新 20 条）；
+  3. `run.json.nodeStatus`（由 `_patchRunBinding` 经 `writeRunMeta` 落盘，runstore 白名单已收，
+     并有 256 KiB 字节预算）。
+  - **没有 `live.nodeStatus`**：`_persistLive` 不再塞这一份（v0.8.1）。节点状态的唯一权威是
+    `run.json.nodeStatus`，同一条信息存两份只会让 run.json 体积翻倍并制造两份事实。
+- **结论优先级与证据保留（v0.8.1，修掉「自审可以伪造通过」）**：
+  - 正式结论（verdict 合法 + 凭证匹配）**优先于**状态块；状态块**永远不能**把正式 `reject`
+    翻成 `pass`——正式 `reject` 先到、状态块 `pass` 后到时仍按 `reject` 返工。
+  - **判「提前完成」必须同时满足**：`progress === 100`、`blockers` 为空、且同一条回复里存在合法
+    正式 verdict。只有状态块而没有正式 verdict → **不判完成**，按超时失败处理。
+  - **证据不许静默丢**：走「只有状态块」或凭证不匹配的路径时，原始 artifacts / findings /
+    acceptance / tests / checks 仍原样落盘 `self-check-raw.json`，并在 `node/status` 的 extra 里留路径。
+  - **格式错 ≠ 没回报**：文本里出现 `state/progress/members/blockers` 形态的键但解析或类型非法 →
+    记 `recordReport(kind:'invalid')`（进调度器 `snapshot()` 与 `flow_watch` 的
+    `health.invalidReports`），且**不**写节点完成状态；普通对话文本不误报。
 - `node/status.data` 白名单（`src/runlog.js` 的 `case 'node/status'`）：
 
 | 字段 | 规则 |

@@ -25,9 +25,9 @@
  * @module @feiyueve/dsh-flow-studio/engine
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, lstat, mkdir, readdir, readFile, realpath as realpathAsync, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readdir, readFile, realpath as realpathAsync, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 import { EDGE_KIND, EXEC_MODE, EXECUTOR, NODE_KIND } from './model.js'
@@ -137,8 +137,106 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** run.json 绑定补写的临时文件计数器（与 runstore 的 tmp 名分开，避免撞名）。 */
-let patchCounter = 0
+/**
+ * 07 §11.3：每轮节点提示词的一次性回报凭证。
+ * 节点必须在正式结论与自审状态块里原样回显 attempt + nonce，否则该回报一律丢弃。
+ */
+function newAttemptNonce() {
+  return randomBytes(9).toString('base64url')
+}
+
+/** 从一段回复里按「纯 JSON → ```json 围栏 → 首尾花括号切片」的顺序取出可解析对象。 */
+function parsedJsonObjectsOf(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return []
+  const text = raw.trim()
+  const candidates = [text]
+  const fences = /```(?:json)?\s*([\s\S]*?)```/gi
+  let fenced
+  while ((fenced = fences.exec(text)) !== null) candidates.push(fenced[1].trim())
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1))
+  const out = []
+  const seen = new Set()
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (!isPlainObject(parsed)) continue
+      // 同一段 JSON 可能同时命中 fenced 与花括号切片：去重，避免重复回报 / 重复 onReject。
+      const key = JSON.stringify(parsed)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(parsed)
+    } catch {
+      // 换下一个候选。
+    }
+  }
+  return out
+}
+
+/** 带 state 字段的 JSON 对象 = 自审状态块（即使 state 非法 / 自带 verdict，也不是正式结论）。 */
+function isNodeSelfCheckBlock(value) {
+  return isPlainObject(value) && Object.prototype.hasOwnProperty.call(value, 'state')
+}
+
+/**
+ * E1-b：自审状态块的**形状 / 类型**问题。`supervise.parseNodeStatus` 对非法值会
+ * 静默收敛（progress:"abc" → 0），引擎侧再把这种「有键但值不合法」判成 invalid，
+ * 既不写 nodeStatus，也能经调度器 recordReport 留痕（unknown 不许绿）。
+ */
+function nodeStatusShapeProblem(value) {
+  if (!isPlainObject(value)) return '回报顶层不是对象'
+  if (!NODE_SELF_CHECK_STATES.has(value.state)) return 'state 必须是 working / done / blocked / failed 之一'
+  if (!Number.isInteger(value.progress) || value.progress < 0 || value.progress > 100) {
+    return 'progress 必须是 0..100 的整数'
+  }
+  if (value.members !== undefined && !Array.isArray(value.members)) return 'members 必须是数组'
+  if (value.blockers !== undefined && !Array.isArray(value.blockers)) return 'blockers 必须是数组'
+  return null
+}
+
+/** 自审状态块里可能夹带的证据字段：只有状态块时也必须保留，不许静默丢掉。 */
+const SELF_CHECK_EVIDENCE_KEYS = ['artifacts', 'findings', 'acceptance', 'tests', 'checks']
+
+/** 内存里的节点状态成员上限：与 runstore.normalizeNodeStatus 同口径，按数组尾部（最新）保留。 */
+const SELF_CHECK_MEMBERS_MAX = 20
+
+function selfCheckEvidenceOf(value) {
+  if (!isPlainObject(value)) return null
+  const out = {}
+  for (const key of SELF_CHECK_EVIDENCE_KEYS) {
+    if (value[key] !== undefined) out[key] = value[key]
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
+/** 回报里的 attempt / nonce 是否与当前轮下发的凭证一致（缺失也算不匹配）。 */
+function attemptEnvelopeMatches(value, expected) {
+  if (!expected) return true
+  if (!isPlainObject(value)) return false
+  return value.attempt === expected.attempt
+    && typeof value.nonce === 'string'
+    && value.nonce === expected.nonce
+}
+
+/**
+ * C2：把本轮 attempt / 一次性 nonce 追加进节点提示词，并写明回报纪律。
+ * 追加尾巴后总长仍受 PROMPT_MAX_CHARS 约束（先截正文，再拼凭证段）。
+ */
+function withAttemptContract(prompt, envelope) {
+  const tail = [
+    '',
+    '',
+    '## 本轮回报凭证（必须回显）',
+    `- attempt: ${envelope.attempt}`,
+    `- nonce: ${envelope.nonce}`,
+    '- 正式结论 JSON 与自审状态 JSON 都必须原样带上这两个字段（字段名 attempt / nonce）；缺失或不匹配的回报会被引擎丢弃。',
+    '- 自审状态块只用于进度 / 成员 / 阻塞，不能代替正式结论；状态块里的 verdict 不能翻掉正式 reject。',
+    '- 只有 progress=100、blockers 为空、并且同时给出正式 verdict 时，才算提前完成。',
+  ].join('\n')
+  const maxBase = Math.max(0, PROMPT_MAX_CHARS - Array.from(tail).length)
+  return `${clipChars(typeof prompt === 'string' ? prompt : '', maxBase)}${tail}`
+}
 
 /** 目录/文件是否存在；坏路径一律 false（只用于「建完复核」，不抛错）。 */
 function existsSyncSafe(path) {
@@ -180,19 +278,6 @@ function normalizeWorktreeRecord(saved) {
 
 function intOr(value, fallback = 0) {
   return Number.isInteger(value) && value >= 0 ? value : fallback
-}
-
-/**
- * 键序无关的 JSON 序列化（只用于「内容是否一致」比较）。
- * runstore 的 normalizeMeta 会按自己的键序重写 nodeStatus，逐字符比较会每次都判不等。
- */
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort()
-    return `{${keys.map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
-  }
-  return JSON.stringify(value)
 }
 
 function clip(value, max) {
@@ -1243,14 +1328,8 @@ function extractStructured(raw) {
  * runtime 的 wakeNode 在会话 busy 时走 `agent.inject`，模型收尾时很可能直接回一段
  * 状态 JSON（verdict 常为 null / 缺失）；它绝不能充当节点结论。
  */
+/** 自审状态块的状态枚举（isNodeSelfCheckBlock 定义在文件顶部）。 */
 const NODE_SELF_CHECK_STATES = new Set(['working', 'done', 'blocked', 'failed'])
-
-/** 是否是一段自审状态块（有合法 state、但 verdict 不是 pass/reject）。 */
-function isNodeSelfCheckBlock(value) {
-  if (!isPlainObject(value)) return false
-  if (!NODE_SELF_CHECK_STATES.has(value.state)) return false
-  return value.verdict !== 'pass' && value.verdict !== 'reject'
-}
 
 /**
  * 06 §16：从复用会话的 assistant 原文里解析结构化输出。
@@ -1260,35 +1339,43 @@ function isNodeSelfCheckBlock(value) {
  * （自审回报 + 正式输出），所以不再只取第一个围栏，而是**优先返回带
  * verdict=pass/reject 的对象**。
  *
- * 防御（07 §11.1）：自审状态块（`state ∈ working|done|blocked|failed` 且
- * verdict 不是 pass/reject）既不是结论，也不当 fallback——它被 inject 进正在
- * 跑的回合时，把它当结论会让 normalizeStructured 以「缺少 verdict」白失败一趟。
+ * 防御（07 §11.1）：自审状态块（有 `state ∈ working|done|blocked|failed`）既不
+ * 是结论，也不当 fallback；即使状态块里带了 verdict=pass，也不能翻掉正式 reject。
  * 只有都不是状态块时才退回第一个可解析对象（旧行为，交给 normalizeStructured
  * 报「缺少 verdict」）。
+ *
+ * 07 §11.3（C2）：传入 `{ attempt, nonce }` 时，正式结论必须原样回显这两个字段；
+ * 不匹配（含缺失）的回报一律丢弃，并通过 `onReject(parsed, reason)` 让调用方留痕。
+ *
+ * @param {string} raw
+ * @param {{ attempt?: number, nonce?: string, onReject?: Function }} [options]
  * @returns {object | null}
  */
-export function parseAssistantStructured(raw) {
+export function parseAssistantStructured(raw, options = {}) {
   if (typeof raw !== 'string' || raw.trim() === '') return null
-  const text = raw.trim()
-  const candidates = [text]
-  const fences = /```(?:json)?\s*([\s\S]*?)```/gi
-  let fenced
-  while ((fenced = fences.exec(text)) !== null) candidates.push(fenced[1].trim())
-  const start = text.indexOf('{')
-  const end = text.lastIndexOf('}')
-  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1))
+  const opts = isPlainObject(options) ? options : {}
+  const expected = Number.isInteger(opts.attempt) && typeof opts.nonce === 'string' && opts.nonce !== ''
+    ? { attempt: opts.attempt, nonce: opts.nonce }
+    : null
+  const onReject = typeof opts.onReject === 'function' ? opts.onReject : null
   let fallback = null
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate)
-      if (!isPlainObject(parsed)) continue
-      if (parsed.verdict === 'pass' || parsed.verdict === 'reject') return parsed
-      // 自审状态块不能当节点结论，也不能当 fallback。
-      if (isNodeSelfCheckBlock(parsed)) continue
-      if (fallback === null) fallback = parsed
-    } catch {
-      // 换下一个候选。
+  for (const parsed of parsedJsonObjectsOf(raw)) {
+    const formal = (parsed.verdict === 'pass' || parsed.verdict === 'reject') && !isNodeSelfCheckBlock(parsed)
+    if (formal) {
+      if (expected && !attemptEnvelopeMatches(parsed, expected)) {
+        if (onReject) onReject(parsed, parsed.attempt !== expected.attempt ? 'attempt-mismatch' : 'nonce-mismatch')
+        continue
+      }
+      return parsed
     }
+    // 自审状态块不能当节点结论，也不能当 fallback。
+    if (isNodeSelfCheckBlock(parsed)) continue
+    // 非正式对象也要过凭证：旧 attempt 的迟到摘要不能被当成本轮输出。
+    if (expected && !attemptEnvelopeMatches(parsed, expected)) {
+      if (onReject) onReject(parsed, parsed.attempt !== expected.attempt ? 'attempt-mismatch' : 'nonce-mismatch')
+      continue
+    }
+    if (fallback === null) fallback = parsed
   }
   return fallback
 }
@@ -1486,6 +1573,19 @@ class FlowEngine {
     this.nodeStatus = new Map()
     // 07 §11.3：sessionId → 当前 attempt 的「提前完成信号」deferred（自审 done+verdict 时 resolve）。
     this.selfChecks = new Map()
+    // 07 §11.3（C2）：sessionId → 本轮下发的 { attempt, nonce }。正式结论与自审状态块
+    // 都必须原样回显，否则视为旧 attempt 的迟到回报并丢弃。
+    this.attemptEnvelopes = new Map()
+    // C2：sessionId → 本 attempt 最近一条**合法正式结论**。若后续又被一条只有状态块
+    // 的消息覆盖了 lastAssistant，收口时仍以正式结论为准（正式结论 > 状态块）。
+    this.lastFormalBySession = new Map()
+    // 自审状态块里夹带的证据只落盘一次（内容指纹去重），避免每次心跳都覆写同一文件。
+    this.selfCheckEvidenceKeys = new Set()
+    // C1：run.json 绑定补写串行化。writeRunMeta 自己有文件锁，但同一引擎内两次
+    // 补写若乱序，旧的 nodeStatus 快照会覆盖新的；这里按调用顺序排队。
+    this.bindingPatchQueue = Promise.resolve()
+    // sessions 被 runstore 拒绝（超 512 项 / 键值非法）时只告警一次，避免 live 刷新刷屏。
+    this.sessionsPatchWarned = false
     // 06 §16 / 07 §3.3：节点会话复用。
     //   nodeSessions     nodeId → { sessionId, handle, agent, createdAt, lastUsedAt, attempt }（本次 run 内）
     //   disposalHandles  本次 run 里所有会话句柄（只有 dispose，run 结束/停止时统一释放）
@@ -1630,6 +1730,8 @@ class FlowEngine {
     } catch (error) {
       this.log('warn', `flow-studio: 写 sessions.json 失败（${runId}）：${error.message}`)
     }
+    // C1：节点会话建立后也要让 run.json 的绑定（sessions / nodeStatus）保持 live 可见。
+    await this._patchRunBinding(runId)
   }
 
   /**
@@ -1783,9 +1885,81 @@ class FlowEngine {
     // 上一次真实上报。所以要求原文里至少出现一个状态专有字段。
     if (!/"(?:state|progress|members|blockers)"\s*:/.test(text)) return null
     try {
-      return parse(text)
+      const parsed = parse(text)
+      if (!parsed) return null
+      // supervise.parseNodeStatus 只保留状态字段；C2 还要 attempt / nonce（凭证）
+      // 与状态块里可能夹带的证据。这里从原始 JSON 里补出来，避免改 supervise.js。
+      const payload = parsedJsonObjectsOf(text).find(value => isNodeSelfCheckBlock(value)) || null
+      const nonce = payload && typeof payload.nonce === 'string' && payload.nonce !== '' ? payload.nonce : null
+      const evidence = selfCheckEvidenceOf(payload)
+      // supervise.parseNodeStatus 的 members 只留**前** 20 条；C2 要求内存快照保留
+      // 「最新」的 20 条，所以这里从原始 payload 取尾部（最后更新 / 最新上报的成员）。
+      const members = payload && Array.isArray(payload.members)
+        ? payload.members
+          .filter(isPlainObject)
+          .slice(-SELF_CHECK_MEMBERS_MAX)
+          .map(member => {
+            const out = {
+              name: typeof member.name === 'string' ? member.name : '',
+              state: NODE_SELF_CHECK_STATES.has(member.state) ? member.state : 'working',
+            }
+            const note = typeof member.note === 'string' ? member.note.trim() : ''
+            if (note !== '') out.note = note.slice(0, 200)
+            return out
+          })
+        : parsed.members
+      const blockers = payload && Array.isArray(payload.blockers)
+        ? payload.blockers
+          .filter(item => typeof item === 'string' && item.trim() !== '')
+          .slice(-SELF_CHECK_MEMBERS_MAX)
+          .map(item => item.trim().slice(0, 200))
+        : parsed.blockers
+      return {
+        ...parsed,
+        members,
+        blockers,
+        ...(nonce ? { nonce } : {}),
+        ...(evidence ? { evidence } : {}),
+      }
     } catch {
       return null
+    }
+  }
+
+  /**
+   * E1-b：判断一条 assistant 文本里的自审回报形态。
+   *   - 文本里没有 state/progress/members/blockers 键 → null（普通对话，不误报 invalid）；
+   *   - 解析失败但确实带这些键 → inspectNodeStatus() 的 invalid / missing；
+   *   - 解析成功但值类型非法（如 progress:"abc"）→ 引擎侧判 invalid（supervise 会静默收敛）。
+   * @returns {{ kind: 'missing'|'invalid'|'ok', parsed: object|null, reason: string|null }|null}
+   */
+  _nodeReportDiagnostic(assistantText, parsed) {
+    if (typeof assistantText !== 'string'
+      || !/"(?:state|progress|members|blockers)"\s*:/.test(assistantText)) return null
+    if (!parsed) {
+      const inspect = superviseModule.inspectNodeStatus
+      if (typeof inspect === 'function') return inspect(assistantText)
+      return { kind: 'invalid', parsed: null, reason: '自审回报解析失败' }
+    }
+    const payload = parsedJsonObjectsOf(assistantText).find(value => isNodeSelfCheckBlock(value))
+    const problem = nodeStatusShapeProblem(payload)
+    if (problem) return { kind: 'invalid', parsed: null, reason: problem }
+    return { kind: 'ok', parsed, reason: null }
+  }
+
+  /**
+   * C2/E1-b：把「回报了但格式/类型不合法」交给调度器记录（未登记 session 返回 false，
+   * 不新建 entry）。这是坏输入的可观测出口，不能静默当「没有回报」。
+   */
+  _recordNodeReport(binding, diagnostic) {
+    if (!diagnostic || diagnostic.kind !== 'invalid') return false
+    const scheduler = this.nodeSupervision
+    if (!scheduler || typeof scheduler.recordReport !== 'function') return false
+    try {
+      return scheduler.recordReport(binding.sessionId, diagnostic) === true
+    } catch (error) {
+      this.log('warn', `flow-studio: 记录自审回报诊断失败（${binding.nodeId}）：${error.message}`)
+      return false
     }
   }
 
@@ -1808,14 +1982,35 @@ class FlowEngine {
     if (!this.nodeSupervision || !this.active || !binding) return
     const runId = this.active.runId
     const nodeId = binding.nodeId
+    // 07 §11.3（C2）：自审状态块也必须回显本轮 attempt + nonce；旧 attempt 的迟到
+    // 回报一律丢弃（只留一条可观测警告），否则会把上一轮的 done 当成这一轮的完成。
+    const expected = this.attemptEnvelopes.get(binding.sessionId)
+    const reportedAttempt = Number.isInteger(parsed.attempt) ? parsed.attempt : null
+    const reportedNonce = typeof parsed.nonce === 'string' && parsed.nonce !== '' ? parsed.nonce : null
+    if (!expected) {
+      this.log('warn', `flow-studio: 丢弃自审状态块（${nodeId}）：当前没有下发中的 attempt 凭证`)
+      return
+    }
+    if (expected.attempt !== binding.attemptId
+      || reportedAttempt !== expected.attempt
+      || reportedNonce !== expected.nonce) {
+      this.log(
+        'warn',
+        `flow-studio: 丢弃自审状态块（${nodeId}）：attempt 回报 ${reportedAttempt ?? '缺失'} / 当前 ${expected.attempt}，`
+        + `nonce ${reportedNonce ? '不匹配' : '缺失'}（预期 ${expected.nonce.slice(0, 8)}…）`,
+      )
+      return
+    }
     const nowIso = isoOf(this.now())
     const entry = {
       state: parsed.state,
       progress: parsed.progress,
       summary: parsed.summary,
       // 与 runstore.normalizeNodeStatus 同一口径：name/state 必留，note 有就带上（≤200）。
+      // 内存上限同样只留 20 条，且保留数组尾部（最后更新 / 最新上报的成员），避免
+      // 模型一次上报上百个成员把内存与快照无限撑大。
       members: Array.isArray(parsed.members)
-        ? parsed.members.map(member => {
+        ? parsed.members.slice(-SELF_CHECK_MEMBERS_MAX).map(member => {
           const out = { name: member.name, state: member.state }
           const note = typeof member.note === 'string' ? member.note.trim() : ''
           if (note !== '') out.note = note.slice(0, 200)
@@ -1835,29 +2030,125 @@ class FlowEngine {
     // live 是同步快照；即使事件写入排队，前端下一次轮询也能立刻看到。
     if (this.live) this.live.nodeStatus = this._nodeStatusSnapshot()
 
-    // 07 §11.3：自审说 done 且 verdict 合法 → 给当前 attempt 的 whenIdle 竞速发信号。
-    const armed = this.selfChecks.get(binding.sessionId)
-    if (armed && armed.attemptId === binding.attemptId
-      && entry.state === 'done' && (entry.verdict === 'pass' || entry.verdict === 'reject')) {
-      armed.resolve(entry)
-    }
-
     // 事件按会话事件队列串行写入；写入时 run 已收尾就跳过（不把记录写进别的 run）。
+    const evidence = parsed.evidence || null
     this._queueSessionWrite(async () => {
       if (!this.active || this.active.runId !== runId) return
+      // C2：只有状态块时，状态块里夹带的 artifacts/findings/acceptance/tests/checks
+      // 不参与流转，但必须原样落盘并在事件流里留痕（不许静默丢掉证据）。
+      const evidencePath = evidence
+        ? await this._persistSelfCheckEvidence(runId, binding, evidence)
+        : null
       // data.nodeId / data.attempt 是模型自报的，可能非法（runlog 会整条拒绝）；
       // 权威归属在事件顶层，这里只保留合法值，别让一条坏字段吞掉整条状态。
       const data = { ...parsed, source: 'self-check' }
+      delete data.nonce
+      delete data.evidence
       if (typeof data.nodeId !== 'string' || !checkRunId(data.nodeId)) delete data.nodeId
       if (!Number.isInteger(data.attempt) || data.attempt < 1) delete data.attempt
+      // runlog 的 summary 是「可选但给了就不能为空」：空串会整条拒绝，直接省略。
+      if (typeof data.summary !== 'string' || data.summary.trim() === '') delete data.summary
       await this._append(runId, [{
         kind: 'node/status',
         nodeId,
         attemptId: binding.attemptId,
         traceId: binding.traceId,
         data,
+        ...(evidencePath ? { extra: { selfCheckEvidence: evidencePath } } : {}),
       }])
     })
+  }
+
+  /**
+   * C2：自审状态块里的证据落盘（`<nodeId>/artifacts/<attempt>/self-check-raw.json`）。
+   * 同一内容只写一次；返回相对路径（事件流用），失败只告警、不影响主流程。
+   */
+  async _persistSelfCheckEvidence(runId, binding, evidence) {
+    try {
+      const body = `${JSON.stringify({
+        nodeId: binding.nodeId,
+        attempt: binding.attemptId,
+        at: isoOf(this.now()),
+        ...evidence,
+      }, null, 2)}\n`
+      const hash = createHash('sha256').update(body, 'utf8').digest('hex')
+      const key = `${binding.attemptId}:${hash}`
+      if (this.selfCheckEvidenceKeys.has(key)) return null
+      this.selfCheckEvidenceKeys.add(key)
+      const written = await this._writeArtifactFile(
+        runId, binding.nodeId, binding.attemptId, 'self-check-raw.json', body, binding.traceId,
+      )
+      this.log('info', `flow-studio: 已保留自审状态块里的证据（${binding.nodeId}#${binding.attemptId}）：${written.path}`)
+      return written.path
+    } catch (error) {
+      this.log('warn', `flow-studio: 保留自审证据失败（${binding.nodeId}#${binding.attemptId}）：${error.message}`)
+      return null
+    }
+  }
+
+  /**
+   * C2：自审「提前完成」的唯一入口。
+   *
+   * 必须**同时**满足：状态块 `progress === 100`、`blockers` 为空、且同一条回复里
+   * 存在合法正式 verdict（attempt + nonce 匹配）。只有状态块时绝不判完成——继续等
+   * whenIdle / 按超时处理；状态块里自带的 verdict 也不能翻掉正式 reject。
+   */
+  _maybeCompleteSelfCheck(binding, rawText) {
+    const armed = this.selfChecks.get(binding.sessionId)
+    if (!armed || armed.attemptId !== binding.attemptId) return
+    const expected = this.attemptEnvelopes.get(binding.sessionId)
+    if (!expected || expected.attempt !== binding.attemptId) return
+    // 同一条回复里必须同时出现「done + progress=100 + blockers 空」的状态块与正式
+    // verdict；只有状态块、或者状态块与结论分两条消息到达，都不算自审提前完成
+    //（后者走正常的 whenIdle 解析，completedBy 保持为 null）。
+    const doneBlock = parsedJsonObjectsOf(rawText).find(value => isNodeSelfCheckBlock(value)
+      && value.state === 'done'
+      && value.progress === 100
+      && (!Array.isArray(value.blockers) || value.blockers.length === 0)
+      && attemptEnvelopeMatches(value, expected))
+    if (!doneBlock) return
+    const structured = parseAssistantStructured(rawText, {
+      attempt: expected.attempt,
+      nonce: expected.nonce,
+      onReject: (value, reason) => {
+        this.log('warn', `flow-studio: 丢弃节点「${binding.nodeId}」的正式回报：${reason}`)
+      },
+    })
+    if (!structured || (structured.verdict !== 'pass' && structured.verdict !== 'reject')) return
+    armed.resolve({ structured, status: this.nodeStatus.get(binding.nodeId) || null })
+  }
+
+  /**
+   * C2：记住本 attempt 最近一条合法正式结论（attempt + nonce 必须匹配）。
+   * 自审状态块永远不能覆盖它；收口时若最后一条消息只有状态块，用它兜底。
+   */
+  _captureFormalVerdict(binding, rawText) {
+    const expected = this.attemptEnvelopes.get(binding.sessionId)
+    if (!expected || expected.attempt !== binding.attemptId) return
+    const structured = parseAssistantStructured(rawText, {
+      attempt: expected.attempt,
+      nonce: expected.nonce,
+      onReject: (value, reason) => {
+        this.log('warn', `flow-studio: 丢弃节点「${binding.nodeId}」的正式回报：${reason}`)
+      },
+    })
+    if (!structured || (structured.verdict !== 'pass' && structured.verdict !== 'reject')) return
+    this.lastFormalBySession.set(binding.sessionId, {
+      structured,
+      attempt: expected.attempt,
+      nonce: expected.nonce,
+    })
+  }
+
+  /**
+   * C2：当前 attempt 的回报凭证（供 runtime 构造节点自审提示词时回显 nonce）。
+   * 未在跑 / 没有当前轮时返回 null。
+   */
+  attemptEnvelopeFor(sessionId) {
+    const envelope = this.attemptEnvelopes.get(sessionId)
+    return envelope
+      ? { attempt: envelope.attempt, nonce: envelope.nonce, nodeId: envelope.nodeId ?? null }
+      : null
   }
 
   /** 07 §11.3：给当前 attempt 挂一个「自审提前完成」信号（不含 whenIdle）。 */
@@ -1934,20 +2225,31 @@ class FlowEngine {
    * `buildFollowupPayload` 投递、`whenIdle()` 等空闲、`parseAssistantStructured`
    * 解析。解析失败抛 StructuredOutputError（走既有「结构化输出不合格」失败路径）。
    *
-   * 07 §11.3（R8）：等待期间若自审回报 `state==='done'` 且 `verdict` 合法，与
-   * `whenIdle()` 竞速；自审先到就用它的 verdict 提前收口。**原 whenIdle 继续在
-   * 后台等完**（不阻塞主流程），避免留下悬挂回合；回合先到则完全走既有解析。
+   * 07 §11.3（C2）：每轮提示词带一个 attempt + 一次性 nonce；正式结论与自审状态块
+   * 都必须回显二者。只有「状态块 progress=100 + blockers 为空 + 合法正式 verdict」
+   * 同时成立才允许自审提前收口；状态块自己带的 verdict 永远不能翻掉正式 reject。
    */
   async _promptNodeSession({ agent, sessionId, prompt, runId, node, attempt, traceId, signal }) {
-    // 清掉上一条 assistant 文本，避免把上一轮的结果误当成本轮输出。
+    // 清掉上一条 assistant 文本 / 正式结论缓存，避免把上一轮的结果误当成本轮输出。
     this.lastAssistantBySession.delete(sessionId)
+    this.lastFormalBySession.delete(sessionId)
     // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
     this.bindSession(sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId }, { rebind: true })
+    // C2：先登记本轮凭证再 followup —— 注入式宿主可能同步把回报喂进 handleSessionEvent。
+    const envelope = { attempt, nonce: newAttemptNonce(), nodeId: node.id }
+    this.attemptEnvelopes.set(sessionId, envelope)
     // 先挂信号再 followup：注入式宿主可能同步把自审回报喂进 handleSessionEvent。
     const selfCheck = this._armSelfCheck(sessionId, { attemptId: attempt })
+    const rejectEnvelope = (value, reason) => {
+      this.log(
+        'warn',
+        `flow-studio: 丢弃节点「${node.id}」的回报：${reason}（attempt ${value && value.attempt !== undefined ? value.attempt : '缺失'}`
+        + ` / 当前 ${attempt}）`,
+      )
+    }
     try {
       agent.followup(buildFollowupPayload({
-        text: prompt,
+        text: withAttemptContract(prompt, envelope),
         runId,
         nodeId: node.id,
         from: 'flow-studio',
@@ -1963,28 +2265,23 @@ class FlowEngine {
           return null
         },
       )
-      // race 的结果：自审状态对象 = 自审先到；null = 回合先到（whenIdle 已结束）。
+      // race 的结果：{ structured } = 自审提前收口；null = 回合先到（whenIdle 已结束）。
       // 没有注入 nodeSupervision 时不挂自审信号，完全保持 v0.7 的 whenIdle 语义。
       const winner = selfCheck
         ? await raceAbort(Promise.race([selfCheck.promise, idleObserved]), signal)
         : null
-      if (winner && typeof winner === 'object') {
+      if (winner && isPlainObject(winner) && isPlainObject(winner.structured)) {
         // 自审提前完成：继续等原 whenIdle，但不再阻塞主流程；失败只 warn。
         idleObserved.then(() => {
           if (idleError) {
             this.log('warn', `flow-studio: 自审提前完成后 whenIdle 失败（${sessionId}）：${idleError.message}`)
           }
         })
-        const structured = {
-          verdict: winner.verdict,
-          summary: typeof winner.summary === 'string' ? winner.summary : '',
-        }
-        // 真实代价（有意简化）：自审提前完成只带回 verdict / summary，节点自己的
-        // artifacts / findings / tests / checks / acceptance 拿不到；指标会偏少，不能
-        // 当成与「正常回合跑完」等价的证据。要走完整证据就等回合结束。
-        // 走既有打回路径：normalizeStructured 要求 reject 必须带 rejectReason。
-        if (structured.verdict === 'reject') {
-          structured.rejectReason = structured.summary.trim() !== ''
+        // C2：提前收口用的是**正式结论对象**（带 artifacts / findings / acceptance /
+        // tests / checks），不是状态块的精简投影 —— 证据不再被静默丢掉。
+        const structured = { ...winner.structured }
+        if (structured.verdict === 'reject' && !structured.rejectReason) {
+          structured.rejectReason = typeof structured.summary === 'string' && structured.summary.trim() !== ''
             ? structured.summary
             : '自审回报判定打回（self-check）'
         }
@@ -1995,15 +2292,34 @@ class FlowEngine {
       // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
       await new Promise(resolve => setTimeout(resolve, 0))
       const raw = this.lastAssistantBySession.get(sessionId)
-      const structured = parseAssistantStructured(raw)
+      let structured = parseAssistantStructured(raw, {
+        attempt,
+        nonce: envelope.nonce,
+        onReject: rejectEnvelope,
+      })
+      // C2：最后一条消息只有状态块时，退回本 attempt 最近一条合法正式结论；
+      // 正式结论 > 自审状态块，不能因为状态块把真实 reject 弄丢或翻成 pass。
+      if (!structured) {
+        const cached = this.lastFormalBySession.get(sessionId)
+        if (cached && cached.attempt === attempt && cached.nonce === envelope.nonce
+          && (cached.structured.verdict === 'pass' || cached.structured.verdict === 'reject')) {
+          structured = cached.structured
+          this.log(
+            'warn',
+            `flow-studio: 节点「${node.id}」最后一条消息只有自审状态块；改用本 attempt 最近一条正式结论（${structured.verdict}）`,
+          )
+        }
+      }
       if (!structured) {
         throw new StructuredOutputError(
-          `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的 JSON（需要与输出格式相同的结构）`,
+          `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的正式 JSON 结论`
+          + `（需要 verdict=pass/reject，且回显 attempt=${attempt} 与一次性 nonce）`,
         )
       }
       return { structured, completedBy: null }
     } finally {
       this._disarmSelfCheck(sessionId, selfCheck)
+      if (this.attemptEnvelopes.get(sessionId) === envelope) this.attemptEnvelopes.delete(sessionId)
     }
   }
 
@@ -2124,7 +2440,8 @@ class FlowEngine {
   /**
    * 07 §4：本次 start 的工作区路径候选（优先级由高到低）：
    * `options.workspace`（也接受已解析对象）→ `options.cwd` →
-   * 构造时注入的 `cwd` / per-start `startCwd` → 发起会话 header.cwd → process.cwd()。
+   * 构造时注入的 `cwd` / per-start `startCwd` → 发起会话 header.cwd。
+   * **C3：没有候选时返回 null（由调用方抛 400），绝不回落 process.cwd()。**
    *
    * `strict` 只对显式 options 生效：显式给的路径不存在 → 400；从引擎/会话上下文
    * 兜底来的路径（例如宿主会话的 cwd 已被删）按「非 git 工作区」继续，不拖死启动。
@@ -2163,7 +2480,35 @@ class FlowEngine {
     const headerCwd = header ? text(header.cwd) : null
     if (headerCwd) return { source: 'initiator-session', strict: false, path: headerCwd }
 
-    return { source: 'process.cwd', strict: false, path: process.cwd() }
+    // C3：没有显式工作区时**不再**回落 process.cwd()（那是 dsh 服务进程自己的目录，
+    // 节点会在里面读写文件）。返回 null，由 _resolveWorkspaceBinding 抛 400。
+    return null
+  }
+
+  /** C3：解析相对工作区路径时唯一允许的基准目录（必须是显式给出的绝对路径）。 */
+  _workspaceBaseDir(options, parentOverride) {
+    const opts = options && typeof options === 'object' ? options : {}
+    const text = value => (typeof value === 'string' && value.trim() !== '' ? value.trim() : null)
+    const explicit = text(opts.cwd) || text(this.startCwd) || text(this.cwd)
+    if (explicit) return explicit
+    const parent = parentOverride || this.parent
+    const header = parent && parent.session && parent.session.header
+    return header ? text(header.cwd) : null
+  }
+
+  /** C3：相对路径 → 绝对路径；没有可用的绝对基准目录就 400（绝不猜 process.cwd）。 */
+  _absoluteWorkspacePath(value, baseDir) {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (raw === '') throw new RunError(400, 'workspace', '工作区路径为空')
+    if (isAbsolute(raw)) return resolve(raw)
+    if (typeof baseDir !== 'string' || baseDir === '' || !isAbsolute(baseDir)) {
+      throw new RunError(
+        400,
+        'workspace',
+        `工作区相对路径无法解析：${raw}（请给出绝对的 workspace 路径，或同时给出绝对的 cwd）`,
+      )
+    }
+    return resolve(baseDir, raw)
   }
 
   /** worktrees 根目录：`runsRoot` 的父级 + `worktrees`（`<home>/flow-studio/worktrees`）。 */
@@ -2172,56 +2517,67 @@ class FlowEngine {
   }
 
   /**
-   * 把 start 时算出的工作区 / worktree / sessionMode 写进 run.json。
+   * C1：run.json 的**唯一**写入口。不再自己 readFile/writeFile/rename —— 一律走
+   * runstore 的 `writeRunMeta`（文件锁 + 1MiB 守卫 + normalizeMeta 白名单）。
    *
-   * 为什么不走 `writeRunMeta`：runstore 的 `normalizeMeta` 只保留白名单字段，会把
-   * `workspace` / `worktree` / `sessionMode` 当未知字段丢掉（runstore.js 不在本次
-   * 改动范围内）。这里按「读原文 → 合并 → 临时文件 + rename」原子写，写完仍能被
-   * 普通 JSON 读取方看到；`readRunMeta()` 是否透传要由 runstore 侧决定（已交接）。
-   * 每次 run.json 被 writeRunMeta 重写后（live 刷新）都要补一次，失败只告警。
+   * 需要的 patch 键（runstore 侧白名单）：`workspace` / `worktree` / `sessionMode` /
+   * `nodeStatus` / `sessions`（nodeId → sessionId）/ 可选 `status`。
+   *
+   * 并发：调用按 this.bindingPatchQueue 串行，避免同一引擎内旧 nodeStatus 快照覆盖新的；
+   * 跨引擎 / 跨进程由 writeRunMeta 的读-合并-锁保证「两次并发 patch 不互相冲掉字段」，
+   * 且 normalizeMeta 会保留既有 seq / lastSeq（不会被补写重置）。
    */
-  async _patchRunBinding(runId) {
-    if (typeof runId !== 'string' || runId === '') return
-    // 07 §11.2：节点自审状态也走这一处补写（runstore 白名单即便丢了也能从原文补回）。
+  async _patchRunBinding(runId, patch = {}) {
+    if (typeof runId !== 'string' || runId === '') return null
+    const next = this.bindingPatchQueue.then(() => this._applyRunBindingPatch(runId, patch))
+    this.bindingPatchQueue = next.catch(() => {})
+    return next
+  }
+
+  async _applyRunBindingPatch(runId, extraPatch = {}) {
+    const binding = {}
+    if (this.workspaceRecord) binding.workspace = this.workspaceRecord
+    if (this.worktreeRecord) binding.worktree = this.worktreeRecord
+    if (this.sessionMode) binding.sessionMode = this.sessionMode
     const nodeStatus = this._nodeStatusSnapshot()
-    const hasNodeStatus = Object.keys(nodeStatus).length > 0
-    if (!this.workspaceRecord && !this.sessionMode && !hasNodeStatus) return
-    const file = join(this.runsRoot, runId, 'run.json')
-    let raw
+    // 自审状态可能很大（模型自报的 blockers / summary）；交给 runstore 的
+    // normalizeNodeStatus 做字段收敛，绝不绕过 1MiB 守卫。
+    if (Object.keys(nodeStatus).length > 0) binding.nodeStatus = nodeStatus
+    const sessions = this._sessionBindingSnapshot()
+    if (Object.keys(sessions).length > 0) binding.sessions = sessions
+    const merged = { ...binding, ...(isPlainObject(extraPatch) ? extraPatch : {}) }
+    if (Object.keys(merged).length === 0) return null
     try {
-      raw = JSON.parse(await readFile(file, 'utf8'))
-    } catch {
-      return
-    }
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
-    // 已经一致就不写：live 每次刷新都补一次，但正常 run 里只有第一次真的落盘。
-    const sameWorkspace = !this.workspaceRecord || (raw.workspace
-      && raw.workspace.id === this.workspaceRecord.id
-      && raw.workspace.path === this.workspaceRecord.path)
-    const sameWorktree = !this.worktreeRecord || (raw.worktree
-      && raw.worktree.enabled === this.worktreeRecord.enabled
-      && raw.worktree.path === this.worktreeRecord.path
-      && raw.worktree.reason === this.worktreeRecord.reason
-      && raw.worktree.baseCommit === this.worktreeRecord.baseCommit)
-    const sameMode = !this.sessionMode || raw.sessionMode === this.sessionMode
-    const sameNodeStatus = !hasNodeStatus
-      || (raw.nodeStatus && typeof raw.nodeStatus === 'object' && !Array.isArray(raw.nodeStatus)
-        && stableJson(raw.nodeStatus) === stableJson(nodeStatus))
-    if (sameWorkspace && sameWorktree && sameMode && sameNodeStatus) return
-    const next = { ...raw }
-    if (this.workspaceRecord) next.workspace = this.workspaceRecord
-    if (this.worktreeRecord) next.worktree = this.worktreeRecord
-    if (this.sessionMode) next.sessionMode = this.sessionMode
-    if (hasNodeStatus) next.nodeStatus = nodeStatus
-    const tmp = `${file}.tmp-binding-${process.pid}-${patchCounter++}`
-    try {
-      await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-      await rename(tmp, file)
-      await chmod(file, 0o600).catch(() => {})
+      return await writeRunMeta(this.runsRoot, runId, merged)
     } catch (error) {
-      await unlink(tmp).catch(() => {})
-      this.log('warn', `flow-studio: 写 run.json 工作区绑定失败（${runId}）：${error.message}`)
+      // runstore 对 sessions 有严格上限（512 项 / 键值 ≤128 字符）；巨型流程撞上时
+      // 只跳过**这一次** binding patch（warn + 不重试），绝不让元数据校验把 run 打挂。
+      if (error && (error.field === 'sessions' || /sessions/.test(String(error.message || '')))) {
+        if (!this.sessionsPatchWarned) {
+          this.sessionsPatchWarned = true
+          this.log(
+            'warn',
+            `flow-studio: 跳过本次 run.json binding patch（sessions 被 runstore 拒绝：${error.message}）；`
+            + 'run 继续执行，sessions.json 仍是节点会话的权威记录',
+          )
+        }
+        return null
+      }
+      this.log('warn', `flow-studio: 写 run.json 绑定失败（${runId}）：${error.message}`)
+      return null
     }
+  }
+
+  /** 节点会话绑定快照：nodeId → sessionId（C1 契约，与 sessions.json 独立）。 */
+  _sessionBindingSnapshot() {
+    const out = {}
+    if (!(this.nodeSessions instanceof Map)) return out
+    for (const [nodeId, entry] of this.nodeSessions) {
+      if (entry && typeof entry.sessionId === 'string' && entry.sessionId !== '') {
+        out[nodeId] = entry.sessionId
+      }
+    }
+    return out
   }
 
   /**
@@ -2236,14 +2592,34 @@ class FlowEngine {
    */
   async _resolveWorkspaceBinding(runId, options, parentOverride) {
     const request = this._workspaceRequestOf(options, parentOverride)
+    // C3：没有显式工作区 → 400，且必须发生在 run/start 落盘之前（不产生任何事件）。
+    // 例外：stub 引擎（测试桩 / 容器测试台）不建真实会话、不读写节点工作目录，工作区对它
+    // 没有语义；路由层同样对 stub run 放行（`src/index.js` 的 `isStubRun`），两层必须一致，
+    // 否则「路由放行 + 引擎 400」会让桩 run 永远停在 pending。
+    if (!request) {
+      if (this.stub) {
+        this.worktreeRecord = disabledWorktree('stub-engine')
+        return {
+          workspace: null,
+          rawMeta: null,
+          worktree: this.worktreeRecord,
+          warnings: ['stub 引擎不绑定工作区：不建真实会话，也不读写节点工作目录'],
+          source: 'stub',
+        }
+      }
+      throw new RunError(
+        400,
+        'workspace',
+        '没有可用的工作区：start() 需要显式给出 workspace（或 cwd）；不再回落到 dsh 服务进程的 process.cwd()',
+      )
+    }
+    const baseDir = this._workspaceBaseDir(options, parentOverride)
     const warnings = []
     let workspace = null
 
     if (request.preset) {
-      const absolute = isAbsolute(request.preset.path) ? resolve(request.preset.path) : resolve(process.cwd(), request.preset.path)
-      const realpath = isAbsolute(request.preset.realpath)
-        ? resolve(request.preset.realpath)
-        : resolve(process.cwd(), request.preset.realpath)
+      const absolute = this._absoluteWorkspacePath(request.preset.path, baseDir)
+      const realpath = this._absoluteWorkspacePath(request.preset.realpath, baseDir)
       workspace = {
         id: typeof request.preset.id === 'string' && /^[0-9a-f]{12}$/.test(request.preset.id)
           ? request.preset.id
@@ -2263,7 +2639,7 @@ class FlowEngine {
         if (code !== 'GIT_UNAVAILABLE' && request.strict) {
           throw new EngineError(400, `工作区不可用：${detail}`)
         }
-        const absolute = isAbsolute(request.path) ? resolve(request.path) : resolve(process.cwd(), request.path)
+        const absolute = this._absoluteWorkspacePath(request.path, baseDir)
         let realpath = absolute
         try {
           realpath = await realpathAsync(absolute)
@@ -2286,7 +2662,8 @@ class FlowEngine {
     }
 
     // 启动开始后不许换工作区：已有 workspace.id 与本次不同 → 400。
-    const rawMeta = await this._readRawRunMeta(runId)
+    // C1：run.json 只经 runstore 读（normalizeMeta 已透传 workspace/worktree 绑定）。
+    const rawMeta = await readRunMeta(this.runsRoot, runId)
     const bound = rawMeta && rawMeta.workspace && typeof rawMeta.workspace === 'object'
       ? rawMeta.workspace
       : null
@@ -2307,6 +2684,15 @@ class FlowEngine {
    * - 建完再 existsSync 复核：**绝不允许** `enabled:true` 但目录实际没建出来。
    */
   async _resolveWorktreeRecord(runId, options, { workspace, rawMeta, warnings, source }) {
+    // stub 引擎没有工作区绑定（见 _resolveWorkspaceBinding）：不建 worktree，也不许
+    // 显式 `on` 在这里假装隔离成功。已有降级记录（reason 更具体，如 'stub-engine'）就保留它。
+    if (!workspace) {
+      const existing = this.worktreeRecord && this.worktreeRecord.enabled === false
+        ? this.worktreeRecord
+        : disabledWorktree('no-workspace')
+      this.worktreeRecord = existing
+      return { workspace: null, worktree: existing, warnings }
+    }
     const policy = options && typeof options.worktree === 'string' && options.worktree !== ''
       ? options.worktree
       : this.defaultWorktreePolicy || 'auto'
@@ -2318,16 +2704,8 @@ class FlowEngine {
       throw new EngineError(400, error && error.message ? error.message : 'worktree 策略不合法')
     }
 
-    // 兜底工作区（没有发起方 workspace / 会话 cwd / 引擎 cwd，只能落到 process.cwd()）
-    // 不擅自开 worktree：连「这是谁的工作区」都没确定，隔离一份服务进程的 cwd 毫无意义，
-    // 还会把测试/宿主进程自己的仓库拖进 worktree 台账。显式 `on` 仍按用户要求照建。
-    if (decision.enabled && policy === 'auto' && source === 'process.cwd') {
-      decision = { enabled: false, reason: 'auto-without-initiator' }
-      warnings.push(
-        `没有发起方工作区（options.workspace / cwd / 会话 header.cwd 都没有），只能回落 process.cwd()；`
-        + `auto 不擅自建 worktree：${workspace.path}`,
-      )
-    }
+    // C3：工作区是显式解析出来的（没有 process.cwd 兜底），不存在「auto-without-initiator」
+    // 这条降级路径；非 git 根按 not-a-git-repo 处理，显式 `on` 仍按用户要求照建。
 
     // 同一个 run 的旧绑定还可用（进程重启 / 上次启动失败）：复用，不再建一份。
     const existingWorktree = rawMeta && rawMeta.worktree && typeof rawMeta.worktree === 'object'
@@ -2377,16 +2755,6 @@ class FlowEngine {
 
     this.worktreeRecord = worktree
     return { workspace, worktree, warnings }
-  }
-
-  /** run.json 原始内容（绕过 normalizeMeta 的白名单，用来读 workspace/worktree 绑定）。 */
-  async _readRawRunMeta(runId) {
-    try {
-      const raw = JSON.parse(await readFile(join(this.runsRoot, runId, 'run.json'), 'utf8'))
-      return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
-    } catch {
-      return null
-    }
   }
 
   /** 节点主管会话的 agent preset（per-start > 引擎配置；都没有就交给宿主默认）。 */
@@ -2811,6 +3179,11 @@ class FlowEngine {
     // 07 §11：节点自审状态只属于刚结束的 run；新 run 从空 Map 开始。
     this.nodeStatus = new Map()
     this.selfChecks.clear()
+    this.attemptEnvelopes.clear()
+    this.lastFormalBySession.clear()
+    this.selfCheckEvidenceKeys.clear()
+    this.bindingPatchQueue = Promise.resolve()
+    this.sessionsPatchWarned = false
     this._resetInboxState()
   }
 
@@ -2822,6 +3195,7 @@ class FlowEngine {
     this.entryStageId = null
     this.sessionDegraded = false
     this.lastAssistantBySession = new Map()
+    this.lastFormalBySession = new Map()
   }
 
   /** 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。 */
@@ -3404,10 +3778,16 @@ class FlowEngine {
 
     let lastUsage = null
     let usageSum = null
+    // C3：外部执行器（codex / custom）只走显式 cwd —— 不再回落 process.cwd()。
+    // start() 已保证 workspaceRecord 存在；这里缺 cwd 属于内部契约被破坏，按 400 拒绝。
+    const executorCwd = this._sessionCwd()
+    if (typeof executorCwd !== 'string' || executorCwd === '') {
+      throw new EngineError(400, `外部执行器缺少工作区 cwd（节点「${node.id}」）：请在 start() 显式给出 workspace / cwd`)
+    }
     const result = await runExternalExecutor({
       spec: runnable,
       prompt,
-      cwd: this._sessionCwd() || process.cwd(),
+      cwd: executorCwd,
       timeoutMs: this.nodeTimeoutMs,
       signal,
       onEvent: event => {
@@ -4046,9 +4426,26 @@ class FlowEngine {
     // 07 §11.2：只采节点主管会话（memberId === null）的 assistant 消息。与结构化
     // verdict 并行解析：同一条文本里既有 verdict 又有 status 块时两者都要处理。
     // 未注入 nodeSupervision 时整条采集链路关闭（v0.7 行为完全不变）。
-    if (assistantText !== '' && binding.memberId === null && this.nodeSupervision) {
-      const parsed = this._parseNodeStatus(assistantText)
-      if (parsed) this._rememberNodeStatus(binding, parsed)
+    if (assistantText !== '' && binding.memberId === null) {
+      // C2：先记住本 attempt 最近一条合法正式结论；后续即使被状态块覆盖了
+      // lastAssistant，收口时仍以正式结论为准（正式结论 > 自审状态块）。
+      this._captureFormalVerdict(binding, assistantText)
+      // 07 §11.2：只采节点主管会话（memberId === null）的 assistant 消息。与结构化
+      // verdict 并行解析：同一条文本里既有 verdict 又有 status 块时两者都要处理。
+      // 未注入 nodeSupervision 时整条采集链路关闭（v0.7 行为完全不变）。
+      if (this.nodeSupervision) {
+        const parsed = this._parseNodeStatus(assistantText)
+        const diagnostic = this._nodeReportDiagnostic(assistantText, parsed)
+        if (diagnostic && diagnostic.kind === 'invalid') {
+          // E1-b：有状态键但解析/类型不合法 → 只记诊断，不写成节点状态（坏输入不许绿）。
+          this._recordNodeReport(binding, diagnostic)
+        } else if (parsed) {
+          this._rememberNodeStatus(binding, parsed)
+        }
+        // C2：即便这条消息只有状态块（parsed 为空也照样尝试），也要检查是否同时
+        // 满足「progress=100 + blockers 空 + 合法正式 verdict」的提前完成条件。
+        this._maybeCompleteSelfCheck(binding, assistantText)
+      }
     }
     this._queueSessionEvent(sessionId, binding, event, session)
   }
@@ -4464,9 +4861,13 @@ class FlowEngine {
 
   async _persistLive() {
     if (!this.active || !this.live) return
-    // 07 §11.2：每次 live 刷新都带出最新节点自审状态（覆盖语义，不是追加）。
-    this.live.nodeStatus = this._nodeStatusSnapshot()
-    await writeRunMeta(this.runsRoot, this.active.runId, { live: { ...this.live } }).catch(error => {
+    // C1/§11.2：节点状态的**唯一权威**是 run.json 顶层 `nodeStatus`（由
+    // `_patchRunBinding` 收口写）。`runstore.normalizeLive` 会丢弃 live.nodeStatus，
+    // 所以这里不再把它塞进 live 载荷（避免看起来 live 里有一份其实落不了盘的状态）。
+    // 内存里的 this.live.nodeStatus 仍可被同进程消费者即时读取，但它不参与持久化。
+    const live = { ...this.live }
+    delete live.nodeStatus
+    await writeRunMeta(this.runsRoot, this.active.runId, { live }).catch(error => {
       this.log('warn', `flow-studio: 写 live 失败：${error.message}`)
     })
     // runstore 的 normalizeMeta 只保留白名单字段，会把 workspace / worktree / sessionMode

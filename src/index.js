@@ -23,8 +23,8 @@
  */
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
-import { readFileSync, statSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
@@ -35,8 +35,9 @@ import { createFlowTools } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
   readLease, readRunDetail, readRunMessages, readRunMeta, repairRunStates, runsDir,
-  sweepExpiredLeases, writeRunInbox,
+  sweepExpiredLeases, writeRunInbox, writeRunMeta,
 } from './runstore.js'
+import { workspaceIdFor } from './worktree.js'
 import {
   FlowConflictError, checkId, deleteFlow, flowsDir, listFlows, newFlowId, readFlow, saveFlow,
 } from './store.js'
@@ -324,10 +325,10 @@ const WORKTREE_POLICIES = Object.freeze(['auto', 'on', 'off'])
 /**
  * 建 run 时记下的发起参数，在**同进程内**从 `POST /runs` 传到 `POST /runs/<id>/start`。
  *
- * 为什么还要内存这一份：`run.json.startOptions` 在 runstore 白名单之外，创建之后只要
- * 有人写 runstore（开 supervision、投消息、engine.start 的 startRun 迁移……）就会被
- * normalizeMeta 顺手丢掉。RAW 落盘仍然写（满足「创建时保存发起参数」这条契约，也覆盖
- * 「进程重启后还能读」的场景），但**同进程的主路径是这张表**，不受其它写入影响。
+ * 持久化已是可靠的：`startOptions` 已进 runstore 白名单（只允许 `workspace` / `worktree`
+ * 两个键），`patchRunJson` → `writeRunMeta` 会校验并落进 `run.json.startOptions`，后续任何
+ * runstore 写入（开 supervision、投消息、startRun 迁移……）都不会再把它丢掉，进程重启后
+ * 也能读回。这张内存表只是同进程内的快速通道（start 时少一次读盘），不是唯一存储。
  * 只在内存里留最近 MAX_PENDING_START_OPTIONS 条，读走即删，不无界增长。
  */
 const MAX_PENDING_START_OPTIONS = 200
@@ -347,6 +348,14 @@ function rememberStartOptions(store, runId, options) {
 }
 
 /**
+ * E3-a：统一的 workspace 400 错误。`field` 是既有 RunError 口径，
+ * `code` 额外带上同一个标识（调用方按错误码分流时不用猜字段名）。
+ */
+function workspaceError(reason) {
+  return new RunError(400, 'workspace', reason, { code: 'workspace' })
+}
+
+/**
  * 07 §4.1：解析 start / 建 run 的 `{workspace, worktree}`。
  * 省略 = 不带该键（worktree 由 engine 按默认 `auto` 裁决）；非法值一律 400。
  * @returns {{ workspace?: string, worktree?: string }}
@@ -359,10 +368,10 @@ function parseStartOptions(body) {
   const options = {}
   if (body.workspace !== undefined && body.workspace !== null) {
     if (typeof body.workspace !== 'string' || body.workspace.trim() === '') {
-      throw new RunError(400, 'workspace', 'workspace 必须是非空字符串（工作区路径）')
+      throw workspaceError('workspace 必须是非空字符串（工作区路径）')
     }
     const workspace = body.workspace.trim()
-    if (!isAbsolute(workspace)) throw new RunError(400, 'workspace', 'workspace 必须是绝对路径')
+    if (!isAbsolute(workspace)) throw workspaceError('workspace 必须是绝对路径')
     options.workspace = workspace
   }
   if (body.worktree !== undefined && body.worktree !== null) {
@@ -373,6 +382,124 @@ function parseStartOptions(body) {
     options.worktree = worktree
   }
   return options
+}
+
+/**
+ * E3-a：run 是否跑在测试桩上。桩引擎不需要真实工作区（也不该被工作目录拖死），
+ * 这是「启动必须给 workspace」唯一豁免。入口只有两处判据：引擎自己声明 stub，
+ * 或 run.json 已经记下 `sessionMode:'stub'` / `engine:'stub'`。
+ */
+function isStubEngine(engine) {
+  return Boolean(engine && engine.engineName === 'stub')
+}
+
+function isStubRun(meta, engine) {
+  if (isStubEngine(engine)) return true
+  return Boolean(meta && (meta.sessionMode === 'stub' || meta.engine === 'stub'))
+}
+
+/**
+ * E3-a：工作区硬校验（路由侧）。
+ *
+ * 只认「绝对路径 + 真实存在 + 是目录」——不接受空串，也不在缺失时回落
+ * `process.cwd()`（那会把节点写进 dsh 服务进程自己的目录）。不合格一律
+ * `400 + code:'workspace'`（可读中文原因），调用方拿得到该修什么。
+ *
+ * 返回值形状与 `runstore.normalizeMeta()` 的 `workspace` 白名单键一致
+ * （`id/path/realpath`；`isGit/gitRoot` 由引擎在 start 时解析后覆盖）。
+ *
+ * @param {unknown} value 调用方给的路径（字符串）
+ * @returns {{ id: string, path: string, realpath: string }}
+ */
+function resolveWorkspaceRecord(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw workspaceError('缺少 workspace：启动 run 必须给出工作区绝对路径（不会再回落到服务进程的当前目录）')
+  }
+  const workspace = value.trim()
+  if (!isAbsolute(workspace)) {
+    throw workspaceError('workspace 必须是绝对路径')
+  }
+  const absolute = resolve(workspace)
+  let info
+  try {
+    info = statSync(absolute)
+  } catch {
+    throw workspaceError(`workspace 不存在：${absolute}`)
+  }
+  if (!info.isDirectory()) {
+    throw workspaceError(`workspace 必须是目录，但它是文件：${absolute}`)
+  }
+  let realpath
+  try {
+    realpath = realpathSync(absolute)
+  } catch {
+    throw workspaceError(`workspace 路径无法解析：${absolute}`)
+  }
+  return { id: workspaceIdFor(realpath), path: absolute, realpath }
+}
+
+/**
+ * E3-b：外部写入通道（`POST /runs/<id>/events`）的**允许集合**。
+ *
+ * 这是白名单，不是「黑名单几条例外」：只有纯观测类事件可以外部追加，
+ * 其余一律 400。生命周期必须由引擎 / 运行时内部推进——
+ *   - `run/start`  会把 `pending` 切成 `running`（且 `started=true`，之后永远 409）；
+ *   - `run/end`    会直接把 run 置成终态；
+ *   - `node/start`、`node/end`、`reject/trigger` 会改节点进度 / 打回重跑；
+ *   - `member/start`、`member/end` 是成员生命周期。
+ * 这些一旦开放给外部，就等于把状态机交给了 HTTP 调用方（而且无法回滚）。
+ *
+ * 允许的是：消息（`agent/message` / `message/in` / `message/out`）、
+ * 节点上报（`node/status`）、以及执行侧的事实上报（工具 / 模型调用、证据、
+ * 评审、检查、验收、测试报告）——它们只追加事实，不推状态机。
+ */
+const EXTERNAL_EVENT_KINDS = new Set([
+  // 消息 / 日志类
+  'agent/message',
+  'message/in',
+  'message/out',
+  // 节点自审上报
+  'node/status',
+  // 执行侧事实上报（只影响聚合与展示，不推 run 状态机）
+  'model/call',
+  'tool/call',
+  'skill/load',
+  'artifact/write',
+  'review/finding',
+  'review/verdict',
+  'check/form',
+  'acceptance/verdict',
+  'test/report',
+])
+
+/** 生命周期 kind（只用来生成可读报错，白名单才是唯一判定）。 */
+const LIFECYCLE_EVENT_KINDS = Object.freeze([
+  'run/start',
+  'run/end',
+  'node/start',
+  'node/end',
+  'member/start',
+  'member/end',
+  'reject/trigger',
+])
+
+/**
+ * E3-b：整批校验外部事件。任何一条不是观测类 → 400，且一条都不写
+ * （`appendEvents` 本身就是整批语义；这里在它之前挡住，保证状态机完全不受影响）。
+ * @param {unknown} rawEvents 单条或数组（与 appendEvents 入参同口径）
+ */
+function assertExternalEvents(rawEvents) {
+  const list = Array.isArray(rawEvents) ? rawEvents : [rawEvents]
+  for (let index = 0; index < list.length; index += 1) {
+    const event = list[index]
+    const kind = event && typeof event === 'object' && !Array.isArray(event) ? event.kind : undefined
+    if (typeof kind === 'string' && EXTERNAL_EVENT_KINDS.has(kind)) continue
+    const shown = typeof kind === 'string' ? kind : String(kind)
+    const hint = LIFECYCLE_EVENT_KINDS.includes(shown)
+      ? '生命周期事件只能由引擎 / 运行时内部推进，外部通道不能追加'
+      : `外部事件通道只接受纯观测类事件（${[...EXTERNAL_EVENT_KINDS].join(' / ')}）`
+    throw new RunError(400, `events[${index}].kind`, `${hint}：${shown}`, { index })
+  }
 }
 
 /** run 的终态：到了这里就不再有「定时唤醒」的意义（supervise.planWake 也直接停）。 */
@@ -525,7 +652,11 @@ async function handle(req, res, env) {
       return
     }
     if (error instanceof RunError) {
-      sendJson(res, error.status, error.toPayload())
+      const payload = error.toPayload()
+      // 错误码：RunError.toPayload() 只带 field/index，额外挂在 error.code 上的
+      // 业务码（例如 workspace）在这里补出去，调用方可按 code 分流。
+      if (typeof error.code === 'string' && error.code !== '') payload.code = error.code
+      sendJson(res, error.status, payload)
       return
     }
     if (error && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
@@ -754,6 +885,15 @@ async function handleRuns(req, res, env, url, parts) {
       // 07 §4.1：建 run 时记下发起参数（workspace / worktree），start 时由 engine 最终裁决
       // 并写权威字段（run.json.workspace / run.json.worktree）。
       const startOptions = parseStartOptions(body)
+      // E3-a：建 run 就能确定工作区 → 这里就要（stub 除外）。缺失时不在 start 补默认值，
+      // 直接把问题挡在创建阶段，避免画布留下一堆「开始运行才发现没工作区」的幽灵 run。
+      let workspaceRecord = null
+      if (startOptions.workspace !== undefined) {
+        workspaceRecord = resolveWorkspaceRecord(startOptions.workspace)
+        startOptions.workspace = workspaceRecord.path
+      } else if (!isStubEngine(env.engine)) {
+        throw workspaceError('缺少 workspace：创建 run 必须给出工作区绝对路径（画布「开始运行」不再回落到服务进程的当前目录）')
+      }
       const nodeTotal = flow.nodes.filter(node => node.kind === NODE_KIND.STAGE).length
       const run = await createRun(root, {
         flowId: flow.id,
@@ -763,10 +903,15 @@ async function handleRuns(req, res, env, url, parts) {
         // 06 §13.8：run.json.engine 从建 run 那一刻就带上，列表 / 聚合都读得到。
         engine: env.engine && env.engine.engineName === 'stub' ? 'stub' : 'real',
       })
+      if (workspaceRecord) {
+        // E3-a：工作区落进 run.json.workspace（runstore 白名单键），走唯一写路径 writeRunMeta。
+        await writeRunMeta(root, run.id, { workspace: workspaceRecord })
+      }
       if (Object.keys(startOptions).length > 0) {
-        // 同进程主路径：内存表（不受后续 runstore 写入影响）。
+        // 同进程快速通道：内存表（start 时少一次读盘；落盘失败也不影响本次 start）。
         rememberStartOptions(env.startOptions, run.id, startOptions)
-        // 持久化兜底：startOptions 不在 runstore 白名单里，只能 raw 合并（写失败不阻塞建 run）。
+        // 持久化：startOptions 已进 runstore 白名单（只认 workspace / worktree），
+        // 这里走 patchRunJson → writeRunMeta 校验并落盘；写失败不阻塞建 run。
         try {
           await patchRunJson(root, run.id, { startOptions })
         } catch (error) {
@@ -775,10 +920,9 @@ async function handleRuns(req, res, env, url, parts) {
           }
         }
       }
-      sendJson(res, 200, {
-        ok: true,
-        run: Object.keys(startOptions).length > 0 ? { ...run, startOptions } : run,
-      })
+      const payloadRun = Object.keys(startOptions).length > 0 ? { ...run, startOptions } : { ...run }
+      if (workspaceRecord) payloadRun.workspace = workspaceRecord
+      sendJson(res, 200, { ok: true, run: payloadRun })
       return
     }
     sendJson(res, 405, { ok: false, error: '只支持 GET / POST' })
@@ -796,7 +940,8 @@ async function handleRuns(req, res, env, url, parts) {
       if (!detail) throw new RunError(404, 'runId', 'run 不存在')
       // 07 §4 / §7：详情带完整 workspace / worktree / sessionMode / supervision
       //（readRunDetail 的 run 已是完整元数据，runstore 白名单已覆盖这四个键）。
-      // startOptions 不在白名单里，只能读原文（仅用于展示发起参数）。
+      // startOptions 也已进 runstore 白名单（workspace / worktree），这里直接读原文只为
+      // 与「发起参数」的原始形状对齐（仅用于展示，权威绑定看 run.json.workspace/worktree）。
       const run = {
         ...detail.run,
         ...runBindingFields(detail.run),
@@ -854,6 +999,12 @@ async function handleRuns(req, res, env, url, parts) {
       if (req.method === 'POST') {
         const body = await readBody(req)
         if (body === undefined) throw new RunError(400, 'events', '缺少事件内容')
+        // run 不存在仍然是 404（与 appendEvents 的读序一致），再判外部通道白名单。
+        const meta = await readRunMeta(root, runId)
+        if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+        // E3-b：外部写入通道只允许纯观测类事件；生命周期事件整批拒绝、一个字都不写，
+        // 保证 run 状态机不会被 HTTP 调用方推动（例如追加 run/start 后永久 409）。
+        assertExternalEvents(body)
         const appended = await appendEvents(root, runId, body)
         sendJson(res, 200, {
           ok: true,
@@ -935,7 +1086,8 @@ async function handleRuns(req, res, env, url, parts) {
       if (!env.engine) throw new RunError(500, 'engine', '执行引擎未初始化')
       if (action === 'start') {
         // 07 §4.1：body 可带 {workspace, worktree}；没带就沿用建 run 时记下的发起参数
-        //（内存表优先——它不受创建之后任何一次 runstore 写入影响；raw 落盘只作重启兜底）。
+        //（内存表优先，省一次读盘；run.json.startOptions 已由 runstore 白名单可靠落盘，
+        // 进程重启后仍能读回）。
         const explicit = parseStartOptions(await readBody(req))
         const memo = env.startOptions instanceof Map ? env.startOptions.get(runId) : undefined
         if (env.startOptions instanceof Map) env.startOptions.delete(runId)
@@ -947,22 +1099,59 @@ async function handleRuns(req, res, env, url, parts) {
             stored = {}
           }
         }
+        const meta = await readRunMeta(root, runId)
+        if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+        const boundWorkspace = meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null
+        // E3-a：工作区优先级 = 显式 body > 创建时参数 > run.json 已有绑定。
+        // **不补默认值**：非 stub run 若三处都没有，直接 400，绝不回落 process.cwd()。
+        const requestedWorkspace = explicit.workspace !== undefined
+          ? explicit.workspace
+          : (typeof stored.workspace === 'string' && stored.workspace !== ''
+            ? stored.workspace
+            : (boundWorkspace && typeof boundWorkspace.path === 'string' && boundWorkspace.path !== ''
+              ? boundWorkspace.path
+              : undefined))
+        let workspaceRecord = null
+        if (requestedWorkspace !== undefined) {
+          workspaceRecord = resolveWorkspaceRecord(requestedWorkspace)
+        } else if (!isStubRun(meta, env.engine)) {
+          throw workspaceError(
+            '缺少 workspace：启动 run 必须给出工作区绝对路径（请求体或创建 run 时传入），不会再回落到服务进程的当前目录',
+          )
+        }
         const startOptions = {}
-        const workspace = explicit.workspace !== undefined ? explicit.workspace : stored.workspace
+        if (workspaceRecord) {
+          // 工作区在创建时已经定下：启动时换一个 → 400（与 engine 的「不可中途更换」同口径，
+          // 提前在路由层给出可读原因，也避免先把 run.json 覆盖掉再被引擎拦）。
+          const boundRealpath = boundWorkspace && typeof boundWorkspace.realpath === 'string' && boundWorkspace.realpath !== ''
+            ? boundWorkspace.realpath
+            : null
+          const boundPath = boundWorkspace && typeof boundWorkspace.path === 'string' && boundWorkspace.path !== ''
+            ? boundWorkspace.path
+            : null
+          const sameBinding = boundRealpath !== null
+            ? boundRealpath === workspaceRecord.realpath
+            : (boundPath === null || boundPath === workspaceRecord.path)
+          if (!sameBinding) {
+            throw workspaceError(`run 已绑定工作区（${boundPath || boundRealpath}），不能在启动时更换`)
+          }
+          startOptions.workspace = workspaceRecord.path
+          // E3-a：把工作区持久化进 run.json.workspace（runstore 白名单键，单一写路径）。
+          if (!boundWorkspace || boundPath !== workspaceRecord.path) {
+            await writeRunMeta(root, runId, { workspace: workspaceRecord })
+          }
+        }
         const worktree = explicit.worktree !== undefined ? explicit.worktree : stored.worktree
-        if (typeof workspace === 'string' && workspace !== '') startOptions.workspace = workspace
         if (typeof worktree === 'string' && WORKTREE_POLICIES.includes(worktree)) startOptions.worktree = worktree
         // 07 §6：executor 的两条规则要在**开跑前**拦住（引擎执行时还会再拦一次）。
         // 存储侧允许保存非法流程（自动保存要能存中间态），但这样的流程不该跑起来。
-        const meta = await readRunMeta(root, runId)
-        if (meta) {
-          const flow = await readFlow(env.dir, meta.flowId)
-          const blockers = executorBlockers(flow)
-          if (blockers.length > 0) {
-            throw new RunError(400, 'executor', `流程里有非法的 executor 配置：${blockers[0].message}`)
-          }
+        const flow = await readFlow(env.dir, meta.flowId)
+        const blockers = executorBlockers(flow)
+        if (blockers.length > 0) {
+          throw new RunError(400, 'executor', `流程里有非法的 executor 配置：${blockers[0].message}`)
         }
         // 06 §10：返回 202；同一 runId 已在跑 → 409（由 runtime 抛 EngineError）。
+        // 引擎自己也会校验工作区并 400，这里不拦截、不改写引擎的错误码/文案。
         const run = await env.engine.start(runId, startOptions)
         sendJson(res, 202, { ok: true, run })
         return
@@ -1194,9 +1383,18 @@ export function apply(ctx) {
   // 07 §4.1：建 run → start 之间的发起参数交接（见 rememberStartOptions 的说明）。
   const startOptions = new Map()
   // 插件卸载 / 测试收尾：停调度定时器、释放所有实例（不删 run.json / 会话）。
+  // E3-c：卸载清理只依赖运行时的稳定门面 `dispose()`，不碰 Engine / 调度器内部结构。
+  // dispose() 可能是同步的，也可能在「卸载 abort」实现里返回 Promise（等待活跃引擎收尾）；
+  // 两种情况都把返回值交给 ctx.effect，让宿主能在卸载时 await。
   ctx.effect(() => () => {
     try {
-      engine.dispose()
+      const result = engine.dispose()
+      if (result && typeof result.then === 'function') {
+        return Promise.resolve(result).catch(() => {
+          // 释放失败不该影响卸载。
+        })
+      }
+      return result
     } catch {
       // 释放失败不该影响卸载。
     }

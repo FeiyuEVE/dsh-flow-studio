@@ -216,7 +216,8 @@ export const api = {
   // ── 运行控制（docs/design/06-execution-engine.md §10）────────────────────
   // 202 `{run}`；run 带 live 字段。运行中 start → 409，不在跑 stop → 409，
   // 两种业务态由调用方用 runActionFailureText 转成人话。
-  startRun: id => request('POST', `/runs/${segment(id)}/start`),
+  // F2：start 也带请求体 {workspace}（后端缺 workspace 会 400，不再回落到进程 cwd）。
+  startRun: (id, body) => request('POST', `/runs/${segment(id)}/start`, body),
   stopRun: id => request('POST', `/runs/${segment(id)}/stop`),
 }
 

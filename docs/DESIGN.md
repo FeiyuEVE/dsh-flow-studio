@@ -187,7 +187,7 @@ single 即可（代价更低，但一个节点只能有一个视角）。team �
 
 ### 8.2 v0.8 的节点闹钟
 
-每个节点主管会话在 `agents.create` 成功后自动登记一个自审闹钟（默认 120s）；到点按会话状态走
+每个节点主管会话在 `agents.create` 成功后自动登记一个自审闹钟（默认 600s / 10 分钟，可用 `FLOW_STUDIO_NODE_ALARM_MS` 覆盖）；到点按会话状态走
 `inject` / `followup` / 冷会话 `resume`，要求节点用 `node/status` 回报
 `state / progress / summary / members / blockers / verdict`。`state=done` + 合法 `verdict` 与
 `whenIdle` 竞速、可提前完成（`node/end.extra.completedBy='self-check'`）；`blocked` 且进度不变由

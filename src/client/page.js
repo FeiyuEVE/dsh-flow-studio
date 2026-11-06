@@ -15,7 +15,7 @@ import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
-import { FlowList, extractRunRows, hasNodeStatus } from './flowlist.js'
+import { FlowList, extractRunRows, hasNodeStatus, workspacePathOf } from './flowlist.js'
 import { Inspector } from './inspector.js'
 import {
   beginLink, confirmLink, describeLink, edgeKindBetween, moveLink,
@@ -99,6 +99,138 @@ export function runPreflight(flow) {
   const message = '流程校验未通过：' + errors.length + ' 个错误，已取消开始。'
     + (target ? '已定位到第 1 个错误，可在问题列表逐条修复。' : '请在问题列表里逐条修复。')
   return { ok: false, issues: merged, target, message }
+}
+
+/**
+ * F2：工作区是**运行的必要参数**——画布上点「开始运行」必须把选中的工作区一起发出去。
+ * Host 的 `POST /runs` / `POST /runs/<id>/start` 都接受 `{workspace}`；引擎会拒绝没有
+ * workspace 的启动（不再回落 `process.cwd()`），所以前端在这里就把空值拦下。
+ */
+export const WORKSPACE_STORAGE_KEY = 'dsh-flow-studio.workspace'
+
+/** 工作区路径归一化：非字符串 / 空白一律视为「未选择」。 */
+export function normalizeWorkspace(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/** 绝对路径判断（POSIX / Windows 两种写法都认；真正的合法性由 Host 再校验）。 */
+export function isAbsoluteWorkspace(value) {
+  const path = normalizeWorkspace(value)
+  return path.startsWith('/') || path.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(path)
+}
+
+/**
+ * 工作区门禁：返回可读中文原因（空串 = 通过）。文案必须说明「未选择工作区，无法启动」，
+ * 并且明确不会退回默认目录 —— 用户点了没反应 / 静默换目录都不可接受。
+ */
+export function workspaceBlockReason(workspace) {
+  if (normalizeWorkspace(workspace) === '') {
+    return '未选择工作区，无法启动：请先在顶栏填写工作区绝对路径（不会退回到默认目录）。'
+  }
+  if (!isAbsoluteWorkspace(workspace)) {
+    return '工作区必须是绝对路径（例如 /home/me/repo 或 C:\\repo），无法启动。'
+  }
+  return ''
+}
+
+/** 从 localStorage 恢复上次选择的工作区（SSR / 隐私模式下退回空串）。 */
+export function readStoredWorkspace(storage) {
+  try {
+    const store = storage || (typeof localStorage !== 'undefined' ? localStorage : null)
+    const stored = store && typeof store.getItem === 'function' ? store.getItem(WORKSPACE_STORAGE_KEY) : ''
+    return typeof stored === 'string' ? normalizeWorkspace(stored) : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 记住工作区选择；清空时删除键，避免下次又悄悄带出一个旧目录。 */
+export function writeStoredWorkspace(storage, value) {
+  const path = normalizeWorkspace(value)
+  try {
+    const store = storage || (typeof localStorage !== 'undefined' ? localStorage : null)
+    if (!store) return false
+    if (path === '') {
+      if (typeof store.removeItem === 'function') store.removeItem(WORKSPACE_STORAGE_KEY)
+      return true
+    }
+    if (typeof store.setItem !== 'function') return false
+    store.setItem(WORKSPACE_STORAGE_KEY, path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * `POST /runs` 的请求体：workspace 必填。没有工作区时返回 null，**调用方必须在此之前
+ * 拦住启动**（绝不构造一个不带 workspace 的建 run 请求）。
+ */
+export function createRunBodyFor(flow, name, workspace) {
+  const path = normalizeWorkspace(workspace)
+  if (!isObject(flow) || typeof flow.id !== 'string' || flow.id === '' || path === '') return null
+  return {
+    flowId: flow.id,
+    name: typeof name === 'string' && name !== '' ? name : flow.name,
+    workspace: path,
+  }
+}
+
+/**
+ * `POST /runs/<id>/start` 的请求体：同样显式带 workspace。
+ * 新建 run 时 Host 已经记下 workspace，但**复用旧 pending run** 的路径也必须显式带上，
+ * 否则引擎会退回建 run 时记下的（可能为空的）参数。
+ */
+export function startRunBodyFor(workspace) {
+  const path = normalizeWorkspace(workspace)
+  return path === '' ? null : { workspace: path }
+}
+
+/**
+ * F2：一次「发起运行」的完整请求序列（建 run → start）。抽成独立异步函数，是为了让
+ * SSR 测试能用 spy 断言真实载荷：未选工作区时**一次请求都不发**；两次请求的 body 都含
+ * 真实的 `workspace` 字段（不是「有传参」这种弱口径）。
+ *
+ * 复用 pending run 时也只认 workspace 与本次选择一致的那条——否则 start 会退回建 run
+ * 时记下的旧参数（引擎会 400，或者跑到错误的目录里）。
+ *
+ * @param {{ api: object, flow: object, workspace: string, runName?: string, runs?: Array<object> }} input
+ * @returns {Promise<{ ok: boolean, error: (Error|string|null), run: object|null,
+ *   createdRun: object|null, started: object|null }>}
+ */
+export async function startRunRequest({ api, flow, workspace, runName = '', runs = [] } = {}) {
+  const reason = workspaceBlockReason(workspace)
+  if (reason !== '') return { ok: false, error: reason, run: null, createdRun: null, started: null }
+  const path = normalizeWorkspace(workspace)
+  // 选中即记住：下次打开页面默认就是这份工作区（清空才删除）。
+  writeStoredWorkspace(undefined, path)
+  const known = Array.isArray(runs) ? runs : []
+  const pending = known.find(item => item && flow && item.flowId === flow.id && runIsPending(item)
+    && workspacePathOf(item) === path)
+  let run = pending || null
+  let createdRun = null
+  if (!run) {
+    const body = createRunBodyFor(flow, runName, path)
+    if (!body) return { ok: false, error: workspaceBlockReason(path), run: null, createdRun: null, started: null }
+    try {
+      const created = await api.createRun(body)
+      run = created && created.run ? created.run : null
+      if (run) createdRun = run
+    } catch (error) {
+      return { ok: false, error, run: null, createdRun: null, started: null }
+    }
+  }
+  if (!run || typeof run.id !== 'string' || run.id === '') {
+    return { ok: false, error: new Error('Host 没有返回 run'), run: null, createdRun, started: null }
+  }
+  const startBody = startRunBodyFor(path)
+  if (!startBody) return { ok: false, error: workspaceBlockReason(path), run, createdRun, started: null }
+  try {
+    const started = await api.startRun(run.id, startBody)
+    return { ok: true, error: null, run, createdRun, started }
+  } catch (error) {
+    return { ok: false, error, run, createdRun, started: null }
+  }
 }
 
 /**
@@ -208,28 +340,33 @@ export function activeRunViewOf(snapshot, flow) {
  * - 第一次点停止只 arm；真正的停止走**独立的「确认停止」按钮**，且要等
  *   `STOP_CONFIRM_DELAY_MS` 才可点（M6：同一按钮双击不再能击穿确认）；
  * - busy 期间两个按钮都禁用，避免连点发出重复 start/stop；
- * - 首次运行列表没回来前禁用「运行」并写清 title（m7）。
+ * - 首次运行列表没回来前禁用「运行」并写清 title（m7）；
+ * - F2：没有选工作区时禁用「运行」并在 title 里写明原因（不允许发一个不带 workspace 的运行）。
  */
 export function runControlState(run, {
-  busy = false, armed = false, hasFlow = false, listReady = true, confirmReady = false,
+  busy = false, armed = false, hasFlow = false, listReady = true, confirmReady = false, hasWorkspace = true,
 } = {}) {
   const running = runIsActive(run)
   const confirming = armed && running
+  // F2：两个禁用原因可以同时成立（首次列表未回 + 未选工作区），title 必须把两条都写出来，
+  // 否则用户只看到一半原因。
+  const workspaceTitle = hasWorkspace ? '' : '未选择工作区，无法启动：先填写工作区绝对路径'
+  const listTitle = listReady ? '' : '正在读取运行记录；确认当前没有运行中的 run 后再开始'
   return {
     running,
     confirming,
     startLabel: busy && !running ? '启动中…' : running ? '运行中' : '运行',
     stopLabel: busy && running ? '停止中…' : '停止',
     confirmLabel: '确认停止',
-    startDisabled: !hasFlow || busy || running || !listReady,
+    startDisabled: !hasFlow || busy || running || !listReady || !hasWorkspace,
     // M6：确认态下主按钮锁死，防止「第一击 arm、第二击 stop」被双击击穿。
     stopDisabled: !hasFlow || !running || busy || confirming,
     confirmDisabled: !confirming || busy || !confirmReady,
-    startTitle: !listReady
-      ? '正在读取运行记录；确认当前没有运行中的 run 后再开始'
-      : running
+    startTitle: workspaceTitle !== '' && listTitle !== ''
+      ? `${workspaceTitle}（${listTitle}）`
+      : workspaceTitle || listTitle || (running
         ? '当前 run 正在运行；要重新开始请先停止'
-        : hasFlow ? '保存当前流程并开始一次新的运行' : '先打开或新建一条流程',
+        : hasFlow ? '保存当前流程并开始一次新的运行' : '先打开或新建一条流程'),
     stopTitle: confirming
       ? '主按钮已锁定：请用右侧「确认停止」按钮（防双击误停）'
       : running
@@ -248,6 +385,7 @@ export function runControlState(run, {
  * @param {object} [props.initialRunView] 预置运行快照（SSR / 测试用；形状同抽屉
  *   `onRunSnapshot` 的回调参数：`{run, runs, events, summary, live, detail}`）。
  * @param {boolean} [props.initialLogOpen] 抽屉初始是否展开。
+ * @param {string} [props.initialWorkspace] 预置工作区绝对路径（SSR / 测试用）；省略则读 localStorage。
  */
 export function FlowStudioPage({
   initialFlow = null,
@@ -255,6 +393,7 @@ export function FlowStudioPage({
   initialRunView = null,
   initialLogOpen = false,
   initialError = '',
+  initialWorkspace = '',
 } = {}) {
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
 
@@ -297,6 +436,16 @@ export function FlowStudioPage({
    */
   const [runNodesById, setRunNodesById] = useState({})
   const runNodesFetched = useRef(new Set())
+  /**
+   * F2：这次运行落在哪个工作区。必须是用户显式选择（或上次记住的一份）绝对路径；
+   * 空值 = 未选择 → 不允许发起运行（见 workspaceBlockReason / beginRun）。
+   */
+  const [workspace, setWorkspace] = useState(() => {
+    const preset = normalizeWorkspace(initialWorkspace)
+    return preset !== '' ? preset : readStoredWorkspace()
+  })
+  const workspaceRef = useRef(workspace)
+  workspaceRef.current = workspace
 
   const pinned = useRef(Boolean(initialFlow))
   const flowRef = useRef(null)
@@ -323,6 +472,12 @@ export function FlowStudioPage({
     if (!lockedRef.current) return false
     setAnnounce(RUN_LOCK_REASON)
     return true
+  }, [])
+
+  /** F2：工作区选择变化立刻落 storage；清空即删除，避免下次悄悄带出旧目录。 */
+  const updateWorkspace = useCallback(value => {
+    setWorkspace(value)
+    writeStoredWorkspace(undefined, value)
   }, [])
 
   const patchFlow = useCallback(patch => {
@@ -900,6 +1055,8 @@ export function FlowStudioPage({
     hasFlow: Boolean(flow),
     listReady,
     confirmReady: stopConfirmReady,
+    // F2：没有工作区时「运行」按钮禁用并写明原因。
+    hasWorkspace: workspaceBlockReason(workspace) === '',
   })
   // v0.7 §4.3：运行列高亮跟抽屉选中；没有选中时退回当前流程的活动 run。
   const selectedRunId = runView && typeof runView.selectedRunId === 'string' && runView.selectedRunId !== ''
@@ -1030,6 +1187,13 @@ export function FlowStudioPage({
    */
   const beginRun = async () => {
     if (!flow || runBusy) return
+    // F2：没有工作区就不允许发起运行（不能点了没反应，也不能静默用默认目录）。
+    const blockReason = workspaceBlockReason(workspaceRef.current)
+    if (blockReason !== '') {
+      setError(blockReason)
+      setAnnounce(blockReason)
+      return
+    }
     if (!listReady) {
       setAnnounce('正在读取运行记录，确认当前没有运行中的 run 后再开始')
       return
@@ -1057,19 +1221,37 @@ export function FlowStudioPage({
       }
       const current = flowRef.current
       if (!current) return
+      const selectedWorkspace = normalizeWorkspace(workspaceRef.current)
       const known = runView && Array.isArray(runView.runs) ? runView.runs : []
-      const pending = known.find(item => item.flowId === current.id && runIsPending(item))
-      run = pending || null
-      if (!run) {
-        const created = await api.createRun({
-          flowId: current.id,
-          name: current.name + ' · ' + formatSavedAt(new Date().toISOString()),
-        })
-        run = created && created.run ? created.run : null
-        if (run && run.id) createdRun = run
+      // F2：建 run → start 的请求序列走 startRunRequest（它保证两次请求都带 workspace，
+      // 且只复用同工作区的 pending run）；失败时带回 run / createdRun 供收口清理。
+      const outcome = await startRunRequest({
+        api,
+        flow: current,
+        workspace: selectedWorkspace,
+        runName: current.name + ' · ' + formatSavedAt(new Date().toISOString()),
+        runs: known,
+      })
+      run = outcome.run
+      createdRun = outcome.createdRun
+      if (!outcome.ok) {
+        const plan = startFailurePlan('start', outcome.error, run, Boolean(createdRun))
+        if (plan.deleteRunId !== '') {
+          // 本次刚建的 run 启动失败：清掉，避免运行记录里留下一条永远 pending 的幽灵。
+          try {
+            await api.deleteRun(plan.deleteRunId)
+            setAnnounce(plan.message + '（已清理本次新建的 run）')
+          } catch {
+            setAnnounce(plan.message + '（新建的 run 清理失败，请在运行记录里删除它）')
+          }
+        } else {
+          setAnnounce(plan.message)
+        }
+        setError(plan.message)
+        setLogSync(value => value + 1)
+        return
       }
-      if (!run || !run.id) throw new Error('Host 没有返回 run')
-      const started = await api.startRun(run.id)
+      const started = outcome.started
       const liveRun = started && started.run ? started.run : run
       // 抽屉自动展开并切到这个 run；同步 token 让它立刻刷新一次。
       setLogOpen(true)
@@ -1171,6 +1353,42 @@ export function FlowStudioPage({
           flow
             ? stageCount + ' 个阶段 · ' + rejectCount + ' 条打回 · ' + teamCount + ' 个主从节点'
             : '把一条研发流水线画出来，每个节点是一个 agent 角色')),
+      // F2：运行必须有显式工作区；顶栏常驻输入，选中值会记住（localStorage）。
+      h('label', {
+        className: 'fs-workspace',
+        title: '这次运行的工作区绝对路径（必填）。空着时「运行」不可点，不会退回到默认目录。',
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '6px',
+          marginLeft: '12px',
+          minWidth: '260px',
+          flex: '0 1 320px',
+        },
+      },
+      h('span', {
+        style: { fontSize: '12px', color: 'var(--fs-muted, #8b949e)', whiteSpace: 'nowrap' },
+      }, '工作区'),
+      h('input', {
+        className: 'fs-workspace-input',
+        type: 'text',
+        value: workspace,
+        placeholder: '/path/to/workspace（绝对路径）',
+        'aria-label': '工作区绝对路径',
+        'aria-invalid': workspaceBlockReason(workspace) !== '' ? 'true' : 'false',
+        spellCheck: false,
+        style: {
+          flex: '1 1 auto',
+          minWidth: '0',
+          padding: '4px 8px',
+          fontSize: '12px',
+          borderRadius: '6px',
+          border: '1px solid var(--fs-border, #30363d)',
+          background: 'var(--fs-input-bg, #0d1117)',
+          color: 'inherit',
+        },
+        onChange: event => updateWorkspace(event.target.value),
+      })),
       h('div', { className: 'fs-save' }, h('span', { className: 'fs-dot ' + dotClass }), saveLabel),
       liveLabel
         // 只做视觉实时读数；播报统一走底栏那个 aria-live，避免同一变化被读两遍。

@@ -25,14 +25,20 @@
  * @module @feiyueve/dsh-flow-studio/tools
  */
 
+import { isAbsolute } from 'node:path'
+
 import { validateFlowForRun } from './engine.js'
-import { deliverInboundMessage, deliverOutboundReply, validateReplyTarget } from './inbox.js'
+import {
+  REPLY_TOKEN_ENV_PREFIX, deliverInboundMessage, deliverOutboundReply, redactSecrets,
+  validateReplyTargetStrict,
+} from './inbox.js'
 import { normalizeExecutor } from './executor.js'
 import { NODE_KIND } from './model.js'
 import { checkRunId } from './runlog.js'
 import { saveSupervision } from './runtime.js'
 import {
-  createRun, listRuns, readAllEvents, readNodeSessions, readRunDetail, readRunMeta,
+  createRun, listRuns, normalizeReplyTarget, readAllEvents, readNodeSessions, readRunDetail,
+  readRunMessages, readRunMeta,
 } from './runstore.js'
 import { checkId, listFlows, readFlow } from './store.js'
 
@@ -57,6 +63,52 @@ const DEFAULT_MAX_REJECTS_PER_EDGE = 3
 
 /** 终态 verdict：到这三个就不必再挂闹钟。 */
 const TERMINAL_VERDICTS = new Set(['done', 'failed', 'aborted'])
+
+// ── F1：外部回复通道的安全边界 ──────────────────────────────────────────────
+//
+// 白名单校验（tokenEnv 专用前缀 / https 或回环 http / 令牌打码）的**唯一实现**
+// 在 `inbox.js`：HTTP `POST /runs/<id>/messages`、`POST /runs/<id>/inbox`、以及
+// `flow_send_message` / `flow_reply` 全部走同一份函数。这里只保留「把 reply 参数
+// 交给 inbox 校验」的壳，不再复制第二份规则（见下面的 execute 与 storedReplyTargetOf）。
+
+/** 读一个回复目标实际会用的令牌值（只用于打码 / 脱敏，绝不外传）。 */
+function tokenValueOf(target) {
+  if (!target || target.kind !== 'http' || typeof target.tokenEnv !== 'string' || target.tokenEnv === '') return ''
+  try {
+    const value = process.env[target.tokenEnv]
+    return typeof value === 'string' ? value : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 取这个 run 当前生效的回复目标（与 inbox.deliverOutboundReply 同优先级：
+ * 消息级 reply > run.json.inbox.reply）。读不出来一律当「未配置」。
+ */
+async function storedReplyTargetOf(deps, runId, inReplyTo) {
+  let target = null
+  if (typeof inReplyTo === 'string' && inReplyTo !== '') {
+    try {
+      const listed = await readRunMessages(deps.runsRoot, runId, { limit: 1000 })
+      const source = listed && Array.isArray(listed.messages)
+        ? listed.messages.find(item => item && item.id === inReplyTo && item.direction === 'in')
+        : null
+      if (source) target = normalizeReplyTarget(source.reply)
+    } catch {
+      target = null
+    }
+  }
+  if (!target) {
+    try {
+      const meta = await readRunMeta(deps.runsRoot, runId)
+      target = normalizeReplyTarget(meta && meta.inbox ? meta.inbox.reply : null)
+    } catch {
+      target = null
+    }
+  }
+  return target
+}
 
 // ── v0.8 §11：节点自审状态（flow_watch / recommended） ────────────────────
 
@@ -115,6 +167,91 @@ function withRecommendations(recommended, advice) {
     return { ...recommended, nodeStatus: advice }
   }
   return advice
+}
+
+// ── 调度器实时快照（flow_watch：卡住 / 超时 / 自审回报格式错要看得见） ──────
+//
+// `status()` 是对外契约（9 个字段），不够诊断；可观测字段都在 `snapshot()`：
+// run 级 `entries[].{lastOutcome,lastDurationMs,lastFinishedAt,lastError,timeouts}` +
+// `tick.lastDurationMs`；节点级还有 `entries[].lastReport`。
+// 老版本 / 注入桩可能没有 snapshot()，这里必须**不抛错**并明确标注不可用。
+
+/**
+ * 读一个调度器的 snapshot()，永不抛错。
+ * @returns {{ available: boolean, snapshot?: object, reason?: string }}
+ */
+function supervisionSnapshotOf(scheduler, label) {
+  if (!scheduler || typeof scheduler !== 'object') {
+    return { available: false, reason: `引擎没有暴露${label}调度器（老版本 / 未启用）` }
+  }
+  if (typeof scheduler.snapshot !== 'function') {
+    return { available: false, reason: `${label}调度器没有 snapshot()（老版本 / 注入桩），无法看实时健康度` }
+  }
+  try {
+    const snapshot = scheduler.snapshot()
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      return { available: false, reason: `${label}调度器的 snapshot() 返回了非对象` }
+    }
+    return { available: true, snapshot }
+  } catch (error) {
+    return { available: false, reason: `${label}调度器的 snapshot() 抛错：${messageOf(error)}` }
+  }
+}
+
+/** 从快照里挑出「调度器超时 / 停摆 / 自审回报格式错」这三类信号。 */
+function supervisionHealthOf(runLevel, nodeLevel) {
+  const warnings = []
+  let timeouts = 0
+  let invalidReports = 0
+
+  const runEntries = runLevel && runLevel.available && runLevel.snapshot
+    && Array.isArray(runLevel.snapshot.entries) ? runLevel.snapshot.entries : []
+  for (const entry of runEntries) {
+    if (!entry || typeof entry !== 'object') continue
+    const rawTimeouts = Number(entry.timeouts)
+    const entryTimeouts = Number.isFinite(rawTimeouts) && rawTimeouts > 0 ? rawTimeouts : 0
+    const lastTimeout = entry.lastOutcome === 'timeout'
+    if (entryTimeouts > 0 || lastTimeout) {
+      const count = Math.max(1, entryTimeouts)
+      timeouts += count
+      warnings.push(
+        `run 级调度器报告超时：run ${entry.runId || '未知'}（累计 ${count} 次`
+          + `${lastTimeout ? '，最近一次结果 timeout' : ''}`
+          + `${entry.lastError ? '：' + entry.lastError : ''}）`,
+      )
+    }
+  }
+  const runTick = runLevel && runLevel.available && runLevel.snapshot ? runLevel.snapshot.tick : null
+  if (runTick && Number.isFinite(runTick.lastDurationMs) && Number.isFinite(runLevel.snapshot.wakeTimeoutMs)
+    && runTick.lastDurationMs > runLevel.snapshot.wakeTimeoutMs) {
+    warnings.push(
+      `run 级调度器整轮 tick 耗时 ${runTick.lastDurationMs}ms，已超过单条唤醒超时 `
+        + `${runLevel.snapshot.wakeTimeoutMs}ms，可能在停摆。`,
+    )
+  }
+
+  const nodeEntries = nodeLevel && nodeLevel.available && nodeLevel.snapshot
+    && Array.isArray(nodeLevel.snapshot.entries) ? nodeLevel.snapshot.entries : []
+  for (const entry of nodeEntries) {
+    if (!entry || typeof entry !== 'object') continue
+    if (entry.lastReport && entry.lastReport.kind === 'invalid') {
+      invalidReports += 1
+      warnings.push(
+        `节点自审回报格式不合规（invalid）：节点 ${entry.nodeId || entry.sessionId || '未知'}`
+          + `${entry.lastReport.reason ? '（' + entry.lastReport.reason + '）' : ''}，建议检查该节点的自审输出格式。`,
+      )
+    }
+  }
+  const nodeTick = nodeLevel && nodeLevel.available && nodeLevel.snapshot ? nodeLevel.snapshot.tick : null
+  if (nodeTick && Number.isFinite(nodeTick.lastDurationMs) && Number.isFinite(nodeLevel.snapshot.wakeTimeoutMs)
+    && nodeTick.lastDurationMs > nodeLevel.snapshot.wakeTimeoutMs) {
+    warnings.push(
+      `节点级调度器整轮 tick 耗时 ${nodeTick.lastDurationMs}ms，已超过单条唤醒超时 `
+        + `${nodeLevel.snapshot.wakeTimeoutMs}ms，可能在停摆。`,
+    )
+  }
+
+  return { warnings, timeouts, invalidReports }
 }
 
 // ── JSON Schema 小工具 ─────────────────────────────────────────────────────
@@ -666,7 +803,9 @@ export function createFlowTools(deps) {
         + '同名多份会失败并列出候选 id。task 是用户这次要跑的任务原文（可选，写进 run 的 name）；'
         + 'name 是本次 run 的显示名（可选，优先于 task）。流程不存在 / 不合法会在建 run 之前失败；'
         + '同一 runId 已在跑（409）会返回可读原因——v0.7 起并发不设上限，不同 run 可以同时跑。'
-        + 'workspace 默认取当前会话的 cwd（不用手填）；worktree 决定是否给这个 run 单独开 git worktree'
+        + 'workspace 必须能显式确定：显式传 workspace（绝对路径）或从带 cwd 的会话里启动；'
+        + '两者都拿不到会直接失败（**不会**悄悄回落到进程 cwd）。'
+        + 'worktree 决定是否给这个 run 单独开 git worktree'
         + '（auto = 工作区是 git 仓库就开，默认；on = 必须开，不是 git 仓库会 400；off = 不开）。',
       parameters: {
         type: 'object',
@@ -675,7 +814,11 @@ export function createFlowTools(deps) {
           flowName: { type: 'string', description: '流程名称（没有 flowId 时用；精确匹配优先，再退不区分大小写；重名会失败并列候选）' },
           task: { type: 'string', description: '用户这次要跑的任务原文（可选，≤2000 字符；写进 run.json 的 name，超过 200 字符截断）' },
           name: { type: 'string', description: '本次 run 的显示名（可选，≤200 字符；优先于 task）' },
-          workspace: { type: 'string', description: '工作区绝对路径（可选；默认取调用方会话的 cwd，取不到就交给引擎回落）' },
+          workspace: {
+            type: 'string',
+            description: '工作区绝对路径（可选；省略时取调用方会话的 cwd）。'
+              + '显式值与会话 cwd 都拿不到时 flow_start 直接失败，不会回落到进程 cwd',
+          },
           worktree: { type: 'string', enum: ['auto', 'on', 'off'], description: 'worktree 策略：auto（默认，git 仓库才开）/ on（必须开，否则 400）/ off（不开）' },
         },
         required: [],
@@ -770,10 +913,26 @@ export function createFlowTools(deps) {
           const explicitName = optionalString(args, 'name', { max: 200 })
           const task = optionalString(args, 'task', { max: 2000 })
           runName = explicitName || (task ? clipChars(task, 200) : flow.name)
-          // 07 §4.1：worktree 策略与 workspace（默认取调用方会话的 cwd，取不到就不传）。
+          // 07 §4.1：worktree 策略与 workspace。F2：workspace 必须显式可确定——
+          // 显式参数优先，其次继承调用方会话的 cwd；两者都没有就失败，绝不悄悄回落到
+          // 进程 cwd（那会让 run 在错误的仓库里开跑）。
           worktree = optionalEnum(args, 'worktree', WORKTREE_POLICIES)
           const explicitWorkspace = optionalString(args, 'workspace', { max: 1000 })
-          workspace = explicitWorkspace !== undefined ? explicitWorkspace : workspaceOfSession(exec)
+          const candidate = explicitWorkspace !== undefined ? explicitWorkspace : workspaceOfSession(exec)
+          if (candidate === undefined || candidate === '') {
+            throw new ParamError(
+              '缺少 workspace：本次运行没有可用的工作区（调用方会话也没有 cwd）',
+              '显式传 workspace（工作区绝对路径），或从一个带工作目录的会话里启动；'
+                + 'flow_start 不会回落到进程 cwd。',
+            )
+          }
+          if (!isAbsolute(candidate)) {
+            throw new ParamError(
+              `workspace 必须是绝对路径：${clipChars(candidate, 200)}`,
+              '传工作区的绝对路径（例如 /home/me/repo）；相对路径会被引擎拒绝。',
+            )
+          }
+          workspace = candidate
         } catch (error) {
           if (error instanceof ParamError) return failure(error.message, error.hint)
           return failure(`读取参数失败：${messageOf(error)}`, '按参数说明改正后重发。')
@@ -809,9 +968,9 @@ export function createFlowTools(deps) {
         }
 
         // 父会话 = 当前会话；workspace / worktree 一并交给 engine.start 裁决（07 §4.1）。
+        // F2：workspace 到这里一定存在（上面缺了就失败），所以无条件带上。
         const parent = exec && exec.agent ? exec.agent : undefined
-        const startOptions = { parent }
-        if (workspace !== undefined) startOptions.workspace = workspace
+        const startOptions = { parent, workspace }
         if (worktree !== undefined) startOptions.worktree = worktree
         let started
         try {
@@ -894,6 +1053,11 @@ export function createFlowTools(deps) {
         + 'currentNode / rejects / anomalies / quality / tokens / idleMs / recommended 等结论，'
         + '并附 supervision：运行中给出下次审查间隔、内建调度状态（scheduler）与向后兼容的闹钟提示词，'
         + 'verdict 为 done/failed/aborted 时 nextCheckSeconds 为 null、alarmPrompt 说明不必再挂闹钟。'
+        + '另附调度器实时快照（schedulerSnapshot = engine.supervision.snapshot()、'
+        + 'nodeSchedulerSnapshot = engine.nodeSupervision.snapshot()，老版本没有 snapshot() 时为 '
+        + '{available:false, reason} 并标注「不可用」）与 health{timeouts, invalidReports, warnings}：'
+        + '调度器超时 / 整轮 tick 停摆 / 节点自审回报格式错（lastReport.kind=invalid）会写进 '
+        + 'recommended 与人类可读结论，不用翻原始 JSON。'
         + '典型用法：flow_start 之后内置 supervision 会自动唤醒本会话（不需要手动挂 proactive_set 闹钟），'
         + '每次醒来调本工具审查；verdict 正常就 proactive_reclaim 安静结束，异常或跑完才通知主人。'
         + 'runId 省略时取最近一次 run（按 startedAt 倒序）。',
@@ -928,12 +1092,40 @@ export function createFlowTools(deps) {
         ),
         supervision: {
           type: 'object',
-          description: '定时自审信号：运行中给间隔与闹钟提示词，终态给 null 与「不必再挂」说明',
+          description: '定时自审信号 + 调度器实时健康度：运行中给间隔与闹钟提示词，终态给 null 与「不必再挂」说明',
           properties: {
             nextCheckSeconds: nullable({ type: 'integer' }, '下次审查间隔秒数；终态为 null（不必再挂闹钟）'),
             alarmPrompt: { type: 'string', description: '给 proactive_set 的完整提示词' },
             watchTool: { type: 'string', description: '审查工具名（恒为 flow_watch）' },
             scheduler: anyJson('run.json.supervision 的只读快照（内建调度：enabled / wakerSessionId / lastWokeAt / nextDueAt / wakes / failures / reason；未开启为 null）'),
+            // 新增：调度器实时快照（run 级 / 节点级）。缺 snapshot() 时是
+            // { available:false, reason }，明确标注「不可用」而不是空对象。
+            schedulerSnapshot: anyJson(
+              'run 级调度器 engine.supervision.snapshot() 的宽松透传：'
+              + '{available, snapshot?{ticking,started,intervalMs,wakeTimeoutMs,concurrency,'
+              + 'tick{count,skipped,lastStartedAt,lastFinishedAt,lastDurationMs,lastStats},'
+              + 'entries[{runId,lastOutcome,lastDurationMs,lastFinishedAt,timeouts,lastError,...}]}}；'
+              + '不可用时 {available:false, reason}',
+            ),
+            nodeSchedulerSnapshot: anyJson(
+              '节点级调度器 engine.nodeSupervision.snapshot() 的宽松透传：形状同上，'
+              + 'entries[] 额外带 lastReport{kind,reason,at}；不可用时 {available:false, reason}',
+            ),
+            health: {
+              type: 'object',
+              description: '调度器健康度（同时会并入 recommended 与人类可读结论）',
+              properties: {
+                timeouts: { type: 'integer', description: 'run 级调度器累计超时次数（跨 entry 求和）' },
+                invalidReports: { type: 'integer', description: '节点自审回报格式不合规（invalid）的条数' },
+                warnings: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '可读告警（超时 / 停摆 / invalid 回报）；为空表示没发现这类信号',
+                },
+              },
+              required: ['timeouts', 'invalidReports', 'warnings'],
+              additionalProperties: true,
+            },
           },
           required: ['alarmPrompt', 'watchTool'],
           additionalProperties: true,
@@ -955,6 +1147,16 @@ export function createFlowTools(deps) {
           const wakes = Number.isInteger(scheduler.wakes) ? scheduler.wakes : 0
           const due = typeof scheduler.nextDueAt === 'string' ? scheduler.nextDueAt : '待定'
           lines.push(`内建调度：开启（已唤醒 ${wakes} 次，下次 ${due}）。`)
+        }
+        // 调度器超时 / 停摆 / 自审回报格式错：必须出现在可读结论里，不能只埋在 JSON 深处。
+        const health = value.supervision && value.supervision.health
+        if (health && Array.isArray(health.warnings) && health.warnings.length > 0) {
+          lines.push(`调度器健康：${health.warnings.join('；')}`)
+        } else {
+          const runSnapshot = value.supervision && value.supervision.schedulerSnapshot
+          const nodeSnapshot = value.supervision && value.supervision.nodeSchedulerSnapshot
+          if (runSnapshot && runSnapshot.available === false) lines.push(`调度器快照：run 级不可用（${runSnapshot.reason || '原因未知'}）。`)
+          if (nodeSnapshot && nodeSnapshot.available === false) lines.push(`调度器快照：节点级不可用（${nodeSnapshot.reason || '原因未知'}）。`)
         }
         return [{ type: 'text', text: lines.join('\n') }]
       }),
@@ -1028,10 +1230,18 @@ export function createFlowTools(deps) {
           // v0.8 §11.4：节点最新自审状态直接读 run.json；blocked 且进度不变时补一条建议。
           const nodeStatus = nodeStatusOfRun(detail.run)
           const nodeAdvice = blockedNodeAdvice(nodeStatus, all.events)
+          // 调度器实时健康度（只读、宽松透传）：status() 的 9 个字段不够诊断，
+          // 超时 / 停摆 / 自审回报格式错都在 snapshot() 里。
+          const runLevelSnapshot = supervisionSnapshotOf(deps.engine && deps.engine.supervision, 'run 级')
+          const nodeLevelSnapshot = supervisionSnapshotOf(deps.engine && deps.engine.nodeSupervision, '节点级')
+          const schedulerHealth = supervisionHealthOf(runLevelSnapshot, nodeLevelSnapshot)
 
           return jsonSafe({
             ...audited,
-            recommended: withRecommendations(audited.recommended, nodeAdvice),
+            recommended: withRecommendations(
+              withRecommendations(audited.recommended, nodeAdvice),
+              schedulerHealth.warnings,
+            ),
             ok: true,
             runId,
             flowId: detail.run.flowId,
@@ -1044,6 +1254,15 @@ export function createFlowTools(deps) {
               scheduler: detail.run.supervision && typeof detail.run.supervision === 'object'
                 ? detail.run.supervision
                 : null,
+              // 新增：调度器内存中的实时快照（缺 snapshot() 时 available=false + reason）。
+              schedulerSnapshot: runLevelSnapshot,
+              nodeSchedulerSnapshot: nodeLevelSnapshot,
+              // 把「超时 / 停摆 / invalid 回报」这类信号收成可读结论（同时并入 recommended）。
+              health: {
+                timeouts: schedulerHealth.timeouts,
+                invalidReports: schedulerHealth.invalidReports,
+                warnings: schedulerHealth.warnings,
+              },
             },
           })
         } catch (error) {
@@ -1292,7 +1511,8 @@ export function createFlowTools(deps) {
         + '投递方式由引擎现状决定：目标节点已有活会话 → 立即注入（injected）；只有冷会话 → resume 后注入（resumed）；'
         + 'run 还没开始 → 作为本 run 的启动输入（started）；run 在跑但节点还没到 → 入队，等引擎推进到该节点时并入提示词（queued）。'
         + '省略 runId 时取当前会话启动的最新 run，再退回最近一次 run。reply 可选：指定节点回消息时要发给谁'
-        + '（session 会话 / http 回调地址 / none 只记日志；http 的 tokenEnv 只写环境变量名）。',
+        + '（session 会话 / http 回调地址 / none 只记日志；http 的 url 只允许 https 或回环地址上的 http，'
+        + `tokenEnv 只接受 ${REPLY_TOKEN_ENV_PREFIX}* 形式的专用环境变量名）。`,
       parameters: {
         type: 'object',
         properties: {
@@ -1305,8 +1525,17 @@ export function createFlowTools(deps) {
             properties: {
               kind: { type: 'string', enum: ['session', 'http', 'none'], description: '回复通道：会话 / HTTP 回调 / 不回复' },
               sessionId: { type: 'string', description: 'kind=session 时的目标会话 id' },
-              url: { type: 'string', description: 'kind=http 时的回调地址（只允许 http/https）' },
-              tokenEnv: { type: 'string', description: 'kind=http 时从哪个环境变量取 Bearer 令牌（只写变量名，不落盘）' },
+              url: {
+                type: 'string',
+                description: 'kind=http 时的回调地址：只允许 https，或回环地址（127.0.0.1 / ::1 / localhost）上的 http；'
+                  + '不允许带用户名密码（user:pass@）',
+              },
+              tokenEnv: {
+                type: 'string',
+                description: `kind=http 时从哪个环境变量取 Bearer 令牌（只写变量名，不落盘）：`
+                  + `只接受 ${REPLY_TOKEN_ENV_PREFIX}<后缀> 形式（前缀大小写敏感，后缀只用大写字母 / 数字 / 下划线）；`
+                  + '其它变量名一律拒绝',
+              },
             },
             required: ['kind'],
             additionalProperties: false,
@@ -1349,8 +1578,16 @@ export function createFlowTools(deps) {
           }
           const rawReply = argsOf(args).reply
           if (rawReply !== undefined && rawReply !== null) {
-            const validated = validateReplyTarget(rawReply)
-            if (!validated.ok) throw new ParamError(validated.error, '按参数说明改正 reply（kind 必填；http 只允许 http/https）。')
+            // F1：tokenEnv 白名单 + url 白名单（https 或回环 http），不再放行任意环境变量。
+            const validated = validateReplyTargetStrict(rawReply)
+            if (!validated.ok) {
+              throw new ParamError(
+                validated.error,
+                '按参数说明改正 reply：kind 必填；http 的 url 只允许 https 或回环地址（127.0.0.1 / ::1 / localhost）上的 http，'
+                  + `tokenEnv 只接受 ${REPLY_TOKEN_ENV_PREFIX}<后缀> 形式的环境变量名；`
+                  + 'kind=session 必须给非空 sessionId。',
+              )
+            }
             reply = validated.reply
           }
           const requestedRunId = optionalString(args, 'runId', { max: 128 })
@@ -1405,6 +1642,8 @@ export function createFlowTools(deps) {
         + 'session 目标直接投进会话（活会话 followup / 冷会话 resume）；http 目标 POST 到回调地址'
         + '（tokenEnv 指向的环境变量作为 Bearer，超时 10s，失败不抛异常）；未配置 / none 只记 message/out 事件，'
         + '返回值 ok:true 并由 hint 说明「没有外部回复通道，已记录在运行日志」。'
+        + '安全边界：已保存的 http 回复通道同样要过白名单——url 只允许 https 或回环地址上的 http，'
+        + `tokenEnv 只接受 ${REPLY_TOKEN_ENV_PREFIX}*；不合规的通道会被拒绝投递（令牌值永远打码）。`
         + '正文前会自动加来源标记 [flow:<流程名> · <节点标题>]。',
       parameters: {
         type: 'object',
@@ -1419,7 +1658,7 @@ export function createFlowTools(deps) {
         messageId: { type: 'string', description: '这条回复的 id（message/out 事件的 id）' },
         inReplyTo: nullable({ type: 'string' }, '被回复的入站消息 id'),
         nodeId: nullable({ type: 'string' }, '发起回复的节点 id'),
-        delivery: { type: 'string', description: '实际回复通道：session / http / local（未配置时只记日志）' },
+        delivery: { type: 'string', description: '实际回复通道：session / http / local（未配置时只记日志）/ blocked（回复通道不合规被拒绝）' },
         sessionId: nullable({ type: 'string' }, 'kind=session 时的目标会话 id'),
         httpStatus: nullable({ type: 'integer' }, 'kind=http 时的 HTTP 状态码'),
       }, (args, value) => {
@@ -1462,6 +1701,23 @@ export function createFlowTools(deps) {
           )
         }
 
+        // F1：投递前先按「这个 run 实际会用的回复目标」做白名单校验（与 inbox 同优先级：
+        // 消息级 reply > run.json.inbox.reply）。已保存的通道可能来自旧版本或 HTTP 入口，
+        // 这里在读取令牌之前就拦下不合规目标，令牌值不会进入任何请求 / 错误信息。
+        const storedTarget = await storedReplyTargetOf(deps, owner.runId, inReplyTo)
+        const checkedTarget = validateReplyTargetStrict(storedTarget)
+        if (!checkedTarget.ok) {
+          return failure(
+            `回复通道不合规，已拒绝投递：${checkedTarget.error}`,
+            '改掉这个 run 的 inbox.reply / 重新发一条带合规 reply 的消息后再回复：'
+              + 'http 只允许 https 或回环地址（127.0.0.1 / ::1 / localhost）上的 http，'
+              + `tokenEnv 只接受 ${REPLY_TOKEN_ENV_PREFIX}<后缀> 形式的环境变量名。`,
+            false,
+            { runId: owner.runId, nodeId: owner.nodeId, delivery: 'blocked' },
+          )
+        }
+        const replyToken = tokenValueOf(checkedTarget.reply)
+
         try {
           const delivered = await deliverOutboundReply({
             runsRoot: deps.runsRoot,
@@ -1479,7 +1735,8 @@ export function createFlowTools(deps) {
           })
           if (delivered.ok !== true) {
             return failure(
-              delivered.error || '回复投递失败',
+              // 令牌值永远打码：上游（fetch / 代理）若把 Authorization 带进错误文本，这里再脱敏一次。
+              redactSecrets(delivered.error || '回复投递失败', [replyToken]),
               '回复已写进运行日志（message/out），但外部通道没有确认收到；检查 reply 配置 / 回调地址 / 令牌环境变量。',
               true,
               {
@@ -1500,7 +1757,7 @@ export function createFlowTools(deps) {
             return failureOf(error, { action: '回复消息 ', extra: { runId: owner.runId, nodeId: owner.nodeId } })
           }
           return failure(
-            `回复失败：${messageOf(error)}`,
+            redactSecrets(`回复失败：${messageOf(error)}`, [replyToken]),
             '稍后重试一次；仍失败就告诉主人（回复通道可能配置错了）。',
             true,
           )

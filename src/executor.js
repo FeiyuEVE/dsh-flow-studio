@@ -5,6 +5,34 @@
  * 纯模块：不 import 任何 dsh 包，也不直接持有进程管理策略——子进程一律走注入的
  * `spawn`（默认 `node:child_process.spawn`），测试注入假 spawn，永不真跑 codex。
  *
+ * ## custom executor 的 prompt 传递契约（RCE 修复后，三条通道并存）
+ *
+ * prompt 里可能携带外部消息、上游节点产物等不可信内容，**绝不作为 shell 文本被解析或拼接**：
+ *
+ *   1. **文件 + `{prompt}`（主通道）**：每次执行把 prompt 原文写进本次专用的临时目录
+ *      （目录 0700）下的普通文件（0600），路径经环境变量 `FLOW_STUDIO_PROMPT_FILE` 暴露。
+ *      命令模板里的 `{prompt}` 被替换成 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`：
+ *      外层双引号防止分词/通配符展开，命令替换只执行 `cat`，读到的是我们自己写入的
+ *      文件字节，prompt 内容不参与任何 shell 解析。该文件在本次执行结束时删除——
+ *      成功、非 0 退出、超时、abort、spawn 失败都用同一条 `finish()` 清理路径。
+ *      注意：命令替换按 POSIX 会剥掉内容**末尾的换行**；需要逐字节原文（含结尾换行）
+ *      请直接读 `$FLOW_STUDIO_PROMPT_FILE` 或 stdin。
+ *   2. **环境变量直传（兼容通道）**：prompt 的 UTF-8 字节数 ≤ 64KiB 时设置
+ *      `FLOW_STUDIO_PROMPT`；超过就不设置（Linux 单条 env 字符串约 128KiB 上限，
+ *      超了 execve 会 E2BIG）。**大 prompt 请用 `{prompt}` 或 `"$FLOW_STUDIO_PROMPT_FILE"`。**
+ *   3. **stdin（兜底通道）**：prompt 原文完整写入子进程 stdin 后 `end()`；子进程不读
+ *      stdin 时的 EPIPE / 管道错误一律吞掉，不影响本次执行结果。
+ *
+ * 占位符位置限制：`{prompt}` 落在**单引号内**（`'{prompt}'`）是**不支持的位置**——
+ * shell 不展开变量，实际传给程序的是替换产物字面量
+ * `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`，不是 prompt 原文（也不会产生注入）。
+ * 需要 prompt 原文时，请把占位符放在普通位置或双引号内。
+ *
+ * 替换形态按占位符所处的 shell 引号上下文选择：普通位置用自带双引号的
+ * `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`；已经在双引号内时用不带外层引号的
+ * `$(cat -- "$FLOW_STUDIO_PROMPT_FILE")`——避免 `""$(...)""` 把命令替换挤出引号，
+ * 让 `"前缀 {prompt}"` 这类模板也能逐字节保真。
+ *
  * 三个职责边界：
  *   1. 归一化：节点配置 → 可执行 spec（kind / command / args / model），非法组合抛
  *      `EXECUTOR_INVALID`（中文原因）；
@@ -15,6 +43,9 @@
  */
 
 import { spawn as spawnProcess } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 /** 允许的 executor 种类；顺序即文档与下拉框的展示顺序。 */
 export const EXECUTORS = Object.freeze(['dsh', 'codex', 'custom'])
@@ -266,29 +297,184 @@ export function parseCodexLine(line) {
   return fallback !== '' ? { kind: 'log', text: fallback } : { kind: 'ignore' }
 }
 
-/** POSIX shell 安全转义：单引号包裹 + 内部单引号写成 '\''。 */
+/** POSIX shell 安全转义：单引号包裹 + 内部单引号写成 '\''。只用于 schema / cwd。 */
 function shellQuote(value) {
   return `'${String(value == null ? '' : value).replace(/'/g, `'\\''`)}'`
 }
 
+/** custom executor 接收 prompt 原文的环境变量名（兼容通道，仅 ≤64KiB 时设置）。 */
+const CUSTOM_PROMPT_ENV = 'FLOW_STUDIO_PROMPT'
+
+/** custom executor 接收 prompt 临时文件路径的环境变量名（主通道）。 */
+const CUSTOM_PROMPT_FILE_ENV = 'FLOW_STUDIO_PROMPT_FILE'
+
 /**
- * custom executor 的命令模板：替换 {prompt} / {schema} / {cwd}；
- * 三个占位符都没有时，把 prompt 作为最后一个参数追加（同样做 shell 转义）。
+ * `FLOW_STUDIO_PROMPT` 直传的字节上限。
+ *
+ * Linux 单条环境变量字符串上限约 128KiB（MAX_ARG_STRLEN），超了 execve 会 E2BIG；
+ * 这里取 64KiB 留余量，超过就只走文件 / stdin 通道（见模块顶部契约）。
  */
-function buildCustomScript(template, { prompt, schemaPath, cwd }) {
-  let replaced = false
-  let script = String(template).replace(/\{prompt\}/g, () => {
-    replaced = true
-    return shellQuote(prompt)
-  }).replace(/\{schema\}/g, () => {
-    replaced = true
-    return shellQuote(schemaPath || '')
-  }).replace(/\{cwd\}/g, () => {
-    replaced = true
-    return shellQuote(cwd || '')
-  })
-  if (!replaced) script = `${script} ${shellQuote(prompt)}`
-  return script
+const CUSTOM_PROMPT_ENV_MAX_BYTES = 64 * 1024
+
+/**
+ * `{prompt}` 的替换产物：读本次执行专用的 prompt 文件。
+ *
+ * `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`：外层双引号防止分词 / 通配符展开；
+ * 命令替换只执行 `cat`，读的是我们自己写入的普通文件字节，prompt 内容不参与任何
+ * shell 解析。命令替换按 POSIX 会剥掉末尾换行——要逐字节原文请读文件或 stdin。
+ *
+ * 不支持的位置：占位符落在**单引号内**（`'{prompt}'`）时 shell 不展开，传给程序的
+ * 是替换产物字面量（见模块顶部契约），不会产生注入。
+ */
+const CUSTOM_PROMPT_REFERENCE = '"$(cat -- "$' + CUSTOM_PROMPT_FILE_ENV + '")"'
+
+/**
+ * 双引号内使用的替换产物：外层引号已经存在，不能再自带一层。
+ * 否则 `"{prompt}"` 会变成 `""$(...)""`，命令替换落到引号外被分词 / 通配符展开。
+ */
+const CUSTOM_PROMPT_REFERENCE_IN_QUOTES = '$(cat -- "$' + CUSTOM_PROMPT_FILE_ENV + '")'
+
+/**
+ * 把模板里的 `{prompt}` 换成读文件命令，并按占位符所处的 shell 引号上下文选形态：
+ *   - 普通位置：`CUSTOM_PROMPT_REFERENCE`（自带双引号）；
+ *   - 双引号内：`CUSTOM_PROMPT_REFERENCE_IN_QUOTES`（外层引号已存在）；
+ *   - 单引号内：照常替换，但 shell 不展开，属于「不支持的位置」。
+ *
+ * 扫描只跟踪单 / 双引号（以及双引号内的反斜杠转义），足以覆盖命令模板的常见写法；
+ * 误判不会引入注入——两种形态都只是 cat 我们自己写的文件，prompt 内容不参与解析。
+ */
+function replacePromptPlaceholders(template) {
+  const text = String(template)
+  const token = '{prompt}'
+  let out = ''
+  let quote = ''
+  let index = 0
+  while (index < text.length) {
+    const ch = text[index]
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = ''
+        out += ch
+        index += 1
+        continue
+      }
+      if (text.startsWith(token, index)) {
+        // 单引号内不做特殊处理：替换产物在这里只是普通字符，不会被展开。
+        out += CUSTOM_PROMPT_REFERENCE
+        index += token.length
+        continue
+      }
+      out += ch
+      index += 1
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '\\' && index + 1 < text.length) {
+        out += text.slice(index, index + 2)
+        index += 2
+        continue
+      }
+      if (ch === '"') {
+        quote = ''
+        out += ch
+        index += 1
+        continue
+      }
+      if (text.startsWith(token, index)) {
+        out += CUSTOM_PROMPT_REFERENCE_IN_QUOTES
+        index += token.length
+        continue
+      }
+      out += ch
+      index += 1
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      out += ch
+      index += 1
+      continue
+    }
+    if (ch === '\\' && index + 1 < text.length) {
+      out += text.slice(index, index + 2)
+      index += 2
+      continue
+    }
+    if (text.startsWith(token, index)) {
+      out += CUSTOM_PROMPT_REFERENCE
+      index += token.length
+      continue
+    }
+    out += ch
+    index += 1
+  }
+  return out
+}
+
+/**
+ * 建本次执行专用的 prompt 临时文件：唯一临时目录（0700）+ 普通文件（0600）。
+ * 写失败时自己清理刚建的目录再把错误抛出去，避免半成品残留。
+ *
+ * @param {string} prompt
+ * @returns {{dir:string,file:string}}
+ */
+function createPromptFile(prompt) {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-flow-studio-prompt-'))
+  try {
+    const file = join(dir, 'prompt.txt')
+    writeFileSync(file, prompt, { encoding: 'utf8', mode: 0o600 })
+    return { dir, file }
+  } catch (error) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // 清理失败不改变错误语义。
+    }
+    throw error
+  }
+}
+
+/** 删除 prompt 临时文件；任何清理失败都吞掉，清理不能改变本次执行结果。 */
+function removePromptFile(state) {
+  if (!state || typeof state.dir !== 'string') return
+  try {
+    rmSync(state.dir, { recursive: true, force: true })
+  } catch {
+    // 同上：清理是尽力而为。
+  }
+}
+
+/**
+ * custom executor 的命令模板：替换 {prompt} / {schema} / {cwd}。
+ *
+ * - `{prompt}` → 读 `FLOW_STUDIO_PROMPT_FILE` 的命令替换（按所在引号上下文选择形态，
+ *   见 `replacePromptPlaceholders`），prompt 原文不进命令文本；
+ * - `{schema}` / `{cwd}` → POSIX 单引号转义（它们来自节点配置，不是 prompt 通道）；
+ * - 命令里没有 `{prompt}` 时**不改命令文本**：prompt 走 `FLOW_STUDIO_PROMPT_FILE` /
+ *   `FLOW_STUDIO_PROMPT`（小 prompt）/ stdin。
+ */
+function buildCustomScript(template, { schemaPath, cwd } = {}) {
+  return replacePromptPlaceholders(template)
+    .replace(/\{schema\}/g, () => shellQuote(schemaPath || ''))
+    .replace(/\{cwd\}/g, () => shellQuote(cwd || ''))
+}
+
+/**
+ * 把 prompt 原文写进 custom 子进程的 stdin，然后 `end()`。
+ *
+ * 子进程不一定读 stdin（例如 `true`）：此时写管道会拿到 EPIPE / ECONNRESET，
+ * 这是预期行为，必须吞掉——否则一次成功的执行会被 stdin 的未捕获 error 事件带崩。
+ */
+function feedPromptToStdin(child, prompt) {
+  const stdin = child && child.stdin
+  if (!stdin || typeof stdin.write !== 'function' || typeof stdin.end !== 'function') return
+  if (typeof stdin.on === 'function') stdin.on('error', () => {})
+  try {
+    // 一次写入 + 关闭：prompt 保持原文字节，不做任何编码/转义变换。
+    stdin.end(prompt)
+  } catch {
+    // 子进程已退出等原因写不进去，同样不影响本次执行的结果。
+  }
 }
 
 /**
@@ -325,6 +511,10 @@ function tailOf(value, max) {
  * 跑一个外部 executor。
  *
  * custom 一律 `sh -c <模板>`；codex 直接 argv 执行，不经过 shell。
+ * custom 的 prompt 原文只走三条数据通道：临时文件（`FLOW_STUDIO_PROMPT_FILE`，主）/
+ * 小 prompt 的 `FLOW_STUDIO_PROMPT`（≤64KiB 兼容）/ 子进程 stdin（全文兜底）；
+ * 命令模板里只有读文件的命令替换 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`，
+ * 绝无 prompt 文本参与 shell 解析。临时文件在本次执行收口时删除。
  * 返回 `{ ok, text, structured, exitCode, usage, events }`；失败时追加
  * `reason`（timeout / aborted / exit / spawn），非 0 退出再带 `tail`。
  *
@@ -424,6 +614,10 @@ export async function runExternalExecutor({
   // 先把命令与 argv 算好：配置错误在起进程之前就以 EXECUTOR_INVALID 抛出。
   let command
   let args
+  /** custom 专属：prompt 原文只通过临时文件 + env + stdin 传给子进程，不进命令文本。 */
+  let customPrompt = null
+  /** custom 专属：本次执行的 prompt 临时文件（成功 / 失败 / 超时 / abort 统一在 finish 清理）。 */
+  let promptFile = null
   if (spec.kind === 'codex') {
     command = spec.command || 'codex'
     args = buildCodexArgs({
@@ -435,7 +629,8 @@ export async function runExternalExecutor({
     })
   } else {
     command = 'sh'
-    args = ['-c', buildCustomScript(spec.command, { prompt, schemaPath: spec.schemaPath, cwd })]
+    customPrompt = typeof prompt === 'string' ? prompt : String(prompt ?? '')
+    args = ['-c', buildCustomScript(spec.command, { schemaPath: spec.schemaPath, cwd })]
   }
 
   const consumeLine = (line) => {
@@ -464,6 +659,9 @@ export async function runExternalExecutor({
       if (signal && typeof signal.removeEventListener === 'function') {
         signal.removeEventListener('abort', onAbort)
       }
+      // 所有收口路径都经过这里：成功 / 非 0 退出 / 超时 / abort / spawn 失败。
+      removePromptFile(promptFile)
+      promptFile = null
       resolve(result)
     }
 
@@ -504,8 +702,36 @@ export async function runExternalExecutor({
       return
     }
 
+    // custom：先把 prompt 原文落到本次执行专用的临时文件。
+    // 它是 `{prompt}` 主通道的数据源，也通过 FLOW_STUDIO_PROMPT_FILE 暴露给命令模板。
+    if (spec.kind === 'custom') {
+      try {
+        promptFile = createPromptFile(customPrompt)
+      } catch (error) {
+        failWith('spawn', {
+          message: `无法写入 prompt 临时文件：${error && error.message ? error.message : String(error)}`,
+        })
+        return
+      }
+    }
+
     try {
-      child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+      if (spec.kind === 'custom') {
+        // 三段式传参：文件（主）+ env 直传（小 prompt 兼容）+ stdin（全文兜底）。
+        const env = { ...process.env, [CUSTOM_PROMPT_FILE_ENV]: promptFile.file }
+        if (Buffer.byteLength(customPrompt, 'utf8') <= CUSTOM_PROMPT_ENV_MAX_BYTES) {
+          env[CUSTOM_PROMPT_ENV] = customPrompt
+        } else {
+          // 大 prompt 不设 FLOW_STUDIO_PROMPT：Linux 单条 env 字符串约 128KiB 上限，
+          // 超了 execve E2BIG。模板应改用 {prompt} 或 "$FLOW_STUDIO_PROMPT_FILE"。
+          // 这里显式 delete，防止父进程同名变量泄漏进来。
+          delete env[CUSTOM_PROMPT_ENV]
+        }
+        child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+      } else {
+        // codex 行为保持不变：prompt 走 argv，不写 stdin、不注入 custom 的环境变量。
+        child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+      }
     } catch (error) {
       failWith('spawn', { message: error && error.message ? error.message : String(error) })
       return
@@ -514,6 +740,7 @@ export async function runExternalExecutor({
       failWith('spawn', { message: '子进程没有可用的 stdout / stderr 通道。' })
       return
     }
+    if (spec.kind === 'custom') feedPromptToStdin(child, customPrompt)
 
     if (typeof child.stdout.setEncoding === 'function') child.stdout.setEncoding('utf8')
     if (typeof child.stderr.setEncoding === 'function') child.stderr.setEncoding('utf8')

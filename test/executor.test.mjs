@@ -2,16 +2,24 @@
 /**
  * 外部 executor 自检（07 §6 / §8）。
  *
- * 除最后一组外全部走注入的假 spawn：手动 emit `data` / `close`，验证跨 chunk 半行、
- * 未知事件、usage、超时、abort 与非 0 退出。最后一组用真 node 子进程跑 `.tmp/` 下的
- * 桩脚本做端到端验证；**任何一组都不会真的调用 codex，也不联网**。
+ * 前半部分走注入的假 spawn：手动 emit `data` / `close`，验证跨 chunk 半行、
+ * 未知事件、usage、超时、abort 与非 0 退出。末尾用真 `sh -c` 子进程跑 `.tmp/`
+ * 下的临时目录，端到端验证 custom executor 的 prompt 注入修复与三条传递通道：
+ *   1. 临时文件 + `FLOW_STUDIO_PROMPT_FILE`（`{prompt}` 主通道）；
+ *   2. `FLOW_STUDIO_PROMPT` 环境变量（仅 ≤64KiB 的兼容通道）；
+ *   3. stdin（全文兜底）。
+ * 另验证 prompt 临时文件在成功 / 失败 / 超时路径都被清理。
+ * **任何一组都不会真的调用 codex，也不联网**。
  *
  * 跑：`node test/executor.test.mjs`
  */
 
 import assert from 'node:assert/strict'
+import { spawn as realSpawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -71,6 +79,18 @@ function fakeSpawn() {
     const child = new EventEmitter()
     child.stdout = new EventEmitter()
     child.stderr = new EventEmitter()
+    // stdin 只记录写入内容：fake 场景不验证真实管道，端到端用例才用真子进程。
+    child.stdin = new EventEmitter()
+    child.stdin.writes = []
+    child.stdin.ended = false
+    child.stdin.write = (chunk) => {
+      child.stdin.writes.push(String(chunk))
+      return true
+    }
+    child.stdin.end = (chunk) => {
+      if (chunk !== undefined && chunk !== null) child.stdin.writes.push(String(chunk))
+      child.stdin.ended = true
+    }
     child.pid = 4300 + children.length
     child.killed = false
     child.killSignals = []
@@ -97,6 +117,77 @@ async function check(name, fn) {
   await fn()
   checks += 1
   console.log(`  ✓ ${name}`)
+}
+
+/** 在 `.tmp/` 下建唯一临时目录；调用方负责删除。 */
+function makeTmpDir(label) {
+  return mkdtempSync(join(repoRoot, '.tmp', `${label}-`))
+}
+
+/** 测试内部拼绝对路径用的 POSIX 单引号引用。 */
+function shq(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+/** 用真实 `sh -c` 跑一次 custom executor（不 mock child_process）。 */
+function runCustom(command, prompt, extra = {}) {
+  return runExternalExecutor({
+    spec: { kind: 'custom', command },
+    prompt,
+    cwd: repoRoot,
+    ...extra,
+  })
+}
+
+/** 给「不应挂起」的用例兜底：超时即失败，避免测试进程被挂死。 */
+async function within(promise, ms, label) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}：超过 ${ms}ms 仍未结束`)), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 真实 spawn 的观测包装：记下执行器传给子进程的 prompt 临时文件路径。 */
+function capturePromptFileSpawn() {
+  const state = { file: null, dir: null }
+  const spawn = (command, args, options) => {
+    const env = options && options.env ? options.env : {}
+    if (typeof env.FLOW_STUDIO_PROMPT_FILE === 'string') {
+      state.file = env.FLOW_STUDIO_PROMPT_FILE
+      state.dir = dirname(state.file)
+    }
+    return realSpawn(command, args, options)
+  }
+  return { state, spawn }
+}
+
+/**
+ * 构造恰好 256KiB（UTF-8 字节）的 prompt：
+ * 含换行、`$`、反引号、单双引号、反斜杠，以及三类注入载荷；
+ * 末尾是 `END-MARKER`（不带换行，避免命令替换剥尾换行影响逐字节断言）。
+ */
+function largePrompt(sentinel, dir) {
+  const target = 256 * 1024
+  const head = [
+    'BEGIN 256KiB payload',
+    "单引号 'x' 双引号 \"y\" 反斜杠 \\ 美元 $HOME 感叹 !",
+    '反引号 `id -u` 与 $(id -u)',
+    `$(touch ${sentinel})`,
+    `"; touch ${sentinel}; echo "`,
+    `$(rm -rf ${dir})`,
+    '第二段：$$$ `echo pwned` "quoted"',
+  ].join('\n') + '\n'
+  const tail = 'END-MARKER'
+  const pad = target - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8')
+  if (pad <= 0) throw new Error('largePrompt：固定头部已超过目标大小')
+  return head + 'A'.repeat(pad) + tail
 }
 
 console.log('executor.js')
@@ -193,6 +284,10 @@ await check('runExternalExecutor：跨 chunk 半行 / usage / stderr 尾部 / on
 
   A.equal(calls[0].command, 'codex')
   A.equal(calls[0].options.cwd, '/repo')
+  // codex 行为保持不变：prompt 走 argv 位置参数，不写 stdin、不注入 PROMPT 环境变量。
+  A.deepEqual(calls[0].options.stdio, ['ignore', 'pipe', 'pipe'])
+  A.equal(calls[0].options.env, undefined)
+  A.equal(calls[0].args[calls[0].args.length - 1], '把事做完')
   A.deepEqual(calls[0].args.slice(0, 5), ['exec', '--json', '--output-schema', '/repo/schema.json', '-C'])
 
   const finalLine = `${JSON.stringify({
@@ -234,7 +329,7 @@ await check('runExternalExecutor：跨 chunk 半行 / usage / stderr 尾部 / on
   A.ok(seen.length >= 4, 'onEvent 应逐条回调')
 })
 
-await check('runExternalExecutor：custom 占位符替换与 shell 安全转义', async () => {
+await check('runExternalExecutor：custom 的 {prompt} 替换成读 prompt 文件，prompt 原文不进命令文本', async () => {
   const { promise, child, calls } = startFake({
     spec: { kind: 'custom', command: 'agent --schema {schema} --cwd {cwd} --prompt {prompt}', schemaPath: '/tmp/x schema.json' },
     prompt: "it's ok",
@@ -244,24 +339,42 @@ await check('runExternalExecutor：custom 占位符替换与 shell 安全转义'
   A.equal(calls[0].args[0], '-c')
   A.equal(
     calls[0].args[1],
-    "agent --schema '/tmp/x schema.json' --cwd '/repo' --prompt 'it'\\''s ok'",
+    `agent --schema '/tmp/x schema.json' --cwd '/repo' --prompt "$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`,
   )
+  A.ok(!calls[0].args[1].includes("it's ok"), 'prompt 原文绝不能出现在 sh -c 脚本里')
+  A.deepEqual(calls[0].options.stdio, ['pipe', 'pipe', 'pipe'])
+  A.equal(calls[0].options.env.FLOW_STUDIO_PROMPT, "it's ok")
+  const promptFile = calls[0].options.env.FLOW_STUDIO_PROMPT_FILE
+  A.ok(typeof promptFile === 'string' && promptFile !== '', '必须用 FLOW_STUDIO_PROMPT_FILE 暴露文件路径')
+  A.equal(existsSync(promptFile), true, '执行期间 prompt 文件应存在')
+  A.equal(readFileSync(promptFile, 'utf8'), "it's ok", 'prompt 文件内容必须是原文')
+  A.equal(child.stdin.writes.join(''), "it's ok")
+  A.equal(child.stdin.ended, true)
   child.emit('close', 0, null)
   const result = await promise
   A.equal(result.ok, true)
+  A.equal(existsSync(promptFile), false, '执行结束后 prompt 文件必须被清理')
+  A.equal(existsSync(dirname(promptFile)), false, '执行结束后 prompt 临时目录必须被清理')
 })
 
-await check('runExternalExecutor：custom 无占位符时 prompt 追加为最后一个参数', async () => {
+await check('runExternalExecutor：custom 无占位符时不改命令文本，prompt 走文件 + env + stdin', async () => {
   const { promise, child, calls } = startFake({
     spec: { kind: 'custom', command: 'my-agent --json' },
     prompt: "say 'hi'",
     cwd: '/repo',
   })
-  A.equal(calls[0].args[1], "my-agent --json 'say '\\''hi'\\'''")
+  A.equal(calls[0].args[1], 'my-agent --json', '没有 {prompt} 时命令文本必须保持原样')
+  A.equal(calls[0].options.env.FLOW_STUDIO_PROMPT, "say 'hi'")
+  const promptFile = calls[0].options.env.FLOW_STUDIO_PROMPT_FILE
+  A.ok(typeof promptFile === 'string' && promptFile !== '')
+  A.equal(readFileSync(promptFile, 'utf8'), "say 'hi'")
+  A.equal(child.stdin.writes.join(''), "say 'hi'", 'prompt 原文应完整写进 stdin')
+  A.equal(child.stdin.ended, true)
   child.emit('close', 0, null)
   const result = await promise
   A.equal(result.ok, true)
   A.equal(result.text, '')
+  A.equal(existsSync(promptFile), false, '执行结束后 prompt 文件必须被清理')
 })
 
 await check('runExternalExecutor：custom 裸 JSON 输出回退成 text / structured', async () => {
@@ -387,6 +500,266 @@ await check('runExternalExecutor：真 node 子进程端到端，structured 解�
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 真实 `sh -c` 端到端：prompt 注入回归（RCE 修复证据，不 mock child_process）
+// ---------------------------------------------------------------------------
+
+await check('真实 sh -c：echo "{prompt}" 里的 $(id -u) 保持字面量，不再执行', async () => {
+  const result = await runCustom('echo "{prompt}"', '$(id -u)')
+  A.equal(result.ok, true)
+  A.equal(result.exitCode, 0)
+  A.equal(result.text, '$(id -u)', '双引号内的占位符必须只做变量展开，输出 prompt 原文')
+  A.ok(!/\b1000\b/.test(result.text), '不得出现 id -u 的真实输出（1000）')
+})
+
+await check('真实 sh -c：反引号 / 引号逃逸 / $(rm -rf) 三类载荷都不执行', async () => {
+  const dir = makeTmpDir('executor-inject')
+  const sentinel = join(dir, 'pwned')
+  try {
+    const escaped = `"; touch ${sentinel}; echo "`
+    const payloads = [
+      '`id -u`',
+      escaped,
+      `$(rm -rf ${dir})`,
+    ]
+    for (const prompt of payloads) {
+      const result = await runCustom('echo "{prompt}"', prompt)
+      A.equal(result.ok, true)
+      A.equal(result.text, prompt, `载荷必须原样输出：${prompt}`)
+    }
+    A.equal(existsSync(sentinel), false, '引号逃逸载荷不得创建哨兵文件')
+    A.equal(existsSync(dir), true, '$(rm -rf …) 载荷不得删除哨兵目录')
+    A.equal(existsSync(sentinel), false, '整轮结束后哨兵文件仍不得存在')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：无引号位置的 {prompt} 同样安全（替换产物自带双引号）', async () => {
+  const dir = makeTmpDir('executor-bare')
+  const sentinel = join(dir, 'pwned')
+  try {
+    const payload = `pre$(id -u)post;touch ${sentinel};`
+    const result = await runCustom('echo {prompt}', payload)
+    A.equal(result.ok, true)
+    A.equal(result.text, payload, '无引号位置也只做变量展开，载荷原样输出')
+    A.equal(existsSync(sentinel), false, '无引号位置不得执行;分隔出的命令')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：单引号内的 {prompt} 是「不支持的位置」——输出替换产物字面量，无展开无注入', async () => {
+  const dir = makeTmpDir('executor-single')
+  const sentinel = join(dir, 'pwned')
+  try {
+    const payload = `$(touch ${sentinel})`
+    const result = await runCustom("echo '{prompt}'", payload)
+    A.equal(result.ok, true)
+    A.equal(
+      result.text,
+      '"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"',
+      '单引号内 shell 不展开变量：输出的是替换产物字面量（不是 prompt，也不会执行 payload）',
+    )
+    A.equal(existsSync(sentinel), false, '单引号位置不得产生注入')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：复杂 prompt（空格/换行/引号/$/!/反斜杠/中文）逐字节到达 env 与 stdin', async () => {
+  const dir = makeTmpDir('executor-roundtrip')
+  const envFile = join(dir, 'env.bin')
+  const stdinFile = join(dir, 'stdin.bin')
+  // 首尾都带空白（前导空格 + 结尾换行）：证明原样传递、没有被 trim 或改写。
+  const prompt = ' 第一行：空格  两个  制表\t制表\n'
+    + "第二行 '单引号' \"双引号\" $HOME ${USER} ! !!\n"
+    + '反斜杠 \\ 与 \\\\ 两道\n'
+    + '$(id -u) `id -u` & ; | > < * ? ~ % 中文结束\n'
+  try {
+    const command = `cat > ${shq(stdinFile)}; printf '%s' "$FLOW_STUDIO_PROMPT" > ${shq(envFile)}`
+    const result = await within(runCustom(command, prompt), 15000, 'prompt 往返')
+    A.equal(result.ok, true)
+    A.equal(result.exitCode, 0)
+    const stdinBytes = readFileSync(stdinFile)
+    A.ok(
+      Buffer.compare(stdinBytes, Buffer.from(prompt, 'utf8')) === 0,
+      'stdin 必须逐字节等于 prompt 原文',
+    )
+    A.equal(stdinBytes.length, Buffer.byteLength(prompt), 'stdin 长度必须与原文一致')
+    A.equal(readFileSync(envFile, 'utf8'), prompt, 'FLOW_STUDIO_PROMPT 必须逐字节等于 prompt 原文')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：子进程不读 stdin（true）不失败、不挂起', async () => {
+  const small = await within(runCustom('true', 'ignored'), 15000, 'true 小 prompt')
+  A.equal(small.ok, true)
+  A.equal(small.exitCode, 0)
+  A.equal(small.text, '')
+
+  // 100KB 超过 Linux 管道默认缓冲（64KB）：压测子进程提前退出时的 stdin 写失败路径。
+  const bigPrompt = 'x'.repeat(100_000)
+  const big = await within(runCustom('true', bigPrompt), 15000, 'true 大 prompt')
+  A.equal(big.ok, true, 'stdin 写失败不得把成功的执行变成失败')
+  A.equal(big.exitCode, 0)
+  A.equal(big.text, '')
+})
+
+await check('真实 sh -c：stdin 管道报错（EPIPE）被吞掉，不影响执行结果', async () => {
+  const stdinErrors = []
+  let observed = null
+  // 真实 spawn 的观测包装：给子进程 stdin 注入一次 EPIPE，验证执行器自己挂的
+  // error 处理器会吞掉它——否则未捕获的 error 事件会带崩整个进程。
+  const spawn = (command, args, options) => {
+    const child = realSpawn(command, args, options)
+    observed = child
+    child.stdin.on('error', error => stdinErrors.push(error.code || error.message))
+    const pipeError = new Error('write EPIPE')
+    pipeError.code = 'EPIPE'
+    child.stdin.destroy(pipeError)
+    return child
+  }
+  const promise = runExternalExecutor({
+    spec: { kind: 'custom', command: 'true' },
+    prompt: 'hello',
+    cwd: repoRoot,
+    spawn,
+  })
+  // runExternalExecutor 起进程是同步的：此刻执行器必须已经挂上自己的 stdin error 处理器。
+  A.ok(observed && observed.stdin.listenerCount('error') >= 2, '执行器必须自己监听 stdin error')
+  const result = await within(promise, 15000, 'stdin 错误注入')
+  A.equal(result.ok, true, 'stdin 写失败不得把成功的执行变成失败')
+  A.equal(result.exitCode, 0)
+  A.deepEqual(stdinErrors, ['EPIPE'], '注入的 EPIPE 必须被观测到且被吞掉')
+})
+
+await check('真实 sh -c：256KiB prompt 经 {prompt} 通道逐字节到达且无注入', async () => {
+  const dir = makeTmpDir('executor-large-file')
+  const sentinel = join(dir, 'pwned')
+  const outFile = join(dir, 'out.bin')
+  try {
+    const prompt = largePrompt(sentinel, dir)
+    A.equal(Buffer.byteLength(prompt, 'utf8'), 256 * 1024, '用例 prompt 必须精确为 256KiB')
+    // 放在双引号内：替换器应按引号上下文去掉多余外层引号，仍逐字节保真。
+    const command = `printf '%s' "{prompt}" > ${shq(outFile)}`
+    const result = await within(runCustom(command, prompt), 30000, '256KiB {prompt}')
+    A.equal(result.ok, true, '256KiB prompt 不得触发 E2BIG 或执行失败')
+    A.equal(result.exitCode, 0)
+    const got = readFileSync(outFile)
+    A.equal(got.length, 256 * 1024, '文件通道输出字节数必须等于 256KiB')
+    A.ok(Buffer.compare(got, Buffer.from(prompt, 'utf8')) === 0, '文件通道输出必须逐字节等于 prompt 原文')
+    A.equal(existsSync(sentinel), false, '256KiB prompt 内的 touch 载荷不得执行')
+    A.equal(existsSync(dir), true, '256KiB prompt 内的 rm -rf 载荷不得执行')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：256KiB prompt 经 stdin 通道逐字节到达', async () => {
+  const dir = makeTmpDir('executor-large-stdin')
+  const sentinel = join(dir, 'pwned')
+  const outFile = join(dir, 'stdin.bin')
+  try {
+    const prompt = largePrompt(sentinel, dir)
+    A.equal(Buffer.byteLength(prompt, 'utf8'), 256 * 1024)
+    const result = await within(runCustom(`cat > ${shq(outFile)}`, prompt), 30000, '256KiB stdin')
+    A.equal(result.ok, true)
+    A.equal(result.exitCode, 0)
+    const got = readFileSync(outFile)
+    A.equal(got.length, 256 * 1024, 'stdin 通道收到字节数必须等于 256KiB')
+    A.ok(Buffer.compare(got, Buffer.from(prompt, 'utf8')) === 0, 'stdin 通道必须逐字节等于 prompt 原文')
+    A.equal(existsSync(sentinel), false, '256KiB prompt 内的载荷经 stdin 也不得执行')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：256KiB prompt 时 FLOW_STUDIO_PROMPT 不设置，FLOW_STUDIO_PROMPT_FILE 逐字节相等', async () => {
+  const dir = makeTmpDir('executor-large-env')
+  const sentinel = join(dir, 'pwned')
+  const envDump = join(dir, 'env.txt')
+  const fileCopy = join(dir, 'file.bin')
+  const previous = process.env.FLOW_STUDIO_PROMPT
+  // 模拟父进程残留同名变量：大 prompt 时必须被显式删除，不能泄漏旧值。
+  process.env.FLOW_STUDIO_PROMPT = 'stale-parent-value'
+  try {
+    const prompt = largePrompt(sentinel, dir)
+    A.equal(Buffer.byteLength(prompt, 'utf8'), 256 * 1024)
+    const command = `env > ${shq(envDump)}; cat -- "$FLOW_STUDIO_PROMPT_FILE" > ${shq(fileCopy)}`
+    const result = await within(runCustom(command, prompt), 30000, '256KiB env 探测')
+    A.equal(result.ok, true, '大 prompt 不得触发 E2BIG')
+    const envLines = readFileSync(envDump, 'utf8').split('\n')
+    A.ok(envLines.some(line => line.startsWith('FLOW_STUDIO_PROMPT_FILE=')), '必须暴露 prompt 文件路径')
+    A.equal(
+      envLines.some(line => line.startsWith('FLOW_STUDIO_PROMPT=')),
+      false,
+      '大 prompt 时 FLOW_STUDIO_PROMPT 必须未设置（含父进程残留值）',
+    )
+    const got = readFileSync(fileCopy)
+    A.equal(got.length, 256 * 1024, 'FLOW_STUDIO_PROMPT_FILE 内容字节数必须是 256KiB')
+    A.ok(Buffer.compare(got, Buffer.from(prompt, 'utf8')) === 0, 'FLOW_STUDIO_PROMPT_FILE 内容必须逐字节相等')
+    A.equal(existsSync(sentinel), false, '文件通道载荷不得执行')
+  } finally {
+    if (previous === undefined) delete process.env.FLOW_STUDIO_PROMPT
+    else process.env.FLOW_STUDIO_PROMPT = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('真实 sh -c：prompt 临时文件在成功路径清理（目录 0700 / 文件 0600）', async () => {
+  const prompt = 'success-path prompt'
+  const { state, spawn } = capturePromptFileSpawn()
+  const promise = runExternalExecutor({
+    spec: { kind: 'custom', command: 'printf ok' },
+    prompt,
+    cwd: repoRoot,
+    spawn,
+  })
+  A.ok(state.file, 'spawn 前必须写好 FLOW_STUDIO_PROMPT_FILE')
+  A.equal(existsSync(state.file), true, '执行期间 prompt 文件应存在')
+  A.equal(readFileSync(state.file, 'utf8'), prompt)
+  A.equal(statSync(state.file).mode & 0o777, 0o600, 'prompt 文件权限必须是 0600')
+  A.equal(statSync(state.dir).mode & 0o777, 0o700, 'prompt 临时目录权限必须是 0700')
+  const result = await within(promise, 15000, '成功路径清理')
+  A.equal(result.ok, true)
+  A.equal(existsSync(state.file), false, '成功后 prompt 文件必须被清理')
+  A.equal(existsSync(state.dir), false, '成功后 prompt 临时目录必须被清理')
+})
+
+await check('真实 sh -c：prompt 临时文件在失败路径清理（exit 3）', async () => {
+  const { state, spawn } = capturePromptFileSpawn()
+  const result = await within(runExternalExecutor({
+    spec: { kind: 'custom', command: 'exit 3' },
+    prompt: 'failure-path prompt',
+    cwd: repoRoot,
+    spawn,
+  }), 15000, '失败路径清理')
+  A.equal(result.ok, false)
+  A.equal(result.reason, 'exit')
+  A.equal(result.exitCode, 3)
+  A.ok(state.file, '失败前必须创建过 prompt 临时文件')
+  A.equal(existsSync(state.file), false, '失败后 prompt 文件必须被清理')
+  A.equal(existsSync(state.dir), false, '失败后 prompt 临时目录必须被清理')
+})
+
+await check('真实 sh -c：prompt 临时文件在超时路径清理', async () => {
+  const { state, spawn } = capturePromptFileSpawn()
+  const result = await within(runExternalExecutor({
+    spec: { kind: 'custom', command: 'exec sleep 5' },
+    prompt: 'timeout-path prompt',
+    cwd: repoRoot,
+    timeoutMs: 60,
+    spawn,
+  }), 15000, '超时路径清理')
+  A.equal(result.ok, false)
+  A.equal(result.reason, 'timeout')
+  A.ok(state.file, '超时前必须创建过 prompt 临时文件')
+  A.equal(existsSync(state.file), false, '超时后 prompt 文件必须被清理')
+  A.equal(existsSync(state.dir), false, '超时后 prompt 临时目录必须被清理')
 })
 
 console.log(`\n${checks} 组通过，${assertionCount} 条断言`)

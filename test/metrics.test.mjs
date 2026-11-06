@@ -276,6 +276,18 @@ function rawEvent(kind, runId, over = {}) {
   }
 }
 
+/**
+ * E3-b：生命周期事件（run/start、run/end、node/start、node/end、member/*、
+ * reject/trigger）只能由引擎 / 运行时内部推进，HTTP `/events` 是观测类白名单。
+ * 测试播种改走内部路径 `store.appendEvents` —— 与路由最终调用的实现同一条
+ * （同一套归一化 / 进度计数 / run.json 写盘），聚合口径与断言全部不变。
+ * 纯观测类事件（acceptance/verdict、artifact/write、review/*、agent/message…）
+ * 仍然走 HTTP `/events`，外部通道能力照旧有覆盖。
+ */
+async function seedEvents(runId, events) {
+  return store.appendEvents(runsRoot, runId, events)
+}
+
 console.log('metrics · Host HTTP 探针')
 
 await check('GET /health 带 auth / runsDir / version（§8.5 + §13.1）', async () => {
@@ -288,7 +300,7 @@ await check('GET /health 带 auth / runsDir / version（§8.5 + §13.1）', asyn
 
 await check('坏 run 目录下 GET /runs 仍 200，并带 skipped（§8.6）', async () => {
   const good = await makeRun()
-  await call(route, 'POST', `/api/flow-studio/runs/${good.id}/events`, [
+  await seedEvents(good.id, [
     rawEvent('node/end', good.id, { data: { status: 'passed', durationMs: 1 } }),
   ])
   mkdirSync(join(runsRoot, 'r-bad-http', 'run.json'), { recursive: true })
@@ -311,6 +323,32 @@ await check('2 MiB 请求体返回可读 413（不是 ECONNRESET）', async () =
   assert.match(result.json.error, /请求体过大/)
   assert.ok(!/ECONNRESET/i.test(result.body))
   console.log(`  · POST 2MiB → ${result.status} ${JSON.stringify(result.json)}`)
+})
+
+await check('E3-b 外部 /events 通道：生命周期 kind → 400 且状态不变，观测 kind → 200', async () => {
+  const meta = await makeRun(1)
+  const base = `/api/flow-studio/runs/${meta.id}/events`
+
+  // 生命周期（run/start）走 HTTP：必须 400，且不能把 pending 推成 running（否则永久 409）。
+  const rejected = await call(route, 'POST', base, [
+    rawEvent('run/start', meta.id, {
+      nodeId: undefined, attemptId: undefined,
+      data: { flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1 },
+    }),
+  ])
+  assert.equal(rejected.status, 400)
+  assert.match(rejected.json.error, /生命周期/)
+  assert.equal((await store.readRunMeta(runsRoot, meta.id)).status, 'pending', '被拒的 run/start 不能改状态机')
+
+  // 观测类（agent/message）走 HTTP：外部通道不能被一刀切死。
+  const accepted = await call(route, 'POST', base, [
+    rawEvent('agent/message', meta.id, {
+      data: { role: 'assistant', text: '外部通道的观测消息', truncated: false },
+    }),
+  ])
+  assert.equal(accepted.status, 200)
+  assert.equal(accepted.json.accepted, 1)
+  console.log(`  · lifecycle → ${rejected.status}（仍 pending）· agent/message → ${accepted.status}`)
 })
 
 await check('500 只回通用文案 + traceId，不带 /home/... 路径（§8.5）', async () => {
@@ -339,7 +377,7 @@ await check('500 只回通用文案 + traceId，不带 /home/... 路径（§8.5�
 
 await check('GET /runs 与 GET /runs/<id> 的 nodeTotal / nodeDone 同口径同值（§8.6）', async () => {
   const meta = await makeRun(2)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('run/start', meta.id, { nodeId: undefined, attemptId: undefined, data: { flowId: 'flow-a', flowName: '默认流程', nodeTotal: 2 } }),
     rawEvent('node/end', meta.id, { nodeId: 'n_a', data: { status: 'passed', durationMs: 1 } }),
     rawEvent('node/end', meta.id, { nodeId: 'n_b', data: { status: 'passed', durationMs: 1 } }),
@@ -356,8 +394,11 @@ await check('GET /runs 与 GET /runs/<id> 的 nodeTotal / nodeDone 同口径同�
 
 await check('summary 声明 eventCount / truncated，并带 findings.byNode（§8.6 + 补充）', async () => {
   const meta = await makeRun(1)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  // 生命周期走内部路径；评审类观测事件仍走 HTTP，事件总数 / 顺序不变。
+  await seedEvents(meta.id, [
     rawEvent('node/end', meta.id, { nodeId: 'n_a', data: { status: 'passed', durationMs: 1 } }),
+  ])
+  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
     rawEvent('review/finding', meta.id, { nodeId: 'n_a', data: { id: 'f1', severity: 'P1', title: '问题', status: 'open' } }),
     rawEvent('review/verdict', meta.id, { nodeId: 'n_a', data: { verdict: 'approve', findingCount: 1 } }),
   ])
@@ -379,7 +420,7 @@ await check('summary 声明 eventCount / truncated，并带 findings.byNode（§
 
 await check('GET /export 接受 ?token（浏览器 <a download>），错 token 401；未配置时参数被忽略', async () => {
   const meta = await makeRun(1)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('node/end', meta.id, { nodeId: 'n_a', data: { status: 'passed', durationMs: 1 } }),
   ])
 
@@ -518,7 +559,7 @@ await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全�
   const stubRun = await store.createRun(runsRoot, {
     flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1, engine: 'stub',
   })
-  await call(route, 'POST', `/api/flow-studio/runs/${stubRun.id}/events`, [
+  await seedEvents(stubRun.id, [
     rawEvent('run/start', stubRun.id, {
       nodeId: undefined, attemptId: undefined,
       data: { flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1, engine: 'stub' },
@@ -581,7 +622,7 @@ await check('§13.7 /summary 按 lastSeq 增量缓存：未变命中、追加后
   assert.equal(first.json.cached, false)
   const second = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
   assert.equal(second.json.cached, true)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('node/end', meta.id, { data: { status: 'passed', durationMs: 1 } }),
   ])
   const third = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)

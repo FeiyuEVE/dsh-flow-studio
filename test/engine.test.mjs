@@ -19,12 +19,17 @@ import { fileURLToPath } from 'node:url'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 const home = mkdtempSync(join(repoRoot, '.tmp', 'home-engine-'))
+// C3：start() 不再回落 process.cwd()。既有测试夹具统一给一个真实存在的显式
+// 工作区（构造时 cwd），新增的「无 workspace → 400」专组会绕过这个默认值。
+const testWorkspace = join(home, 'workspace')
+mkdirSync(testWorkspace, { recursive: true })
 
 const engineModule = await import('../src/engine.js')
 const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
 const { summarize } = await import('../src/runlog.js')
 const { toStrictOutputSchema } = await import('../src/executor.js')
+const supervise = await import('../src/supervise.js')
 
 const {
   createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
@@ -36,9 +41,10 @@ const {
  * 既有 49 组测试关心的是主循环 / 提示词 / 事件契约，不关心 worktree。构造时默认
  * `worktree:'off'`，避免在插件仓库本身（测试进程的 cwd 是 git 根）上真建 worktree；
  * R1/R4 的 auto / on 行为由文末追加的专组用显式 `worktree` 覆盖。
+ * C3 起还必须显式给工作区，夹具统一用 `testWorkspace`（显式 cwd，不是 process.cwd）。
  * 这只是测试夹具默认值，不改任何既有断言。
  */
-const createEngine = (options = {}) => createEngineRaw({ worktree: 'off', ...options })
+const createEngine = (options = {}) => createEngineRaw({ worktree: 'off', cwd: testWorkspace, ...options })
 
 const runsRoot = store.runsDir(home)
 const flowsRoot = flowStore.flowsDir(home)
@@ -224,8 +230,30 @@ function makePlainDir(name) {
 }
 
 /**
+ * C2：从引擎下发的提示词里读回本轮 attempt / nonce（夹具据此回显，正式结论才不会被丢）。
+ * payload 可以是 followup 入参，也可以直接是 prompt 文本。
+ */
+function envelopeOf(payload) {
+  const text = typeof payload === 'string'
+    ? payload
+    : (payload && Array.isArray(payload.content)
+      ? payload.content.filter(block => block && block.type === 'text').map(block => block.text).join('\n')
+      : '')
+  const attempt = /^- attempt: (\d+)$/m.exec(text)
+  const nonce = /^- nonce: (.+)$/m.exec(text)
+  if (!attempt || !nonce) return null
+  return { attempt: Number(attempt[1]), nonce: nonce[1].trim() }
+}
+
+/** 把对象包成 assistant 回复里的 ```json 围栏。 */
+function fenced(value) {
+  return `\`\`\`json\n${JSON.stringify(value)}\n\`\`\``
+}
+
+/**
  * `agents.create` 桩：节点会话按 passResult 的结构返回 ```json 代码块。
  * 返回 { ctx, created }，created 里是每次 create 的入参（可断言 meta.cwd / sessionId）。
+ * C2：自动把引擎下发的 attempt / nonce 回显进正式结论（调用方显式给出时不覆盖）。
  */
 function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').structured } = {}) {
   const created = []
@@ -242,8 +270,10 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
           return {
             agent: {
               session: { id: sessionId, header: {} },
-              followup() {
-                const structured = resultFor(options)
+              followup(payload) {
+                const envelope = envelopeOf(payload)
+                const base = resultFor(options)
+                const structured = envelope ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base } : base
                 engineRef.value.handleSessionEvent({ id: sessionId }, {
                   type: 'assistant/message',
                   data: {
@@ -263,6 +293,19 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
     },
   }
   return { ctx, created }
+}
+
+/**
+ * E1-b：真实 `NodeSupervisionScheduler`（只用来读 snapshot().entries[].lastReport），
+ * 定时器全部注入成空实现，测试里不 tick。
+ */
+function realNodeScheduler() {
+  return new supervise.NodeSupervisionScheduler({
+    now: () => new Date(),
+    wake: async () => ({ action: 'skip' }),
+    setInterval: () => null,
+    clearInterval: () => {},
+  })
 }
 
 /**
@@ -344,21 +387,29 @@ function nodeAlarmAgents(engineRef, behavior) {
           const agent = {
             session: { id: sessionId, header: {} },
             status: 'working',
-            followup() {
+            followup(payload) {
               const emit = text => engineRef.value.handleSessionEvent({ id: sessionId }, {
                 type: 'assistant/message',
                 data: {
                   message: { role: 'assistant', content: [{ type: 'text', text }] },
                 },
               })
+              const envelope = envelopeOf(payload)
               behavior({
                 engine: engineRef.value,
                 sessionId,
                 options,
                 agent,
                 idle,
+                envelope,
                 emit,
-                emitStructured: value => emit(`\`\`\`json\n${JSON.stringify(value)}\n\`\`\``),
+                // C2：正式结论默认回显本轮 attempt / nonce；调用方显式给值时优先。
+                emitStructured: value => emit(`\`\`\`json\n${JSON.stringify(
+                  envelope ? { attempt: envelope.attempt, nonce: envelope.nonce, ...value } : value,
+                )}\n\`\`\``),
+                emitStatus: value => emit(`\`\`\`json\n${JSON.stringify(
+                  envelope ? { attempt: envelope.attempt, nonce: envelope.nonce, ...value } : value,
+                )}\n\`\`\``),
                 finishIdle: () => finishIdle(),
               })
             },
@@ -471,13 +522,18 @@ try {
                 session: { id: sessionId, header: {} },
                 followup(payload) {
                   payloads.push(payload)
+                  // C2：正式结论必须回显本轮 attempt / nonce，否则会被引擎丢弃。
+                  const envelope = envelopeOf(payload)
+                  const structured = envelope
+                    ? { attempt: envelope.attempt, nonce: envelope.nonce, ...passResult('n_spawn').structured }
+                    : passResult('n_spawn').structured
                   // 模拟宿主：followup 之后 assistant/message 带 ```json 代码块回来。
                   engine.handleSessionEvent({ id: sessionId }, {
                     type: 'assistant/message',
                     data: {
                       message: {
                         role: 'assistant',
-                        content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(passResult('n_spawn').structured)}\n\`\`\`` }],
+                        content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
                       },
                     },
                   })
@@ -2606,25 +2662,59 @@ try {
     }
   })
 
-  await check('auto + 只能回落 process.cwd()：不擅自建 worktree（auto-without-initiator），降级原因进 run 日志', async () => {
+  await check('C3：没有显式 workspace（也没有 cwd / header.cwd）→ start 400 workspace，不回落 process.cwd，不写 run/start', async () => {
     const flow = flowOf('flow-noinit', [startNode(), stage('n_noinit', '节点', 300), endNode()], [
       next('e1', 'n_start', 'n_noinit'),
       next('e2', 'n_noinit', 'n_end'),
     ])
     await saveFlow(flow)
     const run = await makeRun('flow-noinit', 1)
-    // 构造时把默认策略设成 auto；start 不给 workspace / cwd / parent → 只能回落 process.cwd()。
-    const engine = createEngine({ runsRoot, flowsRoot, worktree: 'auto', activate: async () => passResult('n_noinit') })
-    await engine.start(run.id)
-    A.equal((await engine.wait(run.id)).status, 'done')
-
+    // 关键：绕过测试夹具的 cwd 默认值，engine 上没有任何 workspace / cwd / parent。
+    const engine = createEngineRaw({ runsRoot, flowsRoot, worktree: 'auto', activate: async () => passResult('n_noinit') })
+    let captured = null
+    await assert.rejects(
+      () => engine.start(run.id),
+      error => {
+        captured = error
+        return error instanceof store.RunError
+          && error.status === 400
+          && error.field === 'workspace'
+          && /process\.cwd/.test(error.message)
+      },
+      '缺工作区必须是 400 + field=workspace',
+    )
+    A.ok(Boolean(captured), 'start 必须抛错，而不是静默回落')
+    A.equal(engine.active, null, '失败的 start 必须释放实例占位')
+    A.equal((await eventsOf(run.id)).some(event => event.kind === 'run/start'), false, '没有 run/start 事件')
+    const meta = await store.readRunMeta(runsRoot, run.id)
+    A.equal(meta.status, 'pending', 'run 仍是 pending，没有被迁移成 running')
+    A.equal(meta.started, false)
     const raw = readRawRun(run.id)
+    A.equal(raw.workspace, undefined, 'run.json 不写入伪造的工作区绑定')
+  })
+
+  await check('C3：stub 引擎不绑定工作区（不建真实会话）→ start 照常跑完，不伪造 workspace', async () => {
+    const flow = flowOf('flow-stubws', [startNode(), stage('n_stubws', '节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_stubws'),
+      next('e2', 'n_stubws', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-stubws', 1)
+    // 绕过夹具的 cwd 默认值：桩引擎在没有工作区时也必须能跑（路由层对 stub 同样放行）。
+    const engine = createEngineRaw({ runsRoot, flowsRoot, stub: true })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    const events = await eventsOf(run.id)
+    const startEvent = events.find(event => event.kind === 'run/start')
+    A.ok(Boolean(startEvent), 'stub 必须真的开跑（run/start 存在）')
+    A.equal(startEvent.data.sessionMode, 'stub')
+    A.equal(startEvent.data.workspaceId, undefined, 'stub 不在 run/start 里伪造 workspaceId')
+    A.match(startEvent.data.worktreeWarning, /stub 引擎不绑定工作区/)
+    const raw = readRawRun(run.id)
+    A.equal(raw.workspace, undefined, 'stub 不写 workspace 绑定')
     A.equal(raw.worktree.enabled, false)
-    A.equal(raw.worktree.reason, 'auto-without-initiator')
-    A.equal(raw.worktree.path, null)
-    const startEvent = (await eventsOf(run.id)).find(event => event.kind === 'run/start')
-    A.equal(startEvent.data.worktreeEnabled, false)
-    A.match(startEvent.data.worktreeWarning, /process\.cwd/)
+    A.equal(raw.worktree.reason, 'stub-engine')
   })
 
   // -------------------------------------------------------------------------
@@ -3048,16 +3138,14 @@ try {
       blockers: ['等接口'],
       verdict: null,
     }
-    const { ctx } = nodeAlarmAgents(engineRef, ({ engine, emit, finishIdle }) => {
-      emit(`\`\`\`json\n${JSON.stringify(statusBlock)}\n\`\`\``)
+    const { ctx } = nodeAlarmAgents(engineRef, ({ engine, emitStatus, emitStructured, finishIdle }) => {
+      emitStatus(statusBlock)
       setTimeout(() => {
         liveNodeStatus = engine.live ? JSON.parse(JSON.stringify(engine.live.nodeStatus)) : null
         // 同一条文本里既有 status 块又有正式 verdict 块：两者都要处理。
         const closingStatus = { ...statusBlock, progress: 70, summary: '准备收尾' }
-        emit([
-          `\`\`\`json\n${JSON.stringify(closingStatus)}\n\`\`\``,
-          `\`\`\`json\n${JSON.stringify(passResult('n_status').structured)}\n\`\`\``,
-        ].join('\n'))
+        emitStatus(closingStatus)
+        emitStructured(passResult('n_status').structured)
         finishIdle()
       }, 0)
     })
@@ -3090,7 +3178,7 @@ try {
     A.equal(events.find(event => event.kind === 'node/end').data.status, 'passed')
   })
 
-  await check('⑤ 自审 done+pass 提前完成：节点 passed 且 node/end.extra.completedBy=self-check', async () => {
+  await check('⑤ 自审 done+pass 提前完成：progress=100 + blockers 空 + 正式 verdict 才收口（证据不丢）', async () => {
     const flow = flowOf('flow-alarm-early', [
       startNode(), stage('n_early', '提前完成', 300), endNode(),
     ], [
@@ -3101,16 +3189,24 @@ try {
     const run = await makeRun('flow-alarm-early', 1)
     const scheduler = fakeNodeAlarmScheduler()
     const engineRef = { value: null }
-    const { ctx } = nodeAlarmAgents(engineRef, ({ emit }) => {
-      // 只发自审回报，不放行 whenIdle —— 必须靠自审信号提前收口。
-      emit(`\`\`\`json\n${JSON.stringify({
-        nodeId: 'n_early',
-        attempt: 1,
-        state: 'done',
-        progress: 100,
-        summary: '自审认为已完成',
-        verdict: 'pass',
-      })}\n\`\`\``)
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit }) => {
+      // 状态块 + 正式结论同一条回复到达，但**不**放行 whenIdle —— 必须靠自审信号提前收口。
+      const block = value => `\`\`\`json\n${JSON.stringify({
+        attempt: envelope.attempt,
+        nonce: envelope.nonce,
+        ...value,
+      })}\n\`\`\``
+      emit([
+        block({
+          nodeId: 'n_early',
+          state: 'done',
+          progress: 100,
+          summary: '自审认为已完成',
+          blockers: [],
+          verdict: 'pass',
+        }),
+        block(passResult('n_early').structured),
+      ].join('\n'))
     })
     const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: scheduler })
     engineRef.value = engine
@@ -3123,6 +3219,9 @@ try {
     A.equal(nodeEnd.data.status, 'passed')
     A.equal(nodeEnd.extra.completedBy, 'self-check')
     A.equal(events.some(event => event.kind === 'node/status' && event.data.state === 'done'), true)
+    // C2：提前收口用的是正式结论，artifacts / findings 等证据必须保留（不再只剩 verdict+summary）。
+    A.ok(events.some(event => event.kind === 'artifact/write'), '正式结论的产物仍然落盘')
+    A.ok(events.some(event => event.kind === 'review/finding'), '正式结论的 findings 仍然落成事件')
   })
 
   await check('⑥ 自审 done 但 verdict 非法：不提前完成，仍走 whenIdle 的正常解析', async () => {
@@ -3136,15 +3235,14 @@ try {
     const run = await makeRun('flow-alarm-invalid', 1)
     const scheduler = fakeNodeAlarmScheduler()
     const engineRef = { value: null }
-    const { ctx } = nodeAlarmAgents(engineRef, ({ emit, emitStructured, finishIdle }) => {
-      emit(`\`\`\`json\n${JSON.stringify({
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emitStatus, emitStructured, finishIdle }) => {
+      emitStatus({
         nodeId: 'n_invalid',
-        attempt: 1,
         state: 'done',
         progress: 100,
         summary: '我说完成但我给不出合法 verdict',
         verdict: 'maybe',
-      })}\n\`\`\``)
+      })
       // 正常回合随后到达并放行 whenIdle。
       setTimeout(() => {
         emitStructured(passResult('n_invalid').structured)
@@ -3176,11 +3274,9 @@ try {
     await saveFlow(flow)
     const run = await makeRun('flow-alarm-none', 1)
     const engineRef = { value: null }
-    const { ctx } = nodeAlarmAgents(engineRef, ({ emit, emitStructured, finishIdle }) => {
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emitStatus, emitStructured, finishIdle }) => {
       // 即使会话消息里有自审结构，没有注入调度器时也不采集、不竞速。
-      emit(`\`\`\`json\n${JSON.stringify({
-        nodeId: 'n_plain', attempt: 1, state: 'done', progress: 100, verdict: 'pass',
-      })}\n\`\`\``)
+      emitStatus({ nodeId: 'n_plain', state: 'done', progress: 100, verdict: 'pass' })
       setTimeout(() => {
         emitStructured(passResult('n_plain').structured)
         finishIdle()
@@ -3274,6 +3370,518 @@ try {
     A.deepEqual(partial && partial.blockers, ['等依赖'])
     // 成员 note 会进 run.json 快照（客户端要显示）。
     A.equal(engine._parseNodeStatus('not json'), null)
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.9 · C1 run.json 单一写入口')
+
+  await check('C1：并发 patch 不丢字段、seq 不回退（真实临时 run 目录）', async () => {
+    const flow = flowOf('flow-c1', [startNode(), stage('n_c1', 'C1 节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_c1'),
+      next('e2', 'n_c1', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c1', 1)
+    // 先落一条真实事件，让 run.json 有非零 seq（补写绝不能把它重置成 0）。
+    await store.appendEvents(runsRoot, run.id, [{
+      v: 1, kind: 'run/start', traceId: 'tr-c1-run',
+      data: { flowId: 'flow-c1', flowName: '流程 flow-c1', nodeTotal: 1 },
+    }])
+    const before = readRawRun(run.id)
+    A.ok(before.seq >= 1, '夹具里 run.json 已有非零 seq')
+
+    const engineA = createEngine({ runsRoot, flowsRoot })
+    const engineB = createEngine({ runsRoot, flowsRoot })
+    // A 只补工作区 / 会话模式，B 只补 nodeStatus / sessions：并发后两组字段都要在。
+    engineA.workspaceRecord = {
+      id: 'aaaaaaaaaaaa', path: '/ws-c1', realpath: '/ws-c1', isGit: false, gitRoot: null,
+    }
+    engineA.sessionMode = 'top-level'
+    engineB.nodeStatus = new Map([['n_c1', {
+      state: 'working', progress: 42, summary: '并发补写', members: [], blockers: [], verdict: null,
+      at: new Date().toISOString(),
+    }]])
+    engineB.nodeSessions = new Map([['n_c1', { sessionId: 'sess-c1', createdAt: null, lastUsedAt: null }]])
+
+    await Promise.all([
+      engineA._patchRunBinding(run.id),
+      engineB._patchRunBinding(run.id),
+    ])
+    const raw = readRawRun(run.id)
+    A.equal(raw.workspace.path, '/ws-c1', '并发的 workspace patch 没有被冲掉')
+    A.equal(raw.sessionMode, 'top-level')
+    A.equal(raw.nodeStatus.n_c1.progress, 42, '并发的 nodeStatus patch 没有被冲掉')
+    A.equal(raw.seq, before.seq, 'seq 不回退')
+    A.equal(raw.lastSeq, before.seq, 'lastSeq 不回退')
+
+    // 再并发多轮，交替只写一侧字段，确认写入串行且每次都保留对方字段。
+    await Promise.all(Array.from({ length: 6 }, (_, index) => {
+      if (index % 2 === 0) {
+        engineA.workspaceRecord = { ...engineA.workspaceRecord, path: `/ws-c1-${index}` }
+        return engineA._patchRunBinding(run.id)
+      }
+      engineB.nodeStatus = new Map([['n_c1', {
+        state: 'working', progress: 42 + index, summary: '并发补写', members: [], blockers: [], verdict: null,
+        at: new Date().toISOString(),
+      }]])
+      return engineB._patchRunBinding(run.id)
+    }))
+    const raw2 = readRawRun(run.id)
+    A.ok(typeof raw2.workspace.path === 'string' && raw2.workspace.path.startsWith('/ws-c1'), 'workspace 字段仍在')
+    A.equal(raw2.nodeStatus.n_c1.progress, 47, '最后一轮 nodeStatus 生效')
+    A.equal(raw2.seq, before.seq, '多轮并发后 seq 仍不回退')
+  })
+
+  await check('C1：sessions 超过 runstore 上限（512）时跳过该次 binding patch（warn），run 不被打挂', async () => {
+    const flow = flowOf('flow-c1-sessions', [startNode(), stage('n_sess', '会话节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_sess'),
+      next('e2', 'n_sess', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c1-sessions', 1)
+    const logs = []
+    const engine = createEngine({ runsRoot, flowsRoot, log: (level, message) => logs.push(`${level}:${message}`) })
+    engine.workspaceRecord = {
+      id: 'bbbbbbbbbbbb', path: '/ws-sessions', realpath: '/ws-sessions', isGit: false, gitRoot: null,
+    }
+    engine.nodeSessions = new Map(Array.from({ length: 513 }, (_, index) => [
+      `n_${index}`, { sessionId: `sess-${index}`, createdAt: null, lastUsedAt: null },
+    ]))
+    // 不得抛出：一次元数据校验失败只跳过该次 binding patch。
+    await engine._patchRunBinding(run.id)
+    A.ok(logs.some(line => /跳过本次 run\.json binding patch/.test(line)), 'sessions 超限必须 warn')
+    const skipped = readRawRun(run.id)
+    A.equal(skipped.sessions, undefined, '被拒绝的 patch 不留下半套数据')
+    A.equal(skipped.workspace, undefined, '本次 patch 整体跳过（workspace 也没写）')
+
+    // 收窄到上限内：同一入口恢复正常，sessions / workspace 都落盘。
+    engine.sessionsPatchWarned = false
+    engine.nodeSessions = new Map(Array.from({ length: 512 }, (_, index) => [
+      `n_${index}`, { sessionId: `sess-${index}`, createdAt: null, lastUsedAt: null },
+    ]))
+    await engine._patchRunBinding(run.id)
+    const recovered = readRawRun(run.id)
+    A.equal(Object.keys(recovered.sessions).length, 512)
+    A.equal(recovered.sessions.n_0, 'sess-0')
+    A.equal(recovered.workspace.path, '/ws-sessions')
+  })
+
+  await check('C1：live 载荷不含 nodeStatus（唯一权威在 run.json 顶层 nodeStatus）', async () => {
+    const flow = flowOf('flow-c1-live', [startNode(), stage('n_live', 'live 节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_live'),
+      next('e2', 'n_live', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c1-live', 1)
+    const engine = createEngine({ runsRoot, flowsRoot })
+    engine.active = { runId: run.id }
+    const entry = {
+      state: 'working', progress: 5, summary: 'live 快照', members: [], blockers: [], verdict: null,
+      at: new Date().toISOString(),
+    }
+    engine.nodeStatus = new Map([['n_live', entry]])
+    engine.live = {
+      phase: 'node',
+      nodeStatus: { n_live: entry },
+      tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
+    }
+    await engine._persistLive()
+    const raw = readRawRun(run.id)
+    A.equal(raw.live && Object.prototype.hasOwnProperty.call(raw.live, 'nodeStatus'), false, 'live 里不再带死字段')
+    A.equal(raw.nodeStatus.n_live.progress, 5, '顶层 nodeStatus 由 binding 收口路径写')
+    A.equal(engine.live.nodeStatus.n_live.progress, 5, '同进程内存快照仍可读')
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.9 · C2 自审可信度')
+
+  await check('C2：正式 reject > 状态块 pass；attempt / nonce 不匹配的正式回报被丢弃', async () => {
+    const statusPass = {
+      nodeId: 'n_c2', state: 'done', progress: 100, blockers: [], verdict: 'pass', attempt: 2, nonce: 'nonce-2',
+    }
+    const formalReject = {
+      verdict: 'reject', summary: '正式打回', rejectReason: '不达标', attempt: 2, nonce: 'nonce-2',
+    }
+    // 状态块里写 pass，正式结论是 reject：必须返回正式 reject（不许翻成 pass）。
+    A.deepEqual(
+      parseAssistantStructured(`${fenced(statusPass)}\n${fenced(formalReject)}`, { attempt: 2, nonce: 'nonce-2' }),
+      formalReject,
+    )
+    // 只有状态块：绝不能当正式结论。
+    A.equal(parseAssistantStructured(fenced(statusPass), { attempt: 2, nonce: 'nonce-2' }), null)
+    // 旧 attempt 的迟到正式回报：丢弃并回调留痕。
+    const rejected = []
+    const staleAttempt = { ...formalReject, attempt: 1 }
+    A.equal(
+      parseAssistantStructured(fenced(staleAttempt), {
+        attempt: 2, nonce: 'nonce-2', onReject: (value, reason) => rejected.push(reason),
+      }),
+      null,
+    )
+    A.deepEqual(rejected, ['attempt-mismatch'])
+    // 缺失 / 错误 nonce：同样丢弃。
+    const rejectedNonce = []
+    A.equal(
+      parseAssistantStructured(fenced({ ...formalReject, nonce: 'old-nonce' }), {
+        attempt: 2, nonce: 'nonce-2', onReject: (value, reason) => rejectedNonce.push(reason),
+      }),
+      null,
+    )
+    A.deepEqual(rejectedNonce, ['nonce-mismatch'])
+    A.equal(parseAssistantStructured(fenced({ ...formalReject, nonce: undefined }), { attempt: 2, nonce: 'nonce-2' }), null)
+  })
+
+  await check('C2：旧 attempt 的自审回报被丢弃（留日志），正式 reject 仍触发返工', async () => {
+    const flow = flowOf('flow-c2-reject', [
+      startNode(), stage('n_a', '上游', 300), stage('n_b', '复核', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      reject('e3', 'n_b', 'n_a'),
+      next('e4', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c2-reject', 2)
+    const engineRef = { value: null }
+    const logs = []
+    let nBRuns = 0
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit, emitStructured, finishIdle, options }) => {
+      if (options.sessionId.includes('n_a')) {
+        emitStructured(passResult('n_a').structured)
+        finishIdle()
+        return
+      }
+      nBRuns += 1
+      if (nBRuns === 1) {
+        // 同一轮里状态块说 pass，但正式结论是 reject：必须按 reject 返工。
+        emit(`${fenced({
+          nodeId: 'n_b', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+          attempt: envelope.attempt, nonce: envelope.nonce,
+        })}\n${fenced({
+          verdict: 'reject', summary: '正式打回 n_a', rejectReason: '证据不达标', rejectTarget: 'n_a',
+          attempt: envelope.attempt, nonce: envelope.nonce,
+        })}`)
+        return
+      }
+      // 第二轮：先发一条**旧 attempt** 的迟到状态块 + pass，必须被丢弃并留日志。
+      emit(`${fenced({
+        nodeId: 'n_b', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+        attempt: envelope.attempt - 1, nonce: envelope.nonce,
+      })}\n${fenced({
+        ...passResult('n_b').structured,
+        attempt: envelope.attempt - 1, nonce: envelope.nonce,
+      })}`)
+      setTimeout(() => {
+        emit(`${fenced({
+          nodeId: 'n_b', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+          attempt: envelope.attempt, nonce: envelope.nonce,
+        })}\n${fenced({
+          ...passResult('n_b').structured,
+          attempt: envelope.attempt, nonce: envelope.nonce,
+        })}`)
+        finishIdle()
+      }, 5)
+    })
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx,
+      nodeSupervision: fakeNodeAlarmScheduler(),
+      nodeTimeoutMs: 1500,
+      log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+
+    A.equal(final.status, 'done')
+    const trigger = events.find(event => event.kind === 'reject/trigger')
+    A.ok(Boolean(trigger), '正式 reject 必须触发返工')
+    A.equal(trigger.data.fromNodeId, 'n_b')
+    A.equal(trigger.data.toNodeId, 'n_a')
+    A.deepEqual(
+      events.filter(event => event.kind === 'node/start' && event.nodeId === 'n_a').map(event => event.attemptId),
+      [1, 2],
+      '目标节点真的重跑了一次',
+    )
+    A.equal(
+      events.find(event => event.kind === 'node/end' && event.nodeId === 'n_b' && event.attemptId === 1).data.status,
+      'rejected',
+      '状态块的 pass 没有翻掉正式 reject',
+    )
+    A.ok(logs.some(line => /丢弃自审状态块/.test(line)), '旧 attempt 的自审回报必须留可观测日志')
+    A.ok(logs.some(line => /attempt 回报 1 \/ 当前 2/.test(line)), '日志要写清旧 attempt / 当前 attempt')
+  })
+
+  await check('C2：progress<100 不算提前完成（仍以正式 verdict 正常收口）', async () => {
+    const flow = flowOf('flow-c2-progress', [
+      startNode(), stage('n_prog', '进度不足', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_prog'),
+      next('e2', 'n_prog', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c2-progress', 1)
+    const engineRef = { value: null }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit, emitStructured, finishIdle }) => {
+      // done 但 progress=99：即使同一个回复里带正式 pass，也不能走自审提前完成。
+      emit(`${fenced({
+        nodeId: 'n_prog', state: 'done', progress: 99, blockers: [], verdict: 'pass',
+        attempt: envelope.attempt, nonce: envelope.nonce,
+      })}\n${fenced({
+        ...passResult('n_prog').structured,
+        attempt: envelope.attempt, nonce: envelope.nonce,
+      })}`)
+      setTimeout(() => {
+        emitStructured(passResult('n_prog').structured)
+        finishIdle()
+      }, 10)
+    })
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, nodeSupervision: fakeNodeAlarmScheduler(), nodeTimeoutMs: 1500,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+
+    A.equal(final.status, 'done')
+    A.equal(nodeEnd.data.status, 'passed')
+    A.equal(nodeEnd.extra && nodeEnd.extra.completedBy, undefined, 'progress<100 不得标记 self-check 提前完成')
+  })
+
+  await check('C2：只有状态块时不得完成（按超时失败），但证据被原样保留并留痕', async () => {
+    const flow = flowOf('flow-c2-status-only', [
+      startNode(), stage('n_ev', '只有状态块', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_ev'),
+      next('e2', 'n_ev', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c2-status-only', 1)
+    const engineRef = { value: null }
+    const evidence = {
+      artifacts: [{ name: 'late.md', content: '# 迟到的证据\n' }],
+      findings: [{ id: 'F-1', severity: 'P2', title: '迟到发现', status: 'open' }],
+      acceptance: [{ itemId: 'R-1', status: 'pass', decidedBy: 'auto' }],
+      tests: { suite: 'late-suite', executed: 1, passed: 1, failed: 0, skipped: 0 },
+      checks: { ruleSetId: 'late-rules', ruleSetVersion: '1', executor: 'test', passedChecks: 1, totalChecks: 1 },
+    }
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit }) => {
+      // 只有状态块（哪怕它自带 verdict=pass），不放行 whenIdle。
+      emit(fenced({
+        nodeId: 'n_ev', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+        attempt: envelope.attempt, nonce: envelope.nonce,
+        ...evidence,
+      }))
+    })
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, nodeSupervision: fakeNodeAlarmScheduler(), nodeTimeoutMs: 200, nodeRetries: 0,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const statusEvent = events.find(event => event.kind === 'node/status')
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+
+    A.equal(final.status, 'failed', '只有状态块没有正式 verdict：不得判完成，按超时失败')
+    A.equal(nodeEnd.data.status, 'failed')
+    A.equal(nodeEnd.extra && nodeEnd.extra.completedBy, undefined)
+    A.ok(Boolean(statusEvent), '状态块仍落成 node/status')
+    A.ok(statusEvent.extra && typeof statusEvent.extra.selfCheckEvidence === 'string', '事件流里留了证据文件路径')
+    const artifactPath = join(runsRoot, run.id, statusEvent.extra.selfCheckEvidence)
+    A.ok(existsSync(artifactPath), '证据文件必须真的落盘')
+    const saved = JSON.parse(readFileSync(artifactPath, 'utf8'))
+    A.deepEqual(saved.artifacts, evidence.artifacts)
+    A.deepEqual(saved.findings, evidence.findings)
+    A.deepEqual(saved.acceptance, evidence.acceptance)
+    A.deepEqual(saved.tests, evidence.tests)
+    A.deepEqual(saved.checks, evidence.checks)
+    A.ok(events.some(event => event.kind === 'artifact/write'
+      && event.data.path === statusEvent.extra.selfCheckEvidence), '证据落盘也有 artifact/write 事件')
+  })
+
+  await check('C2：内存 nodeStatus 的 members 只保留最新 20 条（喂 100 条）', async () => {
+    const flow = flowOf('flow-c2-members', [startNode(), stage('n_big', '成员上限', 300), endNode()], [
+      next('e1', 'n_start', 'n_big'),
+      next('e2', 'n_big', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c2-members', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, nodeSupervision: fakeNodeAlarmScheduler() })
+    engine.active = { runId: run.id }
+    engine.attemptEnvelopes.set('sess-big', { attempt: 1, nonce: 'nonce-big' })
+    const members = Array.from({ length: 100 }, (_, index) => ({
+      name: `member-${index + 1}`, state: 'working',
+    }))
+    // 走完整解析链路：supervise 只留前 20 条，引擎必须从原始 payload 取尾部 20 条。
+    const parsed = engine._parseNodeStatus(fenced({
+      nodeId: 'n_big', state: 'working', progress: 50, summary: '成员很多',
+      members, blockers: [], verdict: null, attempt: 1, nonce: 'nonce-big',
+    }))
+    A.ok(Boolean(parsed), '状态块必须能被解析')
+    engine._rememberNodeStatus(
+      { sessionId: 'sess-big', nodeId: 'n_big', attemptId: 1, traceId: 'tr-big' },
+      parsed,
+    )
+    const entry = engine.nodeStatus.get('n_big')
+    A.equal(entry.members.length, 20, '内存快照最多 20 条')
+    A.deepEqual(
+      entry.members.map(member => member.name),
+      members.slice(-20).map(member => member.name),
+      '保留的是最新（数组尾部）20 条',
+    )
+    await engine.eventQueue
+    await engine._patchRunBinding(run.id)
+    const raw = readRawRun(run.id)
+    A.equal(raw.nodeStatus.n_big.members.length, 20, 'run.json 顶层同样有界')
+  })
+
+  await check('E1-b：有状态键但数值非法 → recordReport(kind=invalid)，不写节点完成状态', async () => {
+    const flow = flowOf('flow-e1b-invalid', [startNode(), stage('n_inv', '坏回报', 300), endNode()], [
+      next('e1', 'n_start', 'n_inv'),
+      next('e2', 'n_inv', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-e1b-invalid', 1)
+    const scheduler = realNodeScheduler()
+    const engineRef = { value: null }
+    let snapshotAfterInvalid = null
+    let hasStatusAfterInvalid = null
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit, emitStructured, finishIdle }) => {
+      // 形状对、键齐全，但 progress 不是 0..100 的整数：坏输入必须被记成 invalid。
+      emit(fenced({
+        nodeId: 'n_inv',
+        state: 'done',
+        progress: 'abc',
+        blockers: [],
+        attempt: envelope.attempt,
+        nonce: envelope.nonce,
+      }))
+      snapshotAfterInvalid = scheduler.snapshot()
+      hasStatusAfterInvalid = engineRef.value.nodeStatus.has('n_inv')
+      // 正常正式结论随后到达，让 run 能收口（验证 invalid 报告本身不拖死流程）。
+      setTimeout(() => {
+        emitStructured(passResult('n_inv').structured)
+        finishIdle()
+      }, 0)
+    })
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, nodeSupervision: scheduler, nodeTimeoutMs: 1500,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const entry = snapshotAfterInvalid && snapshotAfterInvalid.entries.find(item => item.nodeId === 'n_inv')
+    const raw = readRawRun(run.id)
+    const nodeEnd = (await eventsOf(run.id)).find(event => event.kind === 'node/end')
+
+    A.equal(final.status, 'done')
+    A.ok(Boolean(entry), '调度器里必须能找到这个节点的 entry')
+    A.equal(entry.lastReport.kind, 'invalid', '坏回报必须留 invalid 诊断')
+    A.match(entry.lastReport.reason, /progress/)
+    A.equal(hasStatusAfterInvalid, false, 'invalid 回报不得写成节点状态')
+    A.equal(engine.nodeStatus.has('n_inv'), false)
+    A.equal(raw.nodeStatus, undefined, 'run.json 顶层也不含这条坏状态')
+    A.equal(nodeEnd.data.status, 'passed', '正常正式结论仍可收口')
+    A.equal(nodeEnd.extra && nodeEnd.extra.completedBy, undefined, '坏回报不能触发自审提前完成')
+  })
+
+  await check('E1-b：普通对话文本不含状态键 → 不误报 invalid', async () => {
+    const flow = flowOf('flow-e1b-plain', [startNode(), stage('n_plain_talk', '普通对话', 300), endNode()], [
+      next('e1', 'n_start', 'n_plain_talk'),
+      next('e2', 'n_plain_talk', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-e1b-plain', 1)
+    const scheduler = realNodeScheduler()
+    const engineRef = { value: null }
+    let snapshotAfterPlain = null
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emit, emitStructured, finishIdle }) => {
+      emit('这是一段普通对话，没有任何状态字段。')
+      snapshotAfterPlain = scheduler.snapshot()
+      setTimeout(() => {
+        emitStructured(passResult('n_plain_talk').structured)
+        finishIdle()
+      }, 0)
+    })
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, nodeSupervision: scheduler, nodeTimeoutMs: 1500,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const entry = snapshotAfterPlain && snapshotAfterPlain.entries.find(item => item.nodeId === 'n_plain_talk')
+
+    A.equal(final.status, 'done')
+    A.ok(Boolean(entry))
+    A.equal(entry.lastReport, null, '普通对话不得被记成 invalid')
+  })
+
+  await check('C2：正式 reject 先到、状态块 pass 后到 → 仍按 reject 返工（正式结论 > 状态块）', async () => {
+    const flow = flowOf('flow-c2-late-status', [
+      startNode(), stage('n_a', '上游', 300), stage('n_b', '复核', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      reject('e3', 'n_b', 'n_a'),
+      next('e4', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-c2-late-status', 2)
+    const engineRef = { value: null }
+    let nBRuns = 0
+    const { ctx } = nodeAlarmAgents(engineRef, ({ envelope, emit, emitStructured, finishIdle, options }) => {
+      if (options.sessionId.includes('n_a')) {
+        emitStructured(passResult('n_a').structured)
+        finishIdle()
+        return
+      }
+      nBRuns += 1
+      if (nBRuns === 1) {
+        // 先发正式 reject；随后一条只有状态块（自带 pass）把 lastAssistant 覆盖掉。
+        emit(fenced({
+          verdict: 'reject', summary: '正式打回', rejectReason: '证据不达标', rejectTarget: 'n_a',
+          attempt: envelope.attempt, nonce: envelope.nonce,
+        }))
+        setTimeout(() => {
+          emit(fenced({
+            nodeId: 'n_b', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+            attempt: envelope.attempt, nonce: envelope.nonce,
+          }))
+          finishIdle()
+        }, 5)
+        return
+      }
+      emit(`${fenced({
+        nodeId: 'n_b', state: 'done', progress: 100, blockers: [], verdict: 'pass',
+        attempt: envelope.attempt, nonce: envelope.nonce,
+      })}\n${fenced({
+        ...passResult('n_b').structured,
+        attempt: envelope.attempt, nonce: envelope.nonce,
+      })}`)
+      finishIdle()
+    })
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, nodeSupervision: fakeNodeAlarmScheduler(), nodeTimeoutMs: 1500,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+
+    A.equal(final.status, 'done')
+    const trigger = events.find(event => event.kind === 'reject/trigger')
+    A.ok(Boolean(trigger), '正式 reject 不能因为后面一条状态块 pass 而丢失')
+    A.equal(trigger.data.fromNodeId, 'n_b')
+    A.equal(trigger.data.toNodeId, 'n_a')
+    A.deepEqual(
+      events.filter(event => event.kind === 'node/start' && event.nodeId === 'n_a').map(event => event.attemptId),
+      [1, 2],
+    )
   })
 
 } finally {

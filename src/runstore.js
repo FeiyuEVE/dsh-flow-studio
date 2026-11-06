@@ -15,7 +15,7 @@
  */
 
 import { Buffer } from 'node:buffer'
-import { randomInt } from 'node:crypto'
+import { createHash, randomInt } from 'node:crypto'
 import {
   chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile,
 } from 'node:fs/promises'
@@ -30,6 +30,52 @@ import { resolveHome } from './store.js'
 
 /** run.json 的体积上限：元数据不该有成百上千行。 */
 const MAX_META_BYTES = 1024 * 1024
+
+/**
+ * D2：`nodeStatus` 的序列化字节预算（256 KiB）。
+ *
+ * 为什么单独给一个预算：`nodeStatus` 是唯一「节点数 × 成员数」双维度膨胀的字段，
+ * 200 节点 × 20 成员 ×（200 字姓名 + 200 字备注 + 2000 字摘要 + 20 条 blocker）
+ * 实测能把 run.json 顶到 2.6MB，而读取侧上限是 1MiB（`MAX_META_BYTES`）——
+ * 一旦超限，旧实现会在下一次 patch 时把整份 meta 重置成默认值（D1 灾难）。
+ * 所以在**序列化之前**按预算裁剪，保证 run.json 远低于 1MiB。
+ *
+ * 裁剪顺序（确定性）：① 先摘掉所有 members[].note；② 再按「成员最后更新时间」
+ * 从旧到新淘汰成员（没有时间戳就回落到节点 `at`）；③ 仍超预算才淘汰最旧的**节点**
+ * （最近更新的节点一定保留）。任何一步发生裁剪都会置 `nodeStatusTruncated: true`，
+ * 绝不静默。
+ */
+export const MAX_NODE_STATUS_BYTES = 256 * 1024
+/** nodeStatus 的节点数上限（与引擎侧 `_rememberNodeStatus` 同口径）。 */
+const NODE_STATUS_MAX_NODES = 200
+/** 单节点 members / blockers 条数上限。 */
+const NODE_STATUS_MAX_MEMBERS = 20
+const NODE_STATUS_MAX_BLOCKERS = 20
+/** summary / note 的单字段字符上限。 */
+const NODE_STATUS_MAX_SUMMARY_CHARS = 2000
+const NODE_STATUS_MAX_NOTE_CHARS = 200
+
+/**
+ * D3：`run.json.sessions`（nodeId → sessionId）的条数与单值上限。
+ * 512 与 flow 的 2MB 上限留足余量（一个 run 实际不会跑 512 个节点），
+ * 目的是「有界 + 超限显式报错」，而不是让正常流程撞上限制。
+ */
+const MAX_META_SESSIONS = 512
+const MAX_SESSION_KEY_CHARS = 128
+const MAX_SESSION_VALUE_CHARS = 128
+
+/**
+ * D3：`run.json.startOptions`（创建 run 时记下的发起参数）。
+ *
+ * 06 §13.8 / `runtime.readStartOptions()` 的契约：只允许这两个键，
+ *   - `workspace`：非空字符串（工作区路径）；
+ *   - `worktree`：字符串（`auto` / `on` / `off`）。
+ * 它是「发起参数」而不是第二份权威记录，体积很小（两条短字符串），
+ * **不参与** `nodeStatus` 的 256KiB 字节预算；run.json 损坏时也绝不重建它
+ * （D1 的 writeRunMeta 会拒绝覆盖并备份）。
+ */
+const START_OPTIONS_KEYS = ['workspace', 'worktree']
+const START_OPTION_TEXT_MAX_CHARS = 2048
 
 /**
  * 06 §13.4：给 `run/start` / `run/end` 留的保留额度。
@@ -359,7 +405,9 @@ function normalizeMeta(raw, id) {
       ? false
       : (TERMINAL_STATUS.has(status) || count(source.eventCount) > 0 || lastSeq > 0)
   const engine = source.engine === 'stub' ? 'stub' : 'real'
-  return {
+  // 07 §11（R8）：节点自审状态先做形状收敛 + 字节预算裁剪（D2）。
+  const nodeStatus = source.nodeStatus === undefined ? null : normalizeNodeStatus(source.nodeStatus)
+  const meta = {
     v: 1,
     id,
     name: text(source.name, id),
@@ -396,19 +444,107 @@ function normalizeMeta(raw, id) {
     ...(source.workspace === undefined ? {} : { workspace: normalizeBinding(source.workspace, WORKSPACE_KEYS) }),
     ...(source.worktree === undefined ? {} : { worktree: normalizeBinding(source.worktree, WORKTREE_KEYS) }),
     ...(source.supervision === undefined ? {} : { supervision: normalizeBinding(source.supervision, SUPERVISION_KEYS) }),
-    // 07 §11（R8）：节点自审上报的最新结构化状态，nodeId → 状态对象。
-    ...(source.nodeStatus === undefined ? {} : { nodeStatus: normalizeNodeStatus(source.nodeStatus) }),
+    ...(nodeStatus === null ? {} : { nodeStatus: nodeStatus.value }),
+    // D2：预算裁剪必须可观测（绝不静默）；一旦发生过裁剪就持久化这个标志。
+    ...(source.nodeStatusTruncated === true || (nodeStatus !== null && nodeStatus.truncated)
+      ? { nodeStatusTruncated: true }
+      : {}),
+    // D3：节点 → 会话 id 的映射（形如 `{ [nodeId]: sessionId }`），由调用方经 patch 写入。
+    ...(source.sessions === undefined ? {} : { sessions: normalizeMetaSessions(source.sessions) }),
+    // D3：创建 run 时记下的发起参数（06 §13.8）。只保留 { workspace?, worktree? }；
+    // 未传就不出现（绝不凭空造一个空对象），传了空对象则保留为空对象。
+    ...(source.startOptions === undefined ? {} : { startOptions: normalizeStartOptions(source.startOptions) }),
   }
+  if (nodeStatus !== null && nodeStatus.truncated && nodeStatus.stats) {
+    // 诊断细节不落盘（不进 JSON），但写回值上能直接读到裁了多少，便于测试与排障。
+    Object.defineProperty(meta, 'nodeStatusBudget', {
+      value: nodeStatus.stats, enumerable: false, configurable: true, writable: false,
+    })
+  }
+  return meta
 }
 
 /** 节点状态表：每个节点只留最新一条，最多 200 个节点，字段逐个收敛。 */
 const NODE_STATUS_KEYS = ['state', 'progress', 'summary', 'verdict', 'at']
 const NODE_STATUS_STATES = new Set(['working', 'done', 'blocked', 'failed'])
 
-function normalizeNodeStatus(raw) {
-  if (!isPlainObject(raw)) return null
+function measureJsonBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8')
+}
+
+/** 节点 / 成员的时间戳：只用于确定性排序（不落盘）。 */
+function nodeStatusTime(value) {
+  const raw = value && typeof value === 'object' ? value.at : undefined
+  const parsed = typeof raw === 'string' ? Date.parse(raw) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function memberStatusTime(member, entryAt) {
+  if (isPlainObject(member)) {
+    for (const key of ['at', 'updatedAt', 'lastActiveAt', 'lastUpdateAt']) {
+      const raw = member[key]
+      const parsed = typeof raw === 'string' ? Date.parse(raw) : Number.NaN
+      if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  const parsed = typeof entryAt === 'string' ? Date.parse(entryAt) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+/**
+ * 把 `kept`（规范化后的节点表）按「保留哪些成员 / 哪些节点」重新序列化成对象。
+ * `keepMembers === null` 表示全留；否则是 `Map<节点下标, Set<成员下标>>`。
+ * `keepNodes === null` 表示全留；否则是节点下标集合。
+ */
+function buildNodeStatus(kept, keepMembers, keepNodes) {
   const out = {}
-  for (const [nodeId, value] of Object.entries(raw).slice(0, 200)) {
+  for (let index = 0; index < kept.length; index += 1) {
+    if (keepNodes !== null && !keepNodes.has(index)) continue
+    const { nodeId, entry } = kept[index]
+    const copy = { ...entry }
+    if (keepMembers === null) {
+      copy.members = entry.members.map(member => ({ ...member }))
+    } else {
+      const allowed = keepMembers.get(index)
+      const members = []
+      for (let m = 0; m < entry.members.length; m += 1) {
+        if (allowed && allowed.has(m)) members.push({ ...entry.members[m] })
+      }
+      copy.members = members
+    }
+    copy.blockers = entry.blockers.slice()
+    out[nodeId] = copy
+  }
+  return out
+}
+
+/**
+ * D2：nodeStatus 的规范化 + 字节预算裁剪。
+ *
+ * @returns {{ value: object | null, truncated: boolean,
+ *   stats: { limitBytes: number, bytesBefore: number, bytesAfter: number,
+ *     removedNotes: number, evictedMembers: number, evictedNodes: number } | null }}
+ */
+function normalizeNodeStatus(raw) {
+  if (!isPlainObject(raw)) return { value: null, truncated: false, stats: null }
+  const entries = Object.entries(raw)
+  let truncated = false
+
+  // 节点数超限：按 `at` 保留最近更新的 200 个（同时间按插入顺序靠后的优先），
+  // 输出仍按原插入顺序，避免读一次改一次顺序。
+  let refs = entries
+  if (entries.length > NODE_STATUS_MAX_NODES) {
+    truncated = true
+    refs = entries
+      .map(([, value], index) => ({ index, time: nodeStatusTime(value) }))
+      .sort((a, b) => (b.time - a.time) || (b.index - a.index))
+      .slice(0, NODE_STATUS_MAX_NODES)
+      .sort((a, b) => a.index - b.index)
+      .map(ref => entries[ref.index])
+  }
+
+  const kept = []
+  for (const [nodeId, value] of refs) {
     if (!isPlainObject(value)) continue
     const entry = normalizeBinding(value, NODE_STATUS_KEYS)
     if (!entry) continue
@@ -416,31 +552,216 @@ function normalizeNodeStatus(raw) {
     if (!Number.isInteger(entry.progress) || entry.progress < 0) entry.progress = 0
     if (entry.progress > 100) entry.progress = 100
     if (entry.summary !== null && entry.summary !== undefined && typeof entry.summary === 'string') {
-      entry.summary = entry.summary.length > 2000 ? entry.summary.slice(0, 2000) : entry.summary
+      entry.summary = entry.summary.length > NODE_STATUS_MAX_SUMMARY_CHARS
+        ? entry.summary.slice(0, NODE_STATUS_MAX_SUMMARY_CHARS)
+        : entry.summary
     } else {
       delete entry.summary
     }
     if (entry.verdict !== 'pass' && entry.verdict !== 'reject') entry.verdict = null
-    // members / blockers 只在事件里留全量；run.json 只留计数，避免元数据膨胀。
-    const members = Array.isArray(value.members) ? value.members : []
-    const blockers = Array.isArray(value.blockers) ? value.blockers : []
-    entry.members = members.slice(0, 20).map(member => {
-      if (!isPlainObject(member)) return { name: '', state: 'working' }
+    // members / blockers 只在事件里留全量；run.json 只留收敛后的摘要。
+    const rawMembers = Array.isArray(value.members) ? value.members : []
+    const rawBlockers = Array.isArray(value.blockers) ? value.blockers : []
+    if (rawMembers.length > NODE_STATUS_MAX_MEMBERS) truncated = true
+    if (rawBlockers.length > NODE_STATUS_MAX_BLOCKERS) truncated = true
+    const memberTimes = []
+    entry.members = rawMembers.slice(0, NODE_STATUS_MAX_MEMBERS).map(member => {
+      if (!isPlainObject(member)) {
+        memberTimes.push(nodeStatusTime(entry))
+        return { name: '', state: 'working' }
+      }
       const note = text2(member.note, '')
+      memberTimes.push(memberStatusTime(member, entry.at))
       return {
         name: text2(member.name, '').slice(0, 200),
         state: NODE_STATUS_STATES.has(member.state) ? member.state : 'working',
-        ...(note !== '' ? { note: note.slice(0, 200) } : {}),
+        ...(note !== '' ? { note: note.slice(0, NODE_STATUS_MAX_NOTE_CHARS) } : {}),
       }
     })
-    entry.blockers = blockers.slice(0, 20).map(item => text2(item, '').slice(0, 200)).filter(Boolean)
-    out[nodeId] = entry
+    entry.blockers = rawBlockers
+      .slice(0, NODE_STATUS_MAX_BLOCKERS)
+      .map(item => text2(item, '').slice(0, 200))
+      .filter(Boolean)
+    kept.push({ nodeId, entry, memberTimes })
   }
-  return out
+
+  const stats = {
+    limitBytes: MAX_NODE_STATUS_BYTES,
+    bytesBefore: 0,
+    bytesAfter: 0,
+    removedNotes: 0,
+    evictedMembers: 0,
+    evictedNodes: 0,
+  }
+  let value = buildNodeStatus(kept, null, null)
+  let bytes = measureJsonBytes(value)
+  stats.bytesBefore = bytes
+
+  // ① 先裁 members[].note（一次性摘掉所有备注，语义最简单也最省字节）。
+  if (bytes > MAX_NODE_STATUS_BYTES) {
+    for (const item of kept) {
+      for (const member of item.entry.members) {
+        if (member.note !== undefined) {
+          delete member.note
+          stats.removedNotes += 1
+        }
+      }
+    }
+    value = buildNodeStatus(kept, null, null)
+    bytes = measureJsonBytes(value)
+    if (stats.removedNotes > 0) truncated = true
+  }
+
+  // ② 仍超预算：按「成员最后更新时间」从旧到新淘汰成员（保留最新的）。
+  //   时间相同按「节点下标 / 成员下标」倒序保留后出现者，保证结果确定。
+  const flatMembers = []
+  kept.forEach((item, nodeIndex) => {
+    item.entry.members.forEach((member, memberIndex) => {
+      flatMembers.push({ nodeIndex, memberIndex, time: item.memberTimes[memberIndex] })
+    })
+  })
+  if (bytes > MAX_NODE_STATUS_BYTES && flatMembers.length > 0) {
+    flatMembers.sort((a, b) => (b.time - a.time)
+      || (b.nodeIndex - a.nodeIndex)
+      || (b.memberIndex - a.memberIndex))
+    const buildWithMembers = keep => {
+      const allowed = new Map()
+      for (let i = 0; i < keep; i += 1) {
+        const ref = flatMembers[i]
+        if (!allowed.has(ref.nodeIndex)) allowed.set(ref.nodeIndex, new Set())
+        allowed.get(ref.nodeIndex).add(ref.memberIndex)
+      }
+      return buildNodeStatus(kept, allowed, null)
+    }
+    let bestKeep = 0
+    let bestValue = buildWithMembers(0)
+    let bestBytes = measureJsonBytes(bestValue)
+    if (bestBytes <= MAX_NODE_STATUS_BYTES) {
+      // 单调性：留的成员越少字节越少 → 二分找「不超过预算的最大保留数」。
+      let low = 0
+      let high = flatMembers.length
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2)
+        const candidate = buildWithMembers(mid)
+        if (measureJsonBytes(candidate) <= MAX_NODE_STATUS_BYTES) {
+          low = mid
+          bestKeep = mid
+          bestValue = candidate
+          bestBytes = measureJsonBytes(candidate)
+        } else {
+          high = mid - 1
+        }
+      }
+      if (bestKeep === 0) {
+        bestValue = buildWithMembers(0)
+        bestBytes = measureJsonBytes(bestValue)
+      }
+    }
+    value = bestValue
+    bytes = bestBytes
+    stats.evictedMembers = flatMembers.length - bestKeep
+    if (stats.evictedMembers > 0) truncated = true
+  }
+
+  // ③ 仍超预算：淘汰最旧的整个节点（最近更新的节点一定保留，绝不整块清空）。
+  if (bytes > MAX_NODE_STATUS_BYTES && kept.length > 0) {
+    const order = kept
+      .map((item, index) => ({ index, time: nodeStatusTime(item.entry) }))
+      .sort((a, b) => (b.time - a.time) || (b.index - a.index))
+    const buildWithNodes = keep => {
+      const allowed = new Set(order.slice(0, keep).map(ref => ref.index))
+      return buildNodeStatus(kept, new Map(), allowed)
+    }
+    let bestKeep = 0
+    let bestValue = buildWithNodes(0)
+    let bestBytes = measureJsonBytes(bestValue)
+    if (bestBytes <= MAX_NODE_STATUS_BYTES) {
+      let low = 0
+      let high = kept.length
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2)
+        const candidate = buildWithNodes(mid)
+        if (measureJsonBytes(candidate) <= MAX_NODE_STATUS_BYTES) {
+          low = mid
+          bestKeep = mid
+          bestValue = candidate
+          bestBytes = measureJsonBytes(candidate)
+        } else {
+          high = mid - 1
+        }
+      }
+      if (bestKeep === 0) {
+        bestValue = buildWithNodes(0)
+        bestBytes = measureJsonBytes(bestValue)
+      }
+    }
+    value = bestValue
+    bytes = bestBytes
+    stats.evictedNodes = kept.length - bestKeep
+    if (stats.evictedNodes > 0) truncated = true
+  }
+
+  // 兜底：极端情况下（单节点就超预算）退化成空表，但仍然标记 truncated。
+  if (bytes > MAX_NODE_STATUS_BYTES) {
+    value = {}
+    bytes = measureJsonBytes(value)
+    truncated = true
+  }
+
+  stats.bytesAfter = bytes
+  return { value, truncated, stats }
 }
 
 function text2(value, fallback) {
   return typeof value === 'string' && value !== '' ? value : fallback
+}
+
+/**
+ * D3：`run.json.sessions`（nodeId → sessionId）的形状收敛。
+ *
+ * 读路径用宽松口径（坏条目跳过，否则一份手改坏的 run.json 会让整个 run 不可读）；
+ * **写路径**（`writeRunMeta`）在合并前另有严格校验：类型不对 / 超上限一律 400，
+ * 不静默丢。
+ */
+function normalizeMetaSessions(raw) {
+  if (!isPlainObject(raw)) return null
+  const out = {}
+  let count = 0
+  for (const [nodeId, sessionId] of Object.entries(raw)) {
+    if (count >= MAX_META_SESSIONS) break
+    if (typeof nodeId !== 'string' || nodeId === '' || nodeId.length > MAX_SESSION_KEY_CHARS) continue
+    if (typeof sessionId !== 'string') continue
+    if (sessionId.trim() === '' || sessionId.length > MAX_SESSION_VALUE_CHARS) continue
+    out[nodeId] = sessionId
+    count += 1
+  }
+  return out
+}
+
+/**
+ * D3：`run.json.startOptions`（创建 run 时记下的发起参数）的形状收敛。
+ *
+ * 读路径宽松（坏值直接省略，不能让一份手改坏的 run.json 让整个 run 不可读）；
+ * **写路径**在 `validateMetaPatch` 里严格校验（非对象 / workspace 空串或非字符串 /
+ * worktree 非字符串 → 400）。多余键在读侧丢弃，写侧另由 `writeRunMeta` 记进
+ * `droppedKeys`（`startOptions.<key>`），不静默。
+ *
+ * 未传时由 `normalizeMeta` 直接省略该键（不会凭空出现 `{}`）；显式传 `{}` 则保留 `{}`。
+ */
+function normalizeStartOptions(raw) {
+  if (!isPlainObject(raw)) return null
+  const out = {}
+  if (typeof raw.workspace === 'string' && raw.workspace !== '') {
+    out.workspace = raw.workspace.length > START_OPTION_TEXT_MAX_CHARS
+      ? raw.workspace.slice(0, START_OPTION_TEXT_MAX_CHARS)
+      : raw.workspace
+  }
+  if (typeof raw.worktree === 'string') {
+    out.worktree = raw.worktree.length > START_OPTION_TEXT_MAX_CHARS
+      ? raw.worktree.slice(0, START_OPTION_TEXT_MAX_CHARS)
+      : raw.worktree
+  }
+  return out
 }
 
 /** 节点会话模式（07 §3）：未知值一律 null，不猜一个看起来合理的。 */
@@ -467,22 +788,58 @@ function normalizeBinding(value, keys) {
   return out
 }
 
+/**
+ * 读 run.json（不加锁）。
+ *
+ * D1 契约：**三种情况必须区分**，不能再用 `null` 把「不存在」和「读不出来」混在一起：
+ *   ① 文件不存在（ENOENT）→ 返回 `null`；只有这一种允许上层按「新建」处理；
+ *   ② 内容不可解析 / 不是 JSON 对象 → 抛 RunError(500, code=EBADJSON)；
+ *   ③ 超过 `MAX_META_BYTES` → 抛 RunError(500, code=EMETATOOLARGE)。
+ * 其它 IO 错误（EISDIR / EACCES / …）同样抛结构化 RunError，并带上原始 `code`，
+ * 供 `listRuns` 生成可读的 skipped 原因。
+ *
+ * 调用方口径：只读接口（readRunMeta / readEvents / readAllEvents / readRunDetail）
+ * 捕获后按「不存在」回 null；`writeRunMeta` 捕获后**拒绝覆盖**（D1 的核心）。
+ *
+ * @returns {Promise<object | null>}
+ */
 async function readMetaUnlocked(loc) {
   let text
   try {
     text = await readFile(metaPath(loc.dir), 'utf8')
   } catch (error) {
     if (error && error.code === 'ENOENT') return null
-    throw error
+    throw new RunError(500, 'run', describeMetaError(error), {
+      code: error && typeof error.code === 'string' ? error.code : 'EMETAIO',
+      cause: error,
+    })
   }
-  if (Buffer.byteLength(text, 'utf8') > MAX_META_BYTES) return null
+  const bytes = Buffer.byteLength(text, 'utf8')
+  if (bytes > MAX_META_BYTES) {
+    throw new RunError(
+      500,
+      'run',
+      `run.json 超过 1MiB 上限（实际 ${bytes} 字节），元数据异常`,
+      { code: 'EMETATOOLARGE', bytes },
+    )
+  }
+  let parsed
   try {
-    return normalizeMeta(JSON.parse(text), loc.id)
-  } catch {
-    // 坏 meta 当成不存在：一份手改坏的 JSON 不该让整个 run 列表 500。
-    return null
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new RunError(500, 'run', 'run.json 内容损坏：不是合法 JSON（无法解析）', {
+      code: 'EBADJSON',
+      cause: error,
+    })
   }
+  if (!isPlainObject(parsed)) {
+    throw new RunError(500, 'run', 'run.json 内容损坏：不是合法 JSON 对象', { code: 'EBADJSON' })
+  }
+  return normalizeMeta(parsed, loc.id)
 }
+
+/** D1：损坏 run.json 的备份文件名前缀。 */
+const CORRUPT_META_PREFIX = 'run.json.corrupt-'
 
 let tmpCounter = 0
 
@@ -502,6 +859,145 @@ async function writeMetaUnlocked(loc, meta) {
   }
   await chmod(metaPath(loc.dir), FILE_MODE).catch(() => {})
   return meta
+}
+
+/**
+ * D1：把读不出来的 run.json **原样复制**一份到 `run.json.corrupt-<时间戳>-<短哈希>`。
+ *
+ * - 只复制、不搬走：原文件必须保持原样（要求「保持原文件不动」）；
+ * - 同一份损坏内容只备份一次（按内容哈希去重）：live 刷新每次失败都会再走一遍
+ *   `writeRunMeta`，不去重会在 run 目录里堆出成百上千份备份。
+ *
+ * @returns {Promise<string | null>} 备份文件名（不含目录）；无法备份时 null
+ */
+async function backupCorruptMeta(loc) {
+  let bytes
+  try {
+    bytes = await readFile(metaPath(loc.dir))
+  } catch {
+    // run.json 是目录 / 权限拒绝 → 没有内容可备份，交由调用方给出人工处理路径。
+    return null
+  }
+  const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 12)
+  let names = []
+  try {
+    names = await readdir(loc.dir)
+  } catch {
+    names = []
+  }
+  const existing = names.find(name => name.startsWith(CORRUPT_META_PREFIX) && name.endsWith(`-${hash}`))
+  if (existing) return existing
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const name = `${CORRUPT_META_PREFIX}${stamp}-${hash}`
+  try {
+    await writeFile(join(loc.dir, name), bytes, { mode: FILE_MODE, flag: 'wx' })
+    await chmod(join(loc.dir, name), FILE_MODE).catch(() => {})
+    return name
+  } catch (error) {
+    if (error && error.code === 'EEXIST') return name
+    return null
+  }
+}
+
+/** D1：把「run.json 存在但读不出来」包装成可读的 RunError（含恢复路径，不含绝对路径）。 */
+function corruptMetaError(cause, backupName) {
+  const base = cause && cause.reason ? cause.reason : 'run.json 存在但读不出来'
+  const recovery = backupName
+    ? `原内容已另存为 ${backupName}，run.json 保持原样未改动；请人工修复 run.json 或从该备份恢复后重试`
+    : 'run.json 保持原样未改动；请人工检查该文件（可能是目录 / 权限问题）后重试'
+  return new RunError(
+    500,
+    'run',
+    `${base}；为保护元数据，本次拒绝用默认值覆盖。${recovery}`,
+    { code: 'EMETACORRUPT', backup: backupName || null, cause },
+  )
+}
+
+/**
+ * D3：`writeRunMeta` 认得的全部元数据键。
+ *
+ * 只有这些键会进 `normalizeMeta`；其余键仍然丢弃，但会通过返回值的
+ * `droppedKeys`（不可枚举属性，不落盘、不进 API 形状）暴露出来，避免
+ * 「静默丢字段」类故障再次发生。
+ */
+const META_FIELD_KEYS = new Set([
+  'id', 'name', 'flowId', 'flowName', 'status', 'started', 'engine',
+  'startedAt', 'endedAt', 'nodeDone', 'nodeTotal', 'tokenTotal', 'eventCount',
+  'lastSeq', 'seq', 'unkeyedCalls', 'tokenTotalApprox', 'createdAt', 'updatedAt',
+  'progress', 'live', 'input', 'inbox',
+  // 07 §4/§5/§7 运行绑定 + 07 §11 节点自审状态（D3 白名单）
+  'sessionMode', 'workspace', 'worktree', 'supervision', 'nodeStatus',
+  'nodeStatusTruncated', 'sessions',
+  // 06 §13.8：创建 run 时记下的发起参数（runtime.patchRunJson 的唯一写路径）
+  'startOptions',
+])
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key)
+}
+
+/**
+ * D3：写路径上的严格类型校验（只校验 patch 里**显式出现**的键）。
+ *
+ * 读路径保持宽松（坏值收敛成 null / 跳过），否则一份手改坏的 run.json 会让整个
+ * run 不可读；写路径则必须报错——「静默丢字段」正是这次要消除的故障类型。
+ */
+function validateMetaPatch(patch) {
+  if (hasOwn(patch, 'status') && !ALL_STATUS.has(patch.status)) {
+    throw new RunError(400, 'status', `status 必须是 ${[...ALL_STATUS].join(' / ')} 之一`)
+  }
+  if (hasOwn(patch, 'sessionMode') && patch.sessionMode !== null && !SESSION_MODES.has(patch.sessionMode)) {
+    throw new RunError(400, 'sessionMode', `sessionMode 必须是 ${[...SESSION_MODES].join(' / ')} 之一或 null`)
+  }
+  for (const [key, label] of [['workspace', 'workspace'], ['worktree', 'worktree'], ['supervision', 'supervision']]) {
+    if (hasOwn(patch, key) && patch[key] !== null && !isPlainObject(patch[key])) {
+      throw new RunError(400, label, `${label} 必须是对象或 null`)
+    }
+  }
+  if (hasOwn(patch, 'nodeStatus') && patch.nodeStatus !== null && !isPlainObject(patch.nodeStatus)) {
+    throw new RunError(400, 'nodeStatus', 'nodeStatus 必须是对象或 null')
+  }
+  if (hasOwn(patch, 'nodeStatusTruncated') && typeof patch.nodeStatusTruncated !== 'boolean') {
+    throw new RunError(400, 'nodeStatusTruncated', 'nodeStatusTruncated 必须是布尔值')
+  }
+  // 06 §13.8：startOptions 只接受 { workspace?: string, worktree?: string }，类型错必须 400。
+  if (hasOwn(patch, 'startOptions') && patch.startOptions !== null) {
+    if (!isPlainObject(patch.startOptions)) {
+      throw new RunError(400, 'startOptions', 'startOptions 必须是 { workspace?, worktree? } 对象或 null')
+    }
+    const options = patch.startOptions
+    if (options.workspace !== undefined && options.workspace !== null) {
+      if (typeof options.workspace !== 'string' || options.workspace.trim() === '') {
+        throw new RunError(400, 'startOptions', 'startOptions.workspace 必须是非空字符串（工作区路径）')
+      }
+    }
+    if (options.worktree !== undefined && options.worktree !== null) {
+      if (typeof options.worktree !== 'string') {
+        throw new RunError(400, 'startOptions', 'startOptions.worktree 必须是字符串')
+      }
+    }
+  }
+  if (hasOwn(patch, 'sessions') && patch.sessions !== null) {
+    if (!isPlainObject(patch.sessions)) {
+      throw new RunError(400, 'sessions', 'sessions 必须是 { [nodeId]: sessionId } 对象或 null')
+    }
+    const entries = Object.entries(patch.sessions)
+    if (entries.length > MAX_META_SESSIONS) {
+      throw new RunError(400, 'sessions', `节点会话表最多 ${MAX_META_SESSIONS} 项（本次 ${entries.length} 项）`)
+    }
+    for (const [nodeId, sessionId] of entries) {
+      if (nodeId === '' || nodeId.length > MAX_SESSION_KEY_CHARS) {
+        throw new RunError(400, 'sessions', `sessions 的 nodeId 必须是 1–${MAX_SESSION_KEY_CHARS} 字符的字符串`)
+      }
+      if (typeof sessionId !== 'string') {
+        throw new RunError(400, 'sessions', `sessions[${nodeId}] 必须是字符串`)
+      }
+      if (sessionId.trim() === '' || sessionId.length > MAX_SESSION_VALUE_CHARS) {
+        throw new RunError(400, 'sessions',
+          `sessions[${nodeId}] 必须是非空字符串（≤${MAX_SESSION_VALUE_CHARS} 字符）`)
+      }
+    }
+  }
 }
 
 function requireLoc(runsRoot, runId) {
@@ -1156,7 +1652,20 @@ export async function readRunMeta(runsRoot, runId) {
 /**
  * 原子写 run 元数据（临时文件 + rename）。给了部分字段时与现有 meta 合并；
  * `id` 永远以路径为准，不接受请求体伪造。目录不存在 → RunError(404)。
- * @returns {Promise<object>} 写入后的完整 meta
+ *
+ * D1（BLOCKER）：`run.json` **存在但读不出来**时绝不覆盖。
+ *   - 读失败（坏 JSON / 超 1MiB / 目录 / 权限）→ 先把原内容另存为
+ *     `run.json.corrupt-<时间戳>-<短哈希>`，再抛 RunError(500, code=EMETACORRUPT)，
+ *     **原文件一个字节都不动**；
+ *   - 只有 `readMetaUnlocked` 返回 null（真正的 ENOENT）才允许按「新建」写默认值。
+ * 旧行为（读不出来就重建默认 meta）会把 status / 绑定 / seq 全部重置，导致 run
+ * 从列表消失、事件序号从 1 重新开始。
+ *
+ * D3：patch 里未声明的键仍然丢弃，但会挂在返回值的 `droppedKeys`（不可枚举属性，
+ * 不会被 JSON.stringify 写进 run.json，也不改变既有返回结构）上。
+ *
+ * @returns {Promise<object>} 写入后的完整 meta（可能带不可枚举的 `droppedKeys` /
+ *   `nodeStatusBudget` 诊断属性）
  */
 export async function writeRunMeta(runsRoot, runId, patch = {}) {
   const loc = requireLoc(runsRoot, runId)
@@ -1168,11 +1677,34 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
       if (error && error.code === 'ENOENT') throw new RunError(404, 'runId', 'run 不存在')
       throw error
     }
-    const existing = await readMetaUnlocked(loc)
-    const merged = normalizeMeta({ ...(existing || {}), ...(patch && typeof patch === 'object' ? patch : {}) }, loc.id)
+    const source = isPlainObject(patch) ? patch : {}
+    // D3：显式出现的键先严格校验（类型不对 / sessions 超限 → 400，不静默丢）。
+    validateMetaPatch(source)
+    const droppedKeys = Object.keys(source).filter(key => !META_FIELD_KEYS.has(key))
+    // startOptions 是「白名单里的对象 + 对象内还有白名单」：多余的内层键也要可见。
+    if (isPlainObject(source.startOptions)) {
+      for (const key of Object.keys(source.startOptions)) {
+        if (!START_OPTIONS_KEYS.includes(key)) droppedKeys.push(`startOptions.${key}`)
+      }
+    }
+    let existing
+    try {
+      existing = await readMetaUnlocked(loc)
+    } catch (error) {
+      // D1：文件存在但读不出来 → 备份 + 拒绝覆盖，保持原文件不动。
+      const backup = await backupCorruptMeta(loc).catch(() => null)
+      throw corruptMetaError(error, backup)
+    }
+    const merged = normalizeMeta({ ...(existing || {}), ...source }, loc.id)
     merged.updatedAt = new Date().toISOString()
     if (!existing) merged.createdAt = merged.updatedAt
-    return writeMetaUnlocked(loc, merged)
+    const written = await writeMetaUnlocked(loc, merged)
+    if (droppedKeys.length > 0) {
+      Object.defineProperty(written, 'droppedKeys', {
+        value: droppedKeys, enumerable: false, configurable: true, writable: false,
+      })
+    }
+    return written
   })
 }
 
@@ -2064,6 +2596,16 @@ function applyProgressEvent(progress, event) {
 /**
  * 追加一批事件。整批校验：任何一条不合法就一条都不写。
  *
+ * **并发边界（重要，别当成通用并发安全）**：
+ *   - 进程内由 `withLock(runId)` 串行化：同一进程里并发 `appendEvents` / `writeRunMeta`
+ *     不会丢计数、seq 单调不回退；
+ *   - 跨进程**没有文件锁**：同一 `DSH_HOME` 起多个 dsh 进程、多个引擎实例同时写同一个
+ *     run 时，两边会各自读到同一个 `meta.seq` 再各自 +1，落盘出现**重复 seq**，
+ *     `eventCount` 也会互相覆盖。这里依赖 06 §13.3 的**单写者租约**（同一 run 同时
+ *     只有一个持有 `lock.json` 的引擎在写）。
+ *   - 需要多进程并发写同一 run 时，必须另加跨进程锁域（或按 run 分片），
+ *     不要直接在这里加并发调用方。
+ *
  * @param {string} runsRoot
  * @param {string} runId
  * @param {object|object[]} rawEvents 单条或数组
@@ -2265,6 +2807,9 @@ function describeMetaError(error) {
   if (code === 'EACCES' || code === 'EPERM') return 'run.json 权限拒绝'
   if (code === 'ENOENT') return 'run.json 不存在'
   if (code === 'ENOTDIR') return 'run 目录路径异常（不是目录）'
+  // D1：readMetaUnlocked 的结构化错误码 → 可读原因（listRuns 的 skipped.reason 用）。
+  if (code === 'EBADJSON') return 'run.json 内容损坏（不是合法 JSON）'
+  if (code === 'EMETATOOLARGE') return 'run.json 超过 1MiB 上限'
   return `run.json 不可读（${code || '未知错误'}）`
 }
 

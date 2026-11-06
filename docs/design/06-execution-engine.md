@@ -804,9 +804,26 @@ optional 字段必须给空值（`[]` / `""` / `0` / `"na"`），换来的是「
 ### 17.4 custom 的命令模板
 
 - 执行方式固定 `sh -c <script>`，不经过引擎的 argv 解析。
-- `{prompt}` / `{schema}` / `{cwd}` 三个占位符会被替换，并做 POSIX shell 单引号转义；
-- 三个占位符都没有时，把 prompt 作为最后一个参数追加（同样转义）；
-- 无论模板用不用 `{schema}`，引擎都会先生成 schema 文件（见 §17.5）并传路径。
+- **prompt 原文绝不进入脚本文本**（v0.8.1 安全修复）。旧实现把 prompt 用单引号转义后拼进
+  `sh -c`，实测 `echo "{prompt}"` + prompt=`$(id -u)` 会在宿主执行命令替换 —— 自定义 executor
+  等价于任意代码执行。现在 prompt 走三条互不相同的通道：
+  1. **文件通道（主）**：每次 attempt 把 prompt 原文写进 `os.tmpdir()` 下唯一目录
+     （目录 `0700` / 文件 `0600`），路径经 `FLOW_STUDIO_PROMPT_FILE` 传给子进程；模板里的
+     `{prompt}` 按**所在 shell 引号上下文**替换：普通位置是 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`，
+     已在双引号内则不重复加外层引号。
+  2. **环境变量（兼容）**：prompt ≤ 64 KiB 时额外设 `FLOW_STUDIO_PROMPT`；超过不设（避免 spawn
+     `E2BIG`），大 prompt 用 `{prompt}` 或读 `FLOW_STUDIO_PROMPT_FILE`。
+  3. **stdin（兜底）**：prompt 全文写进子进程 stdin 后 `end()`；子进程不读 stdin 时的 EPIPE 被吞掉，
+     不算失败。
+- 单引号内的 `{prompt}` **不支持**（shell 不展开），保持字面量、无注入；该限制写在模块头部契约里。
+- 临时文件在成功 / 非 0 退出 / 超时 / abort / spawn 失败五条路径上统一清理。
+- `{schema}` / `{cwd}` 仍做 POSIX shell 单引号转义后替换；无论模板用不用 `{schema}`，引擎都会
+  先生成 schema 文件（见 §17.5）并传路径。
+- 语义边界：`$(cat)` 按 POSIX 会剥掉 prompt 末尾换行；需要**含尾换行**的逐字节原文，读
+  `FLOW_STUDIO_PROMPT_FILE` 或 stdin。
+- 回归证据（`test/executor.test.mjs`，真实 `sh -c`）：`$(id -u)`、反引号、`"; touch …; echo "`、
+  `$(rm -rf …)` 四类载荷一律按原文输出、哨兵不出现；256 KiB prompt 三通道逐字节保真；
+  临时文件在三条退出路径上都清理。
 
 stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如果 custom 只打印一段
 非 JSONL 的文本（例如整段 JSON），关闭时用整段 stdout 作为 text 回退，再按 §17.5 解析结构。
@@ -940,6 +957,17 @@ proactive_set 闹钟」；`enabled=false`（引擎没有 `enableSupervision` 或
   `evaluate`（runtime 调 `auditWorkflow`）、`wake`（`agents.get` / `resume` + `followup`）、
   `load` / `save`（run.json）全部由 runtime 注入。supervise 不 import dsh、不直接读写 run.json。
 - `tick()` 有重入保护：上一轮未结束时，新一轮直接返回 `{ skipped:true }`。
+- **每条 entry 独立超时**（`wakeTimeoutMs`，默认 60s）＋ **有界并发**（`maxConcurrency`，默认 4）：
+  一条 run 的 `wake` 卡住（例如 `agents.resume` 永不返回）只占它自己那条通道，不再让整轮 tick
+  永久挂死、其它 run 的巡检全部停摆。超时记为 `lastOutcome:'timeout'`、计入 `timeouts`。
+- 超时/`stop()` 之后迟到的结果一律**丢弃**：每条 entry 带 `epoch`，`await` 之后先比 epoch，
+  旧一代的结果不写状态、不推 `nextDueAt`。
+- `snapshot()` 暴露可观测字段：`lastOutcome / lastDurationMs / lastFinishedAt / lastError / timeouts /
+  tick.lastDurationMs / skippedReentries`；`status()`（5 字段）与 `list()` 的既有契约不变。
+  `flow_watch` 把这些字段与 `health{timeouts,invalidReports,warnings}` 一起透出，并把
+  「超时 / 整轮 tick 疑似停摆 / 节点回报格式错」写进可读结论。
+- `stop()` / `dispose()` 会 `abortAll()` 结算在飞 entry 并清掉所有 timer；所有 timer 都 `unref()`，
+  调度器不会吊住进程（有子进程用例实证「不 `process.exit()` 也能自然退出」）。
 
 ### 18.3 `planWake` 的间隔规则
 
@@ -963,9 +991,27 @@ proactive_set 闹钟」；`enabled=false`（引擎没有 `enableSupervision` 或
 - 到点唤醒后**立刻推进** `nextDueAt`（成功、失败都推进），以本次唤醒时间为新基准，
   避免同一个 due 反复叫。
 - 写盘失败（`save` 抛错）只 warn；内存状态仍推进，保证本轮不会重复唤醒。
-- 重启恢复：`runtime.supervisionReady` 扫描 `listRuns(limit:100)` 中 `status ∈ {pending,running}`
-  且 `supervision.enabled === true`、`wakerSessionId` 非空的 run，`register()` 登记；
-  **不立刻唤醒**，第一次唤醒仍由 `nextDueAt` 决定。
+- 重启恢复：`runtime.supervisionReady` **先做重启收口**（见下条），再扫描 `listRuns(limit:100)` 中
+  `status ∈ {pending,running}` 且 `supervision.enabled === true`、`wakerSessionId` 非空的 run，
+  `register()` 登记；**不立刻唤醒**，第一次唤醒仍由 `nextDueAt` 决定。
+- **重启收口（v0.8.1）**：进程重启后，`status === 'running'` 但本进程里没有 `Engine` 实例的 run
+  既停不掉（`flow_stop` 拿不到实例 → 409）又会被调度器每 60s 白叫一次。`reclaimOrphanRuns()`
+  把它们**无条件收成 `failed`**：`supervision.reason='restarted'`、`nextDueAt/lastWokeAt=null`、
+  释放租约、写一条带 `reason`/`ts` 的 `run/end`。
+  - 判定链：本进程实例（`runs` / `LIVE_RUN_IDS`）→ 租约 `pid/host/heartbeatAt/ttlMs`（过期由
+    `readLease` 清）→ 同机 `kill(pid,0)` 探活（`EPERM` 视为活）→ 异机**保守跳过**。
+  - 收口前用 `claimLease()`（O_EXCL）抢收口权，抢不到（409）就跳过；写完前再确认一次仍是
+    `running`。整条动作**幂等**：第二次调用返回 `[]`，`endedAt/updatedAt` 不变。
+  - `running` 且无实例的 run **不恢复 supervision 登记**（`lastReason='not-registered'`）；
+    `pending` 仍按旧规则恢复。
+- **卸载即 abort**：`runtime.dispose()` 先 `stop()` 两个调度器，再对每个活跃 `Engine` 调
+  `abort`/`stop`、摘掉 `session/event` 订阅，然后用 `disposeTimeoutMs`（默认 2000ms）**有界等待**
+  返回 `{aborted, timedOut}`。卸载后不再有新事件写入、定时器全部清空、进程能自然退出；
+  等不到就只告警、不无限挂住宿主。
+- **事件归属过滤（v0.8.1）**：`session/event` 缓冲在 **runtime 组合层**做归属过滤 —— 只有属于本
+  run 的节点会话（以及本 run 的 waker 会话）的事件才进 `pendingSessionEvents`，外来事件只计入
+  `sessionEventStats.foreign`；上限是「条数 + 字节」双限（超出丢最旧并置 `sessionEventOverflow`）。
+  这是**分层决定**：`Engine` 可单独构造（测试用），跨 run 隔离由唯一生产构造点 runtime 负责。
 - 多进程/多实例：tick 时若落盘 `lastWokeAt` 比内存新，以落盘为准，避免重复唤醒；
   这不是分布式锁，跨进程的 run 写者互斥仍由 run 目录的 `lock.json` 租约负责。
 - 显式 `register()` 是「重新启用」动作：对已写 `enabled:false` 的 run 再次登记，
@@ -1020,10 +1066,10 @@ proactive_set 闹钟」、以及 healthy 就结束本轮 / 异常或跑完才通
 ### 18.9 可复核证据
 
 ```sh
-node test/supervise.test.mjs    # 27 组 / 194 条断言
-node test/runtime.test.mjs      # 16 组 / 152 条断言
-node test/tools.test.mjs        # 35 组 / 336 条断言（含 flow_start 自动开启、flow_supervise）
-node test/host.test.mjs         # 40 组（含 POST /runs/<id>/supervision）
+node test/supervise.test.mjs    # 63 组 / 580 条断言（含 per-entry 超时、有界并发、无残留 timer）
+node test/runtime.test.mjs      # 32 组 / 327 条断言（含重启收口、dispose abort、事件归属过滤）
+node test/tools.test.mjs        # 55 组 / 738 条断言（含 flow_start 自动开启、flow_supervise、调度器快照）
+node test/host.test.mjs         # 43 组（含 POST /runs/<id>/supervision）
 ```
 
 关键用例：`planWake` 的终态 / pending / healthy / 异常 / 未知 verdict 五档，到点只唤醒一次、
@@ -1044,9 +1090,9 @@ tick 重入保护、`flow_start` 自动开启与失败回退、HTTP 启用/禁�
 |---|---|---|
 | 叫醒谁 | **发起会话**（`wakerSessionId`） | **节点主管会话**（`sessionId`） |
 | 问什么 | 「整个 run 是否正常运转」，让它调 `flow_watch` | 「你这个节点现在什么状态」，要求结构化回报 |
-| 数据落在 | `run.json.supervision` | `node/status` 事件 + `run.json.nodeStatus` + `live.nodeStatus` |
+| 数据落在 | `run.json.supervision` | `node/status` 事件 + `run.json.nodeStatus`（**唯一权威**；`live` 里不再重复一份，避免双份状态与体积翻倍） |
 | 默认开启 | `flow_start` 起的 run 自动开 | 每个节点主管会话**自动登记**（不需要配置） |
-| 间隔 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 `nodeAlarmMs=120_000`（可配置），每 15s 扫一次到点（`nodeSupervisionIntervalMs` 可覆盖） |
+| 间隔 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 `nodeAlarmMs=600_000`（10 分钟；`FLOW_STUDIO_NODE_ALARM_MS` 或 `nodeSupervisionIntervalMs` 可覆盖），每 15s 扫一次到点 |
 | 失败降级 | 连续 3 次 → `enabled:false` + `reason:'wake-failed: …'` | 连续 3 次 → `enabled:false` + `lastReason:'wake-failed: …'`，仍留在 `list()` 可查 |
 | 生命周期 | run 收尾摘除 | attempt 结束就摘；run 收尾再 `unregisterRun` |
 | 调度器 | `SupervisionScheduler`（`src/supervise.js`） | `NodeSupervisionScheduler`（同文件，**另一个实例、另一个 `setInterval`**） |
@@ -1058,7 +1104,7 @@ tick 重入保护、`flow_start` 自动开启与失败回退、HTTP 启用/禁�
 
 | 时点 | 动作 | 代码位置 |
 |---|---|---|
-| `agents.create` 成功 | 登记 `{runId, nodeId, sessionId, attempt}`；`nextDueAt = now + 120s`（ISO 字符串） | `_createNodeSession()` → `_registerNodeSupervision()` |
+| `agents.create` 成功 | 登记 `{runId, nodeId, sessionId, attempt}`；`nextDueAt = now + 600s`（ISO 字符串；默认 10 分钟，可用 `FLOW_STUDIO_NODE_ALARM_MS` 覆盖） | `_createNodeSession()` → `_registerNodeSupervision()` |
 | 打回重跑 / 外部消息二次激活、复用同一会话 | 重新登记 = **刷新**：重排 `nextDueAt`、更新 `attempt` / `nodeId`、清 `failures`，不叠加第二条，累计 `wakes` 保留 | `_followupNodeSession()` → `_registerNodeSupervision()` |
 | attempt 结束（passed / rejected / failed / 中止） | `_unregisterNodeSupervision(attemptSessionId)`；空 sessionId（外部 executor）安全 no-op | 节点执行 `finally` |
 | run 收尾 | `unregisterRun(runId)`，摘掉该 run 全部闹钟 | 引擎 `_disposeRunSessions()` + runtime `settleInstance()` |
@@ -1084,7 +1130,11 @@ runtime 注入的 `wakeNode(entry)` 按以下顺序决定（返回 `{ action, re
 | `resume` 抛错 / `inject` / `followup` 抛错 | 计一次失败（`failures+1`） | `wake-failed: …` |
 
 - 投递统一走 `buildFollowupPayload`（收件箱同一结构，`from:'flow-studio'`），提示词由
-  `nodeSelfCheckPrompt(entry)` 生成，固定带 `runId` / `nodeId` / `attempt`。
+  `nodeSelfCheckPrompt(entry)` 生成，固定带 `runId` / `nodeId` / `attempt` / **`nonce`**。
+- **凭证（v0.8.1）**：`nonce` 由引擎按 attempt 一次性生成，runtime 通过
+  `engine.attemptEnvelopeFor(sessionId)` 取 `{ attempt, nonce, nodeId }` 并写进提示词；节点回报
+  必须原样回显 `attempt` + `nonce`，不匹配（含上一轮 attempt 的迟到回报）一律丢弃并留痕。
+  取不到 envelope 时**这次唤醒不发**（记 `skip` + `no-attempt-envelope`，进 `snapshot()`）。
 - `wake` 必须返回 `{ action: 'inject'|'followup'|'skip' }`；缺 `action` / 未知值 / `null` 也算失败。
 - 计数：`inject` / `followup` → `wakes+1`；`skip` → 算成功、清 `failures`、**`wakes` 不加**。
 - 三种结果都推进 `nextDueAt`；失败也推进，避免同一个 due 每轮重试刷屏。
@@ -1118,13 +1168,26 @@ runtime 注入的 `wakeNode(entry)` 按以下顺序决定（返回 `{ action, re
 | `verdict` | 只认 `pass` / `reject`，其它 → `null` |
 | `nodeId` | 非空字符串才保留，否则 `null` |
 | `attempt` | 非负整数才保留（含 0），否则 `null` |
+| `nonce` | 非空字符串才保留，否则 `null`；与 envelope 不符的整条回报丢弃 |
+
+**结论优先级与证据保留（v0.8.1，修掉「自审可以伪造通过」）**：
+
+- 正式结论（verdict 合法 + 凭证匹配）**优先于**状态块；状态块**永远不能**把正式 `reject` 翻成
+  `pass`——正式 `reject` 先到、状态块 `pass` 后到时仍按 `reject` 返工。
+- **判「提前完成」必须同时满足**：`progress === 100`、`blockers` 为空、且同一条回复里有合法正式
+  verdict。只有状态块 → **不判完成**，按超时失败处理。
+- **证据不许静默丢**：走「只有状态块」或凭证不匹配的路径时，原始 artifacts / findings /
+  acceptance / tests / checks 仍原样落盘 `self-check-raw.json`，并在 `node/status` 的 extra 里留路径。
+- **格式错 ≠ 没回报**：文本里出现 `state/progress/members/blockers` 形态的键但解析或类型非法 →
+  记 `recordReport(kind:'invalid')`（进调度器 `snapshot()` 与 `flow_watch` 的
+  `health.invalidReports`），且**不**写节点完成状态；普通对话文本不误报。
 
 落盘：
 
 | 去处 | 形状 / 上限 |
 |---|---|
 | `node/status` 事件 | 追加写；`traceId` / `nodeId` / `attemptId` 由引擎按当前绑定写；`data` 白名单见下 |
-| `live.nodeStatus` | 同步快照，每个节点只留最新 |
+| `live` | **不再有 `nodeStatus`**（v0.8.1）；节点状态的唯一权威是 `run.json.nodeStatus` |
 | 引擎内存 `nodeStatus` | `Map<nodeId, entry>`，最多 200 个节点，超出淘汰最早登记的 |
 | `run.json.nodeStatus` | `{ state, progress, summary, verdict, at }` + `members: [{name,state}]` + `blockers: []`；`normalizeNodeStatus()` 再做一次形状收敛 |
 
@@ -1215,15 +1278,45 @@ runtime 注入的 `wakeNode(entry)` 按以下顺序决定（返回 `{ action, re
 node test/supervise.test.mjs   # 52 组 / 410 条（8.1 常量、8.2 parseNodeStatus、8.3–8.6 调度器）
 node test/engine.test.mjs      # 70 组 / 604 条（①–⑨ 节点闹钟组）
 node test/runtime.test.mjs     # 22 组 / 178 条（wake 的 idle/busy/skip、收尾 unregisterRun、dispose）
-node test/tools.test.mjs       # 36 组 / 345 条（flow_watch 返回 nodeStatus + blocked 建议）
+node test/tools.test.mjs       # 55 组 / 738 条（flow_watch 返回 nodeStatus + blocked 建议 + 调度器健康）
 node test/runlog.test.mjs      # 72 组（node/status 通过校验 / 坏输入拒绝）
-node test/host.test.mjs        # 41 组（GET /runs 列表 / 详情 / summary 的 nodeStatus）
-node test/render.test.mjs      # 70 组（运行详情「节点状态」区块：标题 / 徽标 / 进度 / 成员 / 阻塞 / 降级 / 滚动）
+node test/host.test.mjs        # 43 组（GET /runs 列表 / 详情 / summary 的 nodeStatus）
+node test/render.test.mjs      # 71 组（运行详情「节点状态」区块：标题 / 徽标 / 进度 / 成员 / 阻塞 / 降级 / 滚动）
 ```
 
-`run.json.nodeStatus` 的 `normalizeNodeStatus()` 目前没有独立单测，由 host 组的真实写路径间接覆盖。
+`run.json.nodeStatus` 的 `normalizeNodeStatus()` 现在有独立单测（`test/runstore.test.mjs` 的 D2 组：256 KiB 预算、裁剪顺序、成员按时间淘汰、`nodeStatusTruncated` 标志）。
 
 关键用例：建会话即登记、attempt 结束注销先于 `unregisterRun`、打回重跑同一会话重新登记
 （attempt 1→2）、`node/status` 三处可见、`done+pass` 提前完成写 `completedBy:'self-check'`、
 非法 verdict 不触发提前完成、不注入调度器时完全退回 v0.7、外部 executor 不登记、
 连续 3 次失败停摆且不复活、`skip` 推进但不计 `wakes`、tick 重入保护。
+
+## 20 0.8.1：审计修复清单（BLOCKER → 修法 → 证据）
+
+2026-11-07 用 10 路独立子 agent 审计全仓（安全 / 存储 / 生命周期 / 调度 / 客户端 / 文档…），
+共 10 BLOCKER / 41 MAJOR。本节记录**已修**的 BLOCKER 与对应回归，避免以后重犯。
+
+| # | 缺陷（审计原文要点） | 修法 | 证据 |
+|---|---|---|---|
+| B1 | 发布链没有构建门禁：`lib/` 被 gitignore、无 `prepack`，干净检出发包**一个 js 都没有**；工作树发的是旧 lib | `prepack` / `pretest` 强制 build；`build.mjs` 逐字节比对 src↔lib 且与清单一一对应；新增只读 `scripts/verify-build.mjs` | `test/build.test.mjs`（8 组 / 48 条）：干净检出打包 22 文件、`lib/*.js` 14 个、与 HEAD src 逐字节相同；两个反例（陈旧 lib / 无 prepack）能红 |
+| B2 | custom executor 把 prompt 拼进 `sh -c`：`echo "{prompt}"` + `$(id -u)` 实测执行出 `1000`（宿主 RCE） | prompt 走「0700 临时文件 + `FLOW_STUDIO_PROMPT` + stdin」三通道，`{prompt}` 替换为 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"` | `test/executor.test.mjs`（26 组 / 173 条）：`$(id -u)` / 反引号 / 引号逃逸 / `$(rm -rf …)` 四类载荷按原文输出；256 KiB 三通道逐字节保真；三路径清理临时文件 |
+| B3 | `run.json` 三套写路径 / 两套锁域；`nodeStatus` 无字节预算，2.6 MB 时元数据被默认值重建、run 从列表消失、seq 回退成 1,1 | 引擎 `_patchRunBinding` 与 runtime `patchRunJson` 统一走 `writeRunMeta`；`normalizeNodeStatus` 加 256 KiB 预算（先摘 `note` → 再淘汰旧成员 → 再淘汰最旧节点，置 `nodeStatusTruncated`）；`readMetaUnlocked` 三态、损坏时备份并拒绝覆盖 | `test/runstore.test.mjs`（47 组）D1/D2/D3 组；`test/engine.test.mjs` C1 组（并发不丢字段、seq 不回退、sessions>512 跳过）；`test/runtime.test.mjs` E2-d |
+| B4 | 进程重启后半途 run 永远 `running`，还每 60s 被唤醒、`flow_stop` 409 | `reclaimOrphanRuns()`：无本进程实例 → 收成 `failed`（`reason:'restarted'`）、清 `nextDueAt/lastWokeAt`、释放租约；跨进程按租约 pid/host/heartbeat + `kill(pid,0)` 判活，异机保守跳过；收口前 `claimLease()` 抢权，幂等 | `test/runtime.test.mjs` E2-a 两组（含「新鲜跨进程租约不误杀」） |
+| B5 | 自审状态块可被当成正式结论：静默丢 artifacts/findings、pass 能覆盖真实 reject、不校验 attempt | 回报必须回显 `attempt + nonce`；正式结论优先于状态块、reject 不可翻；提前完成需 `progress=100` + 无 blockers + 合法 verdict；证据落 `self-check-raw.json` 且留痕 | `test/engine.test.mjs` C2 六组；`test/runtime.test.mjs` 端到端一组（含 nonce 回显） |
+| B6 | 画布「开始运行」不绑工作区，引擎回落 `process.cwd()`，节点在服务进程目录里写文件 | 引擎删 `process.cwd()` 回落（缺 workspace / 相对无基准 → 400 且不写 `run/start`）；路由 `POST /runs` 与 `/start` 强制 workspace 并持久化；前端未选工作区直接拦、不发请求 | `test/engine.test.mjs` C3 组；`test/host.test.mjs` E3-a 两组（缺/非目录/文件/正常四种）；`test/tools.test.mjs` F2 组（fetch 白盒 body，未选时请求数 0） |
+
+**B6 的后续（容器 e2e 抓到）**：修完「工作区必填」后，桩 run 停在 `pending` —— 路由层对
+`engineName==='stub'` 放行，但引擎层仍然 400，两层口径不一致；同时 e2e 里那句
+`curl … /start … || true` 把错误吞掉了，所以第一次跑只看到「run 最终状态是 pending」。
+两处都改成显式断言（引擎对 stub 豁免、`start` 必须回 202、否则打印响应体）。教训：
+**e2e 里任何 `|| true` 都是在给回归铺路**。
+
+同批修掉的高价值 MAJOR：调度器每条独立超时 + 有界并发 + epoch 丢弃迟到结果（E1）；
+卸载即 abort 且不吊住进程（E2-b）；`session/event` 按归属过滤 + 字节上限（E2-c）；
+`POST /runs/<id>/events` 只收观测类事件（生命周期只能内部推进）；回复通道 `tokenEnv` 收紧为
+`FLOW_STUDIO_REPLY_TOKEN_*` + URL 只许 https/回环 + 令牌打码；`flow_watch` 暴露调度器快照与
+`health{timeouts,invalidReports,warnings}`。
+
+**仍未闭合（如实列出）**：`removeWorktree()` 没有对外入口；跨进程 `appendEvents` 无文件锁
+（依赖单写者租约）；worktree 不自动清理；节点闹钟状态只在内存、重启不恢复；本轮无真机
+（宿主 `dsh-web`）端到端，只有容器测试台。

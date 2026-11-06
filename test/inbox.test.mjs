@@ -109,6 +109,15 @@ async function makeRun(flowId, nodeTotal, name = '收件箱测试 run') {
   return runstore.createRun(runsRoot, { flowId, flowName: `流程 ${flowId}`, name, nodeTotal })
 }
 
+/**
+ * E3-a：引擎 start() 不再回落 `process.cwd()`，测试统一注入一个真实工作区
+ * （项目 `.tmp/` 下，收尾删除）。
+ */
+const workspace = mkdtempSync(join(repoRoot, '.tmp', 'ws-inbox-'))
+function makeEngine(options = {}) {
+  return createEngine({ cwd: workspace, ...options })
+}
+
 function passOf(nodeId, extra = {}) {
   return {
     structured: { verdict: 'pass', summary: `${nodeId} 通过`, findings: [], ...extra },
@@ -157,10 +166,19 @@ function makeReplyAgent(sessionId, structured, sink) {
     session: { id: sessionId },
     followup(payload) {
       sink.follows.push({ sessionId, payload })
+      // 07 §11.3（C2）：正式结论必须原样回显本轮提示词里下发的 attempt + 一次性 nonce，
+      // 否则引擎会当作迟到/伪造回报丢弃。假 agent 从 followup 正文里读回这两个字段。
+      const prompt = Array.isArray(payload && payload.content) && payload.content[0]
+        && typeof payload.content[0].text === 'string' ? payload.content[0].text : ''
+      const attempt = /^- attempt: (\d+)$/m.exec(prompt)
+      const nonce = /^- nonce: (.+)$/m.exec(prompt)
+      const reply = attempt && nonce
+        ? { ...structured, attempt: Number(attempt[1]), nonce: nonce[1].trim() }
+        : structured
       // 模拟宿主 session/event：assistant 消息里带 JSON。
       sink.engine.handleSessionEvent({ id: sessionId }, {
         type: 'assistant/message',
-        data: { message: { role: 'assistant', content: [{ type: 'text', text: JSON.stringify(structured) }] } },
+        data: { message: { role: 'assistant', content: [{ type: 'text', text: JSON.stringify(reply) }] } },
       })
     },
     async whenIdle() {},
@@ -341,7 +359,7 @@ try {
     A.ok(meta.input.messages[0].text.includes('启动前就发来的需求'))
 
     let captured = null
-    const engine = createEngine({
+    const engine = makeEngine({
       runsRoot,
       flowsRoot,
       ctx: makeCtxWithAgents(makeAgents()),
@@ -365,7 +383,7 @@ try {
     let releaseA
     const gate = new Promise(done => { releaseA = done })
     const prompts = {}
-    const engine = createEngine({
+    const engine = makeEngine({
       runsRoot,
       flowsRoot,
       ctx: makeCtxWithAgents(makeAgents()),
@@ -406,7 +424,7 @@ try {
       targetNodeId: 'n_a', status: 'pending',
     }])
     const prompts = {}
-    const engine = createEngine({
+    const engine = makeEngine({
       runsRoot,
       flowsRoot,
       ctx: makeCtxWithAgents(makeAgents()),
@@ -452,7 +470,7 @@ try {
       },
       {
         id: 'm-http', direction: 'in', from: 'owner', text: '走 HTTP', targetNodeId: 'n_a',
-        status: 'injected', reply: { kind: 'http', url: 'https://example.test/hook', tokenEnv: 'INBOX_TEST_TOKEN' },
+        status: 'injected', reply: { kind: 'http', url: 'https://example.test/hook', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_INBOX_TEST' },
       },
     ])
     const sessionAgent = {
@@ -487,8 +505,8 @@ try {
     A.ok(sessionAgent.payload.content[0].text.includes('收到，马上处理'))
 
     const originalFetch = globalThis.fetch
-    const originalToken = process.env.INBOX_TEST_TOKEN
-    process.env.INBOX_TEST_TOKEN = 'hook-secret-token'
+    const originalToken = process.env.FLOW_STUDIO_REPLY_TOKEN_INBOX_TEST
+    process.env.FLOW_STUDIO_REPLY_TOKEN_INBOX_TEST = 'hook-secret-token'
     const httpCalls = []
     globalThis.fetch = async (url, init) => {
       httpCalls.push({ url, init })
@@ -508,8 +526,8 @@ try {
       A.ok(body.text.includes('[flow:'))
     } finally {
       globalThis.fetch = originalFetch
-      if (originalToken === undefined) delete process.env.INBOX_TEST_TOKEN
-      else process.env.INBOX_TEST_TOKEN = originalToken
+      if (originalToken === undefined) delete process.env.FLOW_STUDIO_REPLY_TOKEN_INBOX_TEST
+      else process.env.FLOW_STUDIO_REPLY_TOKEN_INBOX_TEST = originalToken
     }
 
     const localResult = await reply.execute({ text: '没有外部通道也得记' }, exec)
@@ -617,12 +635,12 @@ try {
       A.ok(Array.isArray(list.json.messages) && list.json.messages.length >= 1)
 
       const inbox = await call('POST', `${base}/inbox`, {
-        reply: { kind: 'http', url: 'https://example.test/cb', tokenEnv: 'CB_TOKEN' },
+        reply: { kind: 'http', url: 'https://example.test/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_CB' },
       }, auth)
       A.equal(inbox.status, 200)
       A.equal(inbox.json.inbox.reply.kind, 'http')
       const meta = await runstore.readRunMeta(runsRoot, run.id)
-      A.equal(meta.inbox.reply.tokenEnv, 'CB_TOKEN')
+      A.equal(meta.inbox.reply.tokenEnv, 'FLOW_STUDIO_REPLY_TOKEN_CB')
       const badInbox = await call('POST', `${base}/inbox`, {
         reply: { kind: 'http', url: 'ftp://example.test/cb' },
       }, auth)
@@ -678,7 +696,7 @@ try {
       },
       on() { return () => {} },
     }
-    engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engine = makeEngine({ runsRoot, flowsRoot, ctx })
     await engine.start(run.id)
     const final = await engine.wait(run.id)
     A.equal(final.status, 'done')
@@ -748,7 +766,7 @@ try {
       },
       on() { return () => {} },
     }
-    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    const engine = makeEngine({ runsRoot, flowsRoot, ctx })
     await engine.start(run.id)
     const final = await engine.wait(run.id)
     A.equal(final.status, 'done')
@@ -784,7 +802,7 @@ try {
       },
       on() { return () => {} },
     }
-    const stopEngine = createEngine({ runsRoot, flowsRoot, ctx: stopCtx })
+    const stopEngine = makeEngine({ runsRoot, flowsRoot, ctx: stopCtx })
     await stopEngine.start(stopRun.id)
     await secondStarted
     const stopped = await stopEngine.stop(stopRun.id)
@@ -800,7 +818,7 @@ try {
     const run = await makeRun(flow.id, 2)
     const logs = []
     let activations = 0
-    const engine = createEngine({
+    const engine = makeEngine({
       runsRoot,
       flowsRoot,
       ctx: { get() { return undefined }, on() { return () => {} } },
@@ -867,6 +885,7 @@ try {
     }
   })
 } finally {
+  rmSync(workspace, { recursive: true, force: true })
   rmSync(home, { recursive: true, force: true })
 }
 

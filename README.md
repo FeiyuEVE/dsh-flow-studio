@@ -1,6 +1,6 @@
 # dsh-flow-studio
 
-**当前版本：0.8.0**
+**当前版本：0.8.1**
 
 > DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 端用画布拖拽节点，把一条研发流水线画出来，
 > 每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来，
@@ -87,6 +87,22 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
   pending 30s），到点自动唤醒发起会话；连续 3 次唤醒失败降级关闭。HTTP 起的 run 默认不开，
   可用 `flow_supervise` 或 `POST /runs/<id>/supervision` 打开。
 
+**0.8.1 是一轮「10 路独立审计 → 修 BLOCKER」的收口**，重点不是加功能而是堵漏：
+
+- **发布链补门禁**：`prepack` / `pretest` 强制 `build`，`build.mjs` 逐字节比对 `src` 与 `lib`；
+  干净检出发包若少了构建产物或带了陈旧模块，直接非零退出。
+- **custom executor 不再拼 shell**：prompt 原文不进命令文本，改走「0700 临时文件（`FLOW_STUDIO_PROMPT_FILE`）
+  + `FLOW_STUDIO_PROMPT` + stdin」三条通道；`$(id -u)` / 反引号 / `$(rm -rf …)` 一律按原文处理。
+- **run.json 单一写入口**：引擎与运行时都改走 `writeRunMeta`（同一把锁），`nodeStatus` 加 256 KiB
+  字节预算；元数据损坏时备份 + 拒绝覆盖，不再被默认值重建（也不会让 seq 回退成 1,1）。
+- **启动必须显式工作区**：删掉 `process.cwd()` 回落，缺工作区 / 非目录 / 是文件一律 400，画布未选工作区时前端直接拦。
+- **节点自审要求凭证**：回报必须回显 `attempt + nonce`，正式结论优先于状态块（pass 不能覆盖 reject），
+  只有状态块不判完成，原始证据落 `self-check-raw.json` 而不是静默丢弃。
+- **重启与卸载收口**：重启后把「running 但本进程无实例」的 run 收成 `failed`（跨进程租约保守跳过）；
+  卸载即 abort 在飞引擎；调度器每条独立超时 + 有界并发；`session/event` 按归属过滤。
+- **对外通道收紧**：`POST /runs/<id>/events` 只收观测类事件；回复通道 `tokenEnv` 只认
+  `FLOW_STUDIO_REPLY_TOKEN_*`、URL 只许 https 或回环，令牌在日志/错误里打码。
+
 **0.8.0 给每个节点主管会话加了自审闹钟**（[07 §11](docs/design/07-runtime-0.7.md) /
 [06 §19](docs/design/06-execution-engine.md)）：建会话即登记、attempt 结束注销，到点让节点用
 结构化 `node/status` 回报状态；`state=done` + 合法 verdict 可与 `whenIdle` 竞速提前完成，
@@ -172,7 +188,7 @@ POST /api/flow-studio/runs/<runId>/messages
   建失败如实写 `enabled:false`。
 - **内建 supervision**：`flow_start` 起的 run 默认由 runtime 定时唤醒发起会话复查，不用外部插件，
   也不用自己挂闹钟；连续 3 次唤醒失败自动降级。
-- **每个节点主管会话都有自审闹钟**：`agents.create` 成功后自动登记（默认 120s 一次），到点按会话
+- **每个节点主管会话都有自审闹钟**：`agents.create` 成功后自动登记（默认 **600s / 10 分钟**一次，可用 `FLOW_STUDIO_NODE_ALARM_MS` 改），到点按会话
   状态走 `inject` / `followup` / `resume`，要求节点用 json 代码块回报
   `state / progress / summary / members / blockers / verdict`；`state=done` + 合法 verdict 可与
   `whenIdle` 竞速提前收口（`node/end.extra.completedBy='self-check'`），连续 3 次投递失败自动停摆。
@@ -285,8 +301,9 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 19 个自检文件，共 540 组（其中 7 个套件显式计数，合计 1845 条断言）
-node test/render.test.mjs   # SSR + 构建产物加载，70 组
+npm test           # 20 个自检文件，共 627 组（其中 8 个套件显式计数，合计 2783 条断言）
+node scripts/verify-build.mjs  # 只读发布前校验：src↔lib 逐字节一致 + main 入口存在（npm pack 前也会自动 build）
+node test/render.test.mjs   # SSR + 构建产物加载，71 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
@@ -301,7 +318,7 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）；
   v0.8 组覆盖 `node/status` 通过校验、可选字段收敛、成员 / 阻塞项有界与坏输入拒绝。
 - `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器；
-  `nodeStatus` 的写入 / 归一化由 host 组经真实写路径间接覆盖（本文件暂无独立用例）。
+  D 组覆盖 `nodeStatus` 的 256 KiB 字节预算与裁剪顺序、`nodeStatusTruncated`、损坏 `run.json` 备份且拒绝覆盖、并发 append 的 seq 单调、`startOptions` 白名单。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
 - `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、
   预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门；
@@ -320,7 +337,7 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/supervise.test.mjs` —— 内建 supervision：`planWake` 五档间隔、到点只唤醒一次、失败 3 次降级 /
   成功清零 / 重启恢复 / 终态摘除 / 坏日期不抛错 / tick 重入保护；v0.8 节点闹钟组覆盖
   `parseNodeStatus` 的围栏 / 裸 JSON / 默认值 / 大小写 / 取整 / 上限，`NodeSupervisionScheduler`
-  的 120s 默认间隔、`skip` 推进但不计 `wakes`、连续 3 次失败停摆、刷新与三种注销。
+  的 600s 默认间隔（`FLOW_STUDIO_NODE_ALARM_MS` 可覆盖）、`skip` 推进但不计 `wakes`、连续 3 次失败停摆、刷新与三种注销。
 - `test/client-perf.test.mjs` —— 客户端性能回归：拖动中 0 次提交 / 松手恰好 1 次、锁定不提交、
   节点与边是 `React.memo` 且相同输入复用同一对象、草稿去抖（5 次变更只写 1 次、maxWait 必落、隐藏立即 flush）。
 - `test/logdrawer.test.mjs` —— 运行详情：抽屉三档与全屏类、Esc 逐档还原、节点面板四类实时字段、
@@ -386,7 +403,7 @@ v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：sessio
 | 叫醒谁 | 发起这个 run 的会话（`wakerSessionId`） | 单个节点主管会话（`sessionId`） |
 | 问什么 | 「整个 run 是否正常运转」，要求调 `flow_watch` | 「你这个节点现在什么状态」，要求结构化回报 |
 | 回报落在哪 | `run.json.supervision` | `node/status` 事件 + `run.json.nodeStatus` + `live.nodeStatus` |
-| 节奏 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 120s 一次（每 15s 扫到点） |
+| 节奏 | healthy 180s / 异常 60s / pending 30s / 终态停 | 默认 600s 一次（每 15s 扫到点，`FLOW_STUDIO_NODE_ALARM_MS` 可覆盖） |
 | 什么时候停 | run 收尾 / 连续 3 次唤醒失败 | attempt 结束就注销；run 收尾再 `unregisterRun` |
 | 连续 3 次失败 | 关闭调度并写 `wake-failed` | 停摆（`enabled:false`），条目仍可查 |
 

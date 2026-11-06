@@ -29,6 +29,32 @@ export const SUPERVISION_INTERVALS = Object.freeze({
   pending: 30,
 })
 
+/**
+ * 单条 entry 一轮唤醒的默认超时（毫秒）。
+ *
+ * 为什么必须有：`wake` 链路最终会 `await agent.whenIdle()` 之类的长操作。某个 run
+ * 的节点会话永不 idle 时，没有超时就会把**整轮 tick** 永远吊住——进程还活着，但
+ * 调度器事实性死亡，其它 run 再也得不到巡检（E1-a）。
+ *
+ * 超时后的契约：
+ *   - 向注入的 `wake` 传 `AbortSignal` 并 abort（实现可以据此收手）；
+ *   - 这一条记为 `timeout`（计入 `timeouts`、按失败累计，连续 3 次同样降级）；
+ *   - 推进 `nextDueAt`，同轮其它条照常推进，绝不互相拖累；
+ *   - 迟到的结果由 entry.epoch 丢弃，不会污染下一轮状态。
+ *
+ * 注意这是**每条 entry 一轮**（load / evaluate / wake / persist）的上限，不是
+ * 「一次 tick」的上限；整轮 tick 的耗时见 `snapshot().tick.lastDurationMs`。
+ */
+export const SUPERVISION_WAKE_TIMEOUT_MS = 60_000
+
+/**
+ * 一轮 tick 里同时唤醒的最大 entry 数。
+ *
+ * 有界并发（默认 4）保证一个慢 run 只占住自己那个 worker，不会把整轮拖成串行；
+ * 同一条 run 的多个节点仍串行（见 `NodeSupervisionScheduler.tick` 的分组）。
+ */
+export const SUPERVISION_MAX_CONCURRENCY = 4
+
 /** 连续唤醒失败达到这个次数就降级：enabled=false + reason='wake-failed: ...'。 */
 const MAX_WAKE_FAILURES = 3
 
@@ -89,6 +115,125 @@ function intervalForReason(reason) {
   if (reason === 'pending') return SUPERVISION_INTERVALS.pending
   if (reason === 'healthy') return SUPERVISION_INTERVALS.healthy
   return SUPERVISION_INTERVALS.anomaly
+}
+
+/**
+ * 有界并发跑一组 thunk（thunk 自己负责不 reject）。结果数组与 tasks 顺序一致。
+ *
+ * 实现是「游标 + N 个 worker」而不是 `Promise.all(chunked)`：任一 task 挂住只占住
+ * 它自己那个 worker，其它 worker 继续消费队列；同一时刻在飞的条数永不超过 limit。
+ */
+async function runPool(tasks, limit) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return []
+  const size = Math.min(Number.isInteger(limit) && limit > 0 ? limit : SUPERVISION_MAX_CONCURRENCY, tasks.length)
+  const results = new Array(tasks.length)
+  let cursor = 0
+  const worker = async () => {
+    for (;;) {
+      const index = cursor
+      cursor += 1
+      if (index >= tasks.length) return
+      try {
+        results[index] = await tasks[index]()
+      } catch {
+        // 调用方的 thunk 已有自己的 catch；这里再兜一层，保证 runPool 永不 reject。
+        results[index] = undefined
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: size }, worker))
+  return results
+}
+
+/**
+ * 每次 entry 唤醒的独立超时执行器（E1-a）。
+ *
+ * 语义：
+ *   - `run(factory, timeoutMs)` 返回 `{ status: 'ok'|'timeout'|'error'|'aborted', value?, error? }`，
+ *     **永不 reject**；
+ *   - 正常/超时/abort 三路都会清掉 setTimeout，不留悬挂 timer（timer 另外 unref，
+ *     即便注入实现忘了清也不会拖住进程退出）；
+ *   - 超时先 abort 再结算；底层 promise 后续的 resolve/reject 被 `settled` 丢弃，
+ *     迟到的业务结果由调用方的 epoch 守卫再挡一层；
+ *   - `abortAll(reason)` 给 stop()/dispose() 用：结算所有在飞 entry，清掉它们的 timer。
+ */
+function createWakeRunner({ setTimeoutFn, clearTimeoutFn }) {
+  const inflight = new Set()
+  return {
+    get active() {
+      return inflight.size
+    },
+    run(factory, timeoutMs) {
+      return new Promise(resolve => {
+        const controller = new AbortController()
+        let settled = false
+        const record = { controller, timer: null, settle: null }
+        const finish = outcome => {
+          if (settled) return
+          settled = true
+          if (record.timer !== null) {
+            try {
+              clearTimeoutFn(record.timer)
+            } catch {
+              // 清理失败不影响结算。
+            }
+            record.timer = null
+          }
+          inflight.delete(record)
+          resolve(outcome)
+        }
+        record.settle = finish
+        inflight.add(record)
+
+        try {
+          record.timer = setTimeoutFn(() => {
+            record.timer = null
+            try {
+              controller.abort(new Error(`唤醒超时（${timeoutMs}ms）`))
+            } catch {
+              // abort 失败也要照常结算。
+            }
+            finish({ status: 'timeout' })
+          }, timeoutMs)
+          // 不拖住进程退出：真实 setTimeout 返回的 Timeout 带 unref。
+          try {
+            record.timer?.unref?.()
+          } catch {
+            // 浏览器 / 桩定时器没有 unref，忽略。
+          }
+        } catch (error) {
+          finish({ status: 'error', error })
+          return
+        }
+
+        let promise
+        try {
+          promise = Promise.resolve(factory(controller.signal))
+        } catch (error) {
+          finish({ status: 'error', error })
+          return
+        }
+        promise.then(
+          value => finish({ status: 'ok', value }),
+          error => finish({ status: 'error', error }),
+        )
+      })
+    },
+    /** 结算所有在飞 entry（stop / dispose）并清 timer；返回被结算的条数。 */
+    abortAll(reason = 'scheduler-stopped') {
+      const records = [...inflight]
+      for (const record of records) {
+        const error = new Error(reason)
+        try {
+          record.controller.abort(error)
+        } catch {
+          // abort 失败也要照常结算。
+        }
+        record.settle({ status: 'aborted', error })
+      }
+      return records.length
+    },
+  }
 }
 
 /**
@@ -168,10 +313,14 @@ function normalizeSupervision(raw) {
  * 依赖全部注入（测试里用假时钟 / 假审计 / 假唤醒）：
  *   - `now()` → 当前时间（Date / 毫秒数 / ISO 均可）；
  *   - `evaluate(runId)` → `{ verdict, run }`（runtime 内部调 auditWorkflow 后喂进来）；
- *   - `wake(runId, { wakerSessionId })` → 真正的 `agents.get/resume + followup`，
- *     返回 false 表示唤醒失败；抛错同样算失败；
+ *   - `wake(runId, { wakerSessionId, signal })` → 真正的 `agents.get/resume + followup`，
+ *     返回 false 表示唤醒失败；抛错同样算失败；`signal` 是本次 entry 的 AbortSignal，
+ *     超时 / stop 时会被 abort（实现可以据此收手，不理会也仍然会被 `epoch` 丢弃结果）；
  *   - `load(runId)` / `save(runId, supervision)` → run.json 的 supervision 持久化；
  *   - `log(level, msg)` → 带级别的日志（本模块只用 info / warn）。
+ *
+ * E1-a 并发口径：`tick()` 对每个 run（entry）起**独立超时**（`wakeTimeoutMs`），
+ * 并按 `maxConcurrency` **有界并发**；一条卡死 / 抛错只影响它自己，不会让整轮停摆。
  *
  * 注意：`register()` 是**显式启用**动作。从 run.json 恢复时，runtime 只应为
  * `supervision.enabled !== false` 的 run 调 register；已降级的 run 不要自动登记。
@@ -181,13 +330,17 @@ export class SupervisionScheduler {
    * @param {object} [options]
    * @param {() => (number|Date|string)} [options.now]
    * @param {(runId: string) => Promise<{ verdict?: string, run?: object }>} options.evaluate
-   * @param {(runId: string, ctx: { wakerSessionId: string|null }) => Promise<unknown>|unknown} options.wake
+   * @param {(runId: string, ctx: { wakerSessionId: string|null, signal?: AbortSignal }) => Promise<unknown>|unknown} options.wake
    * @param {(runId: string) => Promise<object|null>|object|null} options.load
    * @param {(runId: string, supervision: object) => Promise<unknown>|unknown} options.save
    * @param {(level: string, message: string) => void} [options.log]
    * @param {number} [options.intervalMs=15000]
+   * @param {number} [options.wakeTimeoutMs=SUPERVISION_WAKE_TIMEOUT_MS] 单条 entry 一轮的超时
+   * @param {number} [options.maxConcurrency=SUPERVISION_MAX_CONCURRENCY] 一轮 tick 的并发上限
    * @param {Function} [options.setInterval]
    * @param {Function} [options.clearInterval]
+   * @param {Function} [options.setTimeout] 单条超时定时器（测试可注入；缺省 globalThis.setTimeout）
+   * @param {Function} [options.clearTimeout]
    */
   constructor(options = {}) {
     const opts = isPlainObject(options) ? options : {}
@@ -200,35 +353,83 @@ export class SupervisionScheduler {
     this._intervalMs = Number.isFinite(opts.intervalMs) && opts.intervalMs > 0
       ? opts.intervalMs
       : DEFAULT_INTERVAL_MS
+    this._wakeTimeoutMs = Number.isFinite(opts.wakeTimeoutMs) && opts.wakeTimeoutMs > 0
+      ? opts.wakeTimeoutMs
+      : SUPERVISION_WAKE_TIMEOUT_MS
+    this._maxConcurrency = Number.isInteger(opts.maxConcurrency) && opts.maxConcurrency > 0
+      ? opts.maxConcurrency
+      : SUPERVISION_MAX_CONCURRENCY
     this._setInterval = typeof opts.setInterval === 'function' ? opts.setInterval : globalThis.setInterval
     this._clearInterval = typeof opts.clearInterval === 'function' ? opts.clearInterval : globalThis.clearInterval
+    const setTimeoutFn = typeof opts.setTimeout === 'function' ? opts.setTimeout : globalThis.setTimeout
+    const clearTimeoutFn = typeof opts.clearTimeout === 'function' ? opts.clearTimeout : globalThis.clearTimeout
+    this._wakeRunner = createWakeRunner({ setTimeoutFn, clearTimeoutFn })
     /** runId → 内存状态；持久化状态在 tick 时通过 load() 合并进来。 */
     this._runs = new Map()
     this._timer = null
     this._ticking = false
+    // ── 可观测状态（只进 snapshot()，不改 status() 的对外契约） ──────────────
+    this._tickCount = 0
+    this._tickSkipped = 0
+    this._lastTickStartedAt = null
+    this._lastTickFinishedAt = null
+    this._lastTickDurationMs = null
+    this._lastTickStats = null
+  }
+
+  /** 单条 entry 一轮的超时（毫秒）。 */
+  get wakeTimeoutMs() {
+    return this._wakeTimeoutMs
+  }
+
+  /** 一轮 tick 的并发上限。 */
+  get maxConcurrency() {
+    return this._maxConcurrency
   }
 
   /** 启动周期扫描。幂等：重复调用不叠加定时器。返回是否真的新起了定时器。 */
   start() {
     if (this._timer !== null) return false
-    this._timer = this._setInterval(() => {
+    const timer = this._setInterval(() => {
       // tick() 自己保证不 reject；这里再兜一层，避免注入实现意外把进程带崩。
       void this.tick().catch(error => this._safeLog('warn', `supervision tick 异常：${errorMessage(error)}`))
     }, this._intervalMs)
+    // 定时器不该拖住进程退出（DSH 宿主里 interval 必须 unref）。
+    try {
+      timer?.unref?.()
+    } catch {
+      // 非 Node 定时器（测试桩 / 浏览器）没有 unref，忽略。
+    }
+    this._timer = timer
     return true
   }
 
-  /** 停掉定时器。幂等；不清空已注册 run（重启 start 后继续用原状态）。 */
+  /**
+   * 停掉定时器 + 结算所有在飞的 entry（abort signal 并清掉它们的超时 timer）。
+   * 幂等；不清空已注册 run（重启 start 后继续用原状态）。
+   */
   stop() {
-    if (this._timer === null) return false
-    const timer = this._timer
-    this._timer = null
-    try {
-      this._clearInterval(timer)
-    } catch (error) {
-      this._safeLog('warn', `supervision 清理定时器失败：${errorMessage(error)}`)
+    const hadTimer = this._timer !== null
+    if (hadTimer) {
+      const timer = this._timer
+      this._timer = null
+      try {
+        this._clearInterval(timer)
+      } catch (error) {
+        this._safeLog('warn', `supervision 清理定时器失败：${errorMessage(error)}`)
+      }
     }
-    return true
+    // 在飞 entry 不能留着：否则超时 timer / 底层 wake 会一直挂着（E1-a 的收尾要求）。
+    const aborted = this._wakeRunner.abortAll('supervision-scheduler-stopped')
+    if (aborted > 0) {
+      this._safeLog('info', `supervision: 停止时结算 ${aborted} 条在飞唤醒`)
+    }
+    return hadTimer
+  }
+
+  /** `stop()` 的别名：让宿主统一用 dispose 语义收尾。返回是否真的停掉了定时器。 */
+  dispose() {
+    return this.stop()
   }
 
   /**
@@ -255,6 +456,13 @@ export class SupervisionScheduler {
         failures: 0,
         lastReason: null,
         registeredAt: isoOf(this._nowMs()),
+        // E1-a 可观测 / 迟到结果丢弃：epoch 每轮 +1，超时后旧回合的结果一律作废。
+        epoch: 0,
+        lastOutcome: null,
+        lastDurationMs: null,
+        lastFinishedAt: null,
+        lastError: null,
+        timeouts: 0,
       }
       this._runs.set(runId, entry)
     } else {
@@ -290,39 +498,169 @@ export class SupervisionScheduler {
 
   /**
    * 扫描一轮。重入时直接返回 `{ skipped: true }`，绝不并发跑两轮。
-   * 单个 run 的 load / evaluate / wake / save 抛错只影响该 run（被 catch + log），
-   * 其余 run 照常推进；本方法本身永远 resolve。
+   *
+   * E1-a 契约：
+   *   - 每个 run（entry）一轮都在**独立超时**里跑（`wakeTimeoutMs`），超时记为
+   *     `timeout` 并推进 `nextDueAt`，底层 wake 被 abort / 结果被 epoch 丢弃；
+   *   - 一轮 tick **有界并发**（`maxConcurrency`），慢 / 挂的 run 只占住自己那个 worker；
+   *   - 单个 run 的 load / evaluate / wake / save 抛错只影响该 run（被 catch + log），
+   *     其余 run 照常推进；本方法本身永远 resolve。
+   *
+   * 返回字段保持老契约不变（`skipped/runs/woken/failed`）；超时计入 `failed`，
+   * 每条的明细（lastOutcome / timeouts / 耗时）看 `snapshot()`。
    *
    * @returns {Promise<{ skipped: boolean, runs: number, woken: number, failed: number }>}
    */
   async tick() {
-    if (this._ticking) return { skipped: true, runs: 0, woken: 0, failed: 0 }
+    if (this._ticking) {
+      // 「上一轮没跑完就跳过」的语义保留，并记进快照便于诊断调度器是否在空转。
+      this._tickSkipped += 1
+      return { skipped: true, runs: 0, woken: 0, failed: 0 }
+    }
     this._ticking = true
     const stats = { skipped: false, runs: 0, woken: 0, failed: 0 }
+    const startedAtMs = Date.now()
+    this._tickCount += 1
+    this._lastTickStartedAt = isoOf(this._nowMs())
     try {
       // 快照当前登记，允许 tick 过程中 unregister 不影响本轮其它 run。
-      for (const [runId, entry] of [...this._runs.entries()]) {
+      const tasks = [...this._runs.entries()].map(([runId, entry]) => async () => {
         stats.runs += 1
         try {
-          const outcome = await this._tickRun(runId, entry)
+          const outcome = await this._runEntry(runId, entry)
           if (outcome === 'woken') stats.woken += 1
-          else if (outcome === 'failed') stats.failed += 1
+          else if (outcome === 'failed' || outcome === 'timeout' || outcome === 'error') stats.failed += 1
         } catch (error) {
           stats.failed += 1
           this._safeLog('warn', `supervision: ${runId} 本轮跳过：${errorMessage(error)}`)
         }
-      }
+      })
+      await runPool(tasks, this._maxConcurrency)
     } finally {
       this._ticking = false
+      this._lastTickFinishedAt = isoOf(this._nowMs())
+      this._lastTickDurationMs = Math.max(0, Date.now() - startedAtMs)
+      this._lastTickStats = { ...stats }
     }
     return stats
+  }
+
+  /**
+   * 调度器可观测快照（flow_watch / 诊断用）。**只读、纯查询**：不触发 tick、不改状态。
+   *
+   * 与 `status(runId)` 的分工：`status` 是对外契约（5 个字段，别动）；这里是调度器
+   * 健康度——每条的最近结果 / 耗时 / 超时次数，以及整轮 tick 的耗时与并发度。
+   *
+   * @returns {{
+   *   kind: 'run', ticking: boolean, started: boolean, intervalMs: number,
+   *   maxConcurrency: number, wakeTimeoutMs: number,
+   *   concurrency: { limit: number, active: number },
+   *   tick: { count: number, skipped: number, lastStartedAt: string|null,
+   *     lastFinishedAt: string|null, lastDurationMs: number|null,
+   *     lastStats: { runs: number, woken: number, failed: number }|null },
+   *   entries: Array<object>,
+   * }}
+   */
+  snapshot() {
+    return {
+      kind: 'run',
+      ticking: this._ticking,
+      started: this._timer !== null,
+      intervalMs: this._intervalMs,
+      maxConcurrency: this._maxConcurrency,
+      wakeTimeoutMs: this._wakeTimeoutMs,
+      concurrency: { limit: this._maxConcurrency, active: this._wakeRunner.active },
+      tick: {
+        count: this._tickCount,
+        skipped: this._tickSkipped,
+        lastStartedAt: this._lastTickStartedAt,
+        lastFinishedAt: this._lastTickFinishedAt,
+        lastDurationMs: this._lastTickDurationMs,
+        lastStats: this._lastTickStats === null ? null : { ...this._lastTickStats },
+      },
+      entries: [...this._runs.values()].map(entry => ({
+        runId: entry.runId,
+        ...this.status(entry.runId),
+        lastOutcome: entry.lastOutcome ?? null,
+        lastDurationMs: entry.lastDurationMs ?? null,
+        lastFinishedAt: entry.lastFinishedAt ?? null,
+        timeouts: nonNegativeInt(entry.timeouts),
+        lastError: entry.lastError ?? null,
+      })),
+    }
   }
 
   // -------------------------------------------------------------------------
   // 内部：单个 run 的一轮
   // -------------------------------------------------------------------------
 
-  async _tickRun(runId, entry) {
+  /** 单条 entry = 独立超时 + 结果归一化；超时/异常只影响这一条。 */
+  async _runEntry(runId, entry) {
+    const startedAtMs = Date.now()
+    // 本轮的 lastError 由本轮结果决定；先清掉上一轮的残留。
+    entry.lastError = null
+    const result = await this._wakeRunner.run(
+      signal => this._tickRun(runId, entry, signal),
+      this._wakeTimeoutMs,
+    )
+    const durationMs = Math.max(0, Date.now() - startedAtMs)
+    entry.lastDurationMs = durationMs
+    entry.lastFinishedAt = isoOf(this._nowMs())
+
+    if (result.status === 'timeout') {
+      // 迟到的回合作废：_tickRun 每个 await 之后都会比对 epoch。
+      entry.epoch = nonNegativeInt(entry.epoch) + 1
+      const message = `唤醒超时（${this._wakeTimeoutMs}ms）`
+      entry.lastOutcome = 'timeout'
+      entry.lastError = message
+      entry.timeouts = nonNegativeInt(entry.timeouts) + 1
+      entry.failures = nonNegativeInt(entry.failures) + 1
+      entry.nextDueAt = isoOf(this._nowMs() + SUPERVISION_INTERVALS.anomaly * 1000)
+      entry.lastReason = `wake-timeout: ${message}`
+      if (entry.failures >= MAX_WAKE_FAILURES) {
+        entry.enabled = false
+        // 这里**不 await** 落盘：超时处理已经花掉了预算，save 卡住不能反过来吊住 tick。
+        // _persist 自己吞错、不 reject，所以 void 是安全的。
+        void this._persist(runId, entry, { enabled: false, reason: entry.lastReason })
+        this.unregister(runId)
+        this._safeLog('warn', `supervision: ${runId} 连续 ${entry.failures} 次唤醒超时，已降级并停止调度：${message}`)
+      } else {
+        void this._persist(runId, entry)
+        this._safeLog('warn', `supervision: ${runId} 唤醒超时（连续 ${MAX_WAKE_FAILURES} 次后降级）：${message}`)
+      }
+      return 'timeout'
+    }
+
+    if (result.status === 'aborted') {
+      entry.lastOutcome = 'aborted'
+      entry.lastError = errorMessage(result.error)
+      return 'aborted'
+    }
+
+    if (result.status === 'error') {
+      // 兜底：_tickRun 内部已尽量吞错，这里防止注入实现意外 reject。
+      entry.lastOutcome = 'error'
+      entry.lastError = errorMessage(result.error)
+      entry.failures = nonNegativeInt(entry.failures) + 1
+      this._safeLog('warn', `supervision: ${runId} 本轮跳过：${entry.lastError}`)
+      return 'error'
+    }
+
+    const outcome = typeof result.value === 'string' ? result.value : 'idle'
+    entry.lastOutcome = outcome
+    return outcome
+  }
+
+  /** 当前回合是否已作废（超时 / stop / 被外部摘除）。作废的迟到结果一律不许写状态。 */
+  _isStaleTurn(runId, entry, epoch) {
+    return entry.epoch !== epoch || this._runs.get(runId) !== entry
+  }
+
+  async _tickRun(runId, entry, signal) {
+    // 本轮 token：超时 / stop 会把 epoch 推进，之后每个 await 的续体都要比对。
+    const epoch = nonNegativeInt(entry.epoch) + 1
+    entry.epoch = epoch
+
     // 1) 读持久化状态：用于重启恢复与「外部禁用」检测。读失败继续用内存状态。
     let persisted = null
     try {
@@ -330,6 +668,7 @@ export class SupervisionScheduler {
     } catch (error) {
       this._safeLog('warn', `supervision: ${runId} 读取 supervision 失败，沿用内存状态：${errorMessage(error)}`)
     }
+    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
 
     let reEnabled = false
     if (persisted) {
@@ -368,6 +707,7 @@ export class SupervisionScheduler {
 
     // 2) 审计 → verdict / run 摘要由 runtime 的 evaluate 注入。
     const evaluation = await this._require('evaluate', this._evaluate)(runId)
+    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
     const run = isPlainObject(evaluation) && isPlainObject(evaluation.run) ? evaluation.run : null
     const verdict = isPlainObject(evaluation) ? verdictOf(evaluation.verdict) : null
     const nowMs = this._nowMs()
@@ -398,13 +738,15 @@ export class SupervisionScheduler {
     let wakeOk = false
     let failureReason = null
     try {
-      const result = await this._require('wake', this._wake)(runId, { wakerSessionId })
+      // signal 让 wake 实现有机会在超时 / stop 时收手（不理会也不会污染状态）。
+      const result = await this._require('wake', this._wake)(runId, { wakerSessionId, signal })
       wakeOk = result !== false
       if (!wakeOk) failureReason = 'wake 返回 false'
     } catch (error) {
       wakeOk = false
       failureReason = errorMessage(error)
     }
+    if (this._isStaleTurn(runId, entry, epoch)) return 'stale'
 
     const wokeAtIso = isoOf(nowMs)
     // 以本次唤醒时间为新基准重新算间隔；唤醒失败同样推进 nextDueAt。
@@ -414,6 +756,7 @@ export class SupervisionScheduler {
 
     if (!wakeOk) {
       entry.failures = nonNegativeInt(entry.failures) + 1
+      entry.lastError = failureReason
       if (entry.failures >= MAX_WAKE_FAILURES) {
         entry.enabled = false
         entry.lastReason = `wake-failed: ${failureReason}`
@@ -422,6 +765,8 @@ export class SupervisionScheduler {
         this._safeLog('warn', `supervision: ${runId} 连续 ${entry.failures} 次唤醒失败，已降级并停止调度：${failureReason}`)
         return 'failed'
       }
+      // 即使还没到降级阈值也把失败原因写进 lastReason，便于 flow_watch 观察。
+      entry.lastReason = `wake-failed: ${failureReason}`
       await this._persist(runId, entry)
       this._safeLog('warn', `supervision: ${runId} 第 ${entry.failures} 次唤醒失败（连续 ${MAX_WAKE_FAILURES} 次后降级）：${failureReason}`)
       return 'failed'
@@ -487,10 +832,20 @@ export class SupervisionScheduler {
 // ===========================================================================
 
 /**
- * 节点自审默认间隔（毫秒）。`nodeAlarmMs = 120s`（07-runtime-0.7 §11.1），
+ * 节点自审默认间隔（毫秒）。`nodeAlarmMs = 600s`（10 分钟，07-runtime-0.7 §11.1；
+ * 用户反馈 120s 太频繁，一轮自审要起一次模型回合，别按分钟级挠），
  * 这里按毫秒给：register 时的 `nextDueAt = now + intervalMs`。
+ *
+ * **与 `SUPERVISION_INTERVALS` 是两套独立的时钟，别混**（07-runtime-0.7 §7 / §11）：
+ *   - `SUPERVISION_INTERVALS` 是 **run 级巡检**（30 / 180 / 60 **秒**）：由
+ *     `auditWorkflow` 的 verdict 决定，唤醒的是 run 的发起会话，问「整个 run 是否健康」；
+ *   - `NODE_ALARM_DEFAULT_MS` 是 **节点闹钟**（默认 600 **秒**，毫秒单位）：每个节点
+ *     主管会话一个闹钟，问「你这个节点现在什么状态」。它只在内存里、不落盘，由
+ *     engine 在 attempt 结束 / run 收尾时注销。
+ * 两者互不驱动：节点自审结果由 engine 自己消费（可提前收口 attempt），不会改 run 级
+ * 的 nextDueAt；run 级到点唤醒也不触发节点自审。改一个不影响另一个。
  */
-export const NODE_ALARM_DEFAULT_MS = 120_000
+export const NODE_ALARM_DEFAULT_MS = 600_000
 
 /** 连续唤醒失败达到这个次数就停摆：enabled=false + reason='wake-failed: ...'。 */
 const NODE_ALARM_MAX_FAILURES = 3
@@ -608,6 +963,67 @@ function tryParseJsonObject(text) {
   }
 }
 
+/** 节点回报的解析判定类别（E1-b）：没回报 / 回报了但结构不合法 / 解析成功。 */
+export const NODE_REPORT_MISSING = 'missing'
+export const NODE_REPORT_INVALID = 'invalid'
+export const NODE_REPORT_OK = 'ok'
+
+/** 把已解析的顶层对象收敛成对外回报结构（字段缺失 / 非法一律走默认值）。 */
+function normalizeNodePayload(payload) {
+  return {
+    state: nodeStateOf(payload.state),
+    progress: progressOf(payload.progress),
+    summary: textOf(payload.summary, NODE_SUMMARY_LIMIT),
+    members: membersOf(payload.members),
+    blockers: blockersOf(payload.blockers),
+    verdict: nodeVerdictOf(payload.verdict),
+    nodeId: nonEmptyString(payload.nodeId),
+    attempt: attemptOf(payload.attempt),
+  }
+}
+
+/**
+ * 解析节点自审回报，并**保留判定类别**（E1-b）。**纯函数，绝不抛错**。
+ *
+ * `parseNodeStatus` 返回 `null` 时其实是两件完全不同的事：
+ *   - `missing`：这一轮**压根没回报**（非字符串 / 空串 / 纯文字里没有 JSON）；
+ *   - `invalid`：**回报了但结构不合法**（有 JSON 围栏或 `{`，但解析失败 / 顶层不是
+ *     对象）。后者说明节点在说话、只是格式不对——可能真在干活，也可能在自说自话，
+ *     主线不该默默当「没有回报」。
+ *
+ * 判定可以经 `NodeSupervisionScheduler.recordReport()` 落进调度器快照
+ * （`snapshot().entries[].lastReport`），供 flow_watch / run 级主线判断节点是否
+ * 真的在干活。
+ *
+ * @param {string} text 模型输出原文
+ * @returns {{ kind: 'missing'|'invalid'|'ok', parsed: object|null, reason: string|null }}
+ *   `kind==='ok'` 时 `parsed` 的结构与 `parseNodeStatus` 的返回一致；其余为 `null`。
+ */
+export function inspectNodeStatus(text) {
+  try {
+    if (typeof text !== 'string') return { kind: NODE_REPORT_MISSING, parsed: null, reason: '回报不是字符串' }
+    if (text.trim() === '') return { kind: NODE_REPORT_MISSING, parsed: null, reason: '回报为空' }
+    const candidates = jsonPayloadCandidates(text)
+    if (candidates.length === 0) {
+      // 没有可用候选：带 JSON 痕迹（`{` 或围栏）说明「回报了但格式错」，否则当没回报。
+      const looksLikeJson = text.includes('{') || text.includes('```')
+      return looksLikeJson
+        ? { kind: NODE_REPORT_INVALID, parsed: null, reason: '有 JSON 痕迹但没有可解析的片段' }
+        : { kind: NODE_REPORT_MISSING, parsed: null, reason: '回报里没有 JSON' }
+    }
+    for (const candidate of candidates) {
+      const payload = tryParseJsonObject(candidate)
+      if (payload !== null) {
+        return { kind: NODE_REPORT_OK, parsed: normalizeNodePayload(payload), reason: null }
+      }
+    }
+    return { kind: NODE_REPORT_INVALID, parsed: null, reason: '有 JSON 片段但解析失败或顶层不是对象' }
+  } catch {
+    // 防御：任何意外（含超长输入导致的正则异常）都按「结构不合法」上报，而不是当没有。
+    return { kind: NODE_REPORT_INVALID, parsed: null, reason: '解析异常' }
+  }
+}
+
 /**
  * 解析节点自审的结构化回报（07-runtime-0.7 §11.2）。**纯函数，绝不抛错**。
  *
@@ -621,32 +1037,14 @@ function tryParseJsonObject(text) {
  *   - verdict：只认 `pass|reject`，其它 → `null`；
  *   - nodeId / attempt：回报里带了且合法才保留，否则 `null`。
  *
+ * 需要区分「没回报」与「回报了但格式错」时用 `inspectNodeStatus`（E1-b）。
+ *
  * @param {string} text 模型输出原文
  * @returns {{ state: string, progress: number, summary: string, members: Array<{name: string, state: string, note: string}>, blockers: string[], verdict: 'pass'|'reject'|null, nodeId: string|null, attempt: number|null }|null}
  *   解析不出来 / 顶层不是对象 / 非字符串输入 → `null`。
  */
 export function parseNodeStatus(text) {
-  try {
-    if (typeof text !== 'string') return null
-    for (const candidate of jsonPayloadCandidates(text)) {
-      const payload = tryParseJsonObject(candidate)
-      if (payload === null) continue
-      return {
-        state: nodeStateOf(payload.state),
-        progress: progressOf(payload.progress),
-        summary: textOf(payload.summary, NODE_SUMMARY_LIMIT),
-        members: membersOf(payload.members),
-        blockers: blockersOf(payload.blockers),
-        verdict: nodeVerdictOf(payload.verdict),
-        nodeId: nonEmptyString(payload.nodeId),
-        attempt: attemptOf(payload.attempt),
-      }
-    }
-    return null
-  } catch {
-    // 防御：任何意外（含超长输入导致的正则异常）都按「坏输入」处理。
-    return null
-  }
+  return inspectNodeStatus(text).parsed
 }
 
 /**
@@ -668,6 +1066,9 @@ export function parseNodeStatus(text) {
  *     + `lastReason='wake-failed: ...'`，此后不再尝试，但**保留在 list 里可查**；
  *   - `tick()` 有重入保护（`_ticking`），单个 entry 失败不影响其它 entry；
  *     entry 在 tick 过程中被注销 → 本轮不再碰它（也不会复活）。
+ *   - E1-a：每个 entry 的唤醒都在**独立超时**里跑（`wakeTimeoutMs`，超时记 `timeout`
+ *     并推进 due），不同 run 之间**有界并发**（`maxConcurrency`），**同一 run 内部仍
+ *     串行**；一条挂死只影响它自己，整轮 tick 有界收口。
  *
  * 时间口径与 run 级一致：对外字段一律 ISO-8601 字符串。
  */
@@ -675,13 +1076,17 @@ export class NodeSupervisionScheduler {
   /**
    * @param {object} [options]
    * @param {() => (number|Date|string)} [options.now]
-   * @param {(entry: object) => Promise<{ action: 'inject'|'followup'|'skip', reason?: string }>|({ action: string, reason?: string })} options.wake
+   * @param {(entry: object, ctx?: { signal?: AbortSignal }) => Promise<{ action: 'inject'|'followup'|'skip', reason?: string }>|({ action: string, reason?: string })} options.wake
    * @param {(level: string, message: string) => void} [options.log]
    * @param {number} [options.intervalMs=15000] tick 扫描间隔
    * @param {number} [options.nodeAlarmMs=NODE_ALARM_DEFAULT_MS] 节点自审默认间隔
+   * @param {number} [options.wakeTimeoutMs=SUPERVISION_WAKE_TIMEOUT_MS] 单条 entry 一轮的超时
+   * @param {number} [options.maxConcurrency=SUPERVISION_MAX_CONCURRENCY] 一轮 tick 的并发上限
+   * @param {number} [options.maxFailures=3] 连续唤醒失败几次后停摆
    * @param {Function} [options.setInterval]
    * @param {Function} [options.clearInterval]
-   * @param {number} [options.maxFailures=3] 连续唤醒失败几次后停摆
+   * @param {Function} [options.setTimeout] 单条超时定时器（测试可注入；缺省 globalThis.setTimeout）
+   * @param {Function} [options.clearTimeout]
    */
   constructor(options = {}) {
     const opts = isPlainObject(options) ? options : {}
@@ -697,12 +1102,28 @@ export class NodeSupervisionScheduler {
     this._maxFailures = Number.isInteger(opts.maxFailures) && opts.maxFailures > 0
       ? opts.maxFailures
       : NODE_ALARM_MAX_FAILURES
+    this._wakeTimeoutMs = Number.isFinite(opts.wakeTimeoutMs) && opts.wakeTimeoutMs > 0
+      ? opts.wakeTimeoutMs
+      : SUPERVISION_WAKE_TIMEOUT_MS
+    this._maxConcurrency = Number.isInteger(opts.maxConcurrency) && opts.maxConcurrency > 0
+      ? opts.maxConcurrency
+      : SUPERVISION_MAX_CONCURRENCY
     this._setInterval = typeof opts.setInterval === 'function' ? opts.setInterval : globalThis.setInterval
     this._clearInterval = typeof opts.clearInterval === 'function' ? opts.clearInterval : globalThis.clearInterval
+    const setTimeoutFn = typeof opts.setTimeout === 'function' ? opts.setTimeout : globalThis.setTimeout
+    const clearTimeoutFn = typeof opts.clearTimeout === 'function' ? opts.clearTimeout : globalThis.clearTimeout
+    this._wakeRunner = createWakeRunner({ setTimeoutFn, clearTimeoutFn })
     /** sessionId → 内存 entry（不落盘）。 */
     this._nodes = new Map()
     this._timer = null
     this._ticking = false
+    // ── 可观测状态（只进 snapshot()，不改 status()/list() 的对外契约） ────────
+    this._tickCount = 0
+    this._tickSkipped = 0
+    this._lastTickStartedAt = null
+    this._lastTickFinishedAt = null
+    this._lastTickDurationMs = null
+    this._lastTickStats = null
   }
 
   /** 节点自审默认间隔（毫秒），runtime 拼自审提问时用得上。 */
@@ -713,6 +1134,16 @@ export class NodeSupervisionScheduler {
   /** 连续失败停摆阈值。 */
   get maxFailures() {
     return this._maxFailures
+  }
+
+  /** 单条 entry 一轮的超时（毫秒）。 */
+  get wakeTimeoutMs() {
+    return this._wakeTimeoutMs
+  }
+
+  /** 一轮 tick 的并发上限。 */
+  get maxConcurrency() {
+    return this._maxConcurrency
   }
 
   /** 启动周期扫描。幂等：重复调用不叠加定时器。返回是否真的新起了定时器。 */
@@ -732,17 +1163,32 @@ export class NodeSupervisionScheduler {
     return true
   }
 
-  /** 停掉定时器。幂等；不清空已登记的节点（重启 start 后继续用原状态）。 */
+  /**
+   * 停掉定时器 + 结算所有在飞的 entry（abort signal 并清掉它们的超时 timer）。
+   * 幂等；不清空已登记的节点（重启 start 后继续用原状态）。
+   */
   stop() {
-    if (this._timer === null) return false
-    const timer = this._timer
-    this._timer = null
-    try {
-      this._clearInterval(timer)
-    } catch (error) {
-      this._safeLog('warn', `node-alarm 清理定时器失败：${errorMessage(error)}`)
+    const hadTimer = this._timer !== null
+    if (hadTimer) {
+      const timer = this._timer
+      this._timer = null
+      try {
+        this._clearInterval(timer)
+      } catch (error) {
+        this._safeLog('warn', `node-alarm 清理定时器失败：${errorMessage(error)}`)
+      }
     }
-    return true
+    // 在飞 entry 不能留着：否则超时 timer / 底层 wake 会一直挂着（E1-a 的收尾要求）。
+    const aborted = this._wakeRunner.abortAll('node-alarm-scheduler-stopped')
+    if (aborted > 0) {
+      this._safeLog('info', `node-alarm: 停止时结算 ${aborted} 条在飞唤醒`)
+    }
+    return hadTimer
+  }
+
+  /** `stop()` 的别名：让宿主统一用 dispose 语义收尾。返回是否真的停掉了定时器。 */
+  dispose() {
+    return this.stop()
   }
 
   /**
@@ -784,6 +1230,15 @@ export class NodeSupervisionScheduler {
         failures: 0,
         lastReason: null,
         registeredAt: isoOf(nowMs),
+        // E1-a 可观测 / 迟到结果丢弃：epoch 每轮 +1，超时后旧回合的结果一律作废。
+        epoch: 0,
+        lastOutcome: null,
+        lastDurationMs: null,
+        lastFinishedAt: null,
+        lastError: null,
+        timeouts: 0,
+        // E1-b：最近一次自审回报的解析判定（missing / invalid / ok），由 recordReport 写入。
+        lastReport: null,
       }
       this._nodes.set(session, entry)
       this._safeLog('info', `node-alarm: 登记 ${session}（run=${run ?? '-'} node=${node ?? '-'} attempt=${attemptValue ?? '-'}），下次 ${nextDueAt}`)
@@ -838,41 +1293,138 @@ export class NodeSupervisionScheduler {
   }
 
   /**
-   * 扫描一轮：对 `now >= nextDueAt` 且仍启用的 entry **依次** `await wake(entry)`。
-   * 重入时直接返回 `{ skipped: true }`；单个 entry 的唤醒异常只影响它自己。
+   * 扫描一轮：对 `now >= nextDueAt` 且仍启用的 entry 执行 `wake`。
+   *
+   * E1-a 契约：
+   *   - 每个 entry 的唤醒在**独立超时**里跑（`wakeTimeoutMs`），超时记为 `timeout`；
+   *   - 一轮 tick **有界并发**（`maxConcurrency`），但**同一 run 内部仍串行**
+   *     （按 runId 分组，组内依次 await；不同 run 才并行）；
+   *   - 重入时直接返回 `{ skipped: true }`；单个 entry 的异常只影响它自己。
+   *
+   * 返回字段保持老契约不变（`skipped/entries/woken/skippedWakes/failed`）；超时计入
+   * `failed`，每条的明细（lastOutcome / timeouts / 耗时）看 `snapshot()`。
    *
    * @returns {Promise<{ skipped: boolean, entries: number, woken: number, skippedWakes: number, failed: number }>}
    *   `woken` 只统计真的发出 inject / followup 的次数，`skippedWakes` 统计 skip。
    */
   async tick() {
-    if (this._ticking) return { skipped: true, entries: 0, woken: 0, skippedWakes: 0, failed: 0 }
+    if (this._ticking) {
+      // 「上一轮没跑完就跳过」的语义保留，并记进快照便于诊断调度器是否在空转。
+      this._tickSkipped += 1
+      return { skipped: true, entries: 0, woken: 0, skippedWakes: 0, failed: 0 }
+    }
     this._ticking = true
     const stats = { skipped: false, entries: 0, woken: 0, skippedWakes: 0, failed: 0 }
+    const startedAtMs = Date.now()
+    this._tickCount += 1
+    this._lastTickStartedAt = isoOf(this._nowMs())
     try {
       // 快照当前登记：允许 tick 过程中 unregister / register 不影响本轮遍历。
-      for (const entry of [...this._nodes.values()]) {
-        stats.entries += 1
-        if (entry.enabled === false) continue
-        // 本轮之前被摘掉 / 被同 sessionId 的新登记替换 → 不再碰这条旧 entry。
-        if (this._nodes.get(entry.sessionId) !== entry) continue
-        try {
-          const nowMs = this._nowMs()
-          const dueMs = toMs(entry.nextDueAt)
-          if (dueMs === null || nowMs < dueMs) continue
-          const outcome = await this._tickEntry(entry, nowMs)
-          if (outcome === 'woken') stats.woken += 1
-          else if (outcome === 'skip') stats.skippedWakes += 1
-          else if (outcome === 'failed') stats.failed += 1
-        } catch (error) {
-          // 防御：注入的 now / 内部状态意外抛错时只影响这一条，不打断整轮。
-          stats.failed += 1
-          this._safeLog('warn', `node-alarm: ${entry.sessionId} 本轮跳过：${errorMessage(error)}`)
+      const entries = [...this._nodes.values()]
+      stats.entries = entries.length
+      // 同一 run 的节点串行（保持既有「同一 run 内部依次自审」的语义），
+      // 不同 run 之间才并行，且总并发受 maxConcurrency 限制。
+      const groups = new Map()
+      for (const entry of entries) {
+        const key = entry.runId === null || entry.runId === undefined
+          ? `session:${entry.sessionId}`
+          : `run:${entry.runId}`
+        let group = groups.get(key)
+        if (!group) {
+          group = []
+          groups.set(key, group)
         }
+        group.push(entry)
       }
+      const tasks = [...groups.values()].map(group => async () => {
+        for (const entry of group) {
+          try {
+            const outcome = await this._runEntry(entry)
+            if (outcome === 'woken') stats.woken += 1
+            else if (outcome === 'skip') stats.skippedWakes += 1
+            else if (outcome === 'failed' || outcome === 'timeout' || outcome === 'error') stats.failed += 1
+          } catch (error) {
+            // 防御：注入的 now / 内部状态意外抛错时只影响这一条，不打断整轮。
+            stats.failed += 1
+            this._safeLog('warn', `node-alarm: ${entry.sessionId} 本轮跳过：${errorMessage(error)}`)
+          }
+        }
+      })
+      await runPool(tasks, this._maxConcurrency)
     } finally {
       this._ticking = false
+      this._lastTickFinishedAt = isoOf(this._nowMs())
+      this._lastTickDurationMs = Math.max(0, Date.now() - startedAtMs)
+      this._lastTickStats = { ...stats }
     }
     return stats
+  }
+
+  /**
+   * 记录一次节点自审回报的解析判定（`inspectNodeStatus` 的结果，E1-b）。
+   *
+   * `parseNodeStatus` 返回 null 有两种完全不同的情况——「这一轮压根没回报」与
+   * 「回报了但结构不合法」。前者不代表节点在干活，后者恰恰说明节点在说话但格式
+   * 不对（可能真在干活）。把判定落进 entry，`snapshot().entries[].lastReport` 可见，
+   * run 级主线（flow_watch）据此判断节点是否真的在干活，而不是默默当没有。
+   *
+   * @param {string} sessionId
+   * @param {{ kind?: 'missing'|'invalid'|'ok', reason?: string|null }|string} diagnostic
+   * @returns {boolean} 是否记录成功（未登记的 session 返回 false，不新建 entry）
+   */
+  recordReport(sessionId, diagnostic) {
+    const session = nonEmptyString(sessionId)
+    if (session === null) return false
+    const entry = this._nodes.get(session)
+    if (!entry) return false
+    const rawKind = diagnostic && typeof diagnostic === 'object' ? diagnostic.kind : diagnostic
+    const rawReason = diagnostic && typeof diagnostic === 'object' ? diagnostic.reason : null
+    const kind = rawKind === NODE_REPORT_OK || rawKind === NODE_REPORT_INVALID || rawKind === NODE_REPORT_MISSING
+      ? rawKind
+      : NODE_REPORT_INVALID
+    const reason = nonEmptyString(rawReason)
+    entry.lastReport = { kind, reason, at: isoOf(this._nowMs()) }
+    if (kind === NODE_REPORT_INVALID) {
+      this._safeLog('warn', `node-alarm: ${session} 自审回报结构不合法（${reason ?? 'unknown'}）`)
+    }
+    return true
+  }
+
+  /**
+   * 调度器可观测快照（flow_watch / 诊断用）。**只读、纯查询**：不触发 tick、不改状态。
+   *
+   * 与 `status()` / `list()` 的分工：那两个是对外契约（9 个字段，别动）；这里是调度器
+   * 健康度——每条的最近结果 / 耗时 / 超时次数 / 最近回报判定，以及整轮 tick 的耗时
+   * 与并发度。
+   */
+  snapshot() {
+    return {
+      kind: 'node',
+      ticking: this._ticking,
+      started: this._timer !== null,
+      intervalMs: this._intervalMs,
+      nodeAlarmMs: this._nodeAlarmMs,
+      maxConcurrency: this._maxConcurrency,
+      wakeTimeoutMs: this._wakeTimeoutMs,
+      concurrency: { limit: this._maxConcurrency, active: this._wakeRunner.active },
+      tick: {
+        count: this._tickCount,
+        skipped: this._tickSkipped,
+        lastStartedAt: this._lastTickStartedAt,
+        lastFinishedAt: this._lastTickFinishedAt,
+        lastDurationMs: this._lastTickDurationMs,
+        lastStats: this._lastTickStats === null ? null : { ...this._lastTickStats },
+      },
+      entries: [...this._nodes.values()].map(entry => ({
+        ...this._publicOf(entry),
+        lastOutcome: entry.lastOutcome ?? null,
+        lastDurationMs: entry.lastDurationMs ?? null,
+        lastFinishedAt: entry.lastFinishedAt ?? null,
+        timeouts: nonNegativeInt(entry.timeouts),
+        lastError: entry.lastError ?? null,
+        lastReport: entry.lastReport === null || entry.lastReport === undefined ? null : { ...entry.lastReport },
+      })),
+    }
   }
 
   /**
@@ -907,16 +1459,72 @@ export class NodeSupervisionScheduler {
   // 内部
   // -------------------------------------------------------------------------
 
+  /**
+   * 单条 entry = 是否到点判断 + 独立超时 + 结果归一化；超时/异常只影响这一条。
+   * 返回 `woken|skip|failed|timeout|aborted|idle|stale`。
+   */
+  async _runEntry(entry) {
+    if (entry.enabled === false) return 'idle'
+    // 本轮之前被摘掉 / 被同 sessionId 的新登记替换 → 不再碰这条旧 entry。
+    if (this._nodes.get(entry.sessionId) !== entry) return 'stale'
+    const nowMs = this._nowMs()
+    const dueMs = toMs(entry.nextDueAt)
+    if (dueMs === null || nowMs < dueMs) return 'idle'
+
+    const startedAtMs = Date.now()
+    // 本轮的 lastError 由本轮结果决定；先清掉上一轮的残留。
+    entry.lastError = null
+    const result = await this._wakeRunner.run(
+      signal => this._tickEntry(entry, nowMs, signal),
+      this._wakeTimeoutMs,
+    )
+    const durationMs = Math.max(0, Date.now() - startedAtMs)
+    entry.lastDurationMs = durationMs
+    entry.lastFinishedAt = isoOf(this._nowMs())
+
+    if (result.status === 'timeout') {
+      // 迟到的回合作废：_tickEntry 每个 await 之后都会比对 epoch。
+      entry.epoch = nonNegativeInt(entry.epoch) + 1
+      const message = `唤醒超时（${this._wakeTimeoutMs}ms）`
+      entry.lastOutcome = 'timeout'
+      entry.lastError = message
+      entry.timeouts = nonNegativeInt(entry.timeouts) + 1
+      return this._recordFailure(entry, isoOf(nowMs + entry.intervalMs), message, 'wake-timeout')
+    }
+
+    if (result.status === 'aborted') {
+      entry.lastOutcome = 'aborted'
+      entry.lastError = errorMessage(result.error)
+      return 'aborted'
+    }
+
+    if (result.status === 'error') {
+      // 兜底：_tickEntry 内部已尽量吞错，这里防止注入实现意外 reject。
+      entry.lastOutcome = 'failed'
+      entry.lastError = errorMessage(result.error)
+      return this._recordFailure(entry, isoOf(nowMs + entry.intervalMs), entry.lastError)
+    }
+
+    const outcome = typeof result.value === 'string' ? result.value : 'failed'
+    entry.lastOutcome = outcome
+    return outcome
+  }
+
   /** 单个 entry 的一轮：成功推进、失败推进 + 计失败、停摆后不再尝试。 */
-  async _tickEntry(entry, nowMs) {
+  async _tickEntry(entry, nowMs, signal) {
+    // 本轮 token：超时 / stop 会把 epoch 推进，之后续体一律作废。
+    const epoch = nonNegativeInt(entry.epoch) + 1
+    entry.epoch = epoch
     let result = null
     let failureReason = null
     try {
-      result = await this._require('wake', this._wake)(this._publicOf(entry))
+      result = await this._require('wake', this._wake)(this._publicOf(entry), { signal })
     } catch (error) {
       failureReason = errorMessage(error)
     }
 
+    // 迟到 / 被注销的结果：不回写状态。
+    if (entry.epoch !== epoch) return 'stale'
     // 等待期间被注销 / 被同 sessionId 刷新成新对象：只回统计，绝不复活旧 entry。
     if (this._nodes.get(entry.sessionId) !== entry) {
       return failureReason === null ? 'woken' : 'failed'
@@ -933,6 +1541,7 @@ export class NodeSupervisionScheduler {
       failureReason = `wake 返回非法结果（action=${action === null ? 'missing' : action}）`
     }
     if (failureReason !== null) {
+      entry.lastError = failureReason
       return this._recordFailure(entry, nextDueAt, failureReason)
     }
 
@@ -952,24 +1561,28 @@ export class NodeSupervisionScheduler {
     return 'woken'
   }
 
-  /** 记一次失败：推进 due + 计连续失败，到阈值就停摆（保留在 list 里）。 */
-  _recordFailure(entry, nextDueAt, reason) {
+  /**
+   * 记一次失败：推进 due + 计连续失败，到阈值就停摆（保留在 list 里）。
+   * `prefix` 区分失败来源：普通失败 `wake-failed`、超时 `wake-timeout`。
+   */
+  _recordFailure(entry, nextDueAt, reason, prefix = 'wake-failed') {
     entry.failures = nonNegativeInt(entry.failures) + 1
     entry.nextDueAt = nextDueAt
-    entry.lastReason = `wake-failed: ${reason}`
+    entry.lastReason = `${prefix}: ${reason}`
+    const label = prefix === 'wake-timeout' ? '唤醒超时' : '唤醒失败'
     if (entry.failures >= this._maxFailures) {
       entry.enabled = false
       this._safeLog(
         'warn',
-        `node-alarm: ${entry.sessionId}（run=${entry.runId ?? '-'} node=${entry.nodeId ?? '-'}）连续 ${entry.failures} 次唤醒失败，已停摆：${reason}`,
+        `node-alarm: ${entry.sessionId}（run=${entry.runId ?? '-'} node=${entry.nodeId ?? '-'}）连续 ${entry.failures} 次${label}，已停摆：${reason}`,
       )
     } else {
       this._safeLog(
         'warn',
-        `node-alarm: ${entry.sessionId} 第 ${entry.failures} 次唤醒失败（连续 ${this._maxFailures} 次后停摆）：${reason}`,
+        `node-alarm: ${entry.sessionId} 第 ${entry.failures} 次${label}（连续 ${this._maxFailures} 次后停摆）：${reason}`,
       )
     }
-    return 'failed'
+    return prefix === 'wake-timeout' ? 'timeout' : 'failed'
   }
 
   /** 内部 entry → 对外快照（新对象，改它不影响内部状态）。 */

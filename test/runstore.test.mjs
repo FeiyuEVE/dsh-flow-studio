@@ -8,8 +8,8 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import {
-  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync,
-  utimesSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync,
+  statSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -955,6 +955,384 @@ try {
     }
     assert.deepEqual(startCounts, [1, 1, 1],
       `崩溃残留的 start.lock 接管必须每轮只有一个赢家：${startCounts.join(',')}`)
+  })
+
+  console.log('runstore.js · D1 坏 run.json 不重建 / D2 nodeStatus 字节预算 / D3 patch 白名单')
+
+  await check('D1 坏 run.json：拒绝覆盖、原文件不动、另存 run.json.corrupt-* 备份', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.appendEvents(runsRoot, meta.id, [
+      event('run/start', { runId: meta.id, nodeId: undefined, attemptId: undefined }),
+      event('node/start', { runId: meta.id, nodeId: 'n_1', attemptId: 1 }),
+    ], { now: NOW })
+
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const broken = '{ broken json: "no closing brace"'
+    writeFileSync(metaPath, broken)
+    const before = statSync(metaPath)
+
+    await assert.rejects(
+      () => store.writeRunMeta(runsRoot, meta.id, { status: 'done' }),
+      error => error.status === 500
+        && error.code === 'EMETACORRUPT'
+        && /run\.json\.corrupt-/.test(error.reason)
+        && /拒绝用默认值覆盖/.test(error.reason),
+    )
+    // 关键断言：原文件一个字节都没动（旧实现会把它重建成默认 meta）。
+    assert.equal(readFileSync(metaPath, 'utf8'), broken)
+    assert.equal(statSync(metaPath).mtimeMs, before.mtimeMs, 'run.json 不应被重写')
+
+    // 备份：内容与原文件一致、0600、同一份损坏内容只备份一次。
+    const backupNames = () => readdirSync(join(runsRoot, meta.id))
+      .filter(name => name.startsWith('run.json.corrupt-'))
+    assert.equal(backupNames().length, 1, `应恰好有一份备份：${backupNames().join(',')}`)
+    const backupPath = join(runsRoot, meta.id, backupNames()[0])
+    assert.equal(readFileSync(backupPath, 'utf8'), broken)
+    assert.equal(statSync(backupPath).mode & 0o777, 0o600)
+    await assert.rejects(() => store.writeRunMeta(runsRoot, meta.id, { name: '再试一次' }))
+    assert.equal(backupNames().length, 1, '重复失败不应堆出多份相同备份')
+
+    // 坏 meta 不会被当成「不存在」：读取仍 null、追加拒绝且不分配 seq。
+    assert.equal(await store.readRunMeta(runsRoot, meta.id), null)
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, event('node/start', { runId: meta.id }), { now: NOW }),
+      error => error.status === 500 && error.code === 'EBADJSON',
+    )
+    // 事件文件没被改动：seq 仍是 1、2，不会因为坏 meta 出现重复序号。
+    const runLines = readFileSync(join(runsRoot, meta.id, 'run.jsonl'), 'utf8').trim().split('\n')
+    assert.deepEqual(runLines.map(line => JSON.parse(line).seq), [1])
+    const nodeLines = readFileSync(join(runsRoot, meta.id, 'n_1', '1.jsonl'), 'utf8').trim().split('\n')
+    assert.deepEqual(nodeLines.map(line => JSON.parse(line).seq), [2])
+    // 列表侧：进 skipped，原因可读且不带内部绝对路径。
+    const listed = await store.listRuns(runsRoot, { limit: 100 })
+    const skipped = listed.skipped.find(item => item.id === meta.id)
+    assert.ok(skipped, '坏 meta 的 run 应进 skipped')
+    assert.match(skipped.reason, /JSON/)
+    assert.ok(!skipped.reason.includes(runsRoot))
+    assert.equal(readFileSync(metaPath, 'utf8'), broken)
+    console.log(`  · 备份 ${backupNames()[0]}（${Buffer.byteLength(broken)} 字节），原文件未改动；追加被拒且 seq 未回退`)
+  })
+
+  await check('D1 超限 run.json 同样拒绝覆盖；只有文件真不存在才按新建写', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const huge = `{"pad":"${'x'.repeat(1024 * 1024 + 16)}"}`
+    writeFileSync(metaPath, huge)
+
+    await assert.rejects(
+      () => store.writeRunMeta(runsRoot, meta.id, { status: 'done' }),
+      error => error.status === 500 && error.code === 'EMETACORRUPT' && /1MiB/.test(error.reason),
+    )
+    assert.equal(readFileSync(metaPath, 'utf8'), huge, '超限原文件也必须保持原样')
+    const names = readdirSync(join(runsRoot, meta.id)).filter(name => name.startsWith('run.json.corrupt-'))
+    assert.equal(names.length, 1)
+    assert.equal(statSync(join(runsRoot, meta.id, names[0])).size, Buffer.byteLength(huge))
+    const listed = await store.listRuns(runsRoot, { limit: 100 })
+    assert.match(listed.skipped.find(item => item.id === meta.id).reason, /1MiB/)
+
+    // 唯一的「新建」路径：run 目录在、run.json 真不存在（ENOENT）。
+    const orphanId = 'r-orphan-dir'
+    mkdirSync(join(runsRoot, orphanId), { recursive: true })
+    created.push(orphanId)
+    const fresh = await store.writeRunMeta(runsRoot, orphanId, { name: '从空目录恢复' })
+    assert.equal(fresh.status, 'running')
+    assert.equal(fresh.name, '从空目录恢复')
+    assert.equal(fresh.createdAt, fresh.updatedAt)
+    assert.ok(existsSync(join(runsRoot, orphanId, 'run.json')))
+    console.log('  · 超限文件拒绝覆盖并备份；ENOENT 才允许按新建写入')
+  })
+
+  await check('D1 并发 appendEvents + writeRunMeta：seq 单调、不重复、不回退', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const jobs = []
+    for (let i = 0; i < 20; i += 1) {
+      jobs.push(store.appendEvents(runsRoot, meta.id, event('node/start', {
+        runId: meta.id, nodeId: `n_${i}`, attemptId: 1,
+      }), { now: NOW }))
+      if (i % 5 === 0) jobs.push(store.writeRunMeta(runsRoot, meta.id, { name: `patch-${i}` }))
+    }
+    const results = await Promise.all(jobs)
+    const seqs = results
+      .filter(result => result && Array.isArray(result.events))
+      .map(result => result.events[0].seq)
+      .sort((a, b) => a - b)
+    assert.equal(seqs.length, 20)
+    assert.deepEqual(seqs, Array.from({ length: 20 }, (_, index) => index + 1))
+
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.seq, 20)
+    assert.equal(after.lastSeq, 20)
+    assert.equal(after.eventCount, 20)
+
+    // 落盘事件文件里的 seq 也必须是一份不重不漏。
+    const nodeDirs = readdirSync(join(runsRoot, meta.id)).filter(name => /^n_\d+$/.test(name))
+    assert.equal(nodeDirs.length, 20)
+    const diskSeqs = []
+    for (const name of nodeDirs) {
+      const lines = readFileSync(join(runsRoot, meta.id, name, '1.jsonl'), 'utf8').trim().split('\n')
+      for (const line of lines) diskSeqs.push(JSON.parse(line).seq)
+    }
+    diskSeqs.sort((a, b) => a - b)
+    assert.deepEqual(diskSeqs, Array.from({ length: 20 }, (_, index) => index + 1))
+
+    // 后续 patch 也不能把 seq 回退（writeRunMeta 以现有 meta 为底合并）。
+    const patched = await store.writeRunMeta(runsRoot, meta.id, { status: 'done' })
+    assert.equal(patched.seq, 20)
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).seq, 20)
+    console.log(`  · 20 并发追加 seq=${seqs[0]}..${seqs[seqs.length - 1]}，patch 后仍为 ${patched.seq}`)
+  })
+
+  const nodeStatusFixture = (count, options = {}) => {
+    const { membersPerNode = 20, nameChars = 200, noteChars = 200, summaryChars = 0, blockers = 0 } = options
+    const out = {}
+    for (let n = 0; n < count; n += 1) {
+      const nodeId = `n_${String(n).padStart(3, '0')}`
+      out[nodeId] = {
+        state: 'working',
+        progress: 10,
+        at: new Date(Date.UTC(2026, 10, 6, 0, 0, 0) + n * 60_000).toISOString(),
+        ...(summaryChars > 0 ? { summary: 'S'.repeat(summaryChars) } : {}),
+        members: Array.from({ length: membersPerNode }, (_, m) => ({
+          name: `n${n}m${m}`.padEnd(nameChars, 'x'),
+          state: 'working',
+          ...(noteChars > 0 ? { note: 'y'.repeat(noteChars) } : {}),
+          at: new Date(Date.UTC(2026, 0, 1) + (n * membersPerNode + m) * 60_000).toISOString(),
+        })),
+        ...(blockers > 0 ? { blockers: Array.from({ length: blockers }, (_, b) => `B${n}-${b}`.padEnd(200, 'z')) } : {}),
+      }
+    }
+    return out
+  }
+
+  await check('D2 nodeStatus 预算：200 节点 × 满配成员 → 落盘 < 256KiB 且最近节点仍在', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const nodeStatus = nodeStatusFixture(200, { membersPerNode: 20, nameChars: 200, noteChars: 200, summaryChars: 2000, blockers: 20 })
+    const beforeBytes = Buffer.byteLength(JSON.stringify(nodeStatus), 'utf8')
+    assert.ok(beforeBytes > 1024 * 1024, `夹具应远超 1MiB（实际 ${beforeBytes}）`)
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, { nodeStatus })
+    assert.equal(written.nodeStatusTruncated, true, '裁剪必须可观测')
+    assert.ok(written.nodeStatusBudget, '返回值应带裁剪诊断')
+    assert.ok(written.nodeStatusBudget.evictedNodes > 0, '满配夹具应触发节点淘汰')
+
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const size = statSync(metaPath).size
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    const nodeBytes = Buffer.byteLength(JSON.stringify(disk.nodeStatus), 'utf8')
+    assert.equal(disk.nodeStatusTruncated, true, 'nodeStatusTruncated 必须落盘')
+    assert.ok(nodeBytes <= store.MAX_NODE_STATUS_BYTES,
+      `落盘 nodeStatus ${nodeBytes} 字节应 ≤ 预算 ${store.MAX_NODE_STATUS_BYTES}`)
+    assert.ok(size < 512 * 1024, `run.json ${size} 字节应显著低于 1MiB`)
+    // 最近更新的节点必须保留、最旧的被淘汰（不是整块清空）。
+    assert.ok(disk.nodeStatus.n_199, '最近节点必须保留')
+    assert.equal(disk.nodeStatus.n_000, undefined, '最旧节点应被淘汰')
+    assert.ok(Object.keys(disk.nodeStatus).length > 0)
+    // 读回也带标志（不静默）。
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).nodeStatusTruncated, true)
+    console.log(`  · nodeStatus ${beforeBytes} → ${nodeBytes} 字节；run.json ${size} 字节；保留 ${Object.keys(disk.nodeStatus).length}/200 节点`)
+  })
+
+  await check('D2 裁剪顺序：先摘 members[].note，够用就不动节点与成员', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 32 节点 × 20 成员 × 200 字备注：带备注超预算，摘掉备注后回到预算内。
+    const nodeStatus = nodeStatusFixture(32, { membersPerNode: 20, nameChars: 200, noteChars: 200 })
+    const withNotes = Buffer.byteLength(JSON.stringify(nodeStatus), 'utf8')
+    assert.ok(withNotes > store.MAX_NODE_STATUS_BYTES, `带备注应超预算（实际 ${withNotes}）`)
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, { nodeStatus })
+    assert.equal(written.nodeStatusTruncated, true)
+    assert.equal(written.nodeStatusBudget.removedNotes, 32 * 20)
+    assert.equal(written.nodeStatusBudget.evictedMembers, 0, '摘 note 就够，不该淘汰成员')
+    assert.equal(written.nodeStatusBudget.evictedNodes, 0, '也不该淘汰节点')
+
+    const disk = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    assert.equal(Object.keys(disk.nodeStatus).length, 32)
+    for (const entry of Object.values(disk.nodeStatus)) {
+      assert.equal(entry.members.length, 20)
+      assert.ok(entry.members.every(member => member.note === undefined), 'note 应被摘掉')
+    }
+    assert.ok(Buffer.byteLength(JSON.stringify(disk.nodeStatus), 'utf8') <= store.MAX_NODE_STATUS_BYTES)
+    console.log(`  · ${withNotes} 字节 → ${Buffer.byteLength(JSON.stringify(disk.nodeStatus), 'utf8')} 字节（摘掉 640 条备注）`)
+  })
+
+  await check('D2 成员淘汰按最后更新时间：旧的先走，最新成员保留', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 60 节点 × 20 成员，备注已没有可摘 → 只能按时间淘汰成员。
+    const nodeStatus = nodeStatusFixture(60, { membersPerNode: 20, nameChars: 200, noteChars: 0 })
+    const beforeBytes = Buffer.byteLength(JSON.stringify(nodeStatus), 'utf8')
+    assert.ok(beforeBytes > store.MAX_NODE_STATUS_BYTES, `夹具应超预算（实际 ${beforeBytes}）`)
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, { nodeStatus })
+    assert.equal(written.nodeStatusTruncated, true)
+    assert.ok(written.nodeStatusBudget.evictedMembers > 0, '应淘汰成员')
+    assert.equal(written.nodeStatusBudget.evictedNodes, 0, '只淘汰成员就够，不该整块丢节点')
+
+    const disk = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    assert.equal(Object.keys(disk.nodeStatus).length, 60, '节点不该被淘汰')
+    const total = Object.values(disk.nodeStatus).reduce((sum, entry) => sum + entry.members.length, 0)
+    assert.ok(total < 60 * 20)
+    // 最新成员（n_59 的 m19）保留；最旧节点（n_0）的成员最先被淘汰。
+    assert.ok(disk.nodeStatus.n_059.members.some(member => member.name.startsWith('n59m19')), '最新成员必须保留')
+    assert.ok(disk.nodeStatus.n_000.members.every(member => !member.name.startsWith('n0m')),
+      '最旧节点的成员应被淘汰')
+    assert.ok(Buffer.byteLength(JSON.stringify(disk.nodeStatus), 'utf8') <= store.MAX_NODE_STATUS_BYTES)
+    console.log(`  · 成员 ${beforeBytes} 字节 → 保留 ${total}/1200，淘汰 ${written.nodeStatusBudget.evictedMembers}`)
+  })
+
+  await check('D3 patch 白名单：sessions / nodeStatusTruncated 落盘，未知键可见 droppedKeys', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const written = await store.writeRunMeta(runsRoot, meta.id, {
+      status: 'done',
+      workspace: { id: 'ws-1', path: '/path/to/ws', isGit: true },
+      worktree: { enabled: false, reason: 'not-a-repo' },
+      sessionMode: 'injected',
+      supervision: { enabled: true, wakes: 2, failures: 0 },
+      nodeStatusTruncated: true,
+      sessions: { n_1: 'session-a', n_2: 'session-b' },
+      mysterious: 'should-be-dropped',
+      anotherOne: 42,
+    })
+    assert.equal(written.id, meta.id)
+    assert.equal(written.name, meta.name)
+    assert.deepEqual(written.sessions, { n_1: 'session-a', n_2: 'session-b' })
+    assert.deepEqual([...written.droppedKeys].sort(), ['anotherOne', 'mysterious'])
+    // droppedKeys 是可读但不可枚举的诊断属性，不改变返回结构与落盘形状。
+    assert.equal(Object.prototype.propertyIsEnumerable.call(written, 'droppedKeys'), false)
+    assert.ok(!JSON.stringify(written).includes('droppedKeys'))
+
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.equal(disk.status, 'done')
+    assert.deepEqual(disk.sessions, { n_1: 'session-a', n_2: 'session-b' })
+    assert.equal(disk.nodeStatusTruncated, true)
+    assert.equal(disk.workspace.id, 'ws-1')
+    assert.equal(disk.worktree.enabled, false)
+    assert.equal(disk.sessionMode, 'injected')
+    assert.equal(disk.supervision.wakes, 2)
+    assert.ok(!('mysterious' in disk))
+    assert.ok(!('droppedKeys' in disk))
+
+    const reread = await store.readRunMeta(runsRoot, meta.id)
+    assert.deepEqual(reread.sessions, written.sessions)
+    assert.equal(reread.nodeStatusTruncated, true)
+
+    // sessions 是整表覆盖语义；null 表示清空（保留键、值为 null）。
+    await store.writeRunMeta(runsRoot, meta.id, { sessions: { n_3: 'session-c' } })
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).sessions, { n_3: 'session-c' })
+    await store.writeRunMeta(runsRoot, meta.id, { sessions: null })
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).sessions, null)
+    // nodeStatusTruncated 传 false 表示清除标志。
+    await store.writeRunMeta(runsRoot, meta.id, { nodeStatusTruncated: false })
+    assert.ok(!('nodeStatusTruncated' in (await store.readRunMeta(runsRoot, meta.id))))
+
+    // 严格校验：类型不对 / 超上限 → 400，且不落盘（不是静默丢）。
+    const bytesBefore = readFileSync(metaPath, 'utf8')
+    const tooManySessions = Object.fromEntries(
+      Array.from({ length: 513 }, (_, index) => [`n_${index}`, `session-${index}`]),
+    )
+    const cases = [
+      [{ sessions: { n_1: 123 } }, /sessions/],
+      [{ sessions: tooManySessions }, /最多 512/],
+      [{ sessions: 'nope' }, /sessions/],
+      [{ sessionMode: 'weird' }, /sessionMode/],
+      [{ status: 'weird' }, /status/],
+      [{ nodeStatusTruncated: 'yes' }, /布尔/],
+      [{ nodeStatus: 'nope' }, /nodeStatus/],
+      [{ supervision: 'nope' }, /supervision/],
+      [{ workspace: 'nope' }, /workspace/],
+    ]
+    for (const [patch, pattern] of cases) {
+      await assert.rejects(
+        () => store.writeRunMeta(runsRoot, meta.id, patch),
+        error => error.status === 400 && pattern.test(error.reason),
+        `应拒绝：${JSON.stringify(patch).slice(0, 60)}`,
+      )
+    }
+    assert.equal(readFileSync(metaPath, 'utf8'), bytesBefore, '被拒的 patch 不能写盘')
+    console.log('  · sessions / nodeStatusTruncated 落盘；未声明键进 droppedKeys；9 类非法 patch 全部 400 且未落盘')
+  })
+
+  await check('D3 startOptions：落盘 / 多余内层键可见 / 类型错 400 / 未传不凭空出现', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    // 未传过 → run.json 里不该出现 startOptions（不能凭空造一个空对象）。
+    assert.ok(!('startOptions' in JSON.parse(readFileSync(metaPath, 'utf8'))))
+
+    const options = { workspace: '/repo/demo', worktree: 'on' }
+    const written = await store.writeRunMeta(runsRoot, meta.id, { startOptions: options })
+    assert.deepEqual(written.startOptions, options)
+    assert.equal(written.droppedKeys, undefined)
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).startOptions, options)
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).startOptions, options)
+
+    // 多余的内层键被丢弃，但必须可见（不静默）。
+    const extra = await store.writeRunMeta(runsRoot, meta.id, {
+      startOptions: { workspace: '/repo/demo', worktree: 'off', engine: 'stub', sessionId: 's-1' },
+    })
+    assert.deepEqual([...extra.droppedKeys].sort(), ['startOptions.engine', 'startOptions.sessionId'])
+    assert.deepEqual(extra.startOptions, { workspace: '/repo/demo', worktree: 'off' })
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).startOptions,
+      { workspace: '/repo/demo', worktree: 'off' })
+
+    // 显式空对象保留为空对象（与「未传 = 不出现」区分开）。
+    await store.writeRunMeta(runsRoot, meta.id, { startOptions: {} })
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).startOptions, {})
+
+    // 不参与 nodeStatus 的字节预算：同一次 patch 里大 nodeStatus 被裁剪，startOptions 原样保留。
+    const bigStatus = nodeStatusFixture(200, {
+      membersPerNode: 20, nameChars: 200, noteChars: 200, summaryChars: 2000, blockers: 20,
+    })
+    await store.writeRunMeta(runsRoot, meta.id, { startOptions: options, nodeStatus: bigStatus })
+    const afterBig = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.deepEqual(afterBig.startOptions, options, 'nodeStatus 裁剪不得影响 startOptions')
+    assert.equal(afterBig.nodeStatusTruncated, true)
+
+    // D1：run.json 损坏时 startOptions 也不可能被「重建」（拒绝覆盖 + 原文件不动）。
+    const broken = '{ broken startOptions test'
+    writeFileSync(metaPath, broken)
+    await assert.rejects(
+      () => store.writeRunMeta(runsRoot, meta.id, { startOptions: options }),
+      error => error.status === 500 && error.code === 'EMETACORRUPT',
+    )
+    assert.equal(readFileSync(metaPath, 'utf8'), broken, '坏 run.json 必须保持原样')
+
+    // 类型错一律 400，且不落盘。
+    const clean = await makeRun()
+    created.push(clean.id)
+    const cleanPath = join(runsRoot, clean.id, 'run.json')
+    const before = readFileSync(cleanPath, 'utf8')
+    const badCases = [
+      [{ startOptions: 'nope' }, /startOptions/],
+      [{ startOptions: 123 }, /startOptions/],
+      [{ startOptions: [] }, /startOptions/],
+      [{ startOptions: { workspace: 123 } }, /workspace/],
+      [{ startOptions: { workspace: '' } }, /workspace/],
+      [{ startOptions: { workspace: '   ' } }, /workspace/],
+      [{ startOptions: { worktree: 1 } }, /worktree/],
+    ]
+    for (const [patch, pattern] of badCases) {
+      await assert.rejects(
+        () => store.writeRunMeta(runsRoot, clean.id, patch),
+        error => error.status === 400 && /startOptions/.test(error.field || '') && pattern.test(error.reason),
+        `应拒绝：${JSON.stringify(patch)}`,
+      )
+    }
+    assert.equal(readFileSync(cleanPath, 'utf8'), before, '被拒的 startOptions 不能写盘')
+    // null 表示清除。
+    await store.writeRunMeta(runsRoot, clean.id, { startOptions: { workspace: '/a', worktree: 'auto' } })
+    assert.deepEqual((await store.readRunMeta(runsRoot, clean.id)).startOptions,
+      { workspace: '/a', worktree: 'auto' })
+    await store.writeRunMeta(runsRoot, clean.id, { startOptions: null })
+    assert.equal((await store.readRunMeta(runsRoot, clean.id)).startOptions, null)
+    console.log('  · startOptions 落盘/读回 deepEqual；内层多余键进 droppedKeys；7 类类型错 400 且未落盘')
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

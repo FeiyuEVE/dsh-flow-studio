@@ -10,17 +10,29 @@
  * 连续失败 3 次降级、单 run 抛错隔离、tick 重入保护、终态自动摘除、重启恢复、
  * status 字段；v0.8 节点闹钟的 parseNodeStatus 解析口径与 NodeSupervisionScheduler
  * 的登记 / 注销 / 到点 / skip / 失败停摆 / 重入 / 快照。
+ *
+ * v0.8.1（E1-a / E1-b）追加：每条 entry 的独立超时（hang 不拖死整轮）、有界并发、
+ * stop 后无 timer 残留（含子进程自然退出实证）、snapshot() 可观测字段、
+ * inspectNodeStatus 区分「没回报」与「回报了但格式错」。
  */
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
 import {
   planWake,
   SupervisionScheduler,
   SUPERVISION_INTERVALS,
+  SUPERVISION_WAKE_TIMEOUT_MS,
+  SUPERVISION_MAX_CONCURRENCY,
   NODE_ALARM_DEFAULT_MS,
   NodeSupervisionScheduler,
   parseNodeStatus,
+  inspectNodeStatus,
+  NODE_REPORT_MISSING,
+  NODE_REPORT_INVALID,
+  NODE_REPORT_OK,
 } from '../src/supervise.js'
 
 let checks = 0
@@ -115,9 +127,57 @@ function fakeTimers() {
 }
 
 /**
- * 组装调度器：evaluate / wake 都记录调用；store / clock / timers 可替换。
+ * 假 setTimeout / clearTimeout：用于断言「stop 后没有 timer 残留」。
+ * 每个 timer 记录 active；fire() 模拟到点（先置 inactive 再跑回调，贴近真实语义），
+ * pending() 返回还活着的 timer。
  */
-function createScheduler({ clock, store = createStore(), evaluate, wake, intervalMs = 1000 } = {}) {
+function fakeTimeouts() {
+  const state = { timers: [], cleared: [], armed: [], nextId: 1, unrefs: 0 }
+  return {
+    state,
+    setTimeout(fn, ms) {
+      const timer = {
+        id: state.nextId++,
+        ms,
+        active: true,
+        unref() {
+          state.unrefs += 1
+        },
+        fire() {
+          if (!timer.active) return
+          timer.active = false
+          fn()
+        },
+      }
+      state.armed.push(timer)
+      state.timers.push(timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      if (!timer || timer.active === false) return
+      timer.active = false
+      state.cleared.push(timer.id)
+    },
+    pending() {
+      return state.timers.filter(timer => timer.active)
+    },
+  }
+}
+
+/**
+ * 组装调度器：evaluate / wake 都记录调用；store / clock / timers 可替换。
+ * v0.8.1 追加 wakeTimeoutMs / maxConcurrency / timeouts（假 setTimeout）注入。
+ */
+function createScheduler({
+  clock,
+  store = createStore(),
+  evaluate,
+  wake,
+  intervalMs = 1000,
+  wakeTimeoutMs,
+  maxConcurrency,
+  timeouts,
+} = {}) {
   const timers = fakeTimers()
   const calls = { wake: [], evaluate: [], logs: [] }
   const scheduler = new SupervisionScheduler({
@@ -136,6 +196,11 @@ function createScheduler({ clock, store = createStore(), evaluate, wake, interva
     save: store.save,
     log: (level, message) => calls.logs.push({ level, message }),
     intervalMs,
+    ...(wakeTimeoutMs === undefined ? {} : { wakeTimeoutMs }),
+    ...(maxConcurrency === undefined ? {} : { maxConcurrency }),
+    ...(timeouts === undefined
+      ? {}
+      : { setTimeout: timeouts.setTimeout, clearTimeout: timeouts.clearTimeout }),
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,
   })
@@ -775,20 +840,36 @@ function fakeNodeTimers() {
 }
 
 /** 组装节点闹钟：wake / 定时器 / 日志全部是桩，缺省 wake 返回 inject。 */
-function createNodeScheduler({ clock, wake, nodeAlarmMs, intervalMs = 15000, maxFailures } = {}) {
+// 注意：多数用例断言的是「到点推进 / 幂等 / 失败停摆」这套机制，跟默认间隔无关，
+// 所以夹具默认注入 120s 的短间隔（真实默认已是 600s，由单独一组用例守护）。
+function createNodeScheduler({
+  clock,
+  wake,
+  nodeAlarmMs = 120_000,
+  intervalMs = 15000,
+  maxFailures,
+  wakeTimeoutMs,
+  maxConcurrency,
+  timeouts,
+} = {}) {
   const timers = fakeNodeTimers()
   const calls = { wake: [], logs: [] }
   const scheduler = new NodeSupervisionScheduler({
     now: clock.now,
-    wake: async entry => {
+    wake: async (entry, ctx) => {
       calls.wake.push(entry)
       if (typeof wake !== 'function') return { action: 'inject' }
-      return wake(entry, calls.wake.length)
+      return wake(entry, calls.wake.length, ctx)
     },
     log: (level, message) => calls.logs.push({ level, message }),
     intervalMs,
     nodeAlarmMs,
     maxFailures,
+    ...(wakeTimeoutMs === undefined ? {} : { wakeTimeoutMs }),
+    ...(maxConcurrency === undefined ? {} : { maxConcurrency }),
+    ...(timeouts === undefined
+      ? {}
+      : { setTimeout: timeouts.setTimeout, clearTimeout: timeouts.clearTimeout }),
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,
   })
@@ -799,27 +880,32 @@ function createNodeScheduler({ clock, wake, nodeAlarmMs, intervalMs = 15000, max
 // 8.1 常量
 // ---------------------------------------------------------------------------
 
-await check('节点闹钟：NODE_ALARM_DEFAULT_MS = 120000，且是 register 缺省间隔', () => {
-  A.equal(NODE_ALARM_DEFAULT_MS, 120000)
+await check('节点闹钟：NODE_ALARM_DEFAULT_MS = 600000（10 分钟，120s 太频繁），且是 register 缺省间隔', () => {
+  A.equal(NODE_ALARM_DEFAULT_MS, 600000)
   A.ok(Number.isInteger(NODE_ALARM_DEFAULT_MS))
 
   const clock = createClock()
-  const { scheduler } = createNodeScheduler({ clock })
+  // 不注入 nodeAlarmMs：验证「缺省就是 600s」这条契约（夹具本身注入 120s 是为了缩短计时）。
+  const scheduler = new NodeSupervisionScheduler({
+    now: clock.now,
+    wake: async () => ({ action: 'inject' }),
+    log: () => {},
+  })
   const status = scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1 })
-  A.equal(status.nextDueAt, at(120), 'register 时 nextDueAt = now + 120s')
+  A.equal(status.nextDueAt, at(600), 'register 时 nextDueAt = now + 600s')
   A.deepEqual(status, {
     sessionId: 's1',
     runId: 'r1',
     nodeId: 'n1',
     attempt: 1,
     enabled: true,
-    nextDueAt: at(120),
+    nextDueAt: at(600),
     wakes: 0,
     failures: 0,
     lastReason: null,
   })
   A.equal(Object.keys(status).length, 9)
-  A.equal(scheduler.nodeAlarmMs, NODE_ALARM_DEFAULT_MS)
+  A.equal(scheduler.nodeAlarmMs, NODE_ALARM_DEFAULT_MS, '不注入时用 600s 默认值')
   A.equal(scheduler.maxFailures, 3)
 })
 
@@ -1383,6 +1469,577 @@ await check('NodeScheduler：start 幂等 / stop 幂等 / interval 用 intervalM
   await waitFor(() => scheduler.status('s1').wakes === 1, '定时器回调驱动 tick')
   A.equal(calls.wake.length, 1)
   A.equal(scheduler.stop(), true)
+})
+
+// ===========================================================================
+// 9. v0.8.1 · E1-a / E1-b：独立超时、有界并发、可观测快照、回报判定
+// ===========================================================================
+
+/** 永不 resolve 的唤醒桩：模拟「节点会话永不 idle」。 */
+const hangForever = () => new Promise(() => {})
+
+// ---------------------------------------------------------------------------
+// 9.1 E1-a · run 级：一条 hang 不拖死整轮
+// ---------------------------------------------------------------------------
+
+await check('Scheduler(E1-a)：一条 hang + 三条正常 → tick 在超时上限内结束，正常三条照常唤醒，hang 记 timeout', async () => {
+  const clock = createClock()
+  const store = createStore()
+  // 用假 setTimeout 手动触发超时，确定性更好；真实 setTimeout 被 unref 后，
+  // 如果事件循环没有别的句柄，进程会在到点前直接退出（真实到点路径由 9.8 子进程覆盖）。
+  const timeouts = fakeTimeouts()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    store,
+    wakeTimeoutMs: 40,
+    maxConcurrency: 4,
+    timeouts,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+    wake: async runId => (runId === 'r-hang' ? hangForever() : true),
+  })
+  for (const runId of ['r-hang', 'r-ok-1', 'r-ok-2', 'r-ok-3']) scheduler.register(runId)
+
+  const tickPromise = scheduler.tick()
+  await waitFor(
+    () => calls.wake.length === 4 && timeouts.pending().length === 1,
+    '四条都进入 wake 且正常条目已结算',
+  )
+  A.equal(timeouts.pending().length, 1, '只有 hang 的那条还挂着超时 timer（正常条目已结算）')
+  A.equal(timeouts.pending()[0].ms, 40, '超时用注入的 wakeTimeoutMs')
+  const startedAt = Date.now()
+  for (const timer of timeouts.pending()) timer.fire()
+  const stats = await tickPromise
+  const elapsed = Date.now() - startedAt
+
+  A.equal(stats.skipped, false)
+  A.equal(stats.runs, 4)
+  A.equal(stats.woken, 3, '正常三条都要被处理')
+  A.equal(stats.failed, 1, '超时计入 failed')
+  A.ok(elapsed < 1000, `超时后 tick 必须立即收口（实测 ${elapsed}ms）`)
+  A.deepEqual(
+    calls.wake.map(item => item.runId).sort(),
+    ['r-hang', 'r-ok-1', 'r-ok-2', 'r-ok-3'],
+    'hang 的那条不能挡住其它条',
+  )
+
+  const snapshot = scheduler.snapshot()
+  const hang = snapshot.entries.find(entry => entry.runId === 'r-hang')
+  A.equal(hang.lastOutcome, 'timeout', 'hang 的那条记为 timeout')
+  A.equal(hang.timeouts, 1)
+  A.equal(hang.failures, 1)
+  A.equal(hang.enabled, true, '单次超时不降级')
+  A.equal(hang.nextDueAt, clock.iso(60), '超时按 anomaly 60s 推进 nextDueAt')
+  A.match(hang.lastReason, /^wake-timeout: /)
+  A.equal(typeof hang.lastDurationMs, 'number')
+
+  for (const runId of ['r-ok-1', 'r-ok-2', 'r-ok-3']) {
+    const entry = snapshot.entries.find(item => item.runId === runId)
+    A.equal(entry.lastOutcome, 'woken', `${runId} 应照常唤醒`)
+    A.equal(entry.wakes, 1)
+    A.equal(entry.timeouts, 0)
+  }
+
+  A.equal(snapshot.tick.count, 1)
+  A.equal(snapshot.tick.skipped, 0)
+  A.equal(typeof snapshot.tick.lastDurationMs, 'number')
+  A.ok(snapshot.tick.lastDurationMs >= 0)
+  A.deepEqual(snapshot.tick.lastStats, stats, '整轮 tick 的统计要能查到')
+  A.equal(snapshot.wakeTimeoutMs, 40)
+  A.equal(snapshot.concurrency.limit, 4)
+  A.equal(snapshot.concurrency.active, 0)
+  A.equal(snapshot.ticking, false)
+  A.ok(
+    calls.logs.some(item => item.level === 'warn' && /唤醒超时/.test(item.message)),
+    '超时要留 warn 日志',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 9.2 E1-a · 单条抛异常 / 卡住只影响自己
+// ---------------------------------------------------------------------------
+
+await check('Scheduler(E1-a)：单条抛异常 / 卡住都只影响自己，其它条照常处理', async () => {
+  const clock = createClock()
+  const timeouts = fakeTimeouts()
+  const { scheduler, calls } = createScheduler({
+    clock,
+    wakeTimeoutMs: 40,
+    timeouts,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+    wake: async runId => {
+      if (runId === 'r-throw') throw new Error('boom-isolated')
+      if (runId === 'r-hang') return hangForever()
+      return true
+    },
+  })
+  for (const runId of ['r-throw', 'r-hang', 'r-good-1', 'r-good-2']) scheduler.register(runId)
+
+  const tickPromise = scheduler.tick()
+  await waitFor(
+    () => calls.wake.length === 4 && timeouts.pending().length === 1,
+    '四条都进入 wake 且只有 hang 那条在等超时',
+  )
+  A.equal(timeouts.pending().length, 1, '只有 hang 的那条还在等超时')
+  for (const timer of timeouts.pending()) timer.fire()
+  const stats = await tickPromise
+
+  A.equal(stats.runs, 4)
+  A.equal(stats.failed, 2)
+  A.equal(stats.woken, 2)
+
+  const byId = runId => scheduler.snapshot().entries.find(entry => entry.runId === runId)
+  A.equal(byId('r-throw').lastOutcome, 'failed')
+  A.equal(byId('r-throw').lastError, 'boom-isolated')
+  A.match(byId('r-throw').lastReason, /^wake-failed: boom-isolated$/)
+  A.equal(byId('r-throw').failures, 1)
+  A.equal(byId('r-throw').enabled, true)
+  A.equal(byId('r-hang').lastOutcome, 'timeout')
+  A.equal(byId('r-good-1').lastOutcome, 'woken')
+  A.equal(byId('r-good-2').lastOutcome, 'woken')
+  A.ok(
+    scheduler.snapshot().entries.every(entry => typeof entry.lastDurationMs === 'number'),
+    '每一条都要有耗时（可观测）',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// 9.3 E1-a · 重入跳过 + stop 结算在飞
+// ---------------------------------------------------------------------------
+
+await check('Scheduler(E1-a)：上一轮未完成时新一轮被跳过，stop 会结算在飞 entry 并清 timer', async () => {
+  const clock = createClock()
+  const { scheduler, calls, timers } = createScheduler({
+    clock,
+    wakeTimeoutMs: 60_000,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+    wake: async () => hangForever(),
+  })
+  scheduler.start()
+  scheduler.register(RUN_ID)
+
+  const firstTick = scheduler.tick()
+  await waitFor(() => calls.wake.length === 1, '第一轮进入 wake')
+  A.equal(scheduler.snapshot().ticking, true)
+  A.equal(scheduler.snapshot().concurrency.active, 1, '有 1 条在飞')
+
+  const second = await scheduler.tick()
+  A.equal(second.skipped, true)
+  A.equal(scheduler.snapshot().tick.skipped, 1, '被跳过的轮次要记进快照')
+  A.equal(calls.wake.length, 1, '重入不许并发跑两轮')
+
+  A.equal(scheduler.stop(), true)
+  const first = await firstTick
+  A.equal(first.skipped, false)
+  A.equal(first.failed, 0, 'stop 结算不算失败')
+  A.equal(scheduler.snapshot().ticking, false)
+  const entry = scheduler.snapshot().entries.find(item => item.runId === RUN_ID)
+  A.equal(entry.lastOutcome, 'aborted')
+  A.equal(scheduler.stop(), false, '重复 stop 幂等')
+  A.equal(timers.state.cleared.length, 1, 'interval 只清一次')
+})
+
+// ---------------------------------------------------------------------------
+// 9.4 E1-a · 节点级：一条 hang 不拖死整轮
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler(E1-a)：一条 hang + 三条正常 → tick 有界结束，正常三条照常自审，hang 记 timeout', async () => {
+  const clock = createClock()
+  const timeouts = fakeTimeouts()
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    nodeAlarmMs: 1000,
+    wakeTimeoutMs: 40,
+    maxConcurrency: 4,
+    timeouts,
+    wake: entry => (entry.sessionId === 's-hang' ? hangForever() : { action: 'followup', reason: 'idle' }),
+  })
+  for (const [runId, nodeId, sessionId] of [
+    ['r-hang', 'n-hang', 's-hang'],
+    ['r-1', 'n-1', 's-1'],
+    ['r-2', 'n-2', 's-2'],
+    ['r-3', 'n-3', 's-3'],
+  ]) {
+    scheduler.register({ runId, nodeId, sessionId, attempt: 1, intervalMs: 1000 })
+  }
+
+  clock.advance(1)
+  const tickPromise = scheduler.tick()
+  await waitFor(
+    () => calls.wake.length === 4 && timeouts.pending().length === 1,
+    '四条都进入 wake 且正常条目已结算',
+  )
+  A.equal(timeouts.pending().length, 1, '只有 hang 的那条还挂着超时 timer')
+  const startedAt = Date.now()
+  for (const timer of timeouts.pending()) timer.fire()
+  const stats = await tickPromise
+  const elapsed = Date.now() - startedAt
+
+  A.equal(stats.entries, 4)
+  A.equal(stats.woken, 3)
+  A.equal(stats.failed, 1)
+  A.ok(elapsed < 1000, `超时后 tick 必须立即收口（实测 ${elapsed}ms）`)
+
+  const snapshot = scheduler.snapshot()
+  const hang = snapshot.entries.find(entry => entry.sessionId === 's-hang')
+  A.equal(hang.lastOutcome, 'timeout')
+  A.equal(hang.timeouts, 1)
+  A.equal(hang.failures, 1)
+  A.equal(hang.enabled, true)
+  A.equal(hang.nextDueAt, clock.iso(1), '超时按本条 intervalMs 推进 due（now=BASE+1s，+1s）')
+  A.match(hang.lastReason, /^wake-timeout: /)
+  for (const sessionId of ['s-1', 's-2', 's-3']) {
+    const entry = snapshot.entries.find(item => item.sessionId === sessionId)
+    A.equal(entry.lastOutcome, 'woken')
+    A.equal(entry.wakes, 1)
+    A.equal(entry.timeouts, 0)
+  }
+  A.equal(snapshot.kind, 'node')
+  A.equal(snapshot.nodeAlarmMs, 1000)
+  A.equal(snapshot.wakeTimeoutMs, 40)
+  A.deepEqual(snapshot.tick.lastStats, stats)
+  A.ok(calls.logs.some(item => item.level === 'warn' && /唤醒超时/.test(item.message)))
+})
+
+// ---------------------------------------------------------------------------
+// 9.5 E1-a · 有界并发
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler(E1-a)：有界并发 maxConcurrency，单条慢不拖住其它条', async () => {
+  const clock = createClock()
+  let active = 0
+  let maxActive = 0
+  let finished = 0
+  const { scheduler } = createNodeScheduler({
+    clock,
+    nodeAlarmMs: 1000,
+    maxConcurrency: 3,
+    wakeTimeoutMs: 5000,
+    wake: async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      active -= 1
+      finished += 1
+      return { action: 'inject' }
+    },
+  })
+  for (let index = 0; index < 6; index += 1) {
+    scheduler.register({
+      runId: `r-${index}`,
+      nodeId: `n-${index}`,
+      sessionId: `s-${index}`,
+      attempt: 1,
+      intervalMs: 1000,
+    })
+  }
+
+  clock.advance(1)
+  const stats = await scheduler.tick()
+  A.equal(stats.entries, 6)
+  A.equal(stats.woken, 6)
+  A.equal(finished, 6)
+  A.ok(maxActive <= 3, `并发不得超过上限 3（实测 ${maxActive}）`)
+  A.ok(maxActive >= 2, `必须真的有并发，不是串行（实测 ${maxActive}）`)
+  A.equal(scheduler.snapshot().concurrency.limit, 3)
+  A.equal(scheduler.snapshot().concurrency.active, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 9.6 E1-a · stop / dispose 后无 timer 残留
+// ---------------------------------------------------------------------------
+
+await check('调度器收尾(E1-a)：stop / dispose 后没有 setTimeout 残留（在飞 entry 被结算）', async () => {
+  const clock = createClock()
+  const runTimeouts = fakeTimeouts()
+  const runScheduler = createScheduler({
+    clock,
+    wakeTimeoutMs: 60_000,
+    timeouts: runTimeouts,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+    wake: async () => hangForever(),
+  })
+  runScheduler.scheduler.start()
+  runScheduler.scheduler.register(RUN_ID)
+  const runTick = runScheduler.scheduler.tick()
+  await waitFor(() => runScheduler.calls.wake.length === 1, 'run 进入 wake')
+  A.equal(runTimeouts.pending().length, 1, '在飞 entry 有 1 个超时 timer')
+  A.ok(runTimeouts.state.unrefs >= 1, '超时 timer 要 unref（不拖住进程退出）')
+
+  runScheduler.scheduler.stop()
+  A.equal(runTimeouts.pending().length, 0, 'stop 后超时 timer 必须清零')
+  await runTick
+  A.equal(runScheduler.scheduler.snapshot().ticking, false)
+  A.equal(runScheduler.scheduler.dispose(), false, 'dispose 幂等（已停止）')
+  A.equal(runTimeouts.pending().length, 0)
+
+  const nodeTimeouts = fakeTimeouts()
+  const nodeScheduler = createNodeScheduler({
+    clock,
+    nodeAlarmMs: 1000,
+    wakeTimeoutMs: 60_000,
+    timeouts: nodeTimeouts,
+    wake: async () => hangForever(),
+  })
+  nodeScheduler.scheduler.start()
+  nodeScheduler.scheduler.register({ runId: 'r-a', nodeId: 'n-a', sessionId: 's-a', attempt: 1, intervalMs: 1000 })
+  nodeScheduler.scheduler.register({ runId: 'r-b', nodeId: 'n-b', sessionId: 's-b', attempt: 1, intervalMs: 1000 })
+  clock.advance(1)
+  const nodeTick = nodeScheduler.scheduler.tick()
+  await waitFor(() => nodeScheduler.calls.wake.length === 2, 'node 两条都进入 wake')
+  A.equal(nodeTimeouts.pending().length, 2)
+  A.ok(nodeTimeouts.state.unrefs >= 2)
+
+  nodeScheduler.scheduler.stop()
+  A.equal(nodeTimeouts.pending().length, 0, 'stop 后两条超时 timer 都要清零')
+  await nodeTick
+  A.equal(nodeScheduler.scheduler.snapshot().ticking, false)
+  A.equal(nodeScheduler.scheduler.dispose(), false)
+  A.equal(nodeTimeouts.pending().length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// 9.7 E1-a · 连续超时累计到阈值就停摆
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler(E1-a)：连续超时累计到阈值 → 停摆（enabled=false），timeouts 可查', async () => {
+  const clock = createClock()
+  const timeouts = fakeTimeouts()
+  const { scheduler, calls } = createNodeScheduler({
+    clock,
+    maxFailures: 2,
+    nodeAlarmMs: 1000,
+    wakeTimeoutMs: 20,
+    timeouts,
+    wake: async () => hangForever(),
+  })
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1, intervalMs: 1000 })
+  clock.advance(1)
+
+  let tickPromise = scheduler.tick()
+  await waitFor(() => calls.wake.length === 1, '第一轮进入 wake')
+  for (const timer of timeouts.pending()) timer.fire()
+  let stats = await tickPromise
+  A.equal(stats.failed, 1)
+  A.equal(scheduler.status('s1').enabled, true)
+
+  clock.advance(60)
+  tickPromise = scheduler.tick()
+  await waitFor(() => calls.wake.length === 2, '第二轮进入 wake')
+  for (const timer of timeouts.pending()) timer.fire()
+  stats = await tickPromise
+  A.equal(stats.failed, 1)
+  const status = scheduler.status('s1')
+  A.equal(status.enabled, false)
+  A.equal(status.failures, 2)
+  A.match(status.lastReason, /^wake-timeout: /)
+  A.equal(scheduler.snapshot().entries[0].timeouts, 2, '超时要单独计数')
+  A.equal(scheduler.list().length, 1, '停摆后仍留在 list 里')
+})
+
+// ---------------------------------------------------------------------------
+// 9.8 E1-a · 进程能自然退出（子进程实证）
+// ---------------------------------------------------------------------------
+
+await check('调度器收尾(E1-a)：跑完调度器后不 process.exit()，子进程能自然退出（无 timer 残留）', async () => {
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url))
+  const moduleUrl = new URL('../src/supervise.js', import.meta.url).href
+  const script = `
+import { SupervisionScheduler, NodeSupervisionScheduler } from ${JSON.stringify(moduleUrl)}
+// 兜底告警：unref 的 watchdog 只在「还有别的句柄吊着事件循环」时才有机会触发。
+const watchdog = setTimeout(() => console.log('LEAK-TIMER'), 1500)
+watchdog.unref()
+const now = () => Date.now()
+const iso = ms => new Date(ms).toISOString()
+const hang = () => new Promise(() => {})
+// 超时 timer 是 unref 的（不拖住进程退出）；测试期间临时用 ref 计时器占住事件循环，
+// 让 unref 的超时有机会真的到点，跑完立刻清掉。
+const keepAlive = () => {
+  const timer = setTimeout(() => {}, 1000)
+  return () => clearTimeout(timer)
+}
+const run = new SupervisionScheduler({
+  now,
+  wakeTimeoutMs: 30,
+  wake: hang,
+  evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: iso(Date.now() - 300000) } }),
+  load: async () => null,
+  save: async () => {},
+})
+run.start()
+run.register('r-exit', { wakerSessionId: 'w-exit' })
+const releaseRun = keepAlive()
+const runStats = await run.tick()
+releaseRun()
+run.stop()
+
+const node = new NodeSupervisionScheduler({ now, wakeTimeoutMs: 30, wake: hang, nodeAlarmMs: 1 })
+node.start()
+node.register({ runId: 'r-exit', nodeId: 'n-exit', sessionId: 's-exit', attempt: 1, intervalMs: 1 })
+await new Promise(resolve => setTimeout(resolve, 5))
+const releaseNode = keepAlive()
+const nodeStats = await node.tick()
+releaseNode()
+node.stop()
+
+const ok = runStats.failed === 1
+  && nodeStats.failed === 1
+  && run.snapshot().entries[0].lastOutcome === 'timeout'
+  && node.snapshot().entries[0].lastOutcome === 'timeout'
+console.log(ok ? 'OK' : 'BAD-RESULT', JSON.stringify({ runStats, nodeStats }))
+`
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: repoRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  const result = await new Promise(resolve => {
+    const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000)
+    child.stdout.on('data', chunk => {
+      stdout += chunk
+    })
+    child.stderr.on('data', chunk => {
+      stderr += chunk
+    })
+    child.on('exit', (code, signal) => {
+      clearTimeout(killTimer)
+      resolve({ code, signal })
+    })
+  })
+
+  A.equal(result.signal, null, `子进程必须自然退出（被 ${result.signal} 杀掉说明有句柄残留）：${stderr}`)
+  A.equal(result.code, 0, `子进程应正常退出：${stderr}`)
+  A.match(stdout, /OK/, `调度器应在超时后正常收口：${stdout}`)
+  A.ok(!/LEAK-TIMER/.test(stdout), `不允许有 timer 残留吊住进程：${stdout}`)
+})
+
+// ---------------------------------------------------------------------------
+// 9.9 E1-b · parseNodeStatus 的判定区分
+// ---------------------------------------------------------------------------
+
+await check('inspectNodeStatus(E1-b)：区分 missing（没回报）与 invalid（回报了但格式错）', () => {
+  const valid = inspectNodeStatus('{"state":"working"}')
+  A.equal(valid.kind, NODE_REPORT_OK)
+  A.equal(valid.parsed.state, 'working')
+  A.equal(valid.reason, null)
+
+  // 「没回报」：非字符串 / 空白 / 纯文字里没有 JSON
+  for (const text of ['', '   ', '这轮没有结构化回报', null, undefined, 42, [], ['{}']]) {
+    const result = inspectNodeStatus(text)
+    A.equal(result.kind, NODE_REPORT_MISSING, `应判为没回报：${JSON.stringify(text)}`)
+    A.equal(result.parsed, null)
+  }
+
+  // 「回报了但结构不合法」：有 JSON 痕迹但解析失败 / 顶层不是对象
+  for (const text of [
+    '{"a":1',
+    '{"state": 这里不是 JSON}',
+    '```json\n{bad}\n```',
+    '```json\n[1,2,3]\n```',
+    '```js\nconst a = 1\n```',
+  ]) {
+    const result = inspectNodeStatus(text)
+    A.equal(result.kind, NODE_REPORT_INVALID, `应判为格式错：${JSON.stringify(text)}`)
+    A.equal(result.parsed, null)
+    A.ok(result.reason !== null)
+  }
+
+  // parseNodeStatus 的既有契约不变：坏输入仍是 null
+  A.equal(parseNodeStatus('{"a":1'), null)
+  A.equal(parseNodeStatus('这轮没有结构化回报'), null)
+})
+
+// ---------------------------------------------------------------------------
+// 9.10 E1-b · recordReport 落进快照
+// ---------------------------------------------------------------------------
+
+await check('NodeScheduler(E1-b)：recordReport 把回报判定落进快照，invalid 会 warn', () => {
+  const clock = createClock()
+  const { scheduler, calls } = createNodeScheduler({ clock })
+  A.equal(scheduler.recordReport('nobody', { kind: NODE_REPORT_OK }), false, '未登记不新建 entry')
+
+  scheduler.register({ runId: 'r1', nodeId: 'n1', sessionId: 's1', attempt: 1 })
+  A.equal(scheduler.recordReport('s1', inspectNodeStatus('这轮没有结构化回报')), true)
+  let entry = scheduler.snapshot().entries[0]
+  A.equal(entry.lastReport.kind, NODE_REPORT_MISSING)
+  A.equal(typeof entry.lastReport.at, 'string')
+
+  A.equal(scheduler.recordReport('s1', inspectNodeStatus('{"a":1')), true)
+  entry = scheduler.snapshot().entries[0]
+  A.equal(entry.lastReport.kind, NODE_REPORT_INVALID)
+  A.ok(
+    calls.logs.some(item => item.level === 'warn' && /结构不合法/.test(item.message)),
+    '格式错要能被上报（warn）',
+  )
+
+  // status()/list() 的 9 字段契约不变，lastReport 只出现在 snapshot 里
+  A.equal(Object.keys(scheduler.status('s1')).length, 9)
+  A.equal(Object.keys(scheduler.list()[0]).length, 9)
+  A.equal(scheduler.status('s1').lastReport, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// 9.11 E1-a · snapshot 契约（只读、字段齐全、不改 status）
+// ---------------------------------------------------------------------------
+
+await check('Scheduler(E1-a)：snapshot 只读、字段齐全，status() 契约不变（5 字段）', async () => {
+  const clock = createClock()
+  const { scheduler } = createScheduler({
+    clock,
+    evaluate: async () => ({ verdict: 'healthy', run: { status: 'running', startedAt: clock.iso(-200) } }),
+  })
+
+  A.equal(typeof SUPERVISION_WAKE_TIMEOUT_MS, 'number')
+  A.equal(SUPERVISION_WAKE_TIMEOUT_MS, 60_000)
+  A.equal(SUPERVISION_MAX_CONCURRENCY, 4)
+
+  A.deepEqual(scheduler.snapshot(), {
+    kind: 'run',
+    ticking: false,
+    started: false,
+    intervalMs: 1000,
+    maxConcurrency: 4,
+    wakeTimeoutMs: 60_000,
+    concurrency: { limit: 4, active: 0 },
+    tick: {
+      count: 0,
+      skipped: 0,
+      lastStartedAt: null,
+      lastFinishedAt: null,
+      lastDurationMs: null,
+      lastStats: null,
+    },
+    entries: [],
+  })
+
+  scheduler.register(RUN_ID)
+  await scheduler.tick()
+  const snapshot = scheduler.snapshot()
+  A.equal(snapshot.entries.length, 1)
+  A.deepEqual(Object.keys(snapshot.entries[0]), [
+    'runId',
+    'enabled',
+    'nextDueAt',
+    'wakes',
+    'failures',
+    'lastReason',
+    'lastOutcome',
+    'lastDurationMs',
+    'lastFinishedAt',
+    'timeouts',
+    'lastError',
+  ])
+  A.deepEqual(
+    Object.keys(scheduler.status(RUN_ID)),
+    ['enabled', 'nextDueAt', 'wakes', 'failures', 'lastReason'],
+    'status() 仍然只有 5 个字段',
+  )
+
+  // 快照是每次现算的新对象：改它不影响内部状态
+  snapshot.entries[0].wakes = 99
+  snapshot.concurrency.active = 99
+  A.equal(scheduler.snapshot().entries[0].wakes, 1)
+  A.equal(scheduler.snapshot().concurrency.active, 0)
 })
 
 console.log(`\nsupervise 自检：${checks} 组通过（${assertionCount} 条断言）`)

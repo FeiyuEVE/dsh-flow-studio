@@ -22,10 +22,25 @@ const home = mkdtempSync(join(repoRoot, '.tmp', 'home-tools-'))
 process.env.DSH_HOME = home
 
 const { createFlowTools, DEFAULT_WATCH_SECONDS } = await import('../src/tools.js')
+// F1：白名单校验的唯一实现在 inbox.js（HTTP /inbox、/messages 与两个模型工具共用）。
+const {
+  REPLY_LOOPBACK_HOSTS, REPLY_TOKEN_ENV_PREFIX, maskSecret, redactSecrets,
+  validateInboundBody, validateReplyTarget, validateReplyTargetStrict, validateReplyTokenEnv,
+  validateReplyUrl,
+} = await import('../src/inbox.js')
+const { deliverInboundMessage } = await import('../src/inbox.js')
 const { createEngine } = await import('../src/engine.js')
 const { apply } = await import('../src/index.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
+// F2：前端的纯逻辑（工作区门禁 / 建 run 与 start 的请求体）在这里一起断言。
+const {
+  createRunBodyFor, isAbsoluteWorkspace, normalizeWorkspace, readStoredWorkspace,
+  runControlState, startFailurePlan, startRunBodyFor, startRunRequest, workspaceBlockReason,
+  writeStoredWorkspace,
+} = await import('../src/client/page.js')
+// F2：HTTP 载荷级断言走真实客户端 api（fetch spy），不是「有传参」这种弱断言。
+const { api: clientApi } = await import('../src/client/api.js')
 
 const flowsRoot = store.flowsDir(home)
 const runsRoot = runstore.runsDir(home)
@@ -124,6 +139,36 @@ function makeEngine({
 
 function makeTools({ engine = makeEngine(), auditWorkflow, watchSeconds, now } = {}) {
   return createFlowTools({ flowsRoot, runsRoot, engine, auditWorkflow, watchSeconds, now })
+}
+
+/**
+ * F1：注册收件箱两个工具需要 ctx 提供 agents 服务（只看形状，不做真投递）。
+ * 传进来的 agents 故意是最小形状：pending run 的投递路径根本不会用到它。
+ */
+function makeToolsWithInbox({ engine = makeEngine(), agents } = {}) {
+  const service = agents || {
+    get() { return undefined },
+    resume: async () => ({ agent: null }),
+    roots: () => [],
+  }
+  const ctx = {
+    get(name) {
+      return name === 'agents' ? service : undefined
+    },
+  }
+  return createFlowTools({ flowsRoot, runsRoot, engine, ctx })
+}
+
+/** 假 storage：与 localStorage 同形，够断言「记住工作区 / 清空即删除」。 */
+function fakeStorage(initial = {}) {
+  const data = new Map(Object.entries(initial))
+  return {
+    getItem: key => (data.has(key) ? data.get(key) : null),
+    setItem: (key, value) => { data.set(key, String(value)) },
+    removeItem: key => { data.delete(key) },
+    has: key => data.has(key),
+    raw: key => data.get(key),
+  }
 }
 
 function byName(tools, name) {
@@ -486,12 +531,33 @@ try {
     A.equal(result.workspace.worktree, 'auto')
     A.equal(result.workspace.worktreeEnabled, null)
 
-    // 取不到 cwd 就不传 workspace（交给 engine 回落），绝不瞎猜路径。
+    // F2：取不到 cwd 时**不再**把 workspace 交给 engine 回落（那会落到 process.cwd()），
+    // 必须在建 run / 调 engine.start 之前失败，并给可操作原因。
     const noCwdExec = { agent: { session: { id: 'session-no-cwd', header: {} } } }
     const noCwd = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, noCwdExec))
-    A.equal(noCwd.ok, true)
-    A.equal(Object.hasOwn(engine.calls.start[1].options, 'workspace'), false)
-    A.equal(noCwd.workspace.path, null)
+    A.equal(noCwd.ok, false, '拿不到 workspace 必须失败，不能悄悄落到进程 cwd')
+    A.match(noCwd.error, /workspace/)
+    A.match(noCwd.hint, /workspace/)
+    A.match(noCwd.hint, /绝对路径|cwd/)
+    A.equal(noCwd.retryable, false)
+    A.equal(engine.calls.start.length, 1, '缺 workspace 不能进 engine.start')
+  })
+
+  await check('F2：flow_start 显式 workspace 必须是绝对路径（相对路径在建 run 前失败）', async () => {
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    const result = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-main', workspace: 'relative/path' },
+      makeExec('session-rel'),
+    ))
+    A.equal(result.ok, false)
+    A.match(result.error, /绝对路径/)
+    A.ok(result.hint)
+    A.equal(result.retryable, false)
+    A.equal(engine.calls.start.length, 0, '非法 workspace 不能进 engine.start')
+    const after = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    A.equal(after, before, '非法 workspace 不建 run')
   })
 
   await check('flow_start 显式 workspace / worktree 原样透传；非法 worktree → 失败且不建 run', async () => {
@@ -878,6 +944,188 @@ try {
     }
   })
 
+  // ── 9.5 flow_watch：调度器实时快照（timeout / 停摆 / invalid 回报要可见） ──
+  function healthyAudit(extra = {}) {
+    return {
+      verdict: 'healthy',
+      status: 'running',
+      headline: '正在跑',
+      progress: { passed: 0, total: 1, ratio: 0 },
+      plan: [],
+      currentNode: null,
+      rejects: { total: 0 },
+      anomalies: [],
+      quality: {},
+      tokens: {},
+      idleMs: 10,
+      recommended: [],
+      nextCheckSeconds: 120,
+      ...extra,
+    }
+  }
+
+  await check('flow_watch：run 级 / 节点级调度器快照原样透传（status 字段保持不变）', async () => {
+    auditResult = healthyAudit()
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '调度器快照正常', nodeTotal: 1, engine: 'real',
+    })
+    const engine = makeEngine()
+    const statusCalls = []
+    engine.supervision = {
+      status(runId) {
+        statusCalls.push(runId)
+        return { enabled: true, wakes: 2, nextDueAt: null }
+      },
+      snapshot() {
+        return {
+          kind: 'run',
+          ticking: false,
+          started: true,
+          intervalMs: 15000,
+          wakeTimeoutMs: 20000,
+          concurrency: { limit: 4, active: 0 },
+          tick: { count: 3, skipped: 0, lastDurationMs: 42, lastStats: { runs: 1, woken: 0, failed: 0 } },
+          entries: [{
+            runId: run.id,
+            lastOutcome: 'healthy',
+            lastDurationMs: 55,
+            lastFinishedAt: '2026-11-06T00:00:05.000Z',
+            timeouts: 0,
+            lastError: null,
+          }],
+        }
+      },
+    }
+    engine.nodeSupervision = {
+      snapshot() {
+        return {
+          kind: 'node',
+          ticking: false,
+          started: true,
+          wakeTimeoutMs: 30000,
+          tick: { count: 2, skipped: 0, lastDurationMs: 7, lastStats: null },
+          entries: [{
+            sessionId: 'sess-1',
+            runId: run.id,
+            nodeId: 'n_a',
+            lastOutcome: 'reported',
+            lastDurationMs: 9,
+            timeouts: 0,
+            lastError: null,
+            lastReport: { kind: 'valid', reason: null, at: '2026-11-06T00:00:06.000Z' },
+          }],
+        }
+      },
+    }
+    const tools = makeTools({ engine, auditWorkflow: stubAudit })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+
+    A.equal(result.ok, true)
+    A.equal(result.supervision.schedulerSnapshot.available, true)
+    A.equal(result.supervision.schedulerSnapshot.snapshot.kind, 'run')
+    A.equal(result.supervision.schedulerSnapshot.snapshot.tick.lastDurationMs, 42)
+    A.equal(result.supervision.schedulerSnapshot.snapshot.entries[0].lastOutcome, 'healthy')
+    A.equal(result.supervision.nodeSchedulerSnapshot.available, true)
+    A.equal(result.supervision.nodeSchedulerSnapshot.snapshot.kind, 'node')
+    A.equal(result.supervision.nodeSchedulerSnapshot.snapshot.entries[0].lastReport.kind, 'valid')
+    // 旧字段：run.json.supervision 的只读快照（这里为 null）与 status 契约都不变。
+    A.ok(Object.hasOwn(result.supervision, 'scheduler'))
+    A.deepEqual(result.supervision.health, { timeouts: 0, invalidReports: 0, warnings: [] })
+    A.equal(statusCalls.length, 0, '快照读取不走 status()（status 契约保持不变）')
+  })
+
+  await check('flow_watch：调度器缺 snapshot() / 没有调度器时标注「不可用」且不抛错', async () => {
+    auditResult = healthyAudit({ verdict: 'healthy', headline: '老引擎' })
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '调度器快照缺失', nodeTotal: 1, engine: 'real',
+    })
+    const engine = makeEngine()
+    // 老版本只暴露 status()，没有 snapshot()；节点级调度器干脆不存在。
+    engine.supervision = { status: () => ({ enabled: true, wakes: 0 }) }
+    const tools = makeTools({ engine, auditWorkflow: stubAudit })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+
+    A.equal(result.ok, true, '缺 snapshot() 不能让 flow_watch 失败')
+    A.equal(result.supervision.schedulerSnapshot.available, false)
+    A.equal(typeof result.supervision.schedulerSnapshot.reason, 'string')
+    A.match(result.supervision.schedulerSnapshot.reason, /snapshot/)
+    A.equal(result.supervision.nodeSchedulerSnapshot.available, false)
+    A.match(result.supervision.nodeSchedulerSnapshot.reason, /节点级|没有暴露/)
+    A.deepEqual(result.supervision.health.warnings, [])
+    // 人类可读结论里也要明确写「不可用」，不能静默空对象。
+    const rendered = byName(tools, 'flow_watch').output.render({}, result)
+    A.match(rendered[0].text, /调度器快照：run 级不可用/)
+    A.match(rendered[0].text, /调度器快照：节点级不可用/)
+  })
+
+  await check('flow_watch：timeout / 整轮 tick 停摆 / invalid 回报 → 可读结论与 recommended 都能看出', async () => {
+    auditResult = healthyAudit({ verdict: 'stalled', headline: '疑似卡住' })
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '调度器超时', nodeTotal: 1, engine: 'real',
+    })
+    const engine = makeEngine()
+    engine.supervision = {
+      snapshot: () => ({
+        kind: 'run',
+        ticking: true,
+        started: true,
+        intervalMs: 15000,
+        wakeTimeoutMs: 1000,
+        concurrency: { limit: 4, active: 1 },
+        tick: { count: 9, skipped: 2, lastDurationMs: 5000, lastStats: { runs: 1, woken: 1, failed: 1 } },
+        entries: [{
+          runId: run.id,
+          lastOutcome: 'timeout',
+          lastDurationMs: 1000,
+          lastFinishedAt: '2026-11-06T00:00:09.000Z',
+          timeouts: 2,
+          lastError: '唤醒超时（1000ms）',
+        }],
+      }),
+    }
+    engine.nodeSupervision = {
+      snapshot: () => ({
+        kind: 'node',
+        ticking: true,
+        started: true,
+        wakeTimeoutMs: 30000,
+        tick: { count: 4, skipped: 0, lastDurationMs: 10, lastStats: null },
+        entries: [{
+          sessionId: 'sess-1',
+          runId: run.id,
+          nodeId: 'n_a',
+          lastOutcome: 'reported',
+          timeouts: 0,
+          lastError: null,
+          lastReport: { kind: 'invalid', reason: '结构化输出不是 JSON', at: '2026-11-06T00:00:08.000Z' },
+        }],
+      }),
+    }
+    const tools = makeTools({ engine, auditWorkflow: stubAudit })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+
+    A.equal(result.ok, true)
+    A.equal(result.supervision.health.timeouts, 2)
+    A.equal(result.supervision.health.invalidReports, 1)
+    A.ok(result.supervision.health.warnings.length >= 3, '超时 + tick 停摆 + invalid 都要有告警')
+    A.ok(result.supervision.health.warnings.some(text => /超时/.test(text)))
+    A.ok(result.supervision.health.warnings.some(text => /停摆/.test(text)))
+    A.ok(result.supervision.health.warnings.some(text => /不合规/.test(text)))
+
+    // 不只放在原始 JSON 深处：recommended 里要有同样两件事。
+    A.ok(Array.isArray(result.recommended), 'recommended 保持原类型（数组）')
+    A.ok(result.recommended.some(text => /调度器报告超时/.test(text)))
+    A.ok(result.recommended.some(text => /格式不合规/.test(text)))
+
+    // 人类可读结论（render）也要能读出来。
+    const rendered = byName(tools, 'flow_watch').output.render({}, result)
+    const text = rendered.map(item => item.text).join('\n')
+    A.match(text, /调度器健康/)
+    A.match(text, /超时/)
+    A.match(text, /格式不合规/)
+    A.match(text, /停摆/)
+  })
+
   await check('flow_watch runId 不存在 → {ok:false, hint}', async () => {
     const tools = makeTools({ auditWorkflow: stubAudit })
     const result = record(await byName(tools, 'flow_watch').execute({ runId: 'r-no-such-run' }, makeExec()))
@@ -916,6 +1164,661 @@ try {
     A.equal(result.ok, false)
     A.match(result.error, /runId/)
     A.equal(engine.calls.stop.length, 0)
+  })
+
+  // ── 9.5 F1：外部回复通道的安全边界（tokenEnv 白名单 / url 白名单 / 打码） ──
+  await check('F1：tokenEnv 只接受 FLOW_STUDIO_REPLY_TOKEN_* 专用前缀（大小写 / 下划线严格）', () => {
+    A.equal(REPLY_TOKEN_ENV_PREFIX, 'FLOW_STUDIO_REPLY_TOKEN_')
+    A.deepEqual(REPLY_LOOPBACK_HOSTS.slice().sort(), ['127.0.0.1', '::1', 'localhost'].sort())
+
+    const ok = validateReplyTokenEnv('FLOW_STUDIO_REPLY_TOKEN_OPS')
+    A.equal(ok.ok, true)
+    A.equal(ok.tokenEnv, 'FLOW_STUDIO_REPLY_TOKEN_OPS')
+    A.equal(validateReplyTokenEnv(undefined).ok, true, '省略 tokenEnv = 不带令牌，合法')
+    A.equal(validateReplyTokenEnv(null).ok, true)
+
+    const rejected = [
+      'DSH_HOME', 'FLOW_STUDIO_TOKEN', 'PATH', '',
+      'FLOW_STUDIO_REPLY_TOKEN_', 'FLOW_STUDIO_REPLY_TOKEN_A..B',
+      'FLOW_STUDIO_REPLY_TOKEN_A/B', 'FLOW_STUDIO_REPLY_TOKEN_A-B',
+      'FLOW_STUDIO_REPLY_TOKEN_A B', 'flow_studio_reply_token_x',
+      '../FLOW_STUDIO_REPLY_TOKEN_X', 'FLOW_STUDIO_REPLY_TOKEN_X\u0000',
+      'FLOW_STUDIO_REPLY_TOKEN_É', 'FLOW_STUDIO_REPLY_TOKEN_中文',
+    ]
+    for (const name of rejected) {
+      const out = validateReplyTokenEnv(name)
+      A.equal(out.ok, false, `必须拒绝 ${JSON.stringify(name)}`)
+      A.match(out.error, /FLOW_STUDIO_REPLY_TOKEN_/, `错误信息要写出允许的形式（${JSON.stringify(name)}）`)
+      A.equal(typeof out.error, 'string')
+    }
+    A.equal(validateReplyTokenEnv(42).ok, false, '非字符串一律拒绝')
+  })
+
+  await check('F1：http 回复地址只允许 https 或回环地址上的 http，且禁止 user:pass@', () => {
+    for (const good of [
+      'https://example.com/hook',
+      'http://127.0.0.1:38217/hook',
+      'http://localhost:3000/hook',
+      'http://[::1]:8080/hook',
+    ]) {
+      const out = validateReplyUrl(good)
+      A.equal(out.ok, true, good)
+      A.equal(typeof out.url, 'string')
+    }
+    const external = validateReplyUrl('http://example.com/hook')
+    A.equal(external.ok, false)
+    A.match(external.error, /回环|https/)
+
+    for (const bad of [
+      'http://192.168.1.10/hook',
+      'http://169.254.169.254/latest/meta-data',
+      'ftp://example.com/x',
+      'file:///etc/passwd',
+      '',
+    ]) {
+      A.equal(validateReplyUrl(bad).ok, false, bad)
+    }
+    // 凭据塞进 URL（user:pass@）：http / https 都拒绝，避免令牌/密码落进日志。
+    for (const userinfo of [
+      'http://user:pass@127.0.0.1:9/hook',
+      'https://user:pass@example.com/hook',
+      'https://user@example.com/hook',
+    ]) {
+      const out = validateReplyUrl(userinfo)
+      A.equal(out.ok, false, userinfo)
+      A.match(out.error, /用户名|密码|user:pass/)
+    }
+    A.equal(validateReplyUrl(42).ok, false)
+  })
+
+  await check('F1：reply 组合校验——合法组合通过，跨组合（外部 http + 任意变量名）被拒', () => {
+    const good = validateReplyTargetStrict({
+      kind: 'http',
+      url: 'http://127.0.0.1:4010/cb',
+      tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_CI',
+    })
+    A.equal(good.ok, true)
+    A.equal(good.reply.kind, 'http')
+    A.equal(good.reply.tokenEnv, 'FLOW_STUDIO_REPLY_TOKEN_CI')
+    A.equal(good.reply.url, 'http://127.0.0.1:4010/cb')
+
+    const badEnv = validateReplyTargetStrict({
+      kind: 'http', url: 'https://example.com/cb', tokenEnv: 'DSH_HOME',
+    })
+    A.equal(badEnv.ok, false)
+    A.match(badEnv.error, /FLOW_STUDIO_REPLY_TOKEN_/)
+
+    const badUrl = validateReplyTargetStrict({
+      kind: 'http', url: 'http://example.com/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_X',
+    })
+    A.equal(badUrl.ok, false)
+    A.match(badUrl.error, /回环|https/)
+
+    A.equal(validateReplyTargetStrict({ kind: 'none' }).ok, true)
+    A.equal(validateReplyTargetStrict({ kind: 'none' }).reply.kind, 'none')
+    A.equal(validateReplyTargetStrict({ kind: 'session', sessionId: 's-1' }).ok, true)
+    A.equal(validateReplyTargetStrict({ kind: 'session' }).ok, false)
+    A.equal(validateReplyTargetStrict({ kind: 'weird' }).ok, false)
+    A.equal(validateReplyTargetStrict(undefined).ok, true)
+  })
+
+  await check('F1：令牌值打码——maskSecret / redactSecrets 永不吐出完整令牌', () => {
+    const token = 'sk-live-super-secret-value-1234'
+    const masked = maskSecret(token)
+    A.equal(masked.includes(token), false)
+    A.ok(masked.startsWith('sk'))
+    A.ok(masked.includes('34'), '保留末 2 位')
+    A.ok(masked.includes('***'))
+    A.ok(masked.includes('长度'))
+    A.equal(maskSecret('short').includes('short'), false, '短令牌整段隐藏')
+    A.equal(maskSecret(''), '')
+    const redacted = redactSecrets(`connect failed for ${token}`, [token])
+    A.equal(redacted.includes(token), false)
+    A.ok(redacted.includes(maskSecret(token)))
+  })
+
+  await check('F1：flow_send_message 拒绝任意 tokenEnv / 外部 http，错误信息不含令牌值', async () => {
+    const secret = 'sk-do-not-leak-9876543210'
+    process.env.FLOW_STUDIO_TOKEN = secret
+    process.env.FLOW_STUDIO_REPLY_TOKEN_DEMO = secret
+    try {
+      const tools = makeToolsWithInbox()
+      const send = byName(tools, 'flow_send_message')
+      A.ok(send, '有 agents 服务时必须注册 flow_send_message')
+
+      const badEnv = record(await send.execute({
+        text: '注入',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_TOKEN' },
+      }, makeExec()))
+      A.equal(badEnv.ok, false)
+      A.match(badEnv.error, /FLOW_STUDIO_REPLY_TOKEN_/)
+      A.equal(badEnv.retryable, false)
+      A.equal(JSON.stringify(badEnv).includes(secret), false, '返回体里不能出现令牌值')
+
+      const badUrl = record(await send.execute({
+        text: '注入',
+        reply: { kind: 'http', url: 'http://example.com/cb' },
+      }, makeExec()))
+      A.equal(badUrl.ok, false)
+      A.match(badUrl.error, /回环|https/)
+      A.equal(JSON.stringify(badUrl).includes(secret), false)
+
+      // 合法组合要真的走得通：pending run 收下消息（started 输入）并原样保存 reply。
+      const run = await runstore.createRun(runsRoot, {
+        flowId: 'flow-main', flowName: '主流程', name: 'F1 合法通道', nodeTotal: 1, engine: 'real',
+      })
+      const good = record(await send.execute({
+        runId: run.id,
+        text: '走合规通道',
+        reply: { kind: 'http', url: 'http://127.0.0.1:9/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_DEMO' },
+      }, makeExec()))
+      A.equal(good.ok, true)
+      A.equal(good.runId, run.id)
+      A.equal(good.mode, 'started')
+      const listed = await runstore.readRunMessages(runsRoot, run.id, { limit: 10 })
+      const stored = listed.messages.find(item => item.id === good.messageId)
+      A.ok(stored, '消息要落进 messages.jsonl')
+      A.equal(stored.reply.tokenEnv, 'FLOW_STUDIO_REPLY_TOKEN_DEMO')
+      A.equal(stored.reply.url, 'http://127.0.0.1:9/cb')
+      const all = await runstore.readAllEvents(runsRoot, run.id)
+      A.equal(JSON.stringify(all.events).includes(secret), false, '事件里不能出现令牌值')
+    } finally {
+      delete process.env.FLOW_STUDIO_TOKEN
+      delete process.env.FLOW_STUDIO_REPLY_TOKEN_DEMO
+    }
+  })
+
+  await check('F1：flow_reply 拒绝已保存的不合规通道——不发请求、不读令牌、不泄漏', async () => {
+    const secret = 'sk-stored-secret-1122334455'
+    process.env.FLOW_STUDIO_TOKEN = secret
+    // 两个敌意组合都来自旧版本 / HTTP 入口能写进 run.json.inbox.reply 的形状：
+    //   ① 外部明文 http（SSRF 到云元数据地址）+ owner 级令牌变量；
+    //   ② 合法 https，但 tokenEnv 指向 owner 级令牌（凭据外泄面）。
+    const hostileUrlRun = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: 'F1 敌意 url', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunInbox(runsRoot, hostileUrlRun.id, {
+      kind: 'http', url: 'http://169.254.169.254/latest/meta-data', tokenEnv: 'FLOW_STUDIO_TOKEN',
+    })
+    const hostileEnvRun = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: 'F1 敌意 tokenEnv', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunInbox(runsRoot, hostileEnvRun.id, {
+      kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_TOKEN',
+    })
+    let owned = hostileUrlRun.id
+    const engine = makeEngine()
+    engine.resolveSessionOwner = async () => ({ runId: owned, nodeId: 'n_a' })
+    const tools = makeToolsWithInbox({ engine })
+    const reply = byName(tools, 'flow_reply')
+    A.ok(reply, '有 agents 服务时必须注册 flow_reply')
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (...args) => {
+      calls.push(args)
+      throw new Error('不合规通道不应该发起请求')
+    }
+    try {
+      // ① 外部明文 http：URL 白名单先拒。
+      const urlResult = record(await reply.execute({ text: '回复外部来源' }, makeExec('session-node')))
+      A.equal(urlResult.ok, false)
+      A.match(urlResult.error, /回复通道不合规/)
+      A.match(urlResult.error, /回环|https/)
+      A.match(urlResult.hint, /FLOW_STUDIO_REPLY_TOKEN_/)
+      A.equal(urlResult.delivery, 'blocked')
+      A.equal(JSON.stringify(urlResult).includes(secret), false, '返回体里不能出现令牌值')
+
+      // ② 合法 https + owner 级令牌变量：tokenEnv 白名单拒。
+      owned = hostileEnvRun.id
+      const envResult = record(await reply.execute({ text: '回复外部来源' }, makeExec('session-node')))
+      A.equal(envResult.ok, false)
+      A.match(envResult.error, /回复通道不合规/)
+      A.match(envResult.error, /FLOW_STUDIO_REPLY_TOKEN_/)
+      A.equal(envResult.delivery, 'blocked')
+      A.equal(JSON.stringify(envResult).includes(secret), false, '返回体里不能出现令牌值')
+
+      // ③ 消息级 reply（inReplyTo）同样拦截：不能只防 run.json.inbox.reply。
+      await runstore.appendRunMessages(runsRoot, hostileEnvRun.id, [{
+        v: 1,
+        id: 'm-hostile',
+        direction: 'in',
+        ts: new Date().toISOString(),
+        from: 'ext',
+        text: '带敌意 reply 的入站消息',
+        targetNodeId: 'n_a',
+        status: 'pending',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_TOKEN' },
+      }])
+      const messageResult = record(await reply.execute(
+        { text: '回复消息级来源', inReplyTo: 'm-hostile' },
+        makeExec('session-node'),
+      ))
+      A.equal(messageResult.ok, false)
+      A.match(messageResult.error, /回复通道不合规/)
+      A.match(messageResult.error, /FLOW_STUDIO_REPLY_TOKEN_/)
+      A.equal(messageResult.delivery, 'blocked')
+      A.equal(JSON.stringify(messageResult).includes(secret), false, '返回体里不能出现令牌值')
+
+      A.equal(calls.length, 0, '必须在读取令牌 / 发请求之前拦下')
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.FLOW_STUDIO_TOKEN
+    }
+  })
+
+  await check('F1：同一 payload 打四个入口——白名单口径一致，错误 / 事件不含令牌值', async () => {
+    const secret = 'sk-cross-entry-secret-abcdef'
+    process.env.FLOW_STUDIO_TOKEN = secret
+    process.env.FLOW_STUDIO_REPLY_TOKEN_OK = secret
+    const send = byName(makeToolsWithInbox(), 'flow_send_message')
+    const fetchCalls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      fetchCalls.push({ url: String(url), init })
+      return { ok: true, status: 200, text: async () => 'ok' }
+    }
+    try {
+      const payloads = [
+        {
+          name: '合法：https + 专用前缀',
+          reply: { kind: 'http', url: 'https://example.com/hook', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_OK' },
+          accepted: true,
+        },
+        {
+          name: '拒绝：tokenEnv=FLOW_STUDIO_TOKEN',
+          reply: { kind: 'http', url: 'https://example.com/hook', tokenEnv: 'FLOW_STUDIO_TOKEN' },
+          accepted: false,
+        },
+        {
+          name: '拒绝：tokenEnv=DSH_HOME',
+          reply: { kind: 'http', url: 'https://example.com/hook', tokenEnv: 'DSH_HOME' },
+          accepted: false,
+        },
+        {
+          name: '拒绝：tokenEnv 无专用前缀',
+          reply: { kind: 'http', url: 'https://example.com/hook', tokenEnv: 'REPLY_HOOK_TOKEN' },
+          accepted: false,
+        },
+        {
+          name: '拒绝：外部明文 http',
+          reply: { kind: 'http', url: 'http://example.com/hook', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_OK' },
+          accepted: false,
+        },
+        {
+          name: '拒绝：url 带 user:pass@',
+          reply: { kind: 'http', url: 'https://user:pass@example.com/hook', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_OK' },
+          accepted: false,
+        },
+      ]
+
+      for (const item of payloads) {
+        const label = item.name
+        // ① POST /runs/<id>/inbox（index.js 调的就是 inbox.validateReplyTarget）
+        const inbox = validateReplyTarget(item.reply)
+        A.equal(inbox.ok, item.accepted, `${label} · /inbox`)
+        if (!item.accepted) A.ok(inbox.error, `${label} · /inbox 要给出可读原因`)
+
+        // ② POST /runs/<id>/messages（deliverInboundMessage → validateInboundBody）
+        const direct = validateInboundBody({ from: 'ext', text: '同一载荷', reply: item.reply })
+        A.equal(direct.ok, item.accepted, `${label} · validateInboundBody`)
+        const run = await runstore.createRun(runsRoot, {
+          flowId: 'flow-main', flowName: '主流程', name: `F1 四入口 ${label}`, nodeTotal: 1, engine: 'real',
+        })
+        const routeEngine = makeEngine()
+        let messagesOk = false
+        let messagesError = ''
+        try {
+          await deliverInboundMessage(
+            { runsRoot, flowsRoot, engine: routeEngine, ctx: {}, log() {} },
+            run.id,
+            { from: 'ext', text: '同一载荷', reply: item.reply },
+          )
+          messagesOk = true
+        } catch (error) {
+          messagesError = error && error.message ? error.message : String(error)
+        }
+        A.equal(messagesOk, item.accepted, `${label} · /messages`)
+
+        // ③ flow_send_message（模型工具入口）
+        const sent = record(await send.execute({ runId: run.id, text: '同一载荷', reply: item.reply }, makeExec()))
+        A.equal(sent.ok, item.accepted, `${label} · flow_send_message`)
+
+        // ④ flow_reply（已保存的 run 级回复通道）
+        await runstore.writeRunInbox(runsRoot, run.id, item.reply)
+        const ownerEngine = makeEngine()
+        ownerEngine.resolveSessionOwner = async () => ({ runId: run.id, nodeId: 'n_a' })
+        const replyTool = byName(makeToolsWithInbox({ engine: ownerEngine }), 'flow_reply')
+        const replied = record(await replyTool.execute({ text: '同一载荷' }, makeExec('session-node')))
+        A.equal(replied.ok, item.accepted, `${label} · flow_reply`)
+
+        // 错误信息 / 返回体 / 事件里都不能出现令牌值（变量名可以出现）。
+        const visible = [
+          inbox.error || '',
+          direct.error || '',
+          messagesError,
+          sent.error || '',
+          replied.error || '',
+          JSON.stringify(sent),
+          JSON.stringify(replied),
+        ]
+        for (const text of visible) {
+          A.equal(text.includes(secret), false, `${label} · 令牌值不能出现在错误 / 返回体里`)
+        }
+        const events = await runstore.readAllEvents(runsRoot, run.id)
+        A.equal(JSON.stringify(events.events).includes(secret), false, `${label} · 事件里不能出现令牌值`)
+      }
+
+      // 只有「合法」那一条的 flow_reply 会真的发一次 HTTP；不合规的一律在发请求前拦下。
+      A.equal(fetchCalls.length, 1, '不合规的回复通道一个请求都不能发')
+      A.equal(fetchCalls[0].init.headers.authorization, `Bearer ${secret}`)
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.FLOW_STUDIO_TOKEN
+      delete process.env.FLOW_STUDIO_REPLY_TOKEN_OK
+    }
+  })
+
+  await check('F1：消息级 reply（inReplyTo）的 tokenEnv / url 矩阵与 run 级同口径', async () => {
+    const secret = 'sk-message-level-secret-xy'
+    process.env.FLOW_STUDIO_TOKEN = secret
+    process.env.FLOW_STUDIO_REPLY_TOKEN_MSG = secret
+    const payloads = [
+      {
+        name: '合法：https + 专用前缀',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_MSG' },
+        accepted: true,
+      },
+      {
+        name: '拒绝：tokenEnv=FLOW_STUDIO_TOKEN',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_TOKEN' },
+        accepted: false,
+      },
+      {
+        name: '拒绝：tokenEnv=DSH_HOME',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'DSH_HOME' },
+        accepted: false,
+      },
+      {
+        name: '拒绝：tokenEnv 无专用前缀',
+        reply: { kind: 'http', url: 'https://example.com/cb', tokenEnv: 'REPLY_MSG_TOKEN' },
+        accepted: false,
+      },
+      {
+        name: '拒绝：外部明文 http',
+        reply: { kind: 'http', url: 'http://example.com/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_MSG' },
+        accepted: false,
+      },
+      {
+        name: '拒绝：url 带 user:pass@',
+        reply: { kind: 'http', url: 'https://user:pass@example.com/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_MSG' },
+        accepted: false,
+      },
+    ]
+    const fetchCalls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      fetchCalls.push({ url: String(url), init })
+      return { ok: true, status: 200, text: async () => 'ok' }
+    }
+    try {
+      let index = 0
+      for (const item of payloads) {
+        index += 1
+        const run = await runstore.createRun(runsRoot, {
+          flowId: 'flow-main', flowName: '主流程', name: `F1 消息级 ${item.name}`, nodeTotal: 1, engine: 'real',
+        })
+        const messageId = `m-level-${index}`
+        await runstore.appendRunMessages(runsRoot, run.id, [{
+          v: 1,
+          id: messageId,
+          direction: 'in',
+          ts: new Date().toISOString(),
+          from: 'ext',
+          text: `带消息级 reply 的入站消息（${item.name}）`,
+          targetNodeId: 'n_a',
+          status: 'pending',
+          reply: item.reply,
+        }])
+        const engine = makeEngine()
+        engine.resolveSessionOwner = async () => ({ runId: run.id, nodeId: 'n_a' })
+        const replyTool = byName(makeToolsWithInbox({ engine }), 'flow_reply')
+        const result = record(await replyTool.execute(
+          { text: '回复消息级来源', inReplyTo: messageId },
+          makeExec('session-node'),
+        ))
+
+        A.equal(result.ok, item.accepted, `${item.name} · 消息级 flow_reply`)
+        if (!item.accepted) {
+          A.match(result.error, /回复通道不合规/, `${item.name} · 要给出可读原因`)
+          A.equal(result.delivery, 'blocked')
+          A.equal(result.retryable, false)
+        } else {
+          A.equal(result.delivery, 'http')
+          A.equal(result.httpStatus, 200)
+        }
+        A.equal(JSON.stringify(result).includes(secret), false, `${item.name} · 返回体不能出现令牌值`)
+        const events = await runstore.readAllEvents(runsRoot, run.id)
+        A.equal(JSON.stringify(events.events).includes(secret), false, `${item.name} · 事件不能出现令牌值`)
+      }
+      A.equal(fetchCalls.length, 1, '只有合法消息级 reply 会真的发一次请求')
+      A.equal(fetchCalls[0].init.headers.authorization, `Bearer ${secret}`)
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.FLOW_STUDIO_TOKEN
+      delete process.env.FLOW_STUDIO_REPLY_TOKEN_MSG
+    }
+  })
+
+  await check('F1：flow_reply 投递失败时令牌值打码（返回体 / 事件都不含完整令牌）', async () => {
+    const secret = 'sk-leak-check-abcdefghijkl'
+    process.env.FLOW_STUDIO_REPLY_TOKEN_LEAK = secret
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: 'F1 打码', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunInbox(runsRoot, run.id, {
+      kind: 'http', url: 'https://example.com/cb', tokenEnv: 'FLOW_STUDIO_REPLY_TOKEN_LEAK',
+    })
+    const engine = makeEngine()
+    engine.resolveSessionOwner = async () => ({ runId: run.id, nodeId: 'n_a' })
+    const tools = makeToolsWithInbox({ engine })
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    // 模拟「上游把 Authorization 抄进错误文本」的最坏情况。
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, authorization: init && init.headers ? init.headers.authorization : '' })
+      throw new Error(`连接失败：Authorization=${init && init.headers ? init.headers.authorization : ''}`)
+    }
+    try {
+      const result = record(await byName(tools, 'flow_reply').execute({ text: '回复' }, makeExec('session-node')))
+      A.equal(calls.length, 1, '合规通道必须真的发一次请求')
+      A.equal(calls[0].authorization, `Bearer ${secret}`, '令牌只作为 Authorization 头发送')
+      A.equal(result.ok, false)
+      A.equal(JSON.stringify(result).includes(secret), false, '错误信息 / 返回体里不能含令牌值')
+      A.ok(String(result.error).includes(maskSecret(secret)), '错误里的令牌应替换成打码形式')
+      const all = await runstore.readAllEvents(runsRoot, run.id)
+      A.equal(JSON.stringify(all.events).includes(secret), false, '事件里不能出现令牌值')
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.FLOW_STUDIO_REPLY_TOKEN_LEAK
+    }
+  })
+
+  // ── 9.6 F2：画布「开始运行」必须带 workspace ──────────────────────────
+  await check('F2 前端：建 run / start 的请求体都含 workspace；没有工作区返回 null', () => {
+    const flow = { id: 'flow-main', name: '主流程' }
+    A.deepEqual(createRunBodyFor(flow, '本次运行', '/repo/a'), {
+      flowId: 'flow-main', name: '本次运行', workspace: '/repo/a',
+    })
+    A.deepEqual(createRunBodyFor(flow, '', '/repo/a'), {
+      flowId: 'flow-main', name: '主流程', workspace: '/repo/a',
+    })
+    A.equal(createRunBodyFor(flow, '本次运行', ''), null, '没工作区不能构造建 run 请求')
+    A.equal(createRunBodyFor(flow, '本次运行', '   '), null)
+    A.equal(createRunBodyFor(null, '本次运行', '/repo/a'), null)
+
+    A.deepEqual(startRunBodyFor(' /repo/a '), { workspace: '/repo/a' })
+    A.equal(startRunBodyFor(''), null, '没工作区不能构造 start 请求')
+    A.equal(startRunBodyFor('  '), null)
+
+    A.equal(normalizeWorkspace('  /repo/a  '), '/repo/a')
+    A.equal(normalizeWorkspace(42), '')
+    A.equal(isAbsoluteWorkspace('/repo/a'), true)
+    A.equal(isAbsoluteWorkspace('C:\\repo'), true)
+    A.equal(isAbsoluteWorkspace('relative/path'), false)
+  })
+
+  await check('F2 前端：未选择工作区不允许启动（可读提示 + 按钮禁用 + 不退回默认目录）', () => {
+    const empty = workspaceBlockReason('')
+    A.match(empty, /未选择工作区/)
+    A.match(empty, /无法启动/)
+    A.match(empty, /默认目录/, '必须说明不会退回默认目录')
+    A.match(workspaceBlockReason('   '), /未选择工作区/)
+    A.match(workspaceBlockReason('relative/path'), /绝对路径/)
+    A.equal(workspaceBlockReason('/repo/a'), '')
+
+    const blocked = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: false })
+    A.equal(blocked.startDisabled, true, '没工作区时「运行」必须禁用')
+    A.match(blocked.startTitle, /未选择工作区/)
+    const ready = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: true })
+    A.equal(ready.startDisabled, false)
+    // 与 m7（运行列表未回）同时成立时，两条原因都要写出来，不能只报一条。
+    const both = runControlState(null, { hasFlow: true, hasWorkspace: false, listReady: false })
+    A.match(both.startTitle, /未选择工作区/)
+    A.match(both.startTitle, /正在读取运行记录/)
+  })
+
+  await check('F2 前端：工作区选择会记住；清空即删除（不会悄悄带出旧目录）', () => {
+    const storage = fakeStorage()
+    A.equal(readStoredWorkspace(storage), '')
+    A.equal(writeStoredWorkspace(storage, '  /repo/a  '), true)
+    A.equal(readStoredWorkspace(storage), '/repo/a')
+    A.equal(storage.raw('dsh-flow-studio.workspace'), '/repo/a')
+    A.equal(writeStoredWorkspace(storage, '   '), true)
+    A.equal(storage.has('dsh-flow-studio.workspace'), false)
+    A.equal(readStoredWorkspace(storage), '')
+    // localStorage 不存在的 SSR 环境：读回空串，不抛错。
+    A.equal(readStoredWorkspace(null), '')
+  })
+
+  await check('F2 前端：startRunRequest 未选工作区时 0 请求；选了就两次请求都带 workspace', async () => {
+    const flow = { id: 'flow-main', name: '主流程' }
+    const calls = { create: [], start: [], delete: [] }
+    const spyApi = {
+      async createRun(body) {
+        calls.create.push(body)
+        return { ok: true, run: { id: 'r-new', flowId: body.flowId, status: 'pending', workspacePath: body.workspace } }
+      },
+      async startRun(id, body) {
+        calls.start.push({ id, body })
+        return { ok: true, run: { id, status: 'running' } }
+      },
+      async deleteRun(id) {
+        calls.delete.push(id)
+        return { ok: true }
+      },
+    }
+
+    // ① 未选工作区：直接拦下，**一次请求都不能发**。
+    const blocked = await startRunRequest({ api: spyApi, flow, workspace: '' })
+    A.equal(blocked.ok, false)
+    A.match(blocked.error, /未选择工作区/)
+    A.equal(calls.create.length + calls.start.length, 0, '未选工作区不能发任何请求（不靠后端 400 兜底）')
+
+    // ② 选了工作区：建 run 与 start 的真实载荷都含 workspace 字段。
+    const ok = await startRunRequest({ api: spyApi, flow, workspace: ' /repo/a ', runName: '本次运行', runs: [] })
+    A.equal(ok.ok, true)
+    A.deepEqual(calls.create[0], { flowId: 'flow-main', name: '本次运行', workspace: '/repo/a' })
+    A.deepEqual(calls.start[0], { id: 'r-new', body: { workspace: '/repo/a' } })
+
+    // ③ 工作区不一致的 pending run 不复用（否则 start 会退回旧参数）。
+    calls.create.length = 0
+    calls.start.length = 0
+    const mismatch = await startRunRequest({
+      api: spyApi, flow, workspace: '/repo/a',
+      runs: [{ id: 'r-old', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/other' }],
+    })
+    A.equal(mismatch.ok, true)
+    A.equal(calls.create.length, 1, '工作区不一致的 pending run 必须新建')
+    A.equal(calls.start[0].id, 'r-new')
+
+    // ④ 工作区一致的 pending run 才复用（且 start 仍显式带 workspace）。
+    calls.create.length = 0
+    calls.start.length = 0
+    const reused = await startRunRequest({
+      api: spyApi, flow, workspace: '/repo/a',
+      runs: [{ id: 'r-match', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/a' }],
+    })
+    A.equal(reused.ok, true)
+    A.equal(calls.create.length, 0, '同工作区的 pending run 应复用')
+    A.deepEqual(calls.start[0], { id: 'r-match', body: { workspace: '/repo/a' } })
+
+    // ⑤ start 失败时把「本次新建的 run」带回去，供 beginRun 清理幽灵 run。
+    const failingApi = {
+      async createRun() { return { ok: true, run: { id: 'r-ghost', flowId: 'flow-main', status: 'pending' } } },
+      async startRun() {
+        const error = new Error('工作区不可用')
+        error.status = 400
+        throw error
+      },
+    }
+    const failed = await startRunRequest({ api: failingApi, flow, workspace: '/repo/a' })
+    A.equal(failed.ok, false)
+    A.equal(failed.run.id, 'r-ghost')
+    A.equal(failed.createdRun.id, 'r-ghost')
+    A.equal(startFailurePlan('start', failed.error, failed.run, Boolean(failed.createdRun)).deleteRunId, 'r-ghost')
+  })
+
+  await check('F2 前端：HTTP 层真实载荷（fetch spy）——POST /runs 与 /runs/<id>/start 的 body 都含 workspace', async () => {
+    const flow = { id: 'flow-main', name: '主流程' }
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), init })
+      const data = calls.length === 1
+        ? { ok: true, run: { id: 'r-http', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/a' } }
+        : { ok: true, run: { id: 'r-http', status: 'running' } }
+      return { ok: true, status: calls.length === 1 ? 201 : 202, json: async () => data }
+    }
+    try {
+      const outcome = await startRunRequest({ api: clientApi, flow, workspace: '/repo/a', runName: 'HTTP 载荷', runs: [] })
+      A.equal(outcome.ok, true)
+      A.equal(calls.length, 2)
+      A.ok(calls[0].url.endsWith('/runs'), calls[0].url)
+      A.equal(calls[0].init.method, 'POST')
+      A.deepEqual(JSON.parse(calls[0].init.body), {
+        flowId: 'flow-main', name: 'HTTP 载荷', workspace: '/repo/a',
+      }, 'POST /runs 的 body 必须真实包含 workspace')
+      A.ok(calls[1].url.endsWith('/runs/r-http/start'), calls[1].url)
+      A.equal(calls[1].init.method, 'POST')
+      A.deepEqual(JSON.parse(calls[1].init.body), { workspace: '/repo/a' },
+        'POST /runs/<id>/start 的 body 必须真实包含 workspace')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  await check('F2 前端：page.js 的两个发起运行调用点都带 workspace（源码级护栏）', () => {
+    const pageSource = readFileSync(join(repoRoot, 'src/client/page.js'), 'utf8')
+    // beginRun 走 startRunRequest（未选工作区的拦截 / 载荷构造都在它里面）。
+    A.match(pageSource, /const outcome = await startRunRequest\(/, 'beginRun 必须走 startRunRequest')
+    A.match(pageSource, /workspaceBlockReason\(workspaceRef\.current\)/, 'beginRun 必须先过工作区门禁')
+    // 建 run：请求体只能由 createRunBodyFor 构造（它保证 workspace 存在，否则返回 null）。
+    A.match(pageSource, /const body = createRunBodyFor\(flow, runName, path\)/, 'POST /runs 的请求体必须带 workspace')
+    A.match(pageSource, /api\.createRun\(body\)/)
+    A.match(pageSource, /if \(!body\) return \{ ok: false, error: workspaceBlockReason\(path\)/, '没有 workspace 不构造请求')
+    // start：同样显式带 workspace（复用的旧 pending run 不依赖建 run 时的参数）。
+    A.match(pageSource, /const startBody = startRunBodyFor\(path\)/, 'POST /runs/<id>/start 必须带 workspace')
+    A.match(pageSource, /api\.startRun\(run\.id, startBody\)/)
+    A.match(pageSource, /workspacePathOf\(item\) === path/, '只复用同工作区的 pending run')
+
+    // api.js 必须把 start 的 body 转发出去，否则页面传了也发不出去（F2 的 HTTP 面）。
+    const apiSource = readFileSync(join(repoRoot, 'src/client/api.js'), 'utf8')
+    A.match(apiSource, /startRun: \(id, body\) => request\('POST', `\/runs\/\$\{segment\(id\)\}\/start`, body\)/)
+
+    const canvasSource = readFileSync(join(repoRoot, 'src/client/canvas.js'), 'utf8')
+    A.equal(/api\.(createRun|startRun)\(/.test(canvasSource), false, 'canvas.js 不直接发起运行')
   })
 
   // ── 10. lossless JSON ──────────────────────────────────────────────────
@@ -1009,7 +1912,8 @@ try {
     const run1 = await runstore.createRun(runsRoot, {
       flowId: 'flow-main', flowName: '主流程', name: 'parent 覆盖', nodeTotal: 1, engine: 'real',
     })
-    await engine.start(run1.id, { parent: overrideParent })
+    // 引擎 C3 起 workspace 必填：显式给临时目录，worktree off 避免测试里建 worktree。
+    await engine.start(run1.id, { parent: overrideParent, workspace: home, worktree: 'off' })
     const final1 = await engine.wait(run1.id)
     A.equal(final1.status, 'done')
     A.equal(activations.length, 1)
@@ -1021,7 +1925,7 @@ try {
     const run2 = await runstore.createRun(runsRoot, {
       flowId: 'flow-main', flowName: '主流程', name: '回落父会话', nodeTotal: 1, engine: 'real',
     })
-    await engine.start(run2.id)
+    await engine.start(run2.id, { workspace: home, worktree: 'off' })
     const final2 = await engine.wait(run2.id)
     A.equal(final2.status, 'done')
     A.equal(activations.length, 2)
@@ -1036,7 +1940,7 @@ try {
     })
     let caught = null
     try {
-      await engine.start(run.id, { parent: 'not-an-agent' })
+      await engine.start(run.id, { parent: 'not-an-agent', workspace: home, worktree: 'off' })
     } catch (error) {
       caught = error
     }

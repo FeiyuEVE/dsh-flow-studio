@@ -269,6 +269,27 @@ check('主从节点没配子 agent 只给提醒不给错误', () => {
   assert.ok(report.warnings.some(item => item.message.includes('子 agent')), JSON.stringify(report.warnings))
 })
 
+check('executor 校验：默认 dsh / custom 缺命令 / 外部 executor 只允许 single', () => {
+  // 默认值是 dsh，且空命令模板会被归一化保留为空字符串。
+  const normalized = normalizeFlow(defaultFlow(), '兜底')
+  assert.ok(normalized.nodes.every(node => node.executor === 'dsh' && node.executorCommand === ''))
+
+  // custom 必须给 executorCommand。
+  const custom = defaultFlow()
+  const customNode = custom.nodes.find(node => node.id === 'n_dev')
+  customNode.mode = EXEC_MODE.SINGLE
+  customNode.executor = 'custom'
+  customNode.executorCommand = '   '
+  assert.ok(validateFlow(custom).errors.some(item => item.nodeId === 'n_dev' && item.message.includes('executorCommand')))
+
+  // 外部 executor 不允许 team 模式。
+  const externalTeam = defaultFlow()
+  const teamNode = externalTeam.nodes.find(node => node.id === 'n_dev')
+  teamNode.mode = EXEC_MODE.TEAM
+  teamNode.executor = 'codex'
+  assert.ok(validateFlow(externalTeam).errors.some(item => item.nodeId === 'n_dev' && item.message.includes('单个 agent')))
+})
+
 check('summarize 只吐摘要字段', () => {
   const summary = summarize({ ...defaultFlow(), id: 'flow-x' })
   assert.equal(summary.id, 'flow-x')

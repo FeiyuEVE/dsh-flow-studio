@@ -24,12 +24,13 @@
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
-import { createEngine } from './engine.js'
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
+import { normalizeExecutor } from './executor.js'
 import { NODE_KIND, validateFlow } from './model.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
+import { createRuntime, patchRunJson, readStartOptions, saveSupervision } from './runtime.js'
 import { createFlowTools } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
@@ -317,6 +318,135 @@ function parseKinds(url) {
   return kinds
 }
 
+/** 07 §4.1：worktree 策略全集（与 `worktree.js` 的 WORKTREE_POLICIES 同口径）。 */
+const WORKTREE_POLICIES = Object.freeze(['auto', 'on', 'off'])
+
+/**
+ * 建 run 时记下的发起参数，在**同进程内**从 `POST /runs` 传到 `POST /runs/<id>/start`。
+ *
+ * 为什么还要内存这一份：`run.json.startOptions` 在 runstore 白名单之外，创建之后只要
+ * 有人写 runstore（开 supervision、投消息、engine.start 的 startRun 迁移……）就会被
+ * normalizeMeta 顺手丢掉。RAW 落盘仍然写（满足「创建时保存发起参数」这条契约，也覆盖
+ * 「进程重启后还能读」的场景），但**同进程的主路径是这张表**，不受其它写入影响。
+ * 只在内存里留最近 MAX_PENDING_START_OPTIONS 条，读走即删，不无界增长。
+ */
+const MAX_PENDING_START_OPTIONS = 200
+
+/** 把发起参数记进内存表（超上限丢最旧的）。 */
+function rememberStartOptions(store, runId, options) {
+  if (!(store instanceof Map) || typeof runId !== 'string' || runId === '') return
+  if (Object.keys(options || {}).length === 0) return
+  while (store.size >= MAX_PENDING_START_OPTIONS) {
+    const oldest = store.keys().next().value
+    if (oldest === undefined) break
+    store.delete(oldest)
+  }
+  // 后写覆盖：同一次创建重复记录时以最后一次为准。
+  store.delete(runId)
+  store.set(runId, { ...options })
+}
+
+/**
+ * 07 §4.1：解析 start / 建 run 的 `{workspace, worktree}`。
+ * 省略 = 不带该键（worktree 由 engine 按默认 `auto` 裁决）；非法值一律 400。
+ * @returns {{ workspace?: string, worktree?: string }}
+ */
+function parseStartOptions(body) {
+  if (body === undefined || body === null) return {}
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    throw new RunError(400, 'body', '请求体必须是 JSON 对象')
+  }
+  const options = {}
+  if (body.workspace !== undefined && body.workspace !== null) {
+    if (typeof body.workspace !== 'string' || body.workspace.trim() === '') {
+      throw new RunError(400, 'workspace', 'workspace 必须是非空字符串（工作区路径）')
+    }
+    const workspace = body.workspace.trim()
+    if (!isAbsolute(workspace)) throw new RunError(400, 'workspace', 'workspace 必须是绝对路径')
+    options.workspace = workspace
+  }
+  if (body.worktree !== undefined && body.worktree !== null) {
+    const worktree = typeof body.worktree === 'string' ? body.worktree.trim() : ''
+    if (!WORKTREE_POLICIES.includes(worktree)) {
+      throw new RunError(400, 'worktree', 'worktree 只允许 auto / on / off')
+    }
+    options.worktree = worktree
+  }
+  return options
+}
+
+/** run 的终态：到了这里就不再有「定时唤醒」的意义（supervise.planWake 也直接停）。 */
+const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'aborted'])
+
+/**
+ * 07 §4.3：把 run 元数据的 workspace / worktree 收敛成列表行要的三个扁平字段
+ * （缺字段 = null / false）。来源是 `readRunMeta`——runstore 白名单已覆盖这四个键。
+ */
+function runWorkspaceFields(meta) {
+  const workspace = meta && meta.workspace && typeof meta.workspace === 'object' ? meta.workspace : null
+  const worktree = meta && meta.worktree && typeof meta.worktree === 'object' ? meta.worktree : null
+  return {
+    workspaceId: workspace && typeof workspace.id === 'string' && workspace.id !== '' ? workspace.id : null,
+    workspacePath: workspace && typeof workspace.path === 'string' && workspace.path !== '' ? workspace.path : null,
+    worktreeEnabled: Boolean(worktree && worktree.enabled === true),
+  }
+}
+
+/** 07 §4.3：列表行 / 详情 / summary 都要能读到 supervision（只读）。 */
+function runSupervisionOf(meta) {
+  return meta && meta.supervision && typeof meta.supervision === 'object' ? meta.supervision : null
+}
+
+/**
+ * 07 §6 的两条 executor 规则（custom 必须填 `executorCommand`；外部 executor 只能 single）
+ * 目前**不在** `engine.validateFlowForRun()` 里——那是独立的结构校验器，executor 只在
+ * 节点执行时由 `normalizeExecutor` 拦住（节点会失败）。为了「开跑前」就报 400，Host 侧的
+ * start 路径在这里按同一份规则预检一次（engine 执行时再拦属于双保险）。
+ *
+ * @returns {Array<{ nodeId: string, message: string }>}
+ */
+function executorBlockers(flow) {
+  const blockers = []
+  for (const node of (flow && flow.nodes) || []) {
+    if (!node || node.kind !== NODE_KIND.STAGE) continue
+    try {
+      normalizeExecutor(node)
+    } catch (error) {
+      blockers.push({ nodeId: node.id, message: error && error.message ? error.message : String(error) })
+    }
+  }
+  return blockers
+}
+
+/** 07 §4 / §7：一个 run 的四个绑定字段（列表行 / 详情 / summary 同一口径）。 */
+function runBindingFields(meta) {
+  return {
+    workspace: meta && meta.workspace ? meta.workspace : null,
+    worktree: meta && meta.worktree ? meta.worktree : null,
+    sessionMode: meta && typeof meta.sessionMode === 'string' ? meta.sessionMode : null,
+    supervision: runSupervisionOf(meta),
+  }
+}
+
+/**
+ * 流程保存的**形状门槛**：只有「请求体不是 JSON 对象」这种垃圾才 400。
+ *
+ * 保存**不因 `validation.errors` 拒绝**（0.7 产品拍板）：客户端画布是自动保存（600ms 防抖），
+ * 用户拖一个还没填任务内容的空节点、或新建空流程，`validateFlow` 都会报 error；把它当 400
+ * 会让每一次中间态都存不进去，直接毁掉编辑体验。真正该严的是**启动 run**——
+ * `engine.validateFlowForRun()` 才是严格口径（同样是 `validateFlow`，executor 的两条新规则
+ * 在那儿一样会拦住），所以非法流程可以存，但开不了跑。
+ *
+ * @param {unknown} body
+ * @returns {boolean} true 表示形状不合法（调用方回 400 后 return）
+ */
+function rejectMalformedFlowBody(res, body) {
+  if (body === undefined || body === null) return false
+  if (typeof body === 'object' && !Array.isArray(body)) return false
+  sendJson(res, 400, { ok: false, error: '流程内容必须是 JSON 对象' })
+  return true
+}
+
 /**
  * 原始 URL 的路径段防线。WHATWG URL 会把 `..` / `%2e%2e` 规范化掉，
  * 规范化之后再看就分不清「用户想穿越」还是「本来就没有这个接口」，
@@ -344,7 +474,7 @@ function assertSafeRawPath(req) {
  * 路由分发。所有错误都在这里收口，不让异常逃出请求处理器。
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
- * @param {{ dir: string, runsRoot: string, ctx: any }} env
+ * @param {{ dir: string, runsRoot: string, ctx: any, engine: any, startOptions?: Map }} env
  */
 async function handle(req, res, env) {
   // 06 §13.1：鉴权必须是 handler 的第一件事，不能只靠 Origin。
@@ -393,6 +523,34 @@ async function handle(req, res, env) {
       return
     }
     sendInternalError(res, env, error)
+  }
+}
+
+/**
+ * 把插件路由绑成一个 HTTP 处理器（`env` 里带 dir / runsRoot / ctx / engine / startOptions）。
+ *
+ * 单独导出是为了让测试能用**注入的假引擎**验证「参数有没有透传到 engine.start」——
+ * 真引擎要起 agents 才能跑，而透传这件事不该只能靠集成测试覆盖。
+ *
+ * @param {{ dir: string, runsRoot: string, ctx: any, engine: any, startOptions?: Map }} env
+ * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void}
+ */
+export function createHandler(env) {
+  return (req, res) => {
+    // prefix 路由会被 /api/flow-studio-x 这类同前缀路径命中，这里再挡一道。
+    const path = (req.url || '').split('?')[0]
+    if (path !== BASE && !path.startsWith(`${BASE}/`)) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('not found')
+      return
+    }
+    handle(req, res, env).catch(error => {
+      if (!res.headersSent) {
+        sendInternalError(res, env, error)
+        return
+      }
+      res.end()
+    })
   }
 }
 
@@ -452,10 +610,11 @@ async function route(req, res, env) {
       }
       if (req.method === 'POST') {
         const body = await readBody(req)
+        // 只有形状垃圾才 400；validation.errors 不拦保存（空流程/半成品都能存，见 rejectMalformedFlowBody）。
+        if (rejectMalformedFlowBody(res, body)) return
         const flowId = newFlowId()
         const saved = await saveFlow(env.dir, flowId, body, { name: '新流程' })
-        const report = validateFlow(saved)
-        sendJson(res, 200, { ok: true, flow: saved, validation: report })
+        sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
         return
       }
       sendJson(res, 405, { ok: false, error: '只支持 GET / POST' })
@@ -502,6 +661,8 @@ async function route(req, res, env) {
             payload = { ...body, version: ifMatch }
           }
         }
+        // 保存不因 validation.errors 拒绝（自动保存 + 中间态必然非法）；只有形状垃圾才是 400。
+        if (rejectMalformedFlowBody(res, payload)) return
         try {
           const saved = await saveFlow(env.dir, id, payload)
           sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
@@ -542,9 +703,24 @@ async function handleRuns(req, res, env, url, parts) {
   if (parts.length === 1) {
     if (req.method === 'GET') {
       const limit = parseLimit(url.searchParams.get('limit'), 20, 100)
+      const workspaceId = url.searchParams.get('workspaceId')
+      // 07 §4.3：`?workspaceId=` 是内存过滤——先取满上限（100）再按 workspace.id 过滤，
+      // 最后截到调用方要的条数，避免「前 20 条恰好都不属于该工作区」时返回空表。
+      const fetchLimit = typeof workspaceId === 'string' && workspaceId !== ''
+        ? Math.max(limit, 100)
+        : limit
       // §8.6：列表只读 run.json；坏 run 记进 skipped，不让整表 500。
-      const result = await listRuns(root, { limit })
-      sendJson(res, 200, { ok: true, runs: result.runs, skipped: result.skipped })
+      const result = await listRuns(root, { limit: fetchLimit })
+      const rows = []
+      for (const row of result.runs || []) {
+        // listRuns 的行是精简投影；四个绑定字段直接取 run.store 白名单里的元数据。
+        const meta = await readRunMeta(root, row.id).catch(() => null)
+        const fields = runWorkspaceFields(meta)
+        if (typeof workspaceId === 'string' && workspaceId !== '' && fields.workspaceId !== workspaceId) continue
+        rows.push({ ...row, ...fields, ...runBindingFields(meta) })
+        if (rows.length >= limit) break
+      }
+      sendJson(res, 200, { ok: true, runs: rows, skipped: result.skipped })
       return
     }
     if (req.method === 'POST') {
@@ -565,6 +741,9 @@ async function handleRuns(req, res, env, url, parts) {
       }
       const flow = await readFlow(env.dir, flowId)
       if (!flow) throw new RunError(404, 'flowId', '流程不存在')
+      // 07 §4.1：建 run 时记下发起参数（workspace / worktree），start 时由 engine 最终裁决
+      // 并写权威字段（run.json.workspace / run.json.worktree）。
+      const startOptions = parseStartOptions(body)
       const nodeTotal = flow.nodes.filter(node => node.kind === NODE_KIND.STAGE).length
       const run = await createRun(root, {
         flowId: flow.id,
@@ -574,7 +753,22 @@ async function handleRuns(req, res, env, url, parts) {
         // 06 §13.8：run.json.engine 从建 run 那一刻就带上，列表 / 聚合都读得到。
         engine: env.engine && env.engine.engineName === 'stub' ? 'stub' : 'real',
       })
-      sendJson(res, 200, { ok: true, run })
+      if (Object.keys(startOptions).length > 0) {
+        // 同进程主路径：内存表（不受后续 runstore 写入影响）。
+        rememberStartOptions(env.startOptions, run.id, startOptions)
+        // 持久化兜底：startOptions 不在 runstore 白名单里，只能 raw 合并（写失败不阻塞建 run）。
+        try {
+          await patchRunJson(root, run.id, { startOptions })
+        } catch (error) {
+          if (env.ctx && env.ctx.logger && typeof env.ctx.logger.warn === 'function') {
+            env.ctx.logger.warn(`flow-studio: 记录 run ${run.id} 的启动参数失败：${error.message}`)
+          }
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        run: Object.keys(startOptions).length > 0 ? { ...run, startOptions } : run,
+      })
       return
     }
     sendJson(res, 405, { ok: false, error: '只支持 GET / POST' })
@@ -590,7 +784,15 @@ async function handleRuns(req, res, env, url, parts) {
     if (req.method === 'GET') {
       const detail = await readRunDetail(root, runId)
       if (!detail) throw new RunError(404, 'runId', 'run 不存在')
-      sendJson(res, 200, { ok: true, run: detail.run, nodes: detail.nodes, eventCount: detail.eventCount })
+      // 07 §4 / §7：详情带完整 workspace / worktree / sessionMode / supervision
+      //（readRunDetail 的 run 已是完整元数据，runstore 白名单已覆盖这四个键）。
+      // startOptions 不在白名单里，只能读原文（仅用于展示发起参数）。
+      const run = {
+        ...detail.run,
+        ...runBindingFields(detail.run),
+        startOptions: await readStartOptions(root, runId),
+      }
+      sendJson(res, 200, { ok: true, run, nodes: detail.nodes, eventCount: detail.eventCount })
       return
     }
     if (req.method === 'DELETE') {
@@ -722,13 +924,126 @@ async function handleRuns(req, res, env, url, parts) {
       }
       if (!env.engine) throw new RunError(500, 'engine', '执行引擎未初始化')
       if (action === 'start') {
-        // 06 §10：返回 202；已有运行中 run / 已开始过 → 409（由引擎抛 EngineError）。
-        const run = await env.engine.start(runId)
+        // 07 §4.1：body 可带 {workspace, worktree}；没带就沿用建 run 时记下的发起参数
+        //（内存表优先——它不受创建之后任何一次 runstore 写入影响；raw 落盘只作重启兜底）。
+        const explicit = parseStartOptions(await readBody(req))
+        const memo = env.startOptions instanceof Map ? env.startOptions.get(runId) : undefined
+        if (env.startOptions instanceof Map) env.startOptions.delete(runId)
+        let stored = memo && typeof memo === 'object' ? memo : {}
+        if (Object.keys(stored).length === 0) {
+          try {
+            stored = (await readStartOptions(root, runId)) || {}
+          } catch {
+            stored = {}
+          }
+        }
+        const startOptions = {}
+        const workspace = explicit.workspace !== undefined ? explicit.workspace : stored.workspace
+        const worktree = explicit.worktree !== undefined ? explicit.worktree : stored.worktree
+        if (typeof workspace === 'string' && workspace !== '') startOptions.workspace = workspace
+        if (typeof worktree === 'string' && WORKTREE_POLICIES.includes(worktree)) startOptions.worktree = worktree
+        // 07 §6：executor 的两条规则要在**开跑前**拦住（引擎执行时还会再拦一次）。
+        // 存储侧允许保存非法流程（自动保存要能存中间态），但这样的流程不该跑起来。
+        const meta = await readRunMeta(root, runId)
+        if (meta) {
+          const flow = await readFlow(env.dir, meta.flowId)
+          const blockers = executorBlockers(flow)
+          if (blockers.length > 0) {
+            throw new RunError(400, 'executor', `流程里有非法的 executor 配置：${blockers[0].message}`)
+          }
+        }
+        // 06 §10：返回 202；同一 runId 已在跑 → 409（由 runtime 抛 EngineError）。
+        const run = await env.engine.start(runId, startOptions)
         sendJson(res, 202, { ok: true, run })
         return
       }
       const run = await env.engine.stop(runId)
       sendJson(res, 200, { ok: true, run })
+      return
+    }
+
+    if (action === 'supervision') {
+      // 07 §7：入口之一是 HTTP（另一个是 flow_supervise 模型工具）；客户端只读展示。
+      if (req.method === 'GET') {
+        const meta = await readRunMeta(root, runId)
+        if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+        const scheduler = env.engine && env.engine.supervision
+        sendJson(res, 200, {
+          ok: true,
+          runId,
+          supervision: runSupervisionOf(meta),
+          scheduler: scheduler && typeof scheduler.status === 'function' ? scheduler.status(runId) : null,
+        })
+        return
+      }
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 GET / POST' })
+        return
+      }
+      const body = await readBody(req)
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new RunError(400, 'body', '请求体必须是 JSON 对象')
+      }
+      if (typeof body.enabled !== 'boolean') {
+        throw new RunError(400, 'enabled', 'enabled 必须是布尔值')
+      }
+      let wakerSessionId
+      if (body.wakerSessionId !== undefined && body.wakerSessionId !== null) {
+        if (typeof body.wakerSessionId !== 'string' || body.wakerSessionId.trim() === '') {
+          throw new RunError(400, 'wakerSessionId', 'wakerSessionId 必须是非空字符串（会话 id）')
+        }
+        wakerSessionId = body.wakerSessionId.trim()
+      }
+      const meta = await readRunMeta(root, runId)
+      if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+      const scheduler = env.engine && env.engine.supervision
+      if (!scheduler || typeof scheduler.register !== 'function') {
+        throw new RunError(500, 'supervision', '内建 supervision 调度未初始化')
+      }
+      if (body.enabled && TERMINAL_RUN_STATUSES.has(meta.status)) {
+        // 已收尾的 run 登记进去也永远不会被唤醒（planWake 的 terminal 分支），直接拒绝。
+        throw new RunError(
+          400,
+          'enabled',
+          `run 已结束（${meta.status}），不能开启 supervision；要定时自审请对运行中的 run 开启`,
+        )
+      }
+      // 与 flow_start / flow_supervise 共用同一条实现（runtime.enableSupervision）：
+      // 登记 + 落盘只有一份逻辑，避免两边漂移。注入的假引擎没有它时退回本地实现（测试用）。
+      let result
+      if (typeof env.engine.enableSupervision === 'function') {
+        result = await env.engine.enableSupervision(runId, {
+          enabled: body.enabled,
+          ...(wakerSessionId === undefined ? {} : { wakerSessionId }),
+        })
+      } else {
+        let saved
+        if (body.enabled) {
+          scheduler.register(runId, wakerSessionId === undefined ? {} : { wakerSessionId })
+          saved = await saveSupervision(root, runId, {
+            enabled: true,
+            ...(wakerSessionId === undefined ? {} : { wakerSessionId }),
+            reason: null,
+            failures: 0,
+          })
+        } else {
+          scheduler.unregister(runId)
+          saved = await saveSupervision(root, runId, { enabled: false, reason: 'disabled-by-caller' })
+        }
+        result = {
+          runId,
+          enabled: body.enabled,
+          supervision: saved,
+          scheduler: typeof scheduler.status === 'function' ? scheduler.status(runId) : null,
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        runId,
+        enabled: body.enabled,
+        supervision: result.supervision,
+        scheduler: result.scheduler,
+      })
       return
     }
 
@@ -739,6 +1054,8 @@ async function handleRuns(req, res, env, url, parts) {
       }
       const meta = await readRunMeta(root, runId)
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+      // 07 §4 / §7：summary 也要能读到 workspace / worktree / supervision（与列表 / 详情同口径）。
+      const extrasPayload = { ...runWorkspaceFields(meta), ...runBindingFields(meta) }
       // 06 §13.7 增量缓存：lastSeq / eventCount / engine 都没变就复用上一次聚合结果。
       const cached = summaryCache.get(runId)
       if (cached && cached.lastSeq === meta.lastSeq
@@ -747,6 +1064,7 @@ async function handleRuns(req, res, env, url, parts) {
           ok: true,
           cached: true,
           summary: { ...cached.summary, computedAt: new Date().toISOString() },
+          ...extrasPayload,
         })
         return
       }
@@ -763,7 +1081,7 @@ async function handleRuns(req, res, env, url, parts) {
         engine: meta.engine,
         summary,
       })
-      sendJson(res, 200, { ok: true, cached: false, summary })
+      sendJson(res, 200, { ok: true, cached: false, summary, ...extrasPayload })
       return
     }
 
@@ -851,7 +1169,11 @@ export function apply(ctx) {
     log('warn', 'flow-studio: 检测到 FLOW_STUDIO_STUB_ENGINE=1，但未设置 FLOW_STUDIO_TESTBED=1；已忽略桩引擎，按 real 运行')
   }
 
-  const engine = createEngine({
+  // 07 §5：进程级运行时 = 一 run 一 Engine 实例（并发不设上限，同 runId 才 409）+ §7 内建
+  // supervision 调度（`engine.supervision`，唯一一个 setInterval，已 .unref()）。
+  // index/tools 仍把它当「单引擎」用：`engineName` / `resolveSessionOwner` / `runForSession` /
+  // `sweepStaleRuns` 由 runtime 门面提供，`active` 已不再需要。
+  const engine = createRuntime({
     ctx,
     runsRoot,
     flowsRoot: dir,
@@ -859,6 +1181,16 @@ export function apply(ctx) {
     stub: stubInfo.stub,
     log,
   })
+  // 07 §4.1：建 run → start 之间的发起参数交接（见 rememberStartOptions 的说明）。
+  const startOptions = new Map()
+  // 插件卸载 / 测试收尾：停调度定时器、释放所有实例（不删 run.json / 会话）。
+  ctx.effect(() => () => {
+    try {
+      engine.dispose()
+    } catch {
+      // 释放失败不该影响卸载。
+    }
+  }, 'flow-studio: 运行时与 supervision 调度')
   // 06 §9 / §13.3 / §13.4：启动时先修 run.json 与 run.jsonl 的终态不一致，
   // 再清理崩溃残留的 running run（含过期租约），不自动续跑。
   repairRunStates(runsRoot)
@@ -880,22 +1212,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: BASE,
-    handler: (req, res) => {
-      // prefix 路由会被 /api/flow-studio-x 这类同前缀路径命中，这里再挡一道。
-      const path = (req.url || '').split('?')[0]
-      if (path !== BASE && !path.startsWith(`${BASE}/`)) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
-        res.end('not found')
-        return
-      }
-      handle(req, res, { dir, runsRoot, ctx, engine }).catch(error => {
-        if (!res.headersSent) {
-          sendInternalError(res, { ctx }, error)
-          return
-        }
-        res.end()
-      })
-    },
+    handler: createHandler({ dir, runsRoot, ctx, engine, startOptions }),
   }), 'flow-studio: /api/flow-studio')
 
   // 06 §15：模型工具（会话内启停 + 定时自审）。

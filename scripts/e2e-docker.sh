@@ -57,6 +57,21 @@ say "0. 前置检查"
 docker inspect "$CONTAINER" >/dev/null 2>&1 || die "容器 $CONTAINER 不存在（先 scripts/testbed up）"
 curl -s -m 5 -o /dev/null "http://127.0.0.1:$PORT/" || true
 ok "容器 $CONTAINER 存在，宿主端口 $PORT"
+# 宿主隔离回归的基线：只读 systemctl 状态与启动时间，绝不对宿主 dsh-web 做任何动作。
+HOST_DSH_ACTIVE_BEFORE="$(systemctl is-active dsh-web 2>/dev/null || true)"
+HOST_DSH_START_BEFORE="$(systemctl show -p ActiveEnterTimestamp --value dsh-web 2>/dev/null || true)"
+
+# v0.7 T4 要求真 git：worktree 的创建/分支/目录都是 git 行为，没有 git 就验不了。
+# 只在容器里装（宿主不动）；已有就跳过。
+say "0b. 容器内 git（worktree 验收依赖）"
+if ! dex sh -c 'command -v git >/dev/null 2>&1'; then
+  say "容器内没有 git，安装到容器（仅容器）"
+  dex sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/testbed/logs/apt-git.log 2>&1 && apt-get install -y --no-install-recommends git >>/testbed/logs/apt-git.log 2>&1' \
+    || { dex sh -c 'tail -20 /testbed/logs/apt-git.log' || true; die "容器内安装 git 失败"; }
+fi
+GIT_VERSION="$(dex sh -c 'git --version' | tr -d '\r')"
+case "$GIT_VERSION" in git\ version*) ;; *) die "容器内 git 不可用：$GIT_VERSION" ;; esac
+ok "$GIT_VERSION"
 
 say "1. 构建 + 打包 $VERSION"
 (cd "$REPO" && npm run build >/dev/null && npm pack --pack-destination .tmp/ >/dev/null)
@@ -209,6 +224,317 @@ console.log('  ✓ quality=' + s.quality.state + ' · ' + (s.quality.label || ''
 console.log('  ✓ progress=' + s.progress.passed + '/' + s.progress.denominator + ' · skill 覆盖 ' + s.skillUsage.coverage)
 NODE
 
+say "6b. v0.7 断言"
+# ── 6b.1 版本 ────────────────────────────────────────────────────────────────
+HEALTH_V="$(req "$BASE/health" | jqr 'j.version')"
+[ "$VERSION" = "0.7.0" ] || die "package.json 版本是 $VERSION（期望 0.7.0）"
+[ "$HEALTH_V" = "0.7.0" ] || die "health.version=$HEALTH_V（期望 0.7.0）"
+ok "health.version = 0.7.0"
+
+# ── 6b.2 并发不设上限 ────────────────────────────────────────────────────────
+# 桩节点是毫秒级的；用一条 55 阶段的长链把 run 拉长，让「两个 run 同时 running」
+# 在轮询窗口里真的能被观察到（短流程会在两次 start 之间就跑完，断言会假绿）。
+LONG_FLOW_BODY="$(node - <<'NODE'
+const count = 55
+const nodes = [{ id: 'n_start', title: '任务输入', kind: 'start', x: 80, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 }]
+for (let i = 0; i < count; i += 1) {
+  nodes.push({ id: `s${i}`, title: `阶段${i + 1}`, kind: 'stage', x: 300 + i * 12, y: 220, mode: 'single', role: `阶段${i + 1}角色`, task: `阶段${i + 1}任务`, skills: [], outputs: `阶段${i + 1}产物`, maxRounds: 2 })
+}
+nodes.push({ id: 'n_end', title: '完成', kind: 'end', x: 300 + count * 12, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 })
+const edges = [{ id: 'e_start', from: 'n_start', to: 's0', kind: 'next' }]
+for (let i = 1; i < count; i += 1) edges.push({ id: `e${i}`, from: `s${i - 1}`, to: `s${i}`, kind: 'next' })
+edges.push({ id: 'e_end', from: `s${count - 1}`, to: 'n_end', kind: 'next' })
+process.stdout.write(JSON.stringify({ name: 'docker e2e long flow', nodes, edges }))
+NODE
+)"
+LONG_FLOW_JSON="$(req -X POST "$BASE/flows" -H 'content-type: application/json' -d "$LONG_FLOW_BODY")"
+LONG_FLOW_ID="$(printf '%s' "$LONG_FLOW_JSON" | jqr 'j.flow.id')"
+[ -n "$LONG_FLOW_ID" ] || die "建长流程失败：$LONG_FLOW_JSON"
+ok "并发用长流程 $LONG_FLOW_ID（55 阶段）"
+
+CONC_A_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' -d "{\"flowId\":\"$LONG_FLOW_ID\",\"name\":\"concurrent A\"}")"
+CONC_A_ID="$(printf '%s' "$CONC_A_JSON" | jqr 'j.run.id')"
+CONC_B_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' -d "{\"flowId\":\"$LONG_FLOW_ID\",\"name\":\"concurrent B\"}")"
+CONC_B_ID="$(printf '%s' "$CONC_B_JSON" | jqr 'j.run.id')"
+[ -n "$CONC_A_ID" ] && [ -n "$CONC_B_ID" ] || die "建并发 run 失败：$CONC_A_JSON / $CONC_B_JSON"
+# 先起轮询（含 node 启动开销），再并行发两个 start —— 保证并发窗口不被脚本自身吃掉。
+cat >"$REPO/.tmp/e2e-concurrency.mjs" <<'NODE'
+import { readFileSync } from 'node:fs'
+
+const [base, token, jar, aId, bId] = process.argv.slice(2)
+function cookieHeader(path) {
+  const lines = readFileSync(path, 'utf8').split(/\r?\n/)
+  const parts = []
+  for (const line of lines) {
+    if (!line || line.startsWith('# ') || line.startsWith('#\t')) continue
+    const body = line.startsWith('#HttpOnly_') ? line.slice('#HttpOnly_'.length) : line
+    if (body.startsWith('#')) continue
+    const f = body.split('\t')
+    if (f.length >= 7) parts.push(`${f[5]}=${f[6]}`)
+  }
+  return parts.join('; ')
+}
+const headers = { authorization: `Bearer ${token}`, cookie: cookieHeader(jar) }
+const terminal = s => s === 'done' || s === 'failed' || s === 'aborted'
+async function status(id) {
+  const res = await fetch(`${base}/runs/${id}`, { headers, signal: AbortSignal.timeout(5000) })
+  if (!res.ok) throw new Error(`GET /runs/${id} → HTTP ${res.status}`)
+  const body = await res.json()
+  return body.run && body.run.status
+}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+const deadline = Date.now() + 60000
+let a = 'pending'
+let b = 'pending'
+const trace = []
+let bothRunning = false
+while (Date.now() < deadline) {
+  try {
+    ;[a, b] = await Promise.all([status(aId), status(bId)])
+  } catch (error) {
+    // 容器内 dsh 刚好在做快照落盘 / 短连接抖动：不当作断言失败，继续轮询。
+    await sleep(20)
+    continue
+  }
+  const snap = `${a}/${b}`
+  if (trace[trace.length - 1] !== snap) trace.push(snap)
+  if (a === 'running' && b === 'running') { bothRunning = true; break }
+  if (terminal(a) && terminal(b)) break
+  await sleep(5)
+}
+if (!bothRunning) {
+  console.error('没抓到「两个 run 同时 running」；状态轨迹：' + trace.join(' → '))
+  process.exit(1)
+}
+console.log('✓ 抓到两个 run 同时 running（轨迹 ' + trace.join(' → ') + '）')
+console.log(`  同时 running 快照 @${new Date().toISOString()}：${aId}=${a} · ${bId}=${b}`)
+let finalA = a
+let finalB = b
+while (Date.now() < deadline) {
+  ;[finalA, finalB] = await Promise.all([status(aId), status(bId)])
+  if (terminal(finalA) && terminal(finalB)) break
+  await sleep(100)
+}
+if (finalA !== 'done' || finalB !== 'done') {
+  console.error(`并发 run 收尾状态 A=${finalA} B=${finalB}（期望都 done）`)
+  process.exit(1)
+}
+console.log(`  收尾快照 @${new Date().toISOString()}：${aId}=${finalA} · ${bId}=${finalB}`)
+console.log(`✓ 两个并发 run 都收口：A=${finalA} B=${finalB}`)
+NODE
+node "$REPO/.tmp/e2e-concurrency.mjs" "$BASE" "$TOKEN" "$JAR" "$CONC_A_ID" "$CONC_B_ID" >"$REPO/.tmp/e2e-concurrency.log" 2>&1 &
+CONC_POLL_PID=$!
+(req -o "$REPO/.tmp/e2e-conc-a-start.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$CONC_A_ID/start" -H 'content-type: application/json' -d '{}' \
+  >"$REPO/.tmp/e2e-conc-a-code.txt" 2>/dev/null) &
+CONC_PID_A=$!
+(req -o "$REPO/.tmp/e2e-conc-b-start.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$CONC_B_ID/start" -H 'content-type: application/json' -d '{}' \
+  >"$REPO/.tmp/e2e-conc-b-code.txt" 2>/dev/null) &
+CONC_PID_B=$!
+wait "$CONC_PID_A" "$CONC_PID_B"
+CONC_A_CODE="$(cat "$REPO/.tmp/e2e-conc-a-code.txt")"
+CONC_B_CODE="$(cat "$REPO/.tmp/e2e-conc-b-code.txt")"
+case "$CONC_A_CODE" in 200|202) ;; *) die "并发 run A start 返回 $CONC_A_CODE（期望 200/202）：$(cat "$REPO/.tmp/e2e-conc-a-start.json")" ;; esac
+case "$CONC_B_CODE" in 200|202) ;; *) die "并发 run B start 返回 $CONC_B_CODE（期望 200/202）：$(cat "$REPO/.tmp/e2e-conc-b-start.json")" ;; esac
+ok "同一流程的两个 run 都启动成功（A=$CONC_A_CODE B=$CONC_B_CODE，无 409）"
+if ! wait "$CONC_POLL_PID"; then
+  cat "$REPO/.tmp/e2e-concurrency.log"
+  die "并发断言失败（详见上方轮询日志）"
+fi
+sed 's/^/  /' "$REPO/.tmp/e2e-concurrency.log"
+
+# ── 6b.3 supervision（放在 pending run 上做，避免和毫秒级 run 抢窗口）──────────
+SUP_RUN_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' -d "{\"flowId\":\"$FLOW_ID\",\"name\":\"supervision probe\"}")"
+SUP_RUN_ID="$(printf '%s' "$SUP_RUN_JSON" | jqr 'j.run.id')"
+[ -n "$SUP_RUN_ID" ] || die "建 supervision 探针 run 失败：$SUP_RUN_JSON"
+SUP_ON_CODE="$(req -o "$REPO/.tmp/e2e-sup-on.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$SUP_RUN_ID/supervision" -H 'content-type: application/json' -d '{"enabled":true}')"
+[ "$SUP_ON_CODE" = "200" ] || die "supervision enable 返回 $SUP_ON_CODE（期望 200）：$(cat "$REPO/.tmp/e2e-sup-on.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(!(j.supervision&&j.supervision.enabled===true)){console.error("enable 响应没带 enabled=true："+JSON.stringify(j));process.exit(1)}' "$REPO/.tmp/e2e-sup-on.json"
+SUP_META_ON="$(dex sh -c "cat $GUEST_HOME/flow-studio/runs/$SUP_RUN_ID/run.json" | tr -d '\r')"
+node -e 'const m=JSON.parse(process.argv[1]);if(!(m.supervision&&m.supervision.enabled===true)){console.error("run.json 没写 supervision.enabled=true："+JSON.stringify(m.supervision));process.exit(1)}' "$SUP_META_ON"
+ok "supervision enable → 200，run.json.supervision.enabled=true"
+SUP_OFF_CODE="$(req -o "$REPO/.tmp/e2e-sup-off.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$SUP_RUN_ID/supervision" -H 'content-type: application/json' -d '{"enabled":false}')"
+[ "$SUP_OFF_CODE" = "200" ] || die "supervision disable 返回 $SUP_OFF_CODE（期望 200）：$(cat "$REPO/.tmp/e2e-sup-off.json")"
+SUP_META_OFF="$(dex sh -c "cat $GUEST_HOME/flow-studio/runs/$SUP_RUN_ID/run.json" | tr -d '\r')"
+node -e 'const m=JSON.parse(process.argv[1]);if(!(m.supervision&&m.supervision.enabled===false&&typeof m.supervision.reason==="string"&&m.supervision.reason!=="")){console.error("run.json disable 结果不对："+JSON.stringify(m.supervision));process.exit(1)}' "$SUP_META_OFF"
+ok "supervision disable → 200，enabled=false，reason=$(printf '%s' "$SUP_META_OFF" | jqr 'j.supervision.reason')"
+SUP_404_CODE="$(req -o "$REPO/.tmp/e2e-sup-404.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/definitely-not-a-run/supervision" -H 'content-type: application/json' -d '{"enabled":true}')"
+[ "$SUP_404_CODE" = "404" ] || die "不存在的 run 开 supervision 返回 $SUP_404_CODE（期望 404）"
+ok "不存在的 run → 404"
+SUP_DONE_CODE="$(req -o "$REPO/.tmp/e2e-sup-done.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$RUN_ID/supervision" -H 'content-type: application/json' -d '{"enabled":true}')"
+[ "$SUP_DONE_CODE" = "400" ] || die "已收尾 run 开 supervision 返回 $SUP_DONE_CODE（期望 400）：$(cat "$REPO/.tmp/e2e-sup-done.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const t=String(j.error||"");if(!/已结束|supervision/.test(t)){console.error("400 文案不可读："+t);process.exit(1)}' "$REPO/.tmp/e2e-sup-done.json"
+ok "已收尾 run → 400（$(printf '%s' "$(cat "$REPO/.tmp/e2e-sup-done.json")" | jqr 'j.error')）"
+
+# ── 6b.4 工作区 + 真 git worktree + sessionMode ───────────────────────────────
+dex_sh "rm -rf /testbed/e2e-repo && mkdir -p /testbed/e2e-repo && git -C /testbed/e2e-repo init -q && printf 'hello e2e\n' > /testbed/e2e-repo/README.md && git -C /testbed/e2e-repo add README.md && git -C /testbed/e2e-repo -c user.name=e2e -c user.email=e2e@example.com commit -q -m init" \
+  || die "容器内造 git 仓库 /testbed/e2e-repo 失败"
+WT_RUN_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' \
+  -d "{\"flowId\":\"$FLOW_ID\",\"name\":\"worktree auto\",\"workspace\":\"/testbed/e2e-repo\",\"worktree\":\"auto\"}")"
+WT_ID="$(printf '%s' "$WT_RUN_JSON" | jqr 'j.run.id')"
+[ -n "$WT_ID" ] || die "建 worktree run 失败：$WT_RUN_JSON"
+WT_START_CODE="$(req -o "$REPO/.tmp/e2e-wt-start.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$WT_ID/start" -H 'content-type: application/json' -d '{}')"
+case "$WT_START_CODE" in 200|202) ;; *) die "worktree run start 返回 $WT_START_CODE：$(cat "$REPO/.tmp/e2e-wt-start.json")" ;; esac
+WT_STATUS=""
+for _ in $(seq 1 100); do
+  WT_STATUS="$(req "$BASE/runs/$WT_ID" | jqr 'j.run.status')"
+  case "$WT_STATUS" in done|failed|aborted) break ;; esac
+  sleep 0.2
+done
+[ "$WT_STATUS" = "done" ] || die "worktree run 最终状态是 $WT_STATUS（期望 done）"
+WT_DETAIL="$(req "$BASE/runs/$WT_ID")"
+WT_META="$(dex sh -c "cat $GUEST_HOME/flow-studio/runs/$WT_ID/run.json" | tr -d '\r')"
+WS_ID="$(printf '%s' "$WT_DETAIL" | jqr 'j.run.workspace.id')"
+WT_PATH="$(printf '%s' "$WT_META" | jqr 'j.worktree.path')"
+WT_BRANCH="$(printf '%s' "$WT_META" | jqr 'j.worktree.branch')"
+[ -n "$WS_ID" ] || die "详情里 workspace.id 为空：$WT_DETAIL"
+[ -n "$WT_PATH" ] || die "run.json 里 worktree.path 为空：$WT_META"
+node - "$WT_DETAIL" "$WT_META" "$WT_ID" <<'NODE'
+const [detailRaw, metaRaw, runId] = process.argv.slice(2)
+const detail = JSON.parse(detailRaw).run || {}
+const meta = JSON.parse(metaRaw)
+const fail = m => { console.error('断言失败: ' + m); process.exit(1) }
+if (!detail.workspace || !/^[0-9a-f]{12}$/.test(String(detail.workspace.id || ''))) fail('workspace.id 不是 12 位 hex：' + JSON.stringify(detail.workspace))
+if (detail.workspace.path !== '/testbed/e2e-repo') fail('workspace.path=' + detail.workspace.path)
+if (detail.workspace.isGit !== true) fail('workspace.isGit 应为 true')
+if (!meta.worktree || meta.worktree.enabled !== true) fail('run.json worktree 未启用：' + JSON.stringify(meta.worktree))
+if (meta.worktree.reason !== 'git-workspace') fail('worktree.reason=' + meta.worktree.reason)
+if (meta.worktree.branch !== 'flow/' + runId) fail('branch=' + meta.worktree.branch + '（期望 flow/' + runId + '）')
+const expected = `/testbed/home/flow-studio/worktrees/${detail.workspace.id}/${runId}`
+if (meta.worktree.path !== expected) fail('worktree.path=' + meta.worktree.path + '（期望 ' + expected + '）')
+if (meta.sessionMode !== 'stub') fail('run.json.sessionMode=' + meta.sessionMode + '（桩引擎下期望 stub）')
+if (detail.sessionMode !== 'stub') fail('详情 sessionMode=' + detail.sessionMode + '（期望 stub）')
+console.log('  ✓ workspace.id=' + detail.workspace.id + ' · path=' + detail.workspace.path)
+console.log('  ✓ worktree.enabled=true · branch=' + meta.worktree.branch)
+console.log('  ✓ worktree.path=' + meta.worktree.path)
+console.log('  ✓ sessionMode=stub（run.json 与详情一致）')
+NODE
+[ "$WT_BRANCH" = "flow/$WT_ID" ] || die "worktree.branch=$WT_BRANCH（期望 flow/$WT_ID）"
+WT_EXISTS="$(dex sh -c "test -d '$WT_PATH' && echo yes || echo no" | tr -d '\r')"
+[ "$WT_EXISTS" = "yes" ] || die "worktree 目录不存在：$WT_PATH"
+WT_HEAD="$(dex_sh "git -C '$WT_PATH' rev-parse --abbrev-ref HEAD" | tr -d '\r')"
+[ "$WT_HEAD" = "flow/$WT_ID" ] || die "worktree HEAD 分支是 $WT_HEAD（期望 flow/$WT_ID）"
+WT_TOP="$(dex_sh "git -C '$WT_PATH' rev-parse --show-toplevel" | tr -d '\r')"
+[ "$WT_TOP" = "$WT_PATH" ] || die "worktree 的 git 根是 $WT_TOP（期望 $WT_PATH）"
+[ "$(dex sh -c "test -f '$WT_PATH/README.md' && echo yes || echo no" | tr -d '\r')" = "yes" ] || die "worktree 里没有仓库内容 README.md"
+ok "worktree 目录真实存在且是仓库内容（HEAD=$WT_HEAD）"
+
+# on + 非 git 根 → 400，且文案可读
+BAD_WT_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' \
+  -d "{\"flowId\":\"$FLOW_ID\",\"name\":\"worktree on non-git\",\"workspace\":\"/testbed\",\"worktree\":\"on\"}")"
+BAD_WT_ID="$(printf '%s' "$BAD_WT_JSON" | jqr 'j.run.id')"
+[ -n "$BAD_WT_ID" ] || die "建 on/非 git 探针 run 失败：$BAD_WT_JSON"
+BAD_WT_CODE="$(req -o "$REPO/.tmp/e2e-wt-bad.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$BAD_WT_ID/start" -H 'content-type: application/json' -d '{}')"
+[ "$BAD_WT_CODE" = "400" ] || die "worktree=on + /testbed 返回 $BAD_WT_CODE（期望 400）：$(cat "$REPO/.tmp/e2e-wt-bad.json")"
+BAD_WT_ERROR="$(cat "$REPO/.tmp/e2e-wt-bad.json" | jqr 'j.error')"
+case "$BAD_WT_ERROR" in *仓库根*|*git*|*worktree*) ;; *) die "400 文案不可读：$BAD_WT_ERROR" ;; esac
+ok "worktree=on + 非 git 根 → 400（$BAD_WT_ERROR）"
+
+# ?workspaceId= 只返回该工作区
+FILTER_JSON="$(req "$BASE/runs?workspaceId=$WS_ID&limit=100")"
+node - "$FILTER_JSON" "$WS_ID" "$WT_ID" <<'NODE'
+const [raw, wsId, runId] = process.argv.slice(2)
+const rows = JSON.parse(raw).runs || []
+const fail = m => { console.error('断言失败: ' + m); process.exit(1) }
+if (rows.length < 1) fail('?workspaceId= 返回空表')
+const foreign = rows.filter(row => row.workspaceId !== wsId)
+if (foreign.length > 0) fail('混进了别的 workspace：' + foreign.map(row => row.id + ':' + row.workspaceId).join(', '))
+if (!rows.some(row => row.id === runId)) fail('过滤结果里没有刚建的 worktree run')
+console.log('  ✓ ?workspaceId=' + wsId + ' 命中 ' + rows.length + ' 条，全部属于该工作区')
+NODE
+EMPTY_WS_JSON="$(req "$BASE/runs?workspaceId=000000000000&limit=100")"
+[ "$(printf '%s' "$EMPTY_WS_JSON" | jqr '(j.runs||[]).length')" = "0" ] || die "未知 workspaceId 竟然返回了 run：$EMPTY_WS_JSON"
+ok "未知 workspaceId → 空表"
+
+# ── 6b.5 保存门禁（0.7 口径：保存 200 + validation.errors；启动 400）────────────
+INVALID_FLOW_BODY="$(node - <<'NODE'
+const nodes = [
+  { id: 'n_start', title: '任务输入', kind: 'start', x: 80, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 },
+  { id: 'n_bad', title: '自定义节点', kind: 'stage', x: 388, y: 220, mode: 'single', role: '开发角色', task: '调用外部命令', skills: [], outputs: '产物', maxRounds: 2, executor: 'custom', executorCommand: '' },
+  { id: 'n_end', title: '完成', kind: 'end', x: 696, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 },
+]
+process.stdout.write(JSON.stringify({ name: 'docker e2e invalid executor', nodes, edges: [{ id: 'e1', from: 'n_start', to: 'n_bad', kind: 'next' }, { id: 'e2', from: 'n_bad', to: 'n_end', kind: 'next' }] }))
+NODE
+)"
+INVALID_SAVE_CODE="$(req -o "$REPO/.tmp/e2e-invalid-flow.json" -w '%{http_code}' \
+  -X POST "$BASE/flows" -H 'content-type: application/json' -d "$INVALID_FLOW_BODY")"
+[ "$INVALID_SAVE_CODE" = "200" ] || die "保存 custom/缺 executorCommand 的流程返回 $INVALID_SAVE_CODE（0.7 口径应为 200）"
+INVALID_FLOW_ID="$(cat "$REPO/.tmp/e2e-invalid-flow.json" | jqr 'j.flow.id')"
+[ -n "$INVALID_FLOW_ID" ] || die "非法流程没返回 flow.id：$(cat "$REPO/.tmp/e2e-invalid-flow.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const e=(j.validation&&j.validation.errors)||[];if(!e.some(x=>/executorCommand/.test(String(x.message||"")))){console.error("validation.errors 里没有 executorCommand："+JSON.stringify(e));process.exit(1)}' "$REPO/.tmp/e2e-invalid-flow.json"
+ok "保存 custom/缺 executorCommand → 200，validation.errors 命中 executorCommand"
+
+CODEX_TEAM_BODY="$(node - <<'NODE'
+const nodes = [
+  { id: 'n_start', title: '任务输入', kind: 'start', x: 80, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 },
+  { id: 'n_bad', title: '外部团队节点', kind: 'stage', x: 388, y: 220, mode: 'team', role: '主管角色', task: '外部执行', skills: [], outputs: '产物', maxRounds: 2, executor: 'codex', team: [{ name: '子 agent', role: '子角色', task: '子任务' }] },
+  { id: 'n_end', title: '完成', kind: 'end', x: 696, y: 220, mode: 'single', role: '', task: '', skills: [], outputs: '', maxRounds: 2 },
+]
+process.stdout.write(JSON.stringify({ name: 'docker e2e codex team', nodes, edges: [{ id: 'e1', from: 'n_start', to: 'n_bad', kind: 'next' }, { id: 'e2', from: 'n_bad', to: 'n_end', kind: 'next' }] }))
+NODE
+)"
+CODEX_SAVE_CODE="$(req -o "$REPO/.tmp/e2e-codex-team.json" -w '%{http_code}' \
+  -X POST "$BASE/flows" -H 'content-type: application/json' -d "$CODEX_TEAM_BODY")"
+[ "$CODEX_SAVE_CODE" = "200" ] || die "保存 codex+team 返回 $CODEX_SAVE_CODE（0.7 口径应为 200）"
+CODEX_FLOW_ID="$(cat "$REPO/.tmp/e2e-codex-team.json" | jqr 'j.flow.id')"
+[ -n "$CODEX_FLOW_ID" ] || die "codex+team 流程没返回 flow.id：$(cat "$REPO/.tmp/e2e-codex-team.json")"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const e=(j.validation&&j.validation.errors)||[];if(e.length===0){console.error("codex+team 的 validation.errors 为空");process.exit(1)}if(!e.some(x=>/外部 executor|team/.test(String(x.message||"")))){console.error("没有 executor/team 规则错误："+JSON.stringify(e));process.exit(1)}' "$REPO/.tmp/e2e-codex-team.json"
+ok "保存 codex+team → 200，validation.errors 非空（外部 executor/team 规则）"
+
+INV_RUN_JSON="$(req -X POST "$BASE/runs" -H 'content-type: application/json' -d "{\"flowId\":\"$INVALID_FLOW_ID\",\"name\":\"invalid flow run\"}")"
+INV_RUN_ID="$(printf '%s' "$INV_RUN_JSON" | jqr 'j.run.id')"
+[ -n "$INV_RUN_ID" ] || die "建非法流程 run 失败：$INV_RUN_JSON"
+INV_START_CODE="$(req -o "$REPO/.tmp/e2e-invalid-start.json" -w '%{http_code}' \
+  -X POST "$BASE/runs/$INV_RUN_ID/start" -H 'content-type: application/json' -d '{}')"
+[ "$INV_START_CODE" = "400" ] || die "用非法流程起 run 返回 $INV_START_CODE（期望 400）：$(cat "$REPO/.tmp/e2e-invalid-start.json")"
+# 文案口径：必须点名 executorCommand 且是可读中文（不要求出现「不能开跑」——启动路径
+# 现在由 `_executorSpecOf` 的严格检查先给更具体的「非法的 executor 配置」）。
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const t=String(j.error||"");if(!/executorCommand/.test(t)||!/[\u4e00-\u9fa5]/.test(t)||t.length<10){console.error("启动 400 文案不可读："+t);process.exit(1)}' "$REPO/.tmp/e2e-invalid-start.json"
+ok "非法流程起 run → 400（$(cat "$REPO/.tmp/e2e-invalid-start.json" | jqr 'j.error')）"
+
+# ── 6b 证据留档（容器内原文；下面会删现场，所以先落到仓库 .tmp/）────────────────
+EVIDENCE_DIR="$REPO/.tmp/e2e-v07-evidence"
+rm -rf "$EVIDENCE_DIR" && mkdir -p "$EVIDENCE_DIR"
+printf '%s\n' "$WT_DETAIL" > "$EVIDENCE_DIR/worktree-detail.json"
+printf '%s\n' "$WT_META" > "$EVIDENCE_DIR/worktree-run.json"
+printf '%s\n' "$SUP_META_ON" > "$EVIDENCE_DIR/supervision-on-run.json"
+printf '%s\n' "$SUP_META_OFF" > "$EVIDENCE_DIR/supervision-off-run.json"
+printf '%s\n' "$FILTER_JSON" > "$EVIDENCE_DIR/workspace-filter.json"
+{
+  echo "# git -C $WT_PATH rev-parse --abbrev-ref HEAD"
+  dex_sh "git -C '$WT_PATH' rev-parse --abbrev-ref HEAD"
+  echo "# git -C $WT_PATH rev-parse --show-toplevel"
+  dex_sh "git -C '$WT_PATH' rev-parse --show-toplevel"
+  echo "# cat $WT_PATH/README.md"
+  dex sh -c "cat '$WT_PATH/README.md'"
+} > "$EVIDENCE_DIR/worktree-git.txt" 2>&1
+cp "$REPO/.tmp/e2e-concurrency.log" "$EVIDENCE_DIR/concurrency.log"
+ok "证据留档到 .tmp/e2e-v07-evidence/（worktree run.json / git HEAD / 并发快照 / supervision）"
+
+# ── 6b 清理：本段造的 run / 流程 / worktree / 临时仓库 ─────────────────────────
+for id in "$CONC_A_ID" "$CONC_B_ID" "$WT_ID" "$SUP_RUN_ID" "$BAD_WT_ID" "$INV_RUN_ID"; do
+  req -X DELETE "$BASE/runs/$id" >/dev/null || true
+done
+req -X DELETE "$BASE/flows/$LONG_FLOW_ID" >/dev/null || true
+req -X DELETE "$BASE/flows/$INVALID_FLOW_ID" >/dev/null || true
+req -X DELETE "$BASE/flows/$CODEX_FLOW_ID" >/dev/null || true
+dex sh -c "git -C /testbed/e2e-repo worktree remove --force '$WT_PATH' >/dev/null 2>&1 || true; rm -rf /testbed/e2e-repo '$WT_PATH'" || true
+CLEANUP_REPORT="$(dex sh -c "
+for id in $CONC_A_ID $CONC_B_ID $WT_ID $SUP_RUN_ID $BAD_WT_ID $INV_RUN_ID; do test -e $GUEST_HOME/flow-studio/runs/\$id && echo \"\$id run PRESENT\" || echo \"\$id run deleted\"; done
+for id in $LONG_FLOW_ID $INVALID_FLOW_ID $CODEX_FLOW_ID; do test -e $GUEST_HOME/flow-studio/flows/\$id.json && echo \"\$id flow PRESENT\" || echo \"\$id flow deleted\"; done
+test -e /testbed/e2e-repo && echo 'e2e-repo PRESENT' || echo 'e2e-repo deleted'
+test -e '$WT_PATH' && echo 'worktree PRESENT' || echo 'worktree deleted'
+")"
+printf '%s\n' "$CLEANUP_REPORT" | tee "$EVIDENCE_DIR/cleanup.txt" | sed 's/^/  /'
+ok "6b 现场已清理（6 个 run、3 个流程、worktree、/testbed/e2e-repo）"
+
 say "7. 导出与落盘检查"
 req "$BASE/runs/$RUN_ID/export" | head -3
 dex sh -c "stat -c '%a %n' $GUEST_HOME/flow-studio/runs $GUEST_HOME/flow-studio/runs/$RUN_ID" || die "run 目录不存在"
@@ -218,5 +544,18 @@ say "8. 清理 run 与流程"
 req -X DELETE "$BASE/runs/$RUN_ID" >/dev/null || true
 req -X DELETE "$BASE/flows/$FLOW_ID" >/dev/null || true
 ok "已删除 run $RUN_ID 与流程 $FLOW_ID"
+
+say "9. 宿主隔离回归（只读 systemctl，证明 dsh-web 没被重启）"
+HOST_DSH_ACTIVE_AFTER="$(systemctl is-active dsh-web 2>/dev/null || true)"
+HOST_DSH_START_AFTER="$(systemctl show -p ActiveEnterTimestamp --value dsh-web 2>/dev/null || true)"
+{
+  printf 'systemctl is-active dsh-web = %s\n' "$HOST_DSH_ACTIVE_AFTER"
+  printf 'ActiveEnterTimestamp (跑之前) = %s\n' "$HOST_DSH_START_BEFORE"
+  printf 'ActiveEnterTimestamp (跑之后) = %s\n' "$HOST_DSH_START_AFTER"
+  printf '容器 = %s · 宿主端口 = %s\n' "$CONTAINER" "$PORT"
+} | tee "$EVIDENCE_DIR/host-isolation.txt" | sed 's/^/  /'
+[ "$HOST_DSH_ACTIVE_AFTER" = "active" ] || die "宿主 dsh-web 不是 active（$HOST_DSH_ACTIVE_AFTER）"
+[ "$HOST_DSH_START_AFTER" = "$HOST_DSH_START_BEFORE" ] || die "宿主 dsh-web 启动时间变了：$HOST_DSH_START_BEFORE → $HOST_DSH_START_AFTER（可能被重启）"
+ok "宿主 dsh-web 未被重启（启动时间保持 $HOST_DSH_START_AFTER）"
 echo
 ok "Docker e2e 全部通过（版本 $VERSION，容器 $CONTAINER）"

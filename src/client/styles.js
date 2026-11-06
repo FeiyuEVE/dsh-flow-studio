@@ -128,6 +128,51 @@ export const CSS = `
 .fs-flow-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fs-flow-actions{display:flex;gap:2px;margin-top:4px}
 
+/* v0.7 §4.3：运行记录按工作区分组（左栏分组头是 02 §3.5 允许 caption 的唯一处）。
+   缺 workspacePath 的旧数据整列落进「未标注工作区」，不改变布局结构。 */
+.fs-rail-runs{
+  flex:none;display:flex;flex-direction:column;min-height:0;max-height:52%;overflow:hidden;
+  border-top:1px solid var(--dsw-alias-border-l1);
+}
+.fs-rail.collapsed .fs-rail-runs{display:none}
+.fs-rail-subhead{padding:8px 12px 4px;justify-content:space-between}
+.fs-rail-runs-list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 8px 8px;display:flex;flex-direction:column;gap:2px}
+.fs-run-detail{display:flex;flex-direction:column;gap:1px;padding:6px 4px 8px;margin-bottom:4px;
+  border-bottom:1px solid var(--dsw-alias-border-l1)}
+.fs-run-detail-name{font-size:12px;line-height:16px;font-weight:500;color:var(--dsw-alias-label-primary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-run-detail-line{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-run-sup{display:flex;flex-direction:column;gap:1px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.fs-run-sup.on{color:var(--dsw-alias-label-secondary)}
+.fs-run-sup-label{color:var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary));margin-right:4px}
+.fs-run-sup-reason{color:var(--fs-r2-warn);word-break:break-word}
+.fs-rail-group{display:flex;flex-direction:column;gap:1px}
+.fs-rail-group-head{
+  display:flex;align-items:center;gap:4px;width:100%;padding:4px;border:1px solid transparent;
+  border-radius:var(--dsw-radius-xs);background:transparent;color:var(--dsw-alias-label-tertiary);
+  font-family:inherit;font-size:12px;line-height:16px;cursor:pointer;text-align:left;
+}
+.fs-rail-group-head:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
+.fs-rail-group-head:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.fs-rail-caret{flex:none;width:10px;font-size:10px;line-height:16px;text-align:center}
+.fs-rail-group-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-rail-count{flex:none;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary))}
+.fs-run-list{display:flex;flex-direction:column;gap:1px;padding-left:6px}
+.fs-run{
+  display:flex;flex-direction:column;gap:1px;padding:5px 8px;min-width:0;
+  border:1px solid transparent;border-left:2px solid transparent;border-radius:var(--dsw-radius-sm);
+  background:transparent;font-family:inherit;text-align:left;cursor:pointer;
+}
+.fs-run:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.fs-run.on{background:var(--dsw-alias-interactive-bg-hover);border-left-color:var(--dsw-alias-state-business-primary)}
+.fs-run:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.fs-run-name{font-size:12px;line-height:16px;color:var(--dsw-alias-label-primary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-run-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-run-wt{color:var(--fs-r2-warn)}
+
 /* 画布 */
 .fs-canvas{
   position:relative;flex:1;min-width:0;min-height:0;overflow:hidden;cursor:grab;touch-action:none;
@@ -488,6 +533,31 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   color:var(--fs-r2-warn);padding:0 8px;border-radius:var(--dsw-radius-xs);
   background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);
 }
+/* v0.7 §6：外部执行器要在面板头部与表单顶部都能一眼看到（不是高级设置）。 */
+.fs-panel-head-main{display:flex;align-items:center;gap:6px;min-width:0}
+.fs-panel-exec-badge{
+  flex:none;font-size:12px;line-height:16px;font-weight:400;padding:0 8px;
+  border-radius:var(--dsw-radius-xs);color:var(--dsw-alias-state-business-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
+}
+.fs-exec-banner{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 10px;
+  border-radius:var(--dsw-radius-sm);
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary) 32%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-1));
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+}
+.fs-exec-badge{
+  flex:none;padding:0 6px;border-radius:var(--dsw-radius-xs);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 16%, transparent);
+  color:var(--dsw-alias-state-business-primary);font-size:12px;line-height:16px;
+}
+.fs-field-error{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  font-size:12px;line-height:16px;color:var(--fs-r2-error);
+}
+.fs-field-error .fs-btn{color:var(--fs-r2-error)}
+.fs-input.bad{border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent)}
 .fs-lock-banner{
   flex:none;margin:8px 12px 0;padding:6px 8px;border-radius:var(--dsw-radius-sm);
   border:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 32%, transparent);
@@ -524,6 +594,8 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
 .fs-seg-btn+.fs-seg-btn{border-left:1px solid var(--dsw-alias-border-l3)}
 .fs-seg-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .fs-seg-btn.on{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);color:var(--dsw-alias-state-business-primary);font-weight:500}
+/* 外部执行器下 team 选项禁用（07 §6）：禁用态要看得出来，且不响应 hover。 */
+.fs-seg-btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
 .fs-divider{height:1px;background:var(--dsw-alias-border-l1);margin:0}
 
 .fs-chips{display:flex;flex-wrap:wrap;gap:4px}

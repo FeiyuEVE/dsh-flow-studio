@@ -16,7 +16,7 @@
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  */
 
-import { copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -76,7 +76,7 @@ if (clientSize > CLIENT_WARN) {
 }
 console.log(`✓ lib/client.js 在单文件上限（${CLIENT_LIMIT}）内`)
 
-for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js', 'engine.js', 'inbox.js', 'audit.js', 'tools.js']) {
+for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js', 'engine.js', 'runtime.js', 'worktree.js', 'executor.js', 'supervise.js', 'inbox.js', 'audit.js', 'tools.js']) {
   copyFileSync(resolve(root, 'src', file), resolve(libDir, file))
   const size = statSync(resolve(libDir, file)).size
   console.log(`✓ lib/${file} ${size} bytes`)
@@ -98,6 +98,23 @@ if (!client.includes('react-flow__')) {
   process.exit(1)
 }
 console.log('✓ client bundle 含 __ModuleLoader__、正确的注册 id 与 React Flow')
+
+// 产物自检：lib/ 里所有相对 import 必须能在 lib/ 内解析。
+// 0.5.0 就是因为漏拷 audit.js / tools.js，插件在容器里直接 404 —— 那次靠 e2e 才发现，
+// 这里在构建期就拦住：新增 src 模块却忘了加进上面的拷贝清单，构建立刻失败。
+const hostModules = readdirSync(libDir).filter(name => name.endsWith('.js'))
+const missing = []
+for (const name of hostModules) {
+  const source = readFileSync(resolve(libDir, name), 'utf8')
+  for (const match of source.matchAll(/from\s+'\.\/([\w.-]+)'/g)) {
+    if (!existsSync(resolve(libDir, match[1]))) missing.push(`${name} → ./${match[1]}`)
+  }
+}
+if (missing.length > 0) {
+  console.error(`✗ lib/ 里有解析不了的相对 import（漏拷模块？）：\n  ${missing.join('\n  ')}`)
+  process.exit(1)
+}
+console.log(`✓ lib/ 内 ${hostModules.length} 个 Host 模块的相对 import 全部可解析`)
 
 // 打包输入清单留个痕，便于核对产物由哪些源文件构成。
 const inputs = Object.keys(result.metafile.inputs)

@@ -15,7 +15,7 @@ import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
-import { FlowList } from './flowlist.js'
+import { FlowList, extractRunRows } from './flowlist.js'
 import { Inspector } from './inspector.js'
 import {
   beginLink, confirmLink, describeLink, edgeKindBetween, moveLink,
@@ -283,6 +283,14 @@ export function FlowStudioPage({
   const [stopConfirmReady, setStopConfirmReady] = useState(false)
   const [logFocus, setLogFocus] = useState(null)
   const [logSync, setLogSync] = useState(0)
+  /**
+   * v0.7 §4.3：运行列表要按工作区分组，需要 raw run 行（workspace* / worktree* / supervision）。
+   * 抽屉回传的 runs 经 logdrawer 归一化会丢掉这些新字段，所以这里单独读 `GET /runs`；
+   * 读取失败时保留上一份数据（含 initialRunView 的旧数据），整列退化为「未标注工作区」。
+   */
+  const [runRows, setRunRows] = useState(() => (
+    initialRunView && Array.isArray(initialRunView.runs) ? initialRunView.runs : []
+  ))
 
   const pinned = useRef(Boolean(initialFlow))
   const flowRef = useRef(null)
@@ -887,8 +895,52 @@ export function FlowStudioPage({
     listReady,
     confirmReady: stopConfirmReady,
   })
+  // v0.7 §4.3：运行列高亮跟抽屉选中；没有选中时退回当前流程的活动 run。
+  const selectedRunId = runView && typeof runView.selectedRunId === 'string' && runView.selectedRunId !== ''
+    ? runView.selectedRunId
+    : (runForFlow ? String(runForFlow.id || '') : '')
+  const activeRunId = runView && runView.activeRun && typeof runView.activeRun.id === 'string'
+    ? runView.activeRun.id
+    : ''
 
   const handleRunSnapshot = useCallback(snapshot => { setRunView(snapshot) }, [])
+
+  /**
+   * 运行列表的 raw 数据：抽屉快照里的 runs 已被归一化（只剩旧字段），分组与 supervision
+   * 都要靠 Host 的原始行。失败不冒泡成页面错误——列表保留上一份数据即可。
+   */
+  const loadRunRows = useCallback(async () => {
+    try {
+      const payload = await api.listRuns(20)
+      setRunRows(extractRunRows(payload))
+    } catch {
+      // 旧 Host 没有 /runs 或网络抖动：保留现状，分组退化为「未标注工作区」。
+    }
+  }, [])
+
+  /** 抽屉的 run 列表状态变化（开始 / 收口 / 切换）时同步一次 raw 行，避免列表状态落后。 */
+  const runDigest = useMemo(() => {
+    const list = runView && Array.isArray(runView.runs) ? runView.runs : []
+    return list.map(run => [
+      run && run.id,
+      run && run.status,
+      run && run.started,
+      run && run.startedAt,
+      run && run.endedAt,
+    ].join(':')).join('|')
+  }, [runView])
+
+  useEffect(() => {
+    void loadRunRows()
+  }, [loadRunRows, logSync, runDigest])
+
+  /** 有 run 在跑时慢轮询：supervision 的 nextDueAt / wakes 会随调度变化（默认 tick 15s）。 */
+  const hasActiveRun = Boolean(runView && runView.activeRun && runIsActive(runView.activeRun))
+  useEffect(() => {
+    if (!hasActiveRun) return undefined
+    const timer = setInterval(() => { void loadRunRows() }, 15000)
+    return () => clearInterval(timer)
+  }, [hasActiveRun, loadRunRows])
 
   // M6：第一次点停止只 arm；确认按钮 400ms 后才可用，5s 内不确认自动解除并播报。
   useEffect(() => {
@@ -1188,6 +1240,17 @@ export function FlowStudioPage({
           onOpen: id => { void openFlow(id) },
           onCreate: () => { void createFlow() },
           onDelete: id => { void removeFlow(id) },
+          // v0.7 §4.3：运行记录（按工作区分组）+ 只读 supervision；点击行切到抽屉里的该 run。
+          runs: runRows,
+          selectedRunId,
+          activeRunId,
+          onFocusRun: run => {
+            if (!run || typeof run.id !== 'string' || run.id === '') return
+            setLogFocus({ id: run.id, nonce: Date.now() })
+            setLogOpen(true)
+            setLogSync(value => value + 1)
+            setAnnounce('已切换到运行「' + (run.name || run.id) + '」')
+          },
         }),
       flow
         ? h(FlowCanvas, {

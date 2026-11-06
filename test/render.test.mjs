@@ -48,7 +48,7 @@ const {
 const { lodOf, rejectPathRects } = await import('../src/client/geometry.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
-const { FlowList } = await import('../src/client/flowlist.js')
+const { FlowList, isGroupOpen, nextGroupToggles } = await import('../src/client/flowlist.js')
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
   RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, mergeSavedFlow, progressOf,
@@ -1582,6 +1582,151 @@ check('打包产物在假浏览器环境里能加载并注册成对的两个 slo
 
   const iconHtml = render(React.createElement(icon.component, { size: 18, active: true }))
   assert.ok(iconHtml.includes('<svg'), '侧栏图标不是 SVG')
+})
+
+// ── v0.7：外部执行器 / 工作区分组 / supervision 只读展示 ──────────────────
+console.log('runtime 0.7（client）')
+
+function renderInspector(flowValue, nodeId) {
+  return render(React.createElement(Inspector, {
+    flow: flowValue,
+    selection: { kind: 'node', id: nodeId },
+    skills: [],
+    onPatchNode() {},
+    onPatchEdge() {},
+    onDeleteNode() {},
+    onDeleteEdge() {},
+    onAddMember() {},
+    onPatchMember() {},
+    onRemoveMember() {},
+    onConnect() {},
+    onNudge() {},
+  }))
+}
+
+function renderFlowList(props) {
+  return render(React.createElement(FlowList, {
+    flows: [],
+    activeId: '',
+    busy: false,
+    onToggle() {},
+    onOpen() {},
+    onCreate() {},
+    onDelete() {},
+    ...props,
+  }))
+}
+
+check('v0.7 §6：节点检查器渲染执行器下拉（dsh 默认 / codex / custom）', () => {
+  const html = renderInspector(flow, 'n_req')
+  assert.ok(html.includes('执行器'), '检查器缺少执行器字段')
+  assert.ok(html.includes('<option value="dsh" selected="">dsh（默认）</option>'), '默认值必须是 dsh')
+  assert.ok(html.includes('<option value="codex">codex</option>'), '缺少 codex 选项')
+  assert.ok(html.includes('<option value="custom">custom</option>'), '缺少 custom 选项')
+  assert.ok(!html.includes('外部执行器'), '默认 dsh 不应显示外部执行器标识')
+  assert.ok(!html.includes('执行命令'), '默认 dsh 不应显示自定义命令输入')
+})
+
+check('v0.7 §6：非 dsh + team 给出红字提示并禁用 team 选项（与 Host 400 同口径）', () => {
+  const external = model.defaultFlow()
+  external.id = 'flow-external'
+  const node = external.nodes.find(item => item.id === 'n_req')
+  node.executor = 'codex'
+  node.mode = model.EXEC_MODE.TEAM
+  const html = renderInspector(external, 'n_req')
+  assert.ok(html.includes('外部执行器'), '面板顶部要能一眼看出这个节点是外部 agent 跑的')
+  assert.ok(html.includes('外部执行器只支持「单个 agent」模式'), '缺少与服务端一致的红字提示')
+  const team = html.match(/<button[^>]*>主管 \+ 子 agent<\/button>/)
+  assert.ok(team && /disabled/.test(team[0]), 'team 选项必须禁用')
+  const single = html.match(/<button[^>]*>单个 agent<\/button>/)
+  assert.ok(single && !/disabled/.test(single[0]), '单个 agent 选项必须仍可选')
+})
+
+check('v0.7 §6：custom 执行器显示必填命令输入（≤2000 字符）', () => {
+  const custom = model.defaultFlow()
+  custom.id = 'flow-custom'
+  custom.nodes.find(item => item.id === 'n_req').executor = 'custom'
+  const html = renderInspector(custom, 'n_req')
+  assert.ok(html.includes('执行命令'), 'custom 必须显示执行命令输入')
+  assert.match(html, /maxLength="2000"/i, '执行命令上限必须是 2000 字符')
+  assert.ok(html.includes('必须填执行命令'), '空命令必须有必填提示')
+})
+
+check('v0.7 §4.3/§7：旧 run 缺 workspace/supervision 时退化为「未标注工作区」+「未开启」', () => {
+  const legacy = [
+    { id: 'run-legacy-1', name: '旧运行一', status: 'done' },
+    { id: 'run-legacy-2', name: '旧运行二', status: 'failed' },
+  ]
+  const html = renderFlowList({ runs: legacy, selectedRunId: 'run-legacy-1' })
+  assert.ok(html.includes('运行记录 · 2'), '运行记录区没有列出旧 run')
+  assert.ok(html.includes('未标注工作区'), '缺 workspacePath 必须退化成一个默认分组')
+  assert.match(html, /class="fs-rail-count">2</, '组头必须显示该组运行数')
+  assert.ok(html.includes('旧运行一') && html.includes('旧运行二'), '旧 run 行必须照常渲染')
+  assert.ok(html.includes('监督'), '详情头部缺少 supervision 区')
+  assert.ok(html.includes('未开启'), 'supervision 缺失时必须显示「未开启」')
+
+  // 降级关闭时 reason 不能丢（07 §7：连续唤醒失败 → enabled:false + reason）。
+  const degraded = renderFlowList({
+    runs: [{
+      id: 'run-off', name: '降级运行', status: 'done',
+      supervision: { enabled: false, wakes: 0, failures: 3, reason: 'wake-failed: 会话不可用' },
+    }],
+    selectedRunId: 'run-off',
+  })
+  assert.ok(degraded.includes('未开启'))
+  assert.ok(degraded.includes('关闭原因：wake-failed: 会话不可用'), '关闭原因必须显示')
+})
+
+check('v0.7 §4.3/§7：按 workspacePath 分组、组头路径尾巴 + 计数、第一组默认展开', () => {
+  const runs = [
+    {
+      id: 'run-a1', name: '仓库 A 运行一', status: 'running', workspacePath: '/home/me/repo-a',
+      worktreeEnabled: true, worktree: { enabled: true, branch: 'flow/run-a1' },
+      supervision: { enabled: true, nextDueAt: '2026-11-06T23:59:00+08:00', wakes: 3, failures: 1, reason: '' },
+    },
+    { id: 'run-a2', name: '仓库 A 运行二', status: 'done', workspacePath: '/home/me/repo-a' },
+    { id: 'run-b1', name: '仓库 B 运行一', status: 'done', workspacePath: '/srv/repo-b' },
+  ]
+  const html = renderFlowList({ runs, selectedRunId: 'run-a1', activeRunId: 'run-a1' })
+  assert.ok(html.includes('me/repo-a'), '组头必须显示路径尾巴')
+  assert.ok(html.includes('repo-b'), '第二个工作区分组没有渲染')
+  assert.deepEqual(
+    html.match(/class="fs-rail-count">\d+</g),
+    ['class="fs-rail-count">2<', 'class="fs-rail-count">1<'],
+    '组头计数必须等于该组运行数',
+  )
+  assert.ok(html.includes('仓库 A 运行一') && html.includes('仓库 A 运行二'), '第一组必须默认展开')
+  assert.ok(!html.includes('仓库 B 运行一'), '其余分组默认收起')
+  assert.ok(html.includes('⎇ worktree'), 'worktreeEnabled 的 run 行必须显示 worktree 标记')
+  assert.ok(/title="[^"]*flow\/run-a1[^"]*"/.test(html), '标题提示里必须写分支名')
+  assert.ok(html.includes('已开启'), 'supervision 开启状态没有显示')
+  assert.ok(html.includes('下次唤醒'), '缺少下次唤醒时间')
+  assert.ok(html.includes('已唤醒 3 次'), '缺少已唤醒次数')
+  assert.ok(html.includes('失败 1 次'), '缺少失败次数')
+
+  // 展开态：第一组默认展开；点它之后必须能收起（不能因为「默认展开」而永远开着）。
+  assert.equal(isGroupOpen(new Map(), 'me/repo-a', 0), true, '第一组必须默认展开')
+  assert.equal(isGroupOpen(new Map(), 'repo-b', 1), false, '其余分组默认收起')
+  const collapsed = nextGroupToggles(new Map(), 'me/repo-a', true)
+  assert.equal(isGroupOpen(collapsed, 'me/repo-a', 0), false, '第一组点一下必须能收起')
+  const expanded = nextGroupToggles(collapsed, 'repo-b', false)
+  assert.equal(isGroupOpen(expanded, 'repo-b', 1), true, '其余分组点一下必须能展开')
+})
+
+check('v0.7 §4.3：页面把 initialRunView.runs 接进运行记录（旧数据不白屏）', () => {
+  const html = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialRunView: {
+      runs: [{ id: 'run-old', name: '旧运行', status: 'done' }],
+      selectedRunId: 'run-old',
+      run: { id: 'run-old', name: '旧运行', status: 'done' },
+      loaded: true,
+    },
+  }))
+  assert.ok(html.includes('运行记录 · 1'), '页面没装配运行记录区')
+  assert.ok(html.includes('未标注工作区'), '旧数据没有退化成一个默认工作区分组')
+  assert.ok(html.includes('未开启'), '旧数据下 supervision 必须显示「未开启」')
 })
 
 console.log(`\n${checks} 组通过`)

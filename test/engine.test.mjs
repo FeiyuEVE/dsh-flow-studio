@@ -11,7 +11,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -25,9 +26,18 @@ const flowStore = await import('../src/store.js')
 const { summarize } = await import('../src/runlog.js')
 
 const {
-  createEngine, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
+  createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
   loadUpstreamArtifactContents, MAX_NODE_RETRIES, UPSTREAM_ARTIFACT_READ_MAX_BYTES,
+  nodeSessionId, ENGINE_OUTPUT_SCHEMA,
 } = engineModule
+
+/**
+ * 既有 49 组测试关心的是主循环 / 提示词 / 事件契约，不关心 worktree。构造时默认
+ * `worktree:'off'`，避免在插件仓库本身（测试进程的 cwd 是 git 根）上真建 worktree；
+ * R1/R4 的 auto / on 行为由文末追加的专组用显式 `worktree` 覆盖。
+ * 这只是测试夹具默认值，不改任何既有断言。
+ */
+const createEngine = (options = {}) => createEngineRaw({ worktree: 'off', ...options })
 
 const runsRoot = store.runsDir(home)
 const flowsRoot = flowStore.flowsDir(home)
@@ -173,6 +183,87 @@ function deferred() {
   return { promise, resolve: resolveFn, reject: rejectFn }
 }
 
+/**
+ * 读取原始 run.json。runstore 的 `readRunMeta()` 只保留白名单字段（workspace /
+ * worktree / sessionMode 会被丢掉），所以断言绑定字段必须读原文。
+ */
+function readRawRun(runId) {
+  return JSON.parse(readFileSync(join(runsRoot, runId, 'run.json'), 'utf8'))
+}
+
+/** 在项目 `.tmp/` 下造一个真 git 仓库（独立 git config，不读宿主全局配置）。 */
+function makeGitRepo(name) {
+  const dir = mkdtempSync(join(repoRoot, '.tmp', `${name}-`))
+  const gitHome = join(home, 'git-home')
+  mkdirSync(gitHome, { recursive: true })
+  const git = args => execFileSync('git', args, {
+    cwd: dir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1' },
+  })
+  git(['init', '-q'])
+  git(['checkout', '-q', '-b', 'main'])
+  git(['config', 'user.email', 'flow-studio-test@example.invalid'])
+  git(['config', 'user.name', 'Flow Studio Test'])
+  writeFileSync(join(dir, 'README.md'), '# fixture\n')
+  git(['add', 'README.md'])
+  git(['commit', '-q', '-m', 'init'])
+  return dir
+}
+
+/**
+ * 造一个**不在任何 git 仓库里**的空目录。项目 `.tmp/` 本身在插件仓库内
+ * （`git rev-parse --show-toplevel` 会返回仓库根），测「非 git 工作区」必须放在仓库外；
+ * 按工作区约定用大卷 `~/tmp`（不进 /tmp，也不污染仓库）。
+ */
+function makePlainDir(name) {
+  const base = join(process.env.HOME || repoRoot, 'tmp')
+  mkdirSync(base, { recursive: true })
+  return mkdtempSync(join(base, `flow-studio-${name}-`))
+}
+
+/**
+ * `agents.create` 桩：节点会话按 passResult 的结构返回 ```json 代码块。
+ * 返回 { ctx, created }，created 里是每次 create 的入参（可断言 meta.cwd / sessionId）。
+ */
+function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').structured } = {}) {
+  const created = []
+  const ctx = {
+    on() {
+      return () => {}
+    },
+    get(name) {
+      if (name !== 'agents') return undefined
+      return {
+        async create(options) {
+          created.push(options)
+          const sessionId = options.sessionId
+          return {
+            agent: {
+              session: { id: sessionId, header: {} },
+              followup() {
+                const structured = resultFor(options)
+                engineRef.value.handleSessionEvent({ id: sessionId }, {
+                  type: 'assistant/message',
+                  data: {
+                    message: {
+                      role: 'assistant',
+                      content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
+                    },
+                  },
+                })
+              },
+              async whenIdle() {},
+            },
+            async dispose() {},
+          }
+        },
+      }
+    },
+  }
+  return { ctx, created }
+}
+
 try {
   // -------------------------------------------------------------------------
   console.log('engine · 单节点通过（产物 / 证据 / live / quality）')
@@ -237,60 +328,81 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  console.log('engine · 默认 activate 包装 ctx.subagents')
+  console.log('engine · 默认 activate 走 agents.create（R2：节点主管会话 = 顶层会话）')
 
-  await check('未注入 activate：用 provider=spawn / delivery=caller / outputSchema 启动，并 dispose', async () => {
+  await check('未注入 activate：agents.create 建顶层会话（稳定 id / 无父会话 / cwd）、followup 解析 JSON、收尾 dispose', async () => {
     const flow = flowOf('flow-default', [startNode(), stage('n_spawn', '真实节点', 300), endNode()], [
       next('e1', 'n_start', 'n_spawn'),
       next('e2', 'n_spawn', 'n_end'),
     ])
     await saveFlow(flow)
     const run = await makeRun('flow-default', 1)
-    const fakeAgent = { id: 'agent-root' }
-    let captured = null
+    let engine = null
+    const created = []
+    const payloads = []
     let disposed = 0
     const ctx = {
       on() {
         return () => {}
       },
       get(name) {
-        if (name === 'subagents') {
-          return {
-            async startActivation(spec) {
-              captured = spec
-              return {
-                childId: 'sess-spawned',
-                result: Promise.resolve({
-                  structured: passResult('n_spawn').structured,
-                  output: [],
-                  stopReason: 'completed',
-                }),
-                async dispose() {
-                  disposed += 1
+        if (name !== 'agents') return undefined
+        return {
+          // 07 §3.1：默认路径只认 agents.create（不再走 subagents.startActivation）。
+          async create(createOptions) {
+            created.push(createOptions)
+            const sessionId = createOptions.sessionId
+            return {
+              agent: {
+                session: { id: sessionId, header: {} },
+                followup(payload) {
+                  payloads.push(payload)
+                  // 模拟宿主：followup 之后 assistant/message 带 ```json 代码块回来。
+                  engine.handleSessionEvent({ id: sessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(passResult('n_spawn').structured)}\n\`\`\`` }],
+                      },
+                    },
+                  })
                 },
-              }
-            },
-          }
+                async whenIdle() {},
+              },
+              async dispose() {
+                disposed += 1
+              },
+            }
+          },
         }
-        if (name === 'agents') return { roots: () => [fakeAgent] }
-        return undefined
       },
     }
-    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engine = createEngine({ runsRoot, flowsRoot, ctx, cwd: '/repo' })
     await engine.start(run.id)
     const final = await engine.wait(run.id)
     A.equal(final.status, 'done')
     A.equal(disposed, 1)
-    A.ok(captured !== null)
-    A.equal(captured.provider, 'spawn')
-    A.equal(captured.delivery, 'caller')
-    A.equal(captured.label, `${run.id}/n_spawn#1`)
-    A.equal(captured.request.parent, fakeAgent)
-    A.equal(Array.isArray(captured.request.prompt), true)
-    A.equal(captured.request.prompt[0].type, 'text')
-    A.ok(captured.request.prompt[0].text.includes('## 输出格式'))
-    A.equal(captured.request.outputSchema.type, 'object')
-    A.ok(captured.signal instanceof AbortSignal)
+    A.equal(created.length, 1)
+    // 同一个 (runId,nodeId) 的会话 id 稳定且只含安全字符。
+    A.equal(created[0].sessionId, nodeSessionId(run.id, 'n_spawn', 1))
+    A.match(created[0].sessionId, /^[A-Za-z0-9._-]+$/)
+    A.equal(created[0].meta.cwd, '/repo')
+    // 顶层会话：绝不出现任何会让宿主记成子会话的字段。
+    A.equal('parentAgent' in created[0], false)
+    A.equal('parentSession' in (created[0].meta || {}), false)
+    A.equal('origin' in (created[0].meta || {}), false)
+    A.equal('delegationDepth' in (created[0].meta || {}), false)
+    // 提示词经 buildFollowupPayload 投递，并要求 ```json 代码块（create 无 schema 通道）。
+    A.equal(payloads.length, 1)
+    A.equal(payloads[0].role, 'user')
+    A.equal(payloads[0].source.kind, 'flow-studio')
+    A.equal(payloads[0].source.room, `${run.id}/n_spawn`)
+    A.ok(payloads[0].content[0].text.includes('## 输出格式'))
+    A.ok(payloads[0].content[0].text.includes('```json'))
+    // 07 §3「降级必须可见」：正常路径在 run.json 与 run/start 里都要写 top-level。
+    A.equal(readRawRun(run.id).sessionMode, 'top-level')
+    A.equal((await eventsOf(run.id)).find(event => event.kind === 'run/start').data.sessionMode, 'top-level')
   })
 
   // -------------------------------------------------------------------------
@@ -1063,7 +1175,8 @@ try {
         return passOf(node.id)
       },
     })
-    // 06 §13.6：两次 start 在同一个 tick 里发起，第二个必须立刻被模块级锁挡下。
+    // 07 §5：一个 Engine 实例只服务一个 run —— 同一实例上并发的第二个 start 被
+    // 实例级占位挡下（跨 run 的并发不在这里，由 runtime 的 run 注册表负责）。
     const results = await Promise.allSettled([engine.start(r1.id), engine.start(r2.id)])
     A.equal(results.filter(item => item.status === 'fulfilled').length, 1)
     A.equal(results.filter(item => item.status === 'rejected').length, 1)
@@ -1090,7 +1203,7 @@ try {
     await second.start(loserId)
     A.equal((await second.wait(loserId)).status, 'done')
 
-    // 锁是模块级的：另一个引擎实例在 run 进行中也不能并发 start。
+    // 07 §5（R3）：锁不再是模块级的 —— 两个实例各自跑不同 run，必须真并发。
     const flow2 = flowOf('flow-conc2', [startNode(), stage('n_a', 'A', 300), endNode()], [
       next('e1', 'n_start', 'n_a'),
       next('e2', 'n_a', 'n_end'),
@@ -1099,14 +1212,19 @@ try {
     const r3 = await makeRun('flow-conc2', 1)
     const r4 = await makeRun('flow-conc2', 1)
     const hold = deferred()
-    const e1 = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => { await hold.promise; return passOf(node.id) } })
-    const e2 = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+    let entered3 = 0
+    let entered4 = 0
+    const e1 = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => { entered3 += 1; await hold.promise; return passOf(node.id) } })
+    const e2 = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => { entered4 += 1; return passOf(node.id) } })
     const first = e1.start(r3.id)
-    await assert.rejects(() => e2.start(r4.id), error => error instanceof EngineError && error.status === 409)
-    assertionCount += 1
+    await e2.start(r4.id)
+    A.equal((await e2.wait(r4.id)).status, 'done')
+    A.equal(entered4, 1, '不同 runId 各起一个实例：r4 不等 r3')
+    A.equal(e1.active && e1.active.runId, r3.id, 'r3 仍在跑时 r4 已经跑完（真并发）')
     hold.resolve()
     await first
     A.equal((await e1.wait(r3.id)).status, 'done')
+    A.equal(entered3, 1)
   })
 
   // -------------------------------------------------------------------------
@@ -1609,37 +1727,49 @@ try {
     A.equal(events.find(event => event.kind === 'node/start').data.model, 'deepseek-chat')
   })
 
-  await check('node.model：默认 spawn 包装器把 model 放进 request.agentOptions', async () => {
+  await check('node.model：默认 agents.create 把 model 放进 agentOptions', async () => {
     const flow = flowOf('flow-model-spawn', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-reasoner' }), endNode()], [
       next('e1', 'n_start', 'n_model'),
       next('e2', 'n_model', 'n_end'),
     ])
     await saveFlow(flow)
     const run = await makeRun('flow-model-spawn', 1)
+    let engine = null
     let captured = null
     const ctx = {
       on() { return () => {} },
       get(name) {
-        if (name === 'subagents') {
-          return {
-            async startActivation(spec) {
-              captured = spec
-              return {
-                childId: 'sess-model',
-                result: Promise.resolve({ structured: structuredPass('n_model'), output: [], stopReason: 'completed' }),
-                dispose: async () => {},
-              }
-            },
-          }
+        if (name !== 'agents') return undefined
+        return {
+          async create(createOptions) {
+            captured = createOptions
+            const sessionId = createOptions.sessionId
+            return {
+              agent: {
+                session: { id: sessionId, header: {} },
+                followup() {
+                  engine.handleSessionEvent({ id: sessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: JSON.stringify(structuredPass('n_model')) }],
+                      },
+                    },
+                  })
+                },
+                async whenIdle() {},
+              },
+              dispose: async () => {},
+            }
+          },
         }
-        if (name === 'agents') return { roots: () => [{ id: 'agent-root' }] }
-        return undefined
       },
     }
-    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engine = createEngine({ runsRoot, flowsRoot, ctx })
     await engine.start(run.id)
     await engine.wait(run.id)
-    A.deepEqual(captured.request.agentOptions, { model: 'deepseek-reasoner' })
+    A.deepEqual(captured.agentOptions, { model: 'deepseek-reasoner' })
   })
 
   // -------------------------------------------------------------------------
@@ -2235,6 +2365,422 @@ try {
     A.ok(Array.from(ida).length <= 64)
     A.match(ida, /^[A-Za-z0-9._:-]+$/)
     A.equal(engineModule.memberIdFor('n_team', 1), 'n_team:1')
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.7 · 工作区与 worktree（R1+R4）')
+
+  await check('真 git 仓库 + auto：run.json 有 workspace/worktree、目录真的建了、节点会话 cwd = worktree', async () => {
+    const repo = makeGitRepo('repo-wt')
+    try {
+      const flow = flowOf('flow-wt', [startNode(), stage('n_wt', '实现', 300), endNode()], [
+        next('e1', 'n_start', 'n_wt'),
+        next('e2', 'n_wt', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-wt', 1)
+      const engineRef = { value: null }
+      const { ctx, created } = agentsCreateCtx(engineRef, { resultFor: () => passResult('n_wt').structured })
+      const engine = createEngine({ runsRoot, flowsRoot, ctx })
+      engineRef.value = engine
+
+      await engine.start(run.id, { workspace: repo, worktree: 'auto' })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const raw = readRawRun(run.id)
+      A.match(raw.workspace.id, /^[0-9a-f]{12}$/)
+      A.equal(raw.workspace.isGit, true)
+      A.equal(raw.workspace.realpath, realpathSync(repo))
+      A.equal(raw.worktree.enabled, true)
+      A.equal(raw.worktree.decidedBy, 'initiator')
+      A.ok(existsSync(raw.worktree.path), 'worktree.enabled=true 时目录必须真的存在')
+      // 07 §4.2：根由 runsRoot 的父级推（<home>/flow-studio/worktrees），不硬编码绝对路径。
+      A.ok(raw.worktree.path.startsWith(join(dirname(runsRoot), 'worktrees')))
+      A.ok(raw.worktree.branch.startsWith('flow/'))
+      A.match(raw.worktree.baseCommit, /^[0-9a-f]{40}$/)
+      A.ok(typeof raw.worktree.createdAt === 'string' && raw.worktree.createdAt !== '')
+
+      // 节点会话 meta.cwd 必须指向 worktree.path（不是 workspace.path）。
+      A.equal(created.length, 1)
+      A.equal(created[0].meta.cwd, raw.worktree.path)
+      A.equal(raw.sessionMode, 'top-level')
+
+      // run/start 事件带 workspaceId / worktreeEnabled（不新增 kind，只加 data 字段）。
+      const startEvent = (await eventsOf(run.id)).find(event => event.kind === 'run/start')
+      A.equal(startEvent.data.workspaceId, raw.workspace.id)
+      A.equal(startEvent.data.worktreeEnabled, true)
+      A.equal(startEvent.data.sessionMode, 'top-level')
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  await check("worktree:'on' + 非 git 目录：start 抛 400（不静默降级），run 仍是 pending", async () => {
+    const plain = makePlainDir('nogit-on')
+    try {
+      const flow = flowOf('flow-on', [startNode(), stage('n_on', '实现', 300), endNode()], [
+        next('e1', 'n_start', 'n_on'),
+        next('e2', 'n_on', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-on', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async () => passResult('n_on') })
+      await assert.rejects(
+        () => engine.start(run.id, { workspace: plain, worktree: 'on' }),
+        error => error instanceof EngineError && error.status === 400 && /不是 git 仓库根/.test(error.message),
+        "on + 非 git 必须 400 且原因可读",
+      )
+      A.equal((await store.readRunMeta(runsRoot, run.id)).status, 'pending')
+      A.equal(readRawRun(run.id).worktree, undefined)
+    } finally {
+      rmSync(plain, { recursive: true, force: true })
+    }
+  })
+
+  await check('auto + 非 git：enabled:false, reason=not-a-git-repo，run 正常跑完', async () => {
+    const plain = makePlainDir('nogit-auto')
+    try {
+      const flow = flowOf('flow-auto', [startNode(), stage('n_auto', '实现', 300), endNode()], [
+        next('e1', 'n_start', 'n_auto'),
+        next('e2', 'n_auto', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-auto', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async () => passResult('n_auto') })
+      await engine.start(run.id, { workspace: plain, worktree: 'auto' })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const raw = readRawRun(run.id)
+      A.equal(raw.workspace.isGit, false)
+      A.equal(raw.workspace.gitRoot, null)
+      A.equal(raw.worktree.enabled, false)
+      A.equal(raw.worktree.reason, 'not-a-git-repo')
+      A.equal(raw.worktree.path, null)
+      A.equal(raw.worktree.branch, null)
+      const startEvent = (await eventsOf(run.id)).find(event => event.kind === 'run/start')
+      A.equal(startEvent.data.worktreeEnabled, false)
+    } finally {
+      rmSync(plain, { recursive: true, force: true })
+    }
+  })
+
+  await check('run 已绑定工作区：换一个 workspace 再 start → 400（不能中途更换）', async () => {
+    const repo = makeGitRepo('repo-bound')
+    try {
+      const flow = flowOf('flow-bound', [startNode(), stage('n_bound', '实现', 300), endNode()], [
+        next('e1', 'n_start', 'n_bound'),
+        next('e2', 'n_bound', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-bound', 1)
+      // 模拟「该 run 已由发起方绑定过工作区」：直接改原始 run.json（绑定字段不在白名单里）。
+      const raw = readRawRun(run.id)
+      raw.workspace = { id: 'ffffffffffff', path: '/elsewhere', realpath: '/elsewhere', isGit: false, gitRoot: null }
+      writeFileSync(join(runsRoot, run.id, 'run.json'), `${JSON.stringify(raw, null, 2)}\n`)
+
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async () => passResult('n_bound') })
+      await assert.rejects(
+        () => engine.start(run.id, { workspace: repo, worktree: 'off' }),
+        error => error instanceof EngineError && error.status === 400 && /已绑定工作区，不能中途更换/.test(error.message),
+        '换工作区必须 400',
+      )
+      A.equal((await store.readRunMeta(runsRoot, run.id)).status, 'pending')
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  await check('auto + 只能回落 process.cwd()：不擅自建 worktree（auto-without-initiator），降级原因进 run 日志', async () => {
+    const flow = flowOf('flow-noinit', [startNode(), stage('n_noinit', '节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_noinit'),
+      next('e2', 'n_noinit', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-noinit', 1)
+    // 构造时把默认策略设成 auto；start 不给 workspace / cwd / parent → 只能回落 process.cwd()。
+    const engine = createEngine({ runsRoot, flowsRoot, worktree: 'auto', activate: async () => passResult('n_noinit') })
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+
+    const raw = readRawRun(run.id)
+    A.equal(raw.worktree.enabled, false)
+    A.equal(raw.worktree.reason, 'auto-without-initiator')
+    A.equal(raw.worktree.path, null)
+    const startEvent = (await eventsOf(run.id)).find(event => event.kind === 'run/start')
+    A.equal(startEvent.data.worktreeEnabled, false)
+    A.match(startEvent.data.worktreeWarning, /process\.cwd/)
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.7 · 会话降级可见（sessionMode）')
+
+  await check('只有 subagents、没有 agents.create：sessionMode=legacy-subagent（run.json + run/start）', async () => {
+    const flow = flowOf('flow-legacy', [startNode(), stage('n_legacy', '兼容节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_legacy'),
+      next('e2', 'n_legacy', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-legacy', 1)
+    const ctx = {
+      on() {
+        return () => {}
+      },
+      get(name) {
+        // 只有 get、没有 create：默认 activate 会退回 subagents.startActivation。
+        if (name === 'agents') return { get() { return null } }
+        if (name === 'subagents') {
+          return {
+            async startActivation() {
+              return {
+                childId: 'child-legacy',
+                result: Promise.resolve({ structured: passResult('n_legacy').structured, output: [], stopReason: 'done' }),
+                dispose: async () => {},
+              }
+            },
+          }
+        }
+        return undefined
+      },
+    }
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx,
+      parent: { session: { id: 'sess-init', header: {} } },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+
+    const raw = readRawRun(run.id)
+    A.equal(raw.sessionMode, 'legacy-subagent')
+    const startEvent = (await eventsOf(run.id)).find(event => event.kind === 'run/start')
+    A.equal(startEvent.data.sessionMode, 'legacy-subagent')
+  })
+
+  await check('stub / 注入 activate：sessionMode 也写（stub / injected），run/start.data 同样带', async () => {
+    const makeOneStage = async id => {
+      const flow = flowOf(id, [startNode(), stage(`${id}_node`, '节点', 300), endNode()], [
+        next(`${id}-e1`, 'n_start', `${id}_node`),
+        next(`${id}-e2`, `${id}_node`, 'n_end'),
+      ])
+      await saveFlow(flow)
+      return makeRun(id, 1)
+    }
+
+    const stubRun = await makeOneStage('flow-mode-stub')
+    const stubEngine = createEngine({ runsRoot, flowsRoot, stub: true })
+    await stubEngine.start(stubRun.id)
+    A.equal((await stubEngine.wait(stubRun.id)).status, 'done')
+    A.equal(readRawRun(stubRun.id).sessionMode, 'stub')
+    A.equal((await eventsOf(stubRun.id)).find(event => event.kind === 'run/start').data.sessionMode, 'stub')
+
+    const injectedRun = await makeOneStage('flow-mode-injected')
+    const injectedEngine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passResult(node.id) })
+    await injectedEngine.start(injectedRun.id)
+    A.equal((await injectedEngine.wait(injectedRun.id)).status, 'done')
+    A.equal(readRawRun(injectedRun.id).sessionMode, 'injected')
+    A.equal((await eventsOf(injectedRun.id)).find(event => event.kind === 'run/start').data.sessionMode, 'injected')
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.7 · 外部 executor（R6）')
+
+  await check('custom 外部进程：结构化判定被解析、usage 记上、过程日志可见、cwd=worktree、schema 落在 run 目录', async () => {
+    const repo = makeGitRepo('repo-exec')
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-'))
+    try {
+      const cwdFile = join(execDir, 'cwd.txt')
+      const stubPath = join(execDir, 'stub.mjs')
+      const structured = {
+        verdict: 'pass',
+        summary: '外部执行通过',
+        artifacts: [{ name: '外部结论.md', content: '# ok\n' }],
+        findings: [],
+        checks: { ruleSetId: 'ext-rules', ruleSetVersion: '1', executor: 'custom', passedChecks: 1, totalChecks: 1 },
+        acceptance: [{ itemId: 'R1', status: 'pass', decidedBy: 'auto' }],
+        tests: { suite: 'ext', executed: 1, passed: 1, failed: 0, skipped: 0 },
+      }
+      writeFileSync(stubPath, [
+        "import { writeFileSync } from 'node:fs'",
+        `writeFileSync(${JSON.stringify(cwdFile)}, process.cwd())`,
+        "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'echo hi' } }))",
+        "console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18 } }))",
+        `console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(${JSON.stringify(structured)}) } }))`,
+      ].join('\n'))
+
+      const command = `node ${JSON.stringify(stubPath)}`
+      const flow = flowOf('flow-exec', [
+        startNode(),
+        stage('n_ext', '外部节点', 300, { executor: 'custom', executorCommand: command }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_ext'),
+        next('e2', 'n_ext', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-exec', 1)
+      const engine = createEngine({ runsRoot, flowsRoot })
+      await engine.start(run.id, { workspace: repo, worktree: 'auto' })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const raw = readRawRun(run.id)
+      A.equal(raw.worktree.enabled, true)
+      // 07 §4.1：外部 executor 的 cwd（-C）与节点会话用同一个 _sessionCwd()。
+      A.equal(readFileSync(cwdFile, 'utf8').trim(), raw.worktree.path)
+
+      const events = await eventsOf(run.id)
+      const nodeEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_ext')
+      A.equal(nodeEnd.data.status, 'passed')
+      // 结构化判定被解析：引擎按既有 schema 落了 acceptance / test 证据。
+      A.equal(events.filter(event => event.kind === 'acceptance/verdict').length, 1)
+      A.equal(events.filter(event => event.kind === 'test/report').length, 1)
+
+      // usage：四桶归一化，缺桶补 0。
+      const modelCall = events.find(event => event.kind === 'model/call' && event.nodeId === 'n_ext')
+      A.deepEqual(modelCall.data.usage, { input: 11, cacheRead: 0, cacheWrite: 0, output: 7 })
+      A.equal(modelCall.data.provider, 'custom')
+
+      // 过程事件走既有 agent/message 通道。
+      A.ok(events.some(event => event.kind === 'agent/message'
+        && event.nodeId === 'n_ext'
+        && typeof event.data.text === 'string'
+        && event.data.text.includes('echo hi')), '节点日志里应能看到外部进程输出')
+
+      // schema 文件在 run 目录下（不写 /tmp），内容是引擎既有输出 schema。
+      const schemaPath = join(runsRoot, run.id, 'executors', '1.schema.json')
+      A.ok(existsSync(schemaPath), 'schema 必须落在 <runsRoot>/<runId>/executors/<attemptId>.schema.json')
+      const schema = JSON.parse(readFileSync(schemaPath, 'utf8'))
+      A.equal(schema.type, 'object')
+      A.deepEqual(schema.required, ['verdict'])
+      A.deepEqual(schema, ENGINE_OUTPUT_SCHEMA)
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  await check('custom 非 0 退出：节点失败，错误文案带 stderr 尾', async () => {
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-fail-'))
+    try {
+      const stubPath = join(execDir, 'fail.mjs')
+      writeFileSync(stubPath, "console.error('BOOM-stderr-tail-42')\nprocess.exit(3)\n")
+      const flow = flowOf('flow-exec-fail', [
+        startNode(),
+        stage('n_fail', '外部失败', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_fail'),
+        next('e2', 'n_fail', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-exec-fail', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, nodeRetries: 0 })
+      await engine.start(run.id, { worktree: 'off' })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'failed')
+
+      const events = await eventsOf(run.id)
+      const nodeEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_fail')
+      A.equal(nodeEnd.data.status, 'failed')
+      const runEnd = events.find(event => event.kind === 'run/end')
+      A.equal(runEnd.data.status, 'failed')
+      A.match(runEnd.data.reason, /BOOM-stderr-tail-42/)
+      A.match(runEnd.data.reason, /3/)
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  await check('custom 被 stop：run 收成 aborted（不是 failed）', async () => {
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-abort-'))
+    try {
+      const stubPath = join(execDir, 'hang.mjs')
+      writeFileSync(stubPath, "setTimeout(() => {}, 60000)\n")
+      const flow = flowOf('flow-exec-abort', [
+        startNode(),
+        stage('n_hang', '外部挂起', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_hang'),
+        next('e2', 'n_hang', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-exec-abort', 1)
+      const engine = createEngine({ runsRoot, flowsRoot })
+      await engine.start(run.id, { worktree: 'off' })
+      const final = await engine.stop(run.id)
+      A.equal(final.status, 'aborted')
+      const runEnd = (await eventsOf(run.id)).find(event => event.kind === 'run/end')
+      A.equal(runEnd.data.status, 'aborted')
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  await check('custom 缺 executorCommand：启动即 400（07 §7.1 保存宽松、启动严格）', async () => {
+    const flow = flowOf('flow-exec-invalid', [
+      startNode(),
+      stage('n_bad', '外部配置错', 300, { executor: 'custom' }),
+      endNode(),
+    ], [
+      next('e1', 'n_start', 'n_bad'),
+      next('e2', 'n_bad', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-exec-invalid', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, nodeRetries: 0 })
+    let rejected = null
+    try {
+      await engine.start(run.id, { worktree: 'off' })
+    } catch (error) {
+      rejected = error
+    }
+    A.equal(rejected && rejected.status, 400)
+    A.match(rejected && rejected.message, /executorCommand/)
+    // 没真的开跑：不该有 run/start 事件。
+    const kinds = (await eventsOf(run.id)).map(event => event.kind)
+    A.equal(kinds.includes('run/start'), false)
+  })
+
+  await check('外部 executor 重试语义与 dsh 一致：失败一次后自动重试并成功（attemptId 不变、retries=1）', async () => {
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-retry-'))
+    try {
+      const counterFile = join(execDir, 'count.txt')
+      const stubPath = join(execDir, 'retry.mjs')
+      writeFileSync(stubPath, [
+        "import { existsSync, writeFileSync } from 'node:fs'",
+        `if (!existsSync(${JSON.stringify(counterFile)})) {`,
+        `  writeFileSync(${JSON.stringify(counterFile)}, '1')`,
+        '  process.exit(1)',
+        '}',
+        "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ verdict: 'pass', summary: '第二次通过' }) } }))",
+      ].join('\n'))
+      const flow = flowOf('flow-exec-retry', [
+        startNode(),
+        stage('n_retry', '外部重试', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_retry'),
+        next('e2', 'n_retry', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-exec-retry', 1)
+      const engine = createEngine({ runsRoot, flowsRoot })
+      await engine.start(run.id, { worktree: 'off' })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+      A.equal(readFileSync(counterFile, 'utf8').trim(), '1', '第一次失败后应再起一次子进程')
+      const nodeEnd = (await eventsOf(run.id)).find(event => event.kind === 'node/end' && event.nodeId === 'n_retry')
+      A.equal(nodeEnd.data.status, 'passed')
+      A.equal(nodeEnd.data.retries, 1)
+      A.equal(nodeEnd.attemptId, 1)
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
   })
 
 } finally {

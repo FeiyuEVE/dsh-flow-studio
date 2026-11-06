@@ -26,6 +26,9 @@ export const EDGE_KIND = { NEXT: 'next', REJECT: 'reject' }
 /** 执行方式：单个 agent / 主管 agent 带若干子 agent。 */
 export const EXEC_MODE = { SINGLE: 'single', TEAM: 'team' }
 
+/** 节点执行器：dsh 内建 / codex CLI / 自定义命令（07 §6）。 */
+export const EXECUTOR = { DSH: 'dsh', CODEX: 'codex', CUSTOM: 'custom' }
+
 /** 单个流程允许的上限，防止误操作把面板拖死。 */
 export const LIMITS = {
   nodes: 60,
@@ -35,6 +38,8 @@ export const LIMITS = {
   skillsPerNode: 12,
   teamMembers: 8,
   maxRounds: 9,
+  /** 外部 executor 的命令模板长度（07 §6）。 */
+  executorCommandLen: 2000,
   /** 未知字段兜底（extras）的上限：键数、单条字符串长度、序列化后的总字节数。 */
   extrasKeys: 16,
   extrasTextLen: 256,
@@ -65,6 +70,8 @@ export function blankNode(kind, x, y, title) {
     maxRounds: 2,
     team: [],
     model: '',
+    executor: EXECUTOR.DSH,
+    executorCommand: '',
   }
 }
 
@@ -117,6 +124,8 @@ export function defaultFlow() {
     maxRounds: 2,
     team: [],
     model: '',
+    executor: EXECUTOR.DSH,
+    executorCommand: '',
     ...extra,
   })
 
@@ -239,7 +248,7 @@ function clip(value, max) {
  */
 const NODE_KNOWN_FIELDS = new Set([
   'id', 'kind', 'title', 'x', 'y', 'mode', 'role', 'task',
-  'skills', 'outputs', 'maxRounds', 'model', 'team', 'extras',
+  'skills', 'outputs', 'maxRounds', 'model', 'team', 'executor', 'executorCommand', 'extras',
 ])
 const EDGE_KNOWN_FIELDS = new Set(['id', 'from', 'to', 'kind', 'label', 'extras'])
 const MEMBER_KNOWN_FIELDS = new Set(['name', 'role', 'task', 'extras'])
@@ -438,6 +447,8 @@ export function normalizeFlow(raw, fallbackName) {
           ? Math.min(LIMITS.maxRounds, Math.max(1, Math.round(item.maxRounds)))
           : 2,
         model: clip(String(item.model || ''), 120),
+        executor: Object.values(EXECUTOR).includes(item.executor) ? item.executor : EXECUTOR.DSH,
+        executorCommand: clip(String(item.executorCommand || ''), LIMITS.executorCommandLen),
         team,
       }
       nodes.push(withExtras(node, item, NODE_KNOWN_FIELDS))
@@ -553,6 +564,20 @@ export function validateFlow(flow) {
       if (node.mode === EXEC_MODE.TEAM && node.team.length === 0) {
         warnings.push({ message: `「${node.title}」选了「主管 + 子 agent」，但还没配任何子 agent。`, nodeId: node.id })
       }
+    }
+    // 07 §6：custom 必须有命令模板；外部 executor 只允许 single（team 要观察成员会话）。
+    const executor = node.executor || EXECUTOR.DSH
+    if (executor === EXECUTOR.CUSTOM && !String(node.executorCommand || '').trim()) {
+      errors.push({
+        message: `「${node.title}」选择了自定义 executor，但没填 executorCommand：外部命令不知道该跑什么。`,
+        nodeId: node.id,
+      })
+    }
+    if (executor !== EXECUTOR.DSH && node.mode !== EXEC_MODE.SINGLE) {
+      errors.push({
+        message: `「${node.title}」使用外部 executor（${executor}）时，执行方式必须是「单个 agent」：team 模式需要引擎观察成员会话，外部进程做不到。`,
+        nodeId: node.id,
+      })
     }
   }
 

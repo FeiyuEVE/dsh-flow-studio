@@ -12,7 +12,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -91,10 +91,17 @@ function makeFlow(id, name, stages = [{ id: 'n_a', title: '阶段 A' }]) {
   }
 }
 
-/** 假引擎：记录 start / stop 的调用，可按用例注入返回值或抛错。 */
-function makeEngine({ startResult, startError, stopResult, stopError, active = null, engineName } = {}) {
+/**
+ * 假引擎：记录 start / stop 的调用，可按用例注入返回值或抛错。
+ * `get` 模拟 runtime 的 `get(runId)`（07 §5：唯一冲突是「同一个 runId 已在跑」）；
+ * `supervision` 模拟 runtime 暴露的 SupervisionScheduler。
+ */
+function makeEngine({
+  startResult, startError, stopResult, stopError, active = null, engineName, get, supervision,
+  enableSupervision,
+} = {}) {
   const calls = { start: [], stop: [] }
-  return {
+  const engine = {
     calls,
     active,
     engineName,
@@ -109,6 +116,10 @@ function makeEngine({ startResult, startError, stopResult, stopError, active = n
       return typeof stopResult === 'function' ? stopResult(runId) : { id: runId, status: 'aborted' }
     },
   }
+  if (typeof get === 'function') engine.get = get
+  if (supervision !== undefined) engine.supervision = supervision
+  if (typeof enableSupervision === 'function') engine.enableSupervision = enableSupervision
+  return engine
 }
 
 function makeTools({ engine = makeEngine(), auditWorkflow, watchSeconds, now } = {}) {
@@ -335,16 +346,27 @@ try {
     A.ok(typeof result.runId === 'string' && result.runId.length > 0)
   })
 
-  await check('flow_start 引擎已有 active run → 提前失败，不建新 run', async () => {
+  await check('flow_start 不再因「已有 run 在跑」提前失败（07 §5 并发不设上限）', async () => {
+    // 旧口径是 engine.active 全局唯一；07 §5 起不同 run 一律并行，engine.active 不再参与判断。
     const engine = makeEngine({ active: { runId: 'r-active' } })
+    const tools = makeTools({ engine })
+    const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, makeExec()))
+    A.equal(result.ok, true, '已有 run 在跑时仍允许再开一个（不同 runId 并行）')
+    A.equal(engine.calls.start.length, 1)
+  })
+
+  await check('flow_start 唯一冲突：runtime.get(runId) 显示同一 run 已在跑 → 友好失败、不调 engine.start', async () => {
+    const engine = makeEngine({ get: runId => ({ runId }) })
     const tools = makeTools({ engine })
     const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
     const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, makeExec()))
     A.equal(result.ok, false)
-    A.match(result.error, /r-active/)
-    A.equal(engine.calls.start.length, 0)
+    A.match(result.error, /同一 run 已在运行|已在运行/)
+    A.ok(result.hint)
+    A.equal(result.retryable, false)
+    A.equal(engine.calls.start.length, 0, '冲突必须在 engine.start 之前挡下')
     const after = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
-    A.equal(after, before)
+    A.equal(after, before + 1, 'run 目录被建出来（runId 与冲突 run 相同），但没有启动')
   })
 
   // ── 6. supervision ─────────────────────────────────────────────────────
@@ -365,6 +387,263 @@ try {
     A.match(result.supervision.hint, /proactive_set/)
     A.match(result.supervision.hint, /flow_watch/)
     A.match(result.supervision.hint, new RegExp(String(result.supervision.nextCheckSeconds)))
+    // 假引擎没有 enableSupervision → 内建调度没开，退回手动闹钟（提示语保留 proactive_set 说明）。
+    A.equal(result.supervision.enabled, false)
+  })
+
+  await check('flow_start 自动开启内建 supervision：登记 wakerSessionId、返回体提示不再要求 proactive_set', async () => {
+    const registrations = []
+    const engine = makeEngine({
+      enableSupervision: async (runId, options) => {
+        registrations.push({ runId, options })
+        return {
+          runId,
+          enabled: true,
+          supervision: { enabled: true, wakerSessionId: options.wakerSessionId },
+          scheduler: { enabled: true, nextDueAt: null, wakes: 0, failures: 0, lastReason: null },
+        }
+      },
+    })
+    const tools = makeTools({ engine })
+    const exec = makeExec('session-auto-sup')
+    const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, exec))
+
+    A.equal(result.ok, true)
+    A.equal(registrations.length, 1, 'start 成功后必须自动登记监督')
+    A.equal(registrations[0].runId, result.runId)
+    A.deepEqual(registrations[0].options, { enabled: true, wakerSessionId: 'session-auto-sup' })
+    A.equal(result.supervision.enabled, true)
+    A.equal(result.supervision.scheduler.enabled, true)
+    // 提示语：内置调度已开启，不再要求挂 proactive_set 闹钟；字段仍向后兼容保留。
+    A.match(result.supervision.hint, /内置 supervision/)
+    A.match(result.supervision.hint, /不需要再挂 proactive_set/)
+    A.equal(result.supervision.hint.includes('挂上 supervision.alarmPrompt'), false)
+    A.ok(Number.isInteger(result.supervision.nextCheckSeconds))
+    A.ok(typeof result.supervision.alarmPrompt === 'string' && result.supervision.alarmPrompt.includes(result.runId))
+    A.equal(result.supervision.watchTool, 'flow_watch')
+  })
+
+  await check('flow_start 自动开启失败只 warn，不让启动失败', async () => {
+    const warnings = []
+    const engine = makeEngine({
+      enableSupervision: async () => { throw new Error('调度器坏了（测试）') },
+    })
+    const tools = createFlowTools({
+      flowsRoot, runsRoot, engine, log: (level, message) => warnings.push({ level, message }),
+    })
+    const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, makeExec('session-warn')))
+    A.equal(result.ok, true, '监督登记失败不能拖垮 flow_start')
+    A.equal(result.status, 'running')
+    A.equal(result.supervision.enabled, false)
+    A.equal(warnings.some(item => item.level === 'warn' && /supervision/.test(item.message)), true)
+    // 退回手动闹钟的提示语。
+    A.match(result.supervision.hint, /proactive_set/)
+  })
+
+  await check('flow_start 开跑前拦非法 executor（custom 缺 executorCommand），不建 run', async () => {
+    await store.saveFlow(flowsRoot, 'flow-bad-executor', {
+      schemaVersion: 1,
+      id: 'flow-bad-executor',
+      name: '非法 executor',
+      description: '',
+      createdAt: FIXED_TS,
+      updatedAt: FIXED_TS,
+      nodes: [
+        nodeBase('n_start', 'start', '任务输入'),
+        { ...nodeBase('n_a', 'stage', '外部执行'), executor: 'custom', executorCommand: '' },
+        nodeBase('n_end', 'end', '完成'),
+      ],
+      edges: [
+        { id: 'e1', from: 'n_start', to: 'n_a', kind: 'next', label: '' },
+        { id: 'e2', from: 'n_a', to: 'n_end', kind: 'next', label: '' },
+      ],
+    })
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-bad-executor' }, makeExec()))
+    A.equal(result.ok, false)
+    A.match(result.error, /executor/i)
+    A.match(result.error, /executorCommand/)
+    A.equal(engine.calls.start.length, 0)
+    const after = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    A.equal(after, before, '非法 executor 不建 run')
+  })
+
+  // ── 6.5 workspace / worktree 透传（07 §4.1） ───────────────────────────
+  await check('flow_start 默认 workspace 取调用方会话 cwd，options 原样交给 engine.start', async () => {
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const exec = makeExec('session-ws')
+    const result = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, exec))
+    A.equal(result.ok, true)
+    A.equal(engine.calls.start.length, 1)
+    const options = engine.calls.start[0].options
+    A.equal(options.parent, exec.agent)
+    A.equal(options.workspace, '/workspace/inherited', '默认取 exec.agent.session.header.cwd')
+    A.equal(Object.hasOwn(options, 'worktree'), false, '没传 worktree 就不带该键（交给 engine 按 auto 裁决）')
+    A.equal(result.workspace.path, '/workspace/inherited')
+    A.equal(result.workspace.worktree, 'auto')
+    A.equal(result.workspace.worktreeEnabled, null)
+
+    // 取不到 cwd 就不传 workspace（交给 engine 回落），绝不瞎猜路径。
+    const noCwdExec = { agent: { session: { id: 'session-no-cwd', header: {} } } }
+    const noCwd = record(await byName(tools, 'flow_start').execute({ flowId: 'flow-main' }, noCwdExec))
+    A.equal(noCwd.ok, true)
+    A.equal(Object.hasOwn(engine.calls.start[1].options, 'workspace'), false)
+    A.equal(noCwd.workspace.path, null)
+  })
+
+  await check('flow_start 显式 workspace / worktree 原样透传；非法 worktree → 失败且不建 run', async () => {
+    const engine = makeEngine()
+    const tools = makeTools({ engine })
+    const exec = makeExec('session-ws2')
+    const result = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-main', workspace: '/repo/explicit', worktree: 'off' },
+      exec,
+    ))
+    A.equal(result.ok, true)
+    const options = engine.calls.start[0].options
+    A.equal(options.parent, exec.agent)
+    A.equal(options.workspace, '/repo/explicit')
+    A.equal(options.worktree, 'off')
+    A.equal(result.workspace.worktree, 'off')
+    A.equal(result.workspace.path, '/repo/explicit')
+
+    // 非法枚举：参数错误，一条 run 都不建。
+    const before = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    const bad = record(await byName(tools, 'flow_start').execute(
+      { flowId: 'flow-main', worktree: 'always' },
+      makeExec('session-ws3'),
+    ))
+    A.equal(bad.ok, false)
+    A.match(bad.error, /worktree/)
+    A.equal(engine.calls.start.length, 1, '非法参数不能进 engine.start')
+    const after = (await runstore.listRuns(runsRoot, { limit: 100 })).runs.length
+    A.equal(after, before)
+  })
+
+  // ── 6.6 flow_supervise（07 §7 内建调度开关） ───────────────────────────
+  await check('flow_supervise 存在、参数校验正确', async () => {
+    const tools = makeTools()
+    const supervise = byName(tools, 'flow_supervise')
+    A.ok(supervise, 'flow_supervise 必须注册')
+    A.deepEqual(supervise.parameters.required, ['runId', 'enabled'])
+    A.equal(supervise.parameters.properties.runId.type, 'string')
+    A.equal(supervise.parameters.properties.enabled.type, 'boolean')
+    A.ok(supervise.output && supervise.output.schema && typeof supervise.output.render === 'function')
+
+    // 参数校验：缺 runId / runId 非法 / enabled 缺失或不是布尔。
+    const cases = [
+      {},
+      { runId: 'r-x' },
+      { runId: 'r-x', enabled: 'yes' },
+      { runId: '../etc/passwd', enabled: true },
+    ]
+    for (const args of cases) {
+      const failed = record(await supervise.execute(args, makeExec()))
+      A.equal(failed.ok, false, JSON.stringify(args))
+      A.ok(failed.hint, JSON.stringify(args))
+      A.equal(failed.retryable, false)
+    }
+
+    // 没有 runtime 门面（假引擎没有 supervision）→ 明确失败，不崩。
+    const unavailable = record(await supervise.execute({ runId: 'r-x', enabled: true }, makeExec()))
+    A.equal(unavailable.ok, false)
+    A.match(unavailable.error, /supervision/)
+  })
+
+  await check('flow_supervise enable / disable：登记摘除 + run.json.supervision 落盘', async () => {
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '开关调度', nodeTotal: 1, engine: 'real',
+    })
+    const registrations = []
+    const supervision = {
+      register(runId, options) {
+        registrations.push({ kind: 'register', runId, options })
+        return { enabled: true, nextDueAt: null, wakes: 0, failures: 0, lastReason: null }
+      },
+      unregister(runId) {
+        registrations.push({ kind: 'unregister', runId })
+        return true
+      },
+      status() {
+        return { enabled: true, nextDueAt: null, wakes: 0, failures: 0, lastReason: null }
+      },
+    }
+    const engine = makeEngine({ supervision })
+    const tools = makeTools({ engine })
+    const supervise = byName(tools, 'flow_supervise')
+    const runPath = join(runsRoot, run.id, 'run.json')
+
+    const enabled = record(await supervise.execute({ runId: run.id, enabled: true }, makeExec('session-waker')))
+    A.equal(enabled.ok, true)
+    A.equal(enabled.enabled, true)
+    A.equal(enabled.supervision.enabled, true)
+    A.equal(enabled.supervision.wakerSessionId, 'session-waker')
+    A.deepEqual(registrations[0], {
+      kind: 'register',
+      runId: run.id,
+      options: { wakerSessionId: 'session-waker' },
+    })
+    const rawEnabled = JSON.parse(readFileSync(runPath, 'utf8'))
+    A.equal(rawEnabled.supervision.enabled, true)
+    A.equal(rawEnabled.supervision.wakerSessionId, 'session-waker')
+    // 只合并 supervision：run.json 的既有字段一个都不能丢。
+    A.equal(rawEnabled.id, run.id)
+    A.equal(rawEnabled.flowId, 'flow-main')
+
+    const disabled = record(await supervise.execute({ runId: run.id, enabled: false }, makeExec('session-waker')))
+    A.equal(disabled.ok, true)
+    A.equal(disabled.enabled, false)
+    A.equal(disabled.supervision.enabled, false)
+    A.equal(disabled.supervision.reason, 'disabled-by-caller')
+    A.deepEqual(registrations[1], { kind: 'unregister', runId: run.id })
+    const rawDisabled = JSON.parse(readFileSync(runPath, 'utf8'))
+    A.equal(rawDisabled.supervision.enabled, false)
+
+    // 有 enableSupervision（runtime 门面）时走**共用实现**，工具不再自己碰 scheduler。
+    const sharedCalls = []
+    const sharedEngine = makeEngine({
+      enableSupervision: async (runId, options) => {
+        sharedCalls.push({ runId, options })
+        return {
+          runId,
+          enabled: options.enabled,
+          supervision: { enabled: options.enabled, reason: options.enabled ? null : 'disabled-by-caller' },
+          scheduler: { enabled: options.enabled, nextDueAt: null, wakes: 0, failures: 0, lastReason: null },
+        }
+      },
+    })
+    const sharedTool = byName(makeTools({ engine: sharedEngine }), 'flow_supervise')
+    const sharedOff = record(await sharedTool.execute({ runId: run.id, enabled: false }, makeExec('session-waker')))
+    A.equal(sharedOff.ok, true)
+    A.deepEqual(sharedCalls, [{ runId: run.id, options: { enabled: false } }])
+    A.equal(sharedOff.supervision.enabled, false)
+    const sharedOn = record(await sharedTool.execute({ runId: run.id, enabled: true }, makeExec('session-waker')))
+    A.equal(sharedOn.ok, true)
+    A.deepEqual(sharedCalls[1], { runId: run.id, options: { enabled: true, wakerSessionId: 'session-waker' } })
+
+    // flow_watch 的 supervision.scheduler 是只读快照。
+    const watchAudit = async () => ({ verdict: 'healthy', status: 'running', headline: 'ok', nextCheckSeconds: 120 })
+    const watch = byName(makeTools({ engine: makeEngine(), auditWorkflow: watchAudit }), 'flow_watch')
+    const watched = record(await watch.execute({ runId: run.id }, makeExec()))
+    A.equal(watched.ok, true)
+    A.equal(watched.supervision.scheduler.enabled, false)
+
+    // 已收尾的 run 不能开启（07 §7：planWake 的 terminal 分支永远不会唤醒它）。
+    // supervision 已进 runstore 白名单：writeRunMeta 局部合并不再丢它。
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'done', started: true, endedAt: new Date().toISOString(),
+    })
+    const terminal = record(await supervise.execute({ runId: run.id, enabled: true }, makeExec('session-waker')))
+    A.equal(terminal.ok, false)
+    A.match(terminal.error, /已结束/)
+    A.equal(terminal.retryable, false)
+    // 被拒绝的开启不能留下 supervision 字段 / 不能新增登记。
+    const rawTerminal = JSON.parse(readFileSync(runPath, 'utf8'))
+    A.equal(rawTerminal.supervision.enabled, false)
+    A.equal(registrations.length, 2, '被拒绝的开启不调 register')
   })
 
   // ── 7. flow_watch（stub 审计） ─────────────────────────────────────────
@@ -595,22 +874,23 @@ try {
     A.equal(ctx.routes.length, 1)
   })
 
-  await check('有 tools 服务时注册四个工具，卸载时逆序撤销', () => {
+  await check('有 tools 服务时注册五个工具，卸载时逆序撤销', () => {
     const { ctx, registered, disposed, disposeFns } = makeCtx({ toolsService: true })
     apply(ctx)
-    A.equal(registered.length, 4)
-    A.deepEqual(registered.map(tool => tool.name).sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_watch'])
+    // v0.7 新增 flow_supervise（内建 supervision 开关），所以固定数量从 4 变成 5。
+    A.equal(registered.length, 5)
+    A.deepEqual(registered.map(tool => tool.name).sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch'])
     A.equal(ctx.routes.length, 1)
     A.ok(disposeFns.length >= 1)
     // 最后一个 effect 就是工具注册；调用它的 disposer 应把四个工具都撤掉。
     disposeFns[disposeFns.length - 1]()
-    A.deepEqual(disposed.slice().sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_watch'])
+    A.deepEqual(disposed.slice().sort(), ['flow_list', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch'])
   })
 
   await check('ctx.tools 属性（不走 ctx.get）也能注册', () => {
     const { ctx, registered } = makeCtx({ toolsService: true, useCtxProperty: true })
     apply(ctx)
-    A.equal(registered.length, 4)
+    A.equal(registered.length, 5)
   })
 
   // ── 11.5 engine.start 的 per-start parent（06 §15） ──────────────────

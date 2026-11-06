@@ -3,12 +3,11 @@
  *
  * 闭环（也是工具描述里必须让模型一眼看懂的三步）：
  *   ① `flow_start` 用**当前会话的 Agent** 作父会话启动 run ——
- *      `request.parent = exec.agent`、`request.cwd` 省略，子 agent 因此继承本会话工作区，
- *      不需要（也不应该）再选目录；
- *   ② 用 `proactive_set` 把返回的 `supervision.alarmPrompt` 挂成定时闹钟
- *      （`after_seconds = supervision.nextCheckSeconds`）；
+ *      `request.parent = exec.agent`、`request.workspace = 会话 cwd`，子 agent 因此继承本会话工作区；
+ *   ② start 成功后**自动开启内建 supervision**（`engine.enableSupervision`），到点由调度器
+ *      唤醒发起会话；不需要再挂 `proactive_set` 闹钟（引擎没有该能力时才回落到手动闹钟）；
  *   ③ 每次醒来调 `flow_watch` 审查「整个工作流是否在正常运转」：
- *      healthy 就 `proactive_reclaim` 安静结束，出现异常或已跑完才通知主人。
+ *      healthy 就直接结束本轮，出现异常或已跑完才通知主人。
  *
  * 约定（与 DSH 工具契约一致）：
  *  - `parameters` 是完整 JSON Schema（只用 DSH 强制子集：type/properties/required/items/enum/oneOf/
@@ -28,8 +27,10 @@
 
 import { validateFlowForRun } from './engine.js'
 import { deliverInboundMessage, deliverOutboundReply, validateReplyTarget } from './inbox.js'
+import { normalizeExecutor } from './executor.js'
 import { NODE_KIND } from './model.js'
 import { checkRunId } from './runlog.js'
+import { saveSupervision } from './runtime.js'
 import {
   createRun, listRuns, readAllEvents, readNodeSessions, readRunDetail, readRunMeta,
 } from './runstore.js'
@@ -37,6 +38,9 @@ import { checkId, listFlows, readFlow } from './store.js'
 
 /** 默认审查间隔（秒）：给模型挂 `proactive_set` 的 `after_seconds`。 */
 export const DEFAULT_WATCH_SECONDS = 180
+
+/** 07 §4.1：worktree 策略全集（`auto` 是默认）。 */
+const WORKTREE_POLICIES = Object.freeze(['auto', 'on', 'off'])
 
 /** 工具超时预算（毫秒）。stop 要等循环收尾，给得比 start 宽。 */
 const TIMEOUT_LIST_MS = 15_000
@@ -147,6 +151,18 @@ function optionalInteger(args, key, { min = 1, max = Number.MAX_SAFE_INTEGER } =
   return value
 }
 
+function optionalEnum(args, key, allowed) {
+  const value = argsOf(args)[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || !allowed.includes(value.trim())) {
+    throw new ParamError(
+      `参数 ${key} 必须是 ${allowed.join(' / ')} 之一`,
+      `按 ${key} 的说明改正后重发（只接受 ${allowed.join(' / ')}）。`,
+    )
+  }
+  return value.trim()
+}
+
 // ── lossless JSON 收口 ─────────────────────────────────────────────────────
 
 /**
@@ -225,10 +241,47 @@ function failureOf(error, { action, extra = {} }) {
 
 // ── 父会话 / 工作区继承 ────────────────────────────────────────────────────
 
-/** 当前会话 id：模型工具只能证明「父会话是谁」，不猜测工作区路径。 */
+/**
+ * 当前会话 id：模型工具只能证明「父会话是谁」，不猜测工作区路径。
+ * 主口径是 `agent.session.id`（与 engine._agentSessionId / agents.get 一致）；
+ * 少数组合只在 `session.header.id` 上给出 id，这里顺带兜底。
+ */
 function sessionIdOf(exec) {
   const session = exec && exec.agent && exec.agent.session
-  return session && typeof session.id === 'string' && session.id !== '' ? session.id : null
+  if (!session) return null
+  if (typeof session.id === 'string' && session.id !== '') return session.id
+  const header = session.header
+  if (header && typeof header.id === 'string' && header.id !== '') return header.id
+  return null
+}
+
+/**
+ * 07 §6 的两条 executor 规则（custom 必须填 `executorCommand`；外部 executor 只能 single）
+ * 不在 `validateFlowForRun` 里，只在节点执行时被 `normalizeExecutor` 拦住。模型工具在
+ * 建 run **之前**按同一份规则预检，非法配置直接失败，不留下一个跑不动的 run。
+ */
+function executorBlockers(flow) {
+  const blockers = []
+  for (const node of (flow && flow.nodes) || []) {
+    if (!node || node.kind !== NODE_KIND.STAGE) continue
+    try {
+      normalizeExecutor(node)
+    } catch (error) {
+      blockers.push({ nodeId: node.id, message: error && error.message ? error.message : String(error) })
+    }
+  }
+  return blockers
+}
+
+/**
+ * 07 §4.1：默认 workspace = **调用方会话的 cwd**（`exec.agent.session.header.cwd`）。
+ * 取不到就不传，交给 engine 回落（绝不瞎猜一个路径）。
+ */
+function workspaceOfSession(exec) {
+  const session = exec && exec.agent && exec.agent.session
+  const header = session && session.header
+  const cwd = header && typeof header.cwd === 'string' ? header.cwd.trim() : ''
+  return cwd !== '' ? cwd : undefined
 }
 
 /**
@@ -425,8 +478,8 @@ async function resolveFlow(deps, args) {
 // ── 工具定义 ───────────────────────────────────────────────────────────────
 
 /**
- * 构造模型工具：基础四个（list / start / watch / stop），agents 服务可用时
- * 追加收件箱两个（flow_send_message / flow_reply）。
+ * 构造模型工具：基础五个（list / start / watch / stop / supervise），agents 服务
+ * 可用时追加收件箱两个（flow_send_message / flow_reply）。
  *
  * @param {{
  *   flowsRoot: string,
@@ -462,8 +515,9 @@ export function createFlowTools(deps) {
   const now = typeof deps.now === 'function' ? deps.now : () => new Date()
   const engineName = deps.engine.engineName === 'stub' ? 'stub' : 'real'
   // 06 §16：收件箱 / 回复工具依赖 agents 服务（没有它无法向会话注入消息，flow_reply
-  // 也没有可用的会话反查）。测试台 / 纯注入环境拿不到 agents 时只注册前四个工具，
-  // 既有 profile 的注册数量与卸载语义保持不变。
+  // 也没有可用的会话反查）。测试台 / 纯注入环境拿不到 agents 时只注册基础五个工具
+  //（v0.7 起多了 flow_supervise；它只写调度状态，不依赖 agents，拿不到 agents 也能注册，
+  // 唤醒失败会由 scheduler 按「连续 3 次降级」处理）。
   const inboxToolsEnabled = ctxHasAgents(deps.ctx)
 
   return [
@@ -541,16 +595,20 @@ export function createFlowTools(deps) {
       name: 'flow_start',
       description:
         '在**当前会话**里直接启动一个流程 run（不用去 Web 面板点运行）。三步闭环：'
-        + '① 本工具用当前会话的 Agent 作父会话启动 run（request.parent=当前会话、request.cwd 省略），'
+        + '① 本工具用当前会话的 Agent 作父会话启动 run（request.parent=当前会话、workspace=本会话 cwd），'
         + '子 agent 因此**继承本会话的工作区**，不需要也不应该再选目录；'
-        + '② 拿到返回的 supervision 后，调用 proactive_set 把 supervision.alarmPrompt 挂成定时闹钟，'
-        + 'after_seconds 用 supervision.nextCheckSeconds；'
-        + '③ 每次闹钟醒来调用 flow_watch（runId=返回的 runId）审查整个工作流是否正常，'
-        + 'healthy 就 proactive_reclaim 安静结束，出现异常或跑完才通知主人。'
+        + '② 启动成功后**自动开启内建 supervision 调度**（返回 supervision.enabled=true 即已开启）：'
+        + '不需要再挂 proactive_set 闹钟，到点会自动唤醒你（同一会话）来复查；'
+        + '只有在 supervision.enabled=false（引擎不支持/登记失败）时才用旧方式：'
+        + 'proactive_set 的 after_seconds=supervision.nextCheckSeconds 挂 supervision.alarmPrompt；'
+        + '③ 每次被唤醒后调用 flow_watch（runId=返回的 runId）审查整个工作流是否正常，'
+        + 'healthy 就直接结束本轮，出现异常或跑完才通知主人。'
         + '流程选择：flowId 优先；没有 id 时按 flowName 精确匹配（再退不区分大小写）；都不给会失败并提示先调 flow_list；'
         + '同名多份会失败并列出候选 id。task 是用户这次要跑的任务原文（可选，写进 run 的 name）；'
-        + 'name 是本次 run 的显示名（可选，优先于 task）。流程不存在 / 不合法会在建 run 之前失败；已有 run 在跑（409）会返回可读原因，'
-        + '不会把两个流程叠在一起跑。',
+        + 'name 是本次 run 的显示名（可选，优先于 task）。流程不存在 / 不合法会在建 run 之前失败；'
+        + '同一 runId 已在跑（409）会返回可读原因——v0.7 起并发不设上限，不同 run 可以同时跑。'
+        + 'workspace 默认取当前会话的 cwd（不用手填）；worktree 决定是否给这个 run 单独开 git worktree'
+        + '（auto = 工作区是 git 仓库就开，默认；on = 必须开，不是 git 仓库会 400；off = 不开）。',
       parameters: {
         type: 'object',
         properties: {
@@ -558,6 +616,8 @@ export function createFlowTools(deps) {
           flowName: { type: 'string', description: '流程名称（没有 flowId 时用；精确匹配优先，再退不区分大小写；重名会失败并列候选）' },
           task: { type: 'string', description: '用户这次要跑的任务原文（可选，≤2000 字符；写进 run.json 的 name，超过 200 字符截断）' },
           name: { type: 'string', description: '本次 run 的显示名（可选，≤200 字符；优先于 task）' },
+          workspace: { type: 'string', description: '工作区绝对路径（可选；默认取调用方会话的 cwd，取不到就交给引擎回落）' },
+          worktree: { type: 'string', enum: ['auto', 'on', 'off'], description: 'worktree 策略：auto（默认，git 仓库才开）/ on（必须开，否则 400）/ off（不开）' },
         },
         required: [],
       },
@@ -569,20 +629,27 @@ export function createFlowTools(deps) {
         candidates: { type: 'array', items: { type: 'string' }, description: '同名流程的候选 id（仅「同名多份」失败时出现）' },
         workspace: nullable({
           type: 'object',
-          description: '工作区继承信息：子 agent 用当前会话的工作区',
+          description: '工作区信息：默认继承当前会话的 cwd；worktree 由 engine 在 start 时最终裁决并写进 run.json',
           properties: {
             inheritedFrom: nullable({ type: 'string' }, '父会话 id；子 agent 从它继承工作目录'),
+            path: nullable({ type: 'string' }, '实际工作区路径（run.json.workspace.path；未裁决时回落请求值）'),
+            workspaceId: nullable({ type: 'string' }, 'run.json.workspace.id（12 位 hex；未裁决为 null）'),
+            worktree: nullable({ type: 'string' }, '请求的 worktree 策略：auto / on / off'),
+            worktreeEnabled: nullable({ type: 'boolean' }, 'run.json.worktree.enabled（未裁决为 null）'),
+            worktreeReason: nullable({ type: 'string' }, 'run.json.worktree.reason（未裁决为 null）'),
           },
           additionalProperties: true,
         }),
         supervision: nullable({
           type: 'object',
-          description: '如何挂定时审查闹钟（交给 proactive_set）',
+          description: '内建 supervision 调度状态 + 向后兼容的闹钟参数（v0.7 起默认自动开启，不需要手动挂闹钟）',
           properties: {
-            nextCheckSeconds: { type: 'integer', description: '建议的审查间隔秒数（proactive_set 的 after_seconds）' },
-            alarmPrompt: { type: 'string', description: '完整提示词，原样作为 proactive_set 的 prompt' },
+            nextCheckSeconds: { type: 'integer', description: '建议的审查间隔秒数（旧口径：proactive_set 的 after_seconds；现在仅供向后兼容）' },
+            alarmPrompt: { type: 'string', description: '完整提示词（向后兼容保留：只有 enabled=false 时才需要用它挂 proactive_set）' },
             watchTool: { type: 'string', description: '醒来后要调用的工具名（恒为 flow_watch）' },
-            hint: { type: 'string', description: '给模型的一句话操作说明' },
+            enabled: { type: 'boolean', description: '内建 supervision 调度是否已在这个 run 上开启' },
+            scheduler: anyJson('run.json.supervision 的只读快照（enabled / wakerSessionId / nextDueAt / wakes / failures / reason）；未开启为 null'),
+            hint: { type: 'string', description: '给模型的一句话操作说明（已开启时不再要求挂 proactive_set）' },
           },
           required: ['nextCheckSeconds', 'alarmPrompt', 'watchTool'],
           additionalProperties: true,
@@ -594,11 +661,16 @@ export function createFlowTools(deps) {
             : ''
           return [{ type: 'text', text: `启动失败：${value && value.error ? value.error : '未知错误'}${candidates}` }]
         }
+        const on = Boolean(value.supervision && value.supervision.enabled === true)
+        const next = on
+          ? `下一步：内置 supervision 调度已开启（下次唤醒 ${value.supervision.nextDueAt || '稍后'}），到点会自动唤醒本会话；`
+            + `醒来后调 flow_watch（runId=${value.runId}）复查即可，**不需要**再挂 proactive_set 闹钟。`
+          : `下一步：内置调度没开启（${(value.supervision && value.supervision.hint) || '引擎不支持或登记失败'}）；`
+            + `如需定时自审，用 proactive_set 的 after_seconds=${value.supervision ? value.supervision.nextCheckSeconds : watchSeconds} `
+            + `挂上 supervision.alarmPrompt，之后每次醒来调 flow_watch（runId=${value.runId}）。`
         return [{
           type: 'text',
-          text: `已在本会话启动 run ${value.runId}（流程「${value.flowName}」，状态 ${value.status}）。\n`
-            + `下一步：用 proactive_set 的 after_seconds=${value.supervision ? value.supervision.nextCheckSeconds : watchSeconds} `
-            + `挂上 supervision.alarmPrompt，之后每次醒来调 flow_watch（runId=${value.runId}）。`,
+          text: `已在本会话启动 run ${value.runId}（流程「${value.flowName}」，状态 ${value.status}）。\n${next}`,
         }]
       }),
       timeoutMs: TIMEOUT_START_MS,
@@ -622,28 +694,33 @@ export function createFlowTools(deps) {
             '先到画布上修好流程（恰好一个开始节点、至少一个阶段节点、每条 next 恰好一条出边、打回目标必须是阶段节点），再启动。',
           )
         }
+        // 07 §6：executor 的两条规则同样在开跑前拦住（校验器里没有，执行时才拦就太晚了）。
+        const blockers = executorBlockers(flow)
+        if (blockers.length > 0) {
+          const detail = blockers.map(item => item.message).join('；')
+          return failure(
+            `流程里有非法的 executor 配置，不能开跑：${detail}`,
+            '到节点检查器里修：custom 必须填 executorCommand；codex / custom 只允许「单个 agent」（team 需要引擎观察成员会话）。',
+          )
+        }
 
         let runName
+        let workspace
+        let worktree
         try {
           const explicitName = optionalString(args, 'name', { max: 200 })
           const task = optionalString(args, 'task', { max: 2000 })
           runName = explicitName || (task ? clipChars(task, 200) : flow.name)
+          // 07 §4.1：worktree 策略与 workspace（默认取调用方会话的 cwd，取不到就不传）。
+          worktree = optionalEnum(args, 'worktree', WORKTREE_POLICIES)
+          const explicitWorkspace = optionalString(args, 'workspace', { max: 1000 })
+          workspace = explicitWorkspace !== undefined ? explicitWorkspace : workspaceOfSession(exec)
         } catch (error) {
           if (error instanceof ParamError) return failure(error.message, error.hint)
           return failure(`读取参数失败：${messageOf(error)}`, '按参数说明改正后重发。')
         }
 
         const nodeTotal = (flow.nodes || []).filter(node => node.kind === NODE_KIND.STAGE).length
-
-        // 引擎同一时刻只允许一个 run：先在这里挡掉，避免建出一个永远 pending 的 run 目录。
-        // （跨引擎实例的并发仍由 engine.start 的模块级锁兜底，下面 catch 会接住 409。）
-        const active = deps.engine.active
-        if (active && typeof active.runId === 'string' && active.runId !== '') {
-          return failure(
-            `已有运行中的 run（${active.runId}），同一时刻只允许一个 run`,
-            '等它结束，或先调 flow_stop 停掉它，再重新 flow_start。',
-          )
-        }
 
         let run
         try {
@@ -659,11 +736,27 @@ export function createFlowTools(deps) {
           return failureOf(error, { action: '创建 run ' })
         }
 
-        // 父会话 = 当前会话。cwd 不传（引擎省略），子 agent 因此继承本会话工作区。
+        // 07 §5：并发不设上限——不再有「同一时刻只允许一个 run」的前置判断。
+        // 唯一的冲突是「同一个 runId 已在跑」（runtime.get(runId)）；新建的 runId 正常永远为
+        // null，只有重复 / 复用 runId 的路径才会命中。文案保持可操作。
+        const alreadyRunning = typeof deps.engine.get === 'function' ? deps.engine.get(run.id) : null
+        if (alreadyRunning) {
+          return failure(
+            `同一 run 已在运行（${run.id}），不能重复启动`,
+            '等它结束，或先调 flow_stop 停掉它，再重新 flow_start。',
+            false,
+            { runId: run.id },
+          )
+        }
+
+        // 父会话 = 当前会话；workspace / worktree 一并交给 engine.start 裁决（07 §4.1）。
         const parent = exec && exec.agent ? exec.agent : undefined
+        const startOptions = { parent }
+        if (workspace !== undefined) startOptions.workspace = workspace
+        if (worktree !== undefined) startOptions.worktree = worktree
         let started
         try {
-          started = await deps.engine.start(run.id, { parent })
+          started = await deps.engine.start(run.id, startOptions)
         } catch (error) {
           // 建出来的 run 可能停在 pending：把 runId 一并带回，模型知道要去 flow_watch 看一眼。
           return failureOf(error, { action: '启动 run ', extra: { runId: run.id } })
@@ -671,19 +764,63 @@ export function createFlowTools(deps) {
 
         const status = started && typeof started.status === 'string' ? started.status : 'running'
         const runId = typeof run.id === 'string' ? run.id : started && typeof started.id === 'string' ? started.id : ''
+
+        // 07 §7（R7）：模型工具起的 run **默认开启内建 supervision**——发起会话就是它的
+        // 主 agent，到点由调度器唤醒它调 flow_watch 自查。失败只 warn，绝不让 flow_start 失败。
+        const wakerSessionId = sessionIdOf(exec)
+        let schedulerState = null
+        if (typeof deps.engine.enableSupervision === 'function' && wakerSessionId !== null) {
+          try {
+            const registered = await deps.engine.enableSupervision(runId, { enabled: true, wakerSessionId })
+            schedulerState = registered ? registered.scheduler || null : null
+          } catch (error) {
+            if (typeof deps.log === 'function') {
+              deps.log('warn', `flow-studio: flow_start 自动开启 supervision 失败（${runId}）：${messageOf(error)}`)
+            }
+          }
+        }
+        const supervisionOn = Boolean(schedulerState && schedulerState.enabled === true)
+
+        // 07 §4.1：workspace / worktree 由 engine 在 start 时裁决并写进 run.json；
+        // engine.start 返回的就是 readRunMeta 结果（runstore 白名单已覆盖这两个键），
+        // 这里只读回来展示（尚未裁决时回落请求值）。
+        const decidedWorkspace = started && started.workspace && typeof started.workspace === 'object'
+          ? started.workspace
+          : null
+        const decidedWorktree = started && started.worktree && typeof started.worktree === 'object'
+          ? started.worktree
+          : null
         return jsonSafe({
           ok: true,
           runId,
           flowId: flow.id,
           flowName: flow.name,
           status,
-          workspace: { inheritedFrom: sessionIdOf(exec) },
+          workspace: {
+            inheritedFrom: sessionIdOf(exec),
+            path: decidedWorkspace && typeof decidedWorkspace.path === 'string'
+              ? decidedWorkspace.path
+              : (workspace ?? null),
+            workspaceId: decidedWorkspace && typeof decidedWorkspace.id === 'string' ? decidedWorkspace.id : null,
+            worktree: worktree ?? 'auto',
+            worktreeEnabled: decidedWorktree ? decidedWorktree.enabled === true : null,
+            worktreeReason: decidedWorktree && typeof decidedWorktree.reason === 'string'
+              ? decidedWorktree.reason
+              : null,
+          },
           supervision: {
             nextCheckSeconds: watchSeconds,
+            // 向后兼容：字段保留（客户端 / 旧调用方仍在读），只是不再是唯一路径。
             alarmPrompt: watchAlarmPrompt(runId, flow.name, watchSeconds),
             watchTool: 'flow_watch',
-            hint: `用 proactive_set 的 after_seconds=${watchSeconds} 挂上 supervision.alarmPrompt；`
-              + `之后每次醒来调 flow_watch（runId="${runId}"），healthy 就 proactive_reclaim 安静结束。`,
+            enabled: supervisionOn,
+            scheduler: schedulerState,
+            hint: supervisionOn
+              ? `内置 supervision 调度已开启：不需要再挂 proactive_set 闹钟，到点会自动唤醒你。`
+                + `醒来后调 flow_watch（runId="${runId}"），healthy 就直接结束本轮，异常或跑完才通知主人。`
+              : `内置 supervision 未能开启（引擎没有 enableSupervision 或登记失败）：退回到手动闹钟——`
+                + `用 proactive_set 的 after_seconds=${watchSeconds} 挂上 supervision.alarmPrompt，`
+                + `之后每次醒来调 flow_watch（runId="${runId}"）。`,
           },
         })
       },
@@ -696,10 +833,10 @@ export function createFlowTools(deps) {
         '审查「整个工作流是否在正常运转」（只读，不改任何状态、不自动修复、不自动停止）。'
         + '读 run.json + 事件 + 流程模板，调用审计模块给出 verdict / headline / progress / plan / '
         + 'currentNode / rejects / anomalies / quality / tokens / idleMs / recommended 等结论，'
-        + '并附 supervision：运行中给出下次审查间隔与完整闹钟提示词（交给 proactive_set），'
+        + '并附 supervision：运行中给出下次审查间隔、内建调度状态（scheduler）与向后兼容的闹钟提示词，'
         + 'verdict 为 done/failed/aborted 时 nextCheckSeconds 为 null、alarmPrompt 说明不必再挂闹钟。'
-        + '典型用法：flow_start 之后按 supervision.nextCheckSeconds 挂 proactive_set 闹钟，每次醒来调本工具；'
-        + 'verdict 正常就 proactive_reclaim 安静结束，异常或跑完才通知主人。'
+        + '典型用法：flow_start 之后内置 supervision 会自动唤醒本会话（不需要手动挂 proactive_set 闹钟），'
+        + '每次醒来调本工具审查；verdict 正常就 proactive_reclaim 安静结束，异常或跑完才通知主人。'
         + 'runId 省略时取最近一次 run（按 startedAt 倒序）。',
       parameters: {
         type: 'object',
@@ -732,6 +869,7 @@ export function createFlowTools(deps) {
             nextCheckSeconds: nullable({ type: 'integer' }, '下次审查间隔秒数；终态为 null（不必再挂闹钟）'),
             alarmPrompt: { type: 'string', description: '给 proactive_set 的完整提示词' },
             watchTool: { type: 'string', description: '审查工具名（恒为 flow_watch）' },
+            scheduler: anyJson('run.json.supervision 的只读快照（内建调度：enabled / wakerSessionId / lastWokeAt / nextDueAt / wakes / failures / reason；未开启为 null）'),
           },
           required: ['alarmPrompt', 'watchTool'],
           additionalProperties: true,
@@ -746,6 +884,13 @@ export function createFlowTools(deps) {
           lines.push('已到终态：不必再挂闹钟，proactive_reclaim 结束本轮。')
         } else if (value.supervision) {
           lines.push(`建议 ${value.supervision.nextCheckSeconds} 秒后再次审查。`)
+        }
+        // 07 §7：内建 supervision 的落盘状态（只读）也进人类可读投影。
+        const scheduler = value.supervision && value.supervision.scheduler
+        if (scheduler && scheduler.enabled === true) {
+          const wakes = Number.isInteger(scheduler.wakes) ? scheduler.wakes : 0
+          const due = typeof scheduler.nextDueAt === 'string' ? scheduler.nextDueAt : '待定'
+          lines.push(`内建调度：开启（已唤醒 ${wakes} 次，下次 ${due}）。`)
         }
         return [{ type: 'text', text: lines.join('\n') }]
       }),
@@ -825,6 +970,10 @@ export function createFlowTools(deps) {
               nextCheckSeconds,
               alarmPrompt,
               watchTool: 'flow_watch',
+              // 07 §7：run.json.supervision 的只读快照（内建调度是否开启、上次/下次唤醒）。
+              scheduler: detail.run.supervision && typeof detail.run.supervision === 'object'
+                ? detail.run.supervision
+                : null,
             },
           })
         } catch (error) {
@@ -901,6 +1050,165 @@ export function createFlowTools(deps) {
             true,
           )
         }
+      },
+    },
+
+    // ── flow_supervise ─────────────────────────────────────────────────────
+    {
+      name: 'flow_supervise',
+      description:
+        '开关一个 run 的**内建 supervision 调度**（07 §7；不用外部插件、不用自己挂定时器）。'
+        + 'enabled=true → 登记这个 run，调度器按审计结论定时唤醒发起会话（健康 180s / 异常 60s / pending 30s，'
+        + '连续 3 次唤醒失败自动降级关闭）；enabled=false → 摘除登记并落盘 enabled=false。'
+        + '唤醒目标是**调用本工具的会话**（当前会话 id），所以要在你想被唤醒的那个会话里调它。'
+        + '返回调度状态（enabled / nextDueAt / wakes / failures / lastReason）与 run.json.supervision 的落盘结果。'
+        + '只读的当前状态用 flow_watch 的 supervision.scheduler 看。',
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string', description: '要开关调度的 run id（必填，来自 flow_start / flow_watch）' },
+          enabled: { type: 'boolean', description: 'true 开启内建调度；false 关闭（并落盘 enabled=false）' },
+        },
+        required: ['runId', 'enabled'],
+      },
+      output: outputFor({
+        runId: { type: 'string', description: '被开关调度的 run id' },
+        enabled: { type: 'boolean', description: '本次操作后调度是否开启' },
+        supervision: nullable({
+          type: 'object',
+          description: 'run.json.supervision 的落盘结果（只读展示）',
+          properties: {
+            enabled: { type: 'boolean', description: '是否仍在调度' },
+            wakerSessionId: nullable({ type: 'string' }, '被唤醒的发起会话 id'),
+            lastWokeAt: nullable({ type: 'string' }, '上次唤醒时间（ISO 8601）'),
+            nextDueAt: nullable({ type: 'string' }, '下次唤醒时间（ISO 8601）'),
+            wakes: { type: 'integer', description: '累计成功唤醒次数' },
+            failures: { type: 'integer', description: '连续失败次数（达到 3 次降级）' },
+            reason: nullable({ type: 'string' }, '停用 / 降级原因（如 terminal / wake-failed: ...）'),
+          },
+          additionalProperties: true,
+        }),
+        scheduler: anyJson('调度器的内存状态（enabled / nextDueAt / wakes / failures / lastReason）'),
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        return [{
+          type: 'text',
+          text: value.enabled
+            ? `已开启 run ${value.runId} 的内建定时自审（下次 ${value.supervision && value.supervision.nextDueAt ? value.supervision.nextDueAt : '由调度器决定'}）。`
+            : `已关闭 run ${value.runId} 的内建定时自审。`,
+        }]
+      }),
+      timeoutMs: TIMEOUT_REPLY_MS,
+      async execute(args, exec) {
+        let runId
+        let enabled
+        try {
+          runId = optionalString(args, 'runId', { max: 128 })
+          if (runId === undefined) {
+            throw new ParamError('缺少必填参数 runId', '传 flow_start 返回的 runId；不知道就用 flow_watch 省略 runId 查最近一次 run。')
+          }
+          if (!checkRunId(runId)) {
+            throw new ParamError(
+              `runId「${runId}」不合法（只允许字母、数字、点、下划线、连字符，1-64 位）`,
+              'runId 来自 flow_start 的返回值，原样传。',
+            )
+          }
+          const raw = argsOf(args).enabled
+          if (typeof raw !== 'boolean') {
+            throw new ParamError('参数 enabled 必须是布尔值', '开启传 true，关闭传 false。')
+          }
+          enabled = raw
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          return failure(`读取参数失败：${messageOf(error)}`, '按参数说明改正后重发。')
+        }
+
+        // 与 HTTP 端点共用 runtime.enableSupervision（登记 + 落盘只有一份实现）；
+        // 注入的假引擎没有它就退回本地实现（测试 / 旧调用方）。
+        const sharedEnable = typeof deps.engine.enableSupervision === 'function'
+        const scheduler = deps.engine && deps.engine.supervision
+        if (!sharedEnable && (!scheduler
+          || typeof scheduler.register !== 'function'
+          || typeof scheduler.unregister !== 'function')) {
+          return failure(
+            '内建 supervision 调度不可用（引擎不是 runtime 门面）',
+            '确认 Host 侧已按 07 §7 起 runtime（engine.enableSupervision / engine.supervision）；这不是参数问题，重发同一请求不会变。',
+          )
+        }
+        const meta = await readRunMeta(deps.runsRoot, runId)
+        if (!meta) {
+          return failure(`run 不存在：${runId}`, '用 flow_watch 确认 runId；省略 runId 则审查最近一次 run。')
+        }
+        // 07 §7：已收尾的 run 登记进去也永远不会被唤醒（planWake 的 terminal 分支直接停），
+        // 所以 enable 直接拒绝，不制造一个「开着但不会响」的假象。
+        if (enabled && TERMINAL_VERDICTS.has(meta.status)) {
+          return failure(
+            `run 已结束（${meta.status}），不能开启 supervision`,
+            '已收尾的 run 不需要定时自审；要自审就用 flow_start 起一个新 run，再对它开启。',
+            false,
+            { runId },
+          )
+        }
+
+        const wakerSessionId = sessionIdOf(exec)
+        if (enabled && !wakerSessionId) {
+          return failure(
+            '拿不到当前会话 id，无法确定「到点唤醒谁」',
+            'flow_supervise 必须在会话里调用；或改用 POST /runs/<id>/supervision 并显式传 wakerSessionId。',
+          )
+        }
+
+        let result
+        try {
+          if (sharedEnable) {
+            result = await deps.engine.enableSupervision(runId, enabled
+              ? { enabled: true, wakerSessionId }
+              : { enabled: false })
+          } else if (enabled) {
+            scheduler.register(runId, { wakerSessionId })
+            const saved = await saveSupervision(deps.runsRoot, runId, {
+              enabled: true,
+              wakerSessionId,
+              reason: null,
+              failures: 0,
+            })
+            result = {
+              runId,
+              enabled: true,
+              supervision: saved,
+              scheduler: typeof scheduler.status === 'function' ? scheduler.status(runId) : null,
+            }
+          } else {
+            scheduler.unregister(runId)
+            const saved = await saveSupervision(deps.runsRoot, runId, { enabled: false, reason: 'disabled-by-caller' })
+            result = {
+              runId,
+              enabled: false,
+              supervision: saved,
+              scheduler: typeof scheduler.status === 'function' ? scheduler.status(runId) : null,
+            }
+          }
+        } catch (error) {
+          const status = error && Number.isInteger(error.status) ? error.status : null
+          if (status === 400 || status === 404) return failureOf(error, { action: '开关 supervision ' })
+          // 写盘失败（权限 / 目录被删的竞态）：调度器内存状态已改，如实报错而不是假装成功。
+          return failure(
+            `开关 supervision 失败：${messageOf(error)}`,
+            '调度器内存状态可能已变更；稍后重试一次，仍失败就告诉主人（run.json 可能不可写）。',
+            true,
+            { runId },
+          )
+        }
+        if (!result || !result.supervision) {
+          return failure(`run 不存在：${runId}`, 'run.json 读不到；用 flow_watch 确认这个 run 还在。')
+        }
+        return jsonSafe({
+          ok: true,
+          runId,
+          enabled: result.enabled,
+          supervision: result.supervision,
+          scheduler: result.scheduler ?? null,
+        })
       },
     },
 

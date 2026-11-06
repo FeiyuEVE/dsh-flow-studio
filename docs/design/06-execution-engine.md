@@ -3,11 +3,14 @@
 > 本册定义「图怎么变成真跑」：run 生命周期、主循环、提示词、结构化产物、事件映射、用量采集、
 > 取消与失败、接口与客户端控制、以及怎么在没有真模型的情况下做 Docker 测试。
 > 依赖 05 的事件契约（本册只规定**谁在什么时候写哪条事件**，不重新定义事件格式）。
+>
+> v0.7 增补：§17 外部 executor、§18 内建 supervision；§1 / §2 / §4.1 / §8 / §13.5 / §15 / §16
+> 已按 v0.7 实现更新。
 
 ## 1 目标与非目标
 
-**要做**：一次 run 从开始节点沿 `next` 边推进；每个阶段节点真的起一个子 agent 会话（`spawn`），
-用到该节点配置的角色/任务/产物/skill；节点返回结构化判定；判定 `reject` 时沿 `reject` 边回退、
+**要做**：一次 run 从开始节点沿 `next` 边推进；每个阶段节点起一个节点主管会话（v0.7 起默认走
+`ctx.agents.create` 的**顶层会话**，见 §16），用到该节点配置的角色/任务/产物/skill；节点返回结构化判定；判定 `reject` 时沿 `reject` 边回退、
 目标节点 `attemptId+1` 重跑；全程按 05 写事件，指标与抽屉自动出数；可停止。
 
 **不做（v0.4 范围外）**：并行分支（同一层多个可执行节点）、条件边、运行中改图、跨 run 断点续跑、多人协作。
@@ -31,7 +34,35 @@
 - 到 `end` 节点且全部阶段通过 → `done`。
 - 调用 `stop` 或进程取消 → 中止在飞请求，写 `run/end{status:'aborted'}` → `aborted`。
 - 任一节点 `failed`、超时、或超 `maxRounds` → 写 `node/end{status:'failed'}` 与 `run/end{status:'failed'}` → `failed`。
-- 引擎同一时刻只允许一个 run 在跑（全局锁）；已有运行中 run 时 `start` 返回 409。
+- 并发按 run 不设上限（v0.7）：`src/runtime.js` 为每个 runId 建一个 Engine 实例并行跑；唯一 409 =
+  **同一个 runId 已在跑**；跨进程单写者仍由 run 目录的 `lock.json` 租约保证（§13.3）。
+
+### 2.1 v0.7 持久化绑定字段
+
+`run.json` 另有三组字段，随 start 一次写入、run 内只读。**最终裁决在 `engine.start`**：
+HTTP 路由与 `flow_start` 只做形状校验（workspace 必须是绝对路径、worktree 必须是 `auto|on|off`）
+和参数传递，不自己决定隔离。
+
+| 字段 | 形状 | 取值 / 语义 |
+|---|---|---|
+| `workspace` | `{ id, path, realpath, isGit, gitRoot }` | `id = sha256(realpath)` 前 12 位小写 hex；`gitRoot` 是 `git rev-parse --show-toplevel` 的结果（仓库根工作区等于 `realpath`；子目录工作区指向上层仓库根且 `isGit=false`；非 git 仓库为 null）；显式 workspace 不可用 → 400 |
+| `worktree` | `{ enabled, reason, decidedBy, path, branch, baseCommit, createdAt }` | `decidedBy` 恒为 `initiator`；未启用时 `path / branch / baseCommit / createdAt` 均为 null；`reason` 见下表 |
+| `sessionMode` | `'top-level' \| 'legacy-subagent' \| 'injected' \| 'stub' \| 'unavailable'` | 本次 run 节点会话的真实形态；不把降级路径谎称 top-level |
+
+`worktree.reason` 的确定取值：
+
+| reason | 何时出现 |
+|---|---|
+| `git-workspace` | 工作区是 git 仓库根，`auto` / `on` 建成功 |
+| `not-a-git-repo` | `auto` + 工作区不是 git 仓库根（含子目录：`isGit=false && gitRoot!=null`） |
+| `disabled-by-initiator` | 发起方传 `worktree:'off'` |
+| `auto-without-initiator` | 没有发起方工作区（`options.workspace` / cwd / 会话 header.cwd 都没有），只能回落 `process.cwd()`；`auto` 不擅自建 worktree |
+| `create-failed: <原因>` | `auto` 下 `git worktree add` 失败（`enabled:false` + 一条 warn），绝不假装已隔离 |
+
+`run.json.startOptions` 是**创建 run 时**记下的发起参数（`{ workspace?, worktree? }`，不在
+runstore 白名单里），只用于 `POST /runs/<id>/start` 把参数交给 `engine.start`；它不是第二份
+权威记录。run 一旦开始，带不同 `workspace` 再 start → 400（「该 run 已绑定工作区，不能中途更换」）；
+没有 PATCH 路由。`sessionMode` 的判定见 §16.2.1。
 
 ## 3 主循环
 
@@ -60,8 +91,15 @@ start(flowSnapshot):
 
 ### 4.1 单 agent（`mode='single'`）
 1. 拼提示词（§6）；
-2. `ctx.subagents.startActivation({ provider:'spawn', label: '<runId>/<nodeId>#<attempt>', delivery:'caller', signal, request:{ prompt, parent: 当前会话, outputSchema } })`；
-3. `await activation.result` → `structured` 即结构化产物；`dispose()` 收尾（无论成功失败）。
+2. 默认路径：`ctx.agents.create({ sessionId: nodeSessionId(runId, node.id, attempt), meta:{ cwd, agentPreset? }, agentOptions })`
+   建一个**顶层会话**（绝不传 `parentAgent` / `meta.parentSession` / `meta.origin` / `delegationDepth`，
+   否则会从顶层会话列表消失；详见 §16.2）；
+3. `handle.agent.followup(buildFollowupPayload(...))` → `await handle.agent.whenIdle()` → 从该会话
+   最后一条 assistant 消息解析 `structured`；句柄留到 run 收尾统一 `dispose()`，不在节点结束时释放
+   （节点可能被二次激活；`dispose()` 只关句柄、不删日志，见 §16.2.1）。
+
+没有 `ctx.agents.create` 的旧宿主才退回 `ctx.subagents.startActivation({ provider:'spawn', … })`
+（`sessionMode:'legacy-subagent'`），这条路径不是 v0.7 的默认实现。
 
 ### 4.2 团队（`mode='team'`）
 lead 会话照 §4.1 起，团队分工写进提示词（每个成员的名字/角色/任务各一段），并要求 lead 用子 agent 工具分发；
@@ -140,7 +178,7 @@ lead 不返回成员级明细时，摘要标 `membersPartial: true`，不编造�
 
 ## 8 用量采集
 
-- 订阅 `session/event`（`{ global: true }`），只关心本 run 已知的会话 id（引擎在 spawn 后把 `sessionId → {nodeId, attemptId, memberId}` 登记进内存映射）。
+- 订阅 `session/event`（`{ global: true }`），只关心本 run 已知的会话 id（引擎在节点会话建立后把 `sessionId → {nodeId, attemptId, memberId}` 登记进内存映射）。
 - `assistant/message.data.usage` → `model/call`，`callId` 取消息 id（无则用 `<sessionId>:<seq>`）；四桶照抄，`reasoning` 仅在 `≤ output` 时带上。
 - `tool/call` 里 `name === 'skill'` → `skill/load`：参数 JSON 里的 `name` 是 skill 名，`ok` 取决于同 `callId` 的工具结果是否有 error。
 - `tool/call` 其他工具 → `tool/call` 事件（只记名字与 `ok`，参数摘要 ≤200 字，不记全文）。
@@ -180,7 +218,8 @@ lead 不返回成员级明细时，摘要标 `membersPartial: true`，不编造�
 
 ## 12 可测性（Docker 测试的关键）
 
-- 引擎做成**依赖注入**：`createEngine({ activate, now, readUsage, signal })`。`activate` 是唯一的模型入口，测试传桩函数即可。
+- 引擎做成**依赖注入**：`createEngine({ activate, now, readUsage, signal })`。`activate` 是
+  **dsh 节点会话**的唯一模型入口，测试传桩函数即可；外部 executor（§17）走独立子进程，不经过 `activate`。
 - **测试钩子**：环境变量 `FLOW_STUDIO_STUB_ENGINE=1` 时，Host 用内置桩执行器（按节点标题匹配预设剧本，产出 pass/reject 与合成 usage）。**只在测试台用**，`/health` 返回 `engine: "stub"` 让人一眼看出不是真跑。
 - 单测（`test/engine.test.mjs`）：单节点通过、两节点通过、打回一轮后通过、超 `maxRounds` 失败、停止中止、结构不合格失败、用量归属与去重。
 - Docker e2e（测试台）：装包 → 建 run → `start`（stub 模式）→ 轮询到 `done`/`failed` → 断言事件序列、`quality.state`、`progress.ratio`、`reject/trigger` 计数、`attemptId=2`、drawer API 数据齐全。
@@ -221,7 +260,9 @@ run 目录放 `lock.json`（pid、host、heartbeatAt、ttlMs）；`start` 先抢
 `GET /runs/<id>` 返回 `storageError`。启动时修复「jsonl 有 `run/end` 但 `run.json` 不是终态」的不一致。
 
 ### 13.5 主循环终止性（B2）
-`start` 前调用 `validateFlow`，**errors 一律 400**（不允许带着断头路/成环/多出边开跑）。
+`start` 前调用 `validateFlowForRun`，**errors 一律 400**（不允许带着断头路/成环/多出边开跑）。
+该函数是**启动侧的严格口径**：结构规则之外，还包含 executor 的两条规则（custom 缺
+`executorCommand`、外部 executor 配 `team`）；流程保存时这些 errors 只报告、不拦保存，见 §17.1。
 v1.1 额外规则：恰好一个 start、至少一个 end；每个非 end 节点**恰好一条 next 出边**（多出边直接 error，
 不做「取最左」）；reject 目标必须在上游且存在；所有阶段必须能到达 end。
 循环内维护 `next` 访问集：重复访问同一节点且不是打回 → `node/end failed` + `run/end failed`；
@@ -263,8 +304,9 @@ run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默�
 重跑节点的「上游产物」只能取**沿 next 边能到达当前节点**且当前有效的 passed 记录，打回时把失效路径从 passed 集合移除。
 
 ### 13.11 模型覆盖（M5）
-`node.model` 必须真正传给子 agent：`request.agentOptions = { model: node.model }`（spawn provider 支持）；
-宿主不支持时启动前报错，不允许「界面能填、实际不生效」。
+`node.model` 必须真正传给节点会话：默认路径是
+`agents.create({ …, agentOptions: { model: node.model } })`；兼容 spawn 路径放
+`request.agentOptions`。宿主不支持时启动前报错，不允许「界面能填、实际不生效」。
 
 ### 13.12 运行详情数据面（live 快照 + `agent/message`）
 
@@ -399,62 +441,76 @@ v0.4.2 之前只能从 Web 面板点「运行」。本节定义一组**模型工
 ```
 ① flow_list / flow_start
      主 agent 在当前会话里启动 run
-     → engine.start(runId, { parent: exec.agent })
-     → request.parent = 当前会话的 Agent，request.cwd 省略
-     → 子 agent 继承本会话的工作区（不需要也不应该再选目录）
+     → engine.start(runId, { parent: exec.agent, workspace: <调用方会话 header.cwd> })
+     → 工作区 / worktree 由 engine.start 最终裁决并写进 run.json
+     → 节点会话是顶层会话，cwd = worktree.path 或 workspace.path
 
-② proactive_set
-     after_seconds = supervision.nextCheckSeconds
+② flow_start 启动成功后**自动开启内建 supervision**（返回 supervision.enabled=true）
+     不需要再挂 proactive_set；到点由 runtime 的调度器唤醒发起会话
+     只有 enabled=false（引擎不支持 / 登记失败）才回退到旧方式：
+     proactive_set after_seconds = supervision.nextCheckSeconds
      prompt        = supervision.alarmPrompt（完整提示词，含 runId / flow_watch / proactive_reclaim）
 
-③ 每次闹钟醒来 → flow_watch（runId）
-     verdict 正常（healthy / running 类）→ proactive_reclaim 安静结束，不打扰主人
+③ 每次被唤醒 → flow_watch（runId）
+     verdict 正常（healthy / running 类）→ 安静结束本轮，不打扰主人
      异常（stalled / looping / deviating / no-progress）或已跑完（done / failed / aborted）
        → 把结论与需要决策的点通知主人
 ```
 
 工具描述（`description`）里必须写清这三步——那是模型唯一会读到的使用说明。
+`alarmPrompt` / `nextCheckSeconds` 从 0.5.0 起保留，但 v0.7 的推荐路径是内建调度（§18）。
 
 ### 15.2 工具清单
 
 | 工具 | 读写 | 入参 | 出参（成功） |
 |---|---|---|---|
 | `flow_list` | 只读 | `{ limit?: integer }`（默认 20、上限 100） | `{ ok, flows: [{ id, name, nodeCount, edgeCount, updatedAt }] }` |
-| `flow_start` | 写（exclusive） | `{ flowId?, flowName?, task?, name? }`（`flowId` / `flowName` 二选一，都不给 → 失败并提示先 `flow_list`） | `{ ok, runId, flowId, flowName, status, workspace, supervision }` |
+| `flow_start` | 写（exclusive） | `{ flowId?, flowName?, task?, name?, workspace?, worktree? }`（`flowId` / `flowName` 二选一，都不给 → 失败并提示先 `flow_list`；`worktree ∈ auto/on/off`） | `{ ok, runId, flowId, flowName, status, workspace, supervision }` |
 | `flow_watch` | 只读（`isConcurrencySafe`） | `{ runId? }`（省略 = 最近一次 run） | 审计结果原样 + `{ ok, runId, flowId, supervision }` |
 | `flow_stop` | 写 | `{ runId: string }`（必填） | `{ ok, runId, status }` |
+| `flow_supervise` | 写 | `{ runId: string, enabled: boolean }`（都必填） | `{ ok, runId, enabled, supervision, scheduler }` |
+
+v0.7 一共 7 个模型工具：上面 5 个 + 收件箱的 `flow_send_message` / `flow_reply`（定义见 §16.8）。
 
 命名规则：`flowId` 优先；没有 id 时按 `flowName` **精确匹配**，再退不区分大小写；同名多份 → 失败并列出候选 id
 （让模型用 `flowId` 指定，而不是猜）。`task` 是用户这次要跑的任务原文，写进 `run.json.name`；显式 `name` 优先于 `task`。
 
-### 15.3 `engine.start(runId, { parent })`：per-start 父会话
+### 15.3 `engine.start(runId, { parent, workspace, worktree })`
 
-`engine.start` 增加**可选**第二参数：
+`engine.start` 的可选第二参数（v0.7）：
 
 ```js
-engine.start(runId)                    // 旧调用：行为完全不变
-engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话（Agent 对象）
+engine.start(runId)                                  // 旧调用：行为不变
+engine.start(runId, { parent })                      // 本会话作为发起方（Agent 对象）
+engine.start(runId, { workspace, worktree })         // 显式工作区 / worktree 策略
 ```
 
-- 优先级：`startParent`（本次覆盖）→ `this.parent` → `resolveParentFn()` → `agents.roots()` 最后一个。
-  不传 / 传 `null` 时 `startParent` 为 `null`，后三段回落的既有语义**一字未改**。
-- 生命周期：只在这一次 run 内有效；run 收尾（`_cleanupActive()`）清空，不影响下一次 `start`。
-  非对象 `parent` 在抢 `START_LOCK` 之前以 400 拒绝，不会留下占位的运行态。
-- 不新增事件 kind、不写 runlog、不改变 `run/start` 与 `run.json` 的任何字段：
-  父子关系只体现在 `subagents.startActivation({ request: { parent } })` 的调用参数上。
-- 并发语义不变：模块级 `START_LOCK` 仍然保证同一时刻只有一个 run（第二个 `start` → 409）。
+- `parent` 只用于三件事：`workspace` 缺省时提供 `header.cwd` 作为候选（`source:'initiator-session'`）、
+  记录 `startedBy`（`flow_send_message` 省略 runId 时取「本会话启动的最新 run」）、以及旧宿主兼容路径。
+  **它不再传给 `agents.create`**：v0.7 的节点主管会话是顶层会话（§16.2）。
+- `workspace` 优先于 `options.cwd`、构造时 `cwd`、会话 `header.cwd`；`worktree` 只接受
+  `auto / on / off`，其它值 400。两者最终都由 `engine.start` 裁决并写进 `run.json`（§2.1）。
+- 生命周期：`startParent` / `startCwd` / `startAgentPreset` 只活在一次 run 内，
+  run 收尾（`_cleanupActive()`）清空，不影响下一次 `start`。非对象 `parent` 在进入临界区前
+  以 400 拒绝，不留下占位运行态。
+- 并发：v0.7 没有模块级 `START_LOCK`、没有并发上限。不同 runId 并行；同一 runId 的二次 start
+  由 `src/runtime.js` 的注册表返回 409。
 
-### 15.4 工作区继承
+### 15.4 工作区来源与继承
 
-`ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', request:{ parent, cwd?, prompt, ... } })` 中：
+v0.7 的默认路径不再靠子会话继承 `parent.cwd`，而是把工作区显式交给引擎裁决：
 
-- `request.parent` 是 **Agent 对象**（不是 id 字符串）；
-- `request.cwd` 省略时**继承父 agent 的工作目录**。
+1. `flow_start` 未显式传 `workspace` 时，取 `exec.agent.session.header.cwd` 作为 workspace；
+2. `engine.start` 解析成 `{ id, path, realpath, isGit, gitRoot }`，按 `worktree` 策略决定是否
+   建 worktree，并把结果写进 `run.json.workspace / run.json.worktree`（§2.1）；
+3. 节点主管会话的 `cwd`：worktree 开着用 `worktree.path`，否则用 `workspace.path`
+   （`_sessionCwd()`）；外部 executor 用同一个 cwd。
 
-所以 `flow_start` 直接把 `exec.agent`（当前会话的 Agent）作为 `request.parent` 传下去，
-`request.cwd` 不传——从哪个会话启动，子 agent 就在哪个工作区里干活，无需额外选择。
-返回值里的 `workspace.inheritedFrom` 是该会话 id（`exec.agent.session.id`，取不到为 `null`），
-只用于向模型/用户交代「继承了谁」，不参与执行。
+旧兼容路径（没有 `ctx.agents.create`）仍走
+`ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', request:{ parent, cwd?, prompt, … } })`：
+`request.parent` 是 **Agent 对象**，`request.cwd` 省略时继承父 agent 的工作目录。
+返回值里的 `workspace.inheritedFrom` 是发起会话 id（取不到为 `null`），只用于向模型/用户交代
+「从哪个会话启动」，不参与执行。
 
 ### 15.5 定时自审（`supervision`）
 
@@ -462,12 +518,15 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
 
 | 字段 | 语义 |
 |---|---|
-| `nextCheckSeconds` | 建议的审查间隔（`proactive_set` 的 `after_seconds`）。`flow_start` 默认 180；`flow_watch` 优先用审计模块给的值，钳制在 30–900；终态（done / failed / aborted）为 `null` |
-| `alarmPrompt` | 完整中文提示词（≥40 字），包含 `runId`、要调 `flow_watch`、healthy 就 `proactive_reclaim` 安静结束、异常或跑完才通知主人；终态时说明「不必再挂闹钟」 |
+| `nextCheckSeconds` | 建议的审查间隔。`flow_start` 默认 180；`flow_watch` 优先用审计模块给的值，钳制在 30–900；终态（done / failed / aborted）为 `null` |
+| `alarmPrompt` | 完整中文提示词（≥40 字），包含 `runId`、要调 `flow_watch`、healthy 就安静结束、异常或跑完才通知主人；终态时说明「不必再查」。0.5.0 起保留，作为内建调度不可用时的**回退** |
 | `watchTool` | 恒为 `'flow_watch'` |
-| `hint`（仅 `flow_start`） | 一句话：用 `proactive_set` 的 `after_seconds=nextCheckSeconds` 把闹钟挂上，之后每次醒来调 `flow_watch` |
+| `enabled`（仅 `flow_start`） | v0.7：内建 supervision 是否已在这个 run 上开启；`true` 时不要再挂 `proactive_set` |
+| `scheduler`（可选） | `run.json.supervision` 的只读快照（`enabled / wakerSessionId / lastWokeAt / nextDueAt / wakes / failures / reason`）；未开启为 null |
+| `hint`（仅 `flow_start`） | 一句话：已开启时说明「不需要挂闹钟，醒来调 `flow_watch`」；未开启才给 `proactive_set` 回退步骤 |
 
-审查是**旁路**：闹钟到点后由主 agent 主动调用工具，引擎不自己轮询、不自己通知。
+v0.7 的推荐路径是**内建 supervision**：runtime 的唯一调度器轮询到点后唤醒发起会话，
+主 agent 醒来仍调 `flow_watch`；`proactive_set` 只在 `enabled=false` 时作为回退。详见 §18。
 
 ### 15.6 `flow_watch` 的边界与数据来源
 
@@ -488,8 +547,8 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
 - 失败分流：流程不存在 404 → hint 指向 `flow_list`；流程不合法 → 在**建 run 之前**由
   `validateFlowForRun` 挡下；已有 run 在跑 → 409（`engine.active` 提前挡一次，跨实例由引擎的模块级锁兜底）；
   `flow_stop` 的目标不在运行中 → hint 明确写「这个 run 不在运行中」。
-- 同一时刻只有一个 run：`flow_start` 在已有 run 运行时直接失败，不建新 run；
-  提醒模型不要在流程里再起一个流程。
+- 并发按 run 不设上限（v0.7）：不同 runId 可以同时跑；`flow_start` 只会在**同一个 runId
+  已在跑**时失败（409），不会因为别的 run 在跑而拒绝。
 
 ### 15.8 注册与兼容
 
@@ -521,8 +580,12 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
 
 ### 16.2 一个节点一个会话（引擎侧规则）
 
-1. **首次激活**：走既有的 `ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', … })`，
-   拿到 `childId` 后把 `{ sessionId, createdAt, lastUsedAt }` 写进 `sessions.json`。
+1. **首次激活**：默认 `ctx.agents.create({ sessionId: nodeSessionId(runId, node.id, attempt),
+   meta:{ cwd, agentPreset? }, agentOptions })`，建出**顶层会话**；绝不传
+   `parentAgent` / `meta.parentSession` / `meta.origin` / `delegationDepth`。拿到句柄后把
+   `{ sessionId, createdAt, lastUsedAt }` 写进 `sessions.json`。没有 `ctx.agents.create` 的旧宿主
+   才退回 `ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', … })`
+   （`sessionMode:'legacy-subagent'`）。
 2. **二次激活**（同一节点被打回重跑、或同一 run 里再次到达该节点）：
    - `sessions.json` 命中该节点 → **绝不新起会话**；
    - 先 `ctx.agents.get(sessionId)`：拿到活的 Agent 就 `agent.followup(prompt)` 注入本轮提示词；
@@ -533,13 +596,30 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
      `outputSchema` 相同结构的 JSON；
    - 解析失败按既有「结构化输出不合格」路径收口：`node/end failed` + 校验错误，
      不静默吞、不回退成新会话。
-3. **生命周期**：节点结束时**不 dispose**。activation 句柄按 nodeId 存在 run 级 Map / Set 里，
+3. **生命周期**：节点结束时**不 dispose**。句柄按 nodeId 存在 run 级 Map / Set 里，
    只在 run 进入终态（`done` / `failed` / `aborted`）或 `stop` 收尾时统一 `dispose()`；
+   `dispose()` **只关闭会话句柄，不删除持久化日志**，会话仍可从列表打开 / `resume`（§16.2.1）。
    中途失败也不提前释放——失败节点可能还要被二次激活。
 4. **降级**：没有 `ctx.agents` 服务（测试台 / 纯注入环境）时，退化为「每次新会话」，并记一条
    `warn` 日志；既有测试与桩引擎路径不受影响。
 5. **事件归属**：复用会话时把 `sessionBindings` 的 `attemptId / traceId` 重挂到新的 attempt，
    避免 `model/call`、`agent/message`、成员事件被记到上一轮。
+
+### 16.2.1 顶层会话的实测口径（v0.7 T2）
+
+- **判据看 session header，不看 `roots()`**：`agents.create` 建出的会话 header 没有
+  `parentSession` / `origin`，`delegationDepth: 0` → 顶层，Web 侧栏可见；子 agent 会话带
+  `parentSession` / `origin:'subagent'` / `delegationDepth:1`。`ctx.agents.roots()` 在 `resume`
+  之后也会把 agent 当 root，但持久化血缘不变，**不能用来判断是否顶层**。
+- **会话列表接口**是 typert RPC `POST /api/session/list`（`GET /api/sessions` 是 404）。
+  子 agent 会话 API 列表里也有，只是 Web 客户端按 `origin==='subagent'` 过滤掉。
+- **`dispose()` 不删日志**：只从内存 store 移除并关持久化句柄；会话仍在列表
+  （`agentAvailable:false`）、磁盘文件仍在、进程重启后仍可 `resume`。
+- **`blank:true` 的会话在 Web 侧栏不可见**：只 `create` 不跑 turn 的会话 API 有、UI 看不到。
+  节点会话一定会跑 turn，不受影响；任何「建了不跑」的路径都不能指望它在侧栏可见。
+- `nodeSessionId(runId, nodeId, attempt)` = `<runId>--<nodeId>` 的 slug（只含
+  `[A-Za-z0-9._-]`，总长 ≤96）；同一 `(runId,nodeId)` 的不同 attempt **复用同一个 id**；
+  slug 有损时追加 `-` + 8 位内容哈希。
 
 ### 16.3 收件箱事件
 
@@ -621,7 +701,8 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
   走与首次激活相同的失败路径。
 - 复用会话时 `whenIdle()` 决定「这一轮结束」；如果宿主没有 `whenIdle`，引擎只能读到 followup 之后
   已到达的事件，读不到就按解析失败处理（不伪造结果）。
-- run 结束统一 dispose 会话；进程崩溃残留的会话由宿主自己的会话回收负责（本插件不做跨进程清理）。
+- run 结束统一 dispose 会话句柄（**不删日志、不删会话文件**）；进程崩溃残留的会话由宿主自己的
+  会话回收负责（本插件不做跨进程清理）。
 
 ### 16.8 安全与兼容
 
@@ -632,3 +713,282 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
   不拼外部输入；runId 继续走 `checkRunId()`。
 - 模型工具 `flow_send_message` / `flow_reply` 只在 agents 服务可用时注册；
   它们与 HTTP 路由共用 `src/inbox.js` 的同一套内部函数，不自己拼 HTTP。
+
+## 17 外部 executor（v0.7）
+
+> 对应 07 册 R6。实现：`src/executor.js`（归一化 / argv / JSONL / 子进程）+ `src/engine.js`
+> （`_executorSpecOf` / `_writeExecutorSchema` / `_runExternalNode`）；测试：
+> `test/executor.test.mjs`、`test/engine.test.mjs` 的「engine v0.7 · 外部 executor（R6）」。
+
+### 17.1 保存宽松、启动严格
+
+v0.7 把「编辑期」和「开跑」拆成两个口径：
+
+| 动作 | 口径 | 结果 |
+|---|---|---|
+| `POST /flows`、`PUT /flows/<id>` | **宽松**：`validation.errors` 不拦保存；仍会 400 的只有形状/协议错误（body 不是 JSON 对象、PUT 缺 body、`version` 不是正整数） | 能解析成对象的请求 → 200 `{ ok, flow, validation }`；`validation.errors` 非空也照存、照推进 `version`；409 只留给 PUT 的乐观锁冲突 |
+| `POST /runs` | 只校验 `flowId` 存在 | 建出 `pending` run；不在这里拦内容 |
+| `flow_start` / `POST /runs/<id>/start` | **严格**：`validateFlowForRun(flow)`，errors 一律 400 | 不建 run / 不进入执行；错误文案带第一条具体原因 |
+
+为什么：客户端画布是 600ms 防抖自动保存，用户拖一个还没填任务的空节点、或新建空流程，
+`validateFlow` 必然报 error；保存侧把它当 400 会让每一次中间态都存不进去。真正该严的是开跑。
+因此下面这些配置**可以保存、但开不了跑**：
+
+- `executor:'custom'` 且 `executorCommand` 为空 → 启动 400；
+- `executor:'codex' | 'custom'` 且 `mode:'team'` → 启动 400。
+
+（未知 `executor` 在保存 / 读回时已被 `normalizeFlow` 收敛成 `dsh`；执行侧 `normalizeExecutor`
+仍会对绕过保存的手改流程抛 `EXECUTOR_INVALID`。）
+
+证据：`src/index.js` `rejectMalformedFlowBody()`（保存侧形状门槛）、`src/engine.js`
+`validateFlowForRun()`（含 executor 两条规则）、`test/host.test.mjs` 的「保存门禁」组、
+`test/model.test.mjs` 的「executor 校验」组。
+
+### 17.2 `node.executor` 三档
+
+| 值 | 必填 | 运行时行为 | 归一化结果 |
+|---|---|---|---|
+| `dsh`（默认） | — | 走节点主管会话（`ctx.agents.create` / 复用会话，见 §16） | `{ kind:'dsh' }` |
+| `codex` | —（`executorCommand` 可选） | 起 `codex exec` 外部进程，逐行读 `--json` | `{ kind:'codex', command, args:['exec','--json'], model }` |
+| `custom` | `executorCommand` 非空 | `sh -c <模板>` 起外部进程 | `{ kind:'custom', command, args:[], model }` |
+
+- `normalizeFlow` 把未知 `executor` 收敛成 `dsh`；`executorCommand` 按 2000 字符截断。
+- `validateFlow` 在**启动侧**（`validateFlowForRun`）检查：custom 必须有命令模板；外部
+  executor 只允许 `mode:'single'`（`team` 需要引擎观察成员会话，外部进程做不到）。
+- 执行时 `normalizeExecutor(node)` 再校验一次；非法组合抛 `EXECUTOR_INVALID`（中文原因），
+  `_executorSpecOf()` 把它转成 `StructuredOutputError`，走节点既有的「结构不合格」失败路径。
+- `codex` 的 `executorCommand` 只作为**可执行文件路径覆盖**（例如 `/path/to/codex`），
+  不是完整命令模板；custom 才是模板。
+
+### 17.3 codex 的真实命令行
+
+`buildCodexArgs()` 按 `codex exec --help`（0.166.0）拼 argv，顺序固定：
+
+```sh
+codex exec --json --output-schema <schema.json> -C <cwd> --skip-git-repo-check \
+  -s workspace-write [-m <model>] <prompt>
+```
+
+| 参数 | 值 |
+|---|---|
+| `--json` | 强制 stdout 为 JSONL |
+| `--output-schema` | 引擎每次 attempt 写出的 schema 文件（见 §17.5） |
+| `-C` | `cwd`：worktree 开着用 `worktree.path`，否则 `workspace.path` |
+| `--skip-git-repo-check` | 允许在非 git 仓库工作区跑 |
+| `-s` | 默认 `workspace-write`；只接受 `read-only / workspace-write / danger-full-access` |
+| `-m` | 仅当 `node.model` 非空时传 |
+| `<prompt>` | 位置参数，必须在所有选项最后 |
+
+- 可执行名默认 `codex`；`node.executorCommand` 非空时替换它（只换路径）。
+- 不联网、不真跑 codex 也能测：`test/executor.test.mjs` 全部用假 `spawn` 或真 `node` 子进程桩，
+  `test/engine.test.mjs` 用 `node -e` / `sh -c` 桩命令。
+
+### 17.4 custom 的命令模板
+
+- 执行方式固定 `sh -c <script>`，不经过引擎的 argv 解析。
+- `{prompt}` / `{schema}` / `{cwd}` 三个占位符会被替换，并做 POSIX shell 单引号转义；
+- 三个占位符都没有时，把 prompt 作为最后一个参数追加（同样转义）；
+- 无论模板用不用 `{schema}`，引擎都会先生成 schema 文件（见 §17.5）并传路径。
+
+stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如果 custom 只打印一段
+非 JSONL 的文本（例如整段 JSON），关闭时用整段 stdout 作为 text 回退，再按 §17.5 解析结构。
+
+### 17.5 JSONL → 节点日志 / 用量
+
+| executor 输出 | `parseCodexLine` | 引擎写入 |
+|---|---|---|
+| `{"type":"item.completed","item":{"type":"agent_message","text":"…"}}` 或 `{"type":"agent_message","text":"…"}` | `final` | 不单独写事件；最后一条作为最终文本，交给 `parseAssistantStructured` |
+| `turn.completed` 带 `usage`，或 `{"type":"usage",…}` | `usage` | 仅当 usage 非空：写一条 `model/call` |
+| 非 JSON 行、未知但带可读文本的事件 | `log` | `agent/message`（`role:'assistant'`） |
+| `command_execution` / `reasoning` / `file_change` / `mcp_tool_call` / `web_search` | `log`（带 `itemType`） | 同上 |
+| `error` / `turn.failed` / `item.failed` | `log`（`level:'error'`） | 同上（不把失败误当成功） |
+| stderr（只保留尾部 ≤2000 字符） | `stderr` | 关闭时非空则写一条节点日志 |
+
+具体字段：
+
+- **`agent/message`**：`role:'assistant'`、`text` 按码点截到 ≤2000、`truncated` 布尔、
+  `provider:'codex'|'custom'`、有 model 时带 `model`。每个节点 attempt 最多写 200 条
+  （`LOG_LIMIT`），超出的过程日志丢弃，避免一条刷屏命令撑爆事件数组。
+- **`model/call`**：`provider` 同上、`model` = 节点 model 或 `'unknown'`、
+  `callId = executor:<nodeId>:<attemptId>`（≤128）。同一 attempt 重试用**同一个 callId**，
+  聚合层按「后到整条替换」处理，不会重复计 token。
+- **四桶归一化**：`mapHostUsage()` 输出 `{ input, cacheRead, cacheWrite, output }`，缺桶补 0；
+  `reasoning` 仅在 `≤ output` 时附带。codex 的 `usage`（`input_tokens/output_tokens/total_tokens`）
+  先归一成 `{input,output,total}`，因此外部 executor 通常 `cacheRead=cacheWrite=0`。
+- **结构化输出**：最终文本先试整段 JSON，再试 ```json 围栏，最后取首个 `{` 到末个 `}`；
+  只有普通对象算数。解析不出 → `StructuredOutputError`（不伪造 pass）。
+
+**schema 文件**（每次 attempt 一个）：
+
+| 项 | 值 |
+|---|---|
+| 路径 | `<runsRoot>/<runId>/executors/<attemptId>.schema.json` |
+| 目录 / 文件权限 | 目录 0700、文件 0600 |
+| 内容 | `ENGINE_OUTPUT_SCHEMA`（与 dsh 路径同一份节点输出 schema，§4.3） |
+| 写入时机 | 起外部进程之前；写失败按普通节点错误处理 |
+
+`runsRoot` 默认 `$DSH_HOME/flow-studio/runs`（`runstore.runsDir()`）。
+
+**没有节点会话**：外部 executor 节点不调 `agents.create`、不写 `sessions.json`、
+不登记 `sessionIndex`。因此收件箱对它的可达方式只有 `queued`（消息随下一次节点提示词消费），
+`injected / resumed` 不适用；外部进程里也无法调用 `flow_reply`。
+
+### 17.6 失败语义
+
+节点级重试沿用 §9：默认重试 1 次（`FLOW_STUDIO_NODE_RETRIES`，0–5），**不新增 `attemptId`**；
+重试用尽才写 `node/end{status:'failed'}` 与 `run/end{status:'failed'}`。
+
+| 情况 | 引擎抛出 / 收口 | 是否重试 |
+|---|---|---|
+| 配置非法（未知 executor / custom 缺命令 / codex+team） | `StructuredOutputError`，文案「executor 配置不合法：…」 | 是 |
+| 子进程起不来（spawn 失败） | `Error`「无法启动外部 executor（codex）：…」 | 是 |
+| 非 0 退出 | `Error`「外部 executor（codex）非 0 退出（N）：<stderr 尾部>」 | 是 |
+| 超过 `nodeTimeoutMs`（默认 20 分钟） | `NodeTimeoutError`（`extra.timeout=true`） | 是 |
+| `stop` / run 墙钟中止 | `AbortError`；run 收成 `aborted`（不是 failed） | 否 |
+| structured 为空 / 解析失败 | `StructuredOutputError`，文案带 stderr 尾 | 是 |
+| schema 写盘失败 | 普通节点错误（按上表重试） | 是 |
+
+已经写入的 `agent/message` / `model/call` 保留；失败不会补写假的成功事件。
+
+### 17.7 为什么只允许 `mode:'single'`
+
+`team` 模式下引擎要靠 `parentSession === leadSessionId` 把成员会话绑成 `memberId`、按成员归属
+用量与事件（§4.2 / §8）。外部进程没有 dsh 会话，引擎观察不到成员，也无法把事件挂到成员上；
+所以这是**契约级限制**，不是暂未实现：
+
+- 保存侧：`validateFlow` 报 error（但保存仍 200，见 §17.1）；
+- 启动侧：`validateFlowForRun` 400；
+- 执行侧：`normalizeExecutor` 再抛一次 `EXECUTOR_INVALID`（防手改流程 / 绕过保存）。
+
+要同时用外部 agent 和团队，拆成两个节点：外部 executor 节点做单 agent 的活，team 节点用 dsh 会话。
+
+### 17.8 可复核证据
+
+```sh
+node test/executor.test.mjs     # 13 组 / 81 条断言
+node test/engine.test.mjs       # 61 组 / 493 条断言（含 v0.7 外部 executor 5 组）
+node test/model.test.mjs        # 17 组（executor 校验 1 组）
+```
+
+对应代码：`src/executor.js` 的 `normalizeExecutor` / `buildCodexArgs` / `parseCodexLine` /
+`runExternalExecutor`；`src/engine.js` 的 `_executorSpecOf` / `_writeExecutorSchema` /
+`_runExternalNode`；`src/model.js` 的 `EXECUTOR` / `validateFlow`。
+
+## 18 内建 supervision（v0.7）
+
+> 对应 07 册 R7。实现：`src/supervise.js`（纯调度）+ `src/runtime.js`（审计 / 唤醒 / 持久化接线）
+> + `src/tools.js` / `src/index.js`（两个入口）；测试：`test/supervise.test.mjs`、
+> `test/runtime.test.mjs`、`test/tools.test.mjs`、`test/host.test.mjs`。
+
+### 18.1 默认策略
+
+| run 从哪来 | supervision 默认 | 怎么开 |
+|---|---|---|
+| `flow_start` 模型工具 | **开启**：启动成功后自动 `enableSupervision(runId,{ enabled:true, wakerSessionId: 发起会话 })` | 自动；登记失败只 warn，不拖垮启动 |
+| HTTP `POST /runs` + `POST /runs/<id>/start` | **关闭** | `POST /runs/<id>/supervision` 或 `flow_supervise` |
+| 进程重启后的存量 run | 只恢复「`enabled:true` 且 `wakerSessionId` 非空」的 run | 缺 waker 的 run 跳过（避免连续 3 次失败刷噪音），之后可手动开 |
+
+`flow_start` 返回 `supervision.enabled=true` 时，提示语是「内置调度已开启，无需再挂
+proactive_set 闹钟」；`enabled=false`（引擎没有 `enableSupervision` 或登记失败）才回退到
+0.5.0 的 `alarmPrompt` / `nextCheckSeconds` 手动闹钟。**推荐路径是内建调度**，旧字段保留只为兼容。
+
+### 18.2 调度归属与节奏
+
+- 一个 `createRuntime()` 只起**一个** `SupervisionScheduler`、一个 `setInterval`；
+  默认 **15s** 一跳（`supervisionIntervalMs` 优先，其次 `intervalMs`），定时器 `.unref()`，
+  不吊住事件循环。
+- runtime 创建时就 `supervision.start()`；`runtime.dispose()` 时 `stop()`。
+  每个 run 不单独起定时器。
+- 分工：`supervise.js` 只决定「该不该唤醒 / 下次何时 / 失败几次降级」；
+  `evaluate`（runtime 调 `auditWorkflow`）、`wake`（`agents.get` / `resume` + `followup`）、
+  `load` / `save`（run.json）全部由 runtime 注入。supervise 不 import dsh、不直接读写 run.json。
+- `tick()` 有重入保护：上一轮未结束时，新一轮直接返回 `{ skipped:true }`。
+
+### 18.3 `planWake` 的间隔规则
+
+| 输入 | `reason` | 间隔 | `nextDueAt` |
+|---|---|---|---|
+| verdict 或 `run.status` 是 `done / failed / aborted` | `terminal` | — | `null`（停止调度） |
+| verdict `pending` | `pending` | 30s | 基准 + 30s |
+| verdict `healthy` | `healthy` | 180s | 基准 + 180s |
+| verdict `stalled / looping / deviating / no-progress` | `anomaly` | 60s | 基准 + 60s |
+| verdict 缺失 / 未知 | `unknown-verdict` | 60s（异常侧保守） | 基准 + 60s |
+
+- 基准时间：`lastWokeAt ?? run.startedAt ?? now`；坏日期不抛错，按 `now` 处理。
+- `shouldWake = (run.status === 'running' || 'pending') && now >= nextDueAt`；
+  status 缺失 / 未知一律不唤醒（宁可少叫一次）。
+- 对外时间字段一律 ISO-8601 字符串。
+
+### 18.4 幂等与重启恢复
+
+- 每次 tick 先 `load(runId)` 读 `run.json.supervision`，与内存状态合并；
+  同一 `nextDueAt` 只唤醒一次。
+- 到点唤醒后**立刻推进** `nextDueAt`（成功、失败都推进），以本次唤醒时间为新基准，
+  避免同一个 due 反复叫。
+- 写盘失败（`save` 抛错）只 warn；内存状态仍推进，保证本轮不会重复唤醒。
+- 重启恢复：`runtime.supervisionReady` 扫描 `listRuns(limit:100)` 中 `status ∈ {pending,running}`
+  且 `supervision.enabled === true`、`wakerSessionId` 非空的 run，`register()` 登记；
+  **不立刻唤醒**，第一次唤醒仍由 `nextDueAt` 决定。
+- 多进程/多实例：tick 时若落盘 `lastWokeAt` 比内存新，以落盘为准，避免重复唤醒；
+  这不是分布式锁，跨进程的 run 写者互斥仍由 run 目录的 `lock.json` 租约负责。
+- 显式 `register()` 是「重新启用」动作：对已写 `enabled:false` 的 run 再次登记，
+  会从 0 开始计数（旧 `wake-failed` 结论作废）。
+
+### 18.5 连续 3 次失败降级
+
+- `wake` 返回 `false` 或抛错 → `failures += 1`；成功一次 → `failures = 0`。
+- `failures >= 3` → `enabled:false`、`reason:'wake-failed: <原因>'`、`unregister(runId)`，
+  并写一条 warn 级宿主日志；**不新增 runlog 事件**，状态只在 `run.json.supervision` 与日志里。
+- 降级后不再尝试；要恢复由 `flow_supervise` / `POST /runs/<id>/supervision` 重新开启。
+- 终态（done / failed / aborted）：run 收尾时 runtime 立即 `unregister` 并落盘
+  `{ enabled:false, reason:'terminal' }`；调度器 tick 里也会做同样收口。
+
+### 18.6 唤醒动作
+
+到点后 runtime 的 `wakeRun(runId,{ wakerSessionId })`：
+
+1. 取 `ctx.get('agents')`；不可用 → 抛错（计一次失败）；
+2. `wakerSessionId` 为空 → 抛错（计一次失败）；
+3. `agents.get(wakerSessionId)` 拿活 Agent；拿不到就 `agents.resume({ resumeSessionId })`；
+4. `agent.followup(buildFollowupPayload({ text: supervisionWakePrompt(runId), … }))`。
+
+提示词固定包含：`runId`、要求调用 `flow_watch`、明确「这是内置调度唤醒，不需要再手动挂
+proactive_set 闹钟」、以及 healthy 就结束本轮 / 异常或跑完才通知主人。实现见
+`runtime.supervisionWakePrompt()`。
+
+### 18.7 两个入口
+
+| 入口 | 入参 | 行为 |
+|---|---|---|
+| `flow_supervise`（模型工具） | `{ runId, enabled }`（都必填） | `enabled:true` 时用**当前会话 id** 作 `wakerSessionId`；`false` 时 unregister + 落盘 `disabled-by-caller`；返回 `{ ok, runId, enabled, supervision, scheduler }` |
+| `POST /runs/<runId>/supervision` | `{ enabled: boolean, wakerSessionId?: string }` | 与 `flow_supervise` 共用 `runtime.enableSupervision()`；`enabled:true` 对已收尾 run → 400；省略 `wakerSessionId` 会登记一个叫不醒的 run，建议显式传 |
+| `GET /runs/<runId>/supervision` | — | 返回 `{ supervision: run.json.supervision, scheduler: scheduler.status(runId) }` |
+
+- `scheduler.status()` 字段：`{ enabled, nextDueAt, wakes, failures, lastReason }`。
+- 客户端**只读展示**：运行详情与 `flow_watch` 的 `supervision.scheduler` 都读 run.json；
+  开关由工具 / HTTP 负责。
+
+### 18.8 `run.json.supervision` 字段
+
+| 字段 | 类型 | 语义 |
+|---|---|---|
+| `enabled` | boolean | 是否仍在调度；缺省按 `true` 读，但重启恢复只认显式 `true` |
+| `wakerSessionId` | string \| null | 到点唤醒哪个会话（发起会话 id）；缺省无法唤醒 |
+| `lastWokeAt` | ISO string \| null | 上次唤醒时间（成功或失败都推进） |
+| `nextDueAt` | ISO string \| null | 下次到期时间；`null` = 已停 |
+| `wakes` | 非负整数 | 累计成功唤醒次数 |
+| `failures` | 非负整数 | 连续失败次数；成功清零，达到 3 降级 |
+| `reason` | string \| null | 最近一次判定 / 停用原因：`healthy` / `anomaly` / `pending` / `terminal` / `disabled-by-caller` / `wake-failed: …` 等 |
+
+### 18.9 可复核证据
+
+```sh
+node test/supervise.test.mjs    # 27 组 / 194 条断言
+node test/runtime.test.mjs      # 16 组 / 152 条断言
+node test/tools.test.mjs        # 35 组 / 336 条断言（含 flow_start 自动开启、flow_supervise）
+node test/host.test.mjs         # 40 组（含 POST /runs/<id>/supervision）
+```
+
+关键用例：`planWake` 的终态 / pending / healthy / 异常 / 未知 verdict 五档，到点只唤醒一次、
+连续 3 次失败降级、成功清零、重启恢复计数与 `nextDueAt`、终态自动摘除、两进程落盘较新者优先、
+tick 重入保护、`flow_start` 自动开启与失败回退、HTTP 启用/禁用。

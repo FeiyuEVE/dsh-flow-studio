@@ -13,6 +13,44 @@
 import { EDGE_KIND, EXEC_MODE, LIMITS, NODE_KIND } from '../model.js'
 import { h, rt } from './runtime.js'
 
+/**
+ * 外部执行器（07 §6）：默认 `dsh` 走节点会话；`codex` / `custom` 起外部进程。
+ * 服务端只允许 `mode:'single'` 配外部执行器，保存时 400 —— 面板要在选的时候就拦住。
+ */
+export const EXECUTOR_KINDS = Object.freeze(['dsh', 'codex', 'custom'])
+export const DEFAULT_EXECUTOR = 'dsh'
+export const EXECUTOR_COMMAND_MAX = 2000
+
+const EXECUTOR_OPTIONS = [
+  { value: 'dsh', label: 'dsh（默认）' },
+  { value: 'codex', label: 'codex' },
+  { value: 'custom', label: 'custom' },
+]
+
+/**
+ * 读节点上的执行器。旧数据没有该字段 → `dsh`；
+ * 宿主 normalizeFlow 会把白名单外字段收进 `extras`（往返保存不丢），这里也认那份。
+ */
+export function executorOf(node) {
+  const direct = node && typeof node.executor === 'string' ? node.executor.trim() : ''
+  const extras = node && node.extras && typeof node.extras === 'object' && !Array.isArray(node.extras)
+    ? node.extras
+    : null
+  const nested = extras && typeof extras.executor === 'string' ? extras.executor.trim() : ''
+  const value = direct !== '' ? direct : nested
+  return EXECUTOR_KINDS.includes(value) ? value : DEFAULT_EXECUTOR
+}
+
+/** 读 `executorCommand`（旧数据可能只有 extras 里的那一份）。 */
+export function executorCommandOf(node) {
+  const direct = node && typeof node.executorCommand === 'string' ? node.executorCommand : ''
+  if (direct !== '') return direct
+  const extras = node && node.extras && typeof node.extras === 'object' && !Array.isArray(node.extras)
+    ? node.extras
+    : null
+  return extras && typeof extras.executorCommand === 'string' ? extras.executorCommand : ''
+}
+
 function Field({ label, hint, children }) {
   return h('div', { className: 'fs-field' },
     h('div', { className: 'fs-label' },
@@ -27,6 +65,7 @@ function Segmented({ value, options, onChange }) {
       key: option.value,
       type: 'button',
       className: 'fs-seg-btn' + (value === option.value ? ' on' : ''),
+      disabled: option.disabled === true,
       onClick: () => onChange(option.value),
       title: option.title || '',
     }, option.label)))
@@ -99,8 +138,21 @@ function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchM
   const targets = flow.nodes.filter(item => item.id !== node.id)
   const step = event => (event.shiftKey ? 20 : 4)
   const nudge = (dx, dy) => event => onNudge(dx * step(event), dy * step(event))
+  // 07 §6：外部执行器。默认 dsh；非 dsh 时面板顶部就给出可见标识（不藏在高级设置里）。
+  const executor = executorOf(node)
+  const external = executor !== DEFAULT_EXECUTOR
+  const command = executorCommandOf(node)
+  const commandMissing = executor === 'custom' && command.trim() === ''
+  const teamConflict = isStage && external && node.mode === EXEC_MODE.TEAM
 
   return h('div', { className: 'fs-panel-body' },
+    external
+      ? h('div', { className: 'fs-exec-banner', role: 'status' },
+        h('span', { className: 'fs-exec-badge' }, '外部执行器'),
+        h('span', null,
+          '这个节点由 ' + executor + ' 在外部进程里跑，不走 dsh 节点会话。'
+          + (teamConflict ? '当前是团队模式，开跑前要改成「单个 agent」。' : '')))
+      : null,
     h('div', { className: 'fs-group' },
       h(Field, { label: '标题' },
         h('input', {
@@ -156,16 +208,65 @@ function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchM
 
     isStage
       ? h('div', { className: 'fs-group' },
-        h('div', { className: 'fs-group-title' }, '谁来做'),
-        h(Field, { label: '执行方式', hint: node.mode === EXEC_MODE.TEAM ? '主管先拆任务再分给子 agent' : '一个 agent 全包' },
-          h(Segmented, {
-            value: node.mode,
-            options: [
-              { value: EXEC_MODE.SINGLE, label: '单个 agent' },
-              { value: EXEC_MODE.TEAM, label: '主管 + 子 agent' },
-            ],
-            onChange: mode => onPatch({ mode }),
-          })),
+        h('div', { className: 'fs-group-title' },
+          h('span', null, '谁来做'),
+          external
+            ? h('span', { className: 'fs-exec-badge', title: '这个节点由外部执行器运行，不建 dsh 节点会话' },
+              '外部执行器 · ' + executor)
+            : null),
+        h(Field, { label: '执行器', hint: 'dsh 走节点会话；codex / custom 起外部进程' },
+          h('select', {
+            className: 'fs-select',
+            value: executor,
+            'aria-label': '执行器',
+            onChange: event => onPatch({ executor: event.target.value }),
+          },
+          EXECUTOR_OPTIONS.map(option => h('option', { key: option.value, value: option.value }, option.label)))),
+        // 与服务端校验一致（07 §6）：team 需要引擎观察成员会话，外部进程做不到。
+        teamConflict
+          ? h('div', { className: 'fs-field-error', role: 'alert' },
+            h('span', null, '外部执行器只支持「单个 agent」模式'),
+            h('button', {
+              type: 'button',
+              className: 'fs-btn ghost sm',
+              onClick: () => onPatch({ mode: EXEC_MODE.SINGLE }),
+            }, '改为「单个 agent」'))
+          : null,
+        executor === 'custom'
+          ? h(Field, { label: '执行命令', hint: '必填 · ≤' + EXECUTOR_COMMAND_MAX + ' 字符' },
+            h('input', {
+              className: 'fs-input' + (commandMissing ? ' bad' : ''),
+              placeholder: '例如：my-agent --cwd {cwd} --prompt {prompt}',
+              value: command,
+              maxLength: EXECUTOR_COMMAND_MAX,
+              'aria-required': 'true',
+              'aria-invalid': commandMissing ? 'true' : 'false',
+              onChange: event => onPatch({ executorCommand: event.target.value }),
+            }),
+            commandMissing
+              ? h('div', { className: 'fs-field-error' },
+                'custom 执行器必须填执行命令，可用 {prompt} / {schema} / {cwd} 占位')
+              : null)
+          : null,
+        h(Field, {
+          label: '执行方式',
+          hint: external
+            ? '外部执行器下只能用「单个 agent」'
+            : node.mode === EXEC_MODE.TEAM ? '主管先拆任务再分给子 agent' : '一个 agent 全包',
+        },
+        h(Segmented, {
+          value: node.mode,
+          options: [
+            { value: EXEC_MODE.SINGLE, label: '单个 agent' },
+            {
+              value: EXEC_MODE.TEAM,
+              label: '主管 + 子 agent',
+              disabled: external,
+              title: external ? '外部执行器只支持「单个 agent」模式' : '',
+            },
+          ],
+          onChange: mode => onPatch({ mode }),
+        })),
         h(Field, { label: '角色定位', hint: '它是什么人' },
           h('textarea', {
             className: 'fs-textarea',
@@ -285,6 +386,7 @@ export function Inspector({
   locked = false, lockReason = '',
 }) {
   let title = '配置'
+  let executorBadge = ''
   let body = h('div', { className: 'fs-empty-panel' },
     '点画布上的节点或连线来配置。',
     h('br'),
@@ -296,6 +398,8 @@ export function Inspector({
     const node = flow.nodes.find(item => item.id === selection.id)
     if (node) {
       title = node.kind === NODE_KIND.STAGE ? '节点配置' : node.kind === NODE_KIND.START ? '开始节点' : '结束节点'
+      const nodeExecutor = executorOf(node)
+      if (nodeExecutor !== DEFAULT_EXECUTOR) executorBadge = nodeExecutor
       body = h(NodeForm, {
         node,
         flow,
@@ -325,7 +429,12 @@ export function Inspector({
   // M1：运行中锁结构 —— 整个表单进 disabled fieldset，并显式写出原因（不是静默失效）。
   return h('aside', { className: 'fs-panel' + (locked ? ' locked' : '') },
     h('div', { className: 'fs-panel-head' },
-      h('span', null, title),
+      h('span', { className: 'fs-panel-head-main' },
+        h('span', null, title),
+        executorBadge !== ''
+          ? h('span', { className: 'fs-panel-exec-badge', title: '这个节点由外部执行器运行，不建 dsh 节点会话' },
+            '外部执行器 · ' + executorBadge)
+          : null),
       locked ? h('span', { className: 'fs-panel-lock-badge' }, '运行中已锁定') : null),
     locked
       ? h('div', { className: 'fs-lock-banner', role: 'status' },

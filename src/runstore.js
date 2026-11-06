@@ -389,7 +389,38 @@ function normalizeMeta(raw, id) {
     //   inbox：运行中动态配置的回复目标（flow_reply 的 run 级默认值）。
     input: normalizeRunInput(source.input),
     inbox: normalizeRunInbox(source.inbox),
+    // 07 §4/§5/§7：运行绑定（工作区 / worktree / 节点会话模式 / 自审调度）。
+    // 这些键以前会被白名单丢掉，逼得 engine 与 runtime 各自「读原文→合并→改写」；
+    // 在这里收敛一次，读写两条路就都稳了。形状收敛、超长文本截断，不认识的键丢弃。
+    ...(source.sessionMode === undefined ? {} : { sessionMode: normalizeSessionMode(source.sessionMode) }),
+    ...(source.workspace === undefined ? {} : { workspace: normalizeBinding(source.workspace, WORKSPACE_KEYS) }),
+    ...(source.worktree === undefined ? {} : { worktree: normalizeBinding(source.worktree, WORKTREE_KEYS) }),
+    ...(source.supervision === undefined ? {} : { supervision: normalizeBinding(source.supervision, SUPERVISION_KEYS) }),
   }
+}
+
+/** 节点会话模式（07 §3）：未知值一律 null，不猜一个看起来合理的。 */
+const SESSION_MODES = new Set(['top-level', 'legacy-subagent', 'injected', 'stub', 'unavailable'])
+const WORKSPACE_KEYS = ['id', 'path', 'realpath', 'isGit', 'gitRoot']
+const WORKTREE_KEYS = ['enabled', 'reason', 'decidedBy', 'path', 'branch', 'baseCommit', 'createdAt']
+const SUPERVISION_KEYS = ['enabled', 'wakerSessionId', 'lastWokeAt', 'nextDueAt', 'wakes', 'failures', 'reason']
+
+function normalizeSessionMode(value) {
+  return SESSION_MODES.has(value) ? value : null
+}
+
+/** 绑定对象只保留白名单里的标量键；不是对象就 null（宁可没有，也别塞半个坏对象）。 */
+function normalizeBinding(value, keys) {
+  if (!isPlainObject(value)) return null
+  const out = {}
+  for (const key of keys) {
+    if (value[key] === undefined) continue
+    const raw = value[key]
+    if (raw === null || typeof raw === 'boolean') out[key] = raw
+    else if (typeof raw === 'number' && Number.isFinite(raw)) out[key] = raw
+    else if (typeof raw === 'string') out[key] = raw.length > 2048 ? raw.slice(0, 2048) : raw
+  }
+  return out
 }
 
 async function readMetaUnlocked(loc) {

@@ -472,7 +472,8 @@ try {
     const tools = createFlowTools({
       flowsRoot, runsRoot, engine, ctx: makeCtxWithAgents(agents),
     })
-    A.equal(tools.length, 6)
+    // v0.7 新增 flow_supervise（内建 supervision 开关）：工具数 6 → 7。
+    A.equal(tools.length, 7)
     const reply = tools.find(tool => tool.name === 'flow_reply')
     const send = tools.find(tool => tool.name === 'flow_send_message')
     A.ok(reply && send)

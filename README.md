@@ -1,5 +1,7 @@
 # dsh-flow-studio
 
+**当前版本：0.7.0**
+
 > DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 端用画布拖拽节点，把一条研发流水线画出来，
 > 每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来，
 > 流程模板落到本机，随时打开继续改。
@@ -22,7 +24,8 @@ token 四段合计，也支持导出 markdown。指标按契约确定性聚合�
 findings 未解决/已复验、打回计数、阶段进度（打回后旧通过失效），以及**质量结论**——
 后者要求验收条目、测试报告、规范检查、审查结论、P0/P1 五类证据齐全且可复核，缺证据一律「未检测」，不给绿灯。
 **0.4.0 接上执行引擎**（[`docs/design/06-execution-engine.md`](docs/design/06-execution-engine.md)）：
-点「运行」把图编译成执行计划，每个节点起一个真实的子 agent 会话（单个 agent，或主管 + 子 agent），
+点「运行」把图编译成执行计划，每个节点起一个真实的节点会话（v0.7 起默认是顶层会话；
+单个 agent，或主管 + 子 agent），
 节点产物经结构化输出在节点之间传递，打回线按判定真的回退并累加 attempt。跑之前先把图校验一遍：
 成环、断头路、多出边、打回指向结束节点一律 400 拒跑，不会跑到一半才卡死；
 「缺任务」在客户端点运行前就拦住（`validateFlow` 的 error），「缺角色」只告警不拦（引擎允许，执行时按任务描述兜底）。
@@ -61,24 +64,48 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
   节点运行详情面板给出角色/模式、attempt、**最近几条 agent 发言**、最近工具调用、token 用量、成员活动、
   已写产物与失败原因，运行中随轮询实时刷新。
 
+**0.6.0 让流程能收外部消息**：`flow_send_message` / `flow_reply` + `POST /runs/<id>/messages`，
+消息进入口节点后往下流；一个节点一个会话（打回重跑 / 新消息都注入同一个会话），回复支持
+`session` / `http` / `none` 三种通道。运行日志、指标、收件箱与审计契约见
+[05](docs/design/05-run-log.md) / [04](docs/design/04-metrics.md) / [06](docs/design/06-execution-engine.md)。
+
+**0.7.0 是运行模型改造**（[07 运行模型](docs/design/07-runtime-0.7.md)）：
+
+- **节点可换外部 executor**：`node.executor = dsh | codex | custom`。codex 起
+  `codex exec --json --output-schema …`，custom 跑 `sh -c <模板>`；过程输出映射成节点日志与
+  `model/call` 用量，结构化判定仍按同一份 `outputSchema` 解析。外部 executor 只允许 single，
+  非法配置**能保存、不能开跑**。
+- **节点会话是顶层会话**：默认 `ctx.agents.create` 建独立会话（不挂父会话），在会话列表能看到、
+  能点开接管；run 收尾 `dispose()` 只关句柄，不删日志。
+- **worktree 由 start 决策**：`run.json.workspace / worktree / sessionMode` 一次写入；工作区是 git
+  仓库根时 `auto` 才建 worktree，建失败如实落 `enabled:false`，绝不假装隔离。
+- **并发不设上限、按工作区分组**：每个 run 一个引擎实例；唯一 409 是同一个 runId 已在跑；
+  `GET /runs?workspaceId=` 过滤，左栏按工作区分组。
+- **内建 supervision**：`flow_start` 启动的 run 默认登记调度（15s tick，healthy 180s / 异常 60s /
+  pending 30s），到点自动唤醒发起会话；连续 3 次唤醒失败降级关闭。HTTP 起的 run 默认不开，
+  可用 `flow_supervise` 或 `POST /runs/<id>/supervision` 打开。
+
 ## 在会话里开流程，让主 agent 自己盯着
 
 不用先去画布点运行：在任意会话里让主 agent 直接开跑，它自己定时醒来自查「整条流水线是否正常运转」。
 
 ```
-flow_list   → 看有哪些流程模板
-flow_start  → 在**当前会话**里开跑（子 agent 继承当前会话的工作目录，不需要选工作区）
-flow_watch  → 审查整个工作流：偏航 / 卡死 / 打回死循环 / 并发乱序 / 超时风险 / 质量结论
-flow_stop   → 停掉这次运行
+flow_list       → 看有哪些流程模板
+flow_start      → 在**当前会话**里开跑，并自动开启内建 supervision
+flow_watch      → 审查整个工作流：偏航 / 卡死 / 打回死循环 / 并发乱序 / 超时风险 / 质量结论
+flow_stop       → 停掉这次运行
+flow_supervise  → 手动开 / 关某个 run 的内建定时自审
 ```
 
-`flow_start` / `flow_watch` 会返回 `supervision.nextCheckSeconds` 与一段可直接用的 `alarmPrompt`：
-主 agent 用 `proactive_set` 挂上「过 N 秒醒来查一次」的闹钟，醒来调 `flow_watch`，
-`verdict=healthy` 就 `proactive_reclaim` 安静结束，出现异常或跑完才通知人。
+`flow_start` 启动成功后**默认开启内建 supervision**，到点由 runtime 唤醒发起会话，
+不需要再挂 `proactive_set`；返回的 `supervision.alarmPrompt` / `nextCheckSeconds` 从 0.5.0 保留，
+只在 `supervision.enabled=false`（引擎不支持 / 登记失败）时作为手动回退。
+醒来后调 `flow_watch`，`verdict=healthy` 就安静结束本轮，出现异常或跑完才通知人。
 
-工作区的答案是**不用选**：模板存在 `$DSH_HOME/flow-studio/flows/`（全局），
-run 的子 agent 通过 `startActivation({ request: { parent } })` 挂在父会话下面，
-`cwd` 省略即继承父会话的目录——从哪个会话启动，就在哪个工作区跑；从面板启动则取当前根会话。
+工作区的答案是**不用手填**：模板存在 `$DSH_HOME/flow-studio/flows/`（全局）；
+`flow_start` 默认取当前会话的 `header.cwd` 作工作区，`engine.start` 再按 `worktree` 策略决定是否
+建隔离副本，最终写进 `run.json.workspace / worktree`。节点主管会话是顶层会话（不是挂在父会话下的
+子 agent），它的 `cwd` 用 worktree 路径或工作区路径；外部 executor 同理。
 
 ## 流程能收外部消息，一个节点只有一个会话
 
@@ -89,11 +116,12 @@ POST /api/flow-studio/runs/<runId>/messages
   { "from": "某个 agent", "text": "…", "nodeId?": "n_dev", "reply": { "kind": "session", "sessionId": "…" } }
 ```
 
-- **节点没启动** → 起一个新会话把消息带进去；run 还没开始 → 这条消息就是本次运行的启动输入。
+- **节点没启动** → 起一个顶层节点会话把消息带进去；run 还没开始 → 这条消息就是本次运行的启动输入。
 - **节点正在跑** → 通过 `agent.followup` 把消息注入到**同一个会话**（上下文注入），不打断当前回合。
 - **节点还没轮到** → 消息入队，引擎推进到该节点时并进提示词；入口消息在后续每个阶段节点都可见（最多 5 条、单条 ≤1200 字）。
 - **一个节点一个会话**：`runs/<runId>/sessions.json` 记着 nodeId → sessionId，二次激活（打回重跑 / 收到新消息）复用同一会话
-  （活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`），不再新开会话；run 结束或停止时统一释放。
+  （活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`），不再新开会话；run 结束或停止时统一
+  `dispose()` 句柄，**不删日志、不删会话文件**（仍可从列表点开 / `resume`）。
 
 回复通道要配置（默认只记进运行日志）：
 
@@ -127,7 +155,15 @@ POST /api/flow-studio/runs/<runId>/messages
 - **team 模式的成本要知道**：每个节点会起 1 个主管 + N 个成员会话，跑完整条链的 token 开销
   显著高于 single（六阶段全 team 时是十几个会话在跑）。先用 single 试跑、分工稳定后再切 team 更划算。
 - **节点可以挂 skill**：从当前 profile 已注册的 skill 里勾选（例如「怎么开发 Java 服务」这类开发规范），
-  运行时要求子 agent 先加载再干活。
+  运行时要求节点会话先加载再干活。
+- **节点可以换外部 executor**：`dsh`（默认，走节点会话）/ `codex`（`codex exec --json`）/
+  `custom`（`sh -c` 模板，用 `{prompt}` / `{schema}` / `{cwd}` 占位）。外部 executor 只允许 single，
+  配置不合法能保存但开不了跑。
+- **运行按工作区分组、并发不设上限**：每个 run 一个引擎实例，同工作区也可以同时跑多个；
+  左栏按 `workspacePath` 分组，`GET /runs?workspaceId=` 可过滤。worktree 由 `engine.start` 决定，
+  建失败如实写 `enabled:false`。
+- **内建 supervision**：`flow_start` 起的 run 默认由 runtime 定时唤醒发起会话复查，不用外部插件，
+  也不用自己挂闹钟；连续 3 次唤醒失败自动降级。
 - **打回是图的一部分，不是例外**：一条打回线指向任意上游节点，自动构成循环；每个节点可单独设打回上限。
 - **模板存在本机**：`$DSH_HOME/flow-studio/flows/<id>.json`，换浏览器、换设备都还在。
 
@@ -150,6 +186,9 @@ POST /api/flow-studio/runs/<runId>/messages
 ## 安装
 
 ```sh
+# 从私源安装固定版本（@feiyueve scope）
+dsh plugin --profile web add @feiyueve/dsh-flow-studio@0.7.0
+
 # 本地目录开发
 git clone git@github.com:FeiyuEVE/dsh-flow-studio.git
 dsh plugin --profile web add ./dsh-flow-studio
@@ -157,7 +196,8 @@ dsh plugin --profile web add ./dsh-flow-studio
 
 装完刷新页面，侧栏出现「流程编排」图标。Host 半边（路由）需要重启 `dsh web` 才挂载。
 
-流程与 run 都落在 `$DSH_HOME/flow-studio/`（`flows/` 与 `runs/`，目录 0700、文件 0600）；没有另外的覆盖变量。
+流程与 run 都落在 `$DSH_HOME/flow-studio/`（`flows/`、`runs/`、`worktrees/`，目录 0700、文件 0600）；
+没有另外的覆盖变量。worktree 根是 `$DSH_HOME/flow-studio/worktrees/<workspaceId>/<runId>`。
 
 ## 数据模型
 
@@ -179,6 +219,8 @@ dsh plugin --profile web add ./dsh-flow-studio
       "outputs": "需求清单 R1..Rn + 风险表",   // 期望产物
       "maxRounds": 2,                        // 打回上限
       "model": "",                           // 模型覆盖，空 = 跟随会话
+      "executor": "dsh",                     // dsh（默认）| codex | custom
+      "executorCommand": "",                 // custom 必填；codex 可填可执行文件路径
       "team": [{ "name": "接口实现", "role": "……", "task": "……" }]
     }
   ],
@@ -189,8 +231,13 @@ dsh plugin --profile web add ./dsh-flow-studio
 }
 ```
 
-校验分两级：**error**（跑不起来：没有开始节点、有孤立节点、打回目标不在上游、阶段节点没写任务…）
-与 **warning**（能存但作者大概还想改：没写角色、主从节点没配子 agent、走不到结束节点…）。
+校验分两级：**error**（跑不起来：没有开始节点、有孤立节点、打回目标不在上游、阶段节点没写任务、
+custom executor 缺命令、外部 executor 配了 team…）与 **warning**（能存但作者大概还想改：没写角色、
+主从节点没配子 agent、走不到结束节点…）。
+
+v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只拒绝「不是 JSON 对象」的请求体，
+`validation.errors` 非空也照存（画布 600ms 防抖自动保存，半成品必须存得下）；真正拦人的是
+`POST /runs/<id>/start` 与 `flow_start` 的 `validateFlowForRun`，非法流程返回 400，不会开跑。
 
 ## Host 接口
 
@@ -199,16 +246,17 @@ dsh plugin --profile web add ./dsh-flow-studio
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/flows` | 流程摘要列表（目录为空时自动种一份出厂模板） |
-| POST | `/flows` | 新建 |
+| POST | `/flows` | 新建；**200 + `{ok, flow, validation}`**，`validation.errors` 非空也照存；只有请求体不是 JSON 对象才 400 |
 | GET | `/flows/<id>` | 读整份（含 `version`）+ 校验结果 |
-| PUT | `/flows/<id>` | 整份覆盖保存；带 `version` 时校验，冲突回 409（`FLOW_VERSION_CONFLICT`，含 `currentVersion` / `updatedAt`），成功回传新 `version` |
+| PUT | `/flows/<id>` | 整份覆盖保存；`validation.errors` 只报告不拦保存（仍会 400 的只有：body 不是 JSON 对象 / 缺 body / `version` 不是正整数）；版本冲突回 409（`FLOW_VERSION_CONFLICT`），成功回传新 `version` |
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
 | GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
-| GET/POST | `/runs` | run 列表（`limit`）/ 新建 run（`pending`，不自动开跑） |
-| POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；已有 run 在写 → 409） |
+| GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` |
+| POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；同一 runId 已在跑 → 409；流程非法 → 400） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
-| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes`）/ 删除整个 run（租约持有中 → 409） |
+| GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision）/ 删除整个 run（租约持有中 → 409） |
+| GET/POST | `/runs/<runId>/supervision` | 读 `run.json.supervision` + 调度器状态 / 开或关内建 supervision（`{enabled, wakerSessionId?}`；对已收尾 run 开启 → 400） |
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验） |
 | GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论） |
 | GET | `/runs/<runId>/export` | 导出 markdown |
@@ -224,8 +272,8 @@ dsh plugin --profile web add ./dsh-flow-studio
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 十四个自检文件，共 320 组（含 8 进程抢锁 / 过期租约接管的跨进程回归）
-node test/render.test.mjs   # SSR + 构建产物加载，59 组
+npm test           # 19 个自检文件，共 491 组（其中 7 个套件显式计数，合计 1483 条断言）
+node test/render.test.mjs   # SSR + 构建产物加载，65 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
@@ -233,21 +281,33 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/geometry.test.mjs` —— 世界边界唯一来源、fit 公式与 15% 地板、6 槽与第 7 条降级、tie-break 与输入顺序无关。
 - `test/link.test.mjs` —— 键盘连线状态机：候选顺序、循环移动、Enter 确认、方向规则、可读播报。
 - `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。
-- `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）。
+- `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）；
+  v0.7 组覆盖保存宽松（空流程 / executor 非法也 200 + validation）、`?workspaceId=` 过滤、
+  `POST /runs/<id>/supervision` 的 400/404/enable/disable 与已收尾 run 拒绝开启。
 - `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）。
 - `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
-- `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者开始锁（并发 start 只成功一个）、打回按 attempt 重跑、
-  预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门。
+- `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、
+  预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门；
+  v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）。
+- `test/worktree.test.mjs` —— 工作区与 worktree：`workspaceIdFor` 稳定、真 git 仓库根 / 子目录 / 非 git 的区分、
+  `git` 不可用与「不是仓库」分开、`auto/on/off` 决策、分支冲突 `-2`、真 worktree 落盘、脏 worktree 删除校验与路径越界拒绝。
+- `test/executor.test.mjs` —— 外部 executor：三档归一化与 `EXECUTOR_INVALID`、codex argv 顺序、JSONL 的
+  final / usage / 过程 / 未知事件、custom 占位符与 shell 转义、超时 / abort / 非 0 退出 / spawn 失败、
+  跨 chunk 半行、真 node 子进程端到端；**不依赖真 codex、不联网**。
+- `test/runtime.test.mjs` —— 进程级注册表：两个 runId 并发跑通、同 runId 二次 start 409、失败实例摘除、
+  sessionIndex 跨实例共享、`sweep` 崩溃残留、`createEngine/new Engine` 旧用法兼容、supervision 接线与收尾落盘。
+- `test/supervise.test.mjs` —— 内建 supervision：`planWake` 五档间隔、到点只唤醒一次、失败 3 次降级 /
+  成功清零 / 重启恢复 / 终态摘除 / 坏日期不抛错 / tick 重入保护。
 - `test/client-perf.test.mjs` —— 客户端性能回归：拖动中 0 次提交 / 松手恰好 1 次、锁定不提交、
   节点与边是 `React.memo` 且相同输入复用同一对象、草稿去抖（5 次变更只写 1 次、maxWait 必落、隐藏立即 flush）。
 - `test/logdrawer.test.mjs` —— 运行详情：抽屉三档与全屏类、Esc 逐档还原、节点面板四类实时字段、
   缺失字段降级占位、长文本展开全文弹层、区域开关与窄屏单列、新 CSS 只用主题 token。
 - `test/audit.test.mjs` —— 工作流健康审计（纯函数）：pending / healthy / stalled / looping / deviating /
   no-progress / done / failed / aborted 九种裁决，以及打回后重跑不误判偏航、坏输入不抛错。
-- `test/tools.test.mjs` —— 会话内启停的四个模型工具：按 id/名字启动、同名多份列候选、结构不合法不建 run、
-  `options.parent === exec.agent`（绑定当前会话与工作区）、supervision 文案、flow_watch 走真实审计、
-  flow_stop 业务态、输出 lossless、无 tools 服务时不炸。
+- `test/tools.test.mjs` —— 会话内启停的五个基础模型工具：按 id/名字启动、同名多份列候选、结构不合法不建 run、
+  `options.parent === exec.agent`（绑定发起会话与工作区）、flow_start 自动开启 supervision / 失败回退、
+  flow_supervise 开关、flow_watch 走真实审计、flow_stop 业务态、输出 lossless、无 tools 服务时不炸。
 - `test/inbox.test.mjs` —— 流程收件箱与节点会话复用：`message/in`/`message/out` 事件与有界截断、messages.jsonl
   追加与分页、目标节点三路解析、活/冷会话注入、未开始当启动输入、排队与推进时并进提示词、下游可见且有界、
   `flow_reply` 三种回复通道、`flow_send_message` 省略 runId、HTTP 401/400/200、二次激活只起一次会话、
@@ -260,13 +320,38 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 
 ## 路线图
 
-- **v0.5 指标看板增强**：跨 run 对比、趋势图、团队汇总；把 `acceptance` / `test` / `check` 三类证据接上独立执行器
-  （引擎已经会写这三类事件，但报告内容目前取决于节点自己的结构化输出，还没有外部的检查器去跑）。
-- **v0.6 图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
-- **v0.7 多人协作**：保存已经是乐观锁（`version` + 409 + 客户端「覆盖 / 载入服务器版本」两条出口），
-  但还没有实时协同（看不到对方光标 / 没有自动合并），多人同时编辑靠「刷新后重试」这条底线。
-- **v0.8 独立证据源**：现在「独立复核」靠跨节点引用上游产物；下一步是让宿主自己跑测试 / 规范检查，
+已交付：0.3 运行日志与指标、0.4 执行引擎、0.5 会话内启停与健康审计、0.6 流程收件箱、
+0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision）。
+
+未排期：
+
+- **实时协同**：保存已经是乐观锁（`version` + 409 + 客户端「覆盖 / 载入服务器版本」两条出口），
+  但还没有多人实时编辑（看不到对方光标 / 没有自动合并），现在靠「刷新后重试」这条底线。
+- **图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
+- **独立证据源**：现在「独立复核」靠跨节点引用上游产物；下一步是让宿主自己跑测试 / 规范检查，
   产物带 `producer=host`（引擎与聚合层已认这个标记，缺的是真正的执行器）。
+- **worktree 管理入口**：`removeWorktree()` 已有路径校验与删除实现，但还没有 HTTP / 模型工具入口。
+
+## 常见问题
+
+### 为什么节点会话能在会话列表看到？它不是「子 agent」吗？
+
+v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：session header 里没有
+`parentSession` / `origin`，`delegationDepth: 0`，所以 Web 侧栏能看到、能点开接管。
+`team` 节点的成员才是主管委派出的子会话（header 带 `parentSession` / `origin:'subagent'`）。
+判断是否顶层**看 session header，不看 `roots()`**——`resume` 之后 agent 在运行时也是 root，
+但持久化血缘不变。run 收尾的 `dispose()` 只关句柄、不删日志，会话仍在列表（`agentAvailable:false`）、
+磁盘文件仍在、之后仍可 `resume`。只 `create` 不跑 turn 的 `blank` 会话 API 有、Web 侧栏看不到；
+节点会话一定会跑 turn，不受影响。
+
+### worktree 建在哪？为什么不自动删？
+
+`worktree.enabled=true` 时根是 `$DSH_HOME/flow-studio/worktrees/<workspaceId>/<runId>`，分支
+`flow/<runId>`（重名依次 `-2`…），base 取工作区 `HEAD`；节点会话与外部 executor 的 `cwd`
+都用这份副本。run 收尾**不自动删**：用户可能还要进去看产物、跑测试。删除只走
+`removeWorktree()`：先校验路径必须落在 `<root>/<workspaceId>/` 下，再执行
+`git -C <workspace> worktree remove [--force] <path>`；目前没有 HTTP / 模型工具入口。
+`auto` 策略下建失败会如实写 `enabled:false, reason:'create-failed: …'`，不会假装已隔离。
 
 ## 先搜现成的（按 `PLUGIN-SEARCH.md`）
 

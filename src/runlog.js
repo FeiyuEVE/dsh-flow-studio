@@ -3,7 +3,7 @@
  *
  * 这里是纯函数层，不碰 fs —— 落盘在 `runstore.js`。契约见
  * `docs/design/05-run-log.md`：
- *   - 未知 kind 一律拒绝，不静默存；
+ *   - 未知 kind 一律拒绝，不静默存（基础白名单 EVENT_KINDS + 收件箱扩展 INBOX_EVENT_KINDS）；
  *   - 必填字段缺失就报错（`usage` 缺桶不补 0）；
  *   - `ts` 非法 / 缺失用服务端时间补齐，并归一成 UTC ISO-8601；
  *   - `extra` 有界（键 ≤16、单串 ≤256、总字节 ≤2048），超限丢弃不报错；
@@ -14,7 +14,7 @@
 
 import { Buffer } from 'node:buffer'
 
-/** §2 白名单：不在表里的 kind 一律拒绝。 */
+/** §2 白名单：v1.0 的 17 种基础事件（不在表里的 kind 一律拒绝）。 */
 export const EVENT_KINDS = Object.freeze([
   'run/start',
   'run/end',
@@ -37,6 +37,17 @@ export const EVENT_KINDS = Object.freeze([
   'agent/message',
 ])
 
+/**
+ * 06 §16 扩展白名单：流程收件箱事件。
+ *
+ * 单独导出而不是直接追加进 `EVENT_KINDS`：`EVENT_KINDS` 是 05 §2 冻结的 v1.0 基础契约
+ * （既有单测按 17 种断言长度），收件箱是 v1.6 的扩展事件。校验器接受的是两者的并集。
+ */
+export const INBOX_EVENT_KINDS = Object.freeze([
+  'message/in',
+  'message/out',
+])
+
 /** 单条事件序列化后的上限（字节，不含行尾换行）。 */
 export const MAX_EVENT_BYTES = 8 * 1024
 
@@ -57,10 +68,16 @@ export const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
 /** 用量四桶（互斥，reasoning 是 output 的子集，不另计）。 */
 export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
 
-const KIND_SET = new Set(EVENT_KINDS)
+const KIND_SET = new Set([...EVENT_KINDS, ...INBOX_EVENT_KINDS])
 
-/** run 级事件写到 run.jsonl；其余都要求 nodeId + attemptId（§1 目录布局）。 */
-const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end'])
+/**
+ * run 级事件写到 run.jsonl；其余都要求 nodeId + attemptId（§1 目录布局）。
+ *
+ * 06 §16：收件箱消息属于「run 级」事实——消息可能在任何节点启动前到达，
+ * 也可能在节点之间流转，所以 message/in、message/out 只要求 runId，不要求
+ * nodeId + attemptId；目标/来源节点放在 data.targetNodeId / data.nodeId 里。
+ */
+const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end', 'message/in', 'message/out'])
 
 const RUN_END_STATUS = new Set(['done', 'aborted', 'failed'])
 const NODE_END_STATUS = new Set(['passed', 'rejected', 'failed', 'skipped'])
@@ -87,6 +104,16 @@ export const AGENT_MESSAGE_MAX_CHARS = 2000
 /** §8.3：每个节点保留的最近 agent/message 条数 / 全局总量上限。 */
 export const AGENT_ACTIVITY_PER_NODE = 5
 export const AGENT_ACTIVITY_TOTAL = 200
+
+/** 06 §16：message/in、message/out 的文本上限（码点；外部输入先截断再落盘）。 */
+export const MESSAGE_TEXT_MAX_CHARS = 2000
+/** 06 §16：消息来源标识（from）的上限。 */
+export const MESSAGE_FROM_MAX_CHARS = 200
+/** 06 §16：消息级回复目标的 kind 白名单。 */
+const MESSAGE_REPLY_KIND = new Set(['session', 'http', 'none'])
+/** 06 §16：message/out.delivery 白名单。 */
+export const MESSAGE_DELIVERY_KINDS = Object.freeze(['session', 'http', 'local'])
+const MESSAGE_DELIVERY = new Set(MESSAGE_DELIVERY_KINDS)
 
 /** 顶层保留字段；其余未识别字段折叠进有界的 `extra`。 */
 const RESERVED_FIELDS = new Set([
@@ -254,6 +281,32 @@ function strField(data, key, { required = true, max = 256 } = {}) {
   if (value.trim() === '') return { ok: false, reason: '不能为空字符串' }
   if (value.length > max) return { ok: false, reason: `超过 ${max} 字符` }
   return { ok: true, value, present: true }
+}
+
+/** 按 Unicode 码点截断（外部文本有界化的唯一口径）。 */
+function clipCodePoints(value, max) {
+  const chars = Array.from(String(value ?? ''))
+  if (chars.length <= max) return chars.join('')
+  if (max <= 1) return chars.slice(0, max).join('')
+  return `${chars.slice(0, max - 1).join('')}…`
+}
+
+/** 06 §16：消息 id（不参与路径，但沿用 runId 的字符集与长度上限）。 */
+function idField(value) {
+  if (value === undefined || value === null) return { ok: false, reason: '缺少必填字段' }
+  if (typeof value !== 'string') return { ok: false, reason: '必须是字符串' }
+  if (value.trim() === '') return { ok: false, reason: '不能为空字符串' }
+  if (value.length > 128) return { ok: false, reason: '超过 128 字符' }
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, reason: '不能包含控制字符' }
+  return { ok: true, value }
+}
+
+/** 06 §16：消息正文必填、非空，超过上限就按码点截断（外部输入有界）。 */
+function messageTextField(value) {
+  if (value === undefined || value === null) return { ok: false, reason: '缺少必填字段' }
+  if (typeof value !== 'string') return { ok: false, reason: '必须是字符串' }
+  if (value.trim() === '') return { ok: false, reason: '不能为空字符串' }
+  return { ok: true, value: clipCodePoints(value, MESSAGE_TEXT_MAX_CHARS) }
 }
 
 function strArrayField(data, key, { required = true, maxItems = 12, maxLen = 64 } = {}) {
@@ -530,6 +583,59 @@ function validateData(kind, data) {
       const failures = strArrayField(data, 'failures', { required: false, maxItems: 50, maxLen: 200 })
       if (!failures.ok) return err('failures', failures.reason)
       if (failures.present) out.failures = failures.value
+      break
+    }
+    case 'message/in': {
+      // 06 §16：字段白名单严格收窄（未知字段丢弃）。
+      const id = idField(data.id)
+      if (!id.ok) return err('id', id.reason)
+      const from = strField(data, 'from', { required: true, max: MESSAGE_FROM_MAX_CHARS })
+      if (!from.ok) return err('from', from.reason)
+      const text = messageTextField(data.text)
+      if (!text.ok) return err('text', text.reason)
+      const out2 = { id: id.value, from: from.value, text: text.value }
+      if (data.targetNodeId !== undefined && data.targetNodeId !== null) {
+        if (typeof data.targetNodeId !== 'string' || !checkRunId(data.targetNodeId)) {
+          return err('targetNodeId', '必须是合法的节点 id')
+        }
+        out2.targetNodeId = data.targetNodeId
+      }
+      if (data.replyKind !== undefined && data.replyKind !== null) {
+        if (typeof data.replyKind !== 'string' || !MESSAGE_REPLY_KIND.has(data.replyKind)) {
+          return err('replyKind', `取值必须是 ${[...MESSAGE_REPLY_KIND].join(' / ')}`)
+        }
+        out2.replyKind = data.replyKind
+      }
+      for (const key of Object.keys(out)) delete out[key]
+      Object.assign(out, out2)
+      break
+    }
+    case 'message/out': {
+      const id = idField(data.id)
+      if (!id.ok) return err('id', id.reason)
+      const text = messageTextField(data.text)
+      if (!text.ok) return err('text', text.reason)
+      const out2 = { id: id.value, text: text.value }
+      if (data.inReplyTo !== undefined && data.inReplyTo !== null) {
+        if (typeof data.inReplyTo !== 'string' || data.inReplyTo.trim() === '' || data.inReplyTo.length > 128) {
+          return err('inReplyTo', '必须是非空字符串（≤128 字符）')
+        }
+        out2.inReplyTo = data.inReplyTo
+      }
+      if (data.nodeId !== undefined && data.nodeId !== null) {
+        if (typeof data.nodeId !== 'string' || !checkRunId(data.nodeId)) {
+          return err('nodeId', '必须是合法的节点 id')
+        }
+        out2.nodeId = data.nodeId
+      }
+      const delivery = data.delivery
+      if (delivery === undefined || delivery === null) return err('delivery', '缺少必填字段')
+      if (typeof delivery !== 'string' || !MESSAGE_DELIVERY.has(delivery)) {
+        return err('delivery', `取值必须是 ${[...MESSAGE_DELIVERY].join(' / ')}`)
+      }
+      out2.delivery = delivery
+      for (const key of Object.keys(out)) delete out[key]
+      Object.assign(out, out2)
       break
     }
     default:

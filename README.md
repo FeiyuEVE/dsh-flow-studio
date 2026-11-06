@@ -80,6 +80,33 @@ flow_stop   → 停掉这次运行
 run 的子 agent 通过 `startActivation({ request: { parent } })` 挂在父会话下面，
 `cwd` 省略即继承父会话的目录——从哪个会话启动，就在哪个工作区跑；从面板启动则取当前根会话。
 
+## 流程能收外部消息，一个节点只有一个会话
+
+外部 agent / 人往流程里发消息，消息从入口节点（需求分析）往下流：
+
+```
+POST /api/flow-studio/runs/<runId>/messages
+  { "from": "某个 agent", "text": "…", "nodeId?": "n_dev", "reply": { "kind": "session", "sessionId": "…" } }
+```
+
+- **节点没启动** → 起一个新会话把消息带进去；run 还没开始 → 这条消息就是本次运行的启动输入。
+- **节点正在跑** → 通过 `agent.followup` 把消息注入到**同一个会话**（上下文注入），不打断当前回合。
+- **节点还没轮到** → 消息入队，引擎推进到该节点时并进提示词；入口消息在后续每个阶段节点都可见（最多 5 条、单条 ≤1200 字）。
+- **一个节点一个会话**：`runs/<runId>/sessions.json` 记着 nodeId → sessionId，二次激活（打回重跑 / 收到新消息）复用同一会话
+  （活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`），不再新开会话；run 结束或停止时统一释放。
+
+回复通道要配置（默认只记进运行日志）：
+
+| `reply.kind` | 行为 |
+|---|---|
+| `session` | 发回指定会话（`agents.get`/`resume` + `followup`，正文带 `[flow:… · 节点名]` 来源标记） |
+| `http` | `POST` 到外部给的 URL（`Bearer` 取自配置的环境变量），body `{runId,nodeId,messageId,text}` |
+| `none` / 未配置 | 只写 `message/out` 事件，工具返回「没有外部回复通道」 |
+
+节点里的 agent 用 `flow_reply` 回消息（工具按会话反查 run/node，不用手填 id）；别的 agent 用
+`flow_send_message` 往流程里发消息。运行中可以 `POST /runs/<id>/inbox` 动态改回复目标，
+`GET /runs/<id>/messages` 看收件箱。
+
 ## 它解决什么
 
 把一句「帮我做个 X」变成一条能盯住的流水线：
@@ -197,7 +224,7 @@ dsh plugin --profile web add ./dsh-flow-studio
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 十三个自检文件，共 302 组（含 8 进程抢锁 / 过期租约接管的跨进程回归）
+npm test           # 十四个自检文件，共 320 组（含 8 进程抢锁 / 过期租约接管的跨进程回归）
 node test/render.test.mjs   # SSR + 构建产物加载，59 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
@@ -221,6 +248,10 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/tools.test.mjs` —— 会话内启停的四个模型工具：按 id/名字启动、同名多份列候选、结构不合法不建 run、
   `options.parent === exec.agent`（绑定当前会话与工作区）、supervision 文案、flow_watch 走真实审计、
   flow_stop 业务态、输出 lossless、无 tools 服务时不炸。
+- `test/inbox.test.mjs` —— 流程收件箱与节点会话复用：`message/in`/`message/out` 事件与有界截断、messages.jsonl
+  追加与分页、目标节点三路解析、活/冷会话注入、未开始当启动输入、排队与推进时并进提示词、下游可见且有界、
+  `flow_reply` 三种回复通道、`flow_send_message` 省略 runId、HTTP 401/400/200、二次激活只起一次会话、
+  sessions.json 容错、run 收尾 dispose、无 agents 服务退化。
 - `test/render.test.mjs` —— 用真实 React 18 把每个组件 SSR 渲染一遍；再把构建产物 `lib/client.js` 放进只有
   `window.__ModuleLoader__` 的假环境里执行，验证注册 id、两个 slot 成对注册、面板能渲染出根节点；
   运行日志抽屉的收起/展开、空态、错误态、结论 pill 与键盘开合也在这里断言。

@@ -62,8 +62,8 @@ export const DEFAULT_LEASE_TTL_MS = 90 * 1000
 const TERMINAL_STATUS = new Set(['done', 'aborted', 'failed'])
 const ALL_STATUS = new Set(['pending', 'running', 'done', 'aborted', 'failed'])
 
-/** 事件按 run 级 / 节点级分流。 */
-const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end'])
+/** 事件按 run 级 / 节点级分流。06 §16：收件箱消息是 run 级事实（可能先于节点到达）。 */
+const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end', 'message/in', 'message/out'])
 
 const ATTEMPT_FILE = /^\d+\.jsonl$/
 const DIR_MODE = 0o700
@@ -173,6 +173,91 @@ function countPassed(progress) {
     if (entry.status === 'passed' && !entry.invalidated) passed += 1
   }
   return passed
+}
+
+/** 06 §16：run.json.input 里保存的启动消息上限（有界，防止外部把元数据撑爆）。 */
+export const RUN_INPUT_MAX_MESSAGES = 20
+/** 06 §16：入站消息正文的持久化上限（码点）。 */
+export const RUN_MESSAGE_TEXT_MAX_CHARS = 4000
+/** 06 §16：来源标识上限。 */
+export const RUN_MESSAGE_FROM_MAX_CHARS = 200
+/** 06 §16：消息级回复目标的 kind 白名单。 */
+export const MESSAGE_REPLY_KINDS = Object.freeze(['session', 'http', 'none'])
+const MESSAGE_REPLY_KIND_SET = new Set(MESSAGE_REPLY_KINDS)
+/** 06 §16：messages.jsonl 里记录的投递状态。 */
+export const MESSAGE_STATUSES = Object.freeze(['pending', 'injected', 'resumed', 'delivered'])
+const MESSAGE_STATUS_SET = new Set(MESSAGE_STATUSES)
+
+function clipText(value, max) {
+  const chars = Array.from(String(value ?? ''))
+  if (chars.length <= max) return chars.join('')
+  if (max <= 1) return chars.slice(0, max).join('')
+  return `${chars.slice(0, max - 1).join('')}…`
+}
+
+/**
+ * 06 §16：回复目标归一化（run.json.inbox.reply 与请求体 reply 共用同一口径）。
+ * 返回 null 表示不合法；调用方决定回 400 还是忽略。
+ * @returns {{ kind: string, sessionId?: string, url?: string, tokenEnv?: string } | null}
+ */
+export function normalizeReplyTarget(source) {
+  if (!isPlainObject(source)) return null
+  const kind = source.kind
+  if (typeof kind !== 'string' || !MESSAGE_REPLY_KIND_SET.has(kind)) return null
+  if (kind === 'none') return { kind: 'none' }
+  if (kind === 'session') {
+    if (typeof source.sessionId !== 'string') return null
+    const sessionId = source.sessionId.trim()
+    if (sessionId === '' || sessionId.length > 128 || /[\u0000-\u001f\u007f]/.test(sessionId)) return null
+    return { kind: 'session', sessionId }
+  }
+  // kind === 'http'
+  if (typeof source.url !== 'string' || source.url.length > 2048) return null
+  let parsed
+  try {
+    parsed = new URL(source.url)
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+  const reply = { kind: 'http', url: parsed.toString() }
+  if (source.tokenEnv !== undefined && source.tokenEnv !== null) {
+    if (typeof source.tokenEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(source.tokenEnv)) return null
+    reply.tokenEnv = source.tokenEnv
+  }
+  return reply
+}
+
+function normalizeRunInput(source) {
+  if (!isPlainObject(source) || !Array.isArray(source.messages)) return null
+  const messages = []
+  for (const item of source.messages.slice(0, RUN_INPUT_MAX_MESSAGES)) {
+    if (!isPlainObject(item)) continue
+    if (typeof item.text !== 'string' || item.text.trim() === '') continue
+    const entry = {
+      id: typeof item.id === 'string' && item.id !== '' ? clipText(item.id, 128) : `seed-${messages.length + 1}`,
+      from: typeof item.from === 'string' && item.from.trim() !== ''
+        ? clipText(item.from.trim(), RUN_MESSAGE_FROM_MAX_CHARS)
+        : 'unknown',
+      text: clipText(item.text, RUN_MESSAGE_TEXT_MAX_CHARS),
+      at: normalizeIso(item.at) || new Date().toISOString(),
+    }
+    if (typeof item.targetNodeId === 'string' && checkRunId(item.targetNodeId)) {
+      entry.targetNodeId = item.targetNodeId
+    }
+    messages.push(entry)
+  }
+  return messages.length > 0 ? { messages } : null
+}
+
+function normalizeRunInbox(source) {
+  if (!isPlainObject(source)) return null
+  const reply = normalizeReplyTarget(source.reply)
+  if (!reply) return null
+  return {
+    reply,
+    updatedAt: normalizeIso(source.updatedAt),
+  }
 }
 
 /** 06 §2：运行中的 live 视图（currentNodeId / attempt / round / since / lastEventSeq / phase）。 */
@@ -299,6 +384,11 @@ function normalizeMeta(raw, id) {
     progress,
     // 06 §2 / §10：live 随 run.json 原子写；结束后由引擎置 null。
     live: normalizeLive(source.live),
+    // 06 §16：可选字段（老 run.json 没有就是 null，不影响既有口径）。
+    //   input：run 还没开始就被投递进来的消息（engine.start 时并进入口节点提示词）；
+    //   inbox：运行中动态配置的回复目标（flow_reply 的 run 级默认值）。
+    input: normalizeRunInput(source.input),
+    inbox: normalizeRunInbox(source.inbox),
   }
 }
 
@@ -1011,6 +1101,380 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// 06 §16：流程收件箱（messages.jsonl）与节点会话表（sessions.json）
+// ---------------------------------------------------------------------------
+
+/** 收件箱消息文件（run 目录内相对路径，JSONL 追加写）。 */
+const MESSAGES_FILE = 'messages.jsonl'
+/** 节点会话表（run 目录内相对路径，原子整写）。 */
+const SESSIONS_FILE = 'sessions.json'
+/** 单条消息行 / 整个文件的体积闸门：外部文本已在入口处有界，这里是最后的兜底。 */
+const MAX_MESSAGE_LINE_BYTES = 16 * 1024
+const MAX_MESSAGES_FILE_BYTES = 8 * 1024 * 1024
+const MAX_SESSIONS_BYTES = 512 * 1024
+const MAX_MESSAGE_RECORDS = 5000
+
+function messagesPath(dir) {
+  return join(dir, MESSAGES_FILE)
+}
+
+function sessionsPath(dir) {
+  return join(dir, SESSIONS_FILE)
+}
+
+function optionalIso(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+    ? new Date(Date.parse(value)).toISOString()
+    : undefined
+}
+
+function optionalText(value, max) {
+  return typeof value === 'string' && value !== '' ? clipText(value, max) : undefined
+}
+
+/**
+ * 归一化一条 messages.jsonl 行。
+ * 完整记录（带 direction）与投递状态补丁（只有 id + status）共用同一套字段上限。
+ */
+function normalizeMessageRecord(raw) {
+  if (!isPlainObject(raw)) return null
+  if (typeof raw.id !== 'string' || raw.id.trim() === '' || raw.id.length > 128) return null
+  if (/[\u0000-\u001f\u007f]/.test(raw.id)) return null
+  const direction = raw.direction
+  if (direction !== 'in' && direction !== 'out') return null
+  const record = { v: 1, id: raw.id }
+  record.direction = direction
+  record.ts = normalizeIso(raw.ts) || new Date().toISOString()
+  if (direction === 'in') {
+    record.from = optionalText(raw.from, RUN_MESSAGE_FROM_MAX_CHARS) || 'unknown'
+    record.text = clipText(typeof raw.text === 'string' ? raw.text : '', RUN_MESSAGE_TEXT_MAX_CHARS)
+    if (typeof raw.targetNodeId === 'string' && checkRunId(raw.targetNodeId)) record.targetNodeId = raw.targetNodeId
+    const reply = normalizeReplyTarget(raw.reply)
+    if (reply) record.reply = reply
+    if (typeof raw.replyKind === 'string' && MESSAGE_REPLY_KIND_SET.has(raw.replyKind)) {
+      record.replyKind = raw.replyKind
+    }
+  } else {
+    record.text = clipText(typeof raw.text === 'string' ? raw.text : '', RUN_MESSAGE_TEXT_MAX_CHARS)
+    const replyTo = optionalText(raw.inReplyTo, 128)
+    if (replyTo) record.inReplyTo = replyTo
+    if (typeof raw.nodeId === 'string' && checkRunId(raw.nodeId)) record.nodeId = raw.nodeId
+    if (typeof raw.delivery === 'string' && raw.delivery.length <= 32) record.delivery = raw.delivery
+  }
+  if (typeof raw.status === 'string' && MESSAGE_STATUS_SET.has(raw.status)) record.status = raw.status
+  else record.status = direction === 'in' ? 'pending' : 'delivered'
+  for (const key of ['sessionId', 'mode', 'deliveredByNodeId']) {
+    const value = optionalText(raw[key], key === 'sessionId' ? 128 : 64)
+    if (value) record[key] = value
+  }
+  const deliveredAt = optionalIso(raw.deliveredAt)
+  if (deliveredAt) record.deliveredAt = deliveredAt
+  return record
+}
+
+/** 状态补丁行：只带 id + status（以及投递细节），不改正文。 */
+function normalizeMessagePatch(raw) {
+  if (!isPlainObject(raw)) return null
+  if (typeof raw.id !== 'string' || raw.id.trim() === '' || raw.id.length > 128) return null
+  if (raw.direction === 'in' || raw.direction === 'out') return null
+  if (typeof raw.status !== 'string' || !MESSAGE_STATUS_SET.has(raw.status)) return null
+  const patch = { v: 1, id: raw.id, status: raw.status, ts: normalizeIso(raw.ts) || new Date().toISOString() }
+  for (const key of ['sessionId', 'mode', 'deliveredByNodeId']) {
+    const value = optionalText(raw[key], key === 'sessionId' ? 128 : 64)
+    if (value) patch[key] = value
+  }
+  const deliveredAt = optionalIso(raw.deliveredAt)
+  if (deliveredAt) patch.deliveredAt = deliveredAt
+  const error = optionalText(raw.error, 256)
+  if (error) patch.error = error
+  return patch
+}
+
+function mergeMessageRecords(records) {
+  const order = new Map()
+  const map = new Map()
+  let skipped = 0
+  for (const entry of records) {
+    const id = entry.id
+    if (!order.has(id)) order.set(id, order.size)
+    if (entry.direction === 'in' || entry.direction === 'out') {
+      const prev = map.get(id)
+      map.set(id, prev ? { ...prev, ...entry } : entry)
+      continue
+    }
+    // 补丁：只更新状态与投递细节。
+    const prev = map.get(id)
+    if (!prev) {
+      skipped += 1
+      continue
+    }
+    const next = { ...prev, status: entry.status }
+    for (const key of ['sessionId', 'mode', 'deliveredByNodeId', 'deliveredAt', 'error']) {
+      if (entry[key] !== undefined) next[key] = entry[key]
+    }
+    map.set(id, next)
+  }
+  const messages = [...map.values()]
+  messages.sort((a, b) => {
+    const ta = Date.parse(a.ts)
+    const tb = Date.parse(b.ts)
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb
+    return (order.get(a.id) || 0) - (order.get(b.id) || 0)
+  })
+  return { messages, skipped }
+}
+
+async function readMessagesUnlocked(loc) {
+  let text
+  try {
+    text = await readFile(messagesPath(loc.dir), 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { messages: [], skipped: 0 }
+    throw error
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_MESSAGES_FILE_BYTES) {
+    return { messages: [], skipped: 1, oversized: true }
+  }
+  const records = []
+  let skipped = 0
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    if (Buffer.byteLength(trimmed, 'utf8') > MAX_MESSAGE_LINE_BYTES) {
+      skipped += 1
+      continue
+    }
+    let raw
+    try {
+      raw = JSON.parse(trimmed)
+    } catch {
+      skipped += 1
+      continue
+    }
+    const record = normalizeMessageRecord(raw) || normalizeMessagePatch(raw)
+    if (!record) {
+      skipped += 1
+      continue
+    }
+    records.push(record)
+    if (records.length >= MAX_MESSAGE_RECORDS) break
+  }
+  const merged = mergeMessageRecords(records)
+  return { messages: merged.messages, skipped: skipped + merged.skipped }
+}
+
+/**
+ * 读 run 的收件箱（in/out 合并，按 ts 升序）。
+ * `limit` 取最近 N 条但仍按时间升序返回；run 不存在 / runId 非法返回 null。
+ * @returns {Promise<{ messages: object[], total: number, truncated: boolean, skipped: number } | null>}
+ */
+export async function readRunMessages(runsRoot, runId, options = {}) {
+  const loc = locate(runsRoot, runId)
+  if (!loc) return null
+  let limit = 100
+  if (options.limit !== undefined && options.limit !== null && options.limit !== '') {
+    const value = typeof options.limit === 'string' ? Number(options.limit) : options.limit
+    if (!Number.isInteger(value) || value < 1) throw new RunError(400, 'limit', '必须是正整数')
+    limit = Math.min(value, 1000)
+  }
+  const merged = await readMessagesUnlocked(loc)
+  const total = merged.messages.length
+  const messages = total > limit ? merged.messages.slice(total - limit) : merged.messages
+  return { messages, total, truncated: total > messages.length, skipped: merged.skipped }
+}
+
+/**
+ * 追加若干收件箱记录（JSONL 追加写，0600）。
+ * @returns {Promise<{ appended: number }>}
+ */
+export async function appendRunMessages(runsRoot, runId, records) {
+  const loc = requireLoc(runsRoot, runId)
+  const list = Array.isArray(records) ? records : [records]
+  const lines = []
+  for (const item of list) {
+    const record = normalizeMessageRecord(item) || normalizeMessagePatch(item)
+    if (!record) throw new RunError(400, 'message', '消息记录不合法（需要 id + direction=in/out，或 id + status 补丁）')
+    const line = JSON.stringify(record)
+    if (Buffer.byteLength(line, 'utf8') > MAX_MESSAGE_LINE_BYTES) {
+      throw new RunError(400, 'message', '单条消息超过 16KB 上限')
+    }
+    lines.push(`${line}\n`)
+  }
+  if (lines.length === 0) throw new RunError(400, 'message', '至少需要一条消息记录')
+  return withLock(loc.id, async () => {
+    await ensureDirMode(loc.dir)
+    const path = messagesPath(loc.dir)
+    // 文件体积闸门：超限时不再追加（读取侧仍能读旧记录）。
+    try {
+      const info = await stat(path)
+      if (info.size + Buffer.byteLength(lines.join(''), 'utf8') > MAX_MESSAGES_FILE_BYTES) {
+        throw new RunError(400, 'message', '收件箱文件已达 8MiB 上限，拒绝继续追加')
+      }
+    } catch (error) {
+      if (error && error.code !== 'ENOENT') throw error
+    }
+    const handle = await open(path, 'a', FILE_MODE)
+    try {
+      await handle.writeFile(lines.join(''), 'utf8')
+    } finally {
+      await handle.close()
+    }
+    await chmod(path, FILE_MODE).catch(() => {})
+    return { appended: lines.length }
+  })
+}
+
+/**
+ * 给一条消息补一个投递状态（追加补丁行；`readRunMessages` 会合并）。
+ */
+export async function updateRunMessageStatus(runsRoot, runId, id, status, extra = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  if (!MESSAGE_STATUS_SET.has(status)) {
+    throw new RunError(400, 'status', `必须是 ${MESSAGE_STATUSES.join(' / ')}`)
+  }
+  const patch = normalizeMessagePatch({
+    id,
+    status,
+    ts: new Date().toISOString(),
+    ...(extra && typeof extra === 'object' ? extra : {}),
+  })
+  if (!patch) throw new RunError(400, 'message', '消息 id 不合法')
+  return appendRunMessages(runsRoot, runId, [patch])
+}
+
+/** 读节点会话表；文件缺失 / 坏 JSON / 字段不合法一律返回空表，不抛错。 */
+export async function readNodeSessions(runsRoot, runId) {
+  const loc = locate(runsRoot, runId)
+  if (!loc) return {}
+  let text
+  try {
+    text = await readFile(sessionsPath(loc.dir), 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return {}
+    return {}
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_SESSIONS_BYTES) return {}
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return {}
+  }
+  if (!isPlainObject(parsed)) return {}
+  const out = {}
+  for (const [nodeId, entry] of Object.entries(parsed)) {
+    if (!checkRunId(nodeId) || !isPlainObject(entry)) continue
+    if (typeof entry.sessionId !== 'string' || entry.sessionId.trim() === '' || entry.sessionId.length > 128) continue
+    out[nodeId] = {
+      sessionId: entry.sessionId,
+      createdAt: normalizeIso(entry.createdAt) || new Date().toISOString(),
+      lastUsedAt: normalizeIso(entry.lastUsedAt) || normalizeIso(entry.createdAt) || new Date().toISOString(),
+    }
+  }
+  return out
+}
+
+/** 原子整写节点会话表（临时文件 + rename，0600）。 */
+async function writeSessionsUnlocked(loc, sessions) {
+  const normalized = {}
+  if (isPlainObject(sessions)) {
+    for (const [nodeId, entry] of Object.entries(sessions)) {
+      if (!checkRunId(nodeId) || !isPlainObject(entry)) continue
+      if (typeof entry.sessionId !== 'string' || entry.sessionId.trim() === '' || entry.sessionId.length > 128) continue
+      normalized[nodeId] = {
+        sessionId: entry.sessionId,
+        createdAt: normalizeIso(entry.createdAt) || new Date().toISOString(),
+        lastUsedAt: normalizeIso(entry.lastUsedAt) || normalizeIso(entry.createdAt) || new Date().toISOString(),
+      }
+    }
+  }
+  const text = `${JSON.stringify(normalized, null, 2)}\n`
+  if (Buffer.byteLength(text, 'utf8') > MAX_SESSIONS_BYTES) {
+    throw new RunError(400, 'sessions', 'sessions.json 超过 512KB 上限')
+  }
+  await ensureDirMode(loc.dir)
+  const path = sessionsPath(loc.dir)
+  const tmp = `${path}.tmp-${process.pid}-${tmpCounter++}`
+  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
+  try {
+    await rename(tmp, path)
+  } catch (error) {
+    await unlink(tmp).catch(() => {})
+    throw error
+  }
+  await chmod(path, FILE_MODE).catch(() => {})
+  return normalized
+}
+
+/** 原子整写节点会话表（临时文件 + rename，0600）。 */
+export async function writeNodeSessions(runsRoot, runId, sessions) {
+  const loc = requireLoc(runsRoot, runId)
+  return withLock(loc.id, () => writeSessionsUnlocked(loc, sessions))
+}
+
+/**
+ * 写入/更新一个节点的会话（读-改-写在同一把进程内锁里完成）。
+ * @returns {Promise<Record<string, object>>} 写入后的会话表
+ */
+export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  if (!checkRunId(nodeId)) throw new RunError(400, 'nodeId', 'nodeId 不合法')
+  if (typeof sessionId !== 'string' || sessionId.trim() === '' || sessionId.length > 128) {
+    throw new RunError(400, 'sessionId', 'sessionId 必须是非空字符串（≤128 字符）')
+  }
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime())
+    ? options.now
+    : new Date()
+  return withLock(loc.id, async () => {
+    const current = await readNodeSessions(runsRoot, runId)
+    const previous = current[nodeId]
+    const entry = {
+      sessionId,
+      createdAt: previous && previous.sessionId === sessionId && options.resetCreatedAt !== true
+        ? previous.createdAt
+        : now.toISOString(),
+      lastUsedAt: now.toISOString(),
+    }
+    current[nodeId] = entry
+    return writeSessionsUnlocked(loc, current)
+  })
+}
+
+/** 运行中动态配置回复目标（写 run.json.inbox）。 */
+export async function writeRunInbox(runsRoot, runId, reply) {
+  const normalized = normalizeReplyTarget(reply)
+  if (!normalized) {
+    throw new RunError(400, 'reply', '回复目标不合法（kind 必须是 session / http / none；http 只允许 http/https）')
+  }
+  return writeRunMeta(runsRoot, runId, {
+    inbox: { reply: normalized, updatedAt: new Date().toISOString() },
+  })
+}
+
+/**
+ * 把「启动前收到」的消息并入 run.json.input.messages（幂等按 id 去重，最多保留 20 条）。
+ * @returns {Promise<object>} 写入后的完整 meta
+ */
+export async function appendRunInputMessages(runsRoot, runId, messages) {
+  const loc = requireLoc(runsRoot, runId)
+  const incoming = normalizeRunInput({ messages })
+  if (!incoming) return readRunMeta(runsRoot, runId)
+  return withLock(loc.id, async () => {
+    const meta = await readMetaUnlocked(loc)
+    if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+    const existing = normalizeRunInput(meta.input)
+    const merged = new Map()
+    for (const item of existing ? existing.messages : []) merged.set(item.id, item)
+    for (const item of incoming.messages) merged.set(item.id, item)
+    const list = [...merged.values()].slice(-RUN_INPUT_MAX_MESSAGES)
+    const next = normalizeMeta({ ...meta, input: { messages: list } }, loc.id)
+    next.updatedAt = new Date().toISOString()
+    return writeMetaUnlocked(loc, next)
+  })
+}
+
+
 async function readAllEventsUnlocked(loc, meta) {
   const events = []
   let order = 0
@@ -1425,12 +1889,15 @@ export async function readEvents(runsRoot, runId, options = {}) {
   }
 }
 
-// 与 runlog.EVENT_KINDS 保持一致；单独列一份避免这里 import 整个校验器。
+// 与 runlog 的事件白名单（EVENT_KINDS + INBOX_EVENT_KINDS）保持一致；
+// 单独列一份避免这里 import 整个校验器。
 const EVENT_KINDS = new Set([
   'run/start', 'run/end', 'node/start', 'node/end', 'member/start', 'member/end',
   'model/call', 'tool/call', 'skill/load', 'artifact/write', 'reject/trigger',
   'review/finding', 'review/verdict', 'check/form',
-  'acceptance/verdict', 'test/report',
+  'acceptance/verdict', 'test/report', 'agent/message',
+  // 06 §16：流程收件箱事件。
+  'message/in', 'message/out',
 ])
 
 function whitelistKind(kind) {

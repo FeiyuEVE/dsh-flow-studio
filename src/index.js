@@ -14,6 +14,8 @@
  *   GET/DELETE      /api/flow-studio/runs/<runId>
  *   POST            /api/flow-studio/runs/<runId>/start|stop
  *   GET/POST        /api/flow-studio/runs/<runId>/events
+ *   GET/POST        /api/flow-studio/runs/<runId>/messages
+ *   POST            /api/flow-studio/runs/<runId>/inbox
  *   GET             /api/flow-studio/runs/<runId>/summary
  *   GET             /api/flow-studio/runs/<runId>/export
  *
@@ -25,12 +27,14 @@ import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createEngine } from './engine.js'
+import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
 import { NODE_KIND, validateFlow } from './model.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import { createFlowTools } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
-  readLease, readRunDetail, readRunMeta, repairRunStates, runsDir, sweepExpiredLeases,
+  readLease, readRunDetail, readRunMessages, readRunMeta, repairRunStates, runsDir,
+  sweepExpiredLeases, writeRunInbox,
 } from './runstore.js'
 import {
   FlowConflictError, checkId, deleteFlow, flowsDir, listFlows, newFlowId, readFlow, saveFlow,
@@ -653,6 +657,64 @@ async function handleRuns(req, res, env, url, parts) {
       return
     }
 
+    if (action === 'messages') {
+      // 06 §16：流程收件箱（外部消息入口 + 列表）。
+      if (req.method === 'GET') {
+        const meta = await readRunMeta(root, runId)
+        if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+        const limit = parseLimit(url.searchParams.get('limit'), 100, 1000)
+        const listed = await readRunMessages(root, runId, { limit })
+        if (!listed) throw new RunError(404, 'runId', 'run 不存在')
+        sendJson(res, 200, {
+          ok: true,
+          messages: listed.messages,
+          total: listed.total,
+          truncated: listed.truncated,
+          skipped: listed.skipped,
+        })
+        return
+      }
+      if (req.method === 'POST') {
+        const body = await readBody(req)
+        const result = await deliverInboundMessage({
+          runsRoot: root,
+          flowsRoot: env.dir,
+          engine: env.engine,
+          ctx: env.ctx,
+          log: (level, message) => {
+            try {
+              if (level === 'warn' && env.ctx && env.ctx.logger && typeof env.ctx.logger.warn === 'function') {
+                env.ctx.logger.warn(message)
+              }
+            } catch {
+              // 日志失败不影响投递。
+            }
+          },
+        }, runId, body)
+        sendJson(res, 200, result)
+        return
+      }
+      sendJson(res, 405, { ok: false, error: '只支持 GET / POST' })
+      return
+    }
+
+    if (action === 'inbox') {
+      // 06 §16：运行中动态配置回复目标（flow_reply 的 run 级默认值）。
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 POST' })
+        return
+      }
+      const body = await readBody(req)
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new RunError(400, 'body', '请求体必须是 JSON 对象')
+      }
+      const validated = validateReplyTarget(body.reply)
+      if (!validated.ok) throw new RunError(400, 'reply', validated.error)
+      const meta = await writeRunInbox(root, runId, validated.reply)
+      sendJson(res, 200, { ok: true, inbox: meta.inbox })
+      return
+    }
+
     if (action === 'start' || action === 'stop') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { ok: false, error: '只支持 POST' })
@@ -841,7 +903,7 @@ export function apply(ctx) {
   // 面板与 /api 路由照常可用——不能因为缺少工具注册表让插件装不上。
   const toolsSvc = (typeof ctx.get === 'function' && ctx.get('tools')) || ctx.tools
   if (toolsSvc && typeof toolsSvc.register === 'function') {
-    const tools = createFlowTools({ flowsRoot: dir, runsRoot, engine })
+    const tools = createFlowTools({ flowsRoot: dir, runsRoot, engine, ctx, log })
     ctx.effect(() => {
       const disposers = tools.map(tool => toolsSvc.register(tool))
       return () => disposers.reverse().forEach(dispose => dispose())

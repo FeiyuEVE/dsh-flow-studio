@@ -27,10 +27,11 @@
  */
 
 import { validateFlowForRun } from './engine.js'
+import { deliverInboundMessage, deliverOutboundReply, validateReplyTarget } from './inbox.js'
 import { NODE_KIND } from './model.js'
 import { checkRunId } from './runlog.js'
 import {
-  createRun, listRuns, readAllEvents, readRunDetail,
+  createRun, listRuns, readAllEvents, readNodeSessions, readRunDetail, readRunMeta,
 } from './runstore.js'
 import { checkId, listFlows, readFlow } from './store.js'
 
@@ -42,6 +43,8 @@ const TIMEOUT_LIST_MS = 15_000
 const TIMEOUT_START_MS = 120_000
 const TIMEOUT_WATCH_MS = 30_000
 const TIMEOUT_STOP_MS = 120_000
+const TIMEOUT_SEND_MS = 60_000
+const TIMEOUT_REPLY_MS = 30_000
 
 /** 审计参数的默认口径（与引擎节点超时一致；可被 deps 覆盖，测试用）。 */
 const DEFAULT_STALL_MS = 10 * 60 * 1000
@@ -228,6 +231,66 @@ function sessionIdOf(exec) {
   return session && typeof session.id === 'string' && session.id !== '' ? session.id : null
 }
 
+/**
+ * 06 §16：sessionId → { runId, nodeId }。
+ * 引擎内存索引优先；没有（或引擎不支持）时扫最近 20 个 run 的 sessions.json 兜底。
+ */
+async function resolveSessionOwner(deps, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return null
+  if (deps.engine && typeof deps.engine.resolveSessionOwner === 'function') {
+    try {
+      const owner = await deps.engine.resolveSessionOwner(sessionId)
+      if (owner) return owner
+    } catch {
+      // 引擎反查失败就退回磁盘。
+    }
+  }
+  try {
+    const listed = await listRuns(deps.runsRoot, { limit: 20 })
+    for (const run of listed.runs || []) {
+      const sessions = await readNodeSessions(deps.runsRoot, run.id)
+      for (const [nodeId, entry] of Object.entries(sessions || {})) {
+        if (entry && entry.sessionId === sessionId) return { runId: run.id, nodeId }
+      }
+    }
+  } catch {
+    // 读不到当查不到。
+  }
+  return null
+}
+
+/** 06 §16：省略 runId 时取「当前会话启动的最新 run」，再退回最近一次 run。 */
+async function resolveRunId(deps, exec, requested) {
+  if (requested !== undefined) {
+    if (!checkRunId(requested)) {
+      throw new ParamError(
+        `runId「${requested}」不合法（只允许字母、数字、点、下划线、连字符，1–64 位）`,
+        'runId 来自 flow_start / flow_watch；省略则用当前会话启动的最新 run。',
+      )
+    }
+    return requested
+  }
+  const sessionId = sessionIdOf(exec)
+  const engine = deps.engine
+  if (engine && typeof engine.runForSession === 'function') {
+    try {
+      const fromEngine = engine.runForSession(sessionId)
+      if (typeof fromEngine === 'string' && fromEngine !== '') return fromEngine
+    } catch {
+      // 退回最近一次 run。
+    }
+  }
+  const listed = await listRuns(deps.runsRoot, { limit: 1 })
+  const latest = Array.isArray(listed.runs) && listed.runs.length > 0 ? listed.runs[0] : null
+  if (!latest) {
+    throw new ParamError(
+      '没有可用的 run',
+      '先用 flow_start 启动一个流程，或显式传 runId。',
+    )
+  }
+  return latest.id
+}
+
 // ── 审查闹钟文案 ───────────────────────────────────────────────────────────
 
 /**
@@ -362,7 +425,8 @@ async function resolveFlow(deps, args) {
 // ── 工具定义 ───────────────────────────────────────────────────────────────
 
 /**
- * 构造四个模型工具。
+ * 构造模型工具：基础四个（list / start / watch / stop），agents 服务可用时
+ * 追加收件箱两个（flow_send_message / flow_reply）。
  *
  * @param {{
  *   flowsRoot: string,
@@ -397,6 +461,10 @@ export function createFlowTools(deps) {
     : DEFAULT_MAX_REJECTS_PER_EDGE
   const now = typeof deps.now === 'function' ? deps.now : () => new Date()
   const engineName = deps.engine.engineName === 'stub' ? 'stub' : 'real'
+  // 06 §16：收件箱 / 回复工具依赖 agents 服务（没有它无法向会话注入消息，flow_reply
+  // 也没有可用的会话反查）。测试台 / 纯注入环境拿不到 agents 时只注册前四个工具，
+  // 既有 profile 的注册数量与卸载语义保持不变。
+  const inboxToolsEnabled = ctxHasAgents(deps.ctx)
 
   return [
     // ── flow_list ──────────────────────────────────────────────────────────
@@ -835,7 +903,245 @@ export function createFlowTools(deps) {
         }
       },
     },
+
+    // ── flow_send_message ──────────────────────────────────────────────────
+    ...(inboxToolsEnabled ? [
+    {
+      name: 'flow_send_message',
+      description:
+        '给一个流程 run 的收件箱发一条外部消息（与 Web 面板的 POST /runs/<id>/messages 是同一条内部逻辑）。'
+        + '目标节点：nodeId 显式指定（必须是阶段节点）→ 否则取 run 当前节点 → 否则（pending）入口节点。'
+        + '投递方式由引擎现状决定：目标节点已有活会话 → 立即注入（injected）；只有冷会话 → resume 后注入（resumed）；'
+        + 'run 还没开始 → 作为本 run 的启动输入（started）；run 在跑但节点还没到 → 入队，等引擎推进到该节点时并入提示词（queued）。'
+        + '省略 runId 时取当前会话启动的最新 run，再退回最近一次 run。reply 可选：指定节点回消息时要发给谁'
+        + '（session 会话 / http 回调地址 / none 只记日志；http 的 tokenEnv 只写环境变量名）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string', description: '目标 run id；省略 = 当前会话启动的最新 run，再退回最近一次 run' },
+          nodeId: { type: 'string', description: '目标阶段节点 id（可选；不传则按「当前节点 → 入口节点」推断）' },
+          text: { type: 'string', description: '消息正文（必填，≤4000 字符，超过按码点截断）' },
+          reply: {
+            type: 'object',
+            description: '节点回复消息时要投递到的目标（可选）',
+            properties: {
+              kind: { type: 'string', enum: ['session', 'http', 'none'], description: '回复通道：会话 / HTTP 回调 / 不回复' },
+              sessionId: { type: 'string', description: 'kind=session 时的目标会话 id' },
+              url: { type: 'string', description: 'kind=http 时的回调地址（只允许 http/https）' },
+              tokenEnv: { type: 'string', description: 'kind=http 时从哪个环境变量取 Bearer 令牌（只写变量名，不落盘）' },
+            },
+            required: ['kind'],
+            additionalProperties: false,
+          },
+        },
+        required: ['text'],
+      },
+      output: outputFor({
+        runId: { type: 'string', description: '实际投递到的 run id' },
+        messageId: { type: 'string', description: '这条入站消息的 id（后续 inReplyTo 用它）' },
+        targetNodeId: { type: 'string', description: '解析出的目标阶段节点 id' },
+        mode: {
+          type: 'string',
+          description: '投递方式：injected（活会话注入）/ resumed（冷会话 resume 后注入）/ started（作为启动输入）/ queued（入队）',
+        },
+        sessionId: nullable({ type: 'string' }, '目标节点的会话 id（started / queued 时为空，表示还没有会话）'),
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        return [{
+          type: 'text',
+          text: `消息 ${value.messageId} 已投递到 run ${value.runId} 的节点 ${value.targetNodeId}（${value.mode}）。`,
+        }]
+      }),
+      timeoutMs: TIMEOUT_SEND_MS,
+      async execute(args, exec) {
+        let text
+        let nodeId
+        let reply
+        try {
+          text = optionalString(args, 'text', { max: 4000 })
+          if (text === undefined) {
+            throw new ParamError('缺少必填参数 text', '传要发进流程的消息正文（≤4000 字符）。')
+          }
+          nodeId = optionalString(args, 'nodeId', { max: 64 })
+          if (nodeId !== undefined && !checkRunId(nodeId)) {
+            throw new ParamError(
+              `nodeId「${nodeId}」不合法（只允许字母、数字、点、下划线、连字符）`,
+              'nodeId 是流程里的阶段节点 id；不确定就从 run 详情里看。',
+            )
+          }
+          const rawReply = argsOf(args).reply
+          if (rawReply !== undefined && rawReply !== null) {
+            const validated = validateReplyTarget(rawReply)
+            if (!validated.ok) throw new ParamError(validated.error, '按参数说明改正 reply（kind 必填；http 只允许 http/https）。')
+            reply = validated.reply
+          }
+          const requestedRunId = optionalString(args, 'runId', { max: 128 })
+          const runId = await resolveRunId(deps, exec, requestedRunId)
+          const sessionId = sessionIdOf(exec)
+          const delivered = await deliverInboundMessage({
+            runsRoot: deps.runsRoot,
+            flowsRoot: deps.flowsRoot,
+            engine: deps.engine,
+            ctx: deps.ctx,
+            log: deps.log,
+          }, runId, {
+            from: sessionId ? clipChars(`agent:${sessionId}`, 200) : 'agent:unknown',
+            text,
+            ...(nodeId === undefined ? {} : { nodeId }),
+            ...(reply === undefined ? {} : { reply }),
+          })
+          return jsonSafe({
+            ok: true,
+            runId,
+            messageId: delivered.messageId,
+            targetNodeId: delivered.targetNodeId,
+            mode: delivered.mode,
+            sessionId: delivered.sessionId ?? null,
+          })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          const status = error && Number.isInteger(error.status) ? error.status : null
+          if (status === 409) {
+            return failure(
+              `投递失败：${messageOf(error)}`,
+              'run 已结束就不能再收消息；用 flow_watch 看它的状态，必要时用 flow_start 新开一个 run。',
+            )
+          }
+          if (status === 400 || status === 404) return failureOf(error, { action: '发送消息 ' })
+          return failure(
+            `发送消息失败：${messageOf(error)}`,
+            '如果是暂时性故障可以重试一次；仍失败就告诉主人。',
+            true,
+          )
+        }
+      },
+    },
+
+    // ── flow_reply ─────────────────────────────────────────────────────────
+    {
+      name: 'flow_reply',
+      description:
+        '在流程节点会话里给「把消息发进流程的来源」回一条消息（外部消息的返回通道）。'
+        + '这个工具只对**属于某个流程 run 的节点会话**有效：会话 id 查不到对应 run/节点时直接失败。'
+        + '回复目标优先级：消息级 reply（inReplyTo 指向的那条入站消息的配置）> run.json 的 inbox.reply > 未配置。'
+        + 'session 目标直接投进会话（活会话 followup / 冷会话 resume）；http 目标 POST 到回调地址'
+        + '（tokenEnv 指向的环境变量作为 Bearer，超时 10s，失败不抛异常）；未配置 / none 只记 message/out 事件，'
+        + '返回值 ok:true 并由 hint 说明「没有外部回复通道，已记录在运行日志」。'
+        + '正文前会自动加来源标记 [flow:<流程名> · <节点标题>]。',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '回复正文（必填，≤4000 字符，超过按码点截断）' },
+          inReplyTo: { type: 'string', description: '要回复的入站消息 id（可选；用于选中该消息自己的 reply 配置）' },
+        },
+        required: ['text'],
+      },
+      output: outputFor({
+        runId: { type: 'string', description: '这条回复所属的 run id' },
+        messageId: { type: 'string', description: '这条回复的 id（message/out 事件的 id）' },
+        inReplyTo: nullable({ type: 'string' }, '被回复的入站消息 id'),
+        nodeId: nullable({ type: 'string' }, '发起回复的节点 id'),
+        delivery: { type: 'string', description: '实际回复通道：session / http / local（未配置时只记日志）' },
+        sessionId: nullable({ type: 'string' }, 'kind=session 时的目标会话 id'),
+        httpStatus: nullable({ type: 'integer' }, 'kind=http 时的 HTTP 状态码'),
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        return [{
+          type: 'text',
+          text: `回复已记录（${value.delivery}${value.httpStatus ? ` / HTTP ${value.httpStatus}` : ''}）。`
+            + (value.hint ? `\n${value.hint}` : ''),
+        }]
+      }),
+      timeoutMs: TIMEOUT_REPLY_MS,
+      async execute(args, exec) {
+        let text
+        let inReplyTo
+        try {
+          text = optionalString(args, 'text', { max: 4000 })
+          if (text === undefined) {
+            throw new ParamError('缺少必填参数 text', '传要回复的正文（≤4000 字符）。')
+          }
+          inReplyTo = optionalString(args, 'inReplyTo', { max: 128 })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          return failure(`读取参数失败：${messageOf(error)}`, '按参数说明改正后重发。')
+        }
+
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) {
+          return failure(
+            '拿不到当前会话 id，无法判断这条回复属于哪个流程 run',
+            'flow_reply 只能在流程节点（run 内的 agent 会话）里调用。',
+          )
+        }
+        const owner = await resolveSessionOwner(deps, sessionId)
+        if (!owner) {
+          return failure(
+            '这个会话不属于任何流程 run',
+            '这个会话不属于任何流程 run：只有流程 run 里的节点会话才能用 flow_reply；普通对话里请直接回复用户。',
+            false,
+            { sessionId },
+          )
+        }
+
+        try {
+          const delivered = await deliverOutboundReply({
+            runsRoot: deps.runsRoot,
+            flowsRoot: deps.flowsRoot,
+            engine: deps.engine,
+            ctx: deps.ctx,
+            log: deps.log,
+          }, {
+            runId: owner.runId,
+            nodeId: owner.nodeId,
+            sessionId,
+            text,
+            ...(inReplyTo === undefined ? {} : { inReplyTo }),
+            signal: exec && exec.signal,
+          })
+          if (delivered.ok !== true) {
+            return failure(
+              delivered.error || '回复投递失败',
+              '回复已写进运行日志（message/out），但外部通道没有确认收到；检查 reply 配置 / 回调地址 / 令牌环境变量。',
+              true,
+              {
+                runId: owner.runId,
+                messageId: delivered.messageId,
+                nodeId: delivered.nodeId,
+                delivery: delivered.delivery,
+                ...(delivered.httpStatus === null || delivered.httpStatus === undefined
+                  ? {}
+                  : { httpStatus: delivered.httpStatus }),
+              },
+            )
+          }
+          return jsonSafe({ ok: true, runId: owner.runId, ...delivered })
+        } catch (error) {
+          const status = error && Number.isInteger(error.status) ? error.status : null
+          if (status === 400 || status === 404) {
+            return failureOf(error, { action: '回复消息 ', extra: { runId: owner.runId, nodeId: owner.nodeId } })
+          }
+          return failure(
+            `回复失败：${messageOf(error)}`,
+            '稍后重试一次；仍失败就告诉主人（回复通道可能配置错了）。',
+            true,
+          )
+        }
+      },
+    },
+    ] : []),
   ]
+}
+
+/** ctx 是否提供可用的 agents 服务（决定是否注册收件箱 / 回复工具）。 */
+function ctxHasAgents(ctx) {
+  if (!ctx) return false
+  try {
+    const service = typeof ctx.get === 'function' ? ctx.get('agents') : ctx.agents
+    return Boolean(service && (typeof service.get === 'function' || typeof service.resume === 'function'))
+  } catch {
+    return false
+  }
 }
 
 /** 按码点截断（不把代理对切成半个字符）。 */

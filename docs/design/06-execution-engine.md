@@ -500,3 +500,135 @@ engine.start(runId, { parent })        // 本次 run 用 parent 覆盖父会话�
   卸载 / HMR 时逆序撤销，不留孤儿工具。
 - 复用既有 `createRun` / `engine` / `dir` / `runsRoot`，不复制第二份建 run / 开跑逻辑；
   工具层不引入任何新依赖，也不 import dsh 包。
+
+## 16 流程收件箱与节点会话复用
+
+流程不只是一次性的单向执行链：它可以**接收外部发给它的消息**，消息从需求分析节点（或流程定义的某个
+开始节点）往下流。为了让「同一节点的后续消息」不会被拆成许多新会话，执行引擎从 v1.6 起采用
+**一个节点一个会话**；每个节点会话都可以通过 `flow_reply` 把结论回给消息来源。
+
+### 16.1 run 目录新增文件
+
+| 文件 | 写入方式 | 内容 |
+|---|---|---|
+| `runs/<runId>/sessions.json` | 原子整写（临时文件 + rename，0600） | `{ "<nodeId>": { "sessionId": "…", "createdAt": "…", "lastUsedAt": "…" } }`；坏文件按空表处理，不抛错 |
+| `runs/<runId>/messages.jsonl` | JSONL 追加写（0600） | 每条一行：入站记录（`direction:"in"`）、出站记录（`direction:"out"`）或状态补丁（`{id,status}`） |
+| `run.json.input` | 随 run.json 原子写 | 可选：`{ messages: [{ id, from, text, at, targetNodeId? }] }`，run 还没开始就被投递进来的消息（最多 20 条） |
+| `run.json.inbox` | 随 run.json 原子写 | 可选：`{ reply: { kind, sessionId?, url?, tokenEnv? }, updatedAt }`，run 级默认回复目标 |
+
+`messages.jsonl` 的读取会把「完整记录 + 状态补丁」按 `id` 合并，按入站/出站原始 `ts` 升序返回；
+坏行跳过并计入 `skipped`，不让一行坏数据拖垮整个收件箱。
+
+### 16.2 一个节点一个会话（引擎侧规则）
+
+1. **首次激活**：走既有的 `ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', … })`，
+   拿到 `childId` 后把 `{ sessionId, createdAt, lastUsedAt }` 写进 `sessions.json`。
+2. **二次激活**（同一节点被打回重跑、或同一 run 里再次到达该节点）：
+   - `sessions.json` 命中该节点 → **绝不新起会话**；
+   - 先 `ctx.agents.get(sessionId)`：拿到活的 Agent 就 `agent.followup(prompt)` 注入本轮提示词；
+   - 拿不到（冷会话 / 已被压缩过的会话）→ `ctx.agents.resume({ resumeSessionId })` 得到
+     `{ agent }`，再 `agent.followup(prompt)`；`resume` 会恢复会话状态（包括压缩后的上下文摘要），
+     所以「被压缩过」不等于「换一个会话」；
+   - 注入后 `await agent.whenIdle()`，从该会话**最后一条 assistant 消息**里解析与
+     `outputSchema` 相同结构的 JSON；
+   - 解析失败按既有「结构化输出不合格」路径收口：`node/end failed` + 校验错误，
+     不静默吞、不回退成新会话。
+3. **生命周期**：节点结束时**不 dispose**。activation 句柄按 nodeId 存在 run 级 Map / Set 里，
+   只在 run 进入终态（`done` / `failed` / `aborted`）或 `stop` 收尾时统一 `dispose()`；
+   中途失败也不提前释放——失败节点可能还要被二次激活。
+4. **降级**：没有 `ctx.agents` 服务（测试台 / 纯注入环境）时，退化为「每次新会话」，并记一条
+   `warn` 日志；既有测试与桩引擎路径不受影响。
+5. **事件归属**：复用会话时把 `sessionBindings` 的 `attemptId / traceId` 重挂到新的 attempt，
+   避免 `model/call`、`agent/message`、成员事件被记到上一轮。
+
+### 16.3 收件箱事件
+
+新增两种 **run 级** 事件（不要求 `nodeId + attemptId`，因为消息可能在任何节点启动前到达）：
+
+| kind | data 字段（白名单） | 上限 / 归一化 |
+|---|---|---|
+| `message/in` | `id`、`from`、`text`、`targetNodeId?`、`replyKind?` | `from` ≤200 字符；`text` 按码点截断到 2000；`targetNodeId` 必须是合法节点 id；`replyKind` ∈ session / http / none |
+| `message/out` | `id`、`inReplyTo?`、`text`、`nodeId?`、`delivery` | `text` 按码点截断到 2000；`delivery` ∈ session / http / local |
+
+`EVENT_KINDS`（05 §2 的 17 种基础契约）保持冻结；收件箱事件单独导出为 `INBOX_EVENT_KINDS`，
+校验器接受两者的并集。HTTP 入口的正文上限是 4000 字符，落事件时再截到 2000。
+
+### 16.4 消息路由表（`POST /api/flow-studio/runs/<runId>/messages`）
+
+请求体：`{ from, text, nodeId?, reply? }`（`from` ≤200、`text` ≤4000 必填）。
+
+目标节点解析顺序：
+
+1. 显式 `nodeId` —— 必须是阶段节点，否则 **400**；
+2. run 正在跑 —— `run.json.live.currentNodeId`；
+3. 否则（pending）—— 入口节点：开始节点沿 `next` 走到的第一个阶段节点。
+
+| mode | 条件 | 行为 |
+|---|---|---|
+| `injected` | 目标节点已有会话，且 `agents.get(sessionId)` 返回活 Agent | 立即 `agent.followup(...)` 注入；消息记录标 `injected` |
+| `resumed` | 目标节点已有会话，但 `agents.get` 拿不到（冷 / 被压缩） | `agents.resume({ resumeSessionId })` 后 `followup`；消息记录标 `resumed` |
+| `started` | 目标节点没有会话，且 run 还没开始（`status=pending`、`started=false`） | 写进 `run.json.input.messages`，`engine.start` 时作为入口节点提示词的一部分；消息记录保持 `pending`，节点启动时转 `delivered` |
+| `queued` | 目标节点没有会话，且 run 正在跑 | 消息入队（`messages.jsonl` 状态 `pending`），引擎推进到该节点时并入提示词并标 `delivered` |
+
+终态 run（done / failed / aborted）且没有会话 → **409**，不再接收消息。
+没有 `ctx.agents` 服务时不能注入：pending 的 run 走 `started`，运行中的 run 走 `queued`，并记 `warn`。
+
+返回：`{ ok: true, messageId, targetNodeId, mode, sessionId? }`。
+
+### 16.5 提示词里的「外部消息」段
+
+引擎在构造每个节点提示词时读取 `messages.jsonl`（并与 `run.json.input.messages` 按 id 去重合并），
+分成两段拼进 `## 外部消息`：
+
+- **fresh**：目标就是本节点、状态仍为 `pending` 的消息（最多 5 条）；
+- **prior**：之前已投递过（`injected` / `resumed` / `delivered`）的消息，**入口节点收到的消息会继续出现
+  在后续每个阶段节点里**（最多 5 条）。
+
+有界口径：最多 5 条、每条 ≤1200 字，行格式 `- [ts · from]（来自流程收件箱 · …）正文`。
+本节点要处理的 fresh 消息在拼完提示词后**全部标记 `delivered`**（即使只展示了前 5 条，其余也算已消费）；
+提示词总预算仍是 8000 字，超限时「输出格式」段硬保留。
+
+### 16.6 返回消息：回复目标优先级
+
+`flow_reply({ text, inReplyTo? })` 先反查 `exec.agent.session.id` 是哪个 run / 节点的会话
+（引擎内存索引 `sessionId → {runId,nodeId}`，再退回最近 20 个 run 的 `sessions.json`）；
+查不到 → `{ ok:false, hint:'这个会话不属于任何流程 run' }`。
+
+回复目标优先级（高 → 低）：
+
+1. **消息级 `reply`**：`inReplyTo` 指向的那条入站消息自己的 `reply` 配置；
+2. **run 级 `inbox.reply`**：`POST /runs/<runId>/inbox` 动态写入（运行中可改）；
+3. **未配置 / `kind:'none'`**：只写 `message/out` 事件，`delivery:'local'`，返回 `ok:true` 并在 `hint`
+   里说明「没有外部回复通道，已记录在运行日志」。
+
+| kind | 行为 |
+|---|---|
+| `session` | `agents.get(sessionId)`（活）或 `agents.resume`（冷）后 `followup`；正文前加来源标记 `[flow:<流程名> · <节点标题>]` |
+| `http` | `POST url`，body `{runId, nodeId, messageId, text}`；`tokenEnv` 指定的环境变量作为 `Authorization: Bearer`；超时 10s；失败不抛异常 |
+| `none` | 只记事件 |
+
+**任何一条回复**都会写 `message/out` 事件与 `messages.jsonl` 出站记录。`GET /runs/<runId>/messages?limit=`
+把 in/out 合并按时间列出；`POST /runs/<runId>/inbox` 只能写 `{ reply }`，`tokenEnv` 只存环境变量名，
+令牌值永不落盘。
+
+### 16.7 会话冷 / 被压缩时的复用边界
+
+- 冷会话（进程重启、会话被回收）与**被压缩过的会话**都走 `agents.resume({ resumeSessionId })`：
+  恢复的是同一个会话（含压缩摘要），会产生新的 turn，**不会**新建第二个会话。
+- `resume` 拿不到 Agent、或目标 Agent 没有 `followup` → 该节点按失败收口（503 语义），
+  **不会**悄悄换成新会话——「一个节点一个会话」是硬约束，宁可失败也不静默分叉。
+- 复用会话的 assistant 输出必须能解析成 JSON 对象；解析失败 / 空输出 = 结构化输出不合格，
+  走与首次激活相同的失败路径。
+- 复用会话时 `whenIdle()` 决定「这一轮结束」；如果宿主没有 `whenIdle`，引擎只能读到 followup 之后
+  已到达的事件，读不到就按解析失败处理（不伪造结果）。
+- run 结束统一 dispose 会话；进程崩溃残留的会话由宿主自己的会话回收负责（本插件不做跨进程清理）。
+
+### 16.8 安全与兼容
+
+- 外部文本一律按码点截断：请求体 4000、事件 2000、提示词单条 1200、来源 200；消息文件 8 MiB、
+  sessions.json 512 KiB 为最后闸门。
+- URL 只允许 `http:` / `https:`；`tokenEnv` 只接受合法环境变量名，值只从 `process.env` 读取。
+- 所有路径都是 run 目录内的固定相对文件名（`messages.jsonl`、`sessions.json`），
+  不拼外部输入；runId 继续走 `checkRunId()`。
+- 模型工具 `flow_send_message` / `flow_reply` 只在 agents 服务可用时注册；
+  它们与 HTTP 路由共用 `src/inbox.js` 的同一套内部函数，不自己拼 HTTP。

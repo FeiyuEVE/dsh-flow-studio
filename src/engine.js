@@ -27,6 +27,7 @@ import { join, resolve, sep } from 'node:path'
 
 import { EDGE_KIND, EXEC_MODE, NODE_KIND } from './model.js'
 import { checkRunId, isSafeRelPath, normalizeEvent } from './runlog.js'
+import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 import {
   RunError, appendEvents, readAllEvents, readRunMeta, runsDir, writeRunMeta,
 } from './runstore.js'
@@ -768,9 +769,12 @@ function charLength(text) {
  *   upstream?: object[],
  *   previous?: object,
  *   rejectContext?: object,
+ *   inboxText?: string,
  * }} input
  */
-export function buildPrompt({ node, attempt, upstream = [], previous = null, rejectContext = null }) {
+export function buildPrompt({
+  node, attempt, upstream = [], previous = null, rejectContext = null, inboxText = '',
+}) {
   const role = String(node.role || '').trim() || node.title || '（未命名角色）'
   let task = String(node.task || '').trim() || '（节点没有写任务说明）'
   const team = teamText(node)
@@ -783,6 +787,8 @@ export function buildPrompt({ node, attempt, upstream = [], previous = null, rej
 
   const formatSection = section('输出格式', outputFormatText())
   const rejectBody = attempt > 1 || rejectContext || previous ? rejectText(previous, rejectContext) : ''
+  // 06 §16：外部消息段（宿主侧已拼好并有界；空串时不占提示词预算）。
+  let inboxBody = String(inboxText || '').trim()
 
   const assemble = () => {
     const sections = [
@@ -792,6 +798,7 @@ export function buildPrompt({ node, attempt, upstream = [], previous = null, rej
       section('必须加载的 skill', skillsText),
       section('上游产物', upstreamBody),
     ]
+    if (inboxBody !== '') sections.push(section('外部消息', inboxBody))
     if (rejectBody.trim() !== '') sections.push(section('打回上下文', rejectBody))
     sections.push(formatSection)
     return sections.join('\n\n')
@@ -820,6 +827,7 @@ export function buildPrompt({ node, attempt, upstream = [], previous = null, rej
   for (const shrink of [
     value => { outputs = value },
     value => { skillsText = value },
+    value => { inboxBody = value },
     value => { task = value },
   ]) {
     shrink('…')
@@ -835,6 +843,7 @@ export function buildPrompt({ node, attempt, upstream = [], previous = null, rej
       section('必须加载的 skill', skillsText),
       section('上游产物', upstreamBody),
     ]
+    if (inboxBody !== '') sections.push(section('外部消息', inboxBody))
     if (rejectBody.trim() !== '') sections.push(section('打回上下文', rejectBody))
     return sections.join('\n\n')
   })()
@@ -1090,6 +1099,31 @@ function extractStructured(raw) {
   return undefined
 }
 
+/**
+ * 06 §16：从复用会话的 assistant 原文里解析结构化输出。
+ * 兼容：纯 JSON / Markdown 代码块包裹 / JSON 前后夹带解释文字。
+ * @returns {object | null}
+ */
+export function parseAssistantStructured(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  const text = raw.trim()
+  const candidates = [text]
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text)
+  if (fenced) candidates.push(fenced[1].trim())
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1))
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (isPlainObject(parsed)) return parsed
+    } catch {
+      // 换下一个候选。
+    }
+  }
+  return null
+}
+
 /** 把宿主的 TokenUsage 映射成 05 §3 的四桶；reasoning 仅在 ≤ output 时带上。 */
 export function mapHostUsage(usage) {
   if (!isPlainObject(usage)) return null
@@ -1248,7 +1282,17 @@ class FlowEngine {
     // 06 §13.7：本 run 已落盘的产物索引（path → { nodeId, attemptId, sha256 }），
     // 校验模型给的 evidenceRef / reportRef 是否真的对应一条 artifact/write。
     this.artifactIndex = new Map()
+    // 06 §16：节点会话复用。
+    //   nodeSessions     nodeId → { sessionId, createdAt, lastUsedAt, handle }（本次 run 内）
+    //   disposalHandles  本次 run 里所有 activation 句柄（run 结束/停止时统一 dispose）
+    //   sessionIndex     跨 run 的 sessionId → { runId, nodeId }（flow_reply 反查用）
+    //   lastAssistantBySession  sessionId → 最近一条 assistant 原文（复用会话时解析结构化输出）
+    //   startupMessages  run.json.input.messages（启动前投递进来的消息）
+    this.sessionIndex = new Map()
+    this.startedBy = new Map()
+    this.lastStartedRunId = null
     this.eventQueue = Promise.resolve()
+    this._resetInboxState()
 
     if (this.ctx && typeof this.ctx.on === 'function') {
       this.unsubscribe = this.ctx.on(
@@ -1269,6 +1313,291 @@ class FlowEngine {
   _subagentService() {
     if (!this.ctx || typeof this.ctx.get !== 'function') return undefined
     return this.ctx.get('subagents')
+  }
+
+  // -- 06 §16：节点会话复用 / 收件箱 ---------------------------------------
+
+  /** agents 服务（可选依赖；拿不到就退化为「每次新会话」）。 */
+  _agentsService() {
+    if (!this.ctx) return undefined
+    try {
+      if (typeof this.ctx.get === 'function') {
+        const service = this.ctx.get('agents')
+        if (service) return service
+      }
+      return this.ctx.agents
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 只有具备 get / resume 之一才算可复用会话（测试台里可能只注入 roots）。 */
+  _agentsUsable() {
+    const agents = this._agentsService()
+    return Boolean(agents && (typeof agents.get === 'function' || typeof agents.resume === 'function'))
+  }
+
+  _agentSessionId(agent) {
+    const sessionId = agent && agent.session && agent.session.id
+    return typeof sessionId === 'string' && sessionId !== '' ? sessionId : null
+  }
+
+  /** run.json.input.messages → 本次 run 的启动消息（有界）。 */
+  _startupMessagesOf(meta) {
+    const list = meta && meta.input && Array.isArray(meta.input.messages) ? meta.input.messages : []
+    return list.slice(0, 20)
+      .filter(item => item && typeof item.id === 'string' && item.id !== '')
+      .map(item => ({
+        id: item.id,
+        from: typeof item.from === 'string' && item.from !== '' ? item.from : 'unknown',
+        text: typeof item.text === 'string' ? item.text : '',
+        at: typeof item.at === 'string' ? item.at : isoOf(this.now()),
+        ...(typeof item.targetNodeId === 'string' ? { targetNodeId: item.targetNodeId } : {}),
+      }))
+  }
+
+  /** 入口阶段节点：开始节点沿 next 走到的第一个 stage（找不到返回 null）。 */
+  _firstStageId(flow) {
+    let node = null
+    try {
+      node = selectFirstNode(flow)
+    } catch {
+      return null
+    }
+    const seen = new Set()
+    while (node && !seen.has(node.id)) {
+      seen.add(node.id)
+      if (node.kind === NODE_KIND.STAGE) return node.id
+      if (node.kind === NODE_KIND.END) return null
+      node = selectNextNode(flow, node)
+    }
+    return null
+  }
+
+  /** 启动时加载 sessions.json（存在就复用；坏文件按空表处理）。 */
+  async _loadNodeSessions(runId) {
+    if (typeof runstoreModule.readNodeSessions !== 'function') return
+    try {
+      const sessions = await runstoreModule.readNodeSessions(this.runsRoot, runId)
+      for (const [nodeId, entry] of Object.entries(sessions || {})) {
+        if (!entry || typeof entry.sessionId !== 'string') continue
+        this.nodeSessions.set(nodeId, {
+          sessionId: entry.sessionId,
+          createdAt: entry.createdAt,
+          lastUsedAt: entry.lastUsedAt,
+          handle: null,
+        })
+        this._rememberSessionOwner(entry.sessionId, runId, nodeId)
+      }
+    } catch (error) {
+      this.log('warn', `flow-studio: 读 sessions.json 失败（${runId}）：${error.message}`)
+    }
+  }
+
+  _sessionsSnapshot() {
+    const out = {}
+    for (const [nodeId, entry] of this.nodeSessions) {
+      if (!entry || typeof entry.sessionId !== 'string') continue
+      out[nodeId] = {
+        sessionId: entry.sessionId,
+        createdAt: entry.createdAt,
+        lastUsedAt: entry.lastUsedAt,
+      }
+    }
+    return out
+  }
+
+  /** 原子落 sessions.json；失败只告警（会话复用退化为本次进程内有效）。 */
+  async _persistNodeSessions(runId) {
+    if (typeof runstoreModule.writeNodeSessions !== 'function') return
+    try {
+      await runstoreModule.writeNodeSessions(this.runsRoot, runId, this._sessionsSnapshot())
+    } catch (error) {
+      this.log('warn', `flow-studio: 写 sessions.json 失败（${runId}）：${error.message}`)
+    }
+  }
+
+  /** 记录一个节点会话（sessionId + 可选的 activation 句柄）。 */
+  _recordNodeSession(runId, nodeId, sessionId, { handle = null, createdAt = null } = {}) {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const nowIso = isoOf(this.now())
+    const previous = this.nodeSessions.get(nodeId)
+    const keepHandle = previous && previous.sessionId === sessionId ? previous.handle || null : null
+    this.nodeSessions.set(nodeId, {
+      sessionId,
+      createdAt: createdAt
+        || (previous && previous.sessionId === sessionId ? previous.createdAt : null)
+        || nowIso,
+      lastUsedAt: nowIso,
+      handle: handle || keepHandle,
+    })
+    this._rememberSessionOwner(sessionId, runId, nodeId)
+    if (handle && typeof handle.dispose === 'function') this.disposalHandles.add(handle)
+  }
+
+  /** 跨 run 的 sessionId → { runId, nodeId } 索引（LRU 500）。 */
+  _rememberSessionOwner(sessionId, runId, nodeId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    if (this.sessionIndex.has(sessionId)) this.sessionIndex.delete(sessionId)
+    else if (this.sessionIndex.size >= 500) {
+      const oldest = this.sessionIndex.keys().next().value
+      if (oldest !== undefined) this.sessionIndex.delete(oldest)
+    }
+    this.sessionIndex.set(sessionId, { runId, nodeId })
+  }
+
+  /** 某 run / 节点是否已有会话（路由与工具共用；同步读内存）。 */
+  sessionIdForNode(runId, nodeId) {
+    if (this.active && this.active.runId === runId) {
+      const entry = this.nodeSessions.get(nodeId)
+      if (entry && typeof entry.sessionId === 'string') return entry.sessionId
+    }
+    for (const [sessionId, owner] of this.sessionIndex) {
+      if (owner.runId === runId && owner.nodeId === nodeId) return sessionId
+    }
+    return null
+  }
+
+  /** flow_send_message：省略 runId 时取「当前会话启动的最新 run」。 */
+  runForSession(sessionId) {
+    if (typeof sessionId === 'string' && sessionId !== '') {
+      const started = this.startedBy.get(sessionId)
+      if (started) return started
+      const owner = this.sessionIndex.get(sessionId)
+      if (owner && typeof owner.runId === 'string') return owner.runId
+      if (this.active && this.active.runId) return this.active.runId
+    }
+    return this.latestRunId()
+  }
+
+  latestRunId() {
+    if (this.active && typeof this.active.runId === 'string') return this.active.runId
+    return this.lastStartedRunId || null
+  }
+
+  /**
+   * flow_reply：sessionId 反查 run / 节点。
+   * 内存索引优先；查不到再扫最近 20 个 run 的 sessions.json 兜底。
+   * @returns {Promise<{ runId: string, nodeId: string } | null>}
+   */
+  async resolveSessionOwner(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null
+    const hit = this.sessionIndex.get(sessionId)
+    if (hit) return hit
+    if (typeof runstoreModule.listRuns !== 'function' || typeof runstoreModule.readNodeSessions !== 'function') {
+      return null
+    }
+    try {
+      const listed = await runstoreModule.listRuns(this.runsRoot, { limit: 20 })
+      for (const run of listed.runs || []) {
+        const sessions = await runstoreModule.readNodeSessions(this.runsRoot, run.id)
+        for (const [nodeId, entry] of Object.entries(sessions || {})) {
+          if (entry && entry.sessionId === sessionId) {
+            this._rememberSessionOwner(sessionId, run.id, nodeId)
+            return { runId: run.id, nodeId }
+          }
+        }
+      }
+    } catch (error) {
+      this.log('warn', `flow-studio: 反查会话归属失败：${error.message}`)
+    }
+    return null
+  }
+
+  /** 冷会话 resume 时给一个可用的默认模型（取不到就用宿主默认）。 */
+  _defaultAgentSelection() {
+    try {
+      const service = this.ctx && typeof this.ctx.get === 'function'
+        ? this.ctx.get('agentDefaultModel')
+        : null
+      const selection = service && typeof service.currentSelection === 'function'
+        ? service.currentSelection()
+        : null
+      if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return undefined
+      if (selection.provider === '' || selection.model === '') return undefined
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort !== ''
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 把本轮提示词投进已有会话并等它空闲，然后从该会话最后一条 assistant 消息里
+   * 解析与 outputSchema 相同结构的 JSON；解析失败抛 StructuredOutputError
+   *（走既有「结构化输出不合格」失败路径：node/end failed + 校验错误）。
+   */
+  async _followupNodeSession({ runId, node, attempt, prompt, combined, traceId, entry }) {
+    const agents = this._agentsService()
+    const sessionId = entry.sessionId
+    let agent = null
+    let mode = 'injected'
+    try {
+      if (typeof agents.get === 'function') agent = agents.get(sessionId) || null
+    } catch {
+      agent = null
+    }
+    if (!agent) {
+      if (typeof agents.resume !== 'function') {
+        throw new EngineError(503, `节点「${node.id}」的会话已不可用，且 agents.resume 不可用`)
+      }
+      const resumeOptions = { resumeSessionId: sessionId }
+      const selection = this._defaultAgentSelection()
+      if (selection) resumeOptions.agentOptions = selection
+      const resumed = await raceAbort(agents.resume(resumeOptions), combined)
+      agent = resumed && resumed.agent ? resumed.agent : null
+      mode = 'resumed'
+    }
+    if (!agent || typeof agent.followup !== 'function') {
+      throw new EngineError(503, `节点「${node.id}」的会话 ${sessionId} 无法接收消息（没有 followup）`)
+    }
+    // 清掉上一条 assistant 文本，避免把上一轮的结果误当成本轮输出。
+    this.lastAssistantBySession.delete(sessionId)
+    // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
+    this.bindSession(sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId }, { rebind: true })
+    agent.followup(buildFollowupPayload({
+      text: prompt,
+      runId,
+      nodeId: node.id,
+      from: 'flow-studio',
+    }))
+    if (typeof agent.whenIdle === 'function') {
+      const idle = agent.whenIdle()
+      if (idle && typeof idle.then === 'function') await raceAbort(idle, combined)
+    }
+    // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const raw = this.lastAssistantBySession.get(sessionId)
+    const structured = parseAssistantStructured(raw)
+    if (!structured) {
+      throw new StructuredOutputError(
+        `复用会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的 JSON（需要与 outputSchema 相同的结构）`,
+      )
+    }
+    return { structured, sessionId, mode }
+  }
+
+  /**
+   * run 收尾统一释放会话：用 Set 去重，单个失败只告警。
+   * 中途节点失败不提前 dispose（节点可能还要被二次激活）。
+   */
+  async _disposeRunSessions(runId) {
+    const handles = [...this.disposalHandles]
+    this.disposalHandles.clear()
+    this.nodeSessions.clear()
+    for (const handle of handles) {
+      if (!handle || typeof handle.dispose !== 'function') continue
+      try {
+        await handle.dispose()
+      } catch (error) {
+        this.log('warn', `flow-studio: dispose 会话失败（${runId}）：${error.message}`)
+      }
+    }
   }
 
   async _defaultActivate({ prompt, outputSchema, signal, label, onSession, agentOptions }) {
@@ -1422,6 +1751,11 @@ class FlowEngine {
       }
       const stages = (flow.nodes || []).filter(node => node.kind === NODE_KIND.STAGE)
 
+      // 06 §16：启动前投递进来的消息、入口阶段节点、以及可能已存在的节点会话表。
+      this.startupMessages = this._startupMessagesOf(meta)
+      this.entryStageId = this._firstStageId(flow)
+      await this._loadNodeSessions(runId)
+
       // 06 §13.3：先抢单写者租约；抢不到 409（Host 侧 claimLease 才存在时启用）。
       if (typeof runstoreModule.claimLease === 'function') {
         try {
@@ -1461,6 +1795,9 @@ class FlowEngine {
         })
       }
       transitioned = true
+      this.lastStartedRunId = runId
+      const starterSessionId = this._agentSessionId(parentOverride || this.parent)
+      if (starterSessionId) this.startedBy.set(starterSessionId, runId)
 
       active.flow = flow
       active.starting = false
@@ -1515,6 +1852,17 @@ class FlowEngine {
     this.lastAssistantText.clear()
     this.liveUsage.clear()
     this.artifactIndex = new Map()
+    this._resetInboxState()
+  }
+
+  /** 06 §16：每 run 从零开始的收件箱 / 节点会话运行态（跨 run 的 sessionIndex 不清）。 */
+  _resetInboxState() {
+    this.nodeSessions = new Map()
+    this.disposalHandles = new Set()
+    this.startupMessages = []
+    this.entryStageId = null
+    this.sessionDegraded = false
+    this.lastAssistantBySession = new Map()
   }
 
   /** 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。 */
@@ -1943,6 +2291,8 @@ class FlowEngine {
           this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
         })
       }
+      // 06 §16：run 结束（done/failed/aborted）或 stop 收口时，统一释放本次 run 的会话。
+      await this._disposeRunSessions(runId)
       this._cleanupActive()
     }
   }
@@ -2010,19 +2360,27 @@ class FlowEngine {
     // 06 §6：宿主侧预读最近上游产物的有界正文（buildPrompt 保持纯函数，不碰 fs）；
     // 读取失败 / 文件缺失 / 超限都降级为空内容，路径行照旧下传。
     const upstreamWithContents = await loadUpstreamArtifactContents(this.runsRoot, runId, upstream)
+    // 06 §16：把「发给本节点的、尚未投递的入站消息」拼进提示词，并把它们标记为已投递；
+    // 入口节点收到的消息会作为「来自流程收件箱」继续出现在后续每个阶段节点里。
+    const inboxText = await consumeInboxForNode(
+      { runsRoot: this.runsRoot, log: this.log },
+      runId,
+      node.id,
+      { startupMessages: this.startupMessages },
+    )
     const prompt = buildPrompt({
       node,
       attempt,
       upstream: upstreamWithContents,
       previous,
       rejectContext,
+      inboxText,
     })
     // 06 §13.11 M5：node.model 传给子 agent（注入的 activate 同样能收到 agentOptions）。
     const model = typeof node.model === 'string' && node.model.trim() !== '' ? clip(node.model.trim(), 128) : ''
     const agentOptions = model === '' ? undefined : { model }
 
     let structuredRaw
-    let disposed = null
     const timeoutController = new AbortController()
     let timedOut = false
     const timer = setTimeout(() => {
@@ -2039,33 +2397,61 @@ class FlowEngine {
         await this._writeStubEvidence(runId, node, attempt, traceId)
       } else {
         const label = `${runId}/${node.id}#${attempt}`
-        let activation
-        try {
-          activation = await raceAbort(this.activate({
-            prompt,
-            outputSchema: ENGINE_OUTPUT_SCHEMA,
-            signal: combined,
-            label,
-            // 附加字段：注入的 activate 可忽略；默认包装器靠它提前登记 sessionId。
-            onSession: sessionId => this.bindSession(sessionId, {
-              nodeId: node.id,
-              attemptId: attempt,
-              memberId: null,
-              traceId,
-            }),
-            node,
-            attempt,
-            ...(agentOptions ? { agentOptions } : {}),
-          }), combined)
-        } catch (error) {
-          if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
-          throw error
+        const existingSession = this.nodeSessions.get(node.id)
+        if (existingSession && typeof existingSession.sessionId === 'string' && this._agentsUsable()) {
+          // 06 §16：一个节点一个会话。二次激活 / 打回重跑都投进同一个会话（活会话直接
+          // followup，冷会话或已被压缩的会话先 resume），**不再新起会话**。
+          try {
+            const reused = await this._followupNodeSession({
+              runId, node, attempt, prompt, signal, combined, traceId, entry: existingSession,
+            })
+            structuredRaw = reused.structured
+            this._recordNodeSession(runId, node.id, reused.sessionId, { createdAt: existingSession.createdAt })
+            await this._persistNodeSessions(runId)
+          } catch (error) {
+            if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+            throw error
+          }
+        } else {
+          if (!this._agentsUsable() && !this.sessionDegraded) {
+            // 06 §16 降级：测试台 / 纯注入环境没有 agents 服务，无法复用会话；退回每次新会话。
+            this.sessionDegraded = true
+            this.log('warn', 'flow-studio: 缺少 ctx.agents 服务，节点会话无法复用，已退化为每次新会话')
+          }
+          let activation
+          try {
+            activation = await raceAbort(this.activate({
+              prompt,
+              outputSchema: ENGINE_OUTPUT_SCHEMA,
+              signal: combined,
+              label,
+              // 附加字段：注入的 activate 可忽略；默认包装器靠它提前登记 sessionId。
+              onSession: sessionId => this.bindSession(sessionId, {
+                nodeId: node.id,
+                attemptId: attempt,
+                memberId: null,
+                traceId,
+              }),
+              node,
+              attempt,
+              ...(agentOptions ? { agentOptions } : {}),
+            }), combined)
+          } catch (error) {
+            if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
+            throw error
+          }
+          // 06 §16：**不**在节点结束时 dispose —— 句柄留到 run 结束（done/failed/aborted）
+          // 或 stop 时统一释放，节点可能在打回循环里被二次激活。
+          if (activation && typeof activation.dispose === 'function') {
+            this.disposalHandles.add(activation)
+          }
+          if (activation && typeof activation.sessionId === 'string') {
+            this.bindSession(activation.sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId })
+            this._recordNodeSession(runId, node.id, activation.sessionId, { handle: activation })
+            await this._persistNodeSessions(runId)
+          }
+          structuredRaw = extractStructured(activation)
         }
-        disposed = activation && typeof activation.dispose === 'function' ? activation.dispose : null
-        if (activation && typeof activation.sessionId === 'string') {
-          this.bindSession(activation.sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId })
-        }
-        structuredRaw = extractStructured(activation)
       }
 
       if (timedOut) throw new NodeTimeoutError(node.id, this.nodeTimeoutMs)
@@ -2100,13 +2486,8 @@ class FlowEngine {
       throw error
     } finally {
       clearTimeout(timer)
-      if (disposed) {
-        try {
-          await disposed()
-        } catch (error) {
-          this.log('warn', `flow-studio: dispose 失败（${node.id}#${attempt}）：${error.message}`)
-        }
-      }
+      // 06 §16：会话句柄**不在这里** dispose（节点可能被二次激活）。
+      // 统一由 run 收尾的 _disposeRunSessions() 释放，stop 也走同一条路径。
       timeoutController.abort()
     }
   }
@@ -2445,6 +2826,12 @@ class FlowEngine {
   handleSessionEvent(session, event) {
     const sessionId = session && typeof session.id === 'string' ? session.id : null
     if (!sessionId || !event || typeof event.type !== 'string') return
+    // 06 §16：复用会话要靠「最后一条 assistant 消息」拿结构化输出，所以这里先留存原文
+    //（有界 LRU；只在本进程内存里，不落盘）。
+    if (event.type === 'assistant/message') {
+      const rawText = extractAssistantText(event.data && event.data.message)
+      if (rawText !== '') this._rememberAssistantRaw(sessionId, rawText)
+    }
     let binding = this.sessionBindings.get(sessionId)
     if (!binding) {
       const parentSessionId = session.header && typeof session.header.parentSession === 'string'
@@ -2466,10 +2853,31 @@ class FlowEngine {
     this._queueSessionEvent(sessionId, binding, event, session)
   }
 
+  /** 06 §16：sessionId → 最近一条 assistant 原文（LRU 64，用于复用会话解析结构化输出）。 */
+  _rememberAssistantRaw(sessionId, rawText) {
+    const map = this.lastAssistantBySession
+    if (map.has(sessionId)) map.delete(sessionId)
+    else if (map.size >= ASSISTANT_TEXT_CACHE_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+    map.set(sessionId, clipChars(rawText, 20000))
+  }
+
   /** 登记 lead 会话；顺便把缓冲里属于它 / 它子会话的事件补写出去。 */
-  bindSession(sessionId, info) {
+  bindSession(sessionId, info, options = {}) {
     if (typeof sessionId !== 'string' || sessionId === '') return
-    if (this.sessionBindings.has(sessionId)) return
+    const existing = this.sessionBindings.get(sessionId)
+    if (existing) {
+      if (options.rebind === true) {
+        // 06 §16：同一节点会话被二次激活，把因果链改挂到新的 attempt / trace。
+        existing.nodeId = info.nodeId
+        existing.attemptId = info.attemptId
+        existing.memberId = info.memberId ?? null
+        existing.traceId = info.traceId
+      }
+      return
+    }
     const binding = {
       sessionId,
       nodeId: info.nodeId,
@@ -2921,6 +3329,8 @@ class FlowEngine {
     this.lastAssistantText.clear()
     this.liveUsage.clear()
     this.artifactIndex.clear()
+    // 06 §16：run 级收件箱 / 节点会话运行态归零；跨 run 的 sessionIndex 保留。
+    this._resetInboxState()
     this.eventQueue = Promise.resolve()
   }
 

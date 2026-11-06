@@ -1,0 +1,749 @@
+/**
+ * 流程收件箱：外部消息的路由、投递与提示词注入。
+ *
+ * 06 §16 的口径（与引擎 / HTTP / 模型工具共用同一份实现）：
+ *   - 外部消息是 **run 级事实**：入口节点收到后要沿 next 往下游每个阶段节点可见；
+ *   - 一个节点只有一个会话：有会话就 followup 注入（活会话）或 resume 后注入（冷会话 /
+ *     被压缩过的会话）；没有会话时，pending 的 run 把消息作为启动输入，运行中的 run 入队；
+ *   - 回复目标优先级：消息级 reply > run.json.inbox.reply > 未配置（只记 message/out）。
+ *
+ * 本模块只做**纯函数 + 投递编排**：落盘全部委托给 `runstore.js`，
+ * 流程模板读取委托给 `store.js`，不 import engine（避免 engine ↔ inbox 循环依赖）。
+ *
+ * 安全边界：外部文本一律按码点截断（正文 4000 / 事件 2000 / 提示词 1200），
+ * URL 只允许 http/https，tokenEnv 只记环境变量名（绝不把令牌值落盘）。
+ *
+ * @module @feiyueve/dsh-flow-studio/inbox
+ */
+
+import { randomUUID } from 'node:crypto'
+
+import { EDGE_KIND, NODE_KIND } from './model.js'
+import { checkRunId } from './runlog.js'
+import {
+  MESSAGE_REPLY_KINDS, RunError, appendEvents, appendRunInputMessages, appendRunMessages,
+  normalizeReplyTarget, readNodeSessions, readRunMessages, readRunMeta, updateRunMessageStatus,
+  upsertNodeSession,
+} from './runstore.js'
+import { readFlow } from './store.js'
+
+/** 外部消息正文上限（HTTP 请求体 / flow_send_message / flow_reply 共用）。 */
+export const MESSAGE_BODY_MAX_CHARS = 4000
+/** 消息来源标识上限。 */
+export const MESSAGE_FROM_MAX_CHARS = 200
+/** 写事件时的正文上限（与 runlog.MESSAGE_TEXT_MAX_CHARS 一致）。 */
+export const MESSAGE_EVENT_TEXT_MAX_CHARS = 2000
+/** 提示词里「外部消息」段的条数 / 单条长度上限（06 §16）。 */
+export const PROMPT_INBOX_MAX_MESSAGES = 5
+export const PROMPT_INBOX_MESSAGE_MAX_CHARS = 1200
+/** 认为「已经投递过」的状态。 */
+export const DELIVERED_STATUSES = Object.freeze(['injected', 'resumed', 'delivered'])
+/** 回复 HTTP 请求超时（毫秒）。 */
+export const REPLY_HTTP_TIMEOUT_MS = 10_000
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** 按 Unicode 码点截断。 */
+export function clipCodePoints(value, max) {
+  const chars = Array.from(String(value ?? ''))
+  if (chars.length <= max) return chars.join('')
+  if (max <= 1) return chars.slice(0, max).join('')
+  return `${chars.slice(0, max - 1).join('')}…`
+}
+
+function isoOf(value) {
+  const date = value instanceof Date ? value : new Date(value ?? Date.now())
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString()
+}
+
+function logWarn(deps, message) {
+  try {
+    if (deps && typeof deps.log === 'function') deps.log('warn', message)
+  } catch {
+    // 日志失败不该影响投递。
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 纯函数：请求校验
+// ---------------------------------------------------------------------------
+
+/**
+ * 校验 `{ from, text, nodeId?, reply? }`。
+ * @returns {{ ok: true, message: object } | { ok: false, error: string }}
+ */
+export function validateInboundBody(raw) {
+  if (!isPlainObject(raw)) return { ok: false, error: '请求体必须是 JSON 对象' }
+  if (typeof raw.from !== 'string' || raw.from.trim() === '') {
+    return { ok: false, error: '缺少 from（消息来源标识，必填）' }
+  }
+  const from = clipCodePoints(raw.from.trim(), MESSAGE_FROM_MAX_CHARS)
+  if (typeof raw.text !== 'string' || raw.text.trim() === '') {
+    return { ok: false, error: '缺少 text（消息正文，必填）' }
+  }
+  const text = clipCodePoints(raw.text, MESSAGE_BODY_MAX_CHARS)
+  let nodeId
+  if (raw.nodeId !== undefined && raw.nodeId !== null && raw.nodeId !== '') {
+    if (typeof raw.nodeId !== 'string' || !checkRunId(raw.nodeId)) {
+      return { ok: false, error: 'nodeId 不合法（只允许字母、数字、点、下划线、连字符）' }
+    }
+    nodeId = raw.nodeId
+  }
+  let reply
+  if (raw.reply !== undefined && raw.reply !== null) {
+    reply = normalizeReplyTarget(raw.reply)
+    if (!reply) {
+      return {
+        ok: false,
+        error: `reply 不合法（kind 必须是 ${MESSAGE_REPLY_KINDS.join(' / ')}；kind=http 时 url 只允许 http/https）`,
+      }
+    }
+  }
+  return {
+    ok: true,
+    message: {
+      from,
+      text,
+      ...(nodeId === undefined ? {} : { nodeId }),
+      ...(reply === undefined ? {} : { reply }),
+    },
+  }
+}
+
+/**
+ * 校验一个消息级回复目标（复用 runstore 的归一化；HTTP 只允许 http/https）。
+ * @returns {{ ok: true, reply: object } | { ok: false, error: string }}
+ */
+export function validateReplyTarget(raw) {
+  const reply = normalizeReplyTarget(raw)
+  if (!reply) {
+    return {
+      ok: false,
+      error: `reply 不合法（kind 必须是 ${MESSAGE_REPLY_KINDS.join(' / ')}；kind=http 时 url 只允许 http/https，tokenEnv 只写环境变量名）`,
+    }
+  }
+  return { ok: true, reply }
+}
+
+// ---------------------------------------------------------------------------
+// 纯函数：目标节点路由
+// ---------------------------------------------------------------------------
+
+/** 流程里的阶段节点 id 集合。 */
+export function stageNodeIds(flow) {
+  const set = new Set()
+  for (const node of (flow && Array.isArray(flow.nodes) ? flow.nodes : [])) {
+    if (node && node.kind === NODE_KIND.STAGE && checkRunId(node.id)) set.add(node.id)
+  }
+  return set
+}
+
+/**
+ * 入口节点：开始节点沿 next 边（多出边取与引擎一致的「最左」）走到的第一个阶段节点。
+ * @returns {string | null}
+ */
+export function entryStageNodeId(flow) {
+  if (!isPlainObject(flow) || !Array.isArray(flow.nodes)) return null
+  const byId = new Map(flow.nodes.map(node => [node.id, node]))
+  const starts = flow.nodes.filter(node => node && node.kind === NODE_KIND.START)
+  if (starts.length === 0) return null
+  const leftmost = nodes => [...nodes].sort((a, b) => {
+    const ax = Number.isFinite(a.x) ? a.x : Number.MAX_SAFE_INTEGER
+    const bx = Number.isFinite(b.x) ? b.x : Number.MAX_SAFE_INTEGER
+    if (ax !== bx) return ax - bx
+    const ay = Number.isFinite(a.y) ? a.y : Number.MAX_SAFE_INTEGER
+    const by = Number.isFinite(b.y) ? b.y : Number.MAX_SAFE_INTEGER
+    if (ay !== by) return ay - by
+    return String(a.id).localeCompare(String(b.id))
+  })[0]
+  let node = leftmost(starts)
+  const seen = new Set()
+  while (node && !seen.has(node.id)) {
+    seen.add(node.id)
+    if (node.kind === NODE_KIND.STAGE) return checkRunId(node.id) ? node.id : null
+    if (node.kind === NODE_KIND.END) return null
+    const edges = (flow.edges || []).filter(edge => edge.from === node.id && edge.kind === EDGE_KIND.NEXT)
+    const targets = edges.map(edge => byId.get(edge.to)).filter(Boolean)
+    node = targets.length === 0 ? null : leftmost(targets)
+  }
+  return null
+}
+
+/**
+ * 06 §16 的目标解析：显式 nodeId > run 当前节点 > pending 时入口节点。
+ * @returns {{ ok: true, nodeId: string, via: 'explicit'|'current'|'entry' } | { ok: false, error: string }}
+ */
+export function resolveTargetNode({ flow, meta, explicitNodeId }) {
+  const stages = stageNodeIds(flow)
+  if (explicitNodeId !== undefined && explicitNodeId !== null && explicitNodeId !== '') {
+    if (typeof explicitNodeId !== 'string' || !checkRunId(explicitNodeId)) {
+      return { ok: false, error: 'nodeId 不合法（只允许字母、数字、点、下划线、连字符）' }
+    }
+    if (!stages.has(explicitNodeId)) {
+      return { ok: false, error: `nodeId「${explicitNodeId}」不是阶段节点（只能是流程里的阶段节点）` }
+    }
+    return { ok: true, nodeId: explicitNodeId, via: 'explicit' }
+  }
+  const liveCurrent = meta && meta.live && typeof meta.live.currentNodeId === 'string'
+    ? meta.live.currentNodeId
+    : null
+  const running = meta && (meta.status === 'running' || meta.started === true)
+  if (running && liveCurrent && stages.has(liveCurrent)) {
+    return { ok: true, nodeId: liveCurrent, via: 'current' }
+  }
+  const entry = entryStageNodeId(flow)
+  if (!entry) return { ok: false, error: '流程里没有可投递的阶段节点（开始节点没有走到阶段节点的 next 出边）' }
+  return { ok: true, nodeId: entry, via: 'entry' }
+}
+
+// ---------------------------------------------------------------------------
+// 纯函数：提示词段 / 事件 / followup
+// ---------------------------------------------------------------------------
+
+/** 「外部消息」段的一条：带 from / 时间 / 正文，正文有界。 */
+export function formatInboxMessageLine(message, note) {
+  const at = typeof message.ts === 'string' ? message.ts : ''
+  const from = typeof message.from === 'string' && message.from !== '' ? message.from : 'unknown'
+  const text = clipCodePoints(message.text, PROMPT_INBOX_MESSAGE_MAX_CHARS)
+  return `- [${at} · ${from}]（${note}）${text}`
+}
+
+/**
+ * 把「新到的」与「之前已投递、向下游流转的」消息拼成提示词段。
+ * 最多 5 条、每条 ≤1200 字；没有消息时返回空串（不占提示词预算）。
+ */
+export function buildPromptInboxSection({ fresh = [], prior = [] } = {}) {
+  const lines = []
+  for (const message of Array.isArray(fresh) ? fresh.slice(0, PROMPT_INBOX_MAX_MESSAGES) : []) {
+    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 新到，本节点处理'))
+  }
+  for (const message of Array.isArray(prior) ? prior.slice(-PROMPT_INBOX_MAX_MESSAGES) : []) {
+    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 上游节点已收到'))
+  }
+  if (lines.length === 0) return ''
+  return [
+    '以下消息由外部发进本流程的收件箱（按到达时间排序；单条已按上限截断）。',
+    ...lines,
+  ].join('\n')
+}
+
+/**
+ * 从收件箱记录里挑出本节点要看的消息：
+ *   fresh —— 目标就是本节点、还没投递的；
+ *   prior —— 之前已投递过的（入口节点收到的消息在后续节点继续可见）。
+ */
+export function selectPromptMessages(messages, nodeId) {
+  const inbound = (Array.isArray(messages) ? messages : []).filter(item => item && item.direction === 'in')
+  const fresh = inbound
+    .filter(item => item.status === 'pending' && item.targetNodeId === nodeId)
+    .slice(0, PROMPT_INBOX_MAX_MESSAGES)
+  const freshIds = new Set(fresh.map(item => item.id))
+  const prior = inbound
+    .filter(item => !freshIds.has(item.id) && DELIVERED_STATUSES.includes(item.status))
+    .slice(-PROMPT_INBOX_MAX_MESSAGES)
+  return { fresh, prior }
+}
+
+/** 投递到会话时用的 followup payload（角色是 user，来源标成 flow-studio）。 */
+export function buildFollowupPayload({ text, runId, nodeId, from = 'flow-studio' }) {
+  return {
+    id: `flow-${String(runId).slice(0, 40)}-${String(nodeId || 'run').slice(0, 32)}-${Date.now()}-${randomUUID().slice(0, 8)}`,
+    role: 'user',
+    source: {
+      kind: 'flow-studio',
+      room: `${runId}${nodeId ? `/${nodeId}` : ''}`,
+      from,
+      at: new Date().toISOString(),
+    },
+    content: [{ type: 'text', text }],
+  }
+}
+
+/** 外部消息投进会话时的正文（带来源标记，避免模型误以为是用户当前轮输入）。 */
+export function inboundSessionText({ from, text }) {
+  return `[流程收件箱 · 来自 ${clipCodePoints(from, MESSAGE_FROM_MAX_CHARS)}]\n${clipCodePoints(text, MESSAGE_BODY_MAX_CHARS)}`
+}
+
+/** 回复正文的前缀：告诉接收方这条消息来自哪个流程 / 哪个节点。 */
+export function replyMarker({ flowName, nodeTitle }) {
+  const flow = clipCodePoints(flowName || '未命名流程', 80)
+  const node = clipCodePoints(nodeTitle || '未知节点', 80)
+  return `[flow:${flow} · ${node}]`
+}
+
+/** 构造 run 级 `message/in` 事件（字段与 runlog 白名单一致）。 */
+export function buildMessageInEvent({ id, from, text, targetNodeId, replyKind }, { traceId } = {}) {
+  return {
+    v: 1,
+    kind: 'message/in',
+    ...(traceId ? { traceId } : {}),
+    data: {
+      id: String(id),
+      from: clipCodePoints(from, MESSAGE_FROM_MAX_CHARS),
+      text: clipCodePoints(text, MESSAGE_EVENT_TEXT_MAX_CHARS),
+      ...(targetNodeId ? { targetNodeId } : {}),
+      ...(replyKind ? { replyKind } : {}),
+    },
+  }
+}
+
+/** 构造 run 级 `message/out` 事件（字段与 runlog 白名单一致）。 */
+export function buildMessageOutEvent({ id, inReplyTo, text, nodeId, delivery }, { traceId } = {}) {
+  return {
+    v: 1,
+    kind: 'message/out',
+    ...(traceId ? { traceId } : {}),
+    data: {
+      id: String(id),
+      ...(inReplyTo ? { inReplyTo: String(inReplyTo) } : {}),
+      text: clipCodePoints(text, MESSAGE_EVENT_TEXT_MAX_CHARS),
+      ...(nodeId ? { nodeId } : {}),
+      delivery,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 投递编排（HTTP 路由与 flow_* 工具共用）
+// ---------------------------------------------------------------------------
+
+/** 从 deps（路由 env 或工具 deps）里取 agents 服务；取不到返回 undefined。 */
+export function agentsOf(deps) {
+  const ctx = (deps && deps.ctx) || (deps && deps.engine && deps.engine.ctx) || null
+  if (!ctx) return undefined
+  try {
+    if (typeof ctx.get === 'function') {
+      const service = ctx.get('agents')
+      if (service) return service
+    }
+    return ctx.agents
+  } catch {
+    return undefined
+  }
+}
+
+function agentsUsable(agents) {
+  return Boolean(agents && (typeof agents.get === 'function' || typeof agents.resume === 'function'))
+}
+
+/** 冷会话 resume 时给一个可用的默认模型（取不到就用宿主默认）。 */
+export function defaultAgentSelection(ctx) {
+  try {
+    const service = ctx && typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : null
+    const selection = service && typeof service.currentSelection === 'function'
+      ? service.currentSelection()
+      : null
+    if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return undefined
+    if (selection.provider === '' || selection.model === '') return undefined
+    return {
+      provider: selection.provider,
+      model: selection.model,
+      ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort !== ''
+        ? { reasoningEffort: selection.reasoningEffort }
+        : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 把一段文本投进一个已存在的会话：活会话直接 followup，冷会话先 resume。
+ * 返回 `{ mode, sessionId }`；不可用时抛 RunError(503)。
+ */
+export async function deliverToAgentSession(agents, sessionId, text, { runId, nodeId, from, agentOptions } = {}) {
+  if (!agentsUsable(agents)) {
+    throw new RunError(503, 'agents', 'agents 服务不可用：无法向已有会话注入消息')
+  }
+  let agent = null
+  let mode = 'injected'
+  try {
+    if (typeof agents.get === 'function') agent = agents.get(sessionId) || null
+  } catch {
+    agent = null
+  }
+  if (!agent) {
+    if (typeof agents.resume !== 'function') {
+      throw new RunError(503, 'agents', '会话不存在，且 agents.resume 不可用')
+    }
+    const resumeOptions = { resumeSessionId: sessionId }
+    if (agentOptions) resumeOptions.agentOptions = agentOptions
+    const resumed = await agents.resume(resumeOptions)
+    agent = resumed && resumed.agent ? resumed.agent : null
+    mode = 'resumed'
+  }
+  if (!agent || typeof agent.followup !== 'function') {
+    throw new RunError(503, 'agents', `会话 ${sessionId} 无法接收消息（agent 不可用或没有 followup）`)
+  }
+  agent.followup(buildFollowupPayload({ text, runId, nodeId, from }))
+  return { mode, sessionId }
+}
+
+/** 查节点会话：先问引擎内存，再回 sessions.json。 */
+export async function sessionForNode(deps, runId, nodeId) {
+  const engine = deps && deps.engine
+  if (engine && typeof engine.sessionIdForNode === 'function') {
+    try {
+      const fromMemory = await engine.sessionIdForNode(runId, nodeId)
+      if (typeof fromMemory === 'string' && fromMemory !== '') return fromMemory
+    } catch {
+      // 内存索引不可用就退回磁盘。
+    }
+  }
+  try {
+    const sessions = await readNodeSessions(deps.runsRoot, runId)
+    return sessions[nodeId] && typeof sessions[nodeId].sessionId === 'string' ? sessions[nodeId].sessionId : null
+  } catch {
+    return null
+  }
+}
+
+async function appendRunLevelEvent(deps, runId, event) {
+  try {
+    await appendEvents(deps.runsRoot, runId, [event])
+    return true
+  } catch (error) {
+    logWarn(deps, `flow-studio: 写 ${event.kind} 事件失败（${runId}）：${error.message}`)
+    return false
+  }
+}
+
+function messageTraceId(runId) {
+  return `tr-${String(runId).slice(0, 80)}-inbox`
+}
+
+/** 把入站消息写进 messages.jsonl 与事件流（失败不影响主流程，但会记 warn）。 */
+async function recordInbound(deps, runId, record) {
+  await appendRunMessages(deps.runsRoot, runId, [record])
+  const replyKind = record.reply ? record.reply.kind : undefined
+  await appendRunLevelEvent(deps, runId, buildMessageInEvent({
+    id: record.id,
+    from: record.from,
+    text: record.text,
+    targetNodeId: record.targetNodeId,
+    replyKind,
+  }, { traceId: messageTraceId(runId) }))
+}
+
+/**
+ * 外部消息入口（HTTP `POST /runs/<runId>/messages` 与 `flow_send_message` 共用）。
+ *
+ * 目标节点：显式 nodeId > 运行中当前节点 > pending 时入口节点。
+ * 投递四分支：injected（活会话）/ resumed（冷会话）/ started（未开始 → 启动输入）/
+ * queued（运行中但节点未到 → 入队，等引擎推进时并入提示词）。
+ *
+ * @param {{ runsRoot: string, flowsRoot: string, engine?: object, ctx?: object, log?: Function }} deps
+ * @returns {Promise<{ ok: true, messageId: string, targetNodeId: string, mode: string, sessionId?: string }>}
+ */
+export async function deliverInboundMessage(deps, runId, body) {
+  if (!deps || typeof deps.runsRoot !== 'string' || deps.runsRoot === '') {
+    throw new RunError(500, 'runsRoot', '缺少 runsRoot')
+  }
+  if (!checkRunId(runId)) throw new RunError(400, 'runId', 'runId 不合法')
+  const meta = await readRunMeta(deps.runsRoot, runId)
+  if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+
+  const validated = validateInboundBody(body)
+  if (!validated.ok) throw new RunError(400, 'body', validated.error)
+  const input = validated.message
+
+  let flow = null
+  try {
+    flow = await readFlow(deps.flowsRoot, meta.flowId)
+  } catch {
+    flow = null
+  }
+  if (!flow) throw new RunError(404, 'flowId', 'run 使用的流程模板不存在，无法确定目标节点')
+
+  const target = resolveTargetNode({ flow, meta, explicitNodeId: input.nodeId })
+  if (!target.ok) throw new RunError(400, 'nodeId', target.error)
+  // 终态 run 不再接收新消息（有会话也不行：run 已经结束，注入没有执行上下文）。
+  if (meta.status === 'done' || meta.status === 'failed' || meta.status === 'aborted') {
+    throw new RunError(409, 'runId', `run 已结束（${meta.status}），无法再投递消息`)
+  }
+
+  const messageId = `m-${randomUUID()}`
+  const createdAt = isoOf(new Date())
+  const record = {
+    v: 1,
+    id: messageId,
+    direction: 'in',
+    ts: createdAt,
+    from: input.from,
+    text: input.text,
+    targetNodeId: target.nodeId,
+    status: 'pending',
+    ...(input.reply ? { reply: input.reply, replyKind: input.reply.kind } : {}),
+  }
+
+  const sessionId = await sessionForNode(deps, runId, target.nodeId)
+  if (sessionId) {
+    const agents = agentsOf(deps)
+    if (!agentsUsable(agents)) {
+      // 06 §16 降级：没有 agents 服务时不能注入，运行中的 run 只能入队；
+      // pending 的 run 走启动输入。显式记 warn，避免静默丢消息。
+      logWarn(deps, 'flow-studio: 没有可用的 agents 服务，收件箱消息改为入队 / 启动输入')
+    } else {
+      const delivered = await deliverToAgentSession(agents, sessionId, inboundSessionText(input), {
+        runId,
+        nodeId: target.nodeId,
+        from: input.from,
+        agentOptions: defaultAgentSelection(deps.ctx || (deps.engine && deps.engine.ctx)),
+      })
+      record.status = delivered.mode
+      record.sessionId = sessionId
+      record.mode = delivered.mode
+      record.deliveredAt = isoOf(new Date())
+      record.deliveredByNodeId = target.nodeId
+      await recordInbound(deps, runId, record)
+      // 复用会话时刷新 lastUsedAt（失败不影响投递结果）。
+      try {
+        await upsertNodeSession(deps.runsRoot, runId, target.nodeId, sessionId)
+      } catch (error) {
+        logWarn(deps, `flow-studio: 刷新 sessions.json 失败（${runId}/${target.nodeId}）：${error.message}`)
+      }
+      return {
+        ok: true,
+        messageId,
+        targetNodeId: target.nodeId,
+        mode: delivered.mode,
+        sessionId,
+      }
+    }
+  }
+
+  // 没有会话：pending → 启动输入；running → 入队；终态 → 409。
+  if (meta.status === 'done' || meta.status === 'failed' || meta.status === 'aborted') {
+    throw new RunError(409, 'runId', `run 已结束（${meta.status}），无法再投递消息`)
+  }
+  if (meta.status === 'running' || meta.started === true) {
+    record.status = 'pending'
+    await recordInbound(deps, runId, record)
+    return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'queued' }
+  }
+
+  record.status = 'pending'
+  await recordInbound(deps, runId, record)
+  await appendRunInputMessages(deps.runsRoot, runId, [{
+    id: messageId,
+    from: input.from,
+    text: input.text,
+    at: createdAt,
+    targetNodeId: target.nodeId,
+  }])
+  return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'started' }
+}
+
+/**
+ * 引擎侧：读取本节点要展示的收件箱消息，并把 fresh 标记为 delivered。
+ * 返回提示词段（空串表示没有消息）。
+ *
+ * @param {{ runsRoot: string }} deps
+ * @param {string} runId
+ * @param {string} nodeId
+ * @param {{ startupMessages?: object[], log?: Function }} options
+ */
+export async function consumeInboxForNode(deps, runId, nodeId, options = {}) {
+  let messages = []
+  try {
+    const listed = await readRunMessages(deps.runsRoot, runId, { limit: 1000 })
+    messages = listed ? listed.messages : []
+  } catch (error) {
+    logWarn(deps, `flow-studio: 读收件箱失败（${runId}）：${error.message}`)
+    return ''
+  }
+  // run.json.input 里的启动消息可能还没写进 messages.jsonl（旧 run / 手工恢复），按 id 去重补上。
+  const known = new Set(messages.filter(item => item && item.direction === 'in').map(item => item.id))
+  const startup = Array.isArray(options.startupMessages) ? options.startupMessages : []
+  for (const item of startup) {
+    if (!item || typeof item.id !== 'string' || known.has(item.id)) continue
+    messages.push({
+      v: 1,
+      id: item.id,
+      direction: 'in',
+      ts: typeof item.at === 'string' ? item.at : isoOf(new Date()),
+      from: typeof item.from === 'string' ? item.from : 'unknown',
+      text: typeof item.text === 'string' ? item.text : '',
+      targetNodeId: typeof item.targetNodeId === 'string' ? item.targetNodeId : nodeId,
+      status: 'pending',
+    })
+  }
+  const selected = selectPromptMessages(messages, nodeId)
+  const section = buildPromptInboxSection(selected)
+  // 本节点要处理的消息全部标记 delivered（提示词里只展示前 5 条，其余也已消费）。
+  for (const message of messages.filter(item => item.direction === 'in'
+    && item.status === 'pending' && item.targetNodeId === nodeId)) {
+    try {
+      await updateRunMessageStatus(deps.runsRoot, runId, message.id, 'delivered', {
+        deliveredAt: isoOf(new Date()),
+        deliveredByNodeId: nodeId,
+      })
+    } catch (error) {
+      logWarn(deps, `flow-studio: 标记消息已投递失败（${message.id}）：${error.message}`)
+    }
+  }
+  return section
+}
+
+// ---------------------------------------------------------------------------
+// 回复投递（flow_reply 与 message/out）
+// ---------------------------------------------------------------------------
+
+async function postHttpReply(url, payload, { token, signal } = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('回复 HTTP 超时')), REPLY_HTTP_TIMEOUT_MS)
+  const onAbort = () => controller.abort(signal && signal.reason)
+  if (signal && typeof signal.addEventListener === 'function') {
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  }
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+    const text = await response.text().catch(() => '')
+    return { ok: response.ok, status: response.status, body: clipCodePoints(text, 500) }
+  } catch (error) {
+    return { ok: false, status: null, error: clipCodePoints(error && error.message ? error.message : String(error), 300) }
+  } finally {
+    clearTimeout(timer)
+    if (signal && typeof signal.removeEventListener === 'function') {
+      signal.removeEventListener('abort', onAbort)
+    }
+  }
+}
+
+/**
+ * 节点回复外部消息。回复目标优先级：消息级 reply > run.json.inbox.reply > 未配置。
+ * 任何一条回复都会写 message/out 事件；HTTP / 会话投递失败不抛异常，返回值里说明。
+ *
+ * @param {{ runsRoot: string, flowsRoot: string, engine?: object, ctx?: object, log?: Function }} deps
+ * @param {{ runId: string, sessionId?: string, nodeId?: string, text: string, inReplyTo?: string, reply?: object }} input
+ */
+export async function deliverOutboundReply(deps, input) {
+  const runId = input && input.runId
+  if (!checkRunId(runId)) throw new RunError(400, 'runId', 'runId 不合法')
+  const meta = await readRunMeta(deps.runsRoot, runId)
+  if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+
+  const text = clipCodePoints(typeof input.text === 'string' ? input.text : '', MESSAGE_BODY_MAX_CHARS)
+  if (text.trim() === '') throw new RunError(400, 'text', '回复正文不能为空')
+
+  let inReplyTo = typeof input.inReplyTo === 'string' && input.inReplyTo !== '' ? input.inReplyTo : undefined
+  let target = normalizeReplyTarget(input.reply)
+  if (!target && inReplyTo) {
+    // 消息级 reply 优先：从收件箱记录里找这条入站消息自己的回复配置。
+    const listed = await readRunMessages(deps.runsRoot, runId, { limit: 1000 })
+    const source = listed ? listed.messages.find(item => item.id === inReplyTo && item.direction === 'in') : null
+    if (!source) throw new RunError(404, 'inReplyTo', '找不到这条入站消息（inReplyTo 无效）')
+    target = normalizeReplyTarget(source.reply)
+  }
+  if (!target) target = normalizeReplyTarget(meta.inbox ? meta.inbox.reply : null)
+
+  let flow = null
+  try {
+    flow = await readFlow(deps.flowsRoot, meta.flowId)
+  } catch {
+    flow = null
+  }
+  const nodeId = typeof input.nodeId === 'string' && checkRunId(input.nodeId) ? input.nodeId : undefined
+  let nodeTitle = nodeId
+  if (flow && Array.isArray(flow.nodes) && nodeId) {
+    const node = flow.nodes.find(item => item.id === nodeId)
+    if (node && typeof node.title === 'string' && node.title !== '') nodeTitle = node.title
+  }
+  const marker = replyMarker({ flowName: meta.flowName || meta.flowId, nodeTitle: nodeTitle || '未知节点' })
+  const body = `${marker} ${text}`
+  const messageId = `o-${randomUUID()}`
+  const eventRecord = {
+    id: messageId,
+    inReplyTo,
+    text,
+    nodeId,
+    delivery: 'local',
+  }
+
+  let delivery = 'local'
+  let ok = true
+  let error
+  let httpStatus = null
+  let sessionId = target && target.kind === 'session' ? target.sessionId : undefined
+
+  if (target && target.kind === 'session') {
+    delivery = 'session'
+    const agents = agentsOf(deps)
+    try {
+      await deliverToAgentSession(agents, target.sessionId, body, {
+        runId,
+        nodeId,
+        from: marker,
+        agentOptions: defaultAgentSelection(deps.ctx || (deps.engine && deps.engine.ctx)),
+      })
+    } catch (failure) {
+      ok = false
+      error = failure && failure.message ? failure.message : String(failure)
+    }
+  } else if (target && target.kind === 'http') {
+    delivery = 'http'
+    let token
+    if (target.tokenEnv) {
+      try {
+        token = process.env[target.tokenEnv]
+      } catch {
+        token = undefined
+      }
+    }
+    const posted = await postHttpReply(target.url, {
+      runId,
+      nodeId: nodeId || null,
+      messageId: inReplyTo || messageId,
+      text: body,
+    }, { token, signal: input.signal })
+    ok = posted.ok
+    httpStatus = posted.status
+    if (!posted.ok) error = posted.error || `HTTP ${posted.status ?? 'error'}`
+  }
+  eventRecord.delivery = delivery
+
+  // 先落审计（messages.jsonl + message/out 事件），再返回；投递失败也保留证据。
+  try {
+    await appendRunMessages(deps.runsRoot, runId, [{
+      v: 1,
+      id: messageId,
+      direction: 'out',
+      ts: isoOf(new Date()),
+      text: body,
+      ...(inReplyTo ? { inReplyTo } : {}),
+      ...(nodeId ? { nodeId } : {}),
+      delivery,
+      status: ok ? 'delivered' : 'pending',
+      ...(error ? { error } : {}),
+    }])
+  } catch (writeError) {
+    logWarn(deps, `flow-studio: 写回复记录失败（${runId}）：${writeError.message}`)
+  }
+  await appendRunLevelEvent(deps, runId, buildMessageOutEvent(eventRecord, { traceId: messageTraceId(runId) }))
+
+  const result = {
+    ok,
+    messageId,
+    inReplyTo: inReplyTo || null,
+    nodeId: nodeId || null,
+    delivery,
+    ...(sessionId ? { sessionId } : {}),
+    ...(httpStatus === null ? {} : { httpStatus }),
+    ...(error ? { error } : {}),
+  }
+  if (delivery === 'local') {
+    result.hint = '没有外部回复通道，已记录在运行日志（reply 未设置或 kind=none）'
+  }
+  return result
+}

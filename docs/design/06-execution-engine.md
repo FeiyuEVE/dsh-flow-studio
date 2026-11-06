@@ -44,6 +44,8 @@ start(flowSnapshot):
     attempt = 该节点已有尝试数 + 1
     写 node/start{title, mode, model, skills}
     result = await executeNode(node, attempt, 上游产物摘要, 打回上下文)
+    # 节点执行抛错（超时 / 崩溃 / 结构化输出不合格）先重试，默认 1 次，见 §9；
+    # 重试用尽才写 node/end{status:'failed'}，并跳出循环收口 run/end{status:'failed', failedNodeId}
     写 node/end{status: result.verdict === 'pass' ? 'passed' : 'rejected', durationMs}
     if result.verdict === 'reject':
       target = 选中的 reject 边目标（见 §5.3）
@@ -106,20 +108,28 @@ lead 不返回成员级明细时，摘要标 `membersPartial: true`，不编造�
 2. **你负责什么**：`node.task`；
 3. **期望产物**：`node.outputs`；
 4. **必须加载的 skill**：逐个列 `skills[]`，要求先调用 skill 工具加载再动手；
-5. **上游产物**：最近 3 个已通过节点的 summary 与产物路径（不粘全文，给引用）；
+5. **上游产物**：最近 3 个已通过节点的 summary 与产物路径，**外加最近 1–2 个产物的有界正文**
+   （宿主在拼提示词前预读，单产物 ≤1200 字、总 ≤3000 字；只认记录里 attempt 对应的
+   `<nodeId>/artifacts/<attempt>/` 目录，历史 attempt 的同名文件不会混入；读取失败 / 文件缺失 /
+   超过大小上限降级为只给路径行，绝不抛错中断 run）；
 6. **打回上下文**（仅 attempt>1）：上一轮判定、打回原因、上次 findings；
-7. **输出格式**：明确要求返回 §4.3 的 JSON（`verdict` 必填、`reject` 必带 `rejectReason`），不要夹带正文产物以外的解释。
+7. **输出格式**：明确要求返回 §4.3 的 JSON（`verdict` 必填、`reject` 必带 `rejectReason`），不要夹带正文产物以外的解释；
+   并说明证据引用口径：验收 / 检查条目判 `pass` 时 `evidenceRef` 优先引用上游节点产物（跨节点才算独立复核），
+   只引用本节点刚写的产物属于自证；可给多条证据，自己在产物里写「已通过」不算证据。
+   模型给的 `evidenceRef` / `reportRef` 只是候选，引擎只透传通过校验的 run 内安全路径（见 §13.7）。
 
-提示词长度上限 8000 字，超出按 §5 完整性优先截断（上游产物先截）。
+提示词长度上限 8000 字，超出按 §5 完整性优先截断：**先截「上游产物」段**（正文先丢、路径行与摘要尽量留），
+再截任务；「输出格式」段是硬保留段。上游正文的 1200 / 3000 预算保证正常场景下不会触发二次截断。
 
 ## 7 事件映射（引擎侧必须写）
 
 | 时机 | 事件 |
 |---|---|
 | run 开始 / 结束 | `run/start` / `run/end` |
-| 节点开始 / 结束 | `node/start`（带 `skills[]`，这是覆盖率分母）/ `node/end` |
+| 节点开始 / 结束 | `node/start`（带 `skills[]`，这是覆盖率分母；重试时同一 `attemptId` 再写一条，`data.retry` / `retryReason` 留痕）/ `node/end` |
 | 成员开始 / 结束 | `member/start`（`memberId` 必填）/ `member/end` |
 | 模型调用 | `model/call`（`callId` 必填，四桶 usage） |
+| assistant 可见文本 | `agent/message`（脱敏 + 截断 + 同会话去重，见 §13.12） |
 | 工具调用 | `tool/call` |
 | skill 加载 | `skill/load`（`ok` 布尔） |
 | 产物落盘 | `artifact/write` |
@@ -140,8 +150,16 @@ lead 不返回成员级明细时，摘要标 `membersPartial: true`，不编造�
 ## 9 取消、超时、失败
 
 - 每次 run 一个 `AbortController`；`stop` → `abort()`，在飞的 `startActivation` 用 `signal` 中断，已写事件保留，收尾写 `run/end{status:'aborted'}`。
-- 单节点超时默认 20 分钟（可按 `FLOW_STUDIO_NODE_TIMEOUT_MS` 覆盖）；超时 → 节点 `failed`。
-- 任何异常都要落到 `run/end{status:'failed', reason}` 并把细节写进事件 `extra`，不允许静默停住。
+- 单节点超时默认 20 分钟（可按 `FLOW_STUDIO_NODE_TIMEOUT_MS` 覆盖）；超时算**一次失败**，走与其它异常相同的重试路径。
+- **节点级失败先重试**：默认重试 1 次（共 2 次尝试），`FLOW_STUDIO_NODE_RETRIES` 覆盖并钳制在 0–5。
+  重试**不新增 `attemptId`**（不消耗打回目标 `maxRounds`），而是用同一 `attemptId` 再写一条
+  `node/start{data.retry, retryReason}` 留痕；`stop` / run 墙钟中止不重试。
+- **失败隔离**：重试用尽 → 只判该节点失败：写 `node/end{status:'failed'}`（`data.retries`、
+  `extra.reason`/`extra.timeout` 等），再写 `run/end{status:'failed', reason, failedNodeId}` 正常收口。
+  已通过节点的事件与产物完整保留；`summarize()` / `readRunDetail()` 在 failed run 上照常可算；
+  live 快照置 `null`，不留 running 节点。
+- 打回循环里的失败同样适用；`maxRounds` 耗尽仍按 §5.3 / §13.10 的语义先写目标节点 `node/end failed`。
+- 其它异常（成环 / 步数 / 断头路等）都要落到 `run/end{status:'failed', reason}` 并把细节写进事件 `extra`，不允许静默停住。
 - 引擎崩溃（进程重启后残留 `running` 的 run）：启动时把超过 30 分钟无新事件的 run 标 `failed` 并注明「引擎中断」，不自动续跑（v0.4 不做断点续跑）。
 
 ## 10 接口
@@ -223,6 +241,11 @@ run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默�
 - 证据可信度：`acceptance/verdict`、`test/report`、`check/form` 由模型自述产生的，事件 `extra.provenance='model-claim'`；
   `reportRef`/`evidenceRef` 必须在 run 目录内、文件真实存在、且与某条 `artifact/write` 的 `path+sha256` 对上；
   对不上 → `unknown` 并列入 `missing`。**桩（stub）run 一律 `quality.state='unknown'`**，`label` 前缀「桩」。
+- m7 证据引用透传：模型可在 `acceptance[].evidenceRef` / `checks.reportRef` / `tests.reportRef` 里引用**上游节点产物**
+  （跨节点引用在聚合层算 peer，才算独立复核；引用本节点产物是 self）。引擎只透传校验通过的安全路径：
+  必须是 run 目录内相对路径、对应本 run 的 `artifact/write`、文件存在且 sha256 一致；任一失败则退回引擎自己落盘的
+  `acceptance.json` / `checks-report.json` / `test-report.json`（审计文件本身永远保留），并在事件 `extra` 写
+  `evidenceRefRejected` / `reportRefRejected` 说明原因（runlog 的 data 白名单会丢弃未知字段，所以标记放 `extra`）。
 
 ### 13.8 桩的可见标记（M7）
 `FLOW_STUDIO_STUB_ENGINE=1` **且** `FLOW_STUDIO_TESTBED=1` 才启用（否则忽略并在日志告警）。
@@ -242,3 +265,26 @@ run 级预算：`maxTotalSteps`（默认阶段数 × 3）、墙钟上限（默�
 ### 13.11 模型覆盖（M5）
 `node.model` 必须真正传给子 agent：`request.agentOptions = { model: node.model }`（spawn provider 支持）；
 宿主不支持时启动前报错，不允许「界面能填、实际不生效」。
+
+### 13.12 运行详情数据面（live 快照 + `agent/message`）
+
+客户端在 run 进行中轮询 `GET /runs/<id>`（读 `run.json.live`）显示「agent 正在干什么」。引擎在每次
+`_append()` 后由 `_persistLive()` 整体写回 `live`，run 结束置 `null`。字段与体积口径（全部有界）：
+
+| 字段 | 结构 / 语义 | 上限 |
+|---|---|---|
+| `nodeTitle` / `nodeMode` | 当前节点标题；`single` / `team` | 200 字符 |
+| `activeMemberId` | 正在产生事件的那个成员；`null` = lead | `checkMemberId` |
+| `lastTool` | `{ name, startedAt, ok }`：`tool/call` 开始时写 `name`/`startedAt`、`ok=null`；`tool/result` 补 `ok` | name 200 字符 |
+| `lastMessage` | `{ text, at, memberId }`：最近一条 `agent/message` 的可见文本 | text 200 字符 |
+| `tokens` | `{ input, cacheRead, cacheWrite, output }` 本 run 累计四桶（互斥） | 非负整数 |
+| `members` | team 节点已观察成员 `[{ memberId, name, role?, model?, state }]`；`state` ∈ `starting/running/done/unknown`，`member/start` 落盘后转 `running`，节点收尾转 `done` | ≤16 条 |
+
+`tokens` 与 `computeTokens` 同口径：同一 `traceId + callId` 的用量按「后到整条替换」累计，避免重放把总量算重。
+`members` 只在 team 节点有值，single 节点为空数组；不确定的状态写 `unknown`，不编造。
+
+`agent/message` 的来源与加工：订阅 `session/event` 的 `assistant/message` → 从 `message.content` 里只取
+`type:'text'` 的块（防御性兼容字符串 / `message.text`，提不到不发）→ `redactArguments` 脱敏 →
+按码点截到 ≤2000 字符（再以 UTF-8 4 KiB 兜底，保证单条事件 < 8KB）→ 同会话连续相同文本去重（hash 表 ≤64）→
+写 `agent/message{ role:'assistant', text, truncated, provider?, model? }`，事件级 `memberId` 沿用 binding。
+原有 `model/call` 映射不变：有 `usage` 才写，token / quality 口径不受新增事件影响。

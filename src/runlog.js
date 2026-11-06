@@ -33,6 +33,8 @@ export const EVENT_KINDS = Object.freeze([
   // 05 §8.2 v1.1 新增：没有这两类事件，quality 永远只能是 unknown。
   'acceptance/verdict',
   'test/report',
+  // 05 §8.2 v1.2 新增：让客户端看得见 agent 到底说了什么。
+  'agent/message',
 ])
 
 /** 单条事件序列化后的上限（字节，不含行尾换行）。 */
@@ -77,6 +79,14 @@ const DECIDED_BY = new Set(['human', 'auto'])
 /** 06 §13.8：引擎标记只认 real / stub。 */
 export const ENGINE_NAMES = Object.freeze(['real', 'stub'])
 const ENGINE_NAME_SET = new Set(ENGINE_NAMES)
+
+/** §8.2：agent/message 的 role 白名单（目前只有 assistant）。 */
+const MESSAGE_ROLE = new Set(['assistant'])
+/** §8.2：agent/message.data.text 的上限（字符，按 Unicode 码点）。 */
+export const AGENT_MESSAGE_MAX_CHARS = 2000
+/** §8.3：每个节点保留的最近 agent/message 条数 / 全局总量上限。 */
+export const AGENT_ACTIVITY_PER_NODE = 5
+export const AGENT_ACTIVITY_TOTAL = 200
 
 /** 顶层保留字段；其余未识别字段折叠进有界的 `extra`。 */
 const RESERVED_FIELDS = new Set([
@@ -398,6 +408,16 @@ function validateData(kind, data) {
       bad = putStr('callId', 128)
       if (bad) return bad
       bad = putStr('stopReason', 128, false)
+      if (bad) return bad
+      break
+    }
+    case 'agent/message': {
+      // §8.2：assistant 消息摘录。text 必填非空且 ≤2000 码点（引擎截断后再落盘）。
+      let bad = putEnum('role', MESSAGE_ROLE)
+      if (bad) return bad
+      bad = putStr('text', AGENT_MESSAGE_MAX_CHARS) || putBool('truncated')
+      if (bad) return bad
+      bad = putStr('provider', 128, false) || putStr('model', 128, false)
       if (bad) return bad
       break
     }
@@ -1061,7 +1081,8 @@ const EVIDENCE_LABELS = {
   tests: '测试',
   checks: '规范',
   review: '审查一致性',
-  p0p1: 'P0/P1 未解决',
+  // §8.4 v1.3：P1/P2 不再是 fail 级门禁（降为 warn），这一项的判定语义收窄到 P0。
+  p0p1: 'P0 缺陷',
 }
 
 /** 06 §13.7 / 05 §8.2：引擎写下的 artifact/write（path + sha256）索引。 */
@@ -1076,6 +1097,50 @@ export function collectArtifactIndex(events = []) {
     map.set(path, sha256.toLowerCase())
   }
   return map
+}
+
+/**
+ * §8.4 v1.3：产物归属索引（path → 谁写的）。证据独立性分级只认三件事：
+ *   - `extra.producer === 'host'` → `host`（宿主生成 / 标记的产物）；
+ *   - `artifact/write.nodeId` 与声明者相同 → `self`（自证）；
+ *   - `artifact/write.nodeId` 与声明者不同 → `peer`（独立复核）。
+ * 同一 path 多次写入时以 seq 最大者为准（与 {@link collectArtifactIndex} 同口径）。
+ *
+ * @param {object[]} events
+ * @returns {Map<string, { nodeId: string | null, attemptId: number | null, producer: string | null }>}
+ */
+export function collectArtifactOwners(events = []) {
+  const map = new Map()
+  for (const event of sortEvents(events)) {
+    if (!event || event.kind !== 'artifact/write' || !event.data) continue
+    const path = event.data.path
+    if (typeof path !== 'string' || !isSafeRelPath(path)) continue
+    map.set(path, {
+      nodeId: typeof event.nodeId === 'string' ? event.nodeId : null,
+      attemptId: Number.isInteger(event.attemptId) ? event.attemptId : null,
+      producer: event.extra && typeof event.extra.producer === 'string' ? event.extra.producer : null,
+    })
+  }
+  return map
+}
+
+/**
+ * §8.4 v1.3：一条通过条目的证据独立性级别。
+ * 找不到产物归属时返回 null（可信写入方直接给的 ref，沿用 §8.5 的信任边界），
+ * 不把「查不到」硬判成 self —— 只有能证明是同一节点写的才算自证。
+ *
+ * @param {object} event 声明者事件（acceptance/verdict、test/report、check/form）
+ * @param {string | undefined} ref 证据引用
+ * @param {Map<string, {nodeId: string|null, producer: string|null}>} owners
+ * @returns {'self' | 'peer' | 'host' | null}
+ */
+function classifyEvidenceLevel(event, ref, owners) {
+  if (!(owners instanceof Map) || typeof ref !== 'string' || ref.trim() === '') return null
+  const owner = owners.get(ref)
+  if (!owner) return null
+  if (owner.producer === 'host') return 'host'
+  if (typeof owner.nodeId !== 'string' || owner.nodeId === '') return null
+  return typeof event?.nodeId === 'string' && owner.nodeId === event.nodeId ? 'self' : 'peer'
 }
 
 /** 模型自述证据：事件 extra.provenance === 'model-claim'（06 §13.7）。 */
@@ -1174,10 +1239,17 @@ export function summarizeAcceptance(events = []) {
 /**
  * 验收条目证据（§8.2 / §8.4）：同一 itemId 以 seq 最大者为准；只认当前 attempt。
  * 缺证据或证据链接 → unknown；任一条 fail → fail；全部 skip/na → unknown。
+ *
+ * v1.3 证据独立性：`selfCertified` 记「引用本节点自写产物」的通过条目数，
+ * `selfOnly` = 有通过条目且全部为自证。指标层不因此降级（自证仍是证据，不是
+ * 缺证据）；「证据不独立」由 quality 层在五项全过时降为 warn 兜底。
  */
 export function computeAcceptance(events = [], options = {}) {
   const scoped = currentAttemptEvents(events)
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
+  const owners = options.artifactOwners instanceof Map
+    ? options.artifactOwners
+    : collectArtifactOwners(events)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
@@ -1192,7 +1264,16 @@ export function computeAcceptance(events = [], options = {}) {
   let notApplicable = 0
   let missingLink = 0
   let unverified = 0
+  let selfCertified = 0
   const unverifiedRefs = []
+  const selfCertifiedRefs = []
+  const countPass = (data, event) => {
+    passed += 1
+    if (classifyEvidenceLevel(event, data.evidenceRef, owners) === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(data.itemId)
+    }
+  }
   for (const { data, event } of latest.values()) {
     if (data.status === 'fail') {
       failed += 1
@@ -1209,16 +1290,28 @@ export function computeAcceptance(events = [], options = {}) {
         unverifiedRefs.push(`${data.itemId}: ${claim.reason}`)
         continue
       }
-      passed += 1
+      countPass(data, event)
       continue
     }
     if (typeof data.evidenceRef !== 'string' || data.evidenceRef.trim() === '') {
       missingLink += 1
       continue
     }
-    passed += 1
+    countPass(data, event)
   }
-  if (failed > 0) return { state: 'fail', reason: `${failed} 个验收条目未通过`, items: latest.size, passed, failed, notApplicable }
+  const selfOnly = passed > 0 && selfCertified === passed
+  if (failed > 0) {
+    return {
+      state: 'fail',
+      reason: `${failed} 个验收条目未通过`,
+      items: latest.size,
+      passed,
+      failed,
+      notApplicable,
+      selfCertified,
+      selfOnly,
+    }
+  }
   if (unverified > 0) {
     return {
       state: 'unknown',
@@ -1229,24 +1322,51 @@ export function computeAcceptance(events = [], options = {}) {
       notApplicable,
       unverified,
       unverifiedRefs,
+      selfCertified,
+      selfOnly,
     }
   }
   if (missingLink > 0) {
-    return { state: 'unknown', reason: `${missingLink} 个通过的验收条目缺证据链接`, items: latest.size, passed, failed, notApplicable }
+    return {
+      state: 'unknown',
+      reason: `${missingLink} 个通过的验收条目缺证据链接`,
+      items: latest.size,
+      passed,
+      failed,
+      notApplicable,
+      selfCertified,
+      selfOnly,
+    }
   }
   if (passed === 0) {
     return { state: 'unknown', reason: '验收条目全部被跳过 / 不适用', items: latest.size, passed, failed, notApplicable }
   }
-  return { state: 'pass', items: latest.size, passed, failed, notApplicable }
+  // v1.3：自证不再把指标打成 unknown（unknown = 缺证据 / 自相矛盾）；
+  // 「证据不独立」由 quality 层以 warn 兜底，这里如实暴露 selfCertified 条数。
+  return {
+    state: 'pass',
+    items: latest.size,
+    passed,
+    failed,
+    notApplicable,
+    selfCertified,
+    selfOnly,
+    selfCertifiedRefs,
+  }
 }
 
 /**
  * 测试证据（§8.2 / §8.4）：同一 suite 以 seq 最大者为准；只认当前 attempt。
  * 有失败 → fail；计数缺失 / 只跑 0 条 / 缺报告链接 → unknown。
+ * v1.3：`selfCertified` 记引用本节点自写报告的通过套件数，`selfOnly` = 通过套件全部自证；
+ * 指标不降级，quality 层在五项全过时按 selfOnly 兜底 warn。
  */
 export function computeTests(events = [], options = {}) {
   const scoped = currentAttemptEvents(events)
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
+  const owners = options.artifactOwners instanceof Map
+    ? options.artifactOwners
+    : collectArtifactOwners(events)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'test/report' || !event.data) continue
@@ -1261,8 +1381,18 @@ export function computeTests(events = [], options = {}) {
   let missingCounts = 0
   let missingLink = 0
   let unverified = 0
+  let selfCertified = 0
   const unverifiedRefs = []
+  const selfCertifiedRefs = []
   const suites = []
+  const countPass = (suite, data, event) => {
+    passedSuites += 1
+    if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(suite)
+    }
+    suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
+  }
   for (const [suite, { data, event }] of latest) {
     const counts = ['executed', 'passed', 'failed', 'skipped']
     if (!counts.every(key => Number.isInteger(data[key]))) {
@@ -1296,22 +1426,21 @@ export function computeTests(events = [], options = {}) {
         unverifiedRefs.push(`${suite}: ${claim.reason}`)
         continue
       }
-      passedSuites += 1
-      suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
+      countPass(suite, data, event)
       continue
     }
     if (typeof data.reportRef !== 'string' || data.reportRef.trim() === '') {
       missingLink += 1
       continue
     }
-    passedSuites += 1
-    suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
+    countPass(suite, data, event)
   }
+  const selfOnly = passedSuites > 0 && selfCertified === passedSuites
   if (failedSuites > 0) {
-    return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites }
+    return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
   }
   if (missingCounts > 0) {
-    return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites }
+    return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
   }
   if (unverified > 0) {
     return {
@@ -1323,23 +1452,31 @@ export function computeTests(events = [], options = {}) {
       unverified,
       unverifiedRefs,
       details: suites,
+      selfCertified,
+      selfOnly,
     }
   }
   if (missingLink > 0) {
-    return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites }
+    return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
   }
   if (passedSuites === 0) {
     return { state: 'unknown', reason: '没有可用的测试执行记录', suites: latest.size, passedSuites, failedSuites, details: suites }
   }
-  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites }
+  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
+  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, selfCertifiedRefs }
 }
 
 /**
  * 规范检查证据（§8.3）：state=pass 只有在 passedChecks / totalChecks 都是整数、
  * total > 0、passed === total、且 executedAt 或 reportRef 至少有一个时才成立。
+ * v1.3：`selfCertified` 记引用本节点自写报告的通过规则集数，`selfOnly` = 通过规则集全部自证；
+ * 指标不降级，quality 层在五项全过时按 selfOnly 兜底 warn。
  */
 function checkEvidence(events, options = {}) {
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
+  const owners = options.artifactOwners instanceof Map
+    ? options.artifactOwners
+    : collectArtifactOwners(events)
   const latest = new Map()
   for (const event of sortEvents(currentAttemptEvents(events))) {
     if (!event || event.kind !== 'check/form' || !event.data) continue
@@ -1356,8 +1493,17 @@ function checkEvidence(events, options = {}) {
   let failed = 0
   let incomplete = 0
   let unverified = 0
+  let selfCertified = 0
   const unverifiedRefs = []
+  const selfCertifiedRefs = []
   const skipped = []
+  const countPass = (ruleSetId, data, event) => {
+    passed += 1
+    if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(ruleSetId)
+    }
+  }
   for (const [ruleSetId, { data, event }] of latest) {
     if (data.state === 'fail') {
       failed += 1
@@ -1386,7 +1532,7 @@ function checkEvidence(events, options = {}) {
         unverifiedRefs.push(`${ruleSetId}: ${claim.reason}`)
         continue
       }
-      passed += 1
+      countPass(ruleSetId, data, event)
       continue
     }
     const hasSource = (typeof data.executedAt === 'string' && data.executedAt.trim() !== '')
@@ -1395,9 +1541,12 @@ function checkEvidence(events, options = {}) {
       incomplete += 1
       continue
     }
-    passed += 1
+    countPass(ruleSetId, data, event)
   }
-  if (failed > 0) return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed }
+  const selfOnly = passed > 0 && selfCertified === passed
+  if (failed > 0) {
+    return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed, skipped, selfCertified, selfOnly }
+  }
   if (unverified > 0) {
     return {
       state: 'unknown',
@@ -1407,6 +1556,8 @@ function checkEvidence(events, options = {}) {
       failed,
       unverified,
       unverifiedRefs,
+      selfCertified,
+      selfOnly,
     }
   }
   if (incomplete > 0) {
@@ -1416,12 +1567,15 @@ function checkEvidence(events, options = {}) {
       applicable,
       passed,
       failed,
+      selfCertified,
+      selfOnly,
     }
   }
   if (applicable === 0) {
     return { state: 'unknown', reason: '全部规则集被跳过 / 不适用', applicable, passed, failed, skipped }
   }
-  return { state: 'pass', applicable, passed, failed, skipped }
+  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
+  return { state: 'pass', applicable, passed, failed, skipped, selfCertified, selfOnly, selfCertifiedRefs }
 }
 
 /**
@@ -1474,12 +1628,25 @@ function reviewEvidence(events, findings) {
   }
 
   let p0p1State
-  if (p0 > 0) p0p1State = { state: 'fail', reason: `${p0} 个 P0 未解决`, p0, p1 }
+  const p2 = findings.unresolvedBySeverity.P2
+  if (p0 > 0) p0p1State = { state: 'fail', reason: `${p0} 个 P0 未解决`, p0, p1, p2 }
   else if (verdicts.length === 0 && findings.total === 0) {
-    p0p1State = { state: 'unknown', reason: '没有审查发现数据', p0, p1 }
-  } else p0p1State = { state: 'pass', p0, p1 }
+    p0p1State = { state: 'unknown', reason: '没有审查发现数据', p0, p1, p2 }
+  } else if (p1 > 0 || p2 > 0) {
+    // §8.4 v1.3：P1/P2 未解决不再给绿灯，但也不到 fail 级（P0 才 fail）。
+    const parts = []
+    if (p1 > 0) parts.push(`${p1} 个 P1`)
+    if (p2 > 0) parts.push(`${p2} 个 P2`)
+    p0p1State = {
+      state: 'warn',
+      reason: `遗留 ${parts.join(' / ')} 未解决`,
+      p0,
+      p1,
+      p2,
+    }
+  } else p0p1State = { state: 'pass', p0, p1, p2 }
 
-  return { review: reviewState, p0p1: p0p1State, p0, p1 }
+  return { review: reviewState, p0p1: p0p1State, p0, p1, p2 }
 }
 
 /** 返工轮次 = `reject/trigger` 事件数（§8.4 的「返工 n 轮」）。 */
@@ -1520,18 +1687,26 @@ const STALE_METRICS = {
 }
 
 /**
- * B4：返工后的旧失败必须被**复判**，不能被「这一轮不再提它」洗成绿灯。
+ * B4 → v1.3：返工后的旧条目必须被**复判**，不能被「这一轮不再提它」洗成绿灯，
+ * 也不能让分母缩水。
  *
  * 三个证据指标只在当前 attempt 里聚合（§8.2 / §8.3），所以节点被打回重跑后，
- * 上一轮判过的 `fail` 会随着旧 attempt 一起被过滤掉。更要命的是「改个说法就能洗白」：
- * 上一轮 `R1=fail`，这一轮把同一条改成 `skip`，按「取最新判定」它就不再是 fail，
- * 而 skip 只记 notApplicable —— 其余条目 pass 就给了绿灯。所以判据是：
+ * 上一轮的判定会随着旧 attempt 一起被过滤掉。两个洗白路径：
+ *   1. 旧 `fail` 消失：上一轮 `R1=fail`，这一轮改说成 `skip`，按「取最新判定」
+ *      它就不再是 fail，而 skip 只记 notApplicable —— 其余条目 pass 就给了绿灯；
+ *   2. 分母缩水：上一轮报了 10 条（全 pass），本轮只报 1 条（pass），按当前
+ *      attempt 聚合分母就从 10 变成 1，「通过率」与绿灯一起被洗白。
  *
- * - `failEver`：该标识在**任何** attempt 里出现过 `fail`（顺序无关，晚到的旧事件也算）；
+ * 所以按标识（`itemId` / `suite` / `ruleSetId`）维护**全 attempt 账本**：
+ * - `seenEarlier`：该标识在**更早** attempt 里出现过（顺序无关，晚到的旧事件也算）；
  * - `passInCurrent`：**当前** attempt 里出现过 `pass`（这是唯一能清账的复判）；
  * - `failInCurrent`：当前 attempt 里出现过 `fail`（它已经是 fail，交给正常路径，不重复报 stale）。
  *
- * `failEver && !passInCurrent && !failInCurrent` → 未复判（skip / na / 干脆不提都算）。
+ * `seenEarlier && !passInCurrent && !failInCurrent` → 未复判（skip / na / 干脆不提都算）。
+ * 只在**当前** attempt 首次出现的新标识不受影响。
+ *
+ * 语义从「只盯曾经 fail 过的条目」扩展到「所有更早出现过的标识」，导出名与返回形状
+ * （`{ acceptance, tests, checks }`，元素是标识）保持不变，向后兼容。
  *
  * @param {object[]} events
  * @returns {{ acceptance: string[], tests: string[], checks: string[] }}
@@ -1547,20 +1722,20 @@ export function computeStaleFails(events = []) {
     if (typeof id !== 'string' || id === '') continue
     const key = `${metric.name}\u0000${id}`
     const entry = latest.get(key) || {
-      metric: metric.name, id, failEver: false, passInCurrent: false, failInCurrent: false,
+      metric: metric.name, id, seenEarlier: false, passInCurrent: false, failInCurrent: false,
     }
+    const current = isCurrentAttempt(event, attempts)
+    if (!current) entry.seenEarlier = true
     const verdict = metric.verdict(event.data)
-    if (verdict === 'fail') {
-      entry.failEver = true
-      if (isCurrentAttempt(event, attempts)) entry.failInCurrent = true
-    } else if (verdict === 'pass' && isCurrentAttempt(event, attempts)) {
-      entry.passInCurrent = true
-    }
+    if (verdict === 'fail' && current) entry.failInCurrent = true
+    else if (verdict === 'pass' && current) entry.passInCurrent = true
     latest.set(key, entry)
   }
   const stale = { acceptance: [], tests: [], checks: [] }
   for (const entry of latest.values()) {
-    if (entry.failEver && !entry.passInCurrent && !entry.failInCurrent) stale[entry.metric].push(entry.id)
+    if (entry.seenEarlier && !entry.passInCurrent && !entry.failInCurrent) {
+      stale[entry.metric].push(entry.id)
+    }
   }
   for (const list of Object.values(stale)) list.sort((a, b) => a.localeCompare(b))
   return stale
@@ -1568,7 +1743,7 @@ export function computeStaleFails(events = []) {
 
 function staleFailReason(label, ids) {
   const shown = ids.slice(0, 3).join('、')
-  return `${label}里有 ${ids.length} 条上一轮判未通过、本轮没有复判为通过（${shown}${ids.length > 3 ? ' 等' : ''}），不能按通过算`
+  return `${label}里有 ${ids.length} 条上一轮出现过、本轮没有复判为通过（${shown}${ids.length > 3 ? ' 等' : ''}），不能按通过算`
 }
 
 /**
@@ -1576,12 +1751,15 @@ function staleFailReason(label, ids) {
  *
  * 必要证据五项：acceptance / tests / checks / review / p0p1。
  * - 任一项 unknown → unknown（缺证据不给绿灯）；
- * - 任一项 fail → fail；
- * - 五项全过 + progress.ratio===1 + P0 未解决===0：
- *   返工 0 → pass「优：首轮通过」；
- *   返工 1 + P1=0 + acceptedRate≥0.6 → pass「良：返工 1 轮后达标」；
- *   否则 warn「可：返工 n 轮」（不是绿灯）；
+ * - 任一项 fail（含未解决 P0）→ fail；
+ * - 五项全过 + progress.ratio===1 时也不直接绿灯：
+ *   - 有未解决 P1/P2 → warn，label 写「遗留 N 个 P1 / M 个 P2 未解决」；
+ *   - 任一证据指标「全部为自证」（selfOnly）→ warn，label 写「<指标名> 全部为自证证据（N 条），缺独立复核」；
+ *     每个有通过条目的指标都至少有 1 条 peer/host 级证据时才允许 pass（自证总数见 quality.selfCertified）；
+ *   - 返工 0 → pass「优：首轮通过」；返工 1 + P1=P2=0 + acceptedRate≥0.6 → pass「良」；
+ *   - 其余返工情形 → warn「可：返工 n 轮」。
  * - progress.ratio < 1 → 至少 warn。
+ * - 多项 warn 原因同时成立时全部写进同一个 label（不丢原因）。
  */
 export function computeQuality(events = [], options = {}) {
   const findings = computeFindings(events)
@@ -1589,8 +1767,11 @@ export function computeQuality(events = [], options = {}) {
     ? options.conflicts
     : computeConflicts(events)
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
+  const artifactOwners = options.artifactOwners instanceof Map
+    ? options.artifactOwners
+    : collectArtifactOwners(events)
   const scoped = currentAttemptEvents(events)
-  const evidenceOptions = { artifacts, verifyEvidence: options.verifyEvidence }
+  const evidenceOptions = { artifacts, artifactOwners, verifyEvidence: options.verifyEvidence }
   let checks = checkEvidence(scoped, evidenceOptions)
   let acceptance = computeAcceptance(scoped, evidenceOptions)
   let tests = computeTests(scoped, evidenceOptions)
@@ -1633,7 +1814,8 @@ export function computeQuality(events = [], options = {}) {
     }
   }
 
-  // B4：上一轮判 fail、本轮没有复判的条目 → 该指标 unknown（先记着，别让旧失败被洗白）。
+  // B4 / v1.3：更早 attempt 出现过、本轮没有复判为通过的标识 → 该指标 unknown
+  // （既防旧失败被洗白，也防分母缩水）。
   const stale = computeStaleFails(events)
   for (const [metric, label] of [
     ['acceptance', EVIDENCE_LABELS.acceptance],
@@ -1674,36 +1856,59 @@ export function computeQuality(events = [], options = {}) {
     .filter(([, value]) => value.state === 'fail')
     .map(([key]) => key)
 
+  const p1Unresolved = findings.unresolvedBySeverity.P1
+  const p2Unresolved = findings.unresolvedBySeverity.P2
+  // §8.4 v1.3：三项证据指标里「证据由本节点自写」的通过条目总数（供 UI 展示）。
+  // 结论层门禁不按「有一条自证就不许绿」，而是「**每个**有通过条目的指标至少要有
+  // 一条 peer/host 级独立证据」——全自证（selfOnly）才是闭环。
+  const selfCertified = ['acceptance', 'tests', 'checks']
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0), 0)
+  const selfOnlyMetrics = ['acceptance', 'tests', 'checks']
+    .filter(key => evidence[key].selfOnly === true)
+  const acceptedRate = findings.acceptedRate
+  const goodRework = reworkRounds === 1 && p1Unresolved === 0 && p2Unresolved === 0
+    && acceptedRate !== null && acceptedRate >= 0.6
+
   let state
   let label
   if (failed.length > 0) {
     state = 'fail'
-    label = `需返工：${failed.map(key => EVIDENCE_LABELS[key]).join('、')}未通过`
+    label = `需返工：${failed.map(key => EVIDENCE_LABELS[key]).join('、')}`
     if (missing.length > 0) label += `；另有 ${missing.map(key => EVIDENCE_LABELS[key]).join('、')}未检测`
   } else if (missing.length > 0) {
     state = 'unknown'
     label = `证据不足：${missing.map(key => EVIDENCE_LABELS[key]).join('、')}未检测，不能判定为通过`
-  } else if (progress.ratio === null || progress.ratio < 1) {
-    // 半成品不许绿：证据全过也至少 warn。
-    state = 'warn'
-    label = progress.ratio === null
-      ? '可：阶段进度未检测，不能判定为完成'
-      : `可：进度未完成（${progress.passed}/${progress.denominator}）`
-  } else if (reworkRounds === 0) {
-    state = 'pass'
-    label = '优：首轮通过'
-  } else if (reworkRounds === 1 && review.p1 === 0
-    && findings.acceptedRate !== null && findings.acceptedRate >= 0.6) {
-    state = 'pass'
-    label = '良：返工 1 轮后达标'
   } else {
-    state = 'warn'
-    let detail = `可：返工 ${reworkRounds} 轮`
-    if (review.p1 > 0) detail += `、遗留 ${review.p1} 个 P1`
-    if (findings.acceptedRate !== null && findings.acceptedRate < 0.6) {
-      detail += `、采纳率 ${(findings.acceptedRate * 100).toFixed(0)}%`
+    // 证据齐全（没有 unknown / fail）之后，把所有「不能给绿灯」的原因一起列出来，
+    // 缺一条都可能把「首轮通过 + 遗留 P1」这类假绿放出去。
+    const warnReasons = []
+    if (progress.ratio === null) warnReasons.push('阶段进度未检测，不能判定为完成')
+    else if (progress.ratio < 1) warnReasons.push(`进度未完成（${progress.passed}/${progress.denominator}）`)
+    if (reworkRounds > 0 && !goodRework) {
+      warnReasons.push(`返工 ${reworkRounds} 轮`)
+      if (acceptedRate !== null && acceptedRate < 0.6) {
+        warnReasons.push(`采纳率 ${(acceptedRate * 100).toFixed(0)}%`)
+      }
     }
-    label = detail
+    if (p1Unresolved > 0 || p2Unresolved > 0) {
+      const parts = []
+      if (p1Unresolved > 0) parts.push(`${p1Unresolved} 个 P1`)
+      if (p2Unresolved > 0) parts.push(`${p2Unresolved} 个 P2`)
+      warnReasons.push(`遗留 ${parts.join(' / ')} 未解决`)
+    }
+    if (selfOnlyMetrics.length > 0) {
+      const names = selfOnlyMetrics.map(key => EVIDENCE_LABELS[key]).join('、')
+      const count = selfOnlyMetrics
+        .reduce((sum, key) => sum + (Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0), 0)
+      warnReasons.push(`${names} 全部为自证证据（${count} 条），缺独立复核`)
+    }
+    if (warnReasons.length > 0) {
+      state = 'warn'
+      label = `可：${warnReasons.join('、')}`
+    } else {
+      state = 'pass'
+      label = reworkRounds === 0 ? '优：首轮通过' : '良：返工 1 轮后达标'
+    }
   }
 
   const engine = options.engine === 'stub' ? 'stub' : 'real'
@@ -1717,9 +1922,11 @@ export function computeQuality(events = [], options = {}) {
       failed,
       evidence,
       reworkRounds,
-      acceptedRate: findings.acceptedRate,
+      acceptedRate,
       p0Unresolved: review.p0,
-      p1Unresolved: review.p1,
+      p1Unresolved,
+      p2Unresolved,
+      selfCertified,
       engine,
       stub: true,
       conflicts: conflictList,
@@ -1733,12 +1940,71 @@ export function computeQuality(events = [], options = {}) {
     failed,
     evidence,
     reworkRounds,
-    acceptedRate: findings.acceptedRate,
+    acceptedRate,
     p0Unresolved: review.p0,
-    p1Unresolved: review.p1,
+    p1Unresolved,
+    p2Unresolved,
+    selfCertified,
     engine,
     conflicts: conflictList,
   }
+}
+
+/**
+ * agent 活动摘要（§8.3）：按 nodeId 聚合最近若干条 `agent/message` 的可见文本，
+ * 供客户端在「运行详情」里展示「这个节点最近在说什么」。
+ *
+ * 有界：每节点最多 `perNode`（默认 5）条，全局最多 `total`（默认 200）条；
+ * 总量超限时保留全局最新的事件（同一节点的组内仍按时间升序输出）。
+ *
+ * @param {object[]} events 按 seq 升序的已落盘事件
+ * @param {{ perNode?: number, total?: number }} [options]
+ * @returns {{ nodes: Record<string, { text: string, at: string | null, memberId: string | null }[]> }}
+ */
+export function computeAgentActivity(events = [], options = {}) {
+  const perNode = Number.isInteger(options.perNode) && options.perNode > 0
+    ? options.perNode
+    : AGENT_ACTIVITY_PER_NODE
+  const total = Number.isInteger(options.total) && options.total > 0
+    ? options.total
+    : AGENT_ACTIVITY_TOTAL
+  const byNode = new Map()
+  let order = 0
+  for (const event of events) {
+    if (!event || event.kind !== 'agent/message') continue
+    const data = isPlainObject(event.data) ? event.data : null
+    if (!data || typeof data.text !== 'string' || data.text === '') continue
+    const nodeId = typeof event.nodeId === 'string' && event.nodeId !== '' ? event.nodeId : '(run)'
+    if (!byNode.has(nodeId)) byNode.set(nodeId, [])
+    const list = byNode.get(nodeId)
+    order += 1
+    list.push({
+      order,
+      text: data.text,
+      at: typeof event.ts === 'string' && event.ts !== '' ? event.ts : null,
+      memberId: typeof event.memberId === 'string' && event.memberId !== '' ? event.memberId : null,
+    })
+    // 每节点只保留最近 perNode 条。
+    if (list.length > perNode) list.shift()
+  }
+  // 全局总量有界：先取全局最新的 total 条，再按节点分组。
+  const flat = []
+  for (const [nodeId, list] of byNode.entries()) {
+    for (const item of list) flat.push({ nodeId, item })
+  }
+  const kept = flat.sort((a, b) => b.item.order - a.item.order).slice(0, total)
+  const grouped = new Map()
+  for (const { nodeId, item } of kept) {
+    if (!grouped.has(nodeId)) grouped.set(nodeId, [])
+    grouped.get(nodeId).push(item)
+  }
+  const nodes = {}
+  for (const nodeId of [...grouped.keys()].sort((a, b) => a.localeCompare(b))) {
+    nodes[nodeId] = grouped.get(nodeId)
+      .sort((a, b) => a.order - b.order)
+      .map(item => ({ text: item.text, at: item.at, memberId: item.memberId }))
+  }
+  return { nodes }
 }
 
 /**
@@ -1792,6 +2058,8 @@ export function summarize(events = [], options = {}) {
     findings,
     rejects: computeRejects(events),
     progress: computeProgress(events),
+    // §8.3：agent 最近发言（有界：每节点 ≤5、全局 ≤200 条）。
+    activity: computeAgentActivity(events),
     quality: computeQuality(events, {
       engine,
       conflicts,
@@ -1838,6 +2106,8 @@ function eventDigest(event) {
       return `status=${data.status} · ${data.durationMs}ms`
     case 'model/call':
       return `${data.provider || ''}/${data.model || ''} · ${usageText(data.usage)}`
+    case 'agent/message':
+      return `${data.role || ''} · ${String(data.text || '')}${data.truncated ? ' …' : ''}`
     case 'tool/call':
       return `${data.name || ''} · ok=${data.ok}${data.durationMs === undefined ? '' : ` · ${data.durationMs}ms`}`
     case 'skill/load':

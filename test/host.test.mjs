@@ -142,6 +142,97 @@ await check('删除返回是否存在', async () => {
   assert.equal(await store.deleteFlow(dir, id), false)
 })
 
+console.log('store.js · 乐观锁')
+
+await check('新建流程 version=1，读回与磁盘一致', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const saved = await store.saveFlow(dir, id, { name: '版本起点', nodes: [], edges: [] })
+  assert.equal(saved.version, 1)
+  const readBack = await store.readFlow(dir, id)
+  assert.equal(readBack.version, 1)
+  const raw = JSON.parse(readFileSync(join(dir, `${id}.json`), 'utf8'))
+  assert.equal(raw.version, 1, 'version 必须真的落盘')
+})
+
+await check('带正确 version 保存 → version+1', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const v1 = await store.saveFlow(dir, id, { name: '第一版', nodes: [], edges: [] })
+  const v2 = await store.saveFlow(dir, id, { ...v1, name: '第二版' })
+  assert.equal(v2.version, 2)
+  const readBack = await store.readFlow(dir, id)
+  assert.equal(readBack.version, 2)
+  assert.equal(readBack.name, '第二版')
+})
+
+await check('过期 version → FlowConflictError，且磁盘内容不被覆盖', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const v1 = await store.saveFlow(dir, id, { name: '旧内容', nodes: [], edges: [] })
+  const v2 = await store.saveFlow(dir, id, { ...v1, name: '已提交的新内容' })
+  assert.equal(v2.version, 2)
+  const error = await store.saveFlow(dir, id, {
+    ...v2,
+    version: v1.version, // 拿着过期版本保存
+    name: '过期覆盖尝试',
+  }).catch(caught => caught)
+  assert.ok(error instanceof store.FlowConflictError, '必须是可识别的冲突错误')
+  assert.equal(error.code, 'FLOW_VERSION_CONFLICT')
+  assert.equal(error.currentVersion, 2)
+  assert.equal(typeof error.currentDigest, 'string')
+  assert.equal(error.currentDigest.length, 16)
+  assert.equal(error.currentUpdatedAt, v2.updatedAt)
+  const raw = JSON.parse(readFileSync(join(dir, `${id}.json`), 'utf8'))
+  assert.equal(raw.name, '已提交的新内容', '冲突路径不能先写后比')
+  assert.equal(raw.version, 2)
+})
+
+await check('并发保存同一 base version：恰好一个成功、一个冲突', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const base = await store.saveFlow(dir, id, { name: 'base', nodes: [], edges: [] })
+  const results = await Promise.allSettled([
+    store.saveFlow(dir, id, { ...base, name: '并发 A' }),
+    store.saveFlow(dir, id, { ...base, name: '并发 B' }),
+  ])
+  const fulfilled = results.filter(item => item.status === 'fulfilled')
+  const rejected = results.filter(item => item.status === 'rejected')
+  assert.equal(fulfilled.length, 1, '只允许一个赢家')
+  assert.equal(rejected.length, 1, '输家必须收到冲突')
+  assert.equal(rejected[0].reason.code, 'FLOW_VERSION_CONFLICT')
+  const readBack = await store.readFlow(dir, id)
+  assert.equal(readBack.version, base.version + 1, '版本只能前进一版')
+  assert.ok(['并发 A', '并发 B'].includes(readBack.name))
+})
+
+await check('不带 version 的旧调用仍能保存，version 继续递增', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const v1 = await store.saveFlow(dir, id, { name: '旧调用一', nodes: [], edges: [] })
+  // 故意不带 version：兼容旧调用方 / 脚本的无条件写入语义。
+  const v2 = await store.saveFlow(dir, id, { name: '旧调用二', nodes: [], edges: [] })
+  assert.equal(v2.version, v1.version + 1)
+  assert.equal((await store.readFlow(dir, id)).name, '旧调用二')
+})
+
+await check('老文件没有 version → 按 v1 读，保存后变 v2', async () => {
+  const dir = store.flowsDir(home)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'flow-legacy.json'), JSON.stringify({
+    id: 'flow-legacy',
+    name: '老流程',
+    nodes: [],
+    edges: [],
+    createdAt: '2020-01-01T00:00:00.000Z',
+    updatedAt: '2020-01-01T00:00:00.000Z',
+  }))
+  const readBack = await store.readFlow(dir, 'flow-legacy')
+  assert.equal(readBack.version, 1, '缺 version 的老文件不该被判坏')
+  const saved = await store.saveFlow(dir, 'flow-legacy', { ...readBack, name: '老流程改名' })
+  assert.equal(saved.version, 2)
+})
+
 console.log('routes')
 
 const ctx = makeCtx()
@@ -188,6 +279,65 @@ await check('PUT 后 GET 拿到同一份内容', async () => {
   assert.equal(got.json.flow.nodes.length, 2)
   assert.equal(got.json.flow.edges.length, 1)
   assert.equal(validateFlow(got.json.flow).ok, true)
+})
+
+await check('POST 新建不校验版本，body.version 不生效，一律从 v1 开始', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', {
+    name: '新建不要预条件',
+    version: 99,
+    nodes: [],
+    edges: [],
+  })
+  assert.equal(created.status, 200)
+  assert.equal(created.json.flow.version, 1)
+})
+
+await check('PUT 带过期 version → 409，错误体字段齐全，磁盘不覆盖', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', { name: '冲突流程', nodes: [], edges: [] })
+  const id = created.json.flow.id
+  const first = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+    name: '冲突流程', version: 1, nodes: [], edges: [],
+  })
+  assert.equal(first.status, 200)
+  assert.equal(first.json.flow.version, 2, '成功保存要回传新 version')
+  const conflict = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+    name: '过期覆盖', version: 1, nodes: [], edges: [],
+  })
+  assert.equal(conflict.status, 409)
+  assert.equal(conflict.json.ok, false)
+  assert.equal(conflict.json.error, '流程已被其他人改过，请刷新后重试')
+  assert.equal(conflict.json.code, 'FLOW_VERSION_CONFLICT')
+  assert.equal(conflict.json.currentVersion, 2)
+  assert.ok(typeof conflict.json.updatedAt === 'string' && !Number.isNaN(Date.parse(conflict.json.updatedAt)))
+  const got = await call(route, 'GET', `/api/flow-studio/flows/${id}`)
+  assert.equal(got.json.flow.name, '冲突流程', '409 之后磁盘必须还是旧内容')
+  assert.equal(got.json.flow.version, 2)
+})
+
+await check('PUT 支持 If-Match 版本预条件（可选兼容），过期同样 409', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', { name: '预条件', nodes: [], edges: [] })
+  const id = created.json.flow.id
+  const ok = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, { name: '预条件', nodes: [], edges: [] }, {
+    'if-match': '"1"',
+  })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.json.flow.version, 2)
+  const stale = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, { name: '预条件', nodes: [], edges: [] }, {
+    'if-match': '"1"',
+  })
+  assert.equal(stale.status, 409)
+  assert.equal(stale.json.code, 'FLOW_VERSION_CONFLICT')
+  assert.equal(stale.json.currentVersion, 2)
+})
+
+await check('PUT 的 version 不是正整数 → 400（不静默退化成无条件写）', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', { name: '坏版本', nodes: [], edges: [] })
+  const id = created.json.flow.id
+  const result = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+    name: '坏版本', version: '3', nodes: [], edges: [],
+  })
+  assert.equal(result.status, 400)
+  assert.equal(result.json.code, 'FLOW_VERSION_INVALID')
 })
 
 await check('DELETE 后 GET 回归 404', async () => {

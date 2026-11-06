@@ -44,7 +44,8 @@ check('worldBounds 是唯一世界边界来源：8 列主干宽 2028', () => {
   assert.equal(EIGHT_COL_WORLD_W, 2028, '导出的 8 列常量也必须等于 2028')
   assert.equal(bounds.minX, 40)
   assert.equal(bounds.maxX, 2068)
-  assert.equal(bounds.h, 96)
+  // 出厂模板的阶段节点是 team 模式（主管 + 3 名成员），卡高 116；start/end 仍是 96。
+  assert.equal(bounds.h, 116)
 })
 
 check('fitView 用屏幕 px 边距与 15% 地板，不再有第二套数学', () => {

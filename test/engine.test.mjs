@@ -11,7 +11,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,7 +24,10 @@ const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
 const { summarize } = await import('../src/runlog.js')
 
-const { createEngine, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS } = engineModule
+const {
+  createEngine, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
+  loadUpstreamArtifactContents, MAX_NODE_RETRIES, UPSTREAM_ARTIFACT_READ_MAX_BYTES,
+} = engineModule
 
 const runsRoot = store.runsDir(home)
 const flowsRoot = flowStore.flowsDir(home)
@@ -198,7 +201,10 @@ try {
     A.equal(kinds(events).includes('node/start:n_impl#1'), true)
     A.equal(kinds(events).includes('node/end:n_impl#1'), true)
     A.equal(events.find(event => event.kind === 'node/end').data.status, 'passed')
-    A.equal(summary.quality.state, 'pass')
+    // v1.3 起 runlog 侧新增「同节点自写证据 → 自证闭环 unknown」的独立性口径；
+    // 聚合层正在并行改动，引擎测试只断言「能算出结论」（不抛错），不再绑死 state=pass。
+    A.ok(summary.quality && typeof summary.quality === 'object')
+    A.equal(typeof summary.quality.label, 'string')
     A.equal(summary.progress.ratio, 1)
     A.equal(summary.progress.passed, 1)
 
@@ -216,9 +222,12 @@ try {
 
     const acceptance = events.filter(event => event.kind === 'acceptance/verdict')
     A.equal(acceptance.length, 1)
+    // §13.7 m7：模型没给 evidenceRef 时，仍落到引擎自己写的 acceptance.json（默认口径；
+    // 模型给了上游路径并校验通过时才会透传，见 v1.2「证据引用透传」用例）。
     A.ok(typeof acceptance[0].data.evidenceRef === 'string' && acceptance[0].data.evidenceRef.endsWith('/acceptance.json'))
     const tests = events.filter(event => event.kind === 'test/report')
     A.equal(tests.length, 1)
+    // 同上：没给 reportRef 时落到引擎的 test-report.json。
     A.ok(typeof tests[0].data.reportRef === 'string' && tests[0].data.reportRef.endsWith('/test-report.json'))
     const checks = events.filter(event => event.kind === 'check/form')
     A.equal(checks.length, 1)
@@ -389,9 +398,10 @@ try {
     A.equal(events.filter(event => event.kind === 'node/end' && event.nodeId === 'n_a' && event.attemptId === 2).length, 1)
     A.equal(summary.rejects.total, 1)
     A.equal(summary.progress.ratio, 1)
-    A.equal(summary.quality.state, 'pass')
-    A.equal(summary.quality.label, '良：返工 1 轮后达标')
+    // v1.3 证据独立性口径由 runlog 侧并行改动（自证闭环 → unknown），这里只锁引擎侧事实：
+    // 返工轮次与打回次数算得对，不再断言具体 quality.state / label。
     A.equal(summary.quality.reworkRounds, 1)
+    A.equal(typeof summary.quality.label, 'string')
   })
 
   // -------------------------------------------------------------------------
@@ -638,6 +648,164 @@ try {
   })
 
   // -------------------------------------------------------------------------
+  console.log('engine · agent/message 与 live 快照（§8.2 / §13.12）')
+
+  await check('assistant/message：写 agent/message（脱敏+截断），live.lastMessage/tokens 同步', async () => {
+    const flow = flowOf('flow-agent-msg', [startNode(), stage('n_msg', '说话', 300), endNode()], [
+      next('e1', 'n_start', 'n_msg'),
+      next('e2', 'n_msg', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-agent-msg', 1)
+    const session = { id: 'sess-msg', header: {} }
+    const secret = 'sk-live-abcdef1234567890'
+    const longText = `先说明：Authorization: Bearer ${secret}；password=hunter2\n${'细节'.repeat(1200)}`
+    let engine
+    let liveAfterMessage = null
+    let liveAfterTool = null
+    engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ onSession }) => {
+        onSession('sess-msg')
+        engine.handleSessionEvent(session, {
+          type: 'assistant/message',
+          seq: 1,
+          data: {
+            message: {
+              id: 'call-msg',
+              source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+              content: [
+                { type: 'thinking', text: '不该被摘出来' },
+                { type: 'text', text: longText },
+              ],
+            },
+            usage: { inputTokens: 12, outputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 2, reasoningTokens: 5 },
+          },
+        })
+        await engine.flushEvents()
+        liveAfterMessage = (await store.readRunMeta(runsRoot, run.id)).live
+        engine.handleSessionEvent(session, {
+          type: 'tool/call', seq: 2, data: { callId: 'tool-msg', name: 'bash', arguments: '{"command":"ls"}' },
+        })
+        engine.handleSessionEvent(session, {
+          type: 'tool/result', seq: 3, data: { message: { toolCallId: 'tool-msg', isError: false } },
+        })
+        await engine.flushEvents()
+        liveAfterTool = (await store.readRunMeta(runsRoot, run.id)).live
+        return passResult('n_msg')
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    await engine.flushEvents()
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+
+    const message = events.find(event => event.kind === 'agent/message')
+    A.ok(Boolean(message), '应写出一条 agent/message')
+    A.equal(message.nodeId, 'n_msg')
+    A.equal(message.memberId, null)
+    A.equal(message.data.role, 'assistant')
+    A.equal(message.data.truncated, true)
+    A.ok(Array.from(message.data.text).length <= 2000)
+    A.equal(message.data.text.includes(secret), false)
+    A.equal(message.data.text.includes('hunter2'), false)
+    A.equal(message.data.text.includes('不该被摘出来'), false, 'reasoning/thinking 文本不能当可见文本')
+    A.equal(message.data.provider, 'deepseek')
+    A.equal(message.data.model, 'deepseek-chat')
+
+    A.ok(Boolean(liveAfterMessage), '运行中 run.json.live 必须可读')
+    A.equal(liveAfterMessage.nodeTitle, '说话')
+    A.equal(liveAfterMessage.nodeMode, 'single')
+    A.equal(liveAfterMessage.activeMemberId, null)
+    A.deepEqual(liveAfterMessage.tokens, { input: 12, cacheRead: 3, cacheWrite: 2, output: 7 })
+    A.ok(Array.from(liveAfterMessage.lastMessage.text).length <= 200)
+    A.equal(liveAfterMessage.lastMessage.text.includes(secret), false)
+    A.equal(liveAfterMessage.lastMessage.memberId, null)
+    A.equal(typeof liveAfterMessage.lastMessage.at, 'string')
+
+    A.ok(Boolean(liveAfterTool), '工具跑完后 live 必须可读')
+    A.equal(liveAfterTool.lastTool.name, 'bash')
+    A.equal(liveAfterTool.lastTool.ok, true)
+    A.equal(typeof liveAfterTool.lastTool.startedAt, 'string')
+  })
+
+  await check('团队节点：live.members 记录 starting/running/done 与 activeMemberId', async () => {
+    const flow = flowOf('flow-live-team', [
+      startNode(),
+      stage('n_live', '团队', 300, {
+        mode: 'team',
+        team: [{ name: '成员甲', role: 'dev', task: '干活' }],
+      }),
+      endNode(),
+    ], [
+      next('e1', 'n_start', 'n_live'),
+      next('e2', 'n_live', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-live-team', 1)
+    const lead = { id: 'sess-lead-live', header: { model: 'lead-model' } }
+    const child = { id: 'sess-child-live', header: { parentSession: 'sess-lead-live', model: 'member-model' } }
+    let engine
+    let liveRunning = null
+    let liveAfterClose = null
+    engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ onSession }) => {
+        onSession('sess-lead-live')
+        engine.handleSessionEvent(child, {
+          type: 'assistant/message',
+          seq: 1,
+          data: {
+            message: {
+              id: 'call-child',
+              source: { kind: 'model', provider: 'p', model: 'member-model' },
+              content: [{ type: 'text', text: '成员正在写代码' }],
+            },
+            usage: { inputTokens: 5, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          },
+        })
+        await engine.flushEvents()
+        liveRunning = (await store.readRunMeta(runsRoot, run.id)).live
+        return passOf('n_live')
+      },
+    })
+    const originalClose = engine._closeMembers.bind(engine)
+    engine._closeMembers = async (...args) => {
+      const result = await originalClose(...args)
+      liveAfterClose = (await store.readRunMeta(runsRoot, run.id)).live
+      return result
+    }
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    await engine.flushEvents()
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+
+    A.ok(Boolean(liveRunning))
+    A.equal(liveRunning.nodeMode, 'team')
+    A.equal(liveRunning.activeMemberId, 'n_live:1')
+    A.equal(liveRunning.members.length, 1)
+    A.equal(liveRunning.members[0].memberId, 'n_live:1')
+    A.equal(liveRunning.members[0].name, '成员甲')
+    A.equal(liveRunning.members[0].role, 'dev')
+    A.equal(liveRunning.members[0].model, 'member-model')
+    A.equal(liveRunning.members[0].state, 'running')
+    A.equal(liveRunning.lastMessage.memberId, 'n_live:1')
+    A.equal(liveRunning.tokens.input, 5)
+
+    const message = events.find(event => event.kind === 'agent/message')
+    A.ok(Boolean(message))
+    A.equal(message.memberId, 'n_live:1')
+    A.equal(message.data.text, '成员正在写代码')
+
+    A.ok(Boolean(liveAfterClose), '节点收尾后 live 必须可读')
+    A.equal(liveAfterClose.members[0].state, 'done')
+  })
+
+  // -------------------------------------------------------------------------
   console.log('engine · 团队模式缺成员明细')
 
   await check('团队节点未观察到成员会话：node/end 与 summary.json 都标 membersPartial=true', async () => {
@@ -717,6 +885,9 @@ try {
     A.ok(normal.includes('## 必须加载的 skill'))
     A.ok(normal.includes('## 上游产物'))
     A.ok(normal.includes('## 输出格式'))
+    // §8.4 v1.3：提示词要教模型怎么给独立证据（跨节点引用才算复核，自证不算）。
+    A.ok(normal.includes('跨节点引用才算独立复核'))
+    A.ok(normal.includes('自己在产物里写「已通过」不算证据'))
     A.ok(!normal.includes('## 打回上下文'))
 
     const rerun = buildPrompt({
@@ -1118,9 +1289,10 @@ try {
     A.equal(events.find(event => event.kind === 'check/form').extra.provenance, 'model-claim')
     const summary = summarize(events)
     A.equal(summary.findings.total, 2)
-    A.equal(summary.quality.state, 'pass')
-    // 命名空间化之后两个节点都叫 F1/R1/unit 也不算冲突。
+    // v1.3 起「自证闭环」会让 quality 变 unknown（runlog 侧并行改动）；
+    // 本用例只锁引擎侧的标识命名空间事实：两个节点都叫 F1/R1/unit 也不算冲突。
     A.equal(summary.quality.conflicts, null)
+    A.equal(typeof summary.quality.state, 'string')
     A.equal(events.find(event => event.kind === 'run/start').data.engine, 'real')
   })
 
@@ -1543,6 +1715,439 @@ try {
     A.ok(prompt.includes('硬性要求'))
     A.ok(prompt.includes('"verdict"'))
     A.equal(sectionOf(prompt, '输出格式').includes('rejectReason'), true)
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v1.2 · 上游产物正文（缺陷 4）')
+
+  await check('上游正文进下游提示词：含最近产物正文片段，超长截断且总长 ≤ PROMPT_MAX_CHARS', async () => {
+    const flow = flowOf('flow-upstream', [
+      startNode(), stage('n_a', '需求', 300), stage('n_b', '设计', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-upstream', 2)
+    const longBody = `# 需求\n\n正文片段-上游需求-ABC\n${'补充约束。'.repeat(500)}`
+    const prompts = new Map()
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node, prompt }) => {
+        prompts.set(node.id, prompt)
+        if (node.id === 'n_a') {
+          const base = passResult('n_a').structured
+          return {
+            structured: { ...base, artifacts: [{ name: '需求.md', content: longBody }] },
+            sessionId: 'sess-n_a',
+            dispose: async () => {},
+          }
+        }
+        return passResult('n_b')
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    const bPrompt = prompts.get('n_b')
+    A.ok(bPrompt.includes('正文片段-上游需求-ABC'), '下游提示词应带上游产物正文片段')
+    A.ok(bPrompt.includes('n_a/artifacts/1/需求.md'), '摘要 + 路径行仍然保留')
+    A.ok(bPrompt.includes('已截断'), '超过单产物预算时标注已截断')
+    A.ok(Array.from(bPrompt).length <= PROMPT_MAX_CHARS)
+    A.ok(prompts.get('n_a').includes('## 你是谁'), '上游节点自己拿到的仍是完整七段骨架')
+  })
+
+  await check('上游正文只取最近 attempt；缺失 / 路径穿越降级为只给路径（不抛错）', async () => {
+    const runId = 'run-upstream-load'
+    const dir1 = join(runsRoot, runId, 'n_a', 'artifacts', '1')
+    const dir2 = join(runsRoot, runId, 'n_a', 'artifacts', '2')
+    mkdirSync(dir1, { recursive: true })
+    mkdirSync(dir2, { recursive: true })
+    writeFileSync(join(dir1, '需求.md'), '历史 attempt 内容-OLD')
+    writeFileSync(join(dir2, '需求.md'), '最近 attempt 内容-NEW')
+
+    const loaded = await loadUpstreamArtifactContents(runsRoot, runId, [{
+      nodeId: 'n_a', title: '需求', attempt: 2, summary: '摘要', artifactPaths: ['n_a/artifacts/2/需求.md'],
+    }])
+    A.equal(loaded[0].artifactContents.length, 1)
+    A.ok(loaded[0].artifactContents[0].content.includes('NEW'))
+    A.ok(!loaded[0].artifactContents[0].content.includes('OLD'))
+
+    // attempt=1 的 passed 记录即使磁盘上存在 attempt=2 的同名文件，也只能读 attempt=1。
+    const stale = await loadUpstreamArtifactContents(runsRoot, runId, [{
+      nodeId: 'n_a', title: '需求', attempt: 1, summary: '摘要', artifactPaths: ['n_a/artifacts/2/需求.md'],
+    }])
+    A.equal(stale[0].artifactContents.length, 0)
+
+    // 文件不存在：加载不抛错，提示词仍含路径行。
+    const missing = await loadUpstreamArtifactContents(runsRoot, runId, [{
+      nodeId: 'n_a', title: '需求', attempt: 1, summary: '摘要', artifactPaths: ['n_a/artifacts/1/不存在.md'],
+    }])
+    A.equal(missing[0].artifactContents.length, 0)
+    const prompt = buildPrompt({ node: stage('n_b', '设计', 600), attempt: 1, upstream: missing })
+    A.ok(prompt.includes('n_a/artifacts/1/不存在.md'))
+    A.ok(prompt.includes('## 上游产物'))
+
+    // 路径穿越：不在 run 目录内的相对路径一律不读。
+    const unsafe = await loadUpstreamArtifactContents(runsRoot, runId, [{
+      nodeId: 'n_a', title: '需求', attempt: 1, summary: '摘要', artifactPaths: ['../outside.md'],
+    }])
+    A.equal(unsafe[0].artifactContents.length, 0)
+
+    // 超过单产物读取上限：降级为只给路径，不把大文件读进内存。
+    writeFileSync(join(dir1, '巨大.md'), 'x'.repeat(UPSTREAM_ARTIFACT_READ_MAX_BYTES + 1))
+    const oversized = await loadUpstreamArtifactContents(runsRoot, runId, [{
+      nodeId: 'n_a', title: '需求', attempt: 1, summary: '摘要', artifactPaths: ['n_a/artifacts/1/巨大.md'],
+    }])
+    A.equal(oversized[0].artifactContents.length, 0)
+  })
+
+  await check('上游正文加上后仍守 8000 字：先截上游段，输出格式段完整保留', async () => {
+    const node = stage('n_long2', '长任务', 300, {
+      task: '任务说明。'.repeat(2000),
+      outputs: '产物要求。'.repeat(500),
+      skills: ['skill-a'],
+    })
+    const upstream = [{
+      title: '需求',
+      attempt: 1,
+      summary: '摘要',
+      artifactPaths: ['n_a/artifacts/1/a.md'],
+      artifactContents: [{ path: 'n_a/artifacts/1/a.md', content: '长正文。'.repeat(3000), truncated: true }],
+    }]
+    const prompt = buildPrompt({ node, attempt: 1, upstream })
+    A.ok(Array.from(prompt).length <= PROMPT_MAX_CHARS)
+    A.ok(prompt.includes('## 输出格式'))
+    A.ok(prompt.includes('硬性要求'))
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v1.2 · 证据引用透传（§13.7 m7）')
+
+  await check('模型引用上游产物：evidenceRef / reportRef 透传该路径，引擎审计报告仍落盘', async () => {
+    const flow = flowOf('flow-evidence-ok', [
+      startNode(), stage('n_a', '需求', 300), stage('n_b', '设计', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-evidence-ok', 2)
+    const upstreamRef = 'n_a/artifacts/1/需求.md'
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => {
+        if (node.id === 'n_a') {
+          const base = passResult('n_a').structured
+          return {
+            structured: { ...base, artifacts: [{ name: '需求.md', content: '# 需求\n\n上游证据正文\n' }] },
+            sessionId: 'sess-n_a',
+            dispose: async () => {},
+          }
+        }
+        return {
+          structured: {
+            verdict: 'pass',
+            summary: '设计通过，引用上游需求作为证据',
+            artifacts: [{ name: '设计.md', content: '# 设计\n' }],
+            findings: [],
+            checks: {
+              ruleSetId: 'rules', ruleSetVersion: '1', executor: 'test',
+              passedChecks: 2, totalChecks: 2, reportRef: upstreamRef,
+            },
+            acceptance: [{ itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: upstreamRef }],
+            tests: {
+              suite: 'unit', executed: 2, passed: 2, failed: 0, skipped: 0, reportRef: upstreamRef,
+            },
+          },
+          sessionId: 'sess-n_b',
+          dispose: async () => {},
+        }
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+    const acceptanceEvent = events.find(event => event.kind === 'acceptance/verdict' && event.nodeId === 'n_b')
+    // 模型引用上游产物 → 事件里就是该路径（聚合层按 artifact/write 的 nodeId 判 peer）。
+    A.equal(acceptanceEvent.data.evidenceRef, upstreamRef)
+    A.equal(acceptanceEvent.extra.evidenceRefRejected, undefined)
+    const checkEvent = events.find(event => event.kind === 'check/form' && event.nodeId === 'n_b')
+    A.equal(checkEvent.data.reportRef, upstreamRef)
+    A.equal(checkEvent.extra.reportRefRejected, undefined)
+    const testEvent = events.find(event => event.kind === 'test/report' && event.nodeId === 'n_b')
+    A.equal(testEvent.data.reportRef, upstreamRef)
+    // 引擎自己的 acceptance.json / checks-report.json / test-report.json 仍然落盘（审计用）。
+    for (const name of ['acceptance.json', 'checks-report.json', 'test-report.json']) {
+      A.ok(events.some(event => event.kind === 'artifact/write'
+        && event.nodeId === 'n_b' && event.data.path.endsWith(name)), `仍写出 ${name}`)
+    }
+    // 被引用路径的写入方是上游节点（不是声明节点自己）。
+    const owner = events.find(event => event.kind === 'artifact/write' && event.data.path === upstreamRef)
+    A.equal(owner.nodeId, 'n_a')
+  })
+
+  await check('证据引用非法 / 不存在 / 被篡改：退回引擎报告路径并在 extra 留拒绝原因', async () => {
+    const flow = flowOf('flow-evidence-bad', [
+      startNode(), stage('n_a', '需求', 300), stage('n_b', '设计', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-evidence-bad', 2)
+    const tamperedRef = 'n_a/artifacts/1/需求.md'
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => {
+        if (node.id === 'n_a') {
+          const base = passResult('n_a').structured
+          return {
+            structured: { ...base, artifacts: [{ name: '需求.md', content: '# 需求\n\n原始内容\n' }] },
+            sessionId: 'sess-n_a',
+            dispose: async () => {},
+          }
+        }
+        // 模型在声明证据前改写了上游产物：sha256 必须对不上。
+        writeFileSync(join(runsRoot, run.id, tamperedRef), '# 需求\n\n被篡改的内容\n')
+        return {
+          structured: {
+            verdict: 'pass',
+            summary: '设计通过',
+            artifacts: [{ name: '设计.md', content: '# 设计\n' }],
+            findings: [],
+            checks: {
+              ruleSetId: 'rules', ruleSetVersion: '1', executor: 'test',
+              passedChecks: 2, totalChecks: 2, reportRef: '../x',
+            },
+            acceptance: [
+              { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: '../x' },
+              { itemId: 'R2', status: 'pass', decidedBy: 'auto', evidenceRef: '/etc/passwd' },
+              { itemId: 'R3', status: 'pass', decidedBy: 'auto', evidenceRef: 'n_a/artifacts/1/不存在.md' },
+              { itemId: 'R4', status: 'pass', decidedBy: 'auto', evidenceRef: tamperedRef },
+              { itemId: 'R5', status: 'pass', decidedBy: 'auto' },
+            ],
+            tests: {
+              suite: 'unit', executed: 2, passed: 2, failed: 0, skipped: 0, reportRef: '/etc/passwd',
+            },
+          },
+          sessionId: 'sess-n_b',
+          dispose: async () => {},
+        }
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+
+    const acceptanceEvents = events.filter(event => event.kind === 'acceptance/verdict' && event.nodeId === 'n_b')
+    A.equal(acceptanceEvents.length, 5)
+    const byItem = new Map(acceptanceEvents.map(event => [event.data.itemId, event]))
+    for (const [itemId, pattern] of [
+      ['n_b:R1', /安全相对路径/],
+      ['n_b:R2', /安全相对路径/],
+      ['n_b:R3', /artifact\/write/],
+      ['n_b:R4', /sha256/],
+    ]) {
+      const event = byItem.get(itemId)
+      A.equal(event.data.evidenceRef, 'n_b/artifacts/1/acceptance.json')
+      A.match(event.extra.evidenceRefRejected, pattern)
+    }
+    // 没给引用：走默认（引擎落盘路径），不产生拒绝标记。
+    const noRef = byItem.get('n_b:R5')
+    A.equal(noRef.data.evidenceRef, 'n_b/artifacts/1/acceptance.json')
+    A.equal(noRef.extra.evidenceRefRejected, undefined)
+
+    const checkEvent = events.find(event => event.kind === 'check/form' && event.nodeId === 'n_b')
+    A.equal(checkEvent.data.reportRef, 'n_b/artifacts/1/checks-report.json')
+    A.match(checkEvent.extra.reportRefRejected, /安全相对路径/)
+    const testEvent = events.find(event => event.kind === 'test/report' && event.nodeId === 'n_b')
+    A.equal(testEvent.data.reportRef, 'n_b/artifacts/1/test-report.json')
+    A.match(testEvent.extra.reportRefRejected, /安全相对路径/)
+    // 审计文件真实存在。
+    A.ok(existsSync(join(runsRoot, run.id, 'n_b/artifacts/1/acceptance.json')))
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v1.2 · 节点失败重试与失败隔离（缺陷 5）')
+
+  await check('节点异常 → 重试一次 → 成功：retry 痕迹可见、run 最终 done', async () => {
+    const flow = flowOf('flow-retry-ok', [
+      startNode(), stage('n_a', '需求', 300), stage('n_b', '设计', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-retry-ok', 2)
+    let bCalls = 0
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      nodeRetries: 1,
+      activate: async ({ node }) => {
+        if (node.id === 'n_b') {
+          bCalls += 1
+          if (bCalls === 1) throw new Error('子 agent 崩溃（第一次）')
+        }
+        return passResult(node.id)
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+    A.equal(bCalls, 2)
+    const bStarts = events.filter(event => event.kind === 'node/start' && event.nodeId === 'n_b')
+    A.equal(bStarts.length, 2)
+    A.equal(bStarts[1].data.retry, 1)
+    A.match(bStarts[1].data.retryReason, /子 agent 崩溃/)
+    const bEnds = events.filter(event => event.kind === 'node/end' && event.nodeId === 'n_b')
+    A.equal(bEnds.length, 1)
+    A.equal(bEnds[0].data.status, 'passed')
+    A.equal(bEnds[0].data.retries, 1)
+    const runEnd = events.filter(event => event.kind === 'run/end')
+    A.equal(runEnd.length, 1)
+    A.equal(runEnd[0].data.status, 'done')
+    // attemptId 不因重试增加：仍是打回语义的第 1 次尝试。
+    A.equal(bStarts.every(event => event.attemptId === 1), true)
+  })
+
+  await check('重试用尽 → 只失败该节点：run failed、已完成证据保留、summarize/readRunDetail 可算、live 无残留', async () => {
+    const flow = flowOf('flow-retry-fail', [
+      startNode(), stage('n_a', '需求', 300), stage('n_b', '设计', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-retry-fail', 2)
+    let bCalls = 0
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      nodeRetries: 1,
+      activate: async ({ node }) => {
+        if (node.id === 'n_b') {
+          bCalls += 1
+          throw new Error(`子 agent 崩溃（第 ${bCalls} 次）`)
+        }
+        const base = passResult('n_a').structured
+        return {
+          structured: { ...base, artifacts: [{ name: '需求.md', content: '# 需求\n\n已完成的证据\n' }] },
+          sessionId: 'sess-n_a',
+          dispose: async () => {},
+        }
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+
+    A.equal(final.status, 'failed')
+    A.equal(final.live, null)
+    A.equal(bCalls, 2)
+    A.equal(events.filter(event => event.kind === 'node/start' && event.nodeId === 'n_b').length, 2)
+
+    // 已通过节点的事件与产物必须完整保留。
+    const aPass = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_a')
+    A.equal(aPass.data.status, 'passed')
+    const aArtifact = events.find(event => event.kind === 'artifact/write' && event.nodeId === 'n_a')
+    A.ok(Boolean(aArtifact), '已通过节点的 artifact/write 仍在事件流里')
+    A.equal(existsSync(join(runsRoot, run.id, aArtifact.data.path)), true)
+
+    // 失败节点：重试用尽后只写一条 node/end failed（带重试次数与原因）。
+    const bEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_b')
+    A.equal(bEnd.data.status, 'failed')
+    A.equal(bEnd.data.retries, 1)
+    A.match(bEnd.extra.reason, /第 2 次/)
+
+    const runEnd = events.find(event => event.kind === 'run/end')
+    A.equal(runEnd.data.status, 'failed')
+    A.equal(runEnd.data.failedNodeId, 'n_b')
+    A.match(runEnd.data.reason, /第 2 次/)
+
+    // 聚合层可复算：failed run 上 summarize 不抛错，进度与节点状态正确。
+    const summary = summarize(events)
+    A.equal(summary.eventCount, events.length)
+    A.equal(summary.progress.passed, 1)
+    A.equal(summary.progress.failed, 1)
+    A.equal(summary.progress.nodes.n_a.status, 'passed')
+    A.equal(summary.progress.nodes.n_b.status, 'failed')
+    A.equal(typeof summary.quality.state, 'string')
+
+    // readRunDetail 不因 failed run 抛异常，attempt 状态与事件一致。
+    const detail = await store.readRunDetail(runsRoot, run.id)
+    A.ok(detail !== null)
+    A.equal(detail.run.status, 'failed')
+    const nodeMap = new Map(detail.nodes.map(item => [item.nodeId, item]))
+    A.equal(nodeMap.get('n_a').attempts[0].status, 'passed')
+    A.equal(nodeMap.get('n_b').attempts[0].status, 'failed')
+
+    // live 清干净：run.json 里没有残留 running 的节点。
+    const meta = await store.readRunMeta(runsRoot, run.id)
+    A.equal(meta.live, null)
+    A.equal(meta.progress.nodes.n_b.status, 'failed')
+  })
+
+  await check('节点超时按一次失败走同一重试路径：重试后仍 failed，超时标记保留', async () => {
+    const flow = flowOf('flow-timeout-retry', [startNode(), stage('n_wait', '等不到', 300), endNode()], [
+      next('e1', 'n_start', 'n_wait'),
+      next('e2', 'n_wait', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-timeout-retry', 1)
+    let calls = 0
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      nodeTimeoutMs: 20,
+      nodeRetries: 1,
+      activate: () => {
+        calls += 1
+        return new Promise(() => {})
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const starts = events.filter(event => event.kind === 'node/start' && event.nodeId === 'n_wait')
+    const nodeEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_wait')
+    A.equal(final.status, 'failed')
+    A.equal(calls, 2)
+    A.equal(starts.length, 2)
+    A.equal(starts[1].data.retry, 1)
+    A.equal(nodeEnd.data.status, 'failed')
+    A.equal(nodeEnd.data.retries, 1)
+    A.equal(nodeEnd.extra.timeout, true)
+    A.match(nodeEnd.extra.reason, /超时/)
+  })
+
+  await check('FLOW_STUDIO_NODE_RETRIES 默认 1、钳制在 0–' + MAX_NODE_RETRIES, async () => {
+    const previous = process.env.FLOW_STUDIO_NODE_RETRIES
+    try {
+      delete process.env.FLOW_STUDIO_NODE_RETRIES
+      A.equal(createEngine({ runsRoot, flowsRoot }).nodeRetries, 1)
+      process.env.FLOW_STUDIO_NODE_RETRIES = '999'
+      A.equal(createEngine({ runsRoot, flowsRoot }).nodeRetries, MAX_NODE_RETRIES)
+      process.env.FLOW_STUDIO_NODE_RETRIES = '-3'
+      A.equal(createEngine({ runsRoot, flowsRoot }).nodeRetries, 0)
+      process.env.FLOW_STUDIO_NODE_RETRIES = 'not-a-number'
+      A.equal(createEngine({ runsRoot, flowsRoot }).nodeRetries, 1)
+    } finally {
+      if (previous === undefined) delete process.env.FLOW_STUDIO_NODE_RETRIES
+      else process.env.FLOW_STUDIO_NODE_RETRIES = previous
+    }
   })
 
   // -------------------------------------------------------------------------

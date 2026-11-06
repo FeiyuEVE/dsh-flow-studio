@@ -22,11 +22,11 @@
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { chmod, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 
 import { EDGE_KIND, EXEC_MODE, NODE_KIND } from './model.js'
-import { checkRunId, normalizeEvent } from './runlog.js'
+import { checkRunId, isSafeRelPath, normalizeEvent } from './runlog.js'
 import {
   RunError, appendEvents, readAllEvents, readRunMeta, runsDir, writeRunMeta,
 } from './runstore.js'
@@ -50,6 +50,35 @@ export const MAX_RUN_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 /** 提示词硬上限（06 §6）。 */
 export const PROMPT_MAX_CHARS = 8000
+
+/**
+ * 节点级失败的重试次数（06 §9）：默认重试 1 次（共 2 次尝试）。
+ * `FLOW_STUDIO_NODE_RETRIES` 可覆盖；为防配置把人拖死，钳制在 0–5（最多 6 次尝试）。
+ */
+export const DEFAULT_NODE_RETRIES = 1
+export const MAX_NODE_RETRIES = 5
+
+/**
+ * 上游产物正文的注入预算（06 §6，单位：Unicode 码点）。
+ *
+ * 为什么是 1200 / 3000 / 2 个文件：
+ *   - 下游真正需要的是「上一棒做了什么、有什么约束」，不是整份文档；1200 字够放
+ *     一段结论 + 关键清单，再长就应该让下游按路径自己去读。
+ *   - 七段骨架总共 8000 字，上游段还要放摘要与路径；内容给 3000 字约留 37% 余量，
+ *     既不挤掉任务 / 输出格式，也不会因为两个产物就把提示词撑爆。
+ *   - 最近 2 个产物：覆盖「上一阶段 + 再上一个阶段」两条最相关上下文；再多只是
+ *     重复摘要里已经有的信息。
+ */
+export const UPSTREAM_ARTIFACT_MAX_CHARS = 1200
+export const UPSTREAM_ARTIFACT_TOTAL_CHARS = 3000
+export const UPSTREAM_ARTIFACT_MAX_FILES = 2
+
+/**
+ * 单个上游产物文件的最大读取字节数。产物本身已有 1 MiB 上限，但正文只取头部
+ * 1200 字；超过这个上限就不读正文（降级为只给路径），避免为了一段摘要把接近
+ * 1 MiB 的文本读进主进程内存。读不到 / 超限都不算错误。
+ */
+export const UPSTREAM_ARTIFACT_READ_MAX_BYTES = 256 * 1024
 
 /** 桩执行器每次 attempt 的合成用量（四桶 + reasoning，reasoning 是 output 子集）。 */
 export const STUB_USAGE = Object.freeze({
@@ -131,9 +160,9 @@ export function redactArguments(raw) {
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
   // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
   text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
-  // 3) key: value / key=value / "key": "value" 形式
+  // 3) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
   text = text.replace(
-    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}]+)/gi,
+    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
     (match, prefix, value) => {
       if (/^Bearer$/i.test(String(value).replace(/["']/g, ''))) return match
       return `${prefix}"[REDACTED]"`
@@ -142,6 +171,74 @@ export function redactArguments(raw) {
   // 4) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
   text = text.replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
   return text
+}
+
+/** §8.2：agent/message 文本上限（码点）。 */
+export const AGENT_MESSAGE_MAX_CHARS = 2000
+/** §8.2：文本的 UTF-8 兜底上限，保证单条事件仍 < MAX_EVENT_BYTES(8KB)。 */
+export const AGENT_MESSAGE_MAX_BYTES = 4096
+/** §13.12：live.lastMessage.text 上限（码点）。 */
+export const LIVE_MESSAGE_MAX_CHARS = 200
+/** §13.12：live.nodeTitle 上限（码点）。 */
+export const LIVE_NODE_TITLE_MAX_CHARS = 200
+/** §13.12：live.members 上限。 */
+export const LIVE_MEMBERS_MAX = 16
+/** §8.2：同会话连续相同文本去重表的上限。 */
+const ASSISTANT_TEXT_CACHE_MAX = 64
+
+function textOfContentBlock(block) {
+  if (typeof block === 'string') return block
+  if (!block || typeof block !== 'object') return ''
+  // 宿主 ContentBlock：{ type:'text', text }；只取可见文本，reasoning 等其它块不算。
+  if (typeof block.type === 'string') {
+    return block.type === 'text' && typeof block.text === 'string' ? block.text : ''
+  }
+  // 防御简化形状：{ text } / 嵌套 content。
+  if (typeof block.text === 'string') return block.text
+  if (block.content !== undefined) return extractAssistantText(block)
+  return ''
+}
+
+/**
+ * 防御性提取 assistant 消息的可见文本（06 §13.12 / 05 §8.2）。
+ *
+ * 真宿主形状（`dsh-llm` 的 `AssistantMessage`）：
+ *   `{ role:'assistant', content:[{ type:'text', text }], source:{ kind:'model', provider, model } }`
+ * 同时兼容 `content` 为字符串、`message.text`、以及直接给字符串的测试夹具。
+ * 提不到文本（空串 / 全空白）返回 ''，调用方据此不发事件。
+ *
+ * @param {unknown} message
+ * @returns {string}
+ */
+export function extractAssistantText(message) {
+  if (typeof message === 'string') return message
+  if (!message || typeof message !== 'object') return ''
+  let text = ''
+  if (typeof message.content === 'string') text = message.content
+  else if (Array.isArray(message.content)) {
+    text = message.content.map(textOfContentBlock).filter(part => part !== '').join('\n')
+  } else if (message.content && typeof message.content === 'object') {
+    text = textOfContentBlock(message.content)
+  }
+  if (text === '' && typeof message.text === 'string') text = message.text
+  return text.trim() === '' ? '' : text
+}
+
+/** 按码点截断到 2000 字符；再用 UTF-8 字节兜底，确保 8KB 事件上限不会踩线。 */
+function clipAssistantText(raw) {
+  const chars = Array.from(raw)
+  let text = raw
+  let truncated = false
+  if (chars.length > AGENT_MESSAGE_MAX_CHARS) {
+    text = `${chars.slice(0, AGENT_MESSAGE_MAX_CHARS - 1).join('')}…`
+    truncated = true
+  }
+  if (Buffer.byteLength(text, 'utf8') > AGENT_MESSAGE_MAX_BYTES) {
+    const prefix = Buffer.from(text, 'utf8').subarray(0, AGENT_MESSAGE_MAX_BYTES - 3).toString('utf8')
+    text = `${prefix.replace(/\uFFFD+$/u, '')}…`
+    truncated = true
+  }
+  return { text, truncated }
 }
 
 /**
@@ -225,6 +322,15 @@ function envInt(name, fallback) {
   if (typeof raw !== 'string' || raw.trim() === '') return fallback
   const value = Number(raw)
   return Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+/** 与 {@link envInt} 相同，但允许 0 并把值钳制在 [min, max]（重试次数用）。 */
+function envIntClamped(name, fallback, min, max) {
+  const raw = process.env[name]
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value)) return fallback
+  return Math.min(max, Math.max(min, value))
 }
 
 // ---------------------------------------------------------------------------
@@ -448,13 +554,103 @@ function section(title, body) {
   return `## ${title}\n${String(body ?? '').trim()}`
 }
 
+/**
+ * 读上游产物正文，挂到 `upstream[].artifactContents`（宿主侧，06 §6）。
+ *
+ * **为什么不在 buildPrompt 里读盘**：buildPrompt 是导出的纯函数，单测直接构造
+ * 上游对象就能验证提示词骨架与长度，不用编造文件系统；读盘失败也只影响「正文」
+ * 这一层，摘要与路径行照旧下传，不能因为一个读不到的文件让整个 run 挂掉。
+ * 因此由主循环在拼提示词前调用本函数，把结果作为 `artifactContents` 传入。
+ *
+ * 只认 `<nodeId>/artifacts/<attempt>/<文件名>` 这一层（attempt 来自 passed 记录）：
+ * 打回重跑后同名文件在 `<attempt+1>` 目录里，历史 attempt 的内容不会被混进来。
+ * 路径先过 `isSafeRelPath`，再用 resolve 复核必须落在 run 目录内。
+ *
+ * 读取失败 / 不存在 / 超过大小上限一律静默降级（该产物不提供正文，路径行保留）。
+ *
+ * @param {string} runsRoot
+ * @param {string} runId
+ * @param {object[]} upstream 主循环挑出的上游 passed 记录
+ * @returns {Promise<object[]>} 新数组，每条附 `artifactContents: [{ path, content, truncated }]`
+ */
+export async function loadUpstreamArtifactContents(runsRoot, runId, upstream = []) {
+  if (!Array.isArray(upstream) || upstream.length === 0) return []
+  const out = upstream.map(entry => ({ ...entry, artifactContents: [] }))
+  const runRootAbs = resolve(String(runsRoot), String(runId))
+  let budget = UPSTREAM_ARTIFACT_TOTAL_CHARS
+  let picked = 0
+  // 从最近的上游节点往前取：每个节点最多 1 个产物、总共最多 2 个，
+  // 这样拿到的是「上一棒」和「再上一棒」的核心产物，而不是同一节点的两份报告。
+  for (let index = out.length - 1; index >= 0 && picked < UPSTREAM_ARTIFACT_MAX_FILES; index -= 1) {
+    const entry = out[index]
+    if (typeof entry.nodeId !== 'string' || !Number.isInteger(entry.attempt) || entry.attempt < 1) continue
+    if (budget <= 0) break
+    const prefix = `${entry.nodeId}/artifacts/${entry.attempt}/`
+    const files = (Array.isArray(entry.artifactPaths) ? entry.artifactPaths : [])
+      .filter(path => typeof path === 'string'
+        && path.startsWith(prefix)
+        && !path.slice(prefix.length).includes('/')
+        && isSafeRelPath(path))
+    // 优先取模型写的正文产物：evidence 报告与 summary.json 是引擎生成的索引，
+    // 信息量低且摘要行已经带过，排到最后。
+    const preference = path => {
+      if (path.endsWith('/summary.json')) return 2
+      if (/\/(?:checks-report|acceptance|test-report)\.json$/.test(path)) return 1
+      return 0
+    }
+    files.sort((a, b) => preference(a) - preference(b))
+    // 每个上游节点只取 1 个产物；若首选文件读不到 / 超限，按优先级继续试同节点的下一个，
+    // 实在都不行就只留路径行（降级不等于整段失败）。
+    for (const chosen of files) {
+      if (budget <= 0) break
+      const abs = resolve(runRootAbs, chosen)
+      // resolve 复核：即使 isSafeRelPath 有疏漏，也不允许读到 run 目录之外。
+      if (abs !== runRootAbs && !abs.startsWith(`${runRootAbs}${sep}`)) continue
+      let text
+      try {
+        // 用 lstat 而不是 stat：产物目录是引擎自己写的普通文件，出现符号链接就当作不可读，
+        // 避免有人用指向 run 目录外的软链把内容带进提示词。
+        const info = await lstat(abs)
+        if (!info.isFile() || info.size > UPSTREAM_ARTIFACT_READ_MAX_BYTES) continue
+        text = await readFile(abs, 'utf8')
+      } catch {
+        // 文件不存在 / 权限问题 / 编码问题：降级为只给路径。
+        continue
+      }
+      const limit = Math.min(UPSTREAM_ARTIFACT_MAX_CHARS, budget)
+      const truncated = charLength(text) > limit
+      const content = truncated ? clipChars(text, limit) : text
+      const cost = charLength(content)
+      if (cost === 0) continue
+      entry.artifactContents.push({ path: chosen, content, truncated })
+      budget -= cost
+      picked += 1
+      break
+    }
+  }
+  return out
+}
+
+/** 上游产物正文在提示词里的缩进块（避免正文里的 Markdown 与骨架标题混淆）。 */
+function indentBlock(text) {
+  return String(text ?? '').split('\n').map(line => `    ${line}`).join('\n')
+}
+
 function upstreamText(upstream) {
   if (!Array.isArray(upstream) || upstream.length === 0) return '（无：这是链路上的第一个阶段节点。）'
   return upstream.map(entry => {
     const paths = Array.isArray(entry.artifactPaths) && entry.artifactPaths.length > 0
       ? entry.artifactPaths.join('、')
       : '（无产物文件）'
-    return `- 「${entry.title}」（attempt ${entry.attempt}）：${entry.summary || '（无摘要）'}；产物：${paths}`
+    let block = `- 「${entry.title}」（attempt ${entry.attempt}）：${entry.summary || '（无摘要）'}；产物：${paths}`
+    // 06 §6：只给路径等于让下游猜；把最近产物的有界正文一并带上（宿主预读，纯函数不碰 fs）。
+    const contents = Array.isArray(entry.artifactContents) ? entry.artifactContents : []
+    for (const item of contents) {
+      if (!item || typeof item.content !== 'string' || item.content.trim() === '') continue
+      const note = item.truncated ? `（仅取前 ${charLength(item.content)} 字，已截断）` : ''
+      block += `\n  产物内容「${item.path}」${note}：\n${indentBlock(item.content)}`
+    }
+    return block
   }).join('\n')
 }
 
@@ -548,6 +744,7 @@ function outputFormatText() {
     '  "rejectReason": "打回原因（reject 时必填）"',
     '}',
     '硬性要求：`verdict` 必填；判定 reject 时必须写 `rejectReason`，并把需要返工的问题写进 findings。',
+    '证据要求：验收 / 检查条目判 pass 时，evidenceRef 优先引用上游节点的产物（跨节点引用才算独立复核）；只引用本节点刚写的产物属于自证，单独不足以支撑通过结论。可以同时给多条证据；自己在产物里写「已通过」不算证据。',
   ].join('\n')
 }
 
@@ -560,7 +757,18 @@ function charLength(text) {
  *
  * 06 §6 / §13.9 m5：总长硬上限 8000 字；超出时**先截上游产物、再截任务**，
  * 「输出格式」段是硬保留段，任何情况下都不能被截掉。
- * @param {{ node: object, attempt: number, upstream?: object[], previous?: object, rejectContext?: object }} input
+ *
+ * `upstream[].artifactContents` 由宿主侧 {@link loadUpstreamArtifactContents}
+ * 预读（有界：单产物 1200 字、总 3000 字），本函数只做格式化与长度截断，不碰 fs；
+ * 没有正文时只输出摘要 + 路径行，行为与旧版一致。
+ *
+ * @param {{
+ *   node: object,
+ *   attempt: number,
+ *   upstream?: object[],
+ *   previous?: object,
+ *   rejectContext?: object,
+ * }} input
  */
 export function buildPrompt({ node, attempt, upstream = [], previous = null, rejectContext = null }) {
   const role = String(node.role || '').trim() || node.title || '（未命名角色）'
@@ -758,6 +966,11 @@ function normalizeTests(raw, nodeId) {
       `tests 计数不自洽：passed(${tests.passed}) + failed(${tests.failed}) + skipped(${tests.skipped}) !== executed(${tests.executed})`,
     )
   }
+  // 06 §13.7 m7：模型给的 reportRef 只是候选，宿主在 _writeStructured 里对照
+  // artifact/write 索引 + 文件 sha256 校验后才透传；这里不信任、不计算 self/peer。
+  if (typeof raw.reportRef === 'string' && raw.reportRef.trim() !== '') {
+    tests.reportRef = clip(raw.reportRef.trim(), 512)
+  }
   if (Array.isArray(raw.failures)) {
     tests.failures = raw.failures
       .filter(item => typeof item === 'string' && item.trim() !== '')
@@ -793,6 +1006,10 @@ function normalizeChecks(raw, nodeId) {
     checks.passedChecks = passedChecks
     checks.totalChecks = totalChecks
   }
+  // 06 §13.7 m7：reportRef 候选（校验后再决定是否采用，见 _writeStructured）。
+  if (typeof raw.reportRef === 'string' && raw.reportRef.trim() !== '') {
+    checks.reportRef = clip(raw.reportRef.trim(), 512)
+  }
   return checks
 }
 
@@ -820,6 +1037,10 @@ function normalizeAcceptance(input, nodeId, now) {
       decidedBy: DECIDED_BY.has(raw.decidedBy) ? raw.decidedBy : 'auto',
       // 06 §13.9 m6：decidedAt 用注入的 now，不用真实时钟（测试可确定）。
       decidedAt: isoOf(now instanceof Date ? now : new Date()),
+      // 06 §13.7 m7：evidenceRef 候选（校验后再决定是否采用，见 _writeStructured）。
+      ...(typeof raw.evidenceRef === 'string' && raw.evidenceRef.trim() !== ''
+        ? { evidenceRef: clip(raw.evidenceRef.trim(), 512) }
+        : {}),
     })
   }
   return items
@@ -946,7 +1167,7 @@ function supportsPartialMemberStatus() {
  * @param {{
  *   activate?: Function, now?: () => Date, readUsage?: Function, log?: Function,
  *   ctx?: any, runsRoot?: string, flowsRoot?: string, readFlow?: Function,
- *   nodeTimeoutMs?: number, staleMs?: number, stub?: boolean,
+ *   nodeTimeoutMs?: number, nodeRetries?: number, staleMs?: number, stub?: boolean,
  *   runTimeoutMs?: number, maxTotalSteps?: number, maxArtifactBytes?: number,
  *   maxRunArtifactBytes?: number, parent?: object, resolveParent?: Function,
  * }} [options]
@@ -969,6 +1190,10 @@ class FlowEngine {
     this.nodeTimeoutMs = Number.isInteger(options.nodeTimeoutMs) && options.nodeTimeoutMs > 0
       ? options.nodeTimeoutMs
       : envInt('FLOW_STUDIO_NODE_TIMEOUT_MS', DEFAULT_NODE_TIMEOUT_MS)
+    // 06 §9：节点失败先重试（默认 1 次）；FLOW_STUDIO_NODE_RETRIES 覆盖并钳制在 0–5。
+    this.nodeRetries = Number.isInteger(options.nodeRetries) && options.nodeRetries >= 0
+      ? Math.min(options.nodeRetries, MAX_NODE_RETRIES)
+      : envIntClamped('FLOW_STUDIO_NODE_RETRIES', DEFAULT_NODE_RETRIES, 0, MAX_NODE_RETRIES)
     // 06 §13.5：run 级墙钟上限（默认 2 小时）与步数上限（阶段数 × 3）。
     this.runTimeoutMs = Number.isInteger(options.runTimeoutMs) && options.runTimeoutMs > 0
       ? options.runTimeoutMs
@@ -1008,10 +1233,18 @@ class FlowEngine {
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
+    this.failedNode = null
     this.sessionBindings = new Map()
     this.pendingSessionEvents = []
     this.pendingSessionLimit = 4000
     this.pendingToolCalls = new Map()
+    // §8.2：sessionId → 上一条 agent/message 文本 hash（去重 / 心跳），上限 64。
+    this.lastAssistantText = new Map()
+    // §13.12：traceId+callId → 最近一次 usage，用于 live.tokens 的「后到整条替换」。
+    this.liveUsage = new Map()
+    // 06 §13.7：本 run 已落盘的产物索引（path → { nodeId, attemptId, sha256 }），
+    // 校验模型给的 evidenceRef / reportRef 是否真的对应一条 artifact/write。
+    this.artifactIndex = new Map()
     this.eventQueue = Promise.resolve()
 
     if (this.ctx && typeof this.ctx.on === 'function') {
@@ -1135,6 +1368,14 @@ class FlowEngine {
       since: isoOf(this.now()),
       lastEventSeq: 0,
       phase: 'idle',
+      // §13.12 运行详情快照字段（客户端轮询 run.json.live 显示「正在干什么」）。
+      nodeTitle: null,
+      nodeMode: null,
+      activeMemberId: null,
+      lastTool: null,
+      lastMessage: null,
+      tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
+      members: [],
     }
 
     let transitioned = false
@@ -1245,10 +1486,15 @@ class FlowEngine {
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
+    // 06 §9：最近一次节点级失败的坐标；run/end failed 用 failedNodeId 指认「死在哪」。
+    this.failedNode = null
     this.maxTotalSteps = this.configuredMaxTotalSteps
     this.sessionBindings.clear()
     this.pendingSessionEvents = []
     this.pendingToolCalls.clear()
+    this.lastAssistantText.clear()
+    this.liveUsage.clear()
+    this.artifactIndex = new Map()
   }
 
   /** 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。 */
@@ -1420,19 +1666,51 @@ class FlowEngine {
           round: this.round,
           since: isoOf(startedAt),
           phase: 'spawn',
+          // §13.12：节点级快照字段在每次换节点时重置；tokens 是 run 级累计，不清零。
+          nodeTitle: clip(String(node.title || node.id), LIVE_NODE_TITLE_MAX_CHARS),
+          nodeMode: node.mode === EXEC_MODE.TEAM ? 'team' : 'single',
+          activeMemberId: null,
+          lastTool: null,
+          lastMessage: null,
+          members: [],
         })
         await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
 
-        let outcome
-        try {
-          outcome = await this._executeNode(runId, flow, node, attempt, stageTotal, {
-            traceId, previous, rejectContext, startedAt, signal,
-          })
-        } catch (error) {
+        let outcome = null
+        let lastError = null
+        let retries = 0
+        // 06 §9：节点级失败先重试（默认 1 次）。重试不新增 attemptId——attemptId 仍表示
+        // 「打回意义上的第几次」，不能因为一次崩溃就吃掉目标的 maxRounds；同 attemptId
+        // 再写一条 node/start（data.retry / data.retryReason）作为重试痕迹，不新增事件 kind。
+        for (;;) {
+          try {
+            outcome = await this._executeNode(runId, flow, node, attempt, stageTotal, {
+              traceId, previous, rejectContext, startedAt, signal,
+            })
+            break
+          } catch (error) {
+            lastError = error
+            // 用户停止 / run 墙钟：重试只会被同一个信号再打断，直接走中止/超时收尾。
+            if (signal.aborted || this.runTimedOut) break
+            if (retries >= this.nodeRetries) break
+            retries += 1
+            const retryReason = clip(error.message || String(error), 256)
+            this.log('warn', `flow-studio: 节点「${node.id}」attempt ${attempt} 失败，第 ${retries}/${this.nodeRetries} 次重试：${retryReason}`)
+            await this._setLive({ phase: 'spawn', since: isoOf(this.now()) })
+            await this._append(runId, [
+              this._nodeStartEvent(node, attempt, traceId, { retry: retries, retryReason }),
+            ]).catch(() => {})
+          }
+        }
+
+        if (!outcome) {
+          const error = lastError || new Error('节点执行失败（原因未知）')
           const durationMs = Math.max(0, this.now().getTime() - startedAt.getTime())
           const validationError = error instanceof StructuredOutputError ? error.validationError : undefined
+          const reason = clip(error.message || String(error), 256)
           const extra = {
-            reason: clip(error.message || String(error), 256),
+            reason,
+            ...(retries > 0 ? { retries } : {}),
             ...(validationError ? { validationError: clip(validationError, 256) } : {}),
             ...(error instanceof NodeTimeoutError ? { timeout: true, timeoutMs: error.timeoutMs } : {}),
             ...(signal.aborted && !this.runTimedOut ? { aborted: true } : {}),
@@ -1443,16 +1721,19 @@ class FlowEngine {
             nodeId: node.id,
             attemptId: attempt,
             traceId,
-            data: { status: 'failed', durationMs },
+            data: { status: 'failed', durationMs, ...(retries > 0 ? { retries } : {}) },
             extra,
           }]).catch(() => {})
           this.current = null
+          this.failedNode = { nodeId: node.id, attempt, reason: clip(error.message || String(error), 2000) }
           if (this.runTimedOut) throw error
           if (signal.aborted) {
             aborted = true
             break
           }
-          throw error
+          // 06 §9：失败隔离——重试用尽只判该节点失败，已通过节点的事件/产物全部保留；
+          // 跳出主循环，由下面的统一收口写 run/end{status:'failed', failedNodeId}。
+          break
         }
 
         const durationMs = Math.max(0, this.now().getTime() - startedAt.getTime())
@@ -1478,13 +1759,16 @@ class FlowEngine {
             data: {
               status: 'rejected',
               durationMs,
+              ...(retries > 0 ? { retries } : {}),
               ...(outcome.membersPartial ? { membersPartial: true } : {}),
             },
             ...(outcome.membersPartial ? { extra: { membersPartial: true } } : {}),
           }])
           const choice = selectRejectTarget(flow, node, outcome.rejectTarget)
           if (!choice) {
-            throw new Error(`节点「${node.title || node.id}」判定打回，但没有任何 reject 边（无法确定回退目标）`)
+            const reason = `节点「${node.title || node.id}」判定打回，但没有任何 reject 边（无法确定回退目标）`
+            this.failedNode = { nodeId: node.id, attempt, reason }
+            throw new Error(reason)
           }
           const reason = clip(outcome.rejectReason || '未提供打回原因', 2000)
           await this._append(runId, [{
@@ -1553,6 +1837,7 @@ class FlowEngine {
           data: {
             status: 'passed',
             durationMs,
+            ...(retries > 0 ? { retries } : {}),
             ...(outcome.membersPartial ? { membersPartial: true } : {}),
           },
           ...(outcome.membersPartial ? { extra: { membersPartial: true } } : {}),
@@ -1570,26 +1855,55 @@ class FlowEngine {
 
       if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${this.runTimeoutMs}ms）`)
       if (signal.aborted) aborted = true
-      await this._append(runId, [{
-        kind: 'run/end',
-        traceId: runTraceId(runId),
-        data: aborted ? { status: 'aborted', reason: '已停止' } : { status: 'done' },
-      }])
+      if (this.failedNode && !aborted) {
+        // 06 §9 失败隔离：节点失败收口为 run failed，但已通过节点的事件 / 产物一条不动；
+        // failedNodeId 明确告诉查看者「死在哪」，而不是只有一个笼统 reason。
+        const failure = this.failedNode
+        await this._append(runId, [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: {
+            status: 'failed',
+            reason: clip(failure.reason || '节点执行失败', 2000),
+            failedNodeId: failure.nodeId,
+          },
+          extra: {
+            error: 'NodeFailure',
+            detail: clip(failure.reason || '', 256),
+            nodeId: failure.nodeId,
+            ...(Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
+          },
+        }])
+      } else {
+        await this._append(runId, [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: aborted ? { status: 'aborted', reason: '已停止' } : { status: 'done' },
+        }])
+      }
     } catch (error) {
       const timedOut = this.runTimedOut
       const abortedNow = !timedOut && (signal.aborted || isAbortError(error))
+      // 06 §9：失败坐标为 null 时退回 this.current（例如在主循环外抛错时仍尽量指认节点）。
+      const failure = this.failedNode
+        || (this.current ? { nodeId: this.current.node.id, attempt: this.current.attempt } : null)
       try {
         await this._append(runId, [{
           kind: 'run/end',
           traceId: runTraceId(runId),
           data: abortedNow
             ? { status: 'aborted', reason: '已停止' }
-            : { status: 'failed', reason: clip(error.message || String(error), 2000) },
+            : {
+              status: 'failed',
+              reason: clip(error.message || String(error), 2000),
+              ...(failure ? { failedNodeId: failure.nodeId } : {}),
+            },
           ...(abortedNow ? {} : {
             extra: {
               error: clip(error.name || 'Error', 64),
               detail: clip(error.message || String(error), 256),
-              ...(this.current ? { nodeId: this.current.node.id, attempt: this.current.attempt } : {}),
+              ...(failure ? { nodeId: failure.nodeId } : {}),
+              ...(failure && Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
               ...(error instanceof StructuredOutputError ? { validationError: clip(error.validationError, 256) } : {}),
               ...(error instanceof NodeTimeoutError ? { timeout: true } : {}),
               ...(timedOut ? { runTimeout: true } : {}),
@@ -1613,7 +1927,15 @@ class FlowEngine {
     }
   }
 
-  _nodeStartEvent(node, attempt, traceId) {
+  /**
+   * node/start 事件。
+   *
+   * 06 §9：重试不新增 attemptId（attemptId 仍表示「打回意义上的第几次尝试」，
+   * 不能因为一次崩溃就吃掉 maxRounds），而是在同一个 attemptId 上再写一条
+   * node/start，用 `data.retry` 标出第几次重试、`data.retryReason` 留失败原因。
+   * 这样不新增事件 kind、不改 runlog.js 契约，时间线也能看出「这条是重试」。
+   */
+  _nodeStartEvent(node, attempt, traceId, extra = {}) {
     return {
       kind: 'node/start',
       nodeId: node.id,
@@ -1626,12 +1948,15 @@ class FlowEngine {
         skills: Array.isArray(node.skills)
           ? node.skills.filter(name => typeof name === 'string' && name.trim() !== '').slice(0, 12).map(name => clip(name, 64))
           : [],
+        ...extra,
       },
     }
   }
 
   /** 06 §13.5/§13.10：失败收尾时给节点补一条 node/end failed（带 reason）。 */
   async _failNode(runId, node, attempt, traceId, reason, extra = {}) {
+    // 06 §9：把失败坐标留给 run/end 的 failedNodeId（外层的 this.current 此时可能已清空）。
+    this.failedNode = { nodeId: node.id, attempt, reason: clip(reason, 2000) }
     await this._append(runId, [{
       kind: 'node/end',
       nodeId: node.id,
@@ -1662,10 +1987,13 @@ class FlowEngine {
       seenUpstream.add(entry.nodeId)
       upstream.unshift(entry)
     }
+    // 06 §6：宿主侧预读最近上游产物的有界正文（buildPrompt 保持纯函数，不碰 fs）；
+    // 读取失败 / 文件缺失 / 超限都降级为空内容，路径行照旧下传。
+    const upstreamWithContents = await loadUpstreamArtifactContents(this.runsRoot, runId, upstream)
     const prompt = buildPrompt({
       node,
       attempt,
-      upstream,
+      upstream: upstreamWithContents,
       previous,
       rejectContext,
     })
@@ -1825,6 +2153,59 @@ class FlowEngine {
 
   // -- 结构化产物落盘 -----------------------------------------------------
 
+  /**
+   * 校验模型给的证据引用（06 §13.7 m7 / §8.4 v1.3）。
+   *
+   * 模型可以在 acceptance[].evidenceRef / checks.reportRef / tests.reportRef 里引用
+   * **上游节点产物**（跨节点引用在聚合层算 peer，才算独立复核）。但模型输出不可信，
+   * 宿主按下面顺序逐条校验，任何一步失败都退回引擎自己落盘的那份报告，并在事件
+   * `extra` 里留可读原因（runlog 只保留 data 白名单字段，未知 data 字段会被丢掉，
+   * 所以拒绝标记放 `extra`，字段名 evidenceRefRejected / reportRefRejected）：
+   *
+   *   1. 必须是 run 目录内的安全相对路径（isSafeRelPath，拒绝绝对路径 / `..` / 空段）；
+   *   2. 必须对应本 run 的一条 artifact/write（路径在内存索引里，带写入时的 sha256）；
+   *   3. resolve 后仍必须在 run 目录内（双保险，防软链 / 拼接绕过）；
+   *   4. 文件必须真实存在（lstat 普通文件）；
+   *   5. 文件内容的 sha256 必须与 artifact/write 记录一致（不信任模型，也不信任事后改盘）。
+   *
+   * @param {string} runId
+   * @param {unknown} candidate 模型给的引用（可为空）
+   * @param {string|undefined} fallbackPath 校验失败时退回的引擎报告路径
+   * @param {Map<string, {path?: string, rejected?: string}>} [cache] 同节点内按引用去重
+   * @returns {Promise<{ path?: string, rejected?: string }>}
+   */
+  async _resolveEvidenceRef(runId, candidate, fallbackPath, cache = new Map()) {
+    if (typeof candidate !== 'string' || candidate.trim() === '') return { path: fallbackPath }
+    const ref = candidate.trim()
+    if (cache.has(ref)) {
+      const hit = cache.get(ref)
+      return hit.path ? hit : { path: fallbackPath, rejected: hit.rejected }
+    }
+    const reject = reason => {
+      const result = { rejected: clip(`引用「${ref}」：${reason}`, 200) }
+      cache.set(ref, result)
+      return { path: fallbackPath, rejected: result.rejected }
+    }
+    if (!isSafeRelPath(ref)) return reject('不是 run 目录内的安全相对路径')
+    const entry = this.artifactIndex.get(ref)
+    if (!entry) return reject('没有对应的 artifact/write 事件')
+    const runRootAbs = resolve(this.runsRoot, runId)
+    const abs = resolve(runRootAbs, ref)
+    if (abs !== runRootAbs && !abs.startsWith(`${runRootAbs}${sep}`)) return reject('路径跑出了 run 目录')
+    try {
+      const info = await lstat(abs)
+      if (!info.isFile()) return reject('文件不存在')
+      const body = await readFile(abs)
+      const sha256 = createHash('sha256').update(body).digest('hex')
+      if (sha256 !== entry.sha256) return reject('文件内容与 artifact/write.sha256 不符')
+    } catch {
+      return reject('文件不存在')
+    }
+    const result = { path: ref }
+    cache.set(ref, result)
+    return result
+  }
+
   async _writeStructured(runId, node, attempt, traceId, structured, stageTotal) {
     const paths = []
     const usedNames = new Set()
@@ -1882,7 +2263,11 @@ class FlowEngine {
 
     if (checks) {
       const report = await addArtifact('checks-report.json', `${JSON.stringify({ nodeId: node.id, attempt, checks }, null, 2)}\n`)
-      checks.reportRef = report.path
+      // 模型给的 reportRef 只是候选；校验通过才采用（可指向上游产物 = peer 证据），
+      // 否则退回引擎刚写的 checks-report.json。checks-report.json 本身永远保留（审计）。
+      const resolved = await this._resolveEvidenceRef(runId, checks.reportRef, report.path)
+      checks.reportRef = resolved.path
+      if (resolved.rejected) checks.reportRefRejected = resolved.rejected
       checks.executedAt = isoOf(this.now())
       await this._append(runId, [{
         kind: 'check/form',
@@ -1890,36 +2275,53 @@ class FlowEngine {
         attemptId: attempt,
         traceId,
         // 06 §13.7：模型自述证据必须自带 provenance，聚合层才会做 artifact 对账。
-        extra: { provenance: this.stub ? 'stub-synthetic' : 'model-claim' },
+        extra: {
+          provenance: this.stub ? 'stub-synthetic' : 'model-claim',
+          // runlog 的 data 白名单会丢弃未知字段，拒绝原因放 extra 才留得住。
+          ...(resolved.rejected ? { reportRefRejected: resolved.rejected } : {}),
+        },
         data: checks,
       }])
     }
 
     if (acceptance.length > 0) {
       const report = await addArtifact('acceptance.json', `${JSON.stringify({ nodeId: node.id, attempt, acceptance }, null, 2)}\n`)
+      const verifiedRefs = new Map()
       for (const item of acceptance) {
+        const resolved = await this._resolveEvidenceRef(runId, item.evidenceRef, report.path, verifiedRefs)
+        item.evidenceRef = resolved.path
+        if (resolved.rejected) item.evidenceRefRejected = resolved.rejected
         await this._append(runId, [{
           kind: 'acceptance/verdict',
           nodeId: node.id,
           attemptId: attempt,
           traceId,
-          extra: { provenance: this.stub ? 'stub-synthetic' : 'model-claim' },
-          data: { ...item, evidenceRef: report.path },
+          extra: {
+            provenance: this.stub ? 'stub-synthetic' : 'model-claim',
+            ...(resolved.rejected ? { evidenceRefRejected: resolved.rejected } : {}),
+          },
+          data: item,
         }])
       }
     }
 
     if (tests) {
-      if (tests.executed > 0) {
-        const report = await addArtifact('test-report.json', `${JSON.stringify({ nodeId: node.id, attempt, tests }, null, 2)}\n`)
-        tests.reportRef = report.path
-      }
+      const report = tests.executed > 0
+        ? await addArtifact('test-report.json', `${JSON.stringify({ nodeId: node.id, attempt, tests }, null, 2)}\n`)
+        : null
+      const resolved = await this._resolveEvidenceRef(runId, tests.reportRef, report ? report.path : undefined)
+      if (resolved.path) tests.reportRef = resolved.path
+      else delete tests.reportRef
+      if (resolved.rejected) tests.reportRefRejected = resolved.rejected
       await this._append(runId, [{
         kind: 'test/report',
         nodeId: node.id,
         attemptId: attempt,
         traceId,
-        extra: { provenance: this.stub ? 'stub-synthetic' : 'model-claim' },
+        extra: {
+          provenance: this.stub ? 'stub-synthetic' : 'model-claim',
+          ...(resolved.rejected ? { reportRefRejected: resolved.rejected } : {}),
+        },
         data: tests,
       }])
     }
@@ -1971,6 +2373,9 @@ class FlowEngine {
   /**
    * 写一个产物文件并落 artifact/write 事件。
    * 06 §13.9：单产物 1 MiB、单 run 64 MiB；超限截断，并在事件里标 truncated / originalBytes。
+   *
+   * 证据独立性（§8.4 v1.3）：这里写的都是**模型结构化输出转写**的产物，属于自证，
+   * 不能标 `extra.producer='host'`；宿主自己观测/落盘的产物才打这个标记，本次没有。
    */
   async _writeArtifactFile(runId, nodeId, attempt, filename, content, traceId) {
     const dir = join(this.runsRoot, runId, nodeId, 'artifacts', String(attempt))
@@ -2008,6 +2413,9 @@ class FlowEngine {
         ...(truncated ? { truncated: true, originalBytes } : {}),
       },
     }])
+    // 06 §13.7 m7：记住「本 run 写过哪些产物 + 内容 sha256」，供证据引用校验用。
+    // 同一路径重试覆写时以最后一次写入为准（与 runlog.collectArtifactIndex 的 seq 口径一致）。
+    this.artifactIndex.set(rel, { nodeId, attemptId: attempt, sha256 })
     return { path: rel, bytes, sha256, truncated, originalBytes }
   }
 
@@ -2100,9 +2508,13 @@ class FlowEngine {
         ? clip(session.header.model, 128)
         : undefined,
       startedAt: this.now(),
+      // §13.12：先标 starting；member/start 落盘后转 running，节点收尾转 done。
+      state: 'starting',
     }
     this.current.members.set(sessionId, member)
     this.sessionBindings.set(sessionId, binding)
+    this._syncLiveMembers()
+    this._scheduleLivePersist()
     this._queueSessionWrite(async () => {
       await this._append(this.active ? this.active.runId : '', [{
         kind: 'member/start',
@@ -2116,6 +2528,9 @@ class FlowEngine {
           ...(member.model ? { model: member.model } : {}),
         },
       }])
+      member.state = 'running'
+      this._syncLiveMembers()
+      this._scheduleLivePersist()
     })
     return binding
   }
@@ -2156,44 +2571,100 @@ class FlowEngine {
   _mapSessionEvent(sessionId, binding, event, session) {
     if (!this.active) return null
     if (event.type === 'assistant/message') {
-      const usage = mapHostUsage(event.data && event.data.usage)
-      if (!usage) return null
       const message = event.data && event.data.message
       const source = message && message.source
-      const callId = message && typeof message.id === 'string' && message.id !== ''
-        ? clip(message.id, 128)
-        : clip(`${sessionId}:${event.seq ?? 0}`, 128)
+      const provider = source && typeof source.provider === 'string' && source.provider !== ''
+        ? clip(source.provider, 128)
+        : null
+      const model = source && typeof source.model === 'string' && source.model !== ''
+        ? clip(source.model, 128)
+        : null
+      const out = []
+
+      // 1) 原有口径：有 usage 才写 model/call（token 聚合口径不动）。
+      const usage = mapHostUsage(event.data && event.data.usage)
+      if (usage) {
+        const callId = message && typeof message.id === 'string' && message.id !== ''
+          ? clip(message.id, 128)
+          : clip(`${sessionId}:${event.seq ?? 0}`, 128)
+        const payload = {
+          provider: provider || 'unknown',
+          model: model || 'unknown',
+          callId,
+          usage,
+        }
+        if (message && typeof message.stopReason === 'string' && message.stopReason !== '') {
+          payload.stopReason = clip(message.stopReason, 128)
+        }
+        out.push({
+          kind: 'model/call',
+          nodeId: binding.nodeId,
+          attemptId: binding.attemptId,
+          memberId: binding.memberId,
+          traceId: binding.traceId,
+          data: payload,
+        })
+      }
+
       this.liveStateChanged('model')
-      const payload = {
-        provider: source && typeof source.provider === 'string' && source.provider !== '' ? clip(source.provider, 128) : 'unknown',
-        model: source && typeof source.model === 'string' && source.model !== '' ? clip(source.model, 128) : 'unknown',
-        callId,
-        usage,
+      if (this.live) this.live.activeMemberId = binding.memberId ?? null
+
+      // 2) §8.2：额外摘出 assistant 可见文本，写 agent/message（脱敏 + 截断 + 同会话去重）。
+      const rawText = extractAssistantText(message)
+      if (rawText !== '') {
+        const clean = redactArguments(rawText)
+        if (this.live) {
+          this.live.lastMessage = {
+            text: clipChars(clean, LIVE_MESSAGE_MAX_CHARS),
+            at: isoOf(this.now()),
+            memberId: binding.memberId ?? null,
+          }
+        }
+        const clipped = clipAssistantText(clean)
+        const hash = createHash('sha256').update(clipped.text, 'utf8').digest('hex')
+        if (this.lastAssistantText.get(sessionId) !== hash) {
+          this._rememberAssistantText(sessionId, hash)
+          out.push({
+            kind: 'agent/message',
+            nodeId: binding.nodeId,
+            attemptId: binding.attemptId,
+            memberId: binding.memberId,
+            traceId: binding.traceId,
+            data: {
+              role: 'assistant',
+              text: clipped.text,
+              truncated: clipped.truncated,
+              ...(provider ? { provider } : {}),
+              ...(model ? { model } : {}),
+            },
+          })
+        } else {
+          // 文本被去重（重放 / 心跳），但 live.lastMessage 可能已刷新，仍需可见。
+          this._scheduleLivePersist()
+        }
       }
-      if (message && typeof message.stopReason === 'string' && message.stopReason !== '') {
-        payload.stopReason = clip(message.stopReason, 128)
-      }
-      return {
-        kind: 'model/call',
-        nodeId: binding.nodeId,
-        attemptId: binding.attemptId,
-        memberId: binding.memberId,
-        traceId: binding.traceId,
-        data: payload,
-      }
+      return out.length > 0 ? out : null
     }
 
     if (event.type === 'tool/call') {
       const callId = event.data && typeof event.data.callId === 'string' ? event.data.callId : null
       if (!callId) return null
+      const name = typeof event.data.name === 'string' ? event.data.name : 'unknown'
+      const startedAt = this.now()
       this.pendingToolCalls.set(`${sessionId}\u0000${callId}`, {
-        name: typeof event.data.name === 'string' ? event.data.name : 'unknown',
+        name,
         arguments: typeof event.data.arguments === 'string' ? event.data.arguments : '',
-        startedAt: this.now().getTime(),
+        startedAt: startedAt.getTime(),
         binding,
         sessionId,
       })
       this.liveStateChanged('tool')
+      if (this.live) {
+        this.live.activeMemberId = binding.memberId ?? null
+        // §13.12：工具一开始就让客户端看到「正在跑哪个工具」，不等 tool/result。
+        this.live.lastTool = { name: clip(name, 200), startedAt: isoOf(startedAt), ok: null }
+        this._scheduleLivePersist()
+      }
       return null
     }
 
@@ -2209,6 +2680,14 @@ class FlowEngine {
       this.pendingToolCalls.delete(key)
       const ok = !(message && message.isError === true) && !(event.data && event.data.error)
       const durationMs = Math.max(0, this.now().getTime() - pending.startedAt)
+      if (this.live) {
+        this.live.activeMemberId = pending.binding.memberId ?? null
+        this.live.lastTool = {
+          name: clip(pending.name, 200),
+          startedAt: isoOf(new Date(pending.startedAt)),
+          ok,
+        }
+      }
       if (pending.name === 'skill') {
         let skill = 'unknown'
         try {
@@ -2244,6 +2723,17 @@ class FlowEngine {
     return null
   }
 
+  /** §8.2：记住会话的上一条文本 hash（LRU，最多 64 个会话，防内存泄漏）。 */
+  _rememberAssistantText(sessionId, hash) {
+    const map = this.lastAssistantText
+    if (map.has(sessionId)) map.delete(sessionId)
+    else if (map.size >= ASSISTANT_TEXT_CACHE_MAX) {
+      const oldest = map.keys().next().value
+      if (oldest !== undefined) map.delete(oldest)
+    }
+    map.set(sessionId, hash)
+  }
+
   liveStateChanged(phase) {
     if (!this.live) return false
     if (this.live.phase === phase) return false
@@ -2268,9 +2758,74 @@ class FlowEngine {
       this.live.currentNodeId = this.current ? this.current.node.id : this.live.currentNodeId
       this.live.attempt = this.current ? this.current.attempt : this.live.attempt
       this.live.round = this.current ? this.current.round : this.live.round
+      if (this.current) {
+        this.live.nodeTitle = clip(
+          String(this.current.node.title || this.current.node.id),
+          LIVE_NODE_TITLE_MAX_CHARS,
+        )
+        this.live.nodeMode = this.current.node.mode === EXEC_MODE.TEAM ? 'team' : 'single'
+        this._syncLiveMembers()
+      }
+      // §13.12：live.tokens 与本 run 已落盘的 model/call 同口径（同 traceId+callId 后到替换）。
+      this._accumulateLiveTokens(normalized)
       await this._persistLive()
     }
     return result
+  }
+
+  /** 用当前节点的成员表刷新 live.members（≤16 条，只带展示必需字段）。 */
+  _syncLiveMembers() {
+    if (!this.live) return
+    this.live.members = this._liveMemberSnapshots()
+  }
+
+  _liveMemberSnapshots() {
+    if (!this.current) return []
+    const out = []
+    for (const member of this.current.members.values()) {
+      if (out.length >= LIVE_MEMBERS_MAX) break
+      out.push({
+        memberId: member.memberId,
+        name: clip(member.name, 64),
+        ...(member.role ? { role: clip(member.role, 32) } : {}),
+        ...(member.model ? { model: clip(member.model, 64) } : {}),
+        state: member.state === 'starting' || member.state === 'running' || member.state === 'done'
+          ? member.state
+          : 'unknown',
+      })
+    }
+    return out
+  }
+
+  /** live.tokens 四桶累计：keyed 按「后到整条替换」，unkeyed 逐条累加（与 §3 一致）。 */
+  _accumulateLiveTokens(events) {
+    if (!this.live || !this.live.tokens) return
+    for (const event of events) {
+      if (!event || event.kind !== 'model/call') continue
+      const data = event.data && typeof event.data === 'object' ? event.data : null
+      const usage = data && data.usage
+      if (!usage || typeof usage !== 'object') continue
+      const next = {
+        input: intOr(usage.input),
+        cacheRead: intOr(usage.cacheRead),
+        cacheWrite: intOr(usage.cacheWrite),
+        output: intOr(usage.output),
+      }
+      const callId = typeof data.callId === 'string' && data.callId !== '' ? data.callId : ''
+      const key = callId === '' ? null : `${event.traceId}\u0000${callId}`
+      const previous = key ? this.liveUsage.get(key) : null
+      for (const bucket of ['input', 'cacheRead', 'cacheWrite', 'output']) {
+        const delta = next[bucket] - (previous ? previous[bucket] : 0)
+        this.live.tokens[bucket] = Math.max(0, (this.live.tokens[bucket] || 0) + delta)
+      }
+      if (key) this.liveUsage.set(key, next)
+    }
+  }
+
+  /** 不产生新事件也要让 live 立刻可见（如工具刚开跑）：异步补写 run.json.live。 */
+  _scheduleLivePersist() {
+    if (!this.live || !this.active) return
+    this._persistLive()
   }
 
   async _setLive(patch) {
@@ -2303,7 +2858,12 @@ class FlowEngine {
   async _closeMembers(runId, node, attempt, traceId) {
     const membersPartial = this._membersPartial(node)
     if (!this.current || this.current.members.size === 0) return membersPartial
+    // §13.12：节点收尾一律标 done（即使宿主不支持 member/end，live 也不能停在 running）。
+    for (const member of this.current.members.values()) member.state = 'done'
+    this._syncLiveMembers()
     if (!supportsPartialMemberStatus()) {
+      // 不写 member/end 时也要让 live.members 立刻落到 done。
+      await this._persistLive()
       this.log('warn', 'flow-studio: 宿主 runlog 不支持 member/end.status=partial；本轮不写成员结论（不伪造 passed/failed）')
       return membersPartial
     }
@@ -2336,6 +2896,9 @@ class FlowEngine {
     this.sessionBindings.clear()
     this.pendingSessionEvents = []
     this.pendingToolCalls.clear()
+    this.lastAssistantText.clear()
+    this.liveUsage.clear()
+    this.artifactIndex.clear()
     this.eventQueue = Promise.resolve()
   }
 

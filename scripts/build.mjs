@@ -30,25 +30,48 @@ const result = await build({
   entryPoints: [resolve(root, 'src/client/entry.js')],
   outfile: resolve(libDir, 'client.js'),
   bundle: true,
-  format: 'iife',
+  // closure-factory：整个模块图（含 @xyflow/react）都在 factory 体内求值，
+  // 依赖里的 require('react') 才能拿到宿主模块表；format 用 cjs 让 module.exports
+  // 在 factory 内可见，banner/footer 负责包成 __ModuleLoader__ 的注册形状。
+  format: 'cjs',
   platform: 'browser',
   target: 'es2022',
+  // React 由宿主模块表提供（createPlugin 里 bindReact(require('react'))）。
+  // esbuild 的 external 会连 `react` 的子路径一起外置，所以 react/jsx-runtime 必须用
+  // alias 指到真实文件再打进产物 —— 宿主模块表不保证有 jsx-runtime。
+  external: ['react', 'react-dom'],
+  alias: {
+    'react/jsx-runtime': require.resolve('react/jsx-runtime'),
+  },
   minify: true,
   keepNames: true,
   legalComments: 'none',
   charset: 'utf8',
-  banner: { js: '// Generated from src/client/* via `node scripts/build.mjs` (esbuild). Do not edit directly.' },
+  banner: {
+    js: '// Generated from src/client/* via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
+      + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', factory: (require) => {\n'
+      + 'var module = { exports: {} }; var exports = module.exports;',
+  },
+  footer: { js: 'return module.exports.createPlugin(require);\n} });' },
   metafile: true,
   logLevel: 'warning',
 })
 
 const clientSize = statSync(resolve(libDir, 'client.js')).size
 console.log(`src/client/entry.js -> lib/client.js ${clientSize} bytes`)
-if (clientSize > 262144) {
-  console.error(`✗ lib/client.js 超过 262144 字节（${clientSize}），DSH 的 STORE 单文件上限装不下`)
+// 上限证据（2026-11 实测）：把 lib/client.js 填到 428,792 字节后，宿主仍以
+// HTTP 200 完整下发 428,875 字节（combo 路由 /plugins/??<pkg>/client.js&rev=...）。
+// 所以 262144 是自设门槛而不是宿主硬上限；这里留 512 KiB 的余量并保留告警。
+const CLIENT_LIMIT = 524288
+const CLIENT_WARN = 409600
+if (clientSize > CLIENT_LIMIT) {
+  console.error(`✗ lib/client.js 超过 ${CLIENT_LIMIT} 字节（${clientSize}），宿主 bundle 与加载耗时都不适合再涨`)
   process.exit(1)
 }
-console.log('✓ lib/client.js 在 DSH STORE 单文件上限（262144）内')
+if (clientSize > CLIENT_WARN) {
+  console.warn(`⚠ lib/client.js ${clientSize} 字节，已超过 400 KB 警戒线（上限 ${CLIENT_LIMIT}）`)
+}
+console.log(`✓ lib/client.js 在单文件上限（${CLIENT_LIMIT}）内`)
 
 for (const file of ['index.js', 'model.js', 'store.js', 'runlog.js', 'runstore.js', 'engine.js']) {
   copyFileSync(resolve(root, 'src', file), resolve(libDir, file))
@@ -66,7 +89,12 @@ if (!client.includes('__ModuleLoader__')) {
   console.error('✗ lib/client.js 里找不到 __ModuleLoader__ 调用')
   process.exit(1)
 }
-console.log('✓ client bundle 含 __ModuleLoader__ 与正确的注册 id')
+// React Flow 的类名前缀是「真的打进去了」的最便宜特征；被 tree-shake 掉或外置都会在这里暴露。
+if (!client.includes('react-flow__')) {
+  console.error('✗ lib/client.js 里找不到 React Flow 特征串 react-flow__')
+  process.exit(1)
+}
+console.log('✓ client bundle 含 __ModuleLoader__、正确的注册 id 与 React Flow')
 
 // 打包输入清单留个痕，便于核对产物由哪些源文件构成。
 const inputs = Object.keys(result.metafile.inputs)

@@ -23,6 +23,9 @@ check('出厂模板通过校验，且包含六阶段与四处打回', () => {
   const flow = defaultFlow()
   const report = validateFlow(flow)
   assert.deepEqual(report.errors, [], `出厂模板不该有错误：${JSON.stringify(report.errors)}`)
+  assert.deepEqual(report.warnings, [], `出厂模板不该有提醒：${JSON.stringify(report.warnings)}`)
+  assert.equal(flow.nodes.length, 8, '出厂模板应当是 8 个节点')
+  assert.equal(flow.edges.length, 11, '出厂模板应当是 11 条连线')
   const titles = flow.nodes.map(node => node.title)
   for (const stage of ['需求分析', '方案设计', '结构设计', '开发', '测试', '代码审查']) {
     assert.ok(titles.includes(stage), `缺少阶段「${stage}」`)
@@ -31,6 +34,43 @@ check('出厂模板通过校验，且包含六阶段与四处打回', () => {
   assert.equal(rejects.length, 4, '应当有 4 条打回线')
   assert.equal(flow.nodes.filter(node => node.kind === NODE_KIND.START).length, 1)
   assert.equal(flow.nodes.filter(node => node.kind === NODE_KIND.END).length, 1)
+})
+
+check('出厂模板每个阶段默认是「主管 + 3 个子 agent」', () => {
+  const flow = defaultFlow()
+  const stages = flow.nodes.filter(node => node.kind === NODE_KIND.STAGE)
+  assert.equal(stages.length, 6, '应当有六个阶段节点')
+  for (const stage of stages) {
+    assert.equal(stage.mode, EXEC_MODE.TEAM, `「${stage.title}」应当默认是 team 模式`)
+    assert.ok(stage.team.length >= 3, `「${stage.title}」至少预设 3 个成员，实际 ${stage.team.length}`)
+    assert.ok(stage.role.trim().length > 0, `「${stage.title}」主管缺角色定位`)
+    assert.ok(stage.task.trim().length > 0, `「${stage.title}」主管缺任务`)
+    const names = new Set()
+    for (const member of stage.team) {
+      assert.ok(member.name.trim().length > 0, `「${stage.title}」有成员缺名字`)
+      assert.ok(member.role.trim().length > 0, `「${stage.title}」的「${member.name}」缺角色定位`)
+      assert.ok(member.task.trim().length > 0, `「${stage.title}」的「${member.name}」缺任务`)
+      assert.ok(member.task.trim() !== '同上', `「${stage.title}」的「${member.name}」任务不能写成同上`)
+      assert.ok(!names.has(member.name), `「${stage.title}」成员名「${member.name}」重复`)
+      names.add(member.name)
+    }
+  }
+  // 开始 / 结束保持单 agent，不带成员。
+  for (const edgeNode of flow.nodes.filter(node => node.kind !== NODE_KIND.STAGE)) {
+    assert.equal(edgeNode.mode, EXEC_MODE.SINGLE, `「${edgeNode.title}」应当保持 single`)
+    assert.deepEqual(edgeNode.team, [], `「${edgeNode.title}」不该有成员`)
+  }
+})
+
+check('出厂模板往返保存不丢成员', () => {
+  const flow = defaultFlow()
+  const round = normalizeFlow(flow, '兜底')
+  assert.deepEqual(round.nodes.map(node => node.team), flow.nodes.map(node => node.team), '成员在保存读回后丢失')
+  assert.deepEqual(round.nodes.map(node => node.mode), flow.nodes.map(node => node.mode))
+  const dev = round.nodes.find(node => node.id === 'n_dev')
+  assert.equal(dev.mode, EXEC_MODE.TEAM)
+  assert.deepEqual(dev.team.map(member => member.name), ['后端实现', '前端实现', '自测与用例'])
+  assert.deepEqual(validateFlow(round).warnings, [], '往返后不应冒出提醒')
 })
 
 check('describeFlow 把打回写进流转说明', () => {

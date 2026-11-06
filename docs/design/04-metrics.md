@@ -750,6 +750,20 @@
 - **字段晋升**：当一个字段从「未知」变成「已知」时，必须一次性把旧 `extras.foo` 迁移到 `foo`；因为 `normalizeFlow` 对已知字段优先，旧 extras 里的同名值不会自动被读取。当前没有迁移脚本，标为未完成项。
 - 实现位置：`src/model.js` 的 `normalizeFlow` / `collectExtras` / `withExtras`；测试位置：`test/model.test.mjs` 的「未知字段进 extras」「extras 有界」「extras 坏输入」「没有未知字段时不挂 extras」四组。
 
+### 3.14 流程文件版本与并发保存（乐观锁）
+
+流程文件 `$DSH_HOME/flow-studio/flows/<id>.json` 带一个单调递增的 `version`（`≥1` 的整数，新建从 1 开始）：
+
+- **老文件兼容**：磁盘上没有 `version` 时按 `1` 读，不判坏；下次保存写回 `2`，`updatedAt` 继续保留。
+- **保存语义**：`PUT /flows/<id>` 的 `body.version` 是主路径。带版本且等于磁盘当前版本 → 写入并把 `version + 1`；带版本但不匹配 → **不写盘**，返回 `409`；不带版本 → 无条件写入（兼容旧调用方 / 脚本），版本照样递增。
+- **409 响应体**：`{ ok:false, error:'流程已被其他人改过，请刷新后重试', code:'FLOW_VERSION_CONFLICT', currentVersion, updatedAt }`。错误对象上另带 `currentDigest`（当前内容 sha256 前 16 位），供对账用，不携带流程内容本身。
+- **可选 `If-Match: "<version>"`**：只在 body 没带 `version` 时补位，语义与 `body.version` 相同；格式非法 → `400 FLOW_VERSION_INVALID`。
+- **POST 新建**：不校验版本，`body.version` 被忽略，结果一律 `version = 1`。
+- **串行化边界**：读版本、比版本、写文件在同一把「按 flowId 分键」的进程内 promise 锁里完成（`src/store.js` 的 `withFlowLock`），保证同一进程内并发保存不会都读到 v3 再各自写 v4。**跨进程不保证**（多个 Host 共用一份 `DSH_HOME`、或外部脚本直接改文件）——那需要文件锁 / CAS，本版不做。
+- **客户端实现**（0.4.2）：保存请求体带 `version`；成功后把响应里的新 `version` 与 `updatedAt` 合并回本地（只并这两个字段，
+  不覆盖保存期间用户新敲的内容），否则下一次保存必然带旧版本号而永远 409。撞 409 时弹出「用我的版本覆盖 / 载入服务器版本」
+  两条出口：前者剥掉 `version` 走无条件写入（用户显式选择才可静默覆盖），后者重新 `GET` 服务器版本并丢弃本地草稿。
+
 ---
 
 ## 四、状态与流转的可视化规则

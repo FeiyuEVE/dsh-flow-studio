@@ -18,10 +18,10 @@ DeepSeek Harness（下称 DSH）的一个 Web 插件。它给「把一个研发�
 
 | 约束 | 说明 |
 |---|---|
-| 技术栈 | 浏览器里跑 React（由宿主提供），**不能用任何第三方 UI/画布库**（没有 react-flow、没有 tailwind、没有图标字体）。所有样式手写 CSS。 |
+| 技术栈 | 浏览器里跑 React（由宿主提供）。v0.5 起画布改用 **@xyflow/react（React Flow 12）** 并打进单文件；其余 UI 仍手写 CSS，不引入 tailwind / 图标字体。 |
 | 主题 | 只能用宿主的 CSS 变量：`--dsw-alias-*`（bg-base / bg-layer-1..3 / border-l1..l4 / label-primary|secondary|tertiary / brand-primary / state-success|warn|error-primary / interactive-bg-hover）、`--dsw-radius-*`、`--dsw-font-family`、`--dsw-focus-ring-*`。**亮/暗主题由宿主切换，设计必须两边都成立。** |
 | 语言 | 中文界面。术语要贴中文研发团队的说法，不要生硬翻译。 |
-| 体量 | 客户端产物是单文件，上限 262144 字节。设计要经得起「手写实现」的复杂度。 |
+| 体量 | 客户端产物是单文件；v0.5 起构建上限 524288 字节（React Flow 12 打进产物，实测宿主可下发 >400 KB）。设计仍要经得起「不重造轮子」的复杂度。 |
 | 宿主外壳 | 它占满中间主区域（不是弹窗、不是侧边抽屉）。上方是侧栏与会话列表，本面板是其中一页。没有 keep-alive，切走即卸载。 |
 | 数据规模 | 典型流程 6–12 个节点；极端 30 个节点。要能一屏看清主干。 |
 

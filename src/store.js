@@ -7,6 +7,7 @@
  * @module @feiyueve/dsh-flow-studio/store
  */
 
+import { createHash } from 'node:crypto'
 import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -22,6 +23,79 @@ const FILE_MODE = 0o600
 
 /** 流程 id 允许的字符集：既当文件名，也进 URL。 */
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
+
+/** 版本从 1 开始；老文件没有 version 字段时按它补默认值，不判坏。 */
+const INITIAL_VERSION = 1
+
+/**
+ * 版本冲突：调用方带来的 version 与磁盘当前版本不一致。
+ *
+ * 只带定位冲突所需的元信息（当前版本 / update 时间 / 内容摘要），
+ * 不把整份流程塞进 error——错误会进日志与 HTTP 响应，不该夹带用户数据。
+ */
+export class FlowConflictError extends Error {
+  /**
+   * @param {number} currentVersion 磁盘上的当前版本
+   * @param {string} currentUpdatedAt 磁盘上的 updatedAt（ISO 8601）
+   * @param {string} currentDigest 当前内容的短摘要（sha256 前 16 位）
+   */
+  constructor(currentVersion, currentUpdatedAt, currentDigest) {
+    super(`流程已被其他人改过（磁盘当前 v${currentVersion}），请刷新后重试`)
+    this.name = 'FlowConflictError'
+    this.code = 'FLOW_VERSION_CONFLICT'
+    this.currentVersion = currentVersion
+    this.currentUpdatedAt = currentUpdatedAt
+    this.currentDigest = currentDigest
+  }
+}
+
+/** 版本收敛：正整数原样保留，缺省 / 非法 / 小于 1 一律回落到 1。 */
+function normalizeVersion(value) {
+  return Number.isSafeInteger(value) && value >= 1 ? value : INITIAL_VERSION
+}
+
+/** 当前内容的短摘要，给冲突方一个对账依据（不返回内容本身）。 */
+function digestOf(flow) {
+  return createHash('sha256').update(JSON.stringify(flow)).digest('hex').slice(0, 16)
+}
+
+/**
+ * 从请求体取客户端期望的版本。
+ *
+ * 只有「≥1 的安全整数」才算带了 version；其余（缺省、字符串、0、小数）按未带处理，
+ * 保持老调用方 / 脚本的无条件写入语义。HTTP 层会在进到这里之前把非法 version 拦成 400。
+ * @param {unknown} body
+ * @returns {number | undefined}
+ */
+function requestedVersion(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined
+  const value = body.version
+  return Number.isSafeInteger(value) && value >= 1 ? value : undefined
+}
+
+/**
+ * 进程内按流程分键的串行队列。
+ *
+ * read-check-write 必须在同一把锁里完成：否则两次并发 saveFlow 会都读到 v3、
+ * 都通过校验、都写 v4，后写的静默覆盖先写的。这里用 promise 链把同一流程的
+ * 保存排成一条队，不同流程（或不同流程目录）互不阻塞。
+ *
+ * 边界：**只管本进程**。Host 是单进程，所以够用；跨进程（多个 Host 共用一份
+ * DSH_HOME，或外部脚本直接改文件）不在保证范围内——那需要文件锁 / CAS，本版不做。
+ */
+const flowLocks = new Map()
+
+function withFlowLock(key, task) {
+  const previous = flowLocks.get(key) || Promise.resolve()
+  // 前一次失败不该卡死队列：成功 / 失败都接着执行下一段任务。
+  const result = previous.then(task, task)
+  const tail = result.then(() => undefined, () => undefined)
+  flowLocks.set(key, tail)
+  return result.finally(() => {
+    // 队尾没人接就直接清掉，避免 Map 无限增长。
+    if (flowLocks.get(key) === tail) flowLocks.delete(key)
+  })
+}
 
 /** DSH 家目录：容器/多 profile 部署下 homedir() 与 DSH_HOME 并不相等，优先环境变量。 */
 export function resolveHome(env) {
@@ -116,6 +190,7 @@ export async function listFlows(dir) {
 async function seedDefaultFlow(dir) {
   const flow = defaultFlow()
   flow.id = newFlowId()
+  flow.version = INITIAL_VERSION
   flow.createdAt = new Date().toISOString()
   flow.updatedAt = flow.createdAt
   try {
@@ -135,28 +210,47 @@ export async function readFlow(dir, id) {
   if (!safe) return null
   const raw = await readJson(join(dir, `${safe}.json`))
   if (!raw) return null
-  return normalizeFlow({ ...raw, id: safe }, '未命名流程')
+  const flow = normalizeFlow({ ...raw, id: safe }, '未命名流程')
+  // normalizeFlow 只保留已知字段，version 由存储层补：老文件没有该字段就按 v1 读，不判坏。
+  flow.version = normalizeVersion(raw.version)
+  return flow
 }
 
 /**
- * 保存一份流程（整份替换语义）。id 由 Host 决定，不信任请求体里的 id。
+ * 保存一份流程（整份替换语义 + 乐观锁）。id 由 Host 决定，不信任请求体里的 id。
+ *
+ * 版本规则：
+ * - 新建（磁盘上没有该文件）→ version = 1，忽略 body.version（POST 新建不需要预条件）；
+ * - 更新且 body 带合法 version → 必须等于磁盘当前版本，否则抛 FlowConflictError；
+ * - 更新且 body 不带 version → 无条件写入（兼容老调用方 / 脚本），版本照样 +1。
+ *
+ * 读版本、比版本、写文件三步在同一把按 flowId 的进程内锁里完成，见 withFlowLock。
  * @param {string} dir
  * @param {string} id
  * @param {unknown} body
  * @param {{ name?: string }} [fallback]
+ * @returns {Promise<object>} 写入后的流程（含新 version）
  */
 export async function saveFlow(dir, id, body, fallback) {
   const safe = checkId(id)
   if (!safe) throw new Error('流程 id 不合法（只允许小写字母、数字、连字符）')
   await ensureDir(dir)
-  const existing = await readFlow(dir, safe).catch(() => null)
-  const now = new Date().toISOString()
-  const flow = normalizeFlow(body, (existing && existing.name) || (fallback && fallback.name) || '未命名流程')
-  flow.id = safe
-  flow.createdAt = existing ? existing.createdAt : flow.createdAt || now
-  flow.updatedAt = now
-  await writeJsonAtomic(join(dir, `${safe}.json`), flow)
-  return flow
+  return withFlowLock(`${dir}\u0000${safe}`, async () => {
+    const existing = await readFlow(dir, safe).catch(() => null)
+    const expected = requestedVersion(body)
+    // 冲突路径先校验后写：不匹配就直接抛，磁盘一个字节都不动。
+    if (existing && expected !== undefined && expected !== existing.version) {
+      throw new FlowConflictError(existing.version, existing.updatedAt, digestOf(existing))
+    }
+    const now = new Date().toISOString()
+    const flow = normalizeFlow(body, (existing && existing.name) || (fallback && fallback.name) || '未命名流程')
+    flow.id = safe
+    flow.version = existing ? normalizeVersion(existing.version) + 1 : INITIAL_VERSION
+    flow.createdAt = existing ? existing.createdAt : flow.createdAt || now
+    flow.updatedAt = now
+    await writeJsonAtomic(join(dir, `${safe}.json`), flow)
+    return flow
+  })
 }
 
 /**

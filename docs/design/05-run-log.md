@@ -50,6 +50,7 @@ $DSH_HOME/flow-studio/runs/
 | `member/start` | `name`、`role?`、`model?` | 引擎 |
 | `member/end` | `status`（`passed`/`failed`/`aborted`/`partial`）、`durationMs` | 引擎 |
 | `model/call` | `provider`、`model`、`usage`（见 §3）、`stopReason?` | 宿主事件归集 |
+| `agent/message` | `role`（`assistant`）、`text`（≤2000 字符）、`truncated`、`provider?`、`model?` | 宿主 `assistant/message` 归集（§8.2） |
 | `tool/call` | `name`、`argumentsDigest?`、`ok`、`durationMs?` | 宿主事件归集 |
 | `skill/load` | `skill`（唯一名）、`ok` | `tool/call` 里 `name==='skill'` |
 | `artifact/write` | `path`（相对 run 目录）、`bytes`、`kind`（`md`/`diff`/`json`/`log`） | 引擎 |
@@ -133,18 +134,28 @@ $DSH_HOME/flow-studio/runs/
 - **`artifact/write.data.path`**：相对 run 目录，禁止绝对路径、`..`、反斜杠、空段，长度 ≤512；写入方必须在事件里同时给 `bytes` 与 `sha256`（可选但推荐），没有 `sha256` 时摘要标注「未校验」。
 - **`skill/load.data.ok=false`**：不计入 `loaded`，计入 `loads.failed`；`missing` = 声明集 − 成功加载集（因此失败项也会出现在 missing 里）。
 
-### 8.2 新增两个 kind：让「完成质量」真的能算
+### 8.2 新增 kind：让「完成质量」真的能算、让 agent 发言可见
 
-审核确认：不补这两类事件，`quality` **永远只能是 unknown**（`pass`/`warn` 是死代码），等于用户的需求第 5 条（完成质量）没交付。
+审核确认：不补 `acceptance/verdict` / `test/report`，`quality` **永远只能是 unknown**（`pass`/`warn` 是死代码），等于用户的需求第 5 条（完成质量）没交付。v1.2 再补 `agent/message`，让运行详情能显示「agent 刚刚说了什么」。
 
 | kind | data 字段 |
 |---|---|
 | `acceptance/verdict` | `itemId`（run 内唯一）、`status`（`pass`/`fail`/`skip`/`na`）、`decidedBy`（`human`/`auto`）、`evidenceRef?`、`decidedAt?` |
 | `test/report` | `suite`、`executed`、`passed`、`failed`、`skipped`、`reportRef?`、`failures?`（≤50 条名称） |
+| `agent/message` | `role`（目前白名单只有 `assistant`）、`text`（必填非空、≤2000 字符）、`truncated`（bool）、`provider?`、`model?` |
 
 规则：`acceptance/verdict` 同一 `itemId` 以 `seq` 最大者为准（后判覆盖先判）；`test/report` 同一 `suite` 同样取最新。两者都绑定 `attemptId`：旧 attempt 的报告不进入当前结论。
 
+**证据产物的归属标记（v1.3）**：`artifact/write` 除 `path` / `sha256` 外，聚合层还读两处归属信息——事件级 `nodeId`（谁写的）与 `extra.producer`（`'host'` 表示宿主生成 / 标记的产物，引擎侧写入）。没有 `producer` 的 `artifact/write` 一律按模型产物处理；**不新增证据事件 kind**。`acceptance/verdict.evidenceRef` / `test/report.reportRef` / `check/form.reportRef` 指向某条 `artifact/write` 时，即可按 §8.3 判定证据独立性（self / peer / host）。
+
 **证据链接是硬条件**：`acceptance/verdict` 在 `status=pass` 时 `evidenceRef` 必填；`test/report` 在 `executed>0` 时 `reportRef` 必填。缺链接一律按「未检测」处理（`quality.missing` 里列出），不给绿灯——这是「质量结论必须可复核」的代价，引擎实现时必须落产物文件并写 ref。
+
+**`agent/message` 的采集与脱敏规则（引擎侧，06 §13.12）**：
+
+- 来源：宿主 `assistant/message` 事件的 `message`。真形状是 `AssistantMessage.content: [{ type:'text', text }]`（同时兼容 `content` 为字符串、`message.text`）；**只取 `type:'text'` 块，reasoning/thinking 不算**。提不到文本就不发事件，绝不发空串。
+- 截断：`text` 先按 Unicode 码点截到 **≤2000 字符**（不切断代理对），再用 UTF-8 **4 KiB** 兜底，保证序列化后仍 < 单条事件 8KB；发生截断时 `truncated=true`。
+- 脱敏：文本先过 `redactArguments`（`Bearer …` / `sk-…` / `token|password|secret|api_key` 的值 / 超长串），凭据原文不落日志。`provider`/`model` 来自同一条消息的 `source`，没有就省略。
+- 事件级 `memberId` 必填（lead 为 `null`，成员为 `<nodeId>:<序号>`）；同一会话连续两条文本完全相同（重放 / 心跳）只写一条，去重表按会话记 hash、上限 64 条。
 
 ### 8.3 聚合口径修正
 
@@ -155,26 +166,48 @@ $DSH_HOME/flow-studio/runs/
   - `total` = 去重后的唯一 finding 数（取每条最新状态），`reportedCount` = 原始事件数，两者都要返回；
   - `bySeverity` = 唯一 finding 最新状态的 severity 分布；另给 `unresolvedBySeverity` / `verifiedBySeverity` / `dismissedBySeverity`；
   - `unresolved` = `open + accepted + fixed`（**采纳 ≠ 修复 ≠ 复验**）；`verified` 与 `dismissed` 单列。
+  - `unresolvedBySeverity.P0` 进 §8.4 的 fail 级门禁；`.P1` / `.P2` 进 warn 级门禁（未解决即压住绿灯）。
+- **证据独立性（v1.3）**：三条证据指标的**通过条目**按被引用产物的归属分级——`artifact/write.nodeId` 与声明者相同 → `self`（自证）；不同 → `peer`（独立复核）；`artifact/write.extra.producer === 'host'` → `host`（宿主生成 / 标记）。
+  - 指标对象暴露 `selfCertified`（自证通过条目数）与 `selfOnly`（有通过条目、且**全部**为自证）。
+  - **指标层不因此降级**：自证仍是证据，不是「缺证据 / 数据自相矛盾」（那是 `unknown` 的语义）；独立性不足交给 §8.4 结论层用 `warn` 兜底。
+  - 查不到产物归属的 ref（可信写入方直接给的路径）不计入自证，沿用 §8.5 的信任边界——只有能证明是同一节点写的才算自证。
+- **跨 attempt 账本（v1.3，B4 扩展）**：三个证据指标各自维护**全 attempt 出现过的标识集合**（`itemId` / `suite` / `ruleSetId`）。凡在**更早 attempt** 出现过、当前 attempt 没有**复判为 `pass`** 的标识，一律计入未复判（stale）：
+  - 当前 attempt 出现 `fail` → 走正常 fail 路径，不重复记 stale；
+  - 出现 `skip` / `na`，或干脆不再提 → 该指标 `unknown`，reason 写「上一轮出现过、本轮没有复判为通过」并列出条数（`staleFails[]`）；
+  - 只在当前 attempt 首次出现的新标识不受影响。
+  这样返工后「上一轮报 10 条、本轮只报 1 条」的分母不会缩水成 1，历史条目也不能靠不再提被洗白。
 - **审查一致性（review）**：取**最后一次有效 `review/verdict`**（`seq` 最大）判定；之前的 `reject` 不永久判死（返工后 `approve` 可以救回）。`findingCount` 与 finding 事件不一致的两种情况必须判 `unknown`：`findingCount > 0` 但该节点无任何 `review/finding` 事件；或记录到的 finding 数 > `findingCount`。
 - **采纳率**：`acceptedRate = (accepted + fixed + verified) / (total − dismissed − na)`；分母为 0 → `unknown`（不是 0% 也不是 100%）。
 - **规范 `check/form`**：`state=pass` 只有在 `passedChecks`、`totalChecks` 都是整数且 `total > 0`、`passed === total`、且 `executedAt` 与 `reportRef` 至少有一个时才成立；缺任一 → `unknown`。`fail`/`na`/`skipped` 原样透出。
 - **`nodeDone`**：只数当前有效 `passed` 的阶段节点（不含 skipped）；`GET /runs` 与 `GET /runs/<id>` 必须同口径、同数值。
+- **agent 活动（`summary.activity`）**：`computeAgentActivity(events)` 按 `nodeId` 聚合最近的 `agent/message`，形状为
+  `activity: { nodes: { <nodeId>: [{ text, at, memberId }] } }`；每节点最多 **5** 条、全局最多 **200** 条，
+  超限时保留全局最新的事件（组内仍按时间升序）。`at` 取事件 `ts`，`memberId` 没有则 `null`。
+  这是纯展示数据，**不进入 token / skill / findings / reject / progress / quality 任何口径**。
 
 ### 8.4 quality 判定（按 04 §3.9.3 落地，不许再硬编码）
 
 必要证据五项：`acceptance`、`tests`、`checks`、`review`、`p0p1`。
 
-- 任一项 `unknown`（缺事件、计数缺失、证据链接缺失）→ `state=unknown`，`missing` 列出缺项；**不得**给绿灯。
-- 任一项 `fail` → `state=fail`。
-- 五项全 `pass` 且 `progress.ratio === 1` 且 `unresolved P0 === 0`：
+- 任一项 `unknown`（缺事件、计数缺失、证据链接缺失、更早 attempt 的标识未复判）→ `state=unknown`，`missing` 列出缺项；**不得**给绿灯。
+- 任一项 `fail` → `state=fail`；`fail` 压过 `unknown`。
+- `p0p1` 的 fail 级门禁只认**未解决 P0**（`open + accepted + fixed`）；`p0p1` 的证据文案相应收窄为「P0 缺陷」。
+- **未解决 P1 / P2 压住绿灯（v1.3）**：P1/P2 不判 fail，而是把 `evidence.p0p1` 置为 `warn`；五项全过 + `progress.ratio === 1` 时，只要有未解决 P1/P2，结论 `warn`，label 写「可：…、遗留 N 个 P1 / M 个 P2 未解决」（只列非零项）。
+  依据：P1/P2 是质量问题而非「结论不成立」，但「首轮通过 + 遗留 3 个 P1」不能是「优」。
+- **证据独立性门禁（v1.3）**：**每个有通过条目的证据指标至少要有一条 `peer` / `host` 级独立证据**。
+  - 任一指标 `selfOnly === true`（该指标通过条目全部是 `self`）→ 结论不得 `pass`，降为 `warn`，label 写「可：<指标名> 全部为自证证据（N 条），缺独立复核」；
+  - 只要每个指标都至少有 1 条 peer/host 级证据，其余自证条目可以共存，结论仍可 `pass`，自证总数在 `quality.selfCertified` 里体现（不改「优 / 良」文案）；
+  - 依据：自证只能证明「模型写过这个产物」，不能证明「结论正确」，指标整体全自证就是闭环，必须 warn；但 `unknown` 的语义是「缺证据 / 数据自相矛盾」，自证是「有证据但不独立」，用 `warn` 才诚实。若改成「一条自证都不许有」，真实运行的验收通常全是模型自写，quality 会永久黄灯，指标失去意义。
+- 五项全 `pass` 且 `progress.ratio === 1`、无未解决 P1/P2、无 `selfOnly` 时：
   - 返工轮次 0 → `state=pass`、`label=优：首轮通过`；
-  - 返工 1 且 P1=0 且 `acceptedRate ≥ 0.6` → `state=pass`、`label=良：返工 1 轮后达标`；
+  - 返工 1 且 P1=P2=0 且 `acceptedRate ≥ 0.6` → `state=pass`、`label=良：返工 1 轮后达标`；
   - 否则 → `state=warn`、`label=可：返工 <n> 轮`（**不是绿灯**）。
 - `progress.ratio < 1` → 至少 `warn`，即使其它证据全过（半成品不许绿）。
-- **旧失败必须复判（B4）**：三类证据指标只在当前 attempt 里聚合，于是「上一轮判 `fail`、这一轮不再提这条」会被静默洗成绿灯；更糟的是**改个说法就能洗白**——上一轮 `R1=fail`，这一轮把同一条改成 `skip`/`na`，按「取最新判定」它就不再是 fail，而 skip 只记 `notApplicable`，其余条目 pass 就给了绿灯。
-  所以判据按标识（`itemId` / `suite` / `ruleSetId`）**全量回放**：`failEver`（任何 attempt 出现过 fail，顺序无关）× `passInCurrent`（当前 attempt 出现过 **pass**——这是唯一能清账的复判）× `failInCurrent`（当前 attempt 也 fail，交给正常 `fail` 路径）。
-  即 `failEver && !passInCurrent && !failInCurrent` → 该指标强制 `unknown`（理由写「上一轮判未通过、本轮没有复判为通过」，并列 `staleFails[]`）。
-  **skip / na / 干脆不提都不算复判**；反过来，`fail` 不会被 stale 降级成 `unknown`（§8.4「任一项 fail → fail」优先）。
+- 多条 warn 原因（进度 / 返工 / P1-P2 遗留 / 自证）同时成立时**全部写进同一个 label**，不丢原因。
+- **旧条目必须复判（B4 → v1.3 跨 attempt 账本）**：三类证据指标只在当前 attempt 里聚合，于是「上一轮判过、这一轮不再提这条」会被静默洗掉；更糟的是**改个说法就能洗白**——上一轮 `R1=fail`，这一轮把同一条改成 `skip`/`na`，按「取最新判定」它就不再是 fail，而 skip 只记 `notApplicable`，其余条目 pass 就给了绿灯；同理上一轮 10 条、本轮只报 1 条时，分母缩水也会白洗。
+  所以判据按标识（`itemId` / `suite` / `ruleSetId`）**全量回放**：`seenEarlier`（更早 attempt 出现过，顺序无关）× `passInCurrent`（当前 attempt 出现过 **pass**——这是唯一能清账的复判）× `failInCurrent`（当前 attempt 也 fail，交给正常 `fail` 路径）。
+  即 `seenEarlier && !passInCurrent && !failInCurrent` → 该指标强制 `unknown`（理由写「上一轮出现过、本轮没有复判为通过」，并列 `staleFails[]`）。
+  **skip / na / 干脆不提都不算复判**；反过来，当前 attempt 里真实的 `fail` 不会被 stale 降级成 `unknown`（「任一项 fail → fail」优先）。
 
 ### 8.5 安全（B2）—— 诚实的两层
 

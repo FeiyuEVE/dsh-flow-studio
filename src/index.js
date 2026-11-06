@@ -32,7 +32,7 @@ import {
   readLease, readRunDetail, readRunMeta, repairRunStates, runsDir, sweepExpiredLeases,
 } from './runstore.js'
 import {
-  checkId, deleteFlow, flowsDir, listFlows, newFlowId, readFlow, saveFlow,
+  FlowConflictError, checkId, deleteFlow, flowsDir, listFlows, newFlowId, readFlow, saveFlow,
 } from './store.js'
 
 /** 硬依赖：没有 webServer 就没有面板的数据通道。 */
@@ -214,6 +214,21 @@ function isLoopbackRequest(req) {
     ? req.socket.remoteAddress
     : ''
   return raw === '127.0.0.1' || raw === '::1' || raw === '::ffff:127.0.0.1'
+}
+
+/**
+ * 可选兼容：`If-Match: "<version>"`（也接受裸数字、`W/"3"`）。
+ * 没有该头返回 undefined；格式不合法返回 NaN，由调用方回 400。
+ * 主路径仍是 body.version，If-Match 只在 body 没带版本时补位。
+ * @param {string | undefined} header
+ * @returns {number | undefined}
+ */
+function parseIfMatch(header) {
+  if (typeof header !== 'string' || header.trim() === '') return undefined
+  const match = /^(?:W\/)?"?(\d+)"?$/.exec(header.trim())
+  if (!match) return Number.NaN
+  const version = Number(match[1])
+  return Number.isSafeInteger(version) && version >= 1 ? version : Number.NaN
 }
 
 /**
@@ -458,8 +473,46 @@ async function route(req, res, env) {
           sendJson(res, 400, { ok: false, error: '缺少流程内容' })
           return
         }
-        const saved = await saveFlow(env.dir, id, body)
-        sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
+        // 乐观锁：body.version 是主路径；If-Match 只作为可选兼容（body 没带版本时补位）。
+        const ifMatch = parseIfMatch(req.headers['if-match'])
+        if (Number.isNaN(ifMatch)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'If-Match 必须是正整数版本号',
+            code: 'FLOW_VERSION_INVALID',
+          })
+          return
+        }
+        let payload = body
+        if (body && typeof body === 'object' && !Array.isArray(body)) {
+          if (body.version !== undefined && !(Number.isSafeInteger(body.version) && body.version >= 1)) {
+            sendJson(res, 400, {
+              ok: false,
+              error: 'version 必须是 ≥1 的整数',
+              code: 'FLOW_VERSION_INVALID',
+            })
+            return
+          }
+          if (body.version === undefined && ifMatch !== undefined) {
+            payload = { ...body, version: ifMatch }
+          }
+        }
+        try {
+          const saved = await saveFlow(env.dir, id, payload)
+          sendJson(res, 200, { ok: true, flow: saved, validation: validateFlow(saved) })
+        } catch (error) {
+          if (error instanceof FlowConflictError) {
+            sendJson(res, 409, {
+              ok: false,
+              error: '流程已被其他人改过，请刷新后重试',
+              code: 'FLOW_VERSION_CONFLICT',
+              currentVersion: error.currentVersion,
+              updatedAt: error.currentUpdatedAt,
+            })
+            return
+          }
+          throw error
+        }
         return
       }
       if (req.method === 'DELETE') {

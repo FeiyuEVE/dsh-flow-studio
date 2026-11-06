@@ -23,7 +23,7 @@ import { hostname } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
-  MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkRunId, computeProgress,
+  MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkMemberId, checkRunId, computeProgress,
   normalizeEvent, progressFromNodeStates,
 } from './runlog.js'
 import { resolveHome } from './store.js'
@@ -177,6 +177,34 @@ function countPassed(progress) {
 
 /** 06 §2：运行中的 live 视图（currentNodeId / attempt / round / since / lastEventSeq / phase）。 */
 const LIVE_PHASES = new Set(['model', 'tool', 'spawn', 'idle'])
+/** §13.12：live.members[].state 白名单。 */
+const LIVE_MEMBER_STATES = new Set(['starting', 'running', 'done', 'unknown'])
+const LIVE_MEMBERS_MAX = 16
+const LIVE_MESSAGE_MAX_CHARS = 200
+const LIVE_NODE_TITLE_MAX_CHARS = 200
+
+function normalizeIso(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+    ? new Date(Date.parse(value)).toISOString()
+    : null
+}
+
+function liveMemberList(source) {
+  if (!Array.isArray(source)) return []
+  const out = []
+  for (const item of source) {
+    if (!isPlainObject(item) || out.length >= LIVE_MEMBERS_MAX) continue
+    const memberId = checkMemberId(item.memberId)
+    if (!memberId) continue
+    const name = typeof item.name === 'string' && item.name !== '' ? item.name.slice(0, 64) : memberId
+    const entry = { memberId, name }
+    if (typeof item.role === 'string' && item.role !== '') entry.role = item.role.slice(0, 32)
+    if (typeof item.model === 'string' && item.model !== '') entry.model = item.model.slice(0, 64)
+    entry.state = LIVE_MEMBER_STATES.has(item.state) ? item.state : 'unknown'
+    out.push(entry)
+  }
+  return out
+}
 
 function normalizeLive(source) {
   if (!isPlainObject(source)) return null
@@ -193,6 +221,36 @@ function normalizeLive(source) {
       ? source.lastEventSeq
       : 0,
     phase: LIVE_PHASES.has(source.phase) ? source.phase : 'idle',
+    // §13.12：客户端轮询 run.json.live 显示「正在干什么」。字段全部有界，坏值回落 null/0。
+    nodeTitle: typeof source.nodeTitle === 'string' && source.nodeTitle !== ''
+      ? source.nodeTitle.slice(0, LIVE_NODE_TITLE_MAX_CHARS)
+      : null,
+    nodeMode: source.nodeMode === 'single' || source.nodeMode === 'team' ? source.nodeMode : null,
+    activeMemberId: checkMemberId(source.activeMemberId),
+    lastTool: null,
+    lastMessage: null,
+    tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
+    members: liveMemberList(source.members),
+  }
+  const tool = source.lastTool
+  if (isPlainObject(tool) && typeof tool.name === 'string' && tool.name !== '') {
+    live.lastTool = {
+      name: tool.name.slice(0, 200),
+      startedAt: normalizeIso(tool.startedAt),
+      ok: typeof tool.ok === 'boolean' ? tool.ok : null,
+    }
+  }
+  const message = source.lastMessage
+  if (isPlainObject(message) && typeof message.text === 'string' && message.text !== '') {
+    live.lastMessage = {
+      text: message.text.slice(0, LIVE_MESSAGE_MAX_CHARS),
+      at: normalizeIso(message.at),
+      memberId: checkMemberId(message.memberId),
+    }
+  }
+  const tokens = isPlainObject(source.tokens) ? source.tokens : {}
+  for (const bucket of ['input', 'cacheRead', 'cacheWrite', 'output']) {
+    live.tokens[bucket] = Number.isInteger(tokens[bucket]) && tokens[bucket] >= 0 ? tokens[bucket] : 0
   }
   return live
 }

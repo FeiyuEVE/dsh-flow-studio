@@ -121,6 +121,112 @@ export function clearDraft(flowId) {
   defaultStore.clear(flowId)
 }
 
+/** 草稿落盘的默认去抖窗：连续输入时每个字符不各写一次。 */
+export const DRAFT_DEBOUNCE_MS = 600
+/** 连续输入的上限等待：一直不停手也必须在这个时间内落一次盘。 */
+export const DRAFT_MAX_WAIT_MS = 2000
+
+/**
+ * 草稿写盘调度器：去抖 + maxWait，外加可显式 flush（切页 / 页面隐藏 / 卸载）。
+ *
+ * 设计约束（缺陷 8）：
+ *  - 去抖窗（默认 600ms）内连续变更只写最后一次；
+ *  - 从本轮第一次变更起最多等 maxWait（默认 2s），避免用户一直打字永不落盘；
+ *  - `flush()` 立即写掉待写内容并清定时器，重复调用不会重复写。
+ *
+ * 定时器与写盘函数都可注入，测试用假 timer + 假 storage 断言写入次数，
+ * 不依赖真实 setTimeout / localStorage。
+ *
+ * @param {object} [options]
+ * @param {(flow: object) => any} [options.write] 实际写盘函数（接收整份流程快照）
+ * @param {number} [options.debounceMs] 去抖窗，默认 {@link DRAFT_DEBOUNCE_MS}
+ * @param {number} [options.maxWaitMs] 上限等待，默认 {@link DRAFT_MAX_WAIT_MS}
+ * @param {(fn: Function, ms: number) => any} [options.setTimeout]
+ * @param {(id: any) => void} [options.clearTimeout]
+ * @returns {{ schedule: Function, flush: Function, cancel: Function, pending: Function }}
+ */
+export function createDraftScheduler(options = {}) {
+  const write = typeof options.write === 'function' ? options.write : () => null
+  const debounceMs = Number.isFinite(options.debounceMs)
+    ? Math.max(0, options.debounceMs)
+    : DRAFT_DEBOUNCE_MS
+  const maxWaitMs = Number.isFinite(options.maxWaitMs)
+    ? Math.max(debounceMs, options.maxWaitMs)
+    : DRAFT_MAX_WAIT_MS
+  const setTimer = typeof options.setTimeout === 'function'
+    ? options.setTimeout
+    : (fn, ms) => setTimeout(fn, ms)
+  const clearTimer = typeof options.clearTimeout === 'function'
+    ? options.clearTimeout
+    : id => clearTimeout(id)
+
+  let pendingFlow = null
+  let debounceTimer = null
+  let maxWaitTimer = null
+
+  const clearTimers = () => {
+    if (debounceTimer !== null) {
+      clearTimer(debounceTimer)
+      debounceTimer = null
+    }
+    if (maxWaitTimer !== null) {
+      clearTimer(maxWaitTimer)
+      maxWaitTimer = null
+    }
+  }
+
+  const run = () => {
+    clearTimers()
+    if (!pendingFlow) return null
+    const flow = pendingFlow
+    pendingFlow = null
+    try {
+      return write(flow)
+    } catch {
+      // 写盘失败不能反向打断输入；内存副本由 createDraftStore 负责。
+      return null
+    }
+  }
+
+  /**
+   * 记一次待写变更。同一轮里的重复调用只更新快照，不增加写盘次数。
+   * 切到另一份流程时先把上一份立即写掉，避免跨流程串稿。
+   */
+  const schedule = flow => {
+    if (!flow || typeof flow.id !== 'string' || flow.id === '') return false
+    if (pendingFlow && pendingFlow.id !== flow.id) run()
+    if (!pendingFlow) {
+      pendingFlow = flow
+      maxWaitTimer = setTimer(run, maxWaitMs)
+    } else {
+      pendingFlow = flow
+    }
+    if (debounceTimer !== null) clearTimer(debounceTimer)
+    debounceTimer = setTimer(run, debounceMs)
+    return true
+  }
+
+  /** 立即写掉待写内容；没有待写内容时返回 null。 */
+  const flush = () => run()
+
+  /** 丢弃待写内容（保存成功 / 删除流程时）。传 flowId 时只取消同一份流程。 */
+  const cancel = flowId => {
+    if (flowId != null && pendingFlow && pendingFlow.id !== flowId) return false
+    clearTimers()
+    pendingFlow = null
+    return true
+  }
+
+  return {
+    schedule,
+    flush,
+    cancel,
+    pending: () => pendingFlow,
+    debounceMs,
+    maxWaitMs,
+  }
+}
+
 /** 稳定序列化：键排序，忽略 null/undefined 差异，用于「内容是否相同」判定。 */
 function canonical(value) {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']'

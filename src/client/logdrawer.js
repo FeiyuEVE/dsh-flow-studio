@@ -25,6 +25,21 @@ import { h, rt } from './runtime.js'
 export const DRAWER_CLOSED_HEIGHT = 40
 /** 展开高度（DESIGN §7）。 */
 export const DRAWER_OPEN_HEIGHT = 200
+/**
+ * 抽屉高度三档（A：详情可放大）：默认 200px / 拉高 / 全屏（占满视口，遮住画布）。
+ * 档位顺序即「放大」的步进顺序；Esc 逐档往回退（全屏 → 拉高 → 默认）。
+ */
+export const DRAWER_ZOOM_LEVELS = Object.freeze(['normal', 'tall', 'full'])
+/** 拉高档占视口比例；CSS 里是 70vh，抽成常量供文档 / 测试核对。 */
+export const DRAWER_TALL_VH = 70
+/** 节点「最近在做什么」最多列几条 agent/message（05 §8.3 每节点上限 5）。 */
+export const AGENT_ACTIVITY_LIMIT = 5
+/** 节点详情里最近工具调用 / 产物条数上限。 */
+export const NODE_TOOL_LIMIT = 4
+export const NODE_ARTIFACT_LIMIT = 6
+/** 超过这个长度的文本才提供「展开全文」（短句不值得再开一层弹层）。 */
+export const LONG_TEXT_MIN_CHARS = 60
+const ZOOM_TEXT = { normal: '默认高度', tall: '拉高', full: '全屏' }
 /** 事件流每页条数（05 §5）。 */
 export const EVENT_PAGE_SIZE = 200
 /** 一次最多取多少条事件；契约上限 1000，用来支撑 200 条/页的前后翻页。 */
@@ -56,6 +71,7 @@ export const EVENT_KINDS = [
   'run/start', 'run/end',
   'node/start', 'node/end',
   'member/start', 'member/end',
+  'agent/message',
   'model/call', 'tool/call',
   'skill/load', 'artifact/write',
   'reject/trigger',
@@ -86,6 +102,7 @@ const EVENT_GLYPH = {
   'node/end': '◁',
   'member/start': '◇',
   'member/end': '◆',
+  'agent/message': '✎',
   'model/call': '≈',
   'tool/call': '⚙',
   'skill/load': '◈',
@@ -160,6 +177,65 @@ export function drawerActionFor(event) {
 /** 纯开合函数：给出下一步的 open，便于单测状态机。 */
 export function nextDrawerOpen(open) {
   return !open
+}
+
+// ── 高度三档（A：详情可放大；纯函数，SSR 也能单测）──────────────────────────
+
+/** 任意输入归一化成三档之一；未知值退回默认高度，不抛错。 */
+export function normalizeDrawerZoom(value) {
+  const key = text(value, '').toLowerCase()
+  return DRAWER_ZOOM_LEVELS.includes(key) ? key : 'normal'
+}
+
+/** 档位 → 文案 / 可用动作 / 容器 class；SSR 与浏览器共用同一份。 */
+export function drawerZoomInfo(zoom) {
+  const key = normalizeDrawerZoom(zoom)
+  const index = DRAWER_ZOOM_LEVELS.indexOf(key)
+  const canRaise = index < DRAWER_ZOOM_LEVELS.length - 1
+  return {
+    key,
+    index,
+    label: ZOOM_TEXT[key],
+    className: key === 'normal' ? '' : ' zoom-' + key,
+    canRaise,
+    canLower: index > 0,
+    // 「放大」按一跳一档：默认 → 拉高；全屏由独立按钮直达。
+    raiseLabel: '放大',
+    raiseHint: '放大到拉高（再按「全屏」占满视口）',
+    fullLabel: '全屏',
+    fullHint: '全屏查看（占满视口，遮住画布；Esc 逐档还原）',
+    restoreHint: index === 2
+      ? '还原到拉高（Esc；再按一次回默认高度）'
+      : (index === 1 ? '还原到默认高度（Esc）' : '当前是默认高度'),
+    ariaLabel: '运行日志高度：' + ZOOM_TEXT[key] + '，放大 / 全屏 / 还原，Esc 逐档还原',
+  }
+}
+
+/** 沿三档步进：direction > 0 放大，< 0 还原；越界夹在两端。 */
+export function stepDrawerZoom(zoom, direction = 1) {
+  const current = DRAWER_ZOOM_LEVELS.indexOf(normalizeDrawerZoom(zoom))
+  // 注意别用 num()：它把负数当非法值退回 fallback，会把「还原」变成「放大」。
+  const raw = typeof direction === 'number' && Number.isFinite(direction) ? direction : 1
+  const delta = raw < 0 ? -1 : 1
+  const next = Math.min(DRAWER_ZOOM_LEVELS.length - 1, Math.max(0, current + delta))
+  return DRAWER_ZOOM_LEVELS[next]
+}
+
+export function raiseDrawerZoom(zoom) {
+  return stepDrawerZoom(zoom, 1)
+}
+
+export function lowerDrawerZoom(zoom) {
+  return stepDrawerZoom(zoom, -1)
+}
+
+/**
+ * Esc 的归属（A1/A2）：弹层优先关弹层，其次全屏/拉高逐档还原，
+ * 都已经是最内层时返回 none，把 Esc 让给画布（退出全览等）。
+ */
+export function drawerEscapeAction({ overlayOpen = false, zoom = 'normal' } = {}) {
+  if (overlayOpen === true) return 'close-overlay'
+  return normalizeDrawerZoom(zoom) === 'normal' ? 'none' : 'restore-zoom'
 }
 
 // ── 轮询成本与增量窗口（M5；纯函数，SSR 不跑 useEffect 也能单测）──────────
@@ -994,6 +1070,15 @@ export function eventSummary(event) {
       if (data.stopReason) parts.push(text(data.stopReason))
       break
     }
+    case 'agent/message': {
+      // §8.2：assistant 可见文本。列表行只放一段可读摘录，全文在节点详情/弹层里。
+      const raw = typeof data.text === 'string' ? data.text : ''
+      const chars = [...raw]
+      parts.push(text(data.role, 'assistant'))
+      parts.push(chars.length > 120 ? chars.slice(0, 120).join('') + '…' : raw)
+      if (data.truncated === true) parts.push('已截断')
+      break
+    }
     case 'tool/call':
       parts.push(text(data.name, '工具'))
       parts.push(data.ok === true ? '成功' : data.ok === false ? '失败' : '结果未记录')
@@ -1176,6 +1261,374 @@ export function nodeTokenInfo(summary, nodeId) {
   if (!isObject(entry)) return null
   const info = readUsage(entry.tokens || entry.usage || entry.tokenUsage || entry)
   return info.recorded ? info : null
+}
+
+// ── 节点运行详情（B：agent 到底在干什么）──────────────────────────────────
+// 全部数据来自已有契约：summary.activity（05 §8.3）、progress.nodes、detail.nodes
+// 与事件流里的 agent/message · tool/call · model/call · artifact/write · member/*。
+// 每个字段缺失都降级成可读占位，不抛错（沿用本模块的防守口径）。
+
+function asText(value) {
+  return typeof value === 'string' ? value : ''
+}
+
+/** 按 Unicode 码点截断（不切断代理对）；用于单行摘录，全文不过这里。 */
+function clipChars(value, max = 200) {
+  const raw = asText(value)
+  const chars = [...raw]
+  return chars.length <= max ? raw : chars.slice(0, max).join('') + '…'
+}
+
+function formatBytes(value) {
+  const size = optionalNum(value)
+  if (size === null) return '字节数未记录'
+  if (size < 1024) return size + 'B'
+  if (size < 1024 * 1024) return (size / 1024).toFixed(1) + 'KB'
+  return (size / (1024 * 1024)).toFixed(1) + 'MB'
+}
+
+/** 执行方式文案：单 agent / 主管 + 成员。缺失不猜。 */
+export function modeTextOf(mode) {
+  const key = asText(mode).toLowerCase()
+  if (key === 'team') return '主管 + 成员'
+  if (key === 'single') return '单个 agent'
+  return '执行方式未记录'
+}
+
+function memberLabelOf(memberId, name) {
+  if (asText(name) !== '') return name
+  return asText(memberId) === '' ? '主管' : memberId
+}
+
+/**
+ * 该节点最近的 agent 可见文本（§8.3）。优先 `summary.activity.nodes[nodeId]`
+ * （Host 已按每节点 ≤5 条聚合），缺失时回退到事件窗口里同节点的 `agent/message`
+ * ——运行中 summary 还没收口，只能靠事件增量刷新（B5）。
+ */
+export function activityMessagesOf(summary, events, nodeId, limit = AGENT_ACTIVITY_LIMIT) {
+  const id = text(nodeId, '')
+  const max = Math.max(1, Math.floor(num(limit, AGENT_ACTIVITY_LIMIT)))
+  const nodes = isObject(summary) && isObject(summary.activity) && isObject(summary.activity.nodes)
+    ? summary.activity.nodes
+    : null
+  const collected = []
+  if (nodes && Array.isArray(nodes[id])) {
+    for (const item of nodes[id]) {
+      if (!isObject(item)) continue
+      const body = asText(item.text)
+      if (body === '') continue
+      collected.push({
+        text: body,
+        at: asText(item.at),
+        memberId: asText(item.memberId),
+        truncated: item.truncated === true,
+        fromSummary: true,
+      })
+    }
+  }
+  if (collected.length === 0) {
+    for (const event of sortEventsAsc(events)) {
+      if (!isObject(event) || text(event.kind, '') !== 'agent/message') continue
+      if (text(event.nodeId, '') !== id) continue
+      const data = isObject(event.data) ? event.data : {}
+      const body = asText(data.text)
+      if (body === '') continue
+      collected.push({
+        text: body,
+        at: asText(event.ts),
+        memberId: asText(event.memberId),
+        truncated: data.truncated === true,
+        fromSummary: false,
+      })
+    }
+  }
+  return collected.slice(-max)
+}
+
+/** 该节点最近的工具调用（名字 + 参数摘要 + 结果状态），最新在前。 */
+export function nodeToolsOf(events, nodeId, limit = NODE_TOOL_LIMIT) {
+  const id = text(nodeId, '')
+  const max = Math.max(1, Math.floor(num(limit, NODE_TOOL_LIMIT)))
+  const rows = []
+  for (const event of sortEventsAsc(events)) {
+    if (!isObject(event) || text(event.kind, '') !== 'tool/call') continue
+    if (text(event.nodeId, '') !== id) continue
+    const data = isObject(event.data) ? event.data : {}
+    const ok = data.ok === true ? true : data.ok === false ? false : null
+    rows.push({
+      key: eventKey(event),
+      name: asText(data.name) || '未知工具',
+      argsText: clipChars(data.argumentsDigest !== undefined ? data.argumentsDigest : data.arguments, 200),
+      ok,
+      okText: ok === true ? '成功' : ok === false ? '失败' : '结果未记录',
+      durationMs: optionalNum(data.durationMs),
+      durationText: formatDuration(data.durationMs),
+      at: asText(event.ts),
+      timeText: formatEventTime(event.ts),
+      memberId: asText(event.memberId),
+    })
+  }
+  return rows.slice(-max).reverse()
+}
+
+/** 该节点已写产物（路径 + 字节数 + kind），最新在前。 */
+export function nodeArtifactsOf(events, nodeId, limit = NODE_ARTIFACT_LIMIT) {
+  const id = text(nodeId, '')
+  const max = Math.max(1, Math.floor(num(limit, NODE_ARTIFACT_LIMIT)))
+  const rows = []
+  for (const event of sortEventsAsc(events)) {
+    if (!isObject(event) || text(event.kind, '') !== 'artifact/write') continue
+    if (text(event.nodeId, '') !== id) continue
+    const data = isObject(event.data) ? event.data : {}
+    const path = asText(data.path)
+    if (path === '') continue
+    rows.push({
+      key: eventKey(event),
+      path,
+      bytes: optionalNum(data.bytes),
+      bytesText: formatBytes(data.bytes),
+      kind: asText(data.kind) || '文件',
+      at: asText(event.ts),
+      timeText: formatEventTime(event.ts),
+    })
+  }
+  return rows.slice(-max).reverse()
+}
+
+/**
+ * 该节点 token 四桶：先取 `summary.tokens.byNode`（nodeTokenInfo），
+ * 运行中 summary 未收口时回退到事件流里的 `model/call`（B4）。
+ * 两者都没有返回 null，UI 写「未记录」，不拿 0 冒充。
+ */
+export function nodeUsageOf(events, nodeId) {
+  const id = text(nodeId, '')
+  const acc = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, total: 0 }
+  let calls = 0
+  let recorded = false
+  for (const event of sortEventsAsc(events)) {
+    if (!isObject(event) || text(event.kind, '') !== 'model/call') continue
+    if (text(event.nodeId, '') !== id) continue
+    const data = isObject(event.data) ? event.data : {}
+    const usage = readUsage(data.usage !== undefined ? data.usage : data)
+    if (!usage.recorded) continue
+    recorded = true
+    calls += 1
+    for (const key of ['input', 'cacheRead', 'cacheWrite', 'output', 'reasoning']) {
+      acc[key] += usage.missing && usage.missing.includes(key) ? 0 : num(usage[key], 0)
+    }
+    acc.total += num(usage.total, 0)
+  }
+  if (!recorded) return null
+  return { ...acc, recorded: true, missing: [], calls }
+}
+
+/**
+ * 节点「运行详情」的数据模型（B4/B5/B6）：一次把面板要显示的字段算齐。
+ *
+ * 数据来源（绝不写死）：
+ *  - 标题 / 执行方式：事件流 `node/start.data.title|mode`，缺失退回 detail/ summary / nodeId；
+ *  - 状态 / attempt / 返工：`deriveNodeStates()`（progress.nodes + 事件 + live，同画布口径）；
+ *  - 最近在做什么：`summary.activity.nodes[nodeId]`，运行中回退 `agent/message` 事件；
+ *  - 工具 / 产物 / token / 成员：`tool/call`、`artifact/write`、`model/call`、`member/*` 事件；
+ *  - 失败原因：`node/end.extra.reason` 或 `run/end.data.reason`。
+ *
+ * @param {{summary?: object, detail?: object, events?: object[], nodeId?: string,
+ *   live?: object, progress?: object, runStatus?: string}} input
+ */
+export function nodeActivityOf(input = {}) {
+  const summary = isObject(input.summary) ? input.summary : null
+  const detail = isObject(input.detail) ? input.detail : null
+  const events = Array.isArray(input.events) ? input.events.filter(isObject) : []
+  const id = text(input.nodeId, '')
+  const runStatus = asText(input.runStatus)
+  const running = runStatus.toLowerCase() === 'running'
+  const detailEntry = lookupNodeEntry([detail && detail.nodes], id)
+  const summaryNode = lookupNodeEntry([summary && summary.nodes, summary && summary.byNode], id)
+
+  // 标题 / 执行方式：以最近一条 node/start 为准（重跑时 title 可能被改）。
+  let title = asText(detailEntry && detailEntry.title)
+  let mode = asText(summaryNode && summaryNode.mode)
+  let role = asText(summaryNode && summaryNode.role) || asText(detailEntry && detailEntry.role)
+  const attemptsSeen = []
+  let eventCount = 0
+  for (const event of sortEventsAsc(events)) {
+    if (text(event.nodeId, '') !== id) continue
+    eventCount += 1
+    const data = isObject(event.data) ? event.data : {}
+    if (event.kind === 'node/start') {
+      if (asText(data.title) !== '') title = data.title
+      if (asText(data.mode) !== '') mode = data.mode
+      if (asText(data.role) !== '') role = data.role
+    }
+    if (event.attemptId !== undefined && event.attemptId !== null) {
+      const attempt = optionalNum(event.attemptId)
+      if (attempt !== null && !attemptsSeen.includes(attempt)) attemptsSeen.push(attempt)
+    }
+  }
+  if (title === '') title = id
+
+  const states = deriveNodeStates({
+    nodes: id === '' ? [] : [{ id }],
+    events,
+    live: input.live,
+    runStatus,
+    progress: input.progress,
+  })
+  const state = id !== '' && states[id]
+    ? states[id]
+    : { ...nodeStateInfo('idle'), state: 'idle', attempt: null, reworkCount: 0, current: false, invalidated: false }
+
+  // attempt：状态推导优先；没有再取 detail.attempts 的最后一个 / 事件里最大 attempt。
+  let attempt = state.attempt
+  if (attempt === null && detailEntry && Array.isArray(detailEntry.attempts)) {
+    const last = detailEntry.attempts[detailEntry.attempts.length - 1]
+    attempt = last ? optionalNum(last.attemptId) : null
+  }
+  if (attempt === null && attemptsSeen.length > 0) attempt = Math.max(...attemptsSeen)
+
+  // 成员：member/start 提供名字与角色，member/end 提供状态，agent/message 补最近发言。
+  const memberMap = new Map()
+  const touchMember = (memberId, patch = {}) => {
+    const key = asText(memberId)
+    const current = memberMap.get(key) || {
+      id: key, name: '', role: '', state: '', lastText: '', lastAt: '',
+    }
+    memberMap.set(key, { ...current, ...patch })
+  }
+  for (const event of sortEventsAsc(events)) {
+    if (text(event.nodeId, '') !== id) continue
+    const data = isObject(event.data) ? event.data : {}
+    if (event.kind === 'member/start') {
+      touchMember(event.memberId, {
+        name: asText(data.name),
+        role: asText(data.role),
+        state: 'running',
+      })
+    } else if (event.kind === 'member/end') {
+      touchMember(event.memberId, { state: asText(data.status) || 'done' })
+    } else if (event.kind === 'agent/message') {
+      const body = asText(data.text)
+      if (body !== '') touchMember(event.memberId, { lastText: body, lastAt: asText(event.ts) })
+    }
+  }
+  const rawMessages = activityMessagesOf(summary, events, id)
+  for (const message of rawMessages) {
+    if (message.text === '') continue
+    touchMember(message.memberId, { lastText: message.text, lastAt: message.at })
+  }
+  const memberName = memberId => {
+    const key = asText(memberId)
+    const entry = memberMap.get(key)
+    return entry ? entry.name : ''
+  }
+  const members = [...memberMap.values()]
+    .filter(entry => entry.id !== '' || entry.name !== '' || entry.role !== '' || entry.lastText !== '')
+    .map(entry => ({
+      id: entry.id,
+      label: memberLabelOf(entry.id, entry.name),
+      role: entry.role,
+      state: entry.state,
+      statusText: entry.state === '' ? '状态未记录' : statusText(entry.state),
+      lastText: entry.lastText,
+      lastAt: entry.lastAt,
+      timeText: entry.lastAt === '' ? '—' : formatEventTime(entry.lastAt),
+    }))
+    .sort((a, b) => {
+      // 主管（memberId 为空）排最前，其余按 label 稳定排序。
+      if (a.id === '' && b.id !== '') return -1
+      if (b.id === '' && a.id !== '') return 1
+      return a.label.localeCompare(b.label)
+    })
+
+  const messages = rawMessages.map((message, index) => ({
+    key: 'msg-' + index + '-' + (message.at || ''),
+    text: message.text,
+    at: message.at,
+    timeText: message.at === '' ? '—' : formatEventTime(message.at),
+    memberId: message.memberId,
+    memberLabel: memberLabelOf(message.memberId, memberName(message.memberId)),
+    truncated: message.truncated === true,
+    fromSummary: message.fromSummary === true,
+  }))
+
+  // 失败原因：节点级优先，其次运行级（run 结束时也要能看见为什么挂）。
+  let nodeFailure = ''
+  let runFailure = ''
+  for (const event of sortEventsAsc(events)) {
+    const data = isObject(event.data) ? event.data : {}
+    const extra = isObject(event.extra) ? event.extra : {}
+    if (event.kind === 'node/end' && text(event.nodeId, '') === id
+      && asText(data.status).toLowerCase() === 'failed') {
+      nodeFailure = asText(extra.reason) || asText(data.reason) || asText(data.error) || '节点失败，没写原因'
+    }
+    if (event.kind === 'run/end' && asText(data.status).toLowerCase() === 'failed') {
+      runFailure = asText(extra.reason) || asText(data.reason) || '运行失败，没写原因'
+    }
+  }
+  const failureReason = nodeFailure || (runStatus.toLowerCase() === 'failed' ? runFailure : '')
+
+  const summaryTokens = nodeTokenInfo(summary, id)
+  const eventTokens = summaryTokens === null ? nodeUsageOf(events, id) : null
+  const tokens = summaryTokens || eventTokens
+
+  const tools = nodeToolsOf(events, id)
+  const artifacts = nodeArtifactsOf(events, id)
+  const activityFromSummary = Boolean(
+    isObject(summary) && isObject(summary.activity) && isObject(summary.activity.nodes)
+      && Array.isArray(summary.activity.nodes[id]) && summary.activity.nodes[id].length > 0,
+  )
+
+  return {
+    nodeId: id,
+    title,
+    mode,
+    modeText: modeTextOf(mode),
+    role,
+    state: state.state || 'idle',
+    stateLabel: state.label,
+    stateGlyph: state.glyph,
+    stateTone: state.tone,
+    current: state.current === true,
+    attempt,
+    reworkCount: num(state.reworkCount, 0),
+    running,
+    eventCount: detailEntry ? num(detailEntry.eventCount, eventCount) : eventCount,
+    attemptCount: attemptsSeen.length,
+    messages,
+    lastMessage: messages.length > 0 ? messages[messages.length - 1] : null,
+    tools,
+    lastTool: tools.length > 0 ? tools[0] : null,
+    tokens,
+    tokenText: tokenLine(tokens),
+    tokenSource: summaryTokens ? 'summary' : eventTokens ? 'events' : '',
+    members,
+    artifacts,
+    lastArtifact: artifacts.length > 0 ? artifacts[0] : null,
+    failureReason,
+    activityFromSummary,
+    hasActivity: messages.length > 0 || tools.length > 0 || artifacts.length > 0
+      || members.length > 0 || Boolean(failureReason),
+  }
+}
+
+/**
+ * 事件里值得「展开全文」的长文本（B2）：agent 消息、错误 / 原因 / 校验详情。
+ * 只认字符串字段，短句返回空串，不制造多余的弹层入口。
+ */
+export function eventLongTextOf(event, minChars = LONG_TEXT_MIN_CHARS) {
+  if (!isObject(event)) return ''
+  const data = isObject(event.data) ? event.data : {}
+  const extra = isObject(event.extra) ? event.extra : {}
+  const candidates = [
+    data.text, extra.reason, data.reason, data.detail,
+    data.validationError, data.error, data.message,
+  ]
+  const floor = Math.max(1, Math.floor(num(minChars, LONG_TEXT_MIN_CHARS)))
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue
+    if ([...candidate].length >= floor) return candidate
+  }
+  return ''
 }
 
 function severityCounts(entry) {
@@ -1423,6 +1876,105 @@ export function isStaleLoad({ requestId, latestRequestId, runId, selectedRunId }
 // ── 组件 ──────────────────────────────────────────────────────────────────
 
 /**
+ * 完整文本弹层（A2）：长 agent 消息 / 错误 / reason 的全文，可滚动、可复制。
+ * 打开时焦点进入关闭按钮，Esc 关闭并由调用方把焦点归还给触发元素。
+ * 单独导出便于 SSR 直接断言「弹层内容包含完整文本」。
+ */
+export function LogTextOverlay({
+  title = '完整文本',
+  text = '',
+  onClose = () => {},
+} = {}) {
+  const { useEffect, useRef, useState } = rt.React
+  const panelRef = useRef(null)
+  const closeRef = useRef(null)
+  const [copyState, setCopyState] = useState('')
+  const body = typeof text === 'string' ? text : ''
+
+  useEffect(() => {
+    const node = closeRef.current
+    if (node && typeof node.focus === 'function') node.focus()
+  }, [])
+
+  const copyAll = () => {
+    copyText(body).then(
+      () => setCopyState('已复制'),
+      () => setCopyState('复制失败'),
+    )
+  }
+
+  const onKeyDown = event => {
+    if (!event || typeof event.key !== 'string') return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      onClose()
+      return
+    }
+    // 焦点困在弹层里：Tab / Shift+Tab 在可聚焦元素之间循环。
+    if (event.key !== 'Tab') return
+    const panel = panelRef.current
+    if (!panel || typeof panel.querySelectorAll !== 'function') return
+    const focusables = [...panel.querySelectorAll('button, [href], [tabindex]:not([tabindex="-1"])')]
+      .filter(node => node && node.disabled !== true)
+    if (focusables.length === 0) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    const active = typeof document !== 'undefined' ? document.activeElement : null
+    if (event.shiftKey && active === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
+  return h('div', {
+    className: 'fs-log-overlay',
+    role: 'presentation',
+    onClick: event => {
+      if (event && event.target === event.currentTarget) onClose()
+    },
+  },
+  h('div', {
+    className: 'fs-log-overlay-panel',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': text === '' ? title : title + '：' + clipForLabel(body, 60),
+    tabIndex: -1,
+    ref: panelRef,
+    onKeyDown,
+  },
+  h('div', { className: 'fs-log-overlay-head' },
+    h('span', { className: 'fs-log-overlay-title' }, title || '完整文本'),
+    h('div', { className: 'fs-log-overlay-actions' },
+      h('button', {
+        type: 'button',
+        className: 'fs-log-mini',
+        onClick: copyAll,
+        'aria-label': '复制完整文本',
+      }, copyState || '复制全文'),
+      h('button', {
+        type: 'button',
+        className: 'fs-log-mini',
+        onClick: onClose,
+        ref: closeRef,
+        'aria-label': '关闭完整文本（Esc）',
+      }, '关闭'))),
+  h('pre', {
+    className: 'fs-log-overlay-text',
+    tabIndex: 0,
+    'aria-label': '完整文本内容，可滚动',
+  }, body === '' ? '（没有可显示的文本）' : body)))
+}
+
+function clipForLabel(value, max = 60) {
+  const chars = [...asText(value)]
+  return chars.length <= max ? chars.join('') : chars.slice(0, max).join('') + '…'
+}
+
+/**
  * @param {object} [props]
  * @param {boolean} [props.open] 展开态（由 page.js 的 Ctrl/Cmd+J 控制）。
  * @param {() => void} [props.onToggle] 收起/展开。
@@ -1435,12 +1987,16 @@ export function isStaleLoad({ requestId, latestRequestId, runId, selectedRunId }
  * @param {object} [props.initialDetail] 预置 run 详情。
  * @param {Array|object} [props.initialEvents] 预置事件。
  * @param {string} [props.initialSelectedEventKey] 预选事件的稳定键。
+ * @param {string} [props.initialSelectedNodeId] 预选中节点（直接打开节点运行详情）。
+ * @param {'normal'|'tall'|'full'} [props.initialZoom] 预置高度档（SSR / 测试用）。
  * @param {string} [props.initialError] 预置错误文案（SSR / 测试用）。
  * @param {number} [props.pollMs] 轮询间隔，默认 5000。
  * @param {(snapshot: object) => void} [props.onRunSnapshot] 把选中 run 的实时快照
  *   （run/live/events/summary）回传给 page，供顶栏与画布节点状态使用。
  * @param {{id: string, nonce: number}|null} [props.focusRun] 要求切到某个 run
  *   （开始运行后由 page 指定）；nonce 变化即重新聚焦。
+ * @param {{kind: string, id: string}|null} [props.focusNode] 画布当前选中的节点；
+ *   抽屉展开时用它打开节点运行详情（点节点即可看该 agent 在干什么）。
  * @param {number} [props.syncToken] 变化时立即强制刷新一次（开始 / 停止后）。
  */
 export function FsLogDrawer({
@@ -1455,10 +2011,13 @@ export function FsLogDrawer({
   initialDetail = null,
   initialEvents = null,
   initialSelectedEventKey = '',
+  initialSelectedNodeId = '',
+  initialZoom = 'normal',
   initialError = '',
   pollMs = POLL_MS,
   onRunSnapshot = null,
   focusRun = null,
+  focusNode = null,
   syncToken = 0,
 } = {}) {
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
@@ -1488,6 +2047,14 @@ export function FsLogDrawer({
   const [activeIndex, setActiveIndex] = useState(0)
   const [selectedEventKey, setSelectedEventKey] = useState(text(initialSelectedEventKey, ''))
   const [copyState, setCopyState] = useState('')
+  /** 高度档（A1）：默认 / 拉高 / 全屏；Esc 逐档往回退。 */
+  const [zoom, setZoom] = useState(() => normalizeDrawerZoom(initialZoom))
+  /** 右侧详情列当前展示的节点（B4）：点节点或事件里的节点名打开。 */
+  const [selectedNodeId, setSelectedNodeId] = useState(text(initialSelectedNodeId, ''))
+  /** 三个区域各自可独立收起 / 展开（A2）：指标、事件列表、详情（事件或节点）。 */
+  const [collapsedSections, setCollapsedSections] = useState({ metrics: false, events: false, node: false })
+  /** 长文本弹层（A2）：{ title, text } | null。 */
+  const [overlay, setOverlay] = useState(null)
   /**
    * 与抽屉选中解耦的「当前流程最近活动 run」观测窗口（M2）。
    * 抽屉点历史 run 时，顶栏 / 画布仍看这条；运行中的优先。
@@ -1511,6 +2078,11 @@ export function FsLogDrawer({
   /** run 列表也有代次：两次列表请求乱序返回时，旧列表不能覆盖新列表。 */
   const listRequest = useRef(0)
   const listRef = useRef(null)
+  /** 高度按钮 / 弹层的焦点归还（A1/A2；SSR 下 ref 为 null，effect 不跑）。 */
+  const raiseZoomRef = useRef(null)
+  const restoreZoomRef = useRef(null)
+  const overlayReturnRef = useRef(null)
+  const previousZoom = useRef(normalizeDrawerZoom(initialZoom))
   /**
    * 刚创建 / 刚聚焦的 run 可能还没出现在列表里；这段时间内列表刷新不许把选中项
    * 切回列表第一条（否则开始运行后 2s 内抽屉会跳到别的 run）。
@@ -1822,6 +2394,7 @@ export function FsLogDrawer({
       setTruncated(false)
       setDetailError('')
       setEventsError('')
+      setSelectedNodeId('')
       return
     }
     if (renderedRun.current !== selectedRunId) {
@@ -1834,6 +2407,7 @@ export function FsLogDrawer({
       setTruncated(false)
       setEventsError('')
       setSelectedEventKey('')
+      setSelectedNodeId('')
       setPage(1)
     }
     void loadDetail(selectedRunId)
@@ -1862,6 +2436,18 @@ export function FsLogDrawer({
     void loadRuns({ silent: true })
     // nonce 变化时即使 id 相同也重新聚焦（例如对同一个 run 再次点运行）。
   }, [focusRun && focusRun.id, focusRun && focusRun.nonce, loadRuns])
+
+  /**
+   * B4：画布选中节点 → 抽屉右侧切到该节点的运行详情（「点节点」的接线）。
+   * 只在展开态跟随；用户点「关闭」后不会每帧被重置（依赖是 selection 对象 + open）。
+   */
+  useEffect(() => {
+    const id = text(focusNode && focusNode.id, '')
+    if (!open || id === '') return
+    setSelectedNodeId(id)
+    setCollapsedSections(current => (current.node ? { ...current, node: false } : current))
+    // selection 每次点节点都是新对象：同一节点再点一次也能重新打开面板。
+  }, [focusNode, open])
 
   /** 开始 / 停止后由 page 触发一次强制刷新：立刻拿到新状态与新 run。 */
   useEffect(() => {
@@ -2073,6 +2659,35 @@ export function FsLogDrawer({
   /** 06 §11：`live.currentNodeId` 对应的事件行高亮（文字仍是主通道）。 */
   const liveNodeId = currentLive ? text(currentLive.currentNodeId, '') : ''
 
+  /**
+   * 节点运行详情的数据（B4/B5/B6）：消费 summary.activity / detail.nodes /
+   * progress.nodes / 事件流；运行中由轮询把新事件送进来，面板自然跟着刷新。
+   */
+  const progressSource = (feedRun && isObject(feedRun.progress) ? feedRun.progress : null)
+    || (detail && isObject(detail.progress) ? detail.progress : null)
+    || (detailRun && isObject(detailRun.progress) ? detailRun.progress : null)
+  const nodeActivity = selectedNodeId === ''
+    ? null
+    : nodeActivityOf({
+      summary,
+      detail,
+      events,
+      live: currentLive,
+      progress: progressSource,
+      nodeId: selectedNodeId,
+      runStatus: feedRun ? runStatusOf(feedRun) : '',
+    })
+
+  /** 区域收起 / 展开按钮（A2）：事件列表、指标、详情各一份。 */
+  const sectionToggle = (key, label) => h('button', {
+    type: 'button',
+    className: 'fs-log-mini fs-log-region-toggle',
+    'aria-expanded': collapsedSections[key] ? 'false' : 'true',
+    'aria-label': (collapsedSections[key] ? '展开' : '收起') + label,
+    title: (collapsedSections[key] ? '展开' : '收起') + label,
+    onClick: () => toggleSection(key),
+  }, collapsedSections[key] ? '展开' : '收起')
+
   const runTitle = feedRun
     ? feedRun.name
     : runError !== ''
@@ -2092,6 +2707,86 @@ export function FsLogDrawer({
 
   const refresh = () => { void refreshAll({ force: true }) }
 
+  // ── 放大 / 弹层 / 节点详情的交互（A1–A2）────────────────────────────────
+  const zoomInfo = drawerZoomInfo(zoom)
+
+  /** 打开完整文本弹层：记住触发元素，关闭时把焦点还回去。 */
+  const openOverlay = (title, fullText) => {
+    if (typeof document !== 'undefined') overlayReturnRef.current = document.activeElement
+    setOverlay({ title: text(title, '完整文本'), text: asText(fullText) })
+  }
+
+  const closeOverlay = () => {
+    setOverlay(null)
+    const target = overlayReturnRef.current
+    overlayReturnRef.current = null
+    if (target && typeof target.focus === 'function') target.focus()
+  }
+
+  const applyZoom = next => {
+    setZoom(normalizeDrawerZoom(next))
+  }
+
+  const openNode = nodeId => {
+    const key = text(nodeId, '')
+    if (key === '') return
+    setSelectedNodeId(key)
+    setCollapsedSections(current => (current.node ? { ...current, node: false } : current))
+  }
+
+  const toggleSection = key => {
+    setCollapsedSections(current => ({ ...current, [key]: !current[key] }))
+  }
+
+  /** Esc 归属：先关弹层，再逐档还原；两件都不沾时把 Esc 留给画布。 */
+  const handleEscape = () => {
+    const action = drawerEscapeAction({ overlayOpen: overlay !== null, zoom })
+    if (action === 'close-overlay') {
+      closeOverlay()
+      return true
+    }
+    if (action === 'restore-zoom') {
+      setZoom(current => lowerDrawerZoom(current))
+      return true
+    }
+    return false
+  }
+
+  /**
+   * 全屏 / 弹层打开时在 document 捕获阶段接 Esc：焦点可能已经不在抽屉里
+   * （用户点回画布），只在抽屉自己 listen 会漏掉。拦截后不再冒泡给 page.js。
+   */
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') {
+      return undefined
+    }
+    if (zoom === 'normal' && overlay === null) return undefined
+    const onKey = event => {
+      if (!event || event.key !== 'Escape') return
+      if (!handleEscape()) return
+      if (typeof event.preventDefault === 'function') event.preventDefault()
+      if (typeof event.stopPropagation === 'function') event.stopPropagation()
+    }
+    document.addEventListener('keydown', onKey, true)
+    return () => document.removeEventListener('keydown', onKey, true)
+  }, [zoom, overlay]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** 全屏打开时焦点进入「还原」；退回默认高度时焦点还给「放大」。 */
+  useEffect(() => {
+    const previous = previousZoom.current
+    if (previous === zoom) return
+    previousZoom.current = zoom
+    const target = zoom === 'normal' ? raiseZoomRef.current : restoreZoomRef.current
+    if (target && typeof target.focus === 'function') target.focus()
+  }, [zoom])
+
+  /** 收起抽屉回到默认高度，避免下次 Ctrl/Cmd+J 打开时仍在全屏。 */
+  useEffect(() => {
+    if (open) return
+    setZoom('normal')
+    setOverlay(null)
+  }, [open])
+
   const copyRunId = () => {
     if (!selectedRunId) return
     copyText(selectedRunId).then(
@@ -2107,12 +2802,15 @@ export function FsLogDrawer({
     const key = event.key
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', 'Escape'].includes(key)) return
     // 只在这里吞掉事件流的四个导航键；C / Delete / 其它方向键继续归 page.js。
-    event.stopPropagation()
     if (key === 'Escape') {
+      // 全屏 / 拉高时 Esc 先还原档位（抽屉级处理），不在这里清选中事件。
+      if (zoom !== 'normal') return
       event.preventDefault()
+      event.stopPropagation()
       setSelectedEventKey('')
       return
     }
+    event.stopPropagation()
     event.preventDefault()
     if (pageEvents.length === 0) return
     if (key === 'ArrowDown') setActiveIndex(current => moveIndex(current, 1, pageEvents.length))
@@ -2160,6 +2858,7 @@ export function FsLogDrawer({
             holdSelection.current = { id: '', until: 0 }
             setSelectedRunId(run.id)
             setSelectedEventKey('')
+            setSelectedNodeId('')
             setPage(1)
           },
         },
@@ -2203,6 +2902,20 @@ export function FsLogDrawer({
     h('span', { className: 'fs-log-glyph', 'aria-hidden': true }, eventGlyph(event.kind)),
     h('span', { className: 'fs-log-ts', title: text(event.ts, '') }, formatEventTime(event.ts)),
     h('span', { className: 'fs-log-kind' }, text(event.kind, '未识别')),
+    // B4：事件行里的节点名是「打开节点运行详情」的入口（点节点名而不是整行）。
+    text(event.nodeId, '') !== ''
+      ? h('button', {
+        type: 'button',
+        className: 'fs-log-node-chip',
+        title: '查看节点「' + (nodeTitles.get(text(event.nodeId, '')) || text(event.nodeId, '')) + '」的运行详情',
+        'aria-label': '查看节点「'
+          + (nodeTitles.get(text(event.nodeId, '')) || text(event.nodeId, '')) + '」的运行详情',
+        onClick: click => {
+          if (click && typeof click.stopPropagation === 'function') click.stopPropagation()
+          openNode(text(event.nodeId, ''))
+        },
+      }, nodeTitles.get(text(event.nodeId, '')) || text(event.nodeId, ''))
+      : null,
     // m10：当前节点事件行除了左侧竖条，还要有「当前」文字徽标（文字是主通道）。
     liveNodeId !== '' && text(event.nodeId, '') === liveNodeId
       ? h('span', { className: 'fs-log-current-badge' }, '当前')
@@ -2223,11 +2936,20 @@ export function FsLogDrawer({
       loadedCount: events.length,
     })
     const ref = refLabel(detailEvent.ref)
+    const longText = eventLongTextOf(detailEvent)
     return h('div', { className: 'fs-log-detail-body' },
       h('div', { className: 'fs-log-detail-meta' },
         eventGlyph(detailEvent.kind) + ' ' + text(detailEvent.kind, '未识别事件类型')
         + ' · ' + formatEventTime(detailEvent.ts)
         + (detailEvent.attemptId !== undefined ? ' · 第 ' + text(detailEvent.attemptId) + ' 次尝试' : '')),
+      longText !== ''
+        ? h('button', {
+          type: 'button',
+          className: 'fs-log-mini fs-log-more',
+          onClick: () => openOverlay('事件全文 · ' + text(detailEvent.kind, '事件'), longText),
+          'aria-label': '展开全文：' + text(detailEvent.kind, '事件'),
+        }, '展开全文')
+        : null,
       h('pre', { className: 'fs-log-json' }, safeJson(detailEvent)),
       h('div', { className: 'fs-log-ref' },
         'ref：' + (ref === '' ? '无（没有指回原始会话日志）' : ref)),
@@ -2238,13 +2960,158 @@ export function FsLogDrawer({
             '节点 · ' + (nodeTitles.get(nodeId) || nodeId)),
           h('div', { className: 'fs-log-node-line' }, 'token：' + tokenLine(tokens)),
           h('div', { className: 'fs-log-node-line' }, 'findings：' + findingsLine),
-          onJumpToNode
-            ? h('button', {
+          h('div', { className: 'fs-log-node-actions' },
+            h('button', {
               type: 'button',
               className: 'fs-log-mini',
-              onClick: () => onJumpToNode(nodeId),
-            }, '跳回画布 · 定位节点')
-            : null))
+              onClick: () => openNode(nodeId),
+              'aria-label': '查看节点「' + (nodeTitles.get(nodeId) || nodeId) + '」的运行详情',
+            }, '查看节点运行详情'),
+            onJumpToNode
+              ? h('button', {
+                type: 'button',
+                className: 'fs-log-mini',
+                onClick: () => onJumpToNode(nodeId),
+              }, '跳回画布 · 定位节点')
+              : null)))
+  }
+
+  /**
+   * 节点运行详情面板（B4）：角色/模式、状态、attempt、最近 agent 消息（带时间）、
+   * 最近工具调用（名字 + 参数摘要 + 结果）、token 用量、成员活动、已写产物、
+   * 失败原因。字段缺失一律显示可读占位。
+   */
+  const renderNodePanel = () => {
+    if (!nodeActivity) return null
+    const activity = nodeActivity
+    const nodeTitle = activity.title || activity.nodeId || '未命名节点'
+    const statusLine = (activity.stateGlyph || '○') + ' ' + (activity.stateLabel || '状态未知')
+    const messageBlock = activity.messages.length === 0
+      ? h('div', { className: 'fs-log-empty-inline' },
+        '还没有 agent 消息'
+        + (activity.running ? '（等待首个模型输出）' : '（本次运行没有记录 agent 文本）'))
+      : activity.messages.map(message => h('div', { className: 'fs-log-msg', key: message.key },
+        h('div', { className: 'fs-log-msg-meta' },
+          h('span', { className: 'fs-log-msg-who' }, message.memberLabel),
+          h('span', { className: 'fs-log-msg-time' }, message.timeText),
+          message.truncated ? h('span', { className: 'fs-log-msg-flag' }, '已截断') : null),
+        h('div', { className: 'fs-log-msg-text' }, message.text),
+        h('button', {
+          type: 'button',
+          className: 'fs-log-mini fs-log-more',
+          onClick: () => openOverlay('agent 消息 · ' + nodeTitle, message.text),
+          'aria-label': '展开全文：' + nodeTitle + ' 的 agent 消息',
+        }, '展开全文')))
+    const toolBlock = activity.tools.length === 0
+      ? h('div', { className: 'fs-log-empty-inline' }, '还没有工具调用记录')
+      : activity.tools.map(tool => h('div', { className: 'fs-log-tool', key: tool.key },
+        h('div', { className: 'fs-log-tool-line' },
+          h('span', { className: 'fs-log-tool-name' }, tool.name),
+          h('span', {
+            className: 'fs-log-tool-ok ' + (tool.ok === true ? 'ok' : tool.ok === false ? 'bad' : 'unknown'),
+          }, tool.okText),
+          h('span', { className: 'fs-log-tool-time' }, tool.timeText),
+          tool.durationText !== '' ? h('span', { className: 'fs-log-tool-time' }, tool.durationText) : null),
+        h('div', { className: 'fs-log-tool-args' }, tool.argsText === '' ? '参数摘要未记录' : tool.argsText)))
+    const memberBlock = activity.members.length === 0
+      ? h('div', { className: 'fs-log-empty-inline' },
+        activity.mode === 'team'
+          ? '成员还没有活动记录'
+          : (activity.mode === 'single' ? '单 agent 模式，没有成员活动' : '没有成员活动记录'))
+      : activity.members.map(member => h('div', { className: 'fs-log-member', key: 'member-' + member.id },
+        h('div', { className: 'fs-log-member-line' },
+          h('span', { className: 'fs-log-member-name' }, member.label),
+          member.role !== '' ? h('span', { className: 'fs-log-member-role' }, member.role) : null,
+          h('span', { className: 'fs-log-member-state' }, member.statusText)),
+        h('div', { className: 'fs-log-member-last' },
+          member.lastText === ''
+            ? '还没有发言'
+            : member.lastText),
+        member.lastText !== '' && [...member.lastText].length >= LONG_TEXT_MIN_CHARS
+          ? h('button', {
+            type: 'button',
+            className: 'fs-log-mini fs-log-more',
+            onClick: () => openOverlay('成员活动 · ' + member.label, member.lastText),
+            'aria-label': '展开全文：' + member.label + ' 的最近活动',
+          }, '展开全文')
+          : null,
+        member.lastText === '' ? null : h('div', { className: 'fs-log-member-time' }, member.timeText)))
+    const artifactBlock = activity.artifacts.length === 0
+      ? h('div', { className: 'fs-log-empty-inline' }, '还没有产物写入记录')
+      : activity.artifacts.map(artifact => h('div', { className: 'fs-log-artifact', key: artifact.key },
+        h('span', { className: 'fs-log-artifact-path', title: artifact.path }, artifact.path),
+        h('span', { className: 'fs-log-artifact-meta' },
+          artifact.kind + ' · ' + artifact.bytesText + ' · ' + artifact.timeText)))
+    const failureBlock = activity.failureReason === ''
+      ? null
+      : h('div', { className: 'fs-log-failure', role: 'alert' },
+        h('div', { className: 'fs-log-failure-title' }, '失败原因'),
+        h('div', { className: 'fs-log-failure-text' }, activity.failureReason),
+        [...activity.failureReason].length >= LONG_TEXT_MIN_CHARS
+          ? h('button', {
+            type: 'button',
+            className: 'fs-log-mini fs-log-more',
+            onClick: () => openOverlay('失败原因 · ' + nodeTitle, activity.failureReason),
+            'aria-label': '展开全文：' + nodeTitle + ' 的失败原因',
+          }, '展开全文')
+          : null)
+    return h('div', {
+      className: 'fs-log-node-panel',
+      'data-node-id': activity.nodeId,
+      'data-node-state': activity.state,
+    },
+    h('div', { className: 'fs-log-node-head' },
+      h('div', { className: 'fs-log-node-head-main' },
+        h('div', { className: 'fs-log-node-name' }, nodeTitle),
+        h('div', { className: 'fs-log-node-sub' },
+          activity.modeText + ' · ' + (activity.role === '' ? '角色未记录' : activity.role))),
+      h('div', { className: 'fs-log-node-head-side' },
+        activity.running
+          ? h('span', { className: 'fs-log-running' },
+            h('span', { className: 'fs-log-live-dot', 'aria-hidden': true }), '正在运行')
+          : null,
+        h('span', { className: 'fs-log-node-state ' + activity.stateTone, title: activity.stateLabel }, statusLine),
+        h('button', {
+          type: 'button',
+          className: 'fs-log-mini',
+          onClick: () => setSelectedNodeId(''),
+          'aria-label': '关闭节点运行详情，返回事件详情',
+        }, '关闭'))),
+    h('div', { className: 'fs-log-node-facts' },
+      h('span', { className: 'fs-log-fact' }, '状态：' + (activity.stateLabel || '状态未知')),
+      h('span', { className: 'fs-log-fact' },
+        'attempt：' + (activity.attempt === null ? '—' : String(activity.attempt))),
+      activity.reworkCount > 0 ? h('span', { className: 'fs-log-fact' }, '返工：' + activity.reworkCount + ' 次') : null,
+      h('span', { className: 'fs-log-fact' }, '事件：' + activity.eventCount + ' 条'),
+      onJumpToNode
+        ? h('button', {
+          type: 'button',
+          className: 'fs-log-mini',
+          onClick: () => onJumpToNode(activity.nodeId),
+        }, '跳回画布 · 定位节点')
+        : null),
+    failureBlock,
+    h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' },
+        '最近在做什么',
+        h('span', { className: 'fs-log-node-block-hint' },
+          activity.activityFromSummary ? '（summary.activity）' : '（事件流）')),
+      messageBlock),
+    h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' }, '最近工具调用'),
+      toolBlock),
+    h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' }, 'token 用量'),
+      h('div', { className: 'fs-log-node-line' }, 'token：' + activity.tokenText),
+      activity.tokenSource === 'events'
+        ? h('div', { className: 'fs-log-node-block-hint' }, 'summary 未回，按 model/call 事件合计')
+        : null),
+    h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' }, '成员活动'),
+      memberBlock),
+    h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' }, '已写产物'),
+      artifactBlock))
   }
 
   // 展开态明细：五项聚合（04 §3.2）+ token 四段；收起条只留验收通过率。
@@ -2271,7 +3138,7 @@ export function FsLogDrawer({
   // 收起态 40px（M4）：状态点 + 验收通过率主值 + 结论 pill；token 明细下沉到展开态。
   // m2：状态点与结论 pill 同源（都用 conclusion.tone），不再一个看 run 状态一个看质量。
   const dotTone = conclusion ? conclusion.tone : statusTone(runStatusOf(feedRun || {}))
-  const bar = h('div', { className: 'fs-log-bar' },
+  const bar = h('div', { className: 'fs-log-bar fs-log-bar-wrap' },
     h('button', {
       type: 'button',
       className: 'fs-log-toggle',
@@ -2307,13 +3174,47 @@ export function FsLogDrawer({
       : feedRun && runError !== ''
         ? h('span', { className: 'fs-log-note', title: runError }, '刷新失败')
         : null),
-    h('div', { className: 'fs-log-actions' },
+    h('div', { className: 'fs-log-actions fs-log-actions-wrap' },
       !feedRun && !open
         ? h('button', { type: 'button', className: 'fs-log-action', onClick: refresh, disabled: loading },
           loading ? '刷新中…' : '刷新')
         : null,
       open
         ? [
+          // A1：三档高度。放大 / 全屏 / 还原都常驻（默认档时后两者禁用），
+          // 不靠隐藏按钮来表达可用性；Esc 在抽屉级逐档还原。
+          h('button', {
+            key: 'zoom-raise',
+            ref: raiseZoomRef,
+            type: 'button',
+            className: 'fs-log-action fs-log-zoom-raise',
+            'aria-expanded': zoom !== 'normal' ? 'true' : 'false',
+            'aria-label': zoomInfo.raiseLabel + '运行日志：' + zoomInfo.raiseHint,
+            title: zoomInfo.raiseHint,
+            disabled: !(zoom === 'normal'),
+            onClick: () => applyZoom('tall'),
+          }, zoomInfo.raiseLabel),
+          h('button', {
+            key: 'zoom-full',
+            type: 'button',
+            className: 'fs-log-action fs-log-zoom-full',
+            'aria-expanded': zoom === 'full' ? 'true' : 'false',
+            'aria-label': zoomInfo.fullLabel + '运行日志：' + zoomInfo.fullHint,
+            title: zoomInfo.fullHint,
+            disabled: zoom === 'full',
+            onClick: () => applyZoom('full'),
+          }, zoomInfo.fullLabel),
+          h('button', {
+            key: 'zoom-restore',
+            ref: restoreZoomRef,
+            type: 'button',
+            className: 'fs-log-action fs-log-zoom-restore',
+            'aria-keyshortcuts': 'Escape',
+            'aria-label': '还原运行日志高度：' + zoomInfo.restoreHint,
+            title: zoomInfo.restoreHint,
+            disabled: !zoomInfo.canLower,
+            onClick: () => applyZoom(lowerDrawerZoom(zoom)),
+          }, '还原'),
           h('button', { key: 'refresh', type: 'button', className: 'fs-log-action', onClick: refresh, disabled: loading },
             loading ? '刷新中…' : '刷新'),
           selectedRunId
@@ -2342,8 +3243,15 @@ export function FsLogDrawer({
     watchError !== '' && watchRunId !== '' && !watchIsSelected
       ? h('div', { className: 'fs-log-banner', role: 'alert' }, watchError)
       : null,
+    // A2：指标区独立收起 / 展开；高度固定，长内容只在事件列表里滚。
     feedRun
-      ? stats
+      ? h('section', { className: 'fs-log-region fs-log-metrics', 'aria-label': '运行指标' },
+        h('div', { className: 'fs-log-region-head' },
+          h('span', { className: 'fs-log-region-title' }, '指标'),
+          sectionToggle('metrics', '运行指标')),
+        collapsedSections.metrics
+          ? h('div', { className: 'fs-log-empty fs-log-empty-inline' }, '运行指标已收起')
+          : stats)
       : h('div', { className: 'fs-log-stats fs-log-stats-empty' },
         '尚未运行：展开明细会显示验收通过率 / 总耗时 / P0 未解决 / 审查采纳率 / skill 覆盖率 / 返工轮次'),
     h('div', { className: 'fs-log-grid' },
@@ -2355,55 +3263,88 @@ export function FsLogDrawer({
       h('section', { className: 'fs-log-col fs-log-events', 'aria-label': '事件流' },
         h('div', { className: 'fs-log-col-head' },
           h('span', null, '事件流'),
-          h('span', { className: 'fs-log-count' }, countText)),
-        eventsError !== '' && events.length > 0
-          ? h('div', { className: 'fs-log-banner', role: 'alert' },
-            h('span', null, eventsError),
-            h('button', {
-              type: 'button', className: 'fs-log-mini', onClick: () => { void loadEvents(selectedRunId) },
-            }, '重试'))
-          : null,
-        h('div', { className: 'fs-log-filters' },
-          h('label', { className: 'fs-log-filter' },
-            h('span', null, '节点'),
-            h('select', {
-              className: 'fs-log-select',
-              value: nodeFilter,
-              onChange: event => setNodeFilter(event.target.value),
-              'aria-label': '按节点过滤事件',
-            },
-            h('option', { value: '' }, '全部节点'),
-            nodeOptions.map(option => h('option', { key: option.id, value: option.id }, option.title)))),
-          h('label', { className: 'fs-log-filter' },
-            h('span', null, '类型'),
-            h('select', {
-              className: 'fs-log-select',
-              value: kindFilter,
-              onChange: event => setKindFilter(event.target.value),
-              'aria-label': '按事件类型过滤',
-            },
-            h('option', { value: '' }, '全部类型'),
-            kindList.map(kind => h('option', { key: kind, value: kind }, kind))))),
-        renderEvents(),
-        h('div', { className: 'fs-log-pager' },
-          h('button', {
-            type: 'button', className: 'fs-log-mini', disabled: paged.page <= 1,
-            onClick: () => setPage(current => Math.max(1, current - 1)),
-          }, '‹ 上一页'),
-          h('span', { className: 'fs-log-page' },
-            '第 ' + paged.page + '/' + paged.pageCount + ' 页 · ' + EVENT_PAGE_SIZE + ' 条/页'),
-          h('button', {
-            type: 'button', className: 'fs-log-mini', disabled: paged.page >= paged.pageCount,
-            onClick: () => setPage(current => Math.min(paged.pageCount, current + 1)),
-          }, '下一页 ›'))),
-      h('section', { className: 'fs-log-col fs-log-detail', 'aria-label': '事件详情' },
-        h('div', { className: 'fs-log-col-head' }, h('span', null, '事件详情')),
-        h('div', { className: 'fs-log-detail-wrap' }, renderDetail()))))
+          h('span', { className: 'fs-log-count' }, countText),
+          sectionToggle('events', '事件流')),
+        collapsedSections.events
+          ? h('div', { className: 'fs-log-empty' }, '事件流已收起（点「展开」恢复）')
+          : h('div', { className: 'fs-log-events-body' },
+            eventsError !== '' && events.length > 0
+              ? h('div', { className: 'fs-log-banner', role: 'alert' },
+                h('span', null, eventsError),
+                h('button', {
+                  type: 'button', className: 'fs-log-mini', onClick: () => { void loadEvents(selectedRunId) },
+                }, '重试'))
+              : null,
+            h('div', { className: 'fs-log-filters' },
+              h('label', { className: 'fs-log-filter' },
+                h('span', null, '节点'),
+                h('select', {
+                  className: 'fs-log-select',
+                  value: nodeFilter,
+                  onChange: event => setNodeFilter(event.target.value),
+                  'aria-label': '按节点过滤事件',
+                },
+                h('option', { value: '' }, '全部节点'),
+                nodeOptions.map(option => h('option', { key: option.id, value: option.id }, option.title)))),
+              h('label', { className: 'fs-log-filter' },
+                h('span', null, '类型'),
+                h('select', {
+                  className: 'fs-log-select',
+                  value: kindFilter,
+                  onChange: event => setKindFilter(event.target.value),
+                  'aria-label': '按事件类型过滤',
+                },
+                h('option', { value: '' }, '全部类型'),
+                kindList.map(kind => h('option', { key: kind, value: kind }, kind))))),
+            renderEvents(),
+            h('div', { className: 'fs-log-pager' },
+              h('button', {
+                type: 'button', className: 'fs-log-mini', disabled: paged.page <= 1,
+                onClick: () => setPage(current => Math.max(1, current - 1)),
+              }, '‹ 上一页'),
+              h('span', { className: 'fs-log-page' },
+                '第 ' + paged.page + '/' + paged.pageCount + ' 页 · ' + EVENT_PAGE_SIZE + ' 条/页'),
+              h('button', {
+                type: 'button', className: 'fs-log-mini', disabled: paged.page >= paged.pageCount,
+                onClick: () => setPage(current => Math.min(paged.pageCount, current + 1)),
+              }, '下一页 ›')))),
+      h('section', {
+        className: 'fs-log-col fs-log-detail' + (selectedNodeId !== '' ? ' node' : ''),
+        'aria-label': selectedNodeId !== '' ? '节点运行详情' : '事件详情',
+      },
+      h('div', { className: 'fs-log-col-head' },
+        h('span', null, selectedNodeId !== '' ? '节点运行详情' : '事件详情'),
+        sectionToggle('node', selectedNodeId !== '' ? '节点运行详情' : '事件详情')),
+      h('div', { className: 'fs-log-detail-wrap' },
+        collapsedSections.node
+          ? h('div', { className: 'fs-log-empty' }, '详情已收起（点「展开」恢复）')
+          : (selectedNodeId !== '' ? renderNodePanel() : renderDetail())))))
+
+  // A1/A2：Esc 穿透到 document 捕获阶段（见 handleEscape）；这里再兜一层
+  // 焦点在抽屉内部时的键盘事件，两者共用同一个归属函数。
+  const onDrawerKeyDown = event => {
+    if (!event || event.key !== 'Escape') return
+    if (!handleEscape()) return
+    if (typeof event.preventDefault === 'function') event.preventDefault()
+    if (typeof event.stopPropagation === 'function') event.stopPropagation()
+  }
 
   return h('section', {
-    className: 'fs-log' + (open ? ' open' : ''),
-    'aria-label': '运行日志',
+    className: 'fs-log' + (open ? ' open' : '') + zoomInfo.className,
+    'aria-label': '运行日志（' + zoomInfo.label + '）',
+    role: 'region',
+    'data-zoom': zoom,
+    'data-zoom-escape': drawerEscapeAction({ overlayOpen: false, zoom }),
     'data-flow-name': flowName || undefined,
     'data-flow-id': flowId || undefined,
-  }, bar, body)
+    onKeyDown: onDrawerKeyDown,
+  }, bar, body,
+  overlay
+    ? h(LogTextOverlay, {
+      key: 'text-overlay',
+      title: overlay.title,
+      text: overlay.text,
+      onClose: closeOverlay,
+    })
+    : null)
 }

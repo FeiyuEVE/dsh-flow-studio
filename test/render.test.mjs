@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
 import React from 'react'
+import ReactDOM from 'react-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -40,14 +41,18 @@ const { bindReact } = await import('../src/client/runtime.js')
 bindReact(React)
 
 const model = await import('../src/model.js')
-const { FlowCanvas, wheelPanDelta } = await import('../src/client/canvas.js')
+const {
+  FlowCanvas, canConnectNodes, edgeAriaLabel, edgeListText, guardStructureEdit, interactionState,
+  isEdgeActive, lodText, nodeAriaLabel, stateShape, wheelPanDelta,
+} = await import('../src/client/canvas.js')
+const { lodOf, rejectPathRects } = await import('../src/client/geometry.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList } = await import('../src/client/flowlist.js')
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
-  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, progressOf,
-  runEndAnnouncement, runPreflight, startFailurePlan,
+  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, mergeSavedFlow, progressOf,
+  runEndAnnouncement, runPreflight, saveBodyFor, startFailurePlan,
 } = await import('../src/client/page.js')
 const {
   EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
@@ -556,6 +561,141 @@ check('m9：成员圆点文字用 label-primary，不叠低对比前景', () => 
     '成员圆点不再叠低对比前景')
 })
 
+check('SSR 回退：静态画布带 data-* / aria / 连线列表，不是空 div', () => {
+  const states = {
+    n_req: { state: 'passed', label: '已通过', glyph: '✓', tone: 'success', reworkCount: 0, invalidated: false },
+  }
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: { kind: 'node', id: 'n_req' },
+    nodeStates: states,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+    eventWindowNote: '基于最近 3 条',
+  }))
+  assert.ok(html.includes('data-canvas-mode="static"'), '没有标记静态回退')
+  assert.ok(html.includes('data-node-id="n_req"'), '节点缺少稳定 data-node-id')
+  assert.ok(html.includes('data-state="passed"'), '节点缺少 data-state')
+  assert.ok(html.includes('data-selected="true"'), '选中态没写进 data-*')
+  assert.ok(html.includes('role="region"'), '画布容器缺少可读 role')
+  assert.ok(html.includes('流程画布：8 个节点，11 条连线'), '画布 aria 没有规模摘要')
+  assert.ok(html.includes('完整视图'), '画布 aria / HUD 缺少 LOD 文案')
+  assert.ok(html.includes('class="fs-sr-only fs-edge-list"'), '缺少可读连线列表')
+  assert.ok(html.includes('需求分析 → 方案设计，正常流转'), '连线列表没有端点与类型')
+  assert.ok(html.includes('data-edge-kind="reject"'), '连线列表没有打回类型')
+  assert.ok(html.includes('基于最近 3 条'), '事件窗口提示没渲染')
+  assert.ok(!html.includes('react-flow__'), 'SSR 不应输出依赖 DOM 度量的 React Flow 结构')
+
+  const empty = render(React.createElement(FlowCanvas, {
+    flow: { ...flow, nodes: [], edges: [] },
+    selection: null,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(empty.includes('画布还是空的：双击空白处新增第一个节点'), '空态提示丢了')
+})
+
+check('LOD 三档：阈值、文案与 CSS 挂钩', () => {
+  assert.equal(lodOf(0.449), 'far')
+  assert.equal(lodOf(0.45), 'mid')
+  assert.equal(lodOf(0.599), 'mid')
+  assert.equal(lodOf(0.6), 'near')
+  assert.equal(lodText('near'), '完整视图')
+  assert.equal(lodText('mid'), '紧凑视图')
+  assert.equal(lodText('far'), '精简视图')
+  assert.ok(CSS.includes('[data-lod="mid"] .fs-node-summary'), '紧凑档没有降低细节')
+  assert.ok(CSS.includes('[data-lod="far"] .fs-node.has-state .fs-state-mark'),
+    '最简档必须只留形状角标')
+  assert.ok(CSS.includes('prefers-reduced-motion'), '动画没有尊重减少动效偏好')
+})
+
+check('运行中锁结构：画布开关与回调层都被挡住（不是只灰 UI）', () => {
+  const lockedState = interactionState(true)
+  assert.equal(lockedState.nodesDraggable, false)
+  assert.equal(lockedState.nodesConnectable, false)
+  assert.equal(lockedState.edgesFocusable, false)
+  assert.equal(lockedState.doubleClickAdds, false)
+  const openState = interactionState(false)
+  assert.equal(openState.nodesDraggable, true)
+  assert.equal(openState.doubleClickAdds, true)
+
+  let affected = 0
+  const blocked = guardStructureEdit(true, () => { affected += 1 })
+  blocked()
+  assert.equal(affected, 0, '锁定态回调必须不落库')
+  let received = null
+  guardStructureEdit(false, (a, b) => { received = [a, b] })('from', 'to')
+  assert.deepEqual(received, ['from', 'to'], '解锁态要原样转发参数')
+  assert.equal(guardStructureEdit(false, () => { affected += 1 })(), undefined)
+  assert.equal(affected, 1)
+})
+
+check('节点 / 边可读名、状态形状与活动边', () => {
+  const req = flow.nodes.find(node => node.id === 'n_req')
+  assert.equal(
+    nodeAriaLabel({ ...req, mode: 'single', team: [] }, {
+      state: 'passed', label: '已通过', attempt: 2, reworkCount: 0, invalidated: false,
+    }),
+    '节点 需求分析，单 agent，当前已通过，attempt 2',
+  )
+  assert.equal(
+    nodeAriaLabel({ ...req, mode: 'team', team: [{ name: '甲' }, { name: '乙' }, { name: '丙' }] }, {
+      state: 'rejected', label: '被打回', reworkCount: 2, invalidated: true,
+    }),
+    '节点 需求分析，主管 + 3 名成员，当前被打回，返工 2 次，旧通过已失效',
+  )
+  assert.equal(stateShape('running'), '◎')
+  assert.equal(stateShape('passed'), '✓')
+  assert.equal(stateShape('rejected'), '↺')
+  assert.equal(stateShape('failed'), '✕')
+  assert.equal(stateShape('skipped'), '⊘')
+  assert.equal(stateShape('aborted'), '⊘')
+  assert.equal(stateShape('idle'), '')
+
+  const byId = new Map(flow.nodes.map(node => [node.id, node]))
+  const reject = flow.edges.find(edge => edge.kind === 'reject')
+  assert.ok(edgeAriaLabel(reject, byId, { [reject.to]: { reworkCount: 2 } }).includes('已打回 2 次'))
+  assert.ok(edgeListText(reject, byId).includes('，打回'))
+  assert.equal(isEdgeActive(reject, { [reject.from]: { current: true } }), true)
+  assert.equal(isEdgeActive(reject, { [reject.from]: { current: false } }), false)
+  assert.equal(isEdgeActive(reject, null), false)
+})
+
+check('拖线端点规则：结束节点没有出边、开始节点不接受入边、禁止自环', () => {
+  assert.equal(canConnectNodes(flow, 'n_start', 'n_req'), true)
+  assert.equal(canConnectNodes(flow, 'n_req', 'n_end'), true)
+  assert.equal(canConnectNodes(flow, 'n_end', 'n_req'), false, '结束节点不能当源')
+  assert.equal(canConnectNodes(flow, 'n_req', 'n_start'), false, '开始节点不能当目标')
+  assert.equal(canConnectNodes(flow, 'n_req', 'n_req'), false, '禁止自环')
+  assert.equal(canConnectNodes(flow, 'n_missing', 'n_req'), false)
+  assert.equal(canConnectNodes({ nodes: [] }, 'a', 'b'), false)
+})
+
+check('打回线仍走 6 槽位航道：端点 = 节点底缘 + 槽位，标签在水平段 24%', () => {
+  const view = { x: 0, y: 220, z: 1 }
+  const fromRect = { x: 300, y: 0, w: 208, h: 96 }
+  const toRect = { x: 560, y: 0, w: 208, h: 116 }
+  const path = rejectPathRects(fromRect, toRect, 240, 24, -72)
+  assert.equal(path.from.x, 300 + 104 + 24, '出端口应落在节点底缘 + 出槽位')
+  assert.equal(path.from.y, 96, '出端口在源节点底缘')
+  assert.equal(path.to.x, 560 + 104 - 72, '入槽位应落在节点底缘 + 入槽位')
+  assert.equal(path.to.y, 116, '入端口在目标节点底缘（主从节点更高）')
+  assert.equal(path.laneY, 240)
+  assert.ok(path.d.includes('L 582 240'), '水平段应落在给定航道（目标端 - 折角半径）')
+  assert.equal(path.label.y, 236)
+  assert.equal(view.y, 220)
+})
+
+check('样式只用宿主主题变量：CSS 不含 hex，暗色走 body 选择器', () => {
+  assert.ok(!/#[0-9a-f]{3,8}/i.test(CSS), 'styles.js 里出现了 hex 颜色')
+  assert.ok(CSS.includes('body[data-ds-dark-theme]'), '暗色主题没有专门分支')
+  assert.ok(CSS.includes('var(--dsw-alias-'), '颜色没有走宿主 token')
+})
+
 check('M5：轮询只拉 run + since 增量 + kind 过滤；失败退避 / 后台 15s', () => {
   assert.equal(pollDelay({ failures: 0 }), 2000)
   assert.equal(pollDelay({ failures: 1 }), 4000)
@@ -692,6 +832,31 @@ check('B2：校验不过不起引擎；本次新建的 run 启动失败要 DELET
   assert.ok(created.message.includes('已有 run 正在运行'))
   assert.equal(startFailurePlan('start', { status: 400 }, { id: 'run-old' }, false).deleteRunId, '',
     '复用的旧 pending run 启动失败不能删')
+})
+
+check('0.4.2 并发保存：请求体带 version、成功后回写新版本、force 才剥版本', () => {
+  const flow = { ...model.defaultFlow(), id: 'flow-x', version: 3, updatedAt: '2026-11-06T10:00:00.000Z' }
+
+  const body = saveBodyFor(flow)
+  assert.equal(body.version, 3, '正常保存必须带当前版本，Host 才能检测冲突')
+  assert.equal(body.id, 'flow-x')
+  assert.notEqual(body, flow, '不能把内部对象直接当请求体传出去')
+
+  const forced = saveBodyFor(flow, { force: true })
+  assert.equal('version' in forced, false, '用户确认覆盖时才走无条件写入')
+
+  // 关键回归：保存成功后不并版本 → 下一次保存永远 409。
+  const saved = { ...flow, version: 4, updatedAt: '2026-11-06T11:00:00.000Z', name: '服务器上的名字' }
+  const merged = mergeSavedFlow(flow, saved)
+  assert.equal(merged.version, 4, '必须回写服务器给的新版本')
+  assert.equal(merged.updatedAt, '2026-11-06T11:00:00.000Z')
+  assert.equal(merged.name, flow.name, '只并版本/时间，不能覆盖保存期间用户新改的内容')
+
+  // 换了一份流程（id 不同）时不能把版本并过去。
+  const otherSaved = { ...saved, id: 'flow-y', version: 9 }
+  assert.equal(mergeSavedFlow(flow, otherSaved).version, 3, 'id 不同时不许并版本')
+  assert.equal(mergeSavedFlow(null, saved), null)
+  assert.equal(mergeSavedFlow(flow, null), flow)
 })
 
 check('m6/m7：运行收口播报、错误 role=alert、首次列表未回前禁用运行', () => {
@@ -855,7 +1020,8 @@ check('画布节点运行态：business 环 + 形状/文字角标（不是只靠
   }
   assert.ok(html.includes('该节点返工 1 次（目标返工数）'), '独立 ↺n 角标缺少可读 tooltip')
   assert.ok(html.includes('该节点因收到打回重跑了 2 次'), '被打回角标的 tooltip 没写清返工次数')
-  assert.ok(html.includes('aria-label="节点 需求分析，运行中"'), '运行态没进 aria-label')
+  assert.ok(html.includes('aria-label="节点 需求分析，主管 + 3 名成员，当前运行中"'),
+    '运行态与主从模式没进 aria-label')
 })
 
 check('页面运行中：顶栏实时节点 + 开始禁用/停止可用 + 抽屉自动展开', () => {
@@ -1380,6 +1546,8 @@ check('打包产物在假浏览器环境里能加载并注册成对的两个 slo
 
   const plugin = entry.factory(name => {
     if (name === 'react') return React
+    // React Flow 只从 react-dom 取 createPortal；宿主模块表同样提供它。
+    if (name === 'react-dom') return ReactDOM
     throw new Error(`未知的浏览器模块依赖：${name}`)
   })
   assert.equal(plugin.name, 'flow-studio')

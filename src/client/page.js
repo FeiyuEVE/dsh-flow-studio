@@ -14,7 +14,7 @@ import {
 import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
-import { clearDraft, draftDiffers, readDraft, writeDraft } from './drafts.js'
+import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
 import { FlowList } from './flowlist.js'
 import { Inspector } from './inspector.js'
 import {
@@ -43,8 +43,7 @@ function formatSavedAt(iso) {
     + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
-/** live.phase（06 §2）→ 中文；未知 phase 不显示，不编造。 */
-const PHASE_TEXT = { model: '模型调用', tool: '工具调用', spawn: '启动会话', idle: '空闲' }
+/** live.phase（06 §2）→ 中文；未知 phase 不显示，不编造。 */const PHASE_TEXT = { model: '模型调用', tool: '工具调用', spawn: '启动会话', idle: '空闲' }
 
 export function phaseText(phase) {
   return PHASE_TEXT[String(phase || '').toLowerCase()] || ''
@@ -100,6 +99,30 @@ export function runPreflight(flow) {
   const message = '流程校验未通过：' + errors.length + ' 个错误，已取消开始。'
     + (target ? '已定位到第 1 个错误，可在问题列表逐条修复。' : '请在问题列表里逐条修复。')
   return { ok: false, issues: merged, target, message }
+}
+
+/**
+ * 保存请求体（0.4.2 乐观锁）：默认带上当前 `version`，让 Host 做冲突检测；
+ * `force` 只在用户明确选择「用我的版本覆盖」时使用——剥掉 version 走无条件写入。
+ */
+export function saveBodyFor(flow, options = {}) {
+  const body = flow && typeof flow === 'object' ? { ...flow } : {}
+  if (options.force) delete body.version
+  return body
+}
+
+/**
+ * 保存成功后合并服务器回传的元数据（版本 / 更新时间）。
+ *
+ * 只并这两个字段、不动内容：保存期间用户可能又改了东西，用服务器快照整体覆盖
+ * 会把那些改动吞掉。不并版本则下一次保存必然带旧版本号 → 永远 409。
+ */
+export function mergeSavedFlow(flow, saved) {
+  if (!flow || !saved || typeof saved !== 'object' || saved.id !== flow.id) return flow
+  const next = { ...flow }
+  if (typeof saved.version === 'number') next.version = saved.version
+  if (typeof saved.updatedAt === 'string' && saved.updatedAt !== '') next.updatedAt = saved.updatedAt
+  return next
 }
 
 /**
@@ -233,7 +256,7 @@ export function FlowStudioPage({
   initialLogOpen = false,
   initialError = '',
 } = {}) {
-  const { useState, useEffect, useRef, useCallback } = rt.React
+  const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
 
   const [flows, setFlows] = useState(initialFlow ? [summarize(initialFlow)] : [])
   const [flow, setFlow] = useState(initialFlow)
@@ -250,6 +273,8 @@ export function FlowStudioPage({
   const [keyboardLink, setKeyboardLink] = useState(null)
   const [announce, setAnnounce] = useState('')
   const [draftNotice, setDraftNotice] = useState(null)
+  /** 0.4.2：保存撞上别人的改动（409）时挂起，等用户选「覆盖」还是「载入服务器版本」。 */
+  const [conflict, setConflict] = useState(null)
   const [logOpen, setLogOpen] = useState(Boolean(initialLogOpen))
   /** 抽屉回传的实时运行快照：顶栏、画布节点状态、停止按钮都从这里取数。 */
   const [runView, setRunView] = useState(initialRunView)
@@ -307,6 +332,14 @@ export function FlowStudioPage({
       : previous))
   }, [refuseWhenLocked, touch])
 
+  /**
+   * 拖拽结束后的位置提交（缺陷 7）：画布只在 onNodeDragStop 调一次，
+   * 引用稳定，避免每次页面渲染都换 props。
+   */
+  const moveNode = useCallback((id, x, y) => {
+    patchNode(id, { x, y })
+  }, [patchNode])
+
   /** 把当前快照落到本地草稿（浏览器不可用时退化为内存）。 */
   const persistDraft = useCallback(snapshot => {
     if (!snapshot || !snapshot.id) return null
@@ -317,39 +350,108 @@ export function FlowStudioPage({
     }
   }, [])
 
-  const saveNow = useCallback(async target => {
+  /**
+   * 草稿写盘调度（缺陷 8）：连续输入只在去抖窗（600ms）后写一次，
+   * 连续不停手也有 2s 上限；切页 / 页面隐藏 / 卸载由下面的 effect 立即 flush。
+   */
+  const draftScheduler = useMemo(() => createDraftScheduler({ write: persistDraft }), [persistDraft])
+
+  /**
+   * 保存当前流程（0.4.2 乐观锁）。
+   *
+   * 请求体照常带 `version`；成功后把服务器回传的新 version 收回本地，
+   * 否则下一次保存必然重复带旧版本号而永远 409。`force` 只在用户明确选择
+   * 「用我的版本覆盖」时使用：剥掉 version，走 Host 的无条件写入分支。
+   */
+  const saveNow = useCallback(async (target, options = {}) => {
     const snapshot = target || flowRef.current
     if (!snapshot || !snapshot.id) return false
+    const body = saveBodyFor(snapshot, options)
     const version = editVersion.current
     setSaveState('saving')
     try {
-      const result = await api.saveFlow(snapshot.id, snapshot)
+      const result = await api.saveFlow(snapshot.id, body)
       const summary = summarize(result.flow)
       setFlows(previous => previous.map(item => (item.id === summary.id ? summary : item)))
+      setFlow(previous => mergeSavedFlow(previous, result.flow))
+      setConflict(null)
       savedVersion.current = version
       setSaveState(current => (editVersion.current === version ? 'saved' : current))
       setError('')
       clearDraft(snapshot.id)
+      // 没有更新改动时才取消待写草稿；保存期间又敲的字不能被取消掉。
+      if (editVersion.current === version) draftScheduler.cancel(snapshot.id)
       setDraftNotice(current => (current && current.flowId === snapshot.id ? null : current))
       return true
     } catch (failure) {
+      // 保存失败必须立即落草稿（不等去抖）：这是用户唯一的副本。
+      draftScheduler.cancel(snapshot.id)
       persistDraft(snapshot)
       setSaveState('error')
+      // 409 = 别人先改了这份流程：不是网络故障，必须给出「覆盖 / 载入服务器版本」两条路。
+      if (failure && failure.status === 409) {
+        const currentVersion = failure.data && typeof failure.data.currentVersion === 'number'
+          ? failure.data.currentVersion
+          : null
+        setConflict({
+          flowId: snapshot.id,
+          currentVersion,
+          updatedAt: failure.data && failure.data.updatedAt ? failure.data.updatedAt : '',
+        })
+        setError('保存失败：这份流程已被其他人改过'
+          + (currentVersion === null ? '' : `（服务器版本 v${currentVersion}）`)
+          + '。你的改动已存为本地草稿；选择「用我的版本覆盖」或「载入服务器版本」。')
+        return false
+      }
       setError('保存失败：' + (failure && failure.message ? failure.message : '未知原因')
         + '。改动已存为本地草稿，重试或重新打开该流程可恢复。')
       return false
     }
-  }, [persistDraft])
+  }, [draftScheduler, persistDraft])
+
+  /** 冲突处置一：用户确认用本地版本覆盖服务器（显式选择，不算静默覆盖）。 */
+  const overwriteConflict = useCallback(async () => {
+    const current = flowRef.current
+    if (!current) return
+    setConflict(null)
+    const ok = await saveNow(current, { force: true })
+    setAnnounce(ok ? '已用你的版本覆盖服务器上的改动' : '覆盖失败，改动仍在本地草稿里')
+  }, [saveNow])
+
+  /** 冲突处置二：放弃本地改动，载入服务器上的最新版本。 */
+  const reloadServerFlow = useCallback(async () => {
+    const target = conflict && conflict.flowId
+    if (!target) return
+    setBusy(true)
+    try {
+      const result = await api.readFlow(target)
+      draftChecked.current = ''
+      setFlow(result.flow)
+      setIssues(result.validation)
+      setSelection(null)
+      setConflict(null)
+      savedVersion.current = editVersion.current
+      setSaveState('idle')
+      setError('')
+      clearDraft(target)
+      setAnnounce('已载入服务器上的最新版本，本地草稿已丢弃')
+    } catch (failure) {
+      setError('载入服务器版本失败：' + (failure && failure.message ? failure.message : '未知原因'))
+    } finally {
+      setBusy(false)
+    }
+  }, [conflict])
 
   /** 离开当前流程前：先把改动落草稿，再尝试保存；失败也绝不静默丢弃。 */
   const flushBeforeLeave = useCallback(async () => {
     const current = flowRef.current
     if (!current || !(editVersion.current > savedVersion.current)) return ''
+    draftScheduler.cancel(current.id)
     persistDraft(current)
     const saved = await saveNow(current)
     if (saved) return ''
     return '「' + current.name + '」的改动没能保存，已存本地草稿；重新打开该流程可恢复。'
-  }, [persistDraft, saveNow])
+  }, [draftScheduler, persistDraft, saveNow])
 
   const openFlow = useCallback(async id => {
     const warning = await flushBeforeLeave()
@@ -407,20 +509,37 @@ export function FlowStudioPage({
 
   useEffect(() => {
     if (saveState !== 'dirty' || !flow) return undefined
+    // 缺陷 8：草稿写盘走去抖（600ms，最长 2s），输入一个字不再同步写整份 JSON。
+    draftScheduler.schedule(flow)
     const timer = setTimeout(() => { void saveNow(flow) }, 700)
-    // debounce 被取消（切流程 / 卸载 / 又发生编辑）时先落草稿，定时器清掉不等于改动丢掉。
     return () => {
       clearTimeout(timer)
-      const current = flowRef.current
-      if (current && editVersion.current > savedVersion.current) persistDraft(current)
     }
-  }, [flow, saveState, saveNow, persistDraft])
+  }, [draftScheduler, flow, saveState, saveNow])
 
-  // 面板卸载（切页）也不丢：最后一份未保存改动同步落草稿。
+  // 面板卸载（切页）也不丢：先 flush 去抖中的草稿，快照比它新时再补一份。
   useEffect(() => () => {
+    const flushed = draftScheduler.flush()
     const current = flowRef.current
-    if (current && editVersion.current > savedVersion.current) persistDraft(current)
-  }, [persistDraft])
+    if (current && editVersion.current > savedVersion.current && (!flushed || flushed.flow !== current)) {
+      persistDraft(current)
+    }
+  }, [draftScheduler, persistDraft])
+
+  // 页面隐藏（切标签 / 锁屏 / 关闭前）立即 flush，不能把最后一个字符留在去抖窗里。
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+    const onVisibility = () => {
+      if (document.visibilityState && document.visibilityState !== 'hidden') return
+      const flushed = draftScheduler.flush()
+      const current = flowRef.current
+      if (current && editVersion.current > savedVersion.current && (!flushed || flushed.flow !== current)) {
+        persistDraft(current)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [draftScheduler, persistDraft])
 
   // 打开 / 切到某流程时检查本地草稿；内容与服务器一致就不打扰。
   useEffect(() => {
@@ -510,6 +629,7 @@ export function FlowStudioPage({
     try {
       await api.deleteFlow(id)
       clearDraft(id)
+      draftScheduler.cancel(id)
       setDraftNotice(current => (current && current.flowId === id ? null : current))
       const remaining = flows.filter(item => item.id !== id)
       setFlows(remaining)
@@ -533,14 +653,16 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [busy, flows])
+  }, [busy, draftScheduler, flows])
 
   const addNodeAt = useCallback((x, y) => {
-    if (refuseWhenLocked()) return
+    if (refuseWhenLocked()) return null
     const node = blankNode(NODE_KIND.STAGE, Math.round(x), Math.round(y), '新阶段')
     touch()
     setFlow(previous => (previous ? { ...previous, nodes: [...previous.nodes, node] } : previous))
     setSelection({ kind: 'node', id: node.id })
+    // 画布节点工具条的「新增下游」要立刻拿到 id 建边；双击新增忽略返回值。
+    return node
   }, [refuseWhenLocked, touch])
 
   const addEdge = useCallback((from, to) => {
@@ -1031,6 +1153,19 @@ export function FlowStudioPage({
         h('button', { type: 'button', className: 'fs-tool', onClick: () => setError(''), title: '关闭' }, '✕'))
       : null,
 
+    // 0.4.2：并发保存冲突必须给出可执行的出口，不能只弹一句「保存失败」。
+    conflict
+      ? h('div', { className: 'fs-error', role: 'alert' },
+        h('span', null,
+          '服务器上这份流程已被改过（' + (conflict.currentVersion === null ? '未知版本' : '版本 v' + conflict.currentVersion)
+          + (conflict.updatedAt ? ' · ' + formatSavedAt(conflict.updatedAt) : '') + '）。怎么处理？'),
+        h('span', { className: 'fs-status-spacer' }),
+        h('button', { type: 'button', className: 'fs-btn sm danger', onClick: () => { void overwriteConflict() } },
+          '用我的版本覆盖'),
+        h('button', { type: 'button', className: 'fs-btn sm', onClick: () => { void reloadServerFlow() } },
+          '载入服务器版本'))
+      : null,
+
     draftNotice
       ? h('div', { className: 'fs-draft', role: 'status' },
         h('span', { className: 'fs-draft-text' },
@@ -1065,9 +1200,10 @@ export function FlowStudioPage({
           lockReason: RUN_LOCK_REASON,
           eventWindowNote: windowNote,
           onSelect: setSelection,
-          onMoveNode: (id, x, y) => patchNode(id, { x, y }),
+          onMoveNode: moveNode,
           onAddEdge: addEdge,
           onAddNodeAt: addNodeAt,
+          onDeleteNode: deleteNode,
           onPickCandidate: id => {
             if (!keyboardLink || !keyboardLink.fromId) return
             const current = flowRef.current
@@ -1130,6 +1266,8 @@ export function FlowStudioPage({
       flowName: flow ? flow.name : '',
       onRunSnapshot: handleRunSnapshot,
       focusRun: logFocus,
+      // B4：「点节点」也打开节点运行详情——复用画布选中态，抽屉只读 id（不改选中）。
+      focusNode: selection && selection.kind === 'node' ? selection : null,
       syncToken: logSync,
       // 首帧（SSR / 预置快照）就带上抽屉数据，避免打开时先闪一下空态；
       // 浏览器里首次挂载 runView 为 null，抽屉仍走自己的加载路径。

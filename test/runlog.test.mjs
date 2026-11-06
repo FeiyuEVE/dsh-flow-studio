@@ -9,10 +9,11 @@ import assert from 'node:assert/strict'
 
 import {
   EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex, computeAcceptance,
-  computeConflicts, computeFindings, computeProgress, computeQuality, computeRejects,
+  computeAgentActivity, computeConflicts, computeFindings, computeProgress, computeQuality, computeRejects,
   computeSkillUsage, computeStaleFails, computeTests, computeTokens, isSafeRelPath, normalizeEvent,
   renderRunMarkdown, summarize, summarizeAcceptance,
 } from '../src/runlog.js'
+import * as engineModule from '../src/engine.js'
 
 let checks = 0
 function check(name, fn) {
@@ -83,12 +84,66 @@ function ev(kind, over = {}) {
 
 console.log('runlog.js · 校验与归一化')
 
-check('kind 白名单是契约里的 16 种（§8.2 新增两类）', () => {
-  assert.equal(EVENT_KINDS.length, 16)
+check('kind 白名单是契约里的 17 种（§8.2 新增 agent/message）', () => {
+  assert.equal(EVENT_KINDS.length, 17)
   assert.ok(EVENT_KINDS.includes('run/start'))
   assert.ok(EVENT_KINDS.includes('check/form'))
   assert.ok(EVENT_KINDS.includes('acceptance/verdict'))
   assert.ok(EVENT_KINDS.includes('test/report'))
+  assert.ok(EVENT_KINDS.includes('agent/message'))
+})
+
+/** agent/message 事件夹具（节点级事件）。 */
+function agentMsg(over = {}, dataOver = {}) {
+  return base({
+    kind: 'agent/message',
+    data: {
+      role: 'assistant',
+      text: '我先读一下 README，再改引擎。',
+      truncated: false,
+      ...dataOver,
+    },
+    ...over,
+  })
+}
+
+check('agent/message 合法归一化：role/text/truncated 必填，provider/model 可选', () => {
+  const event = ok(agentMsg({}, { provider: 'deepseek', model: 'deepseek-chat' }))
+  assert.equal(event.kind, 'agent/message')
+  assert.equal(event.memberId, null)
+  assert.deepEqual(event.data, {
+    role: 'assistant',
+    text: '我先读一下 README，再改引擎。',
+    truncated: false,
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+  })
+  const minimal = ok(agentMsg())
+  assert.equal(minimal.data.provider, undefined)
+  assert.equal(minimal.data.model, undefined)
+})
+
+check('agent/message 非法：空文本 / 超 2000 字符 / role 不在白名单 / truncated 非布尔', () => {
+  bad(agentMsg({}, { text: '' }), 'data.text')
+  bad(agentMsg({}, { text: '   ' }), 'data.text')
+  bad(agentMsg({}, { text: 'a'.repeat(2001) }), 'data.text')
+  bad(agentMsg({}, { role: 'user' }), 'data.role')
+  bad(agentMsg({}, { truncated: 'no' }), 'data.truncated')
+})
+
+check('agent/message 文本脱敏：Bearer / sk- / password / api_key 的值不落原文', () => {
+  const secret = 'sk-live-abcdef1234567890'
+  const raw = [
+    'Authorization: Bearer sk-live-abcdef1234567890',
+    'password=hunter2',
+    'api_key: abc123secret',
+  ].join('；')
+  const redacted = engineModule.redactArguments(raw)
+  const event = ok(agentMsg({}, { text: redacted }))
+  assert.equal(event.data.text.includes(secret), false)
+  assert.equal(event.data.text.includes('hunter2'), false)
+  assert.equal(event.data.text.includes('abc123secret'), false)
+  assert.ok(event.data.text.includes('[REDACTED]'))
 })
 
 check('合法 node/start 归一化：补齐 memberId=null、ts 转 UTC', () => {
@@ -301,6 +356,50 @@ check('单条事件 > 8KB 拒绝', () => {
 
 console.log('runlog.js · 聚合')
 
+check('agent/message 聚合：按节点取最近 5 条、组内按时间升序', () => {
+  const events = []
+  for (let i = 1; i <= 7; i += 1) {
+    events.push(ev('agent/message', {
+      nodeId: 'n_a', attemptId: 1, memberId: i % 2 ? 'm_a1' : null,
+      data: { role: 'assistant', text: `A${i}`, truncated: false },
+    }))
+  }
+  for (let i = 1; i <= 2; i += 1) {
+    events.push(ev('agent/message', {
+      nodeId: 'n_b', attemptId: 1,
+      data: { role: 'assistant', text: `B${i}`, truncated: i === 2 },
+    }))
+  }
+  const activity = computeAgentActivity(events)
+  assert.deepEqual(Object.keys(activity.nodes), ['n_a', 'n_b'])
+  assert.deepEqual(activity.nodes.n_a.map(item => item.text), ['A3', 'A4', 'A5', 'A6', 'A7'])
+  assert.equal(activity.nodes.n_a[0].memberId, 'm_a1')
+  assert.equal(activity.nodes.n_a[1].memberId, null)
+  assert.equal(activity.nodes.n_b.length, 2)
+  assert.equal(typeof activity.nodes.n_a[0].at, 'string')
+  // summarize 只加字段，旧口径原样保留。
+  const summary = summarize(events)
+  assert.deepEqual(summary.activity, activity)
+  assert.ok('tokens' in summary && 'quality' in summary && 'progress' in summary)
+})
+
+check('agent/message 聚合：全局总量 ≤200 条（有界），保留全局最新', () => {
+  const events = []
+  for (let n = 0; n < 45; n += 1) {
+    for (let i = 0; i < 5; i += 1) {
+      events.push(ev('agent/message', {
+        nodeId: `n_${n}`, attemptId: 1,
+        data: { role: 'assistant', text: `${n}-${i}`, truncated: false },
+      }))
+    }
+  }
+  const activity = computeAgentActivity(events)
+  const total = Object.values(activity.nodes).reduce((sum, list) => sum + list.length, 0)
+  assert.equal(total, 200)
+  assert.ok(activity.nodes.n_44, '最新节点必须在')
+  assert.equal(activity.nodes.n_4, undefined, '最老节点应被裁掉')
+})
+
 check('tokens：四桶按 node/member 分组，reasoning 不进 total，callId 后到替换', () => {
   const calls = [
     ev('model/call', {
@@ -505,11 +604,16 @@ check('progress：旧 attempt 的 passed 不计；ratio 强制 ≤1', () => {
   assert.equal(capped.ratio, 1, 'passed 多于 nodeTotal 时 ratio 也不能 >1')
 })
 
-/** 五项必要证据齐全的 run；over 用来制造返工 / 半成品 / P1 遗留等分支。 */
+/**
+ * 五项必要证据齐全的 run；over 用来制造返工 / 半成品 / P0/P1/P2 遗留等分支。
+ * p0Status / p2Status 为 null 表示不追加该严重级的 finding（保持 findingCount=1）。
+ */
 function fullEvidence(over = {}) {
   const {
     rework = 0,
+    p0Status = null,
     p1Status = 'verified',
+    p2Status = null,
     testFailed = 0,
     passedStages = 2,
     nodeTotal = 2,
@@ -568,9 +672,24 @@ function fullEvidence(over = {}) {
       nodeId: 'n_review', attemptId: 1,
       data: { id: 'f1', severity: 'P1', title: '问题', status: p1Status },
     }))
+    let findingCount = 1
+    if (p0Status !== null) {
+      findingCount += 1
+      events.push(ev('review/finding', {
+        nodeId: 'n_review', attemptId: 1,
+        data: { id: 'f0', severity: 'P0', title: '阻断', status: p0Status },
+      }))
+    }
+    if (p2Status !== null) {
+      findingCount += 1
+      events.push(ev('review/finding', {
+        nodeId: 'n_review', attemptId: 1,
+        data: { id: 'f2', severity: 'P2', title: '格式', status: p2Status },
+      }))
+    }
     events.push(ev('review/verdict', {
       nodeId: 'n_review', attemptId: 1,
-      data: { verdict: 'approve', findingCount: 1 },
+      data: { verdict: 'approve', findingCount },
     }))
   }
   return events
@@ -799,8 +918,10 @@ check('§13.7 summarize.acceptance：当前有效 attempt 的通过率（passed 
 
 check('§13.7 model-claim 证据：artifact path+sha256 对不上 → unknown；对上 + 文件校验通过 → pass', () => {
   const sha = 'a'.repeat(64)
+  // v1.3 证据独立性：产物由别的节点（n_peer）写出 → peer 级，才可能因「path+sha256 对上」而 pass。
+  // 同一节点自写自引的自证闭环现在判 unknown（见下方 v1.3 自证测试）。
   const artifact = ev('artifact/write', {
-    nodeId: 'n_acc', attemptId: 1,
+    nodeId: 'n_peer', attemptId: 1,
     data: { path: 'evidence/acc.md', bytes: 3, kind: 'md', sha256: sha },
   })
   const claim = (ref, extra = { provenance: 'model-claim' }) => ev('acceptance/verdict', {
@@ -811,7 +932,7 @@ check('§13.7 model-claim 证据：artifact path+sha256 对不上 → unknown；
   const good = [artifact, claim('evidence/acc.md')]
   const index = collectArtifactIndex(good)
   assert.equal(index.get('evidence/acc.md'), sha)
-  assert.equal(computeAcceptance(good, { artifacts: index }).state, 'pass', '纯函数层只校验 path+sha256')
+  assert.equal(computeAcceptance(good, { artifacts: index }).state, 'pass', '纯函数层只校验 path+sha256（peer 级证据不是自证）')
   assert.equal(
     computeAcceptance(good, { artifacts: index, verifyEvidence: () => false }).state,
     'unknown',
@@ -1049,6 +1170,279 @@ check('§8.4 B4 本轮真 fail 不被 stale 降级成 unknown（MAJOR-3 回归�
   assert.equal(quality.evidence.acceptance.state, 'fail')
   assert.equal(quality.state, 'fail')
   assert.deepEqual(quality.evidence.acceptance.staleFails, ['R1'], '未复判的旧 fail 仍要列出来')
+})
+
+// ---------------------------------------------------------------------------
+// v1.3：P0/P1/P2 分级门禁、跨 attempt 账本（分母不缩水）、证据独立性
+// ---------------------------------------------------------------------------
+
+check('quality v1.3：首轮通过 + 遗留 1 个 P1 → warn「遗留 1 个 P1 未解决」', () => {
+  const quality = computeQuality(fullEvidence({ rework: 0, p1Status: 'open' }))
+  assert.equal(quality.state, 'warn')
+  assert.equal(quality.label, '可：遗留 1 个 P1 未解决')
+  assert.equal(quality.p1Unresolved, 1)
+  assert.equal(quality.evidence.p0p1.state, 'warn')
+  assert.equal(quality.evidence.acceptance.state, 'pass', '首轮证据本身仍是通过')
+})
+
+check('quality v1.3：首轮通过 + 遗留 1 个 P2 → warn（P2 也压住绿灯）', () => {
+  const quality = computeQuality(fullEvidence({ rework: 0, p2Status: 'fixed' }))
+  assert.equal(quality.state, 'warn')
+  assert.equal(quality.label, '可：遗留 1 个 P2 未解决')
+  assert.equal(quality.p2Unresolved, 1)
+})
+
+check('quality v1.3：未解决 P0 仍然 fail（P0 压过 P1/P2 的 warn）', () => {
+  const quality = computeQuality(fullEvidence({
+    rework: 0, p0Status: 'open', p1Status: 'open', p2Status: 'open',
+  }))
+  assert.equal(quality.state, 'fail')
+  assert.equal(quality.evidence.p0p1.state, 'fail')
+  assert.match(quality.label, /P0 缺陷/)
+  assert.equal(quality.p0Unresolved, 1)
+})
+
+/** v1.3：attempt 1 报 10 个通过标识，attempt 2 只复判第 1 个 → 其余必须计入 stale。 */
+function shrinkAttempt(metric) {
+  const ids = Array.from({ length: 10 }, (_, i) => `X${String(i + 1).padStart(2, '0')}`)
+  const emit = (attemptId, id) => {
+    if (metric === 'acceptance') {
+      return ev('acceptance/verdict', {
+        nodeId: 'n_dev', attemptId,
+        data: { itemId: id, status: 'pass', decidedBy: 'auto', evidenceRef: `ev/${id}.md` },
+      })
+    }
+    if (metric === 'tests') {
+      return ev('test/report', {
+        nodeId: 'n_dev', attemptId,
+        data: { suite: id, executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: `ev/${id}.json` },
+      })
+    }
+    return ev('check/form', {
+      nodeId: 'n_dev', attemptId,
+      data: {
+        ruleSetId: id, ruleSetVersion: '1', executor: 'eslint',
+        state: 'pass', passedChecks: 1, totalChecks: 1,
+        executedAt: '2026-11-06T10:00:00.000Z',
+      },
+    })
+  }
+  return [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 1 } }),
+    ev('node/start', { nodeId: 'n_dev', attemptId: 1, data: { title: '开发', mode: 'single', skills: [] } }),
+    ...ids.map(id => emit(1, id)),
+    ev('node/end', { nodeId: 'n_dev', attemptId: 1, data: { status: 'rejected', durationMs: 1 } }),
+    ev('reject/trigger', {
+      nodeId: 'n_dev', attemptId: 1,
+      data: { edgeId: 'e1', fromNodeId: 'n_dev', toNodeId: 'n_dev', reason: '返工' },
+    }),
+    ev('node/start', { nodeId: 'n_dev', attemptId: 2, data: { title: '开发', mode: 'single', skills: [] } }),
+    emit(2, ids[0]),
+    ev('node/end', { nodeId: 'n_dev', attemptId: 2, data: { status: 'passed', durationMs: 1 } }),
+  ]
+}
+
+const SHRINK_IDS = ['X02', 'X03', 'X04', 'X05', 'X06', 'X07', 'X08', 'X09', 'X10']
+
+check('v1.3 跨 attempt：验收条目 10 → 1 时分母不缩水，9 条未复判 → unknown', () => {
+  const events = shrinkAttempt('acceptance')
+  assert.equal(computeAcceptance(events).state, 'pass', '前提：单看当前 attempt 只有 1 条且通过')
+  assert.deepEqual(computeStaleFails(events).acceptance, SHRINK_IDS)
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.acceptance.state, 'unknown')
+  assert.match(quality.evidence.acceptance.reason, /9 条上一轮出现过、本轮没有复判为通过/)
+  // 只在当前 attempt 首次出现的新标识不受影响。
+  const withNew = [...events, ev('acceptance/verdict', {
+    nodeId: 'n_dev', attemptId: 2,
+    data: { itemId: 'NEW', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/NEW.md' },
+  })]
+  assert.equal(computeStaleFails(withNew).acceptance.length, 9)
+})
+
+check('v1.3 跨 attempt：测试套件 10 → 1 时 9 个未复判 → unknown', () => {
+  const events = shrinkAttempt('tests')
+  assert.equal(computeTests(events).state, 'pass', '前提：单看当前 attempt 只有 1 个套件且通过')
+  assert.deepEqual(computeStaleFails(events).tests, SHRINK_IDS)
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.tests.state, 'unknown')
+  assert.match(quality.evidence.tests.reason, /9 条上一轮出现过、本轮没有复判为通过/)
+})
+
+check('v1.3 跨 attempt：规则集 10 → 1 时 9 个未复判 → unknown', () => {
+  const events = shrinkAttempt('checks')
+  assert.deepEqual(computeStaleFails(events).checks, SHRINK_IDS)
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.checks.state, 'unknown')
+  assert.deepEqual(quality.evidence.checks.staleFails, SHRINK_IDS)
+  assert.match(quality.evidence.checks.reason, /9 条上一轮出现过、本轮没有复判为通过/)
+})
+
+const SELF_SHA = 'c'.repeat(64)
+/** v1.3：产物事件；producer='host' 表示宿主生成 / 标记。 */
+function artifactAt(path, nodeId, producer = null) {
+  const event = ev('artifact/write', {
+    nodeId, attemptId: 1,
+    data: { path, bytes: 1, kind: 'md', sha256: SELF_SHA },
+  })
+  if (producer) event.extra = { producer }
+  return event
+}
+
+check('v1.3 证据独立性：全自证 → 指标仍 pass、selfCertified=2、selfOnly=true', () => {
+  const events = [
+    artifactAt('ev/a.md', 'n_acc'),
+    artifactAt('ev/b.md', 'n_acc'),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'A', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/a.md' },
+    }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'B', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/b.md' },
+    }),
+  ]
+  const acceptance = computeAcceptance(events)
+  assert.equal(acceptance.state, 'pass', '自证是「有证据但不独立」，不是缺证据')
+  assert.equal(acceptance.passed, 2)
+  assert.equal(acceptance.selfCertified, 2, '两条通过条目的产物都是本节点写的')
+  assert.equal(acceptance.selfOnly, true, '通过条目全部自证 → selfOnly')
+})
+
+check('v1.3 证据独立性：混一条 peer + 一条 host → pass、selfCertified=1、selfOnly=false', () => {
+  const events = [
+    artifactAt('ev/a.md', 'n_acc'),
+    artifactAt('ev/b.md', 'n_other'),
+    artifactAt('ev/h.md', 'n_any', 'host'),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'A', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/a.md' },
+    }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'B', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/b.md' },
+    }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'H', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/h.md' },
+    }),
+  ]
+  const acceptance = computeAcceptance(events)
+  assert.equal(acceptance.state, 'pass')
+  assert.equal(acceptance.passed, 3)
+  assert.equal(acceptance.selfCertified, 1, 'peer / host 级证据不计入自证')
+  assert.equal(acceptance.selfOnly, false, '有 peer/host 级交叉证据就不是闭环')
+})
+
+check('v1.3 证据独立性：测试 / 规则集也按产物归属计数 selfCertified / selfOnly', () => {
+  const events = [
+    artifactAt('ev/t.json', 'n_test'),
+    artifactAt('ev/r.json', 'n_check'),
+    ev('test/report', {
+      nodeId: 'n_test', attemptId: 1,
+      data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: 'ev/t.json' },
+    }),
+    ev('check/form', {
+      nodeId: 'n_check', attemptId: 1,
+      data: {
+        ruleSetId: 'eslint', ruleSetVersion: '1', executor: 'eslint',
+        state: 'pass', passedChecks: 1, totalChecks: 1, reportRef: 'ev/r.json',
+      },
+    }),
+  ]
+  const tests = computeTests(events)
+  assert.equal(tests.state, 'pass')
+  assert.equal(tests.selfCertified, 1)
+  assert.equal(tests.selfOnly, true)
+  const quality = computeQuality(events)
+  assert.equal(quality.evidence.checks.state, 'pass')
+  assert.equal(quality.evidence.checks.selfCertified, 1)
+  assert.equal(quality.evidence.checks.selfOnly, true)
+})
+
+const CLAIM_NODE = { acceptance: 'n_acc', tests: 'n_test', checks: 'n_check' }
+
+/** v1.3：按指标造「自证 / 独立」通过条目。mode = self | peer | host | mixed。 */
+function ownershipEvents(metric, mode) {
+  const claimNode = CLAIM_NODE[metric]
+  const entries = mode === 'mixed'
+    ? [{ writer: claimNode }, { writer: 'n_peer' }]
+    : [{ writer: mode === 'self' ? claimNode : (mode === 'host' ? 'n_host' : 'n_peer'), host: mode === 'host' }]
+  const events = []
+  entries.forEach((entry, index) => {
+    const id = `${metric}-${index}`
+    const ref = `ev/${id}.json`
+    events.push(artifactAt(ref, entry.writer, entry.host ? 'host' : null))
+    if (metric === 'acceptance') {
+      events.push(ev('acceptance/verdict', {
+        nodeId: claimNode, attemptId: 1,
+        data: { itemId: id, status: 'pass', decidedBy: 'auto', evidenceRef: ref },
+      }))
+    } else if (metric === 'tests') {
+      events.push(ev('test/report', {
+        nodeId: claimNode, attemptId: 1,
+        data: { suite: id, executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: ref },
+      }))
+    } else {
+      events.push(ev('check/form', {
+        nodeId: claimNode, attemptId: 1,
+        data: {
+          ruleSetId: id, ruleSetVersion: '1', executor: 'eslint',
+          state: 'pass', passedChecks: 1, totalChecks: 1, reportRef: ref,
+        },
+      }))
+    }
+  })
+  return events
+}
+
+/** v1.3：五项证据齐全，三项证据指标的证据归属由 spec 控制（默认 peer = 独立证据）。 */
+function ownershipFixture(spec = {}, p1Status = 'verified') {
+  const base = fullEvidence({ rework: 0, p1Status, withTests: false, withChecks: false })
+    .filter(event => event.kind !== 'acceptance/verdict')
+  const events = [...base]
+  for (const metric of ['acceptance', 'tests', 'checks']) {
+    events.push(...ownershipEvents(metric, spec[metric] || 'peer'))
+  }
+  return events
+}
+
+check('v1.3 结论层：三项指标全部自证 → warn（label 提到自证）', () => {
+  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'self', checks: 'self' }))
+  assert.equal(quality.state, 'warn')
+  assert.match(quality.label, /验收条目、测试、规范 全部为自证证据（3 条），缺独立复核/)
+  assert.equal(quality.selfCertified, 3)
+  for (const key of ['acceptance', 'tests', 'checks']) {
+    assert.equal(quality.evidence[key].selfOnly, true, `${key} 应 selfOnly`)
+  }
+})
+
+check('v1.3 结论层：acceptance 全自证 + tests 混 peer → 因 acceptance selfOnly 仍 warn', () => {
+  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'mixed', checks: 'mixed' }))
+  assert.equal(quality.evidence.acceptance.selfOnly, true)
+  assert.equal(quality.evidence.tests.selfOnly, false)
+  assert.equal(quality.evidence.checks.selfOnly, false)
+  assert.equal(quality.state, 'warn')
+  assert.match(quality.label, /验收条目 全部为自证证据（1 条），缺独立复核/)
+})
+
+check('v1.3 结论层：三项指标各含至少一条 peer/host → 可以 pass，selfCertified 计数正确', () => {
+  const quality = computeQuality(ownershipFixture({ acceptance: 'mixed', tests: 'mixed', checks: 'host' }))
+  assert.equal(quality.evidence.acceptance.selfOnly, false)
+  assert.equal(quality.evidence.tests.selfOnly, false)
+  assert.equal(quality.evidence.checks.selfOnly, false)
+  assert.equal(quality.selfCertified, 2, 'acceptance 1 条 + tests 1 条自证；checks 全是 host')
+  assert.equal(quality.state, 'pass')
+  assert.equal(quality.label, '优：首轮通过')
+})
+
+check('v1.3 结论层：全自证 warn 与 P1 遗留 warn 汇合，两个原因都写进 label', () => {
+  const quality = computeQuality(ownershipFixture(
+    { acceptance: 'self', tests: 'self', checks: 'self' },
+    'open',
+  ))
+  assert.equal(quality.state, 'warn')
+  assert.match(quality.label, /遗留 1 个 P1 未解决/)
+  assert.match(quality.label, /全部为自证证据（3 条），缺独立复核/)
 })
 
 console.log(`\n${checks} 组通过`)

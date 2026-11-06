@@ -54,8 +54,8 @@ function ev(kind, over = {}) {
   }
 }
 
-/** 五项证据齐全的 run；开关用来制造缺证据 / 半成品 / 返工分支。 */
-function fixture({ rework = 0, half = false, p1 = 'verified' } = {}) {
+/** 五项证据齐全的 run；开关用来制造缺证据 / 半成品 / 返工 / P0-P1-P2 分支。 */
+function fixture({ rework = 0, half = false, p1 = 'verified', p2 = null, p0 = null } = {}) {
   const events = [ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 2 } })]
   if (rework > 0) {
     events.push(ev('node/start', { nodeId: 'n_a', attemptId: 1, data: { title: 'A', mode: 'single', skills: [] } }))
@@ -91,9 +91,24 @@ function fixture({ rework = 0, half = false, p1 = 'verified' } = {}) {
     nodeId: 'n_review', attemptId: 1,
     data: { id: 'f1', severity: 'P1', title: '问题', status: p1 },
   }))
+  let findingCount = 1
+  if (p0 !== null) {
+    findingCount += 1
+    events.push(ev('review/finding', {
+      nodeId: 'n_review', attemptId: 1,
+      data: { id: 'f0', severity: 'P0', title: '阻断', status: p0 },
+    }))
+  }
+  if (p2 !== null) {
+    findingCount += 1
+    events.push(ev('review/finding', {
+      nodeId: 'n_review', attemptId: 1,
+      data: { id: 'f2', severity: 'P2', title: '格式', status: p2 },
+    }))
+  }
   events.push(ev('review/verdict', {
     nodeId: 'n_review', attemptId: 1,
-    data: { verdict: 'approve', findingCount: 1 },
+    data: { verdict: 'approve', findingCount },
   }))
   return events
 }
@@ -126,6 +141,23 @@ await check('缺证据 → unknown（列出缺项）；半成品 → warn；P1 �
   assert.match(half.label, /进度未完成（1\/2）/)
   assert.equal(p1Open.state, 'warn')
   assert.notEqual(p1Open.state, 'pass')
+})
+
+await check('v1.3 首轮通过 + P1/P2 未解决 → warn；P0 未解决 → fail', () => {
+  const p1Only = computeQuality(fixture({ rework: 0, p1: 'open' }))
+  const p2Only = computeQuality(fixture({ rework: 0, p2: 'fixed' }))
+  const p0Block = computeQuality(fixture({ rework: 0, p0: 'open', p1: 'open', p2: 'open' }))
+  probeRows.push(['首轮 + P1 未解决', p1Only.state, p1Only.label])
+  probeRows.push(['首轮 + P2 未解决', p2Only.state, p2Only.label])
+  probeRows.push(['首轮 + P0/P1/P2 未解决', p0Block.state, p0Block.label])
+  assert.equal(p1Only.state, 'warn', '首轮通过 + 遗留 P1 不能是绿灯')
+  assert.match(p1Only.label, /遗留 1 个 P1 未解决/)
+  assert.equal(p1Only.evidence.p0p1.state, 'warn')
+  assert.equal(p2Only.state, 'warn')
+  assert.match(p2Only.label, /遗留 1 个 P2 未解决/)
+  assert.equal(p0Block.state, 'fail')
+  assert.equal(p0Block.evidence.p0p1.state, 'fail')
+  assert.match(p0Block.label, /P0 缺陷/)
 })
 
 await check('打回后 ratio 下降（A/B passed 被打回 A）', () => {
@@ -466,7 +498,8 @@ await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ a
   const sha256 = createHash('sha256').update('# 证据\n').digest('hex')
   await append([
     rawEvent('artifact/write', meta.id, {
-      nodeId: 'n_a', data: { path: rel, bytes: 8, kind: 'md', sha256 },
+      // v1.3：产物由别的节点（n_peer）写出 → peer 级；同一节点自写自引的自证闭环会判 unknown。
+      nodeId: 'n_peer', data: { path: rel, bytes: 8, kind: 'md', sha256 },
     }),
     {
       ...rawEvent('acceptance/verdict', meta.id, {
@@ -478,7 +511,7 @@ await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ a
   ])
   result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
   assert.equal(result.json.summary.quality.evidence.acceptance.state, 'pass')
-  console.log(`  · 真产物 + sha256 对齐 → acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
+  console.log(`  · 真产物 + sha256 对齐（peer 证据）→ acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
 })
 
 await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全部体现，quality=unknown 且 label 以「桩」开头', async () => {

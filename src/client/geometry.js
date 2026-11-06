@@ -118,10 +118,18 @@ export function nextPath(from, to) {
  * 箭头画在上升段末端（朝上），所以终点就是目标底缘。
  */
 export function rejectPath(from, to, laneY, outSlot, inSlot) {
-  const sx = from.x + NODE_W / 2 + outSlot
-  const sy = from.y + nodeHeight(from)
-  const tx = to.x + NODE_W / 2 + inSlot
-  const ty = to.y + nodeHeight(to)
+  return rejectPathRects(nodeRect(from), nodeRect(to), laneY, outSlot, inSlot)
+}
+
+/**
+ * 同上，但直接吃矩形（{x,y,w,h}）。React Flow 的自定义边只有节点内部快照，
+ * 没有整份 flow 节点对象，用矩形版本可以避免在边组件里重新猜尺寸。
+ */
+export function rejectPathRects(fromRect, toRect, laneY, outSlot, inSlot) {
+  const sx = fromRect.x + fromRect.w / 2 + outSlot
+  const sy = fromRect.y + fromRect.h
+  const tx = toRect.x + toRect.w / 2 + inSlot
+  const ty = toRect.y + toRect.h
   const goingLeft = sx > tx
   const d = [
     `M ${sx} ${sy}`,
@@ -245,17 +253,6 @@ export function assignRejectLanes(nodes, edges) {
     outerLaneY,
     baseLaneY: base,
   }
-}
-
-/** 命中测试：逻辑坐标落在哪个节点上（后画的优先）。 */
-export function nodeAt(nodes, point) {
-  for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    const node = nodes[index]
-    if (point.x >= node.x && point.x <= node.x + NODE_W && point.y >= node.y && point.y <= node.y + nodeHeight(node)) {
-      return node.id
-    }
-  }
-  return null
 }
 
 /**

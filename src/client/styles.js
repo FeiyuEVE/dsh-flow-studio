@@ -135,12 +135,15 @@ export const CSS = `
   background-image:radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--dsw-alias-label-tertiary) 20%, transparent) 1px, transparent 0);
   background-size:20px 20px;
 }
-.fs-canvas.panning{cursor:grabbing}
-.fs-canvas.linking{cursor:crosshair}
-/* M1：运行中锁结构：可平移 / 查看，但拖拽与连线入口不再呈现可编辑态。 */
 .fs-canvas.locked{cursor:default}
-.fs-canvas.locked .fs-node{cursor:default}
-.fs-canvas.locked .fs-port{display:none}
+.fs-canvas-static{overflow:hidden}
+.fs-canvas-empty{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:4;
+  padding:10px 14px;border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2);
+  border:1px dashed var(--dsw-alias-border-l3);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-secondary);pointer-events:none;
+}
+.fs-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .fs-canvas-lock{
   position:absolute;left:12px;top:12px;z-index:6;max-width:62%;padding:5px 9px;
   border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2);
@@ -150,18 +153,78 @@ export const CSS = `
 .fs-world{position:absolute;left:0;top:0;transform-origin:0 0;width:0;height:0}
 .fs-edges{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 
+/* ══ React Flow 结构（只保留用到的部分；颜色全部走宿主 token）════════════ */
+.react-flow{
+  position:relative;width:100%;height:100%;direction:ltr;background-color:transparent;
+  --xy-edge-stroke:var(--dsw-alias-label-tertiary);
+  --xy-edge-stroke-width:1.5;
+  --xy-edge-stroke-selected:var(--dsw-alias-state-business-primary);
+  --xy-connectionline-stroke:var(--dsw-alias-state-business-primary);
+  --xy-connectionline-stroke-width:1.5;
+  --xy-node-border:1px solid var(--dsw-alias-border-l3);
+  --xy-node-background-color:var(--dsw-alias-bg-layer-1);
+  --xy-node-color:var(--dsw-alias-label-primary);
+  --xy-handle-background-color:var(--dsw-alias-bg-layer-2);
+  --xy-handle-border-color:var(--dsw-alias-border-l4);
+  --xy-selection-background-color:color-mix(in srgb, var(--dsw-alias-state-business-primary) 10%, transparent);
+  --xy-selection-border:1px dashed var(--dsw-alias-state-business-primary);
+  --xy-attribution-background-color:color-mix(in srgb, var(--dsw-alias-bg-layer-2) 80%, transparent);
+}
+.react-flow__container{position:absolute;width:100%;height:100%;top:0;left:0}
+.react-flow__pane{z-index:1;touch-action:none;cursor:grab}
+.react-flow__pane.dragging{cursor:grabbing}
+.react-flow__pane.selection{cursor:crosshair}
+.fs-canvas-flow.locked .react-flow__pane{cursor:default}
+.react-flow__viewport{transform-origin:0 0;z-index:2;pointer-events:none}
+.react-flow__renderer{z-index:4}
+.react-flow__selection{z-index:6;background:var(--xy-selection-background-color);border:var(--xy-selection-border)}
+.react-flow__nodesselection{z-index:3;transform-origin:left top;pointer-events:none}
+.react-flow__nodesselection-rect{position:absolute;pointer-events:all;cursor:grab;background:var(--xy-selection-background-color);border:var(--xy-selection-border)}
+.react-flow .react-flow__edges{position:absolute}
+.react-flow .react-flow__edges svg{overflow:visible;position:absolute;pointer-events:none}
+.react-flow__edge{pointer-events:visibleStroke}
+.react-flow__edge.selectable{cursor:pointer}
+.react-flow__edge.inactive{pointer-events:none}
+.react-flow__edge.selected,.react-flow__edge:focus,.react-flow__edge:focus-visible{outline:none}
+.react-flow__edge-textwrapper{pointer-events:all}
+.react-flow__edge .react-flow__edge-text{pointer-events:none;user-select:none}
+.react-flow__connection{pointer-events:none}
+.react-flow__connection-path,.react-flow__connectionline .react-flow__connection-path{fill:none}
+.react-flow__connectionline{z-index:1001;overflow:visible;position:absolute}
+.react-flow__nodes{pointer-events:none;transform-origin:0 0}
+.react-flow__node{position:absolute;user-select:none;pointer-events:all;transform-origin:0 0;box-sizing:border-box;cursor:default}
+.react-flow__node.selectable{cursor:pointer}
+.react-flow__node.draggable{cursor:grab;pointer-events:all}
+.react-flow__node.draggable.dragging{cursor:grabbing}
+.react-flow__node:focus,.react-flow__node:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:3px;border-radius:var(--dsw-radius-sm)}
+.react-flow__handle{position:absolute;pointer-events:none;min-width:5px;min-height:5px}
+.react-flow__handle.connectionindicator{pointer-events:all;cursor:crosshair}
+.react-flow__handle-bottom{top:auto;left:50%;bottom:0;transform:translate(-50%,50%)}
+.react-flow__handle-top{top:0;left:50%;transform:translate(-50%,-50%)}
+.react-flow__handle-left{top:50%;left:0;transform:translate(-50%,-50%)}
+.react-flow__handle-right{top:50%;right:0;transform:translate(50%,-50%)}
+.react-flow__panel{position:absolute;z-index:5;margin:15px}
+.react-flow__attribution{font-size:11px;line-height:14px;padding:2px 3px;margin:0;
+  background:var(--xy-attribution-background-color);border-radius:var(--dsw-radius-xs)}
+.react-flow__attribution a{text-decoration:none;color:var(--dsw-alias-label-tertiary)}
+.react-flow__edgelabel-renderer{position:absolute;width:100%;height:100%;pointer-events:none;user-select:none;left:0;top:0}
+.react-flow__viewport-portal{position:absolute;width:100%;height:100%;left:0;top:0;user-select:none}
+@keyframes dashdraw{from{stroke-dashoffset:10}}
+
+/* ══ 节点卡 ═════════════════════════════════════════════ */
 .fs-node{
-  position:absolute;display:flex;flex-direction:column;gap:2px;
-  padding:12px 12px 14px;border:1.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);
-  background:var(--dsw-alias-bg-layer-1);cursor:move;user-select:none;
+  position:relative;display:flex;flex-direction:column;gap:2px;width:100%;height:100%;
+  padding:10px 12px 12px;border:1.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-layer-1);cursor:move;user-select:none;overflow:hidden;
+  box-shadow:0 1px 2px color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);
   transition:border-color .15s,box-shadow .15s;
 }
-.fs-node:hover{border-color:var(--dsw-alias-border-l4)}
+.fs-node:hover{
+  border-color:var(--dsw-alias-border-l4);
+  box-shadow:0 6px 18px color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);
+}
 .fs-node.locked{cursor:default}
-/* M3：far 档（<45%）保留纯形状角标（✓ / ↺ / ✕ / 双环 ◎），不靠颜色；
-   near / mid 隐藏它，让位给「形状 + 文字」角标。 */
-.fs-state-mark{display:none}
-.fs-node.has-state .fs-state-mark{display:none}
+.fs-node.has-state .fs-node-head{padding-right:18px}
 .fs-node.selected{
   border-color:var(--dsw-alias-brand-primary);
   box-shadow:0 0 0 4px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
@@ -173,21 +236,30 @@ export const CSS = `
 }
 .fs-node.kind-start{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-1));border-radius:var(--dsw-radius-xl)}
 .fs-node.kind-end{background:var(--dsw-alias-bg-layer-2);border-radius:var(--dsw-radius-xl)}
+.fs-node-head{display:flex;align-items:center;gap:6px;min-width:0;padding-bottom:3px;
+  border-bottom:1px solid var(--dsw-alias-border-l1)}
 .fs-node-title{
-  font-size:14px;line-height:22px;font-weight:500;color:var(--dsw-alias-label-primary);
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px;
-}
-.fs-node-summary{
-  font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary);
+  flex:1;min-width:0;font-size:14px;line-height:22px;font-weight:500;color:var(--dsw-alias-label-primary);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.fs-node-tags{display:flex;align-items:center;gap:4px;height:18px;flex-wrap:nowrap;overflow:hidden;margin-top:2px}
+.fs-mode-badge{
+  flex:none;height:16px;padding:0 5px;border-radius:var(--dsw-radius-xs);
+  font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);
+  background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap;
+}
+.fs-node-summary{
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.fs-node-tags{display:flex;align-items:center;gap:4px;height:18px;flex-wrap:nowrap;overflow:hidden;margin-top:auto}
 .fs-tag{
   display:inline-flex;align-items:center;gap:3px;height:18px;padding:0 6px;flex:none;
   border-radius:var(--dsw-radius-xs);font-size:12px;line-height:14px;white-space:nowrap;
 }
 .fs-tag.team{color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 14%, transparent)}
 .fs-tag.skill{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
+.fs-tag.rounds,.fs-tag.attempt{color:var(--dsw-alias-label-tertiary);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}
+.fs-tag.invalid{color:var(--fs-r2-warn);background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent)}
 .fs-tag.reject{color:var(--fs-r2-warn);box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--fs-r1-warn) 35%, transparent)}
 .fs-tag.status{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
 
@@ -224,36 +296,100 @@ export const CSS = `
 }
 .fs-tag.state.neutral{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
 
-.fs-members{display:flex;align-items:center;gap:6px;height:20px;margin-top:2px;overflow:hidden}
+/* 成员行：首字母 + 角色。身份不靠色相区分（宿主没有 categorical 色板）。 */
+.fs-members{display:flex;align-items:center;gap:3px;height:18px;margin-top:1px;overflow:hidden}
 .fs-member{
-  display:inline-flex;align-items:center;justify-content:center;flex:none;
-  width:16px;height:16px;border-radius:50%;font-size:12px;line-height:16px;
-  color:var(--dsw-alias-label-primary);
+  display:inline-flex;align-items:center;gap:2px;flex:none;max-width:50px;
+  height:18px;padding:0 4px;border-radius:var(--dsw-radius-xs);
+  background:var(--dsw-alias-interactive-bg-hover);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-primary);overflow:hidden;
 }
-.fs-member.lead{width:16px;height:16px;border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary-foreground);font-weight:500}
-.fs-members-more{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.fs-member.lead{
+  width:18px;padding:0;justify-content:center;border-radius:var(--dsw-radius-xs);
+  background:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary-foreground);font-weight:500;
+}
+.fs-member-initial{flex:none;font-weight:600}
+.fs-member-role{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--dsw-alias-label-secondary);font-size:12px;
+}
+.fs-members-more{flex:none;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
 
-.fs-port{position:absolute;top:50%;width:10px;height:10px;margin-top:-5px;border-radius:50%;
-  background:var(--dsw-alias-bg-layer-2);border:2px solid var(--dsw-alias-border-l4);
-  opacity:0;transition:opacity .15s,width .15s,height .15s,margin .15s;z-index:2}
-.fs-node:hover .fs-port,.fs-node.selected .fs-port{opacity:1}
+/* 运行状态角标：near / mid 用右上角形状 + 文字标签，far 用居中纯形状。 */
+.fs-state-mark{
+  position:absolute;right:7px;top:6px;display:none;align-items:center;justify-content:center;
+  width:16px;height:16px;font-size:13px;line-height:16px;font-weight:600;
+  color:var(--dsw-alias-label-primary);pointer-events:none;
+}
+.fs-node.has-state .fs-state-mark{display:inline-flex}
+
+/* 节点工具条：hover / 键盘聚焦时浮出，不常驻占版面。 */
+.fs-node-tools{
+  position:absolute;right:6px;top:-14px;z-index:3;display:flex;align-items:center;gap:2px;
+  padding:2px;border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2);
+  border:1px solid var(--dsw-alias-border-l2);box-shadow:0 2px 8px color-mix(in srgb, var(--dsw-alias-label-primary) 12%, transparent);
+  opacity:0;transform:translateY(2px);pointer-events:none;transition:opacity .15s,transform .15s;
+}
+.fs-node:hover .fs-node-tools,.fs-node:focus-within .fs-node-tools,.fs-node.selected .fs-node-tools{opacity:1;transform:none;pointer-events:auto}
+.fs-node-tool{
+  width:22px;height:22px;border:none;border-radius:var(--dsw-radius-xs);background:transparent;
+  color:var(--dsw-alias-label-secondary);font-size:12px;line-height:16px;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.fs-node-tool:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.fs-node-tool.danger:hover{color:var(--fs-r2-error)}
+.fs-node-tool:disabled{opacity:.4;cursor:not-allowed}
+.fs-node-tool:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+
+/* 端口 */
+.fs-port{
+  position:absolute;top:50%;width:10px;height:10px;margin-top:-5px;border-radius:50%;
+  background:var(--dsw-alias-bg-layer-2);border:2px solid var(--dsw-alias-border-l4);z-index:2;
+}
 .fs-port.in{left:-6px}
 .fs-port.out{right:-6px}
-.fs-port.out{cursor:crosshair}
-.fs-port.out:hover{width:12px;height:12px;margin-top:-6px;border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, var(--dsw-alias-bg-layer-2))}
+.fs-handle{
+  width:10px;height:10px;border-radius:50%;background:var(--dsw-alias-bg-layer-2);
+  border:2px solid var(--dsw-alias-border-l4);opacity:0;z-index:2;
+  transition:opacity .15s,width .15s,height .15s,border-color .15s;
+}
+.react-flow__node:hover .fs-handle,.react-flow__node.selected .fs-handle,
+.fs-node:hover .fs-handle,.fs-node.selected .fs-handle,.fs-handle.connectionindicator{opacity:1}
+.fs-handle.fs-handle-disabled{opacity:0!important;pointer-events:none!important}
+.fs-handle:hover{width:12px;height:12px;border-color:var(--dsw-alias-state-business-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, var(--dsw-alias-bg-layer-2))}
 
 /* 连线 */
-.fs-edge{fill:none;stroke:var(--dsw-alias-label-tertiary);stroke-width:1.5;stroke-linecap:round}
-.fs-edge.reject{stroke:var(--fs-r1-warn);stroke-dasharray:6 4}
-.fs-edge.selected{stroke:var(--dsw-alias-state-business-primary);stroke-width:2.5}
-.fs-edge-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:pointer}
+.fs-edge-path{fill:none;stroke:var(--dsw-alias-label-tertiary);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.fs-edge-path.fs-edge-reject{stroke:var(--fs-r1-warn);stroke-dasharray:6 4}
+.fs-edge-path.selected{stroke:var(--dsw-alias-state-business-primary);stroke-width:2.5}
+.fs-arrow-head{fill:var(--dsw-alias-label-tertiary)}
+.fs-arrow-head.reject{fill:var(--fs-r1-warn)}
+.fs-arrow-head.selected{fill:var(--dsw-alias-state-business-primary)}
+.react-flow__edge.animated .fs-edge-path{stroke-dasharray:6 4;animation:fs-edge-dash 1.2s linear infinite}
+@keyframes fs-edge-dash{to{stroke-dashoffset:-20}}
 .fs-edge-label{
   font-size:12px;line-height:14px;fill:var(--fs-r2-warn);
   paint-order:stroke;stroke:var(--dsw-alias-bg-layer-1);stroke-width:3px;stroke-linejoin:round;
   user-select:none;pointer-events:none;
 }
-.fs-edge-label.neutral{fill:var(--dsw-alias-label-secondary)}
-.fs-link-preview{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.5;stroke-dasharray:4 3}
+.fs-edge-label.reject{fill:var(--fs-r2-warn)}
+.fs-edge-tag{
+  position:absolute;pointer-events:none;padding:1px 6px;border-radius:var(--dsw-radius-xs);
+  background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+  white-space:nowrap;font-variant-numeric:tabular-nums;
+  box-shadow:0 1px 4px color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);
+}
+.fs-edge-tag.reject{color:var(--fs-r2-warn)}
+.fs-edge-tag.selected{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
+.fs-edge-tag.overflow{color:var(--dsw-alias-label-secondary)}
+.fs-edge-flag{
+  font-size:12px;line-height:14px;fill:var(--dsw-alias-label-secondary);
+  font-variant-numeric:tabular-nums;paint-order:stroke;
+  stroke:var(--dsw-alias-bg-layer-1);stroke-width:3px;stroke-linejoin:round;
+}
+.fs-edge-flag.reject{fill:var(--fs-r2-warn)}
 
 /* 画布 HUD */
 .fs-hud{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:2px;padding:3px;
@@ -262,6 +398,7 @@ export const CSS = `
   color:var(--dsw-alias-label-secondary);font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .fs-hud-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .fs-hud-val{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);min-width:38px;text-align:center;font-variant-numeric:tabular-nums}
+.fs-hud-lod{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);padding:0 5px 0 3px;white-space:nowrap}
 .fs-canvas-hint{position:absolute;left:12px;bottom:12px;max-width:60%;padding:5px 9px;border-radius:var(--dsw-radius-sm);
   background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);
   font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);pointer-events:none;z-index:5}
@@ -285,8 +422,6 @@ export const CSS = `
   border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
 .fs-link-option:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 .fs-link-picker-hint{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
-.fs-edge-flag{font-size:12px;line-height:14px;fill:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;
-  paint-order:stroke;stroke:var(--dsw-alias-bg-layer-1);stroke-width:3px;stroke-linejoin:round}
 
 /* 缩放等级：只降内容，不动位置 */
 .fs-canvas[data-lod="mid"] .fs-node-summary{display:none}
@@ -295,23 +430,42 @@ export const CSS = `
    设计态标签（skill 数量等）照旧隐藏，避免挤爆卡片。 */
 .fs-canvas[data-lod="mid"] .fs-node.has-state .fs-node-tags{display:flex}
 .fs-canvas[data-lod="mid"] .fs-node.has-state .fs-node-tags .fs-tag.skill{display:none}
+.fs-canvas[data-lod="mid"] .fs-edge-tag{padding:0 4px}
 .fs-canvas[data-lod="far"] .fs-node-summary,
 .fs-canvas[data-lod="far"] .fs-node-tags,
 .fs-canvas[data-lod="far"] .fs-node-title,
-.fs-canvas[data-lod="far"] .fs-members{display:none}
+.fs-canvas[data-lod="far"] .fs-mode-badge,
+.fs-canvas[data-lod="far"] .fs-node-head,
+.fs-canvas[data-lod="far"] .fs-members,
+.fs-canvas[data-lod="far"] .fs-node-tools{display:none}
 .fs-canvas[data-lod="far"] .fs-node{padding:0;min-height:0}
 /* M3：far 档把状态压成纯形状角标；双环 ◎ 表示运行中，不依赖颜色也能分辨。 */
+.fs-canvas[data-lod="far"] .fs-node .fs-state-mark,
 .fs-canvas[data-lod="far"] .fs-node.has-state .fs-state-mark{
   display:flex;position:absolute;inset:0;align-items:center;justify-content:center;
-  font-size:16px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);
+  font-size:28px;line-height:32px;font-weight:600;color:var(--dsw-alias-label-primary);
   pointer-events:none;
 }
+.fs-canvas[data-lod="far"] .fs-node.kind-start .fs-state-mark,
+.fs-canvas[data-lod="far"] .fs-node.kind-end .fs-state-mark{font-size:20px;line-height:24px}
+.fs-canvas[data-lod="far"] .fs-state-mark.kind-mark{color:var(--dsw-alias-label-secondary)}
 .fs-canvas[data-lod="far"] .fs-node.run-state-running .fs-state-mark{
-  width:18px;height:18px;margin:auto;border:2px double var(--dsw-alias-label-primary);
+  width:36px;height:36px;margin:auto;border:2px double var(--dsw-alias-label-primary);
   border-radius:var(--dsw-radius-panel);
+  font-size:0;line-height:0;
 }
+.fs-canvas[data-lod="far"] .fs-edge-tag,
 .fs-canvas[data-lod="far"] .fs-edge-label{display:none}
 .fs-canvas[data-lod="far"]{background-size:40px 40px}
+
+/* 暗色主题：token 已自适应，这里只调网格与浮层的对比度。 */
+body[data-ds-dark-theme] .fs-canvas{
+  background-color:color-mix(in srgb, var(--dsw-alias-bg-base) 94%, var(--dsw-alias-label-primary));
+  background-image:radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--dsw-alias-label-tertiary) 26%, transparent) 1px, transparent 0);
+}
+body[data-ds-dark-theme] .fs-node{box-shadow:0 1px 2px color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent)}
+body[data-ds-dark-theme] .fs-node-tools,
+body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, var(--dsw-alias-label-primary) 22%, transparent)}
 
 /* ══ 检查器 ════════════════════════════════════════════ */
 .fs-panel{
@@ -709,6 +863,195 @@ export const CSS = `
   font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
 }
 
+/* ══ 抽屉三档高度 / 区域折叠 / 节点运行详情（A + B）════════ */
+/* 拉高：70vh（与 logdrawer 的 DRAWER_TALL_VH 同源）；全屏：fixed 占满视口，遮住画布。 */
+.fs-log.zoom-tall{height:70vh;min-height:320px}
+.fs-log.zoom-full{position:fixed;inset:0;z-index:1200;height:auto;max-height:none;transition:none}
+.fs-log.zoom-tall .fs-log-grid{grid-template-columns:230px minmax(0,1fr) 360px}
+.fs-log.zoom-full .fs-log-grid{grid-template-columns:260px minmax(0,1fr) 440px}
+/* 头部与指标区固定，只有事件列表 / 详情各自滚动（拉高、全屏都不破版）。 */
+.fs-log.zoom-tall .fs-log-body,.fs-log.zoom-full .fs-log-body{overflow:hidden}
+.fs-log.zoom-full .fs-log-stats{height:52px}
+.fs-log-region{flex:none;display:flex;flex-direction:column;min-width:0}
+.fs-log-region-head{
+  flex:none;display:flex;align-items:center;gap:8px;height:24px;padding:0 10px;
+  border-top:1px solid var(--dsw-alias-border-l1);
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+}
+.fs-log-region-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-log-region-toggle{flex:none}
+.fs-log-events-body{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}
+
+/* 事件行里的节点名：B4 的「点节点名看运行详情」入口。 */
+.fs-log-node-chip{
+  flex:none;max-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  border:1px solid var(--dsw-alias-border-l1);background:transparent;border-radius:var(--dsw-radius-panel);
+  color:var(--dsw-alias-label-tertiary);font-family:inherit;font-size:12px;line-height:14px;
+  padding:1px 6px;cursor:pointer;
+}
+.fs-log-node-chip:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.fs-log-node-chip:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+
+/* 节点运行详情面板：状态用形状 + 文字，颜色只加速。 */
+.fs-log-node-panel{display:flex;flex-direction:column;gap:6px;min-width:0;padding-bottom:6px}
+.fs-log-node-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;min-width:0}
+.fs-log-node-head-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.fs-log-node-name{
+  font-size:14px;line-height:20px;font-weight:500;color:var(--dsw-alias-label-primary);
+  word-break:break-word;
+}
+.fs-log-node-sub{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-log-node-head-side{flex:none;display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap;justify-content:flex-end}
+.fs-log-node-state{
+  font-size:12px;line-height:14px;padding:1px 6px;border-radius:var(--dsw-radius-panel);
+  color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap;
+}
+.fs-log-node-state.success{
+  color:var(--fs-r2-success);
+  background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent);
+}
+.fs-log-node-state.error{
+  color:var(--fs-r2-error);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
+}
+.fs-log-node-state.warn{
+  color:var(--fs-r2-warn);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);
+}
+.fs-log-node-state.business{
+  color:var(--dsw-alias-state-business-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
+}
+/* B5：运行中指示 = 圆点 + 文字，不做无限动画；prefers-reduced-motion 已有全局兜底。 */
+.fs-log-running{
+  display:inline-flex;align-items:center;gap:4px;white-space:nowrap;
+  font-size:12px;line-height:14px;color:var(--dsw-alias-state-business-primary);
+}
+.fs-log-live-dot{width:6px;height:6px;border-radius:var(--dsw-radius-panel);background:currentColor}
+.fs-log-node-facts{
+  display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+}
+.fs-log-fact{white-space:nowrap}
+.fs-log-node-block{
+  display:flex;flex-direction:column;gap:4px;min-width:0;padding:6px 8px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-xs);
+  background:var(--dsw-alias-bg-layer-2);
+}
+.fs-log-node-block-title{
+  display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;
+  font-size:12px;line-height:16px;font-weight:500;color:var(--dsw-alias-label-primary);
+}
+.fs-log-node-block-hint{font-size:12px;line-height:16px;font-weight:400;color:var(--dsw-alias-label-tertiary)}
+.fs-log-empty-inline{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);padding:2px 0}
+
+/* 最近在做什么：整段文本换行，超长用「展开全文」进弹层，不靠 ellipsis 一刀切。 */
+.fs-log-msg{display:flex;flex-direction:column;gap:2px;min-width:0;padding:4px 0;
+  border-top:1px solid var(--dsw-alias-border-l1)}
+.fs-log-msg:first-of-type{border-top:none;padding-top:0}
+.fs-log-msg-meta{
+  display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+}
+.fs-log-msg-who{color:var(--dsw-alias-label-secondary);font-weight:500}
+.fs-log-msg-time{font-family:var(--dsw-font-markdown-code-font-family);font-variant-numeric:tabular-nums}
+.fs-log-msg-flag{color:var(--dsw-alias-state-warn-primary)}
+.fs-log-msg-text{
+  font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);
+  white-space:pre-wrap;word-break:break-word;max-height:72px;overflow:hidden;
+}
+.fs-log-more{align-self:flex-start;margin-top:2px}
+
+/* 最近工具调用：名字 + 参数摘要 + 结果状态 + 耗时。 */
+.fs-log-tool{display:flex;flex-direction:column;gap:2px;min-width:0;padding:4px 0;
+  border-top:1px solid var(--dsw-alias-border-l1)}
+.fs-log-tool:first-of-type{border-top:none;padding-top:0}
+.fs-log-tool-line{
+  display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+}
+.fs-log-tool-name{
+  font-family:var(--dsw-font-markdown-code-font-family);font-weight:500;
+  color:var(--dsw-alias-label-primary);word-break:break-all;
+}
+.fs-log-tool-ok{font-weight:500}
+.fs-log-tool-ok.ok{color:var(--fs-r2-success)}
+.fs-log-tool-ok.bad{color:var(--fs-r2-error)}
+.fs-log-tool-ok.unknown{color:var(--dsw-alias-label-tertiary)}
+.fs-log-tool-time{
+  font-family:var(--dsw-font-markdown-code-font-family);font-variant-numeric:tabular-nums;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+}
+.fs-log-tool-args{
+  font-family:var(--dsw-font-markdown-code-font-family);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;word-break:break-all;
+  max-height:48px;overflow:hidden;
+}
+
+/* 成员最近活动 / 已写产物。 */
+.fs-log-member{display:flex;flex-direction:column;gap:2px;min-width:0;padding:4px 0;
+  border-top:1px solid var(--dsw-alias-border-l1)}
+.fs-log-member:first-of-type{border-top:none;padding-top:0}
+.fs-log-member-line{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;font-size:12px;line-height:16px}
+.fs-log-member-name{color:var(--dsw-alias-label-primary);font-weight:500}
+.fs-log-member-role{color:var(--dsw-alias-label-tertiary)}
+.fs-log-member-state{color:var(--dsw-alias-label-secondary)}
+.fs-log-member-last{
+  font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);
+  word-break:break-word;max-height:36px;overflow:hidden;
+}
+.fs-log-member-time{
+  font-family:var(--dsw-font-markdown-code-font-family);font-variant-numeric:tabular-nums;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
+}
+.fs-log-artifact{display:flex;flex-direction:column;gap:1px;min-width:0;padding:3px 0}
+.fs-log-artifact-path{
+  font-family:var(--dsw-font-markdown-code-font-family);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-primary);word-break:break-all;
+}
+.fs-log-artifact-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.fs-log-node-actions{display:flex;flex-wrap:wrap;gap:4px}
+
+/* B6：失败原因不再只显示一个红点。 */
+.fs-log-failure{
+  display:flex;flex-direction:column;gap:2px;padding:6px 8px;
+  border-radius:var(--dsw-radius-xs);
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 35%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
+}
+.fs-log-failure-title{font-size:12px;line-height:16px;font-weight:500;color:var(--fs-r2-error)}
+.fs-log-failure-text{
+  font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);
+  white-space:pre-wrap;word-break:break-word;
+}
+
+/* 长文本弹层（A2）：可滚动、可复制、Esc 关闭。 */
+.fs-log-overlay{
+  position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;padding:24px;
+  background:color-mix(in srgb, var(--dsw-alias-label-primary) 32%, transparent);
+}
+.fs-log-overlay-panel{
+  display:flex;flex-direction:column;width:min(760px,100%);max-height:min(80vh,720px);overflow:hidden;
+  background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);
+  border-radius:var(--dsw-radius-md);outline:none;
+}
+.fs-log-overlay-panel:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.fs-log-overlay-head{
+  flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:10px 14px;border-bottom:1px solid var(--dsw-alias-border-l1);
+}
+.fs-log-overlay-title{
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-size:14px;line-height:22px;font-weight:500;color:var(--dsw-alias-label-primary);
+}
+.fs-log-overlay-actions{flex:none;display:flex;gap:4px}
+.fs-log-overlay-text{
+  flex:1;min-height:0;overflow:auto;margin:0;padding:12px 14px;
+  font-family:var(--dsw-font-markdown-code-font-family);font-size:12px;line-height:20px;
+  color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word;
+  user-select:text;
+}
+
 /* 暗色只调加速识别用的 tint，信息仍靠文字与形状；不写 hex。 */
 body[data-ds-dark-theme] .fs-log-event.active,
 body[data-ds-dark-theme] .fs-log-event[aria-selected="true"]{
@@ -720,6 +1063,29 @@ body[data-ds-dark-theme] .fs-log-event[aria-selected="true"]{
 }
 @media (max-width:900px){
   .fs-log-breakdown{display:none}
+}
+/* A3：窄屏（<720px）三栏退化为单列——run 列表 / 事件流 / 详情纵向排列，各自可滚。 */
+@media (max-width:720px){
+  .fs-log.zoom-tall{height:78vh}
+  .fs-log .fs-log-grid,
+  .fs-log.zoom-tall .fs-log-grid,
+  .fs-log.zoom-full .fs-log-grid{
+    grid-template-columns:minmax(0,1fr);
+    grid-auto-rows:minmax(0,auto);
+    overflow-y:auto;
+  }
+  .fs-log-col{min-height:180px}
+  .fs-log-col + .fs-log-col{border-left:none;border-top:1px solid var(--dsw-alias-border-l1)}
+  .fs-log-event-list{max-height:52vh}
+  .fs-log-node-head{flex-direction:column;gap:4px}
+  .fs-log-node-head-side{justify-content:flex-start}
+  .fs-log-overlay{padding:12px}
+  /* 窄屏头行允许换行：三档按钮 + 刷新 / 导出 / 复制 / 收起不互相挤掉。 */
+  .fs-log.open .fs-log-bar-wrap,
+  .fs-log.zoom-tall .fs-log-bar-wrap,
+  .fs-log.zoom-full .fs-log-bar-wrap{flex-wrap:wrap;height:auto;min-height:40px;padding-bottom:4px}
+  .fs-log-actions-wrap{flex-wrap:wrap;justify-content:flex-end}
+  .fs-log-zoom-raise,.fs-log-zoom-full,.fs-log-zoom-restore{padding-left:4px;padding-right:4px}
 }
 
 @media (prefers-reduced-motion: reduce){

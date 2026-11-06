@@ -90,11 +90,47 @@ export function requestFailureText(status, data) {
   return (data && data.error) || `请求失败（HTTP ${status}）`
 }
 
-/** 拼查询串：省略空值，数组按重复键发送。 */
+/**
+ * 运行控制失败文案（06 §10/§11）。409 是**业务态**而不是故障：
+ *  - `start` 撞上全局运行锁 → 「已有 run 在运行」；
+ *  - `stop` 时目标已经不在跑 → 「不在运行中」。
+ * 两种都把 Host 的原始原因附在后面，但先说人话——用户不需要读 HTTP 码。
+ */
+export function runActionFailureText(action, status, data) {
+  const detail = data && typeof data.error === 'string' ? data.error.trim() : ''
+  const suffix = detail === '' ? '' : '（Host：' + detail + '）'
+  const prefix = action === 'stop' ? '停止失败：' : '开始失败：'
+  if (status === 409) {
+    if (action === 'stop') {
+      return '停止失败：这个 run 已经不在运行中，不需要再停。刷新后确认当前状态。' + suffix
+    }
+    // start 的 409 有两种来源：全局运行锁（要先去停）与「这个 run 已开始过 / 已结束」。
+    const locked = /已有运行中|已有 run 正在运行|只允许一个/.test(detail)
+    if (locked) return '开始失败：已有 run 正在运行。先停止它，再开始新的运行。' + suffix
+    if (detail !== '') return '开始失败：' + detail + '。请新建一个 run 后再开始。'
+    return '开始失败：当前不能开始这个 run（可能已有 run 在跑，或它已经结束）。' + suffix
+  }
+  if (status === 404) return prefix + 'run 不存在（可能已被删除），刷新运行记录后重试。' + suffix
+  if (status === 401) return requestFailureText(status, data)
+  if (status === 403) return prefix + '请求被拒绝（跨站或权限不足）。' + suffix
+  if (status === 405) return prefix + 'Host 还没有提供运行控制接口（执行引擎未启用或版本不匹配）。' + suffix
+  if (detail !== '') return prefix + detail
+  if (typeof status === 'number' && status > 0) return prefix + `Host 返回 HTTP ${status}`
+  return prefix + '连不上 Host 或响应不可读。'
+}
+
+/** 拼查询串：省略空值，数组按重复键发送（事件的 kind 过滤用得到）。 */
 function withQuery(path, params) {
   const search = new URLSearchParams()
   for (const [key, value] of Object.entries(params || {})) {
     if (value === undefined || value === null || value === '') continue
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item === undefined || item === null || item === '') continue
+        search.append(key, String(item))
+      }
+      continue
+    }
     search.set(key, String(value))
   }
   const text = search.toString()
@@ -126,9 +162,36 @@ async function request(method, path, body) {
     data = {}
   }
   if (!response.ok || data.ok === false) {
-    throw new Error(requestFailureText(response.status, data))
+    const error = new Error(requestFailureText(response.status, data))
+    // 运行控制需要区分 409（业务态）/ 404 / 405（Host 未实现）与真正的连接失败。
+    error.status = response.status
+    error.data = data
+    throw error
   }
   return data
+}
+
+/**
+ * 事件查询路径（纯函数，便于单测 M5 的 `since` + `kind` 形态）：
+ * kinds 数组按重复 `kind` 发送；单值 kind 保留给旧调用方。
+ */
+export function readEventsPath(id, options = {}) {
+  const kinds = []
+  if (options && Array.isArray(options.kinds)) {
+    for (const kind of options.kinds) {
+      if (typeof kind === 'string' && kind !== '') kinds.push(kind)
+    }
+  }
+  if (options && typeof options.kind === 'string' && options.kind !== '') kinds.push(options.kind)
+  return withQuery(`/runs/${segment(id)}/events`, {
+    nodeId: options && options.nodeId,
+    attemptId: options && options.attemptId,
+    // Host 读的是重复的 `kind` 参数；数组在这里展开成同一个 key。
+    kind: kinds,
+    since: options && options.since,
+    limit: options && options.limit !== undefined ? options.limit : 200,
+    order: (options && options.order) || 'desc',
+  })
 }
 
 export const api = {
@@ -146,16 +209,15 @@ export const api = {
   listRuns: (limit = 20) => request('GET', withQuery('/runs', { limit })),
   createRun: body => request('POST', '/runs', body || {}),
   readRun: id => request('GET', `/runs/${segment(id)}`),
-  readEvents: (id, options) => request('GET', withQuery(`/runs/${segment(id)}/events`, {
-    nodeId: options && options.nodeId,
-    attemptId: options && options.attemptId,
-    kind: options && options.kind,
-    since: options && options.since,
-    limit: options && options.limit !== undefined ? options.limit : 200,
-    order: (options && options.order) || 'desc',
-  })),
+  readEvents: (id, options) => request('GET', readEventsPath(id, options)),
   readSummary: id => request('GET', `/runs/${segment(id)}/summary`),
   deleteRun: id => request('DELETE', `/runs/${segment(id)}`),
+
+  // ── 运行控制（docs/design/06-execution-engine.md §10）────────────────────
+  // 202 `{run}`；run 带 live 字段。运行中 start → 409，不在跑 stop → 409，
+  // 两种业务态由调用方用 runActionFailureText 转成人话。
+  startRun: id => request('POST', `/runs/${segment(id)}/start`),
+  stopRun: id => request('POST', `/runs/${segment(id)}/stop`),
 }
 
 /**

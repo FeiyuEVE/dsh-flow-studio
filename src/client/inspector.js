@@ -278,7 +278,12 @@ function EdgeForm({ edge, flow, onPatch, onDelete }) {
     h('button', { type: 'button', className: 'fs-btn danger', onClick: onDelete }, '删除这条连线'))
 }
 
-export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge, onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge }) {
+export function Inspector({
+  flow, selection, skills,
+  onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge,
+  onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge,
+  locked = false, lockReason = '',
+}) {
   let title = '配置'
   let body = h('div', { className: 'fs-empty-panel' },
     '点画布上的节点或连线来配置。',
@@ -317,7 +322,18 @@ export function Inspector({ flow, selection, skills, onPatchNode, onPatchEdge, o
     }
   }
 
-  return h('aside', { className: 'fs-panel' },
-    h('div', { className: 'fs-panel-head' }, h('span', null, title)),
-    body)
+  // M1：运行中锁结构 —— 整个表单进 disabled fieldset，并显式写出原因（不是静默失效）。
+  return h('aside', { className: 'fs-panel' + (locked ? ' locked' : '') },
+    h('div', { className: 'fs-panel-head' },
+      h('span', null, title),
+      locked ? h('span', { className: 'fs-panel-lock-badge' }, '运行中已锁定') : null),
+    locked
+      ? h('div', { className: 'fs-lock-banner', role: 'status' },
+        lockReason || '运行中已锁定结构：检查器编辑暂不可用，停止运行后恢复')
+      : null,
+    h('fieldset', {
+      className: 'fs-panel-body',
+      disabled: locked,
+      'aria-label': locked ? '运行中已锁定，检查器编辑暂不可用' : '配置面板',
+    }, body))
 }

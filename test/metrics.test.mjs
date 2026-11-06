@@ -12,6 +12,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
@@ -158,7 +159,7 @@ for (const [name, state, label] of probeRows) {
 // 2. HTTP 探针
 // ---------------------------------------------------------------------------
 
-function makeCtx() {
+function makeCtx(services = {}) {
   const routes = []
   const ctx = {
     routes,
@@ -171,9 +172,12 @@ function makeCtx() {
     effect(fn) {
       return fn()
     },
-    logger: { warn() {} },
-    get() {
-      return undefined
+    logger: { warn() {}, error() {}, info() {} },
+    get(name) {
+      if (name === 'connection' && !Object.hasOwn(services, name)) {
+        return { requestRejection: () => undefined }
+      }
+      return services[name]
     },
   }
   return ctx
@@ -242,10 +246,10 @@ function rawEvent(kind, runId, over = {}) {
 
 console.log('metrics · Host HTTP 探针')
 
-await check('GET /health 带 auth / runsDir / version（§8.5）', async () => {
+await check('GET /health 带 auth / runsDir / version（§8.5 + §13.1）', async () => {
   const result = await call(route, 'GET', '/api/flow-studio/health')
   assert.equal(result.status, 200)
-  assert.equal(result.json.auth, 'origin-only')
+  assert.equal(result.json.auth, 'connection')
   assert.equal(result.json.runsDir, runsRoot)
   assert.equal(result.json.version, PLUGIN_VERSION)
 })
@@ -368,10 +372,10 @@ await check('GET /export 接受 ?token（浏览器 <a download>），错 token 4
   }
 })
 
-await check('可选 token 两档：未设置同源放行；设置后缺/错 token 401、Bearer 与 ?token 放行（§8.5）', async () => {
+await check('可选 token 两档：未设置同源放行；设置后缺/错 token 401、Bearer 放行、?token 只留 export（§8.5 + §13.1）', async () => {
   const noToken = await call(route, 'GET', '/api/flow-studio/health')
   assert.equal(noToken.status, 200, '未设置 token 时保持同源校验')
-  assert.equal(noToken.json.auth, 'origin-only')
+  assert.equal(noToken.json.auth, 'connection')
 
   const token = 'fs-probe-token-0123456789abcdef'
   process.env[AUTH_ENV] = token
@@ -383,23 +387,23 @@ await check('可选 token 两档：未设置同源放行；设置后缺/错 toke
     const bearer = await call(route, 'GET', '/api/flow-studio/health', undefined, { authorization: `Bearer ${token}` })
     assert.equal(bearer.status, 200)
     assert.equal(bearer.json.auth, 'token')
+    // 06 §13.1：?token= 不再适用于普通接口，只有 export 保留。
     const query = await call(route, 'GET', `/api/flow-studio/runs?token=${encodeURIComponent(token)}`)
-    assert.equal(query.status, 200)
+    assert.equal(query.status, 401)
     const crossOrigin = await call(route, 'GET', '/api/flow-studio/health', undefined, {
       authorization: `Bearer ${token}`,
       origin: 'http://evil.example',
     })
     assert.equal(crossOrigin.status, 403, 'token 档位下仍保留同源校验')
-    console.log('  · token 档位：缺 token 401 / 错 token 401 / Bearer 200 / ?token 200 / 跨站 403')
+    console.log('  · token 档位：缺 token 401 / 错 token 401 / Bearer 200 / 普通接口 ?token 401 / 跨站 403')
   } finally {
     delete process.env[AUTH_ENV]
   }
 
-  // 设置了 token 但太短：fail closed，不会悄悄退回 origin-only。
+  // 设置了 token 但太短：启动即拒绝（不再悄悄退回 origin-only）。
   process.env[AUTH_ENV] = 'short'
   try {
-    const short = await call(route, 'GET', '/api/flow-studio/health')
-    assert.equal(short.status, 401)
+    assert.throws(() => apply(makeCtx()), /至少 16 个字符/)
   } finally {
     delete process.env[AUTH_ENV]
   }
@@ -412,6 +416,145 @@ await check('summary 在纯函数层也能独立复算（quality 与 HTTP 同一
   assert.equal(summary.quality.label, '良：返工 1 轮后达标')
   assert.equal(summary.progress.ratio, 1)
   assert.equal(summary.progress.nodeDone, 2)
+})
+
+// ---------------------------------------------------------------------------
+// 3. v1.1 修复契约探针：acceptance 摘要 / 证据防伪 / 桩标记 / 冲突 / 增量缓存
+// ---------------------------------------------------------------------------
+
+await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘要同口径', async () => {
+  const meta = await makeRun(2)
+  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+    rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_a', data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'artifacts/acc.md' },
+    }),
+    rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_a', data: { itemId: 'n_a:R2', status: 'fail', decidedBy: 'auto' },
+    }),
+    rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_b', data: { itemId: 'n_b:R1', status: 'pass', decidedBy: 'human', evidenceRef: 'artifacts/acc2.md' },
+    }),
+  ])
+  const result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(result.status, 200)
+  assert.deepEqual(result.json.summary.acceptance, { passed: 2, total: 3, rate: 2 / 3 })
+  console.log(`  · summary.acceptance = ${JSON.stringify(result.json.summary.acceptance)}`)
+})
+
+await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ acceptance unknown', async () => {
+  const meta = await makeRun(1)
+  const append = events => call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, events)
+  // 模型自述：引用了一个根本不存在的文件。
+  await append([{
+    ...rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_a',
+      data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'evidence/forged.md' },
+    }),
+    extra: { provenance: 'model-claim' },
+  }])
+  let result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'unknown')
+  assert.match(result.json.summary.quality.evidence.acceptance.reason, /证据对不上/)
+  assert.match(result.json.summary.quality.evidence.acceptance.unverifiedRefs[0], /artifact\/write/)
+  console.log(`  · 伪造引用 → acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
+
+  // 真产物 + 匹配的 artifact/write（path + sha256）+ 重新判定 pass → 才算通过。
+  const rel = 'evidence/real.md'
+  const abs = join(runsRoot, meta.id, rel)
+  mkdirSync(dirname(abs), { recursive: true })
+  writeFileSync(abs, '# 证据\n')
+  const sha256 = createHash('sha256').update('# 证据\n').digest('hex')
+  await append([
+    rawEvent('artifact/write', meta.id, {
+      nodeId: 'n_a', data: { path: rel, bytes: 8, kind: 'md', sha256 },
+    }),
+    {
+      ...rawEvent('acceptance/verdict', meta.id, {
+        nodeId: 'n_a',
+        data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: rel },
+      }),
+      extra: { provenance: 'model-claim' },
+    },
+  ])
+  result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'pass')
+  console.log(`  · 真产物 + sha256 对齐 → acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
+})
+
+await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全部体现，quality=unknown 且 label 以「桩」开头', async () => {
+  const stubRun = await store.createRun(runsRoot, {
+    flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1, engine: 'stub',
+  })
+  await call(route, 'POST', `/api/flow-studio/runs/${stubRun.id}/events`, [
+    rawEvent('run/start', stubRun.id, {
+      nodeId: undefined, attemptId: undefined,
+      data: { flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1, engine: 'stub' },
+    }),
+  ])
+  assert.equal((await store.readRunMeta(runsRoot, stubRun.id)).engine, 'stub')
+  const list = await call(route, 'GET', '/api/flow-studio/runs?limit=100')
+  assert.equal(list.json.runs.find(run => run.id === stubRun.id).engine, 'stub')
+  const summary = await call(route, 'GET', `/api/flow-studio/runs/${stubRun.id}/summary`)
+  assert.equal(summary.json.summary.engine, 'stub')
+  assert.equal(summary.json.summary.quality.state, 'unknown')
+  assert.ok(summary.json.summary.quality.label.startsWith('桩'), summary.json.summary.quality.label)
+
+  // FLOW_STUDIO_STUB_ENGINE=1 单独设置不生效；必须同时 TESTBED=1。
+  process.env.FLOW_STUDIO_STUB_ENGINE = '1'
+  delete process.env.FLOW_STUDIO_TESTBED
+  try {
+    const igw = makeCtx()
+    apply(igw)
+    const ignored = await call(igw.routes[0], 'GET', '/api/flow-studio/health')
+    assert.equal(ignored.json.engine, 'real', '缺 TESTBED 时桩引擎必须被忽略')
+  } finally {
+    delete process.env.FLOW_STUDIO_STUB_ENGINE
+  }
+  process.env.FLOW_STUDIO_STUB_ENGINE = '1'
+  process.env.FLOW_STUDIO_TESTBED = '1'
+  try {
+    const gw = makeCtx()
+    apply(gw)
+    const enabled = await call(gw.routes[0], 'GET', '/api/flow-studio/health')
+    assert.equal(enabled.json.engine, 'stub')
+  } finally {
+    delete process.env.FLOW_STUDIO_STUB_ENGINE
+    delete process.env.FLOW_STUDIO_TESTBED
+  }
+  console.log(`  · stub run → quality=${summary.json.summary.quality.state} label=${summary.json.summary.quality.label}`)
+})
+
+await check('§13.7 跨节点重复 itemId → acceptance unknown 且返回 conflicts', async () => {
+  const meta = await makeRun(2)
+  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+    rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_a', data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'a.md' },
+    }),
+    rawEvent('acceptance/verdict', meta.id, {
+      nodeId: 'n_b', data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'b.md' },
+    }),
+  ])
+  const result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(result.json.summary.conflicts.acceptance.length, 1)
+  assert.deepEqual(result.json.summary.conflicts.acceptance[0].nodes, ['n_a', 'n_b'])
+  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'unknown')
+  assert.match(result.json.summary.quality.evidence.acceptance.reason, /跨节点重复/)
+  console.log(`  · conflicts=${JSON.stringify(result.json.summary.conflicts)}`)
+})
+
+await check('§13.7 /summary 按 lastSeq 增量缓存：未变命中、追加后失效', async () => {
+  const meta = await makeRun(1)
+  const first = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(first.json.cached, false)
+  const second = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(second.json.cached, true)
+  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+    rawEvent('node/end', meta.id, { data: { status: 'passed', durationMs: 1 } }),
+  ])
+  const third = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
+  assert.equal(third.json.cached, false)
+  assert.equal(third.json.summary.eventCount, 1)
+  console.log('  · summary cache: miss → hit → miss（lastSeq 变化后重建）')
 })
 
 rmSync(home, { recursive: true, force: true })

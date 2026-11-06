@@ -72,6 +72,9 @@ const CHECK_STATE = new Set(['pass', 'fail', 'skipped', 'na'])
 /** §8.2 acceptance/verdict 白名单。 */
 const ACCEPTANCE_STATUS = new Set(['pass', 'fail', 'skip', 'na'])
 const DECIDED_BY = new Set(['human', 'auto'])
+/** 06 §13.8：引擎标记只认 real / stub。 */
+export const ENGINE_NAMES = Object.freeze(['real', 'stub'])
+const ENGINE_NAME_SET = new Set(ENGINE_NAMES)
 
 /** 顶层保留字段；其余未识别字段折叠进有界的 `extra`。 */
 const RESERVED_FIELDS = new Set([
@@ -98,6 +101,22 @@ function fail(field, reason) {
 export function checkRunId(value) {
   if (typeof value !== 'string') return null
   if (!ID_PATTERN.test(value)) return null
+  if (value === '.' || value === '..') return null
+  if (value.startsWith('.')) return null
+  return value
+}
+
+/**
+ * 成员 id。06 §4.2 规定 `memberId = <nodeId>:<序号>`，冒号不进 run/node 的
+ * 路径字符集（`memberId` 只出现在事件里，不参与落盘路径），所以这里单独放宽一个
+ * 字符，其余规则（长度、拒绝 `.` / 点开头）与 {@link checkRunId} 一致。
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function checkMemberId(value) {
+  if (typeof value !== 'string') return null
+  if (value.length < 1 || value.length > 64) return null
+  if (!/^[A-Za-z0-9._:-]+$/.test(value)) return null
   if (value === '.' || value === '..') return null
   if (value.startsWith('.')) return null
   return value
@@ -250,6 +269,18 @@ function strArrayField(data, key, { required = true, maxItems = 12, maxLen = 64 
 function validateData(kind, data) {
   const out = { ...data }
   const err = (key, reason) => ({ ok: false, field: key ? `data.${key}` : 'data', reason })
+  const putOptionalEnum = (key, allowed) => {
+    const value = data[key]
+    if (value === undefined || value === null) {
+      delete out[key]
+      return null
+    }
+    if (typeof value !== 'string' || !allowed.has(value)) {
+      return err(key, `取值必须是 ${[...allowed].join(' / ')}`)
+    }
+    out[key] = value
+    return null
+  }
 
   const putStr = (key, max = 256, required = true) => {
     const result = strField(data, key, { required, max })
@@ -308,6 +339,9 @@ function validateData(kind, data) {
   switch (kind) {
     case 'run/start': {
       let bad = putStr('flowId', 128) || putStr('flowName', 200) || putInt('nodeTotal', { min: 0 })
+      if (bad) return bad
+      // 06 §13.8：run/start.data.engine 让读事件的人也能看出是不是桩。
+      bad = putOptionalEnum('engine', ENGINE_NAME_SET)
       if (bad) return bad
       break
     }
@@ -537,7 +571,7 @@ export function normalizeEvent(raw, ctx = {}) {
 
   let memberId = raw.memberId === undefined ? null : raw.memberId
   if (memberId !== null) {
-    memberId = checkRunId(memberId)
+    memberId = checkMemberId(memberId)
     if (!memberId) return fail('memberId', '非法 memberId（只允许字母、数字、点、下划线、连字符，1–64 位）')
   }
   if ((kind === 'member/start' || kind === 'member/end') && memberId === null) {
@@ -983,18 +1017,126 @@ const EVIDENCE_LABELS = {
   p0p1: 'P0/P1 未解决',
 }
 
+/** 06 §13.7 / 05 §8.2：引擎写下的 artifact/write（path + sha256）索引。 */
+export function collectArtifactIndex(events = []) {
+  const map = new Map()
+  for (const event of sortEvents(events)) {
+    if (!event || event.kind !== 'artifact/write' || !event.data) continue
+    const path = event.data.path
+    const sha256 = event.data.sha256
+    if (typeof path !== 'string' || !isSafeRelPath(path)) continue
+    if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(sha256)) continue
+    map.set(path, sha256.toLowerCase())
+  }
+  return map
+}
+
+/** 模型自述证据：事件 extra.provenance === 'model-claim'（06 §13.7）。 */
+function isModelClaim(event) {
+  return Boolean(event && event.extra && event.extra.provenance === 'model-claim')
+}
+
+/**
+ * 校验一条 `model-claim` 证据引用：
+ *   - 必须是 run 目录内的相对路径；
+ *   - 必须能对上某条 `artifact/write` 的 path + sha256（纯函数层可查）；
+ *   - 传入 `verifyEvidence` 时再查文件真实存在且内容 sha256 与事件一致（Host 层做）。
+ * 没有 `verifyEvidence` 时只做前两项（纯函数测试 / 离线复算没有 fs）。
+ */
+function verifyClaimRef(event, ref, artifacts, verifyEvidence) {
+  if (typeof ref !== 'string' || ref.trim() === '') {
+    return { ok: false, reason: '缺少证据引用' }
+  }
+  if (!isSafeRelPath(ref)) {
+    return { ok: false, reason: `证据引用不是 run 目录内的相对路径：${ref.slice(0, 120)}` }
+  }
+  if (!(artifacts instanceof Map) || !artifacts.has(ref)) {
+    return { ok: false, reason: `证据引用 ${ref} 没有对应的 artifact/write（path+sha256）` }
+  }
+  if (typeof verifyEvidence === 'function' && !verifyEvidence(ref, artifacts.get(ref))) {
+    return { ok: false, reason: `证据文件 ${ref} 不存在，或内容 sha256 与 artifact/write 不符` }
+  }
+  return { ok: true }
+}
+
+/**
+ * 06 §13.7 双保险：`findings.id` / `acceptance.itemId` / `tests.suite` / `check.ruleSetId`
+ * 在同一 run 内跨节点重复 → 该指标的计数不可信。返回每个指标的冲突清单。
+ */
+export function computeConflicts(events = []) {
+  const groups = {
+    findings: ['review/finding', 'id'],
+    acceptance: ['acceptance/verdict', 'itemId'],
+    tests: ['test/report', 'suite'],
+    checks: ['check/form', 'ruleSetId'],
+  }
+  const conflicts = { findings: [], acceptance: [], tests: [], checks: [] }
+  for (const [metric, [kind, field]] of Object.entries(groups)) {
+    const nodesById = new Map()
+    for (const event of events) {
+      if (!event || event.kind !== kind || !event.data) continue
+      const id = event.data[field]
+      if (typeof id !== 'string' || id === '' || typeof event.nodeId !== 'string') continue
+      if (!nodesById.has(id)) nodesById.set(id, new Set())
+      nodesById.get(id).add(event.nodeId)
+    }
+    for (const [id, nodeSet] of nodesById) {
+      if (nodeSet.size > 1) conflicts[metric].push({ id, nodes: [...nodeSet].sort((a, b) => a.localeCompare(b)) })
+    }
+    conflicts[metric].sort((a, b) => a.id.localeCompare(b.id))
+  }
+  return conflicts
+}
+
+export function hasConflicts(conflicts) {
+  return Object.values(conflicts || {}).some(list => Array.isArray(list) && list.length > 0)
+}
+
+function conflictReason(metric, list) {
+  const ids = list.slice(0, 3).map(item => item.id).join('、')
+  return `${metric} 标识跨节点重复（${ids}${list.length > 3 ? ' 等' : ''}），计数不可信`
+}
+
+const CONFLICT_LABELS = {
+  findings: '审查发现 id',
+  acceptance: '验收条目 itemId',
+  tests: '测试套件 suite',
+  checks: '规则集 ruleSetId',
+}
+
+/**
+ * 40px 主摘要用：当前有效 attempt 的验收条目通过率（06 §13.7 / 04 §3.9）。
+ * `passed` 只数当前 attempt 里最新判定为 pass 的条目；`total` 是条目数；分母 0 → rate null。
+ */
+export function summarizeAcceptance(events = []) {
+  const latest = new Map()
+  for (const event of sortEvents(currentAttemptEvents(events))) {
+    if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
+    const itemId = event.data.itemId
+    if (typeof itemId !== 'string' || itemId === '') continue
+    latest.set(itemId, event.data)
+  }
+  let passed = 0
+  for (const data of latest.values()) {
+    if (data.status === 'pass') passed += 1
+  }
+  const total = latest.size
+  return { passed, total, rate: total === 0 ? null : passed / total }
+}
+
 /**
  * 验收条目证据（§8.2 / §8.4）：同一 itemId 以 seq 最大者为准；只认当前 attempt。
  * 缺证据或证据链接 → unknown；任一条 fail → fail；全部 skip/na → unknown。
  */
-export function computeAcceptance(events = []) {
+export function computeAcceptance(events = [], options = {}) {
   const scoped = currentAttemptEvents(events)
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
     const { itemId } = event.data
     if (typeof itemId !== 'string' || itemId === '') continue
-    latest.set(itemId, event.data)
+    latest.set(itemId, { data: event.data, event })
   }
   if (latest.size === 0) return { state: 'unknown', reason: '没有 acceptance/verdict 记录', items: 0 }
 
@@ -1002,13 +1144,25 @@ export function computeAcceptance(events = []) {
   let failed = 0
   let notApplicable = 0
   let missingLink = 0
-  for (const data of latest.values()) {
+  let unverified = 0
+  const unverifiedRefs = []
+  for (const { data, event } of latest.values()) {
     if (data.status === 'fail') {
       failed += 1
       continue
     }
     if (data.status !== 'pass') {
       notApplicable += 1
+      continue
+    }
+    if (isModelClaim(event)) {
+      const claim = verifyClaimRef(event, data.evidenceRef, artifacts, options.verifyEvidence)
+      if (!claim.ok) {
+        unverified += 1
+        unverifiedRefs.push(`${data.itemId}: ${claim.reason}`)
+        continue
+      }
+      passed += 1
       continue
     }
     if (typeof data.evidenceRef !== 'string' || data.evidenceRef.trim() === '') {
@@ -1018,6 +1172,18 @@ export function computeAcceptance(events = []) {
     passed += 1
   }
   if (failed > 0) return { state: 'fail', reason: `${failed} 个验收条目未通过`, items: latest.size, passed, failed, notApplicable }
+  if (unverified > 0) {
+    return {
+      state: 'unknown',
+      reason: `${unverified} 个模型自述验收条目的证据对不上（路径 / 文件 / sha256）`,
+      items: latest.size,
+      passed,
+      failed,
+      notApplicable,
+      unverified,
+      unverifiedRefs,
+    }
+  }
   if (missingLink > 0) {
     return { state: 'unknown', reason: `${missingLink} 个通过的验收条目缺证据链接`, items: latest.size, passed, failed, notApplicable }
   }
@@ -1031,14 +1197,15 @@ export function computeAcceptance(events = []) {
  * 测试证据（§8.2 / §8.4）：同一 suite 以 seq 最大者为准；只认当前 attempt。
  * 有失败 → fail；计数缺失 / 只跑 0 条 / 缺报告链接 → unknown。
  */
-export function computeTests(events = []) {
+export function computeTests(events = [], options = {}) {
   const scoped = currentAttemptEvents(events)
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'test/report' || !event.data) continue
     const { suite } = event.data
     if (typeof suite !== 'string' || suite === '') continue
-    latest.set(suite, event.data)
+    latest.set(suite, { data: event.data, event })
   }
   if (latest.size === 0) return { state: 'unknown', reason: '没有 test/report 记录', suites: 0 }
 
@@ -1046,8 +1213,10 @@ export function computeTests(events = []) {
   let failedSuites = 0
   let missingCounts = 0
   let missingLink = 0
+  let unverified = 0
+  const unverifiedRefs = []
   const suites = []
-  for (const [suite, data] of latest) {
+  for (const [suite, { data, event }] of latest) {
     const counts = ['executed', 'passed', 'failed', 'skipped']
     if (!counts.every(key => Number.isInteger(data[key]))) {
       missingCounts += 1
@@ -1073,6 +1242,17 @@ export function computeTests(events = []) {
       suites.push({ suite, status: 'fail', executed: data.executed, passed: data.passed, failed: data.failed })
       continue
     }
+    if (isModelClaim(event)) {
+      const claim = verifyClaimRef(event, data.reportRef, artifacts, options.verifyEvidence)
+      if (!claim.ok) {
+        unverified += 1
+        unverifiedRefs.push(`${suite}: ${claim.reason}`)
+        continue
+      }
+      passedSuites += 1
+      suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
+      continue
+    }
     if (typeof data.reportRef !== 'string' || data.reportRef.trim() === '') {
       missingLink += 1
       continue
@@ -1085,6 +1265,18 @@ export function computeTests(events = []) {
   }
   if (missingCounts > 0) {
     return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites }
+  }
+  if (unverified > 0) {
+    return {
+      state: 'unknown',
+      reason: `${unverified} 个模型自述测试报告的证据对不上（路径 / 文件 / sha256）`,
+      suites: latest.size,
+      passedSuites,
+      failedSuites,
+      unverified,
+      unverifiedRefs,
+      details: suites,
+    }
   }
   if (missingLink > 0) {
     return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites }
@@ -1099,13 +1291,14 @@ export function computeTests(events = []) {
  * 规范检查证据（§8.3）：state=pass 只有在 passedChecks / totalChecks 都是整数、
  * total > 0、passed === total、且 executedAt 或 reportRef 至少有一个时才成立。
  */
-function checkEvidence(events) {
+function checkEvidence(events, options = {}) {
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
   const latest = new Map()
   for (const event of sortEvents(currentAttemptEvents(events))) {
     if (!event || event.kind !== 'check/form' || !event.data) continue
     const { ruleSetId } = event.data
     if (typeof ruleSetId !== 'string' || ruleSetId === '') continue
-    latest.set(ruleSetId, event.data)
+    latest.set(ruleSetId, { data: event.data, event })
   }
   if (latest.size === 0) {
     return { state: 'unknown', reason: '没有 check/form 执行记录' }
@@ -1115,8 +1308,10 @@ function checkEvidence(events) {
   let passed = 0
   let failed = 0
   let incomplete = 0
+  let unverified = 0
+  const unverifiedRefs = []
   const skipped = []
-  for (const [ruleSetId, data] of latest) {
+  for (const [ruleSetId, { data, event }] of latest) {
     if (data.state === 'fail') {
       failed += 1
       continue
@@ -1132,15 +1327,41 @@ function checkEvidence(events) {
     applicable += 1
     const countsOk = Number.isInteger(data.passedChecks) && Number.isInteger(data.totalChecks)
       && data.totalChecks > 0 && data.passedChecks === data.totalChecks
+    if (!countsOk) {
+      incomplete += 1
+      continue
+    }
+    if (isModelClaim(event)) {
+      // 模型自述的规范检查：executedAt 不算证据，必须给出可复核的 reportRef。
+      const claim = verifyClaimRef(event, data.reportRef, artifacts, options.verifyEvidence)
+      if (!claim.ok) {
+        unverified += 1
+        unverifiedRefs.push(`${ruleSetId}: ${claim.reason}`)
+        continue
+      }
+      passed += 1
+      continue
+    }
     const hasSource = (typeof data.executedAt === 'string' && data.executedAt.trim() !== '')
       || (typeof data.reportRef === 'string' && data.reportRef.trim() !== '')
-    if (!countsOk || !hasSource) {
+    if (!hasSource) {
       incomplete += 1
       continue
     }
     passed += 1
   }
   if (failed > 0) return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed }
+  if (unverified > 0) {
+    return {
+      state: 'unknown',
+      reason: `${unverified} 个模型自述规范检查的报告对不上（路径 / 文件 / sha256）`,
+      applicable,
+      passed,
+      failed,
+      unverified,
+      unverifiedRefs,
+    }
+  }
   if (incomplete > 0) {
     return {
       state: 'unknown',
@@ -1235,22 +1456,62 @@ export function countRework(events = []) {
  *   否则 warn「可：返工 n 轮」（不是绿灯）；
  * - progress.ratio < 1 → 至少 warn。
  */
-export function computeQuality(events = []) {
+export function computeQuality(events = [], options = {}) {
   const findings = computeFindings(events)
+  const conflicts = options.conflicts && typeof options.conflicts === 'object'
+    ? options.conflicts
+    : computeConflicts(events)
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
   const scoped = currentAttemptEvents(events)
-  const checks = checkEvidence(scoped)
-  const acceptance = computeAcceptance(scoped)
-  const tests = computeTests(scoped)
+  const evidenceOptions = { artifacts, verifyEvidence: options.verifyEvidence }
+  let checks = checkEvidence(scoped, evidenceOptions)
+  let acceptance = computeAcceptance(scoped, evidenceOptions)
+  let tests = computeTests(scoped, evidenceOptions)
   const review = reviewEvidence(scoped, findings)
+  let p0p1 = review.p0p1
   const progress = computeProgress(events)
   const reworkRounds = countRework(events)
+
+  // 06 §13.7 双保险：跨节点标识冲突 → 对应指标 unknown，不给绿灯。
+  if (conflicts.acceptance && conflicts.acceptance.length > 0) {
+    acceptance = {
+      ...acceptance,
+      state: 'unknown',
+      reason: conflictReason(CONFLICT_LABELS.acceptance, conflicts.acceptance),
+      conflicts: conflicts.acceptance,
+    }
+  }
+  if (conflicts.tests && conflicts.tests.length > 0) {
+    tests = {
+      ...tests,
+      state: 'unknown',
+      reason: conflictReason(CONFLICT_LABELS.tests, conflicts.tests),
+      conflicts: conflicts.tests,
+    }
+  }
+  if (conflicts.checks && conflicts.checks.length > 0) {
+    checks = {
+      ...checks,
+      state: 'unknown',
+      reason: conflictReason(CONFLICT_LABELS.checks, conflicts.checks),
+      conflicts: conflicts.checks,
+    }
+  }
+  if (conflicts.findings && conflicts.findings.length > 0) {
+    p0p1 = {
+      ...p0p1,
+      state: 'unknown',
+      reason: conflictReason(CONFLICT_LABELS.findings, conflicts.findings),
+      conflicts: conflicts.findings,
+    }
+  }
 
   const evidence = {
     acceptance,
     tests,
     checks,
     review: review.review,
-    p0p1: review.p0p1,
+    p0p1,
   }
 
   const missing = Object.entries(evidence)
@@ -1292,6 +1553,26 @@ export function computeQuality(events = []) {
     label = detail
   }
 
+  const engine = options.engine === 'stub' ? 'stub' : 'real'
+  const conflictList = hasConflicts(conflicts) ? conflicts : null
+  if (engine === 'stub') {
+    // 06 §13.7 / §13.8：桩数据不是真实证据，无论算出什么都只能是 unknown。
+    return {
+      state: 'unknown',
+      label: `桩：${label}`,
+      missing,
+      failed,
+      evidence,
+      reworkRounds,
+      acceptedRate: findings.acceptedRate,
+      p0Unresolved: review.p0,
+      p1Unresolved: review.p1,
+      engine,
+      stub: true,
+      conflicts: conflictList,
+    }
+  }
+
   return {
     state,
     label,
@@ -1302,6 +1583,8 @@ export function computeQuality(events = []) {
     acceptedRate: findings.acceptedRate,
     p0Unresolved: review.p0,
     p1Unresolved: review.p1,
+    engine,
+    conflicts: conflictList,
   }
 }
 
@@ -1315,18 +1598,53 @@ export function summarize(events = [], options = {}) {
     ? options.now
     : new Date()
   const tokens = computeTokens(events)
+  // 06 §13.8：引擎标记优先取显式参数（run.json.engine），其次取 run/start.data.engine。
+  let engine = 'real'
+  if (options.engine === 'stub' || options.engine === 'real') {
+    engine = options.engine
+  } else {
+    for (const event of events) {
+      if (event && event.kind === 'run/start' && event.data
+        && (event.data.engine === 'stub' || event.data.engine === 'real')) {
+        engine = event.data.engine
+        break
+      }
+    }
+  }
+  const conflicts = computeConflicts(events)
+  const artifacts = collectArtifactIndex(events)
+  const findings = computeFindings(events)
+  if (conflicts.findings.length > 0) {
+    findings.state = 'unknown'
+    findings.reason = conflictReason(CONFLICT_LABELS.findings, conflicts.findings)
+    findings.conflicts = conflicts.findings
+  }
+  let lastSeq = Number.isInteger(options.lastSeq) && options.lastSeq >= 0 ? options.lastSeq : 0
+  for (const event of events) {
+    if (Number.isInteger(event && event.seq) && event.seq > lastSeq) lastSeq = event.seq
+  }
   return {
     computedAt: now.toISOString(),
     eventCount: events.length,
     // §8.6：summary 允许全量，但必须声明 eventCount 与 truncated。
     truncated: options.truncated === true,
+    lastSeq,
+    engine,
+    // 06 §13.7：40px 主摘要直接取这三项，不用再从 quality.evidence 里翻。
+    acceptance: summarizeAcceptance(events),
+    conflicts,
     usage: { unkeyedCalls: tokens.unkeyedCalls },
     tokens,
     skillUsage: computeSkillUsage(events),
-    findings: computeFindings(events),
+    findings,
     rejects: computeRejects(events),
     progress: computeProgress(events),
-    quality: computeQuality(events),
+    quality: computeQuality(events, {
+      engine,
+      conflicts,
+      artifacts,
+      verifyEvidence: options.verifyEvidence,
+    }),
   }
 }
 
@@ -1429,6 +1747,7 @@ export function renderRunMarkdown(meta = {}, events = [], summary = null) {
   lines.push(`- runId: \`${run.id || ''}\``)
   lines.push(`- 流程: ${mdCell(run.flowName || '')}（\`${run.flowId || ''}\`）`)
   lines.push(`- 状态: \`${run.status || 'unknown'}\``)
+  lines.push(`- 引擎: \`${s.engine || 'real'}\`${s.engine === 'stub' ? '（桩数据，不是真实证据）' : ''}`)
   lines.push(`- 开始: ${run.startedAt || '—'}`)
   lines.push(`- 结束: ${run.endedAt || '—'}`)
   lines.push(`- 事件数: ${s.eventCount}（聚合于 ${s.computedAt}）`)
@@ -1439,6 +1758,12 @@ export function renderRunMarkdown(meta = {}, events = [], summary = null) {
   lines.push('## 阶段进度')
   lines.push('')
   lines.push(`passed ${progress.passed} / ${progress.denominator}（总阶段 ${progress.total}，skipped ${progress.skipped} 不计入分母）· ${ratio}${progress.invalidated > 0 ? ` · 返工失效 ${progress.invalidated}（${progress.invalidatedNodes.join(', ')}）` : ''}`)
+  lines.push('')
+
+  const acceptance = s.acceptance || { passed: 0, total: 0, rate: null }
+  lines.push('## 验收条目')
+  lines.push('')
+  lines.push(`通过 ${acceptance.passed} / ${acceptance.total}${acceptance.rate === null ? '（通过率未检测：没有验收条目）' : ` · 通过率 ${(acceptance.rate * 100).toFixed(1)}%`}`)
   lines.push('')
 
   const tokens = s.tokens.total

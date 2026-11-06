@@ -11,7 +11,7 @@
 import {
   EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, summarize, validateFlow,
 } from '../model.js'
-import { api } from './api.js'
+import { api, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, draftDiffers, readDraft, writeDraft } from './drafts.js'
@@ -20,7 +20,10 @@ import { Inspector } from './inspector.js'
 import {
   beginLink, confirmLink, describeLink, edgeKindBetween, moveLink,
 } from './link.js'
-import { FsLogDrawer, drawerActionFor } from './logdrawer.js'
+import {
+  FsLogDrawer, conclusionOf, deriveNodeStates, drawerActionFor, eventWindowNote, liveOf,
+  runIsActive, runIsPending, runLiveLabel,
+} from './logdrawer.js'
 import { h, rt } from './runtime.js'
 import { CSS } from './styles.js'
 
@@ -40,12 +43,182 @@ function formatSavedAt(iso) {
     + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
+/** live.phase（06 §2）→ 中文；未知 phase 不显示，不编造。 */
+const PHASE_TEXT = { model: '模型调用', tool: '工具调用', spawn: '启动会话', idle: '空闲' }
+
+export function phaseText(phase) {
+  return PHASE_TEXT[String(phase || '').toLowerCase()] || ''
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** M1：运行中锁结构的统一原因文案（画布 / 检查器 / 播报共用同一句）。 */
+export const RUN_LOCK_REASON = '运行中已锁定结构：拖拽 / 双击新建 / 连线 / 检查器编辑暂不可用，停止运行后恢复'
+
+/** M6：确认停止按钮在第一次点击后至少等 400ms 才可用（防双击击穿）。 */
+export const STOP_CONFIRM_DELAY_MS = 400
+
+/** M6：5s 内没有确认就自动解除，并播报（aria-live 由调用方负责）。 */
+export const STOP_CONFIRM_TIMEOUT_MS = 5000
+
+/** 校验收口（B2）：错误 → 目标节点/连线 + 可播报文案。纯函数，SSR 也能单测。 */
+export function firstErrorTarget(issues) {
+  const errors = issues && Array.isArray(issues.errors) ? issues.errors : []
+  const first = errors.find(item => isObject(item))
+  if (!first) return null
+  if (typeof first.nodeId === 'string' && first.nodeId !== '') return { kind: 'node', id: first.nodeId }
+  if (typeof first.edgeId === 'string' && first.edgeId !== '') return { kind: 'edge', id: first.edgeId }
+  return null
+}
+
+/**
+ * 开始运行前的门禁：`validateFlow` 有 error 就**不建 run、不起引擎**。
+ * 返回 targets 给调用方打开问题列表 + 定位第一条错误。
+ */
+export function runPreflight(flow) {
+  const issues = validateFlow(flow)
+  if (issues.errors.length === 0) {
+    return { ok: true, issues, target: null, message: '' }
+  }
+  const target = firstErrorTarget(issues)
+  const message = '流程校验未通过：' + issues.errors.length + ' 个错误，已取消开始。'
+    + (target ? '已定位到第 1 个错误，可在问题列表逐条修复。' : '请在问题列表里逐条修复。')
+  return { ok: false, issues, target, message }
+}
+
+/**
+ * start 失败后的收口计划（B2）：只有「本次刚新建的 run」才 DELETE，
+ * 避免 400 / 409 之后在运行记录里留一条幽灵 pending run；复用的旧 run 不能删。
+ */
+export function startFailurePlan(action, failure, run, created) {
+  return {
+    message: runActionFailureText(action, failure && failure.status, failure && failure.data),
+    deleteRunId: created && isObject(run) && typeof run.id === 'string' && run.id !== ''
+      ? run.id
+      : '',
+  }
+}
+
+/**
+ * 运行收口 / 失败的 aria-live 文案（m6）：只在 running → done/failed/aborted 时产生。
+ * 纯函数，便于在 SSR 测试里直接断言。
+ */
+export function runEndAnnouncement(previousStatus, run, summary) {
+  if (!isObject(run)) return ''
+  const previous = String(previousStatus || '').toLowerCase()
+  const status = String(run.status || '').toLowerCase()
+  if (previous !== 'running' || status === 'running') return ''
+  if (!['done', 'failed', 'aborted'].includes(status)) return ''
+  const conclusion = conclusionOf(run, summary)
+  const name = run.name || run.id || '本次运行'
+  const prefix = status === 'failed' ? '运行失败：' : status === 'aborted' ? '运行已中止：' : '运行已结束：'
+  return prefix + name + ' · ' + conclusion.text
+}
+
+/**
+ * 选「真正带每节点状态」的 progress（B1）：summary / run / detail 三处都可能缺 nodes。
+ * 优先 nodes 非空的，其次任意对象，最后 null。
+ */
+export function progressOf(...candidates) {
+  const list = candidates.filter(isObject)
+  return list.find(item => isObject(item.nodes) && Object.keys(item.nodes).length > 0)
+    || list.find(item => isObject(item))
+    || null
+}
+
+/**
+ * 顶栏 / 画布叠加层的数据源（M2）：跟「当前流程最近活动 run」走，运行中优先；
+ * 抽屉里选中历史 run 只影响抽屉自己。
+ */
+export function activeRunViewOf(snapshot, flow) {
+  if (!isObject(snapshot)) return null
+  const flowId = flow && flow.id ? String(flow.id) : ''
+  const matches = run => isObject(run) && (flowId === '' || String(run.flowId || '') === flowId)
+  const build = (run, source) => ({
+    run,
+    live: source.live || null,
+    summary: source.summary || null,
+    events: Array.isArray(source.events) ? source.events : [],
+    detail: source.detail || null,
+    eventsTotal: source.eventsTotal,
+    eventsTruncated: source.eventsTruncated === true,
+  })
+  if (matches(snapshot.activeRun)) {
+    return build(snapshot.activeRun, {
+      live: snapshot.activeLive,
+      summary: snapshot.activeSummary,
+      events: snapshot.activeEvents,
+      eventsTotal: snapshot.activeEventsTotal,
+      eventsTruncated: snapshot.activeEventsTruncated,
+    })
+  }
+  const runs = Array.isArray(snapshot.runs) ? snapshot.runs : []
+  const fallback = runs.find(run => matches(run) && runIsActive(run)) || runs.find(run => matches(run))
+  if (fallback) {
+    const same = snapshot.run && snapshot.run.id === fallback.id
+    return build(fallback, same ? snapshot : { live: fallback.live })
+  }
+  if (matches(snapshot.run)) return build(snapshot.run, snapshot)
+  return null
+}
+
+/**
+ * 顶栏运行控制状态（06 §11）——纯函数，SSR 不跑 useEffect 也能单测。
+ *
+ * - 运行中：开始按钮禁用并写「运行中」，停止可用；
+ * - 第一次点停止只 arm；真正的停止走**独立的「确认停止」按钮**，且要等
+ *   `STOP_CONFIRM_DELAY_MS` 才可点（M6：同一按钮双击不再能击穿确认）；
+ * - busy 期间两个按钮都禁用，避免连点发出重复 start/stop；
+ * - 首次运行列表没回来前禁用「运行」并写清 title（m7）。
+ */
+export function runControlState(run, {
+  busy = false, armed = false, hasFlow = false, listReady = true, confirmReady = false,
+} = {}) {
+  const running = runIsActive(run)
+  const confirming = armed && running
+  return {
+    running,
+    confirming,
+    startLabel: busy && !running ? '启动中…' : running ? '运行中' : '运行',
+    stopLabel: busy && running ? '停止中…' : '停止',
+    confirmLabel: '确认停止',
+    startDisabled: !hasFlow || busy || running || !listReady,
+    // M6：确认态下主按钮锁死，防止「第一击 arm、第二击 stop」被双击击穿。
+    stopDisabled: !hasFlow || !running || busy || confirming,
+    confirmDisabled: !confirming || busy || !confirmReady,
+    startTitle: !listReady
+      ? '正在读取运行记录；确认当前没有运行中的 run 后再开始'
+      : running
+        ? '当前 run 正在运行；要重新开始请先停止'
+        : hasFlow ? '保存当前流程并开始一次新的运行' : '先打开或新建一条流程',
+    stopTitle: confirming
+      ? '主按钮已锁定：请用右侧「确认停止」按钮（防双击误停）'
+      : running
+        ? '停止当前运行（第一次点击只进入确认）'
+        : '当前没有在运行的 run',
+    confirmTitle: confirming
+      ? (confirmReady ? '确认停止：会中止在飞的模型请求' : '确认按钮 ' + STOP_CONFIRM_DELAY_MS + 'ms 后才可用（防误触）')
+      : '先点「停止」再确认',
+  }
+}
+
 /**
  * @param {object} [props]
  * @param {object} [props.initialFlow] 启动时预置的流程；省略则从 Host 拉第一份。
  * @param {Array} [props.initialSkills] 预置的 skill 目录，省一次往返。
+ * @param {object} [props.initialRunView] 预置运行快照（SSR / 测试用；形状同抽屉
+ *   `onRunSnapshot` 的回调参数：`{run, runs, events, summary, live, detail}`）。
+ * @param {boolean} [props.initialLogOpen] 抽屉初始是否展开。
  */
-export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) {
+export function FlowStudioPage({
+  initialFlow = null,
+  initialSkills = [],
+  initialRunView = null,
+  initialLogOpen = false,
+  initialError = '',
+} = {}) {
   const { useState, useEffect, useRef, useCallback } = rt.React
 
   const [flows, setFlows] = useState(initialFlow ? [summarize(initialFlow)] : [])
@@ -55,7 +228,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   const [saveState, setSaveState] = useState('idle')
   const [issues, setIssues] = useState(() => (initialFlow ? validateFlow(initialFlow) : { ok: true, errors: [], warnings: [] }))
   const [dialog, setDialog] = useState(null)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(initialError)
   const [busy, setBusy] = useState(false)
   const [booted, setBooted] = useState(Boolean(initialFlow))
   const [overview, setOverview] = useState(false)
@@ -63,7 +236,14 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   const [keyboardLink, setKeyboardLink] = useState(null)
   const [announce, setAnnounce] = useState('')
   const [draftNotice, setDraftNotice] = useState(null)
-  const [logOpen, setLogOpen] = useState(false)
+  const [logOpen, setLogOpen] = useState(Boolean(initialLogOpen))
+  /** 抽屉回传的实时运行快照：顶栏、画布节点状态、停止按钮都从这里取数。 */
+  const [runView, setRunView] = useState(initialRunView)
+  const [runBusy, setRunBusy] = useState(false)
+  const [stopArmed, setStopArmed] = useState(false)
+  const [stopConfirmReady, setStopConfirmReady] = useState(false)
+  const [logFocus, setLogFocus] = useState(null)
+  const [logSync, setLogSync] = useState(0)
 
   const pinned = useRef(Boolean(initialFlow))
   const flowRef = useRef(null)
@@ -74,10 +254,22 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   const editVersion = useRef(0)
   const savedVersion = useRef(0)
   const draftChecked = useRef('')
+  /** M1：运行中锁结构；回调里用 ref 读最新值，避免闭包吃到旧状态。 */
+  const lockedRef = useRef(false)
+  lockedRef.current = Boolean(runView && runView.activeRun && runIsActive(runView.activeRun))
+  /** m6：上一次看到的活动 run 状态，用来只在 running → 收口时播报一次。 */
+  const lastRunStatus = useRef({ id: '', status: '' })
 
   const touch = useCallback(() => {
     editVersion.current += 1
     setSaveState('dirty')
+  }, [])
+
+  /** M1：运行中拒绝一切结构编辑，并把原因播报出去（不是静默失效）。 */
+  const refuseWhenLocked = useCallback(() => {
+    if (!lockedRef.current) return false
+    setAnnounce(RUN_LOCK_REASON)
+    return true
   }, [])
 
   const patchFlow = useCallback(patch => {
@@ -86,18 +278,20 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   }, [touch])
 
   const patchNode = useCallback((id, patch) => {
+    if (refuseWhenLocked()) return
     touch()
     setFlow(previous => (previous
       ? { ...previous, nodes: previous.nodes.map(node => (node.id === id ? { ...node, ...patch } : node)) }
       : previous))
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   const patchEdge = useCallback((id, patch) => {
+    if (refuseWhenLocked()) return
     touch()
     setFlow(previous => (previous
       ? { ...previous, edges: previous.edges.map(edge => (edge.id === id ? { ...edge, ...patch } : edge)) }
       : previous))
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   /** 把当前快照落到本地草稿（浏览器不可用时退化为内存）。 */
   const persistDraft = useCallback(snapshot => {
@@ -328,13 +522,15 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
   }, [busy, flows])
 
   const addNodeAt = useCallback((x, y) => {
+    if (refuseWhenLocked()) return
     const node = blankNode(NODE_KIND.STAGE, Math.round(x), Math.round(y), '新阶段')
     touch()
     setFlow(previous => (previous ? { ...previous, nodes: [...previous.nodes, node] } : previous))
     setSelection({ kind: 'node', id: node.id })
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   const addEdge = useCallback((from, to) => {
+    if (refuseWhenLocked()) return null
     const current = flowRef.current
     if (!current || from === to) return null
     if (current.edges.some(edge => edge.from === from && edge.to === to)) {
@@ -347,18 +543,20 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
     setFlow(previous => (previous ? { ...previous, edges: [...previous.edges, edge] } : previous))
     setSelection({ kind: 'edge', id: edge.id })
     return edge
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   /** 检查器里的方向微调：单击 4px，按住 Shift 20px。 */
   const nudgeNode = useCallback((id, dx, dy) => {
+    if (refuseWhenLocked()) return
     const current = flowRef.current
     if (!current) return
     const node = current.nodes.find(item => item.id === id)
     if (!node) return
     patchNode(id, { x: Math.max(0, Math.round(node.x + dx)), y: Math.max(0, Math.round(node.y + dy)) })
-  }, [patchNode])
+  }, [patchNode, refuseWhenLocked])
 
   const deleteNode = useCallback(id => {
+    if (refuseWhenLocked()) return
     touch()
     setSelection(null)
     setFlow(previous => (previous
@@ -368,22 +566,24 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
         edges: previous.edges.filter(edge => edge.from !== id && edge.to !== id),
       }
       : previous))
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   const deleteEdge = useCallback(id => {
+    if (refuseWhenLocked()) return
     touch()
     setSelection(null)
     setFlow(previous => (previous ? { ...previous, edges: previous.edges.filter(edge => edge.id !== id) } : previous))
-  }, [touch])
+  }, [refuseWhenLocked, touch])
 
   const addMember = useCallback(() => {
+    if (refuseWhenLocked()) return
     const current = flowRef.current
     const selected = selectionRef.current
     if (!current || !selected || selected.kind !== 'node') return
     const node = current.nodes.find(item => item.id === selected.id)
     if (!node) return
     patchNode(node.id, { team: [...node.team, { name: '', role: '', task: '' }] })
-  }, [patchNode])
+  }, [patchNode, refuseWhenLocked])
 
   // 键盘：C 进入连线待定、Tab/方向键换候选、Enter 建边、Esc 退；Delete 删选中、⌘/Ctrl+S 保存。
   useEffect(() => {
@@ -468,6 +668,11 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey && String(event.key).toLowerCase() === 'c') {
+        if (lockedRef.current) {
+          event.preventDefault()
+          setAnnounce(RUN_LOCK_REASON)
+          return
+        }
         const selected = selectionRef.current
         const current = flowRef.current
         if (!selected || selected.kind !== 'node' || !current) return
@@ -483,6 +688,11 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       }
 
       if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (lockedRef.current) {
+          event.preventDefault()
+          setAnnounce(RUN_LOCK_REASON)
+          return
+        }
         const selected = selectionRef.current
         if (!selected) return
         event.preventDefault()
@@ -493,6 +703,220 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [addEdge, deleteEdge, deleteNode, dialog, keyboardLink, overview, saveNow])
+
+  // ── 运行控制与实时状态（06 §10/§11）────────────────────────────────────
+  // 只认属于当前流程的 run；抽屉里选中别的流程的 run 时，顶栏按「未运行」处理，
+  // 画布也不叠加状态（避免把 A 的状态贴到 B 的节点上）。
+  // M2：顶栏与画布叠加层跟「当前流程最近活动 run」（运行中优先），与抽屉选中解耦。
+  const active = activeRunViewOf(runView, flow)
+  const runForFlow = active ? active.run : null
+  const runEvents = active ? active.events : []
+  const runSummary = active ? active.summary : null
+  const runLive = runForFlow ? (active.live || liveOf(runForFlow, active.detail)) : null
+  const runStatus = runForFlow ? runForFlow.status : ''
+  const stageNodes = flow ? flow.nodes.filter(node => node.kind === NODE_KIND.STAGE) : []
+  // B1：状态优先吃 Host 的 progress.nodes（与 nodeDone 同口径），事件只补细节。
+  // summary.progress 优先；其次是 run.json 的 progress（列表 / 详情都可能带）。
+  const runProgress = progressOf(
+    runSummary && runSummary.progress,
+    runForFlow && runForFlow.progress,
+    active && active.detail && active.detail.run && active.detail.run.progress,
+  )
+  const nodeStates = runForFlow
+    ? deriveNodeStates({
+      nodes: stageNodes,
+      events: runEvents,
+      live: runLive,
+      runStatus,
+      progress: runProgress,
+    })
+    : null
+  const liveLabel = runForFlow
+    ? runLiveLabel(runForFlow, runLive, { nodes: flow.nodes, events: runEvents })
+    : ''
+  const liveHint = runLive
+    ? [liveLabel, phaseText(runLive.phase), runLive.since ? '开始于 ' + runLive.since : '']
+      .filter(Boolean).join(' · ')
+    : liveLabel
+  const locked = Boolean(runForFlow && runIsActive(runForFlow))
+  lockedRef.current = locked
+  const listReady = Boolean(runView && runView.loaded === true)
+  const windowNote = active
+    ? eventWindowNote({ truncated: active.eventsTruncated, loadedCount: runEvents.length })
+    : ''
+  const control = runControlState(runForFlow, {
+    busy: runBusy,
+    armed: stopArmed,
+    hasFlow: Boolean(flow),
+    listReady,
+    confirmReady: stopConfirmReady,
+  })
+
+  const handleRunSnapshot = useCallback(snapshot => { setRunView(snapshot) }, [])
+
+  // M6：第一次点停止只 arm；确认按钮 400ms 后才可用，5s 内不确认自动解除并播报。
+  useEffect(() => {
+    if (!stopArmed) {
+      setStopConfirmReady(false)
+      return undefined
+    }
+    setStopConfirmReady(false)
+    const readyTimer = setTimeout(() => setStopConfirmReady(true), STOP_CONFIRM_DELAY_MS)
+    const cancelTimer = setTimeout(() => {
+      setStopArmed(false)
+      setAnnounce('停止确认已超时自动解除，运行继续')
+    }, STOP_CONFIRM_TIMEOUT_MS)
+    return () => {
+      clearTimeout(readyTimer)
+      clearTimeout(cancelTimer)
+    }
+  }, [stopArmed])
+
+  useEffect(() => {
+    if (stopArmed && !runIsActive(runForFlow)) setStopArmed(false)
+  }, [stopArmed, runForFlow])
+
+  // 切流程退出停止确认，避免把上一条流程的确认态带过去。
+  useEffect(() => {
+    setStopArmed(false)
+    setStopConfirmReady(false)
+  }, [flow && flow.id])
+
+  // M1：运行中锁结构时清掉键盘连线待定，避免停在「待连线」却点不出去。
+  useEffect(() => {
+    if (!locked) return
+    setKeyboardLink(null)
+  }, [locked])
+
+  // m6：运行收口 / 失败进 aria-live（只在 running → 收口时播报一次）。
+  useEffect(() => {
+    const previous = lastRunStatus.current
+    const message = runEndAnnouncement(previous.status, runForFlow, runSummary)
+    if (message !== '') setAnnounce(message)
+    lastRunStatus.current = {
+      id: runForFlow ? String(runForFlow.id || '') : '',
+      status: runForFlow ? String(runForFlow.status || '') : '',
+    }
+  }, [runForFlow, runSummary])
+
+  /**
+   * 开始运行（B2）：
+   *  1. 先 `validateFlow`：有 error 就**不建 run、不起引擎**，打开问题列表并定位第一条错误；
+   *  2. 未保存改动落盘（引擎读的是 Host 上的流程）；
+   *  3. 复用本流程的 pending run 或新建一个，最后 POST start；
+   *  4. start 失败且 run 是本次新建的 → DELETE 清掉，绝不留幽灵 run。
+   */
+  const beginRun = async () => {
+    if (!flow || runBusy) return
+    if (!listReady) {
+      setAnnounce('正在读取运行记录，确认当前没有运行中的 run 后再开始')
+      return
+    }
+    setRunBusy(true)
+    setStopArmed(false)
+    setStopConfirmReady(false)
+    setError('')
+    let run = null
+    let createdRun = null
+    try {
+      const preflight = runPreflight(flowRef.current)
+      setIssues(preflight.issues)
+      if (!preflight.ok) {
+        if (preflight.target) setSelection(preflight.target)
+        setDialog('issues')
+        setAnnounce(preflight.message)
+        return
+      }
+      const warning = await flushBeforeLeave()
+      if (warning) {
+        setError(warning)
+        setAnnounce('流程尚未保存，已取消开始')
+        return
+      }
+      const current = flowRef.current
+      if (!current) return
+      const known = runView && Array.isArray(runView.runs) ? runView.runs : []
+      const pending = known.find(item => item.flowId === current.id && runIsPending(item))
+      run = pending || null
+      if (!run) {
+        const created = await api.createRun({
+          flowId: current.id,
+          name: current.name + ' · ' + formatSavedAt(new Date().toISOString()),
+        })
+        run = created && created.run ? created.run : null
+        if (run && run.id) createdRun = run
+      }
+      if (!run || !run.id) throw new Error('Host 没有返回 run')
+      const started = await api.startRun(run.id)
+      const liveRun = started && started.run ? started.run : run
+      // 抽屉自动展开并切到这个 run；同步 token 让它立刻刷新一次。
+      setLogOpen(true)
+      setLogFocus({ id: run.id, nonce: Date.now() })
+      setLogSync(value => value + 1)
+      setAnnounce('已开始运行「' + (liveRun.name || run.name || run.id) + '」')
+    } catch (failure) {
+      const plan = startFailurePlan('start', failure, run, Boolean(createdRun))
+      if (plan.deleteRunId !== '') {
+        // 本次刚建的 run 启动失败：清掉，避免运行记录里留下一条永远 pending 的幽灵。
+        try {
+          await api.deleteRun(plan.deleteRunId)
+          setAnnounce(plan.message + '（已清理本次新建的 run）')
+        } catch {
+          setAnnounce(plan.message + '（新建的 run 清理失败，请在运行记录里删除它）')
+        }
+      } else {
+        setAnnounce(plan.message)
+      }
+      setError(plan.message)
+      setLogSync(value => value + 1)
+    } finally {
+      setRunBusy(false)
+    }
+  }
+
+  /** M6：第一次点「停止」只 arm；确认由独立的「确认停止」按钮完成。 */
+  const requestStop = async () => {
+    if (!runForFlow || runBusy || stopArmed) return
+    setStopArmed(true)
+    setStopConfirmReady(false)
+    setAnnounce('停止需要确认：' + STOP_CONFIRM_DELAY_MS + 'ms 后点「确认停止」按钮')
+  }
+
+  /** 独立确认按钮：400ms 后可用，真正 POST stop。 */
+  const confirmStop = async () => {
+    if (!runForFlow || runBusy || !stopArmed || !stopConfirmReady) return
+    setRunBusy(true)
+    setStopArmed(false)
+    setStopConfirmReady(false)
+    try {
+      const result = await api.stopRun(runForFlow.id)
+      const settled = result && result.run ? result.run : null
+      if (settled) {
+        // 乐观合入 stop 返回的状态；下一次抽屉轮询会以 Host 为准。
+        setRunView(previous => {
+          if (!previous) return previous
+          const next = { ...previous }
+          if (previous.run && previous.run.id === settled.id) next.run = { ...previous.run, ...settled }
+          if (previous.activeRun && previous.activeRun.id === settled.id) {
+            next.activeRun = { ...previous.activeRun, ...settled }
+          }
+          if (Array.isArray(previous.runs)) {
+            next.runs = previous.runs.map(item => (item.id === settled.id ? { ...item, ...settled } : item))
+          }
+          return next
+        })
+      }
+      setAnnounce('已请求停止运行「' + (runForFlow.name || runForFlow.id) + '」，等待引擎收尾')
+      setLogSync(value => value + 1)
+    } catch (failure) {
+      const message = runActionFailureText('stop', failure && failure.status, failure && failure.data)
+      setError(message)
+      setAnnounce(message)
+      setLogSync(value => value + 1)
+    } finally {
+      setRunBusy(false)
+    }
+  }
 
   const saveLabel = saveState === 'dirty' ? '未保存'
     : saveState === 'saving' ? '保存中…'
@@ -526,6 +950,48 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
             ? stageCount + ' 个阶段 · ' + rejectCount + ' 条打回 · ' + teamCount + ' 个主从节点'
             : '把一条研发流水线画出来，每个节点是一个 agent 角色')),
       h('div', { className: 'fs-save' }, h('span', { className: 'fs-dot ' + dotClass }), saveLabel),
+      liveLabel
+        // 只做视觉实时读数；播报统一走底栏那个 aria-live，避免同一变化被读两遍。
+        ? h('div', { className: 'fs-live', title: liveHint },
+          h('span', { className: 'fs-live-dot', 'aria-hidden': true }),
+          h('span', { className: 'fs-live-text' }, liveLabel))
+        : null,
+      h('div', { className: 'fs-runbar' },
+        h('button', {
+          type: 'button',
+          className: 'fs-btn primary run',
+          disabled: control.startDisabled,
+          title: control.startTitle,
+          onClick: () => { void beginRun() },
+        }, control.startLabel),
+        h('button', {
+          type: 'button',
+          className: 'fs-btn danger run-stop',
+          disabled: control.stopDisabled,
+          title: control.stopTitle,
+          onClick: () => { void requestStop() },
+        }, control.stopLabel),
+        // M6：确认停止是独立按钮，落点必须变化，且 400ms 后才可用，双击同一点击不穿。
+        control.confirming
+          ? h('button', {
+            type: 'button',
+            className: 'fs-btn danger sm run-stop-confirm',
+            disabled: control.confirmDisabled,
+            title: control.confirmTitle,
+            onClick: () => { void confirmStop() },
+          }, control.confirmLabel)
+          : null,
+        control.confirming
+          ? h('button', {
+            type: 'button',
+            className: 'fs-btn ghost sm',
+            onClick: () => {
+              setStopArmed(false)
+              setStopConfirmReady(false)
+              setAnnounce('已取消停止，运行继续')
+            },
+          }, '取消')
+          : null),
       h('div', { className: 'fs-toolbar' },
         h('button', {
           type: 'button',
@@ -546,7 +1012,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
         h('button', { type: 'button', className: 'fs-btn primary', disabled: busy, onClick: createFlow }, '新建流程'))),
 
     error
-      ? h('div', { className: 'fs-error' },
+      ? h('div', { className: 'fs-error', role: 'alert' },
         h('span', null, error),
         h('button', { type: 'button', className: 'fs-tool', onClick: () => setError(''), title: '关闭' }, '✕'))
       : null,
@@ -580,6 +1046,10 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
           selection,
           apiRef: canvasApi,
           linkState: keyboardLink,
+          nodeStates,
+          locked,
+          lockReason: RUN_LOCK_REASON,
+          eventWindowNote: windowNote,
           onSelect: setSelection,
           onMoveNode: (id, x, y) => patchNode(id, { x, y }),
           onAddEdge: addEdge,
@@ -612,12 +1082,15 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
           flow: flow || { nodes: [], edges: [] },
           selection,
           skills,
+          locked,
+          lockReason: RUN_LOCK_REASON,
           onPatchNode: patchNode,
           onPatchEdge: patchEdge,
           onDeleteNode: deleteNode,
           onDeleteEdge: deleteEdge,
           onAddMember: addMember,
           onPatchMember: (nodeId, index, patch) => {
+            if (refuseWhenLocked()) return
             const current = flowRef.current
             if (!current) return
             const node = current.nodes.find(item => item.id === nodeId)
@@ -625,6 +1098,7 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
             patchNode(nodeId, { team: node.team.map((member, at) => (at === index ? { ...member, ...patch } : member)) })
           },
           onRemoveMember: (nodeId, index) => {
+            if (refuseWhenLocked()) return
             const current = flowRef.current
             if (!current) return
             const node = current.nodes.find(item => item.id === nodeId)
@@ -640,6 +1114,16 @@ export function FlowStudioPage({ initialFlow = null, initialSkills = [] } = {}) 
       onToggle: () => setLogOpen(value => !value),
       flowId: flow ? flow.id : '',
       flowName: flow ? flow.name : '',
+      onRunSnapshot: handleRunSnapshot,
+      focusRun: logFocus,
+      syncToken: logSync,
+      // 首帧（SSR / 预置快照）就带上抽屉数据，避免打开时先闪一下空态；
+      // 浏览器里首次挂载 runView 为 null，抽屉仍走自己的加载路径。
+      initialRuns: runView && Array.isArray(runView.runs) ? runView.runs : null,
+      initialRunId: runView && runView.run ? runView.run.id : '',
+      initialSummary: runView ? runView.summary : null,
+      initialDetail: runView ? runView.detail : null,
+      initialEvents: runView ? runView.events : null,
       // 复用画布既有选中逻辑：选中节点 + 收起抽屉，让画布拿回高度。
       onJumpToNode: id => {
         const current = flowRef.current

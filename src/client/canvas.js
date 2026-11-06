@@ -88,21 +88,93 @@ function memberTint(index) {
   return `color-mix(in srgb, var(--dsw-alias-state-business-primary) ${weight}%, var(--dsw-alias-bg-layer-2))`
 }
 
-function NodeCard({ node, selected, rejects, candidate, activeCandidate, onPointerDown, onStartLink }) {
+/** far 档纯形状角标（M3）：运行中用双环 ◎，其余用 ✓ / ↺ / ✕ 等形状，不依赖颜色。 */
+function stateShape(runState) {
+  if (runState === 'running') return '◎'
+  if (runState === 'passed') return '✓'
+  if (runState === 'rejected') return '↺'
+  if (runState === 'failed') return '✕'
+  if (runState === 'skipped') return '–'
+  if (runState === 'aborted') return '⊘'
+  return ''
+}
+
+function NodeCard({
+  node, selected, runtime, candidate, activeCandidate,
+  onPointerDown, onStartLink, onSelect, locked, linkActive,
+}) {
   const isStage = node.kind === NODE_KIND.STAGE
   const team = isStage && node.mode === EXEC_MODE.TEAM && node.team.length > 0
   const tags = []
-  if (rejects > 0) tags.push(h('span', { key: 'r', className: 'fs-tag reject' }, `↺${rejects}`))
+  // 运行态（06 §11）：形状 + 文字是主通道，颜色只加速。
+  // 自由数字遵守 04 §7：卡片上最多 2 个 —— 这里只有「↺n（目标返工数）」+ skill 徽标。
+  const rework = runtime ? Math.max(0, Math.round(Number(runtime.reworkCount) || 0)) : 0
+  const runState = runtime && runtime.state ? runtime.state : 'idle'
+  // m8：reject/trigger 的源节点只写「已判打回」；↺n 只记在被打回的目标节点上。
+  const rejectSource = Boolean(runtime && runtime.rejectRole === 'source')
+  if (runtime) {
+    const numbered = runState === 'rejected' && rework > 0 && !rejectSource
+    const stateLabel = rejectSource
+      ? (runtime.glyph || '↺') + ' 已判打回'
+      : numbered
+        ? `↺${rework} ${runtime.label || '被打回'}`
+        : (runtime.glyph || '·') + ' ' + (runtime.label || '状态未知')
+    const stateHint = rejectSource
+      ? '已判定打回：这个节点提出了打回，返工数字只记在被打回的目标节点上'
+      : runState === 'rejected'
+        ? (rework > 0 ? '被打回：该节点因收到打回重跑了 ' + rework + ' 次' : '被打回：该节点本轮判定未通过')
+        : runtime.invalidated
+          ? (runtime.label || '状态未知') + '；旧通过已失效，等待重跑'
+          : runtime.label || '状态未知'
+    tags.push(h('span', {
+      key: 'state',
+      className: 'fs-tag state ' + (runtime.tone || 'neutral'),
+      title: stateHint,
+    }, stateLabel))
+    if (runState !== 'rejected' && rework > 0) {
+      tags.push(h('span', {
+        key: 'rework',
+        className: 'fs-tag reject',
+        title: '该节点返工 ' + rework + ' 次（目标返工数）',
+      }, `↺${rework}`))
+    }
+  }
   if (node.skills.length > 0) tags.push(h('span', { key: 's', className: 'fs-tag skill' }, `skill ${node.skills.length}`))
+  const shape = runtime ? stateShape(runState) : ''
+
+  const select = () => { if (onSelect) onSelect({ kind: 'node', id: node.id }) }
+  const onKeyDown = event => {
+    if (event.key === ' ') {
+      event.preventDefault()
+      event.stopPropagation()
+      select()
+      return
+    }
+    if (event.key === 'Enter') {
+      // 键盘连线待定时 Enter 归 page.js（确认目标）；这里不抢，避免把选中换掉。
+      if (linkActive) return
+      event.preventDefault()
+      event.stopPropagation()
+      select()
+    }
+  }
 
   return h('div', {
     className: 'fs-node kind-' + node.kind + (selected ? ' selected' : '')
+      + (runtime ? ' run-state-' + runState + ' has-state' : '')
+      + (locked ? ' locked' : '')
       + (candidate ? ' fs-link-target' : '') + (activeCandidate ? ' fs-link-active' : ''),
     style: { left: node.x, top: node.y, width: NODE_W, height: nodeHeight(node) },
     onPointerDown,
+    onClick: select,
+    onKeyDown,
     role: 'button',
     tabIndex: 0,
-    'aria-label': '节点 ' + node.title + (activeCandidate ? '，键盘连线目标' : ''),
+    'aria-disabled': locked ? 'true' : undefined,
+    'aria-label': '节点 ' + node.title
+      + (runtime ? '，' + (runtime.label || '状态未知') + (rework > 0 ? '，返工 ' + rework + ' 次' : '') : '')
+      + (locked ? '，运行中已锁定结构' : '')
+      + (activeCandidate ? '，键盘连线目标' : ''),
     'aria-pressed': selected ? 'true' : 'false',
   },
   isStage ? h('div', { className: 'fs-port in', 'aria-hidden': true }) : null,
@@ -119,10 +191,19 @@ function NodeCard({ node, selected, rejects, candidate, activeCandidate, onPoint
         title: member.name || '子 agent ' + (at + 1),
         style: {
           background: memberTint(at),
-          color: at >= 2 ? 'var(--dsw-alias-label-primary-foreground)' : 'var(--dsw-alias-label-primary)',
+          // m9：文字统一用 label-primary，不叠低对比的 primary-foreground。
+          color: 'var(--dsw-alias-label-primary)',
         },
       }, (member.name || '子').slice(0, 1))),
       node.team.length > 5 ? h('span', { className: 'fs-members-more' }, '+' + (node.team.length - 5)) : null)
+    : null,
+  // far 档（<45%）只保留纯形状角标；near / mid 由 CSS 隐藏，避免与文字角标重复。
+  shape !== ''
+    ? h('span', {
+      className: 'fs-state-mark tone-' + (runtime.tone || 'neutral'),
+      'aria-hidden': true,
+      title: (runtime.label || '状态未知') + '（纯形状）',
+    }, shape)
     : null,
   h('div', { className: 'fs-node-tags' }, tags),
   node.kind === NODE_KIND.END
@@ -130,13 +211,17 @@ function NodeCard({ node, selected, rejects, candidate, activeCandidate, onPoint
     : h('div', {
       className: 'fs-port out',
       'aria-hidden': true,
-      title: '拖到另一个节点上建立连线',
-      onPointerDown: onStartLink,
+      title: locked ? '运行中已锁定结构：停止运行后才能连线' : '拖到另一个节点上建立连线',
+      onPointerDown: locked ? undefined : onStartLink,
     }),
   )
 }
 
-export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMoveNode, onAddEdge, onAddNodeAt, onPickCandidate }) {
+export function FlowCanvas({
+  flow, selection, apiRef, linkState, nodeStates = null,
+  onSelect, onMoveNode, onAddEdge, onAddNodeAt, onPickCandidate,
+  locked = false, lockReason = '', eventWindowNote = '',
+}) {
   const { useState, useEffect, useRef, useCallback } = rt.React
   const containerRef = useRef(null)
   const [view, setView] = useState({ x: 48, y: 24, z: 0.92 })
@@ -158,10 +243,6 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
   const candidateIds = linkState && Array.isArray(linkState.candidates) ? linkState.candidates : []
   const candidateSet = new Set(candidateIds)
   const activeCandidateId = linkState ? candidateIds[linkState.index] || '' : ''
-  const rejectCount = new Map()
-  for (const edge of flow.edges) {
-    if (edge.kind === EDGE_KIND.REJECT) rejectCount.set(edge.from, (rejectCount.get(edge.from) || 0) + 1)
-  }
 
   const doFit = useCallback(() => {
     const element = containerRef.current
@@ -324,6 +405,8 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
     if (event.button !== 0) return
     event.stopPropagation()
     onSelect({ kind: 'node', id: node.id })
+    // M1：运行中锁结构 —— 拖拽失效但选中仍可用，并给出可见原因（不是静默失效）。
+    if (locked) return
     dragRef.current = {
       mode: 'node', id: node.id,
       clientX: event.clientX, clientY: event.clientY,
@@ -333,7 +416,7 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
   }
 
   const startLink = (event, node) => {
-    if (event.button !== 0) return
+    if (event.button !== 0 || locked) return
     event.stopPropagation()
     const rect = containerRef.current.getBoundingClientRect()
     dragRef.current = { mode: 'link', id: node.id }
@@ -342,6 +425,7 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
   }
 
   const onDoubleClick = event => {
+    if (locked) return
     const target = event.target
     if (target && typeof target.closest === 'function' && target.closest('.fs-node, .fs-edge-hit, .fs-hud, .fs-link-picker, .fs-canvas-note, .fs-canvas-hint')) return
     const rect = containerRef.current.getBoundingClientRect()
@@ -459,7 +543,8 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
 
   return h('div', {
     ref: containerRef,
-    className: 'fs-canvas' + (dragKind === 'pan' ? ' panning' : '') + (dragKind === 'link' ? ' linking' : ''),
+    className: 'fs-canvas' + (dragKind === 'pan' ? ' panning' : '')
+      + (dragKind === 'link' ? ' linking' : '') + (locked ? ' locked' : ''),
     'data-lod': lod,
     onPointerDown: startPan,
     onDoubleClick,
@@ -471,11 +556,14 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
     key: node.id,
     node,
     selected: Boolean(selection && selection.kind === 'node' && selection.id === node.id),
-    rejects: rejectCount.get(node.id) || 0,
+    runtime: nodeStates ? nodeStates[node.id] || null : null,
     candidate: candidateSet.has(node.id),
     activeCandidate: node.id === activeCandidateId,
     onPointerDown: event => startNodeDrag(event, node),
     onStartLink: event => startLink(event, node),
+    onSelect,
+    locked,
+    linkActive: Boolean(linkState),
   }))),
 
   h('svg', { className: 'fs-edges', width: '100%', height: '100%' },
@@ -505,6 +593,18 @@ export function FlowCanvas({ flow, selection, apiRef, linkState, onSelect, onMov
         }, '到 ' + target.title)
       })),
     h('div', { className: 'fs-link-picker-hint' }, 'Tab 切换 · Enter 确认 · Esc 取消'))
+    : null,
+
+  // M1：运行中锁结构必须给可见原因（不是静默失效）。
+  locked
+    ? h('div', { className: 'fs-canvas-lock', role: 'status' },
+      lockReason || '运行中已锁定结构：拖拽 / 双击新建 / 连线 / 检查器编辑暂不可用，停止运行后恢复')
+    : null,
+
+  // B1：事件窗口被截断时显式说明「基于最近 N 条」，避免把窗口外误读成未开始。
+  eventWindowNote !== ''
+    ? h('div', { className: 'fs-canvas-note fs-canvas-event-note', title: '节点状态优先取 Host summary.progress；事件只补运行中 / 打回 / attempt 细节' },
+      eventWindowNote)
     : null,
 
   hiddenColumns > 0

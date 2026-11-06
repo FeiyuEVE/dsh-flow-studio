@@ -44,16 +44,26 @@ const { FlowCanvas, wheelPanDelta } = await import('../src/client/canvas.js')
 const { Inspector } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList } = await import('../src/client/flowlist.js')
-const { FlowStudioPage } = await import('../src/client/page.js')
+const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
-  FsLogDrawer, conclusionOf, drawerActionFor, eventCountText, eventKey, eventSummary,
-  filterEvents, findingsLineOf, isStaleLoad, nextDrawerOpen, nodeFindingsInfo,
-  nodeProgressText, normalizeRun, pageSlice, readUsage, sortEventsDesc,
+  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, firstErrorTarget, progressOf,
+  runEndAnnouncement, runPreflight, startFailurePlan,
+} = await import('../src/client/page.js')
+const {
+  EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
+  WATCH_EVENT_KINDS, acceptanceOf, backoffDelay, conclusionOf, deriveNodeStates,
+  drawerActionFor, eventCountText, eventKey, eventSummary, eventWindowNote, eventsSince,
+  filterEvents, findingsLineOf, formatDuration, isStaleLoad, latestSeq, liveOf,
+  mergeEventWindows, mergeRunDetail, needsEventFetch, nextDrawerOpen, nodeFindingsInfo, nodeProgressText, normalizeLive,
+  normalizeProgress, normalizeRun, pageSlice, pickWatchRun, pollDelay, readUsage,
+  runDurationMs, runIsActive, runIsPending, runIsRunning, runLiveLabel, runMetrics,
+  sortEventsDesc,
 } = await import('../src/client/logdrawer.js')
 const {
   FS_TOKEN_STORAGE_KEY, authorizationHeader, captureFsToken, exportUrl,
-  extractFsToken, requestFailureText,
+  extractFsToken, readEventsPath, requestFailureText, runActionFailureText,
 } = await import('../src/client/api.js')
+const { CSS } = await import('../src/client/styles.js')
 
 const flow = model.defaultFlow()
 flow.id = 'flow-test'
@@ -245,6 +255,634 @@ check('页面骨架在没有流程时给出加载态', () => {
   assert.ok(html.includes('.fs-node'), '样式没有随组件一起渲染')
 })
 
+// ── 运行控制与实时状态（06 §10 / §11）────────────────────────────────────
+check('节点状态从事件 + live 推导：运行中 / 已通过 / 失败 / 未开始', () => {
+  const nodes = [
+    { id: 'n_req', title: '需求分析' },
+    { id: 'n_plan', title: '方案设计' },
+    { id: 'n_dev', title: '开发' },
+    { id: 'n_review', title: '代码审查' },
+    { id: 'n_fresh', title: '未触及' },
+  ]
+  const events = [
+    { kind: 'node/start', nodeId: 'n_req', attemptId: 1, seq: 1, data: {} },
+    { kind: 'node/end', nodeId: 'n_req', attemptId: 1, seq: 2, data: { status: 'passed' } },
+    { kind: 'node/start', nodeId: 'n_dev', attemptId: 1, seq: 3, data: {} },
+    { kind: 'node/end', nodeId: 'n_dev', attemptId: 1, seq: 4, data: { status: 'failed' } },
+    { kind: 'node/start', nodeId: 'n_review', attemptId: 1, seq: 5, data: {} },
+  ]
+  const states = deriveNodeStates({
+    nodes,
+    events,
+    live: { currentNodeId: 'n_review', attempt: 1, round: 3 },
+    runStatus: 'running',
+  })
+  assert.equal(states.n_req.state, 'passed')
+  assert.equal(states.n_req.label, '已通过')
+  assert.equal(states.n_req.glyph, '✓')
+  assert.equal(states.n_dev.state, 'failed')
+  assert.equal(states.n_dev.label, '失败')
+  assert.equal(states.n_dev.glyph, '✕')
+  assert.equal(states.n_review.state, 'running', 'live.currentNodeId 命中时应显示运行中')
+  assert.equal(states.n_review.current, true)
+  assert.equal(states.n_review.tone, 'business', '运行中必须走 business 环那一档')
+  assert.equal(states.n_fresh.state, 'idle')
+  assert.equal(states.n_fresh.label, '未开始')
+  assert.equal(states.n_fresh.glyph, '○')
+
+  // 没有 live 时回退：在跑 + 最近事件是 node/start → 运行中，attempt 取事件里的值。
+  const noLive = deriveNodeStates({
+    nodes: [{ id: 'n_dev' }],
+    events: [{ kind: 'node/start', nodeId: 'n_dev', attemptId: 2, seq: 9, data: {} }],
+    live: null,
+    runStatus: 'running',
+  })
+  assert.equal(noLive.n_dev.state, 'running', '没有 live 时用「在跑 + 最近事件是 node/start」回退')
+  assert.equal(noLive.n_dev.attempt, 2)
+})
+
+check('打回目标 ↺n 与旧通过失效：与 Host progress 同口径（04 §4.2 / 06 §11）', () => {
+  const nodes = [{ id: 'n_req' }, { id: 'n_plan' }, { id: 'n_test' }]
+  const events = [
+    { kind: 'node/start', nodeId: 'n_req', attemptId: 1, seq: 1, data: {} },
+    { kind: 'node/end', nodeId: 'n_req', attemptId: 1, seq: 2, data: { status: 'passed' } },
+    { kind: 'node/start', nodeId: 'n_plan', attemptId: 1, seq: 3, data: {} },
+    { kind: 'node/end', nodeId: 'n_plan', attemptId: 1, seq: 4, data: { status: 'passed' } },
+    { kind: 'node/start', nodeId: 'n_test', attemptId: 1, seq: 5, data: {} },
+    { kind: 'node/end', nodeId: 'n_test', attemptId: 1, seq: 6, data: { status: 'rejected' } },
+    {
+      kind: 'reject/trigger', nodeId: 'n_test', attemptId: 1, seq: 7,
+      data: { fromNodeId: 'n_test', toNodeId: 'n_plan', reason: '缺验收证据' },
+    },
+  ]
+  const states = deriveNodeStates({ nodes, events, live: null, runStatus: 'running' })
+  assert.equal(states.n_plan.state, 'rejected', '被打回目标显示「被打回」而不是旧 ✓')
+  assert.equal(states.n_plan.reworkCount, 0, '还没重跑时 ↺n 不能先记 1（04 §4.2 ② 数重跑次数）')
+  assert.equal(states.n_plan.invalidated, true, '旧通过必须失效，不能和 Host progress 打架')
+  assert.equal(states.n_req.state, 'passed', '更早的通过不在失效窗口内')
+  assert.equal(states.n_test.state, 'rejected', '判定不通过的源节点自身显示被打回')
+  assert.equal(states.n_test.reworkCount, 0, '源节点卡不显示打回数字（04 §4.2 ③）')
+
+  // 目标真的重跑（attemptId=2）后才算一次返工；重跑通过后恢复 ✓。
+  const rerun = deriveNodeStates({
+    nodes,
+    events: [
+      ...events,
+      { kind: 'node/start', nodeId: 'n_plan', attemptId: 2, seq: 8, data: {} },
+      { kind: 'node/end', nodeId: 'n_plan', attemptId: 2, seq: 9, data: { status: 'passed' } },
+    ],
+    live: null,
+    runStatus: 'running',
+  })
+  assert.equal(rerun.n_plan.state, 'passed', '重跑通过后应回到已通过')
+  assert.equal(rerun.n_plan.reworkCount, 1, '目标重跑一次 → ↺1（记在 data.to 节点）')
+})
+
+check('B1：summary.progress 优先于事件窗口，截断不会把已通过节点显示成未开始', () => {
+  const nodes = [{ id: 'n_req' }, { id: 'n_plan' }, { id: 'n_dev' }, { id: 'n_review' }]
+  const progress = {
+    passed: 2, total: 4, invalidatedNodes: ['n_plan'],
+    nodes: {
+      n_req: { attemptId: 1, status: 'passed' },
+      n_plan: { attemptId: 1, status: 'passed', invalidated: true },
+      n_dev: { attemptId: 2, status: 'failed' },
+      n_review: { attemptId: 1, status: 'pending' },
+    },
+  }
+  const states = deriveNodeStates({
+    nodes,
+    events: [], // 模拟事件窗口被截断 / 还没拉到：只有 progress 可用
+    live: { currentNodeId: 'n_review', attempt: 1 },
+    runStatus: 'running',
+    progress,
+  })
+  assert.equal(states.n_req.state, 'passed', 'progress 里的 passed 不能退化成未开始')
+  assert.equal(states.n_plan.state, 'rejected', 'invalidated 的旧通过不算数')
+  assert.equal(states.n_plan.invalidated, true)
+  assert.equal(states.n_dev.state, 'failed')
+  assert.equal(states.n_dev.attempt, 2)
+  assert.equal(states.n_review.state, 'running', 'live 当前节点优先')
+  assert.equal(states.n_review.fromProgress, true)
+  assert.equal(normalizeProgress(progress).entries.size, 4)
+  assert.equal(normalizeProgress(progress).invalidated.has('n_plan'), true)
+
+  // progress 与事件冲突时 progress 赢（与 Host nodeDone 同口径）。
+  const conflict = deriveNodeStates({
+    nodes: [{ id: 'n_req' }],
+    events: [{ kind: 'node/start', nodeId: 'n_req', attemptId: 2, seq: 9 }],
+    live: null,
+    runStatus: 'running',
+    progress: { nodes: { n_req: { status: 'passed', attemptId: 1 } } },
+  })
+  assert.equal(conflict.n_req.state, 'passed', 'progress 与事件冲突时以 Host progress 为准')
+
+  // Map / 数组形态也兼容（Host 换序列化形状不会白屏）。
+  const asMap = normalizeProgress({ nodes: new Map([['n_a', { status: 'passed' }]]) })
+  assert.equal(asMap.entries.get('n_a').status, 'passed')
+  const asArray = normalizeProgress({ nodes: [{ nodeId: 'n_b', status: 'failed' }], invalidatedNodes: ['n_c'] })
+  assert.equal(asArray.entries.get('n_b').status, 'failed')
+  assert.equal(asArray.invalidated.has('n_c'), true)
+
+  // 详情接口可能只回 progress 计数、不带 nodes：不能把列表里更完整的 nodes 盖掉。
+  const fromList = normalizeRun({ id: 'r1', progress: { nodes: { n_a: { status: 'passed' } } } })
+  const merged = normalizeRun(mergeRunDetail(fromList, {
+    id: 'r1', status: 'running', progress: { passed: 1, total: 1, ratio: 1 },
+  }))
+  assert.equal(merged.status, 'running', '详情更新状态')
+  assert.equal(merged.progress.nodes.n_a.status, 'passed', '详情计数不能盖掉列表里的 progress.nodes')
+  assert.equal(progressOf({ passed: 1 }, { nodes: { n_a: { status: 'passed' } } }, null).nodes.n_a.status,
+    'passed', '优先选真正带 nodes 的 progress')
+
+  // progress 旧快照不能把更新的 node/end 压回 pending；progress 缺的节点由事件补。
+  const newerEvent = deriveNodeStates({
+    nodes: [{ id: 'n_b' }],
+    events: [{ kind: 'node/end', nodeId: 'n_b', attemptId: 1, seq: 7, data: { status: 'passed' } }],
+    live: null,
+    runStatus: 'running',
+    progress: { nodes: { n_b: { attemptId: 1, status: 'pending', endSeq: 0 } } },
+  })
+  assert.equal(newerEvent.n_b.state, 'passed', '更新的 node/end 必须覆盖旧 progress')
+  const gap = deriveNodeStates({
+    nodes: [{ id: 'n_a' }, { id: 'n_b' }],
+    events: [{ kind: 'node/end', nodeId: 'n_b', attemptId: 1, seq: 7, data: { status: 'passed' } }],
+    live: null,
+    runStatus: 'running',
+    progress: { nodes: { n_a: { attemptId: 1, status: 'passed', endSeq: 2 } } },
+  })
+  assert.equal(gap.n_a.state, 'passed', 'progress 覆盖的节点照 progress')
+  assert.equal(gap.n_b.state, 'passed', 'progress 缺的节点由事件补，不能变成未开始')
+  // 旧 progress 里的 invalidated 不能把重跑通过的新结论压回「被打回」。
+  const recovered = deriveNodeStates({
+    nodes: [{ id: 'n_plan' }],
+    events: [{ kind: 'node/end', nodeId: 'n_plan', attemptId: 2, seq: 9, data: { status: 'passed' } }],
+    live: null,
+    runStatus: 'running',
+    progress: {
+      nodes: { n_plan: { attemptId: 1, status: 'passed', endSeq: 2, invalidated: true } },
+      invalidatedNodes: ['n_plan'],
+    },
+  })
+  assert.equal(recovered.n_plan.state, 'passed', '重跑通过后旧失效必须让位')
+  assert.equal(recovered.n_plan.invalidated, false)
+})
+
+check('m3：中止 run 的在飞节点显示「已中止（无结论）」，不是「未开始」', () => {
+  const states = deriveNodeStates({
+    nodes: [{ id: 'n_dev' }, { id: 'n_fresh' }],
+    events: [{ kind: 'node/start', nodeId: 'n_dev', attemptId: 1, seq: 2 }],
+    live: null,
+    runStatus: 'aborted',
+    progress: { nodes: { n_dev: { attemptId: 1, status: 'pending' } } },
+  })
+  assert.equal(states.n_dev.state, 'aborted')
+  assert.equal(states.n_dev.label, '已中止（无结论）')
+  assert.equal(states.n_dev.glyph, '⊘')
+  assert.equal(states.n_fresh.state, 'idle', '完全没触及的节点才是未开始')
+})
+
+check('m8：源节点「已判打回」、↺n 只给被打回的目标节点', () => {
+  const classes = {
+    n_plan: { state: 'rejected', label: '被打回', glyph: '↺', tone: 'warn', reworkCount: 0, invalidated: false, rejectRole: 'target' },
+    n_test: { state: 'rejected', label: '被打回', glyph: '↺', tone: 'warn', reworkCount: 2, invalidated: false, rejectRole: 'source' },
+  }
+  const states = deriveNodeStates({
+    nodes: [{ id: 'n_plan' }, { id: 'n_test' }],
+    events: [
+      { kind: 'node/end', nodeId: 'n_plan', attemptId: 1, seq: 1, data: { status: 'passed' } },
+      { kind: 'node/end', nodeId: 'n_test', attemptId: 1, seq: 2, data: { status: 'rejected' } },
+      { kind: 'reject/trigger', nodeId: 'n_test', attemptId: 1, seq: 3, data: { fromNodeId: 'n_test', toNodeId: 'n_plan' } },
+    ],
+    live: null,
+    runStatus: 'running',
+  })
+  assert.equal(states.n_test.rejectRole, 'source')
+  assert.equal(states.n_test.reworkCount, 0, '源节点不显示 ↺n')
+  assert.equal(states.n_plan.rejectRole, 'target')
+
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: null,
+    nodeStates: { ...classes, n_test: { ...classes.n_test }, n_plan: { ...classes.n_plan, reworkCount: 2 } },
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(html.includes('↺ 已判打回'), '源节点角标必须写「已判打回」')
+  assert.ok(html.includes('↺2 被打回'), '目标节点显示 ↺n 返工数')
+})
+
+check('M1：运行中锁结构 —— 画布 / 检查器都禁用并给出原因，不是静默失效', () => {
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: { kind: 'node', id: 'n_req' },
+    locked: true,
+    lockReason: RUN_LOCK_REASON,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(html.includes('fs-canvas locked'), '画布要进入锁定态')
+  assert.ok(html.includes(RUN_LOCK_REASON), '锁定原因必须可见')
+  assert.ok(html.includes('aria-disabled="true"'), '节点要标 aria-disabled')
+  assert.ok(html.includes('运行中已锁定结构'), '画布上的原因文案不能省')
+
+  const panel = render(React.createElement(Inspector, {
+    flow,
+    selection: { kind: 'node', id: 'n_req' },
+    skills: [],
+    locked: true,
+    lockReason: RUN_LOCK_REASON,
+    onPatchNode() {},
+    onPatchEdge() {},
+    onDeleteNode() {},
+    onDeleteEdge() {},
+    onAddMember() {},
+    onPatchMember() {},
+    onRemoveMember() {},
+  }))
+  assert.ok(panel.includes('运行中已锁定'), '检查器头部要标锁定')
+  assert.ok(panel.includes(RUN_LOCK_REASON), '检查器要写明原因')
+  assert.ok(panel.includes('disabled'), '检查器表单必须是 disabled fieldset')
+})
+
+check('M3：far 档保留纯形状角标（✓ / ↺ / ✕ / 双环），不依赖颜色', () => {
+  const states = {
+    n_req: { state: 'running', label: '运行中', glyph: '◉', tone: 'business', reworkCount: 0, invalidated: false },
+    n_plan: { state: 'passed', label: '已通过', glyph: '✓', tone: 'success', reworkCount: 0, invalidated: false },
+    n_shape: { state: 'rejected', label: '被打回', glyph: '↺', tone: 'warn', reworkCount: 0, invalidated: false },
+    n_dev: { state: 'failed', label: '失败', glyph: '✕', tone: 'error', reworkCount: 0, invalidated: false },
+  }
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: null,
+    nodeStates: states,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  for (const glyph of ['◎', '✓', '↺', '✕']) {
+    assert.ok(html.includes(glyph), '缺少纯形状角标「' + glyph + '」')
+  }
+  assert.ok(html.includes('fs-state-mark'), '缺少 far 档形状角标元素')
+  assert.ok(CSS.includes('[data-lod="far"] .fs-node.has-state .fs-state-mark'),
+    'far 档 CSS 必须让形状角标可见，不能只有颜色')
+  assert.ok(CSS.includes('border:2px double'), '运行中用双环形状，不依赖颜色')
+})
+
+check('m9：成员圆点文字用 label-primary，不叠低对比前景', () => {
+  const teamFlow = model.defaultFlow()
+  teamFlow.id = 'flow-team'
+  const stage = teamFlow.nodes.find(node => node.id === 'n_req')
+  stage.mode = 'team'
+  stage.team = [
+    { name: '甲', role: '', task: '' },
+    { name: '乙', role: '', task: '' },
+    { name: '丙', role: '', task: '' },
+  ]
+  const html = render(React.createElement(FlowCanvas, {
+    flow: teamFlow,
+    selection: null,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(html.includes('fs-member lead'))
+  assert.ok(html.includes('color:var(--dsw-alias-label-primary)'), '成员圆点文字必须是 label-primary')
+  assert.ok(!/class="fs-member"[^>]*label-primary-foreground/.test(html),
+    '成员圆点不再叠低对比前景')
+})
+
+check('M5：轮询只拉 run + since 增量 + kind 过滤；失败退避 / 后台 15s', () => {
+  assert.equal(pollDelay({ failures: 0 }), 2000)
+  assert.equal(pollDelay({ failures: 1 }), 4000)
+  assert.equal(pollDelay({ failures: 2 }), 8000)
+  assert.equal(pollDelay({ failures: 3 }), 16000)
+  assert.equal(pollDelay({ failures: 4 }), MAX_POLL_MS, '退避上限 30s')
+  assert.equal(pollDelay({ failures: 9 }), 30000)
+  assert.equal(backoffDelay(0), 2000)
+  assert.equal(pollDelay({ failures: 0, hidden: true }), HIDDEN_POLL_MS, '后台标签页降到 15s')
+  assert.equal(HIDDEN_POLL_MS, 15000)
+  assert.equal(pollDelay({ failures: 0, base: 5000 }), 5000, '历史 run 展开态按 5s 档')
+
+  const params = eventsSince(12)
+  assert.equal(params.since, 12, '增量必须带 since=lastSeq')
+  assert.deepEqual(params.kinds, WATCH_EVENT_KINDS.slice())
+  assert.equal(eventsSince(null).since, undefined, '没有游标时走首次全量窗口')
+  assert.equal(needsEventFetch(null, { lastEventSeq: 0 }), true, '首次必须拉事件')
+  assert.equal(needsEventFetch(5, { lastEventSeq: 5 }), false, 'seq 没前进时只拉 GET /runs/<id>')
+  assert.equal(needsEventFetch(5, { lastEventSeq: 6 }), true, '有新事件才拉增量')
+  assert.equal(needsEventFetch(5, null), true, '没有 live 时保守拉一次')
+  assert.ok(WATCH_EVENT_KINDS.includes('node/end') && WATCH_EVENT_KINDS.includes('reject/trigger'))
+  assert.ok(!WATCH_EVENT_KINDS.includes('model/call') && !WATCH_EVENT_KINDS.includes('tool/call'),
+    '增量只取状态推导需要的 kind，不搬全量事件')
+
+  const merged = mergeEventWindows(
+    [{ kind: 'node/start', nodeId: 'a', attemptId: 1, seq: 1 }],
+    [{ kind: 'node/end', nodeId: 'a', attemptId: 1, seq: 2, data: { status: 'passed' } }],
+    10,
+  )
+  assert.equal(merged.events.length, 2)
+  assert.equal(merged.added, 1)
+  assert.equal(latestSeq(merged.events), 2)
+  const dedup = mergeEventWindows(
+    [{ kind: 'node/end', nodeId: 'a', attemptId: 1, seq: 2, data: { status: 'failed' } }],
+    [{ kind: 'node/end', nodeId: 'a', attemptId: 1, seq: 2, data: { status: 'passed' } }],
+    10,
+  )
+  assert.equal(dedup.events.length, 1, '同一 eventKey 不重复计入')
+  assert.equal(dedup.events[0].data.status, 'passed', '同键后到的事件覆盖旧值')
+  assert.equal(eventWindowNote({ truncated: true, loadedCount: 1000 }), '基于最近 1000 条')
+  assert.equal(eventWindowNote({ truncated: false, loadedCount: 10 }), '')
+  assert.equal(EVENT_FETCH_LIMIT, 1000)
+})
+
+check('M2：顶栏 / 画布跟「当前流程最近活动 run」，与抽屉选中历史 run 解耦', () => {
+  const activeRun = {
+    id: 'run-live', flowId: 'flow-test', name: '正在跑', status: 'running', eventCount: 5,
+    live: { currentNodeId: 'n_dev', attempt: 2, round: 3 },
+  }
+  const historical = { id: 'run-old', flowId: 'flow-test', name: '历史', status: 'done' }
+  const snapshot = {
+    run: historical,
+    runs: [activeRun, historical],
+    live: null,
+    summary: null,
+    events: [],
+    detail: null,
+    selectedRunId: 'run-old',
+    activeRun,
+    activeLive: { currentNodeId: 'n_dev', attempt: 2, round: 3 },
+    activeSummary: { progress: { nodes: { n_req: { attemptId: 1, status: 'passed' } } } },
+    activeEvents: [],
+    activeEventsTruncated: false,
+  }
+  const activeView = activeRunViewOf(snapshot, flow)
+  assert.equal(activeView.run.id, 'run-live', '活动 run 优先于抽屉选中的历史 run')
+  assert.equal(activeView.run.status, 'running')
+  const picked = pickWatchRun([historical, { id: 'run-live2', flowId: 'flow-test', status: 'running', eventCount: 3 }], 'flow-test')
+  assert.equal(picked.id, 'run-live2', '列表里运行中的 run 优先于最近一条历史')
+  assert.equal(activeRunViewOf(null, flow), null)
+
+  const html = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialRunView: snapshot,
+    initialLogOpen: true,
+  }))
+  assert.ok(html.includes('当前节点 开发 · 第 3 轮 · attempt 2'), '顶栏必须显示活动 run 的当前节点')
+  assert.match(html, /class="fs-btn primary run"[^>]*disabled/, '活动 run 在跑时开始按钮禁用')
+  assert.ok(!/class="fs-btn danger run-stop"[^>]*disabled/.test(html),
+    '停止按钮必须始终对准活动 run（历史 run 被选中也不能禁用）')
+  assert.ok(html.includes('run-state-running'), '画布叠加层必须显示活动 run 的状态')
+})
+
+check('B2：校验不过不起引擎；本次新建的 run 启动失败要 DELETE 清掉', () => {
+  const ok = runPreflight(model.defaultFlow())
+  assert.equal(ok.ok, true)
+  assert.equal(ok.target, null)
+  const empty = model.defaultFlow()
+  empty.nodes = []
+  empty.edges = []
+  const emptyResult = runPreflight(empty)
+  assert.equal(emptyResult.ok, false, '空任务必须被门禁拦下')
+  assert.ok(emptyResult.message.includes('已取消开始'))
+
+  const broken = model.defaultFlow()
+  broken.edges = broken.edges.filter(edge => edge.from !== 'n_start')
+  const brokenResult = runPreflight(broken)
+  assert.equal(brokenResult.ok, false, '断头路必须被门禁拦下')
+  assert.ok(brokenResult.issues.errors.length > 0)
+  assert.ok(brokenResult.target && brokenResult.target.kind === 'node', '第一条错误要能定位到节点')
+  assert.equal(firstErrorTarget({ errors: [{ message: 'x' }] }), null)
+  assert.deepEqual(firstErrorTarget({ errors: [{ message: 'x', edgeId: 'e1' }] }), { kind: 'edge', id: 'e1' })
+
+  const created = startFailurePlan('start', { status: 409, data: { error: '已有 run 正在运行' } }, { id: 'run-new' }, true)
+  assert.equal(created.deleteRunId, 'run-new', '本次新建的 run 启动失败必须 DELETE')
+  assert.ok(created.message.includes('已有 run 正在运行'))
+  assert.equal(startFailurePlan('start', { status: 400 }, { id: 'run-old' }, false).deleteRunId, '',
+    '复用的旧 pending run 启动失败不能删')
+})
+
+check('m6/m7：运行收口播报、错误 role=alert、首次列表未回前禁用运行', () => {
+  assert.ok(runEndAnnouncement('running', { id: 'r', name: '流程 A', status: 'done' }, { quality: { state: 'pass', label: '优：首轮通过' } })
+    .startsWith('运行已结束：流程 A'))
+  assert.ok(runEndAnnouncement('running', { id: 'r', name: '流程 A', status: 'failed' }, null).startsWith('运行失败：'))
+  assert.ok(runEndAnnouncement('running', { id: 'r', name: '流程 A', status: 'aborted' }, null).startsWith('运行已中止：'))
+  assert.equal(runEndAnnouncement('done', { id: 'r', status: 'done' }, null), '', '不是 running → 收口的迁移不播报')
+  assert.equal(runEndAnnouncement('running', { id: 'r', status: 'running' }, null), '')
+
+  const withError = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialError: '保存失败：磁盘只读',
+  }))
+  assert.ok(withError.includes('role="alert"'), 'm6：.fs-error 必须有 role=alert')
+  assert.ok(withError.includes('保存失败：磁盘只读'))
+
+  const notReady = render(React.createElement(FlowStudioPage, { initialFlow: flow, initialSkills: [] }))
+  assert.match(notReady, /class="fs-btn primary run"[^>]*disabled/, 'm7：运行记录没回来前运行按钮禁用')
+  assert.ok(notReady.includes('正在读取运行记录'), 'm7：禁用原因写进 title')
+})
+
+check('顶栏运行控制态：运行 / 运行中 / 停止 / 独立确认停止 / busy 禁用（06 §11 + M6/m7）', () => {
+  const idle = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true })
+  assert.equal(idle.running, false)
+  assert.equal(idle.startLabel, '运行')
+  assert.equal(idle.startDisabled, false)
+  assert.equal(idle.stopDisabled, true)
+  assert.equal(idle.stopLabel, '停止')
+
+  const running = runControlState({ id: 'r1', status: 'running' }, { hasFlow: true })
+  assert.equal(running.running, true)
+  assert.equal(running.startLabel, '运行中')
+  assert.equal(running.startDisabled, true, '运行中开始按钮必须禁用')
+  assert.equal(running.stopDisabled, false)
+  assert.equal(running.stopLabel, '停止')
+  assert.equal(running.confirming, false)
+
+  // M6：第一击只 arm；主按钮锁死，独立确认按钮出现且默认不可点（400ms 后才可用）。
+  const confirming = runControlState({ id: 'r1', status: 'running' }, { hasFlow: true, armed: true })
+  assert.equal(confirming.confirming, true)
+  assert.equal(confirming.stopDisabled, true, '确认态下同一按钮必须锁死，防双击击穿')
+  assert.equal(confirming.confirmLabel, '确认停止')
+  assert.equal(confirming.confirmDisabled, true, '确认按钮在 400ms 前必须不可点')
+  assert.equal(STOP_CONFIRM_DELAY_MS, 400, '确认按钮延迟不得低于 400ms')
+  const ready = runControlState({ id: 'r1', status: 'running' }, { hasFlow: true, armed: true, confirmReady: true })
+  assert.equal(ready.confirmDisabled, false, '400ms 后独立确认按钮应可用')
+  assert.ok(ready.confirmTitle.includes('确认停止'))
+
+  const busy = runControlState({ id: 'r1', status: 'running' }, { hasFlow: true, busy: true })
+  assert.equal(busy.startDisabled, true)
+  assert.equal(busy.stopDisabled, true, '请求在飞时不允许连点')
+  assert.equal(busy.stopLabel, '停止中…')
+
+  // m7：首次运行列表没回来前禁用「运行」并写 title。
+  const notReady = runControlState(null, { hasFlow: true, listReady: false })
+  assert.equal(notReady.startDisabled, true, '运行记录未就绪时必须禁用运行')
+  assert.ok(notReady.startTitle.includes('正在读取运行记录'), '禁用原因要写进 title')
+
+  const noFlow = runControlState(null, { hasFlow: false })
+  assert.equal(noFlow.running, false)
+  assert.equal(noFlow.startDisabled, true)
+  assert.equal(noFlow.stopDisabled, true)
+
+  // 有些 Host 建 run 时就写 status=running（还没有 live / 事件）；
+  // 这种空壳 run 不能点亮「运行中」，也不该开放「停止」（stop 只会 409）。
+  const shell = { id: 'r2', status: 'running', eventCount: 0, nodeDone: 0 }
+  assert.equal(runIsPending(shell), true)
+  assert.equal(runIsPending({ id: 'r2b', status: 'running', started: false }), true,
+    'Host 持久化的 started=false 就是 pending')
+  assert.equal(runIsPending({ id: 'r2c', status: 'running', started: true, eventCount: 0 }), false,
+    'started=true 之后即使事件还没落盘也不算空壳')
+  assert.equal(runIsActive(shell), false)
+  assert.equal(conclusionOf(shell, null).text, '待运行', '空壳 run 的结论 pill 不能写「运行中」')
+  const shellControl = runControlState(shell, { hasFlow: true })
+  assert.equal(shellControl.running, false)
+  assert.equal(shellControl.startDisabled, false)
+  assert.equal(shellControl.stopDisabled, true)
+  assert.equal(runIsActive({ id: 'r3', status: 'running', eventCount: 4 }), true)
+})
+
+check('运行文案：当前节点 · 第 N 轮 · attempt M；live 缺失从事件回退', () => {
+  assert.equal(LIVE_POLL_MS, 2000, '运行中必须按 06 §10 每 2s 轮询')
+  assert.equal(
+    runLiveLabel(
+      { id: 'r', status: 'running' },
+      { currentNodeId: 'n_dev', attempt: 2, round: 3, phase: 'model' },
+      { nodes: flow.nodes },
+    ),
+    '当前节点 开发 · 第 3 轮 · attempt 2',
+  )
+  assert.equal(
+    runLiveLabel({ id: 'r', status: 'done' }, { currentNodeId: 'n_dev', attempt: 2, round: 3 }, { nodes: flow.nodes }),
+    '',
+    '不在跑的时候不显示实时文案',
+  )
+  assert.equal(
+    runLiveLabel(
+      { id: 'r', status: 'running' },
+      null,
+      { nodes: flow.nodes, events: [{ kind: 'node/start', nodeId: 'n_test', attemptId: 2, seq: 1 }] },
+    ),
+    '当前节点 测试 · 第 1 轮 · attempt 2',
+    '没有 live 时从最近 node/start 回退，round 用 node/start 条数',
+  )
+  assert.equal(
+    runLiveLabel(
+      { id: 'r', status: 'running' },
+      { currentNodeId: null, attempt: 0, round: 0, phase: 'idle' },
+      { nodes: flow.nodes },
+    ),
+    '运行中 · 等待首个节点',
+    'start 202 后首个节点还没落盘时不能写「第 0 轮」',
+  )
+  // m4：等待首个节点要带 since 与 lastSeq，用户能区分「刚启动」与「卡死」。
+  assert.equal(
+    runLiveLabel(
+      { id: 'r', status: 'running' },
+      { currentNodeId: null, attempt: 0, round: 0, phase: 'idle', since: '2026-11-06T08:00:00Z', lastEventSeq: 3 },
+      { nodes: flow.nodes },
+    ),
+    '运行中 · 等待首个节点（since 2026-11-06T08:00:00Z · lastSeq 3）',
+    '等待首个节点必须带上 since 与 lastSeq',
+  )
+  assert.equal(runIsRunning({ status: 'RUNNING' }), true, '状态大小写不敏感')
+  assert.equal(normalizeLive({}), null, '空 live 不伪造 currentNodeId')
+  assert.equal(
+    liveOf({ id: 'run-a' }, { run: { id: 'run-b', live: { currentNodeId: 'x' } } }),
+    null,
+    '详情与选中 run 不一致时不能借用它的 live',
+  )
+  assert.equal(
+    liveOf({ id: 'run-a' }, { run: { id: 'run-a', live: { currentNodeId: 'n_dev', attempt: 1 } } }).currentNodeId,
+    'n_dev',
+  )
+})
+
+check('画布节点运行态：business 环 + 形状/文字角标（不是只靠颜色）', () => {
+  const states = {
+    n_req: { state: 'running', label: '运行中', glyph: '◉', tone: 'business', reworkCount: 0, invalidated: false, current: true },
+    n_plan: { state: 'passed', label: '已通过', glyph: '✓', tone: 'success', reworkCount: 1, invalidated: false },
+    n_shape: { state: 'rejected', label: '被打回', glyph: '↺', tone: 'warn', reworkCount: 2, invalidated: true },
+    n_dev: { state: 'failed', label: '失败', glyph: '✕', tone: 'error', reworkCount: 0, invalidated: false },
+    n_test: { state: 'idle', label: '未开始', glyph: '○', tone: 'idle', reworkCount: 0, invalidated: false },
+  }
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: null,
+    nodeStates: states,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  assert.ok(html.includes('run-state-running'), '运行中没有 business 环对应的类')
+  assert.ok(html.includes('run-state-passed') && html.includes('run-state-rejected'))
+  assert.ok(html.includes('run-state-failed') && html.includes('run-state-idle'))
+  for (const needle of ['◉ 运行中', '✓ 已通过', '↺2 被打回', '✕ 失败', '○ 未开始']) {
+    assert.ok(html.includes(needle), '节点卡缺少形状 + 文字角标「' + needle + '」')
+  }
+  assert.ok(html.includes('该节点返工 1 次（目标返工数）'), '独立 ↺n 角标缺少可读 tooltip')
+  assert.ok(html.includes('该节点因收到打回重跑了 2 次'), '被打回角标的 tooltip 没写清返工次数')
+  assert.ok(html.includes('aria-label="节点 需求分析，运行中"'), '运行态没进 aria-label')
+})
+
+check('页面运行中：顶栏实时节点 + 开始禁用/停止可用 + 抽屉自动展开', () => {
+  const live = { currentNodeId: 'n_dev', attempt: 2, round: 3, phase: 'model' }
+  const runningEvents = [
+    { kind: 'node/start', nodeId: 'n_req', attemptId: 1, seq: 1, data: {} },
+    { kind: 'node/end', nodeId: 'n_req', attemptId: 1, seq: 2, data: { status: 'passed' } },
+    { kind: 'node/start', nodeId: 'n_dev', attemptId: 2, seq: 3, data: {} },
+  ]
+  const runningView = {
+    run: {
+      id: 'run-live', flowId: 'flow-test', flowName: '标准研发流水线',
+      name: '标准研发流水线 · 实时', status: 'running', nodeDone: 1, nodeTotal: 6, tokenTotal: 1200, live,
+    },
+    runs: [{
+      id: 'run-live', flowId: 'flow-test', name: '标准研发流水线 · 实时',
+      status: 'running', nodeDone: 1, nodeTotal: 6, tokenTotal: 1200,
+    }],
+    live,
+    events: runningEvents,
+    summary: null,
+    detail: null,
+    selectedRunId: 'run-live',
+  }
+  const html = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialRunView: runningView,
+    initialLogOpen: true,
+  }))
+  assert.ok(html.includes('当前节点 开发 · 第 3 轮 · attempt 2'), '顶栏没有当前节点 / 轮次 / attempt')
+  assert.match(html, /class="fs-btn primary run"[^>]*disabled/, '运行中开始按钮必须禁用')
+  assert.ok(!/class="fs-btn danger run-stop"[^>]*disabled/.test(html), '运行中停止按钮必须可用')
+  assert.ok(html.includes('运行中'), '节点卡没有运行中角标')
+  assert.ok(html.includes('已通过'), '已通过节点没有状态角标')
+  assert.ok(html.includes('class="fs-log open"'), '开始运行后抽屉应自动展开')
+  assert.ok(html.includes('标准研发流水线 · 实时'), '抽屉没有切到该 run')
+})
+
+check('409 是业务态不是故障：已有 run 在跑 / 不在跑都给可读提示（06 §10）', () => {
+  const startConflict = runActionFailureText('start', 409, { error: '已有 run 正在运行' })
+  assert.ok(startConflict.includes('已有 run 正在运行'), '409 start 必须说清「已有 run 在运行」')
+  assert.ok(startConflict.includes('先停止它'), '409 start 要给出下一步')
+  const stopConflict = runActionFailureText('stop', 409, { error: 'run 不在运行中' })
+  assert.ok(stopConflict.includes('不在运行中'), '409 stop 必须说清「已经不在跑」')
+  const alreadyStarted = runActionFailureText('start', 409, { error: 'run 已开始过，v0.4 不支持断点续跑' })
+  assert.ok(!alreadyStarted.includes('先停止它'), '「已开始过」的 409 不能误导用户去停止别的 run')
+  assert.ok(alreadyStarted.includes('请新建一个 run'), '「已开始过」的 409 要给出正确下一步')
+  assert.ok(runActionFailureText('start', 405, {}).includes('Host 还没有提供'), 'Host 未实现时要说清而不是甩 HTTP 码')
+  assert.ok(runActionFailureText('start', 404, {}).includes('run 不存在'))
+  assert.equal(runActionFailureText('stop', 401, {}), '需要访问令牌：用 ?fs_token=… 打开一次')
+})
+
+
 // 运行日志抽屉：数据都走 initial* 注入，SSR 不跑 useEffect，正好验纯渲染状态机。
 const logRun = {
   id: 'run-20261106-1',
@@ -265,8 +903,15 @@ const logSummary = {
     total: logUsage,
     byNode: { n_req: { input: 1000, cacheRead: 2000, cacheWrite: 0, output: 500, reasoning: 100, total: 3500, calls: 1 } },
   },
-  findings: { total: 2, unresolved: 1, bySeverity: { P0: 1, P1: 1 }, byStatus: { open: 1, verified: 1 } },
-  quality: { state: 'pass', label: '良：返工 1 轮后达标' },
+  findings: { total: 2, unresolved: 1, bySeverity: { P0: 1, P1: 1 }, byStatus: { open: 1, verified: 1 }, unresolvedBySeverity: { P0: 0, P1: 1, P2: 1 } },
+  // Host 会补的验收口径（M4）；缺失时 UI 必须显示「验收 —」。
+  acceptance: { passed: 7, total: 9, rate: 7 / 9 },
+  progress: { passed: 5, total: 6, ratio: 5 / 6, invalidatedNodes: [], nodes: { n_req: { attemptId: 1, status: 'passed' } } },
+  skillUsage: { declaredCount: 3, loadedCount: 2, coverage: 2 / 3, loads: { total: 4, ok: 4, failed: 0 } },
+  quality: {
+    state: 'pass', label: '良：返工 1 轮后达标',
+    reworkRounds: 1, acceptedRate: 0.78, p0Unresolved: 0, p1Unresolved: 1,
+  },
   computedAt: '2026-11-06T10:12:00+08:00',
   eventCount: 4,
 }
@@ -292,7 +937,29 @@ const logEvents = [
   },
 ]
 
-check('抽屉收起态：run 名 · 状态点 · 四段 token 合计 · 结论 pill', () => {
+check('抽屉运行中：live.currentNodeId 对应事件行高亮，状态点走 business（06 §11）', () => {
+  const liveRun = {
+    ...logRun,
+    status: 'running',
+    endedAt: '',
+    live: { currentNodeId: 'n_req', attempt: 1, round: 2, phase: 'model' },
+  }
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [liveRun],
+    initialRunId: liveRun.id,
+    initialEvents: logEvents,
+  }))
+  assert.ok(html.includes('fs-log-event current'), '当前节点的事件行没有高亮类')
+  assert.ok(html.includes('data-current-node="true"'), '当前节点事件行缺少 data 标记')
+  assert.ok(html.includes('当前节点 · 需求分析 开始'), '高亮行没有「当前节点」可读前缀')
+  assert.ok(html.includes('fs-log-current-badge') && html.includes('>当前<'),
+    'm10：当前节点事件行必须有「当前」文字徽标，不能只靠颜色竖条')
+  assert.ok(html.includes('fs-log-dot business'), '运行中状态点应为 business 档')
+})
+
+check('抽屉收起态（M4）：状态点 · 验收通过率主值 · 结论 pill；token 明细不回流 40px', () => {
   const html = render(React.createElement(FsLogDrawer, {
     open: false,
     onToggle() {},
@@ -301,12 +968,57 @@ check('抽屉收起态：run 名 · 状态点 · 四段 token 合计 · 结论 p
     initialSummary: logSummary,
   }))
   assert.ok(html.includes('标准研发流水线 · 第一次'), '收起条没显示 run 名')
-  assert.ok(html.includes('fs-log-dot success'), '状态点没有按 run 状态着色')
-  assert.ok(html.includes('四段合计 50k tok'), '没有把四段 token 合计成一行')
-  assert.ok(html.includes('入 8k · 缓存读 40k · 缓存写 0 · 出 2k'), '没有显示四段明细')
+  assert.ok(html.includes('fs-log-dot success'), '状态点与结论 pill 同源（quality=pass → success）')
+  assert.ok(html.includes('验收 7/9 · 78%'), '40px 主值必须是验收条目通过率')
   assert.ok(html.includes('良：返工 1 轮后达标'), '结论 pill 没显示 summary.quality.label')
+  assert.ok(!html.includes('四段合计'), '四段 token 明细必须下沉到展开态，不能回流 40px 条')
+  assert.ok(!html.includes('入 8k · 缓存读 40k'), '收起条不再显示 token 四段明细')
   assert.ok(html.includes('aria-expanded="false"'), '收起态缺少 aria-expanded')
   assert.ok(!html.includes('事件详情'), '收起态不该渲染三栏明细')
+
+  // 缺失 acceptance 字段：主值必须如实写「验收 —」，不许编数。
+  const missing = render(React.createElement(FsLogDrawer, {
+    open: false,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: { quality: { state: 'pass', label: '优：首轮通过' } },
+  }))
+  assert.ok(missing.includes('验收 —'), 'acceptance 缺失时必须显示「验收 —」')
+  assert.ok(!missing.includes('验收 0/0'), '缺失不能落成 0/0')
+  assert.equal(acceptanceOf(null).text, '验收 —')
+  assert.equal(acceptanceOf({ acceptance: { passed: 0, total: 0 } }).text, '验收 —')
+  assert.equal(acceptanceOf({ acceptance: { passed: 7, total: 9, rate: 0.777 } }).text, '验收 7/9 · 78%')
+})
+
+check('抽屉展开态（M4）：验收 / 总耗时 / P0 / 采纳率 / skill 覆盖率 / 返工轮次 + token 四段', () => {
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: logSummary,
+    initialDetail: { run: logRun, nodes: [{ nodeId: 'n_req', eventCount: 3, attempts: [{ attemptId: 1, eventCount: 3 }] }], eventCount: 4 },
+    initialEvents: logEvents,
+  }))
+  for (const needle of [
+    '验收通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次',
+    '12:00', '78%', '2/3', '1 轮',
+  ]) {
+    assert.ok(html.includes(needle), '展开态缺少指标「' + needle + '」')
+  }
+  assert.ok(html.includes('入 8k · 缓存读 40k · 缓存写 0 · 出 2k'), 'token 四段明细应出现在展开态')
+  assert.equal(formatDuration(42300), '42.3s')
+  assert.equal(formatDuration(720000), '12:00')
+  assert.equal(formatDuration(null), '')
+  assert.equal(runDurationMs(logRun), 720000)
+  assert.equal(runDurationMs({ id: 'x' }), null)
+  const metrics = runMetrics(logRun, logSummary)
+  assert.equal(metrics.durationText, '12:00')
+  assert.equal(metrics.p0, '0')
+  assert.equal(metrics.acceptedRateText, '78%')
+  assert.equal(metrics.skillText, '2/3')
+  assert.equal(metrics.reworkText, '1 轮')
 })
 
 check('抽屉无 run：显示「还没有运行记录」与「刷新」', () => {
@@ -358,7 +1070,7 @@ check('抽屉展开态：三栏渲染 run 列表 / 事件行 / 事件详情', ()
   assert.ok(html.includes('第 1/1 页 · 200 条/页'), '缺少 200 条/页的分页信息')
 })
 
-check('done + 无 summary：结论 pill 为中性，不冒充绿色（审核 M8）', () => {
+check('done + 无 summary：结论 pill 与状态点同源中性，不冒充绿色（审核 M8 + m2）', () => {
   const html = render(React.createElement(FsLogDrawer, {
     open: false,
     onToggle() {},
@@ -366,13 +1078,15 @@ check('done + 无 summary：结论 pill 为中性，不冒充绿色（审核 M8�
     initialRunId: logRun.id,
   }))
   assert.ok(html.includes('fs-log-pill neutral'), '没有 quality 证据时 pill 必须是中性档')
+  assert.ok(html.includes('fs-log-dot neutral'), '状态点必须与 pill 同源（中性），不能按 run 状态单独上色')
   assert.ok(html.includes('完成 · 质量未检测'), '中性 pill 要写清「质量未检测」')
+  assert.ok(html.includes('验收 —'), '没有 acceptance 证据时主值显示「验收 —」')
   assert.ok(!html.includes('fs-log-pill success'), '没有 summary 时绝不能出现绿 pill')
   assert.equal(conclusionOf(logRun, null).tone, 'neutral')
   assert.equal(conclusionOf(logRun, { quality: { state: 'pass' } }).tone, 'success')
 })
 
-check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工」（审核 m6）', () => {
+check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工」；fail 走黄（m1/m6）', () => {
   const pass = conclusionOf(logRun, { quality: { state: 'pass', label: '优：首轮通过' } })
   assert.equal(pass.tone, 'success')
   assert.equal(pass.text, '优：首轮通过')
@@ -383,12 +1097,12 @@ check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工�
   const warnNoLabel = conclusionOf(logRun, { quality: { state: 'warn' } })
   assert.ok(!warnNoLabel.text.includes('需返工'), '缺 label 的 warn 也不能写成需返工')
   const fail = conclusionOf(logRun, { quality: { state: 'fail', label: '需返工：测试未通过' } })
-  assert.equal(fail.tone, 'error', 'fail 必须是红档')
+  assert.equal(fail.tone, 'warn', 'm1：quality=fail 用 warn 黄，红只留给运行失败')
   assert.ok(fail.text.includes('需返工'))
   const unknown = conclusionOf(logRun, { quality: { state: 'unknown', label: '证据不足：测试未检测' } })
   assert.equal(unknown.tone, 'warn', 'Host 明确判 unknown 时按 04 走黄（证据不足），不是绿')
   const failed = conclusionOf({ ...logRun, status: 'failed' }, { quality: { state: 'pass' } })
-  assert.equal(failed.tone, 'error', '运行失败优先于质量结论')
+  assert.equal(failed.tone, 'error', '运行失败优先于质量结论，并且是唯一红档')
   assert.equal(failed.text, '失败')
 })
 
@@ -478,6 +1192,19 @@ check('数值 0 与未记录分开；skill/load 缺 ok 不写已加载（审核 
   })
   assert.ok(modelCall.includes('token 0'), '记录过的 0 要显示 0')
   assert.ok(!modelCall.includes('未记录'), '0 不能显示成未记录')
+})
+
+check('M5：事件请求把 kinds 展开成重复 kind、并带 since 游标', () => {
+  const url = readEventsPath('run-1', {
+    since: 5, kinds: ['node/start', 'node/end'], limit: 500, order: 'asc',
+  })
+  assert.ok(url.startsWith('/runs/run-1/events?'), '事件路径不对：' + url)
+  assert.equal((url.match(/[?&]kind=/g) || []).length, 2, 'kinds 必须按重复 key 发送')
+  assert.ok(url.includes('kind=node%2Fstart') && url.includes('kind=node%2Fend'))
+  assert.ok(url.includes('since=5'), '增量必须带 since=lastSeq')
+  assert.ok(url.includes('order=asc') && url.includes('limit=500'))
+  assert.ok(!url.includes('kind=node%2Fstart%2Cnode%2Fend'), '不能把 kinds 拼成逗号单值')
+  assert.equal(readEventsPath('r', {}), '/runs/r/events?limit=200&order=desc')
 })
 
 check('可选鉴权：fs_token 存一次、Authorization 头与 401 文案（05 §8.5）', () => {

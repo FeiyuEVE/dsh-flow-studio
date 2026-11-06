@@ -7,7 +7,7 @@
  * @module @feiyueve/dsh-flow-studio/store
  */
 
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -15,6 +15,10 @@ import { defaultFlow, makeId, normalizeFlow, summarize } from './model.js'
 
 /** 单份流程文件的最大字节数，防止读进一份畸形大文件。 */
 const MAX_FLOW_BYTES = 2 * 1024 * 1024
+
+/** 与 run 日志同口径：目录 0700、文件 0600（05 §1 / 06 §13.7）。 */
+const DIR_MODE = 0o700
+const FILE_MODE = 0o600
 
 /** 流程 id 允许的字符集：既当文件名，也进 URL。 */
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -42,7 +46,11 @@ export function newFlowId() {
 }
 
 async function ensureDir(dir) {
-  await mkdir(dir, { recursive: true })
+  await mkdir(dir, { recursive: true, mode: DIR_MODE })
+  // 目录已存在时 mkdir 不会改 mode，显式 chmod 一次，保证与 run 目录同口径。
+  await chmod(dir, DIR_MODE).catch(error => {
+    if (error && error.code !== 'ENOENT') throw error
+  })
 }
 
 /** 读一个文件并解析；不存在返回 null，解析失败抛错交给调用方决定。 */
@@ -58,15 +66,16 @@ async function readJson(path) {
   return JSON.parse(text)
 }
 
-/** 原子写：先写 .tmp 再 rename，中途崩溃不会留下半份流程。 */
+/** 原子写：先写 .tmp 再 rename，中途崩溃不会留下半份流程；文件 0600。 */
 async function writeJsonAtomic(path, value) {
   const text = `${JSON.stringify(value, null, 2)}\n`
   if (Buffer.byteLength(text, 'utf8') > MAX_FLOW_BYTES) {
     throw new Error(`流程超过 ${MAX_FLOW_BYTES} 字节，存不下`)
   }
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
-  await writeFile(tmp, text, 'utf8')
+  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
   await rename(tmp, path)
+  await chmod(path, FILE_MODE).catch(() => {})
 }
 
 /**

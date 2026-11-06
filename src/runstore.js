@@ -19,6 +19,7 @@ import { randomInt } from 'node:crypto'
 import {
   chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile,
 } from 'node:fs/promises'
+import { hostname } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
@@ -29,6 +30,23 @@ import { resolveHome } from './store.js'
 
 /** run.json 的体积上限：元数据不该有成百上千行。 */
 const MAX_META_BYTES = 1024 * 1024
+
+/**
+ * 06 §13.4：给 `run/start` / `run/end` 留的保留额度。
+ * 普通事件最多用到 `MAX_RUN_EVENTS - 64`，保证任何致命失败都还有位置落终态。
+ */
+export const RESERVED_TERMINAL_EVENTS = 64
+const NORMAL_EVENT_LIMIT = MAX_RUN_EVENTS - RESERVED_TERMINAL_EVENTS
+
+/** §13.3 单写者租约文件（放在 run 目录里，0600）。 */
+const LEASE_FILE = 'lock.json'
+/** §13.4 写盘失败的侧车文件（GET /runs/<id> 会把它作为 storageError 返回）。 */
+const ERROR_FILE = '.error'
+/** 默认租约 TTL：引擎每 30s 续租，90s 过期（3 次心跳）。 */
+export const DEFAULT_LEASE_TTL_MS = 90 * 1000
+
+const TERMINAL_STATUS = new Set(['done', 'aborted', 'failed'])
+const ALL_STATUS = new Set(['pending', 'running', 'done', 'aborted', 'failed'])
 
 /** 事件按 run 级 / 节点级分流。 */
 const RUN_LEVEL_KINDS = new Set(['run/start', 'run/end'])
@@ -143,18 +161,47 @@ function countPassed(progress) {
   return passed
 }
 
+/** 06 §2：运行中的 live 视图（currentNodeId / attempt / round / since / lastEventSeq / phase）。 */
+const LIVE_PHASES = new Set(['model', 'tool', 'spawn', 'idle'])
+
+function normalizeLive(source) {
+  if (!isPlainObject(source)) return null
+  const live = {
+    currentNodeId: typeof source.currentNodeId === 'string' && checkRunId(source.currentNodeId)
+      ? source.currentNodeId
+      : null,
+    attempt: Number.isInteger(source.attempt) && source.attempt >= 0 ? source.attempt : 0,
+    round: Number.isInteger(source.round) && source.round >= 0 ? source.round : 0,
+    since: typeof source.since === 'string' && Number.isFinite(Date.parse(source.since))
+      ? new Date(Date.parse(source.since)).toISOString()
+      : null,
+    lastEventSeq: Number.isInteger(source.lastEventSeq) && source.lastEventSeq >= 0
+      ? source.lastEventSeq
+      : 0,
+    phase: LIVE_PHASES.has(source.phase) ? source.phase : 'idle',
+  }
+  return live
+}
+
 function normalizeMeta(raw, id) {
   const source = raw && typeof raw === 'object' ? raw : {}
   const now = new Date().toISOString()
   const text = (value, fallback) => (typeof value === 'string' && value !== '' ? value : fallback)
   const count = (value, fallback = 0) => (Number.isInteger(value) && value >= 0 ? value : fallback)
-  const status = ['running', 'done', 'aborted', 'failed'].includes(source.status)
-    ? source.status
-    : 'running'
+  const status = ALL_STATUS.has(source.status) ? source.status : 'running'
   const progress = normalizeProgress(source.progress)
   const hasProgress = isPlainObject(source.progress) && isPlainObject(source.progress.nodes)
-  const lastSeq = count(source.lastSeq, count(source.seq))
+  const lastSeq = Math.max(count(source.lastSeq, 0), count(source.seq, 0))
   const nodeTotal = count(source.nodeTotal)
+  // 06 §13.2：`started` 是持久化的「开始过」标志，start 不再用 eventCount 猜。
+  // 老 run.json（v0.3 没有 started 字段）按「有事件 / 已终态」推断，避免把从没跑过的
+  // running 壳子误判成已开始。
+  const started = source.started === true
+    ? true
+    : source.started === false
+      ? false
+      : (TERMINAL_STATUS.has(status) || count(source.eventCount) > 0 || lastSeq > 0)
+  const engine = source.engine === 'stub' ? 'stub' : 'real'
   return {
     v: 1,
     id,
@@ -162,6 +209,8 @@ function normalizeMeta(raw, id) {
     flowId: text(source.flowId, ''),
     flowName: text(source.flowName, ''),
     status,
+    started,
+    engine,
     startedAt: text(source.startedAt, now),
     endedAt: typeof source.endedAt === 'string' && source.endedAt !== '' ? source.endedAt : null,
     nodeDone: hasProgress ? countPassed(progress) : count(source.nodeDone),
@@ -176,6 +225,8 @@ function normalizeMeta(raw, id) {
     createdAt: text(source.createdAt, now),
     updatedAt: text(source.updatedAt, now),
     progress,
+    // 06 §2 / §10：live 随 run.json 原子写；结束后由引擎置 null。
+    live: normalizeLive(source.live),
   }
 }
 
@@ -283,11 +334,15 @@ export async function createRun(runsRoot, input = {}) {
   if (!loc) throw new RunError(500, 'runId', '生成 runId 失败（连续冲突）')
 
   const now = new Date().toISOString()
+  const requestedEngine = input.engine === 'stub' ? 'stub' : 'real'
   const meta = normalizeMeta({
     name,
     flowId,
     flowName,
-    status: 'running',
+    // 06 §13.2：建出来只是 pending，真正开跑必须走 startRun()。
+    status: 'pending',
+    started: false,
+    engine: requestedEngine,
     startedAt: now,
     endedAt: null,
     nodeDone: 0,
@@ -306,6 +361,368 @@ export async function createRun(runsRoot, input = {}) {
     throw error
   }
   return meta
+}
+
+/**
+ * 06 §13.2：把 `pending` 原子切成 `running`，并置持久化的 `started` 标志。
+ * 不是 pending / 已经 started 一律 409（同一进程内由 withLock 串行化，两个并发 startRun
+ * 只有一个能成功）。
+ *
+ * @param {string} runsRoot
+ * @param {string} runId
+ * @param {{ now?: Date }} [options]
+ * @returns {Promise<object>} 写入后的 meta
+ */
+export async function startRun(runsRoot, runId, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  return withLock(loc.id, async () => {
+    const meta = await readMetaUnlocked(loc)
+    if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+    if (meta.started === true || meta.status !== 'pending') {
+      throw new RunError(
+        409,
+        'runId',
+        meta.started === true
+          ? `run 已开始过（当前 ${meta.status}），v0.4 不支持断点续跑`
+          : `run 不是 pending（当前 ${meta.status}），不能重复开始`,
+      )
+    }
+    const now = options.now instanceof Date && !Number.isNaN(options.now.getTime())
+      ? options.now
+      : new Date()
+    const next = normalizeMeta({
+      ...meta,
+      status: 'running',
+      started: true,
+      startedAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    }, loc.id)
+    return writeMetaUnlocked(loc, next)
+  })
+}
+
+/**
+ * 06 §13.3 单写者租约：`runs/<runId>/lock.json`（pid / host / heartbeatAt / ttlMs）。
+ * 过期由读取方清理；`sweepExpiredLeases()` 会把过期租约的 running run 标 failed。
+ */
+
+function leasePath(dir) {
+  return join(dir, LEASE_FILE)
+}
+
+function normalizeLease(raw) {
+  if (!isPlainObject(raw)) return null
+  const pid = Number.isInteger(raw.pid) && raw.pid > 0 ? raw.pid : null
+  const host = typeof raw.host === 'string' && raw.host !== '' ? raw.host : null
+  const heartbeatAt = typeof raw.heartbeatAt === 'string' && Number.isFinite(Date.parse(raw.heartbeatAt))
+    ? new Date(Date.parse(raw.heartbeatAt)).toISOString()
+    : null
+  const ttlMs = Number.isInteger(raw.ttlMs) && raw.ttlMs > 0 ? raw.ttlMs : DEFAULT_LEASE_TTL_MS
+  if (pid === null || host === null || heartbeatAt === null) return null
+  const acquiredAt = typeof raw.acquiredAt === 'string' && Number.isFinite(Date.parse(raw.acquiredAt))
+    ? new Date(Date.parse(raw.acquiredAt)).toISOString()
+    : heartbeatAt
+  return { pid, host, ttlMs, acquiredAt, heartbeatAt }
+}
+
+function leaseExpired(lease, now) {
+  return Date.parse(lease.heartbeatAt) + lease.ttlMs <= now.getTime()
+}
+
+function leaseOwner(lease) {
+  return `${lease.pid}@${lease.host}`
+}
+
+function leaseOwnerMatches(lease, options) {
+  const pid = Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid
+  const host = typeof options.host === 'string' && options.host !== '' ? options.host : hostname()
+  return lease.pid === pid && lease.host === host
+}
+
+async function readLeaseFile(dir) {
+  let text
+  try {
+    text = await readFile(leasePath(dir), 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    return normalizeLease(JSON.parse(text))
+  } catch {
+    return null
+  }
+}
+
+async function writeLeaseFile(dir, lease) {
+  await ensureDirMode(dir)
+  const text = `${JSON.stringify(lease, null, 2)}\n`
+  const tmp = `${leasePath(dir)}.tmp-${process.pid}-${tmpCounter++}`
+  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
+  try {
+    await rename(tmp, leasePath(dir))
+  } catch (error) {
+    await unlink(tmp).catch(() => {})
+    throw error
+  }
+  await chmod(leasePath(dir), FILE_MODE).catch(() => {})
+}
+
+async function removeLeaseFile(dir, lease) {
+  if (lease) {
+    const current = await readLeaseFile(dir).catch(() => null)
+    if (current && leaseOwner(current) !== leaseOwner(lease)) return false
+  }
+  try {
+    await unlink(leasePath(dir))
+    return true
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+function leaseOptions(options = {}) {
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime())
+    ? options.now
+    : new Date()
+  const ttlMs = Number.isInteger(options.ttlMs) && options.ttlMs > 0
+    ? options.ttlMs
+    : DEFAULT_LEASE_TTL_MS
+  return {
+    now,
+    ttlMs,
+    pid: Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid,
+    host: typeof options.host === 'string' && options.host !== '' ? options.host : hostname(),
+  }
+}
+
+/**
+ * 读当前租约。过期租约视为不存在并顺手清掉；没有租约返回 null。
+ * @returns {Promise<object | null>}
+ */
+export async function readLease(runsRoot, runId, options = {}) {
+  const loc = locate(runsRoot, runId)
+  if (!loc) return null
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime()) ? options.now : new Date()
+  const lease = await readLeaseFile(loc.dir).catch(() => null)
+  if (!lease) return null
+  if (leaseExpired(lease, now)) {
+    await removeLeaseFile(loc.dir).catch(() => {})
+    return null
+  }
+  return lease
+}
+
+/**
+ * 抢单写者租约。已有**未过期**租约（任何持有者）一律 409；过期租约可被抢。
+ * 同一 run 的 claim 在进程内串行化。
+ * @returns {Promise<object>} 新租约
+ */
+export async function claimLease(runsRoot, runId, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  const { now, ttlMs, pid, host } = leaseOptions(options)
+  return withLock(loc.id, async () => {
+    const existing = await readLeaseFile(loc.dir)
+    if (existing && !leaseExpired(existing, now)) {
+      throw new RunError(
+        409,
+        'runId',
+        `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
+      )
+    }
+    const iso = now.toISOString()
+    const lease = { pid, host, ttlMs, acquiredAt: iso, heartbeatAt: iso }
+    await writeLeaseFile(loc.dir, lease)
+    return lease
+  })
+}
+
+/**
+ * 续租。租约不存在 / 已过期 / 不是本进程持有 → 409。
+ * @returns {Promise<object>} 续租后的租约
+ */
+export async function renewLease(runsRoot, runId, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  const { now, ttlMs, pid, host } = leaseOptions(options)
+  return withLock(loc.id, async () => {
+    const existing = await readLeaseFile(loc.dir)
+    if (!existing) throw new RunError(409, 'runId', '该 run 没有执行租约，无法续租')
+    if (leaseExpired(existing, now)) {
+      await removeLeaseFile(loc.dir).catch(() => {})
+      throw new RunError(409, 'runId', '执行租约已过期（引擎可能已中断），不能续租')
+    }
+    if (!leaseOwnerMatches(existing, { pid, host })) {
+      throw new RunError(409, 'runId', `执行租约由 ${leaseOwner(existing)} 持有，本实例无权续租`)
+    }
+    const lease = {
+      ...existing,
+      ttlMs,
+      heartbeatAt: now.toISOString(),
+    }
+    await writeLeaseFile(loc.dir, lease)
+    return lease
+  })
+}
+
+/**
+ * 释放租约；只能释放本实例持有的（`force:true` 可强制清）。
+ * @returns {Promise<boolean>} 是否真的删掉
+ */
+export async function releaseLease(runsRoot, runId, options = {}) {
+  const loc = locate(runsRoot, runId)
+  if (!loc) return false
+  return withLock(loc.id, async () => {
+    const existing = await readLeaseFile(loc.dir)
+    if (!existing) return false
+    if (options.force !== true && !leaseOwnerMatches(existing, options)) {
+      throw new RunError(409, 'runId', `执行租约由 ${leaseOwner(existing)} 持有，不能由本实例释放`)
+    }
+    return removeLeaseFile(loc.dir)
+  })
+}
+
+/**
+ * 启动时清理过期租约：**只扫 `running`**，把租约过期（引擎崩溃）的 run 标 failed，
+ * reason 含「引擎中断」。返回被处理的 runId。
+ * @returns {Promise<string[]>}
+ */
+export async function sweepExpiredLeases(runsRoot, options = {}) {
+  const root = resolve(runsRoot)
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime()) ? options.now : new Date()
+  let dirents = []
+  try {
+    dirents = await readdir(root, { withFileTypes: true })
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return []
+    throw error
+  }
+  const recovered = []
+  for (const entry of dirents) {
+    if (!entry.isDirectory() || !checkRunId(entry.name)) continue
+    const loc = locate(root, entry.name)
+    if (!loc) continue
+    const meta = await readMetaUnlocked(loc).catch(() => null)
+    if (!meta || meta.status !== 'running') continue
+    const lease = await readLeaseFile(loc.dir).catch(() => null)
+    if (!lease || !leaseExpired(lease, now)) continue
+    const reason = `引擎中断：执行租约过期（${leaseOwner(lease)}，心跳 ${lease.heartbeatAt}），不自动续跑`
+    try {
+      await appendEvents(runsRoot, loc.id, [{
+        v: 1,
+        kind: 'run/end',
+        traceId: `tr-${loc.id.slice(0, 80)}-sweep`,
+        data: { status: 'failed', reason: reason.slice(0, 2000) },
+        extra: { recovered: true, engineInterrupted: true, leaseExpired: true },
+      }], { now })
+    } catch (error) {
+      await markStorageFailure(loc, error).catch(() => {})
+      await writeRunMeta(runsRoot, loc.id, {
+        status: 'failed',
+        endedAt: now.toISOString(),
+        live: null,
+      }).catch(() => {})
+    }
+    await removeLeaseFile(loc.dir, lease).catch(() => {})
+    recovered.push(loc.id)
+  }
+  return recovered
+}
+
+/**
+ * 06 §13.4：启动时修复「run.jsonl 已经有 run/end，但 run.json 还是非终态」的不一致。
+ * 只读 run.jsonl（不碰节点文件），返回修复过的 runId。
+ * @returns {Promise<string[]>}
+ */
+export async function repairRunStates(runsRoot, options = {}) {
+  const root = resolve(runsRoot)
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime()) ? options.now : new Date()
+  let dirents = []
+  try {
+    dirents = await readdir(root, { withFileTypes: true })
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return []
+    throw error
+  }
+  const repaired = []
+  for (const entry of dirents) {
+    if (!entry.isDirectory() || !checkRunId(entry.name)) continue
+    const loc = locate(root, entry.name)
+    if (!loc) continue
+    const meta = await readMetaUnlocked(loc).catch(() => null)
+    if (!meta || TERMINAL_STATUS.has(meta.status)) continue
+    let text
+    try {
+      text = await readFile(join(loc.dir, 'run.jsonl'), 'utf8')
+    } catch {
+      continue
+    }
+    let lastEnd = null
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      let event
+      try {
+        event = JSON.parse(trimmed)
+      } catch {
+        continue
+      }
+      if (event && event.kind === 'run/end' && event.data && TERMINAL_STATUS.has(event.data.status)) {
+        lastEnd = event
+      }
+    }
+    if (!lastEnd) continue
+    const endedAt = typeof lastEnd.ts === 'string' && Number.isFinite(Date.parse(lastEnd.ts))
+      ? new Date(Date.parse(lastEnd.ts)).toISOString()
+      : now.toISOString()
+    await withLock(loc.id, async () => {
+      const fresh = await readMetaUnlocked(loc)
+      if (!fresh || TERMINAL_STATUS.has(fresh.status)) return
+      await writeMetaUnlocked(loc, normalizeMeta({
+        ...fresh,
+        status: lastEnd.data.status,
+        started: true,
+        endedAt,
+        live: null,
+        updatedAt: now.toISOString(),
+      }, loc.id))
+    })
+    repaired.push(loc.id)
+  }
+  return repaired
+}
+
+/** 写 `.error` 侧车文件：写盘失败时给 GET /runs/<id> 一个可读的 storageError。 */
+async function markStorageFailure(loc, error) {
+  const raw = error && error.message ? String(error.message) : String(error)
+  // 侧车会被 GET /runs/<id> 返回，先把内部绝对路径压掉（§8.5）。
+  const sanitized = raw.split(loc.root).join('<runs>').slice(0, 2000)
+  const payload = {
+    at: new Date().toISOString(),
+    error: sanitized,
+    code: error && typeof error.code === 'string' ? error.code : null,
+  }
+  const text = `${JSON.stringify(payload)}\n`
+  const tmp = join(loc.dir, `${ERROR_FILE}.tmp-${process.pid}-${tmpCounter++}`)
+  await writeFile(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
+  await rename(tmp, join(loc.dir, ERROR_FILE))
+  await chmod(join(loc.dir, ERROR_FILE), FILE_MODE).catch(() => {})
+}
+
+async function readStorageError(dir) {
+  let text
+  try {
+    text = await readFile(join(dir, ERROR_FILE), 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    return { at: null, error: '读 .error 侧车文件失败', code: error && error.code ? error.code : null }
+  }
+  try {
+    const parsed = JSON.parse(text)
+    return isPlainObject(parsed) ? parsed : { at: null, error: text.trim().slice(0, 2000), code: null }
+  } catch {
+    return { at: null, error: text.trim().slice(0, 2000), code: null }
+  }
 }
 
 /**
@@ -454,8 +871,231 @@ function parseSince(value) {
   return { type: 'ts', value: parsed }
 }
 
+/** 列出 run 目录里所有事件文件（run.jsonl + 每个 node 的 attempt 文件）。 */
+async function listEventFiles(loc) {
+  const files = []
+  const rootFile = join(loc.dir, 'run.jsonl')
+  try {
+    const info = await stat(rootFile)
+    if (info.isFile()) files.push(rootFile)
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error
+  }
+  let dirents = []
+  try {
+    dirents = await readdir(loc.dir, { withFileTypes: true })
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error
+  }
+  const nodeDirs = dirents
+    .filter(entry => entry.isDirectory() && checkRunId(entry.name))
+    .map(entry => entry.name)
+    .sort((a, b) => a.localeCompare(b))
+  for (const nodeId of nodeDirs) {
+    const nodePath = join(loc.dir, nodeId)
+    let entries = []
+    try {
+      entries = await readdir(nodePath, { withFileTypes: true })
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error
+      continue
+    }
+    const names = entries
+      .filter(entry => entry.isFile() && ATTEMPT_FILE.test(entry.name))
+      .map(entry => entry.name)
+      .sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10))
+    for (const name of names) files.push(join(nodePath, name))
+  }
+  return files
+}
+
+/**
+ * 单文件倒序行迭代器：从文件尾部按块读，逐行倒着吐。
+ * 不把整个文件读进内存，也不会先解析前面的行（06 §13.7 / 05 §8.6 的读放大要求）。
+ */
+function makeReverseLineIterator(path) {
+  let handle = null
+  let pos = 0
+  let pending = ''
+  let bytes = 0
+  const buffer = []
+  const CHUNK = 64 * 1024
+
+  async function openOnce() {
+    if (handle !== null) return
+    handle = await open(path, 'r')
+    const info = await handle.stat()
+    pos = info.size
+  }
+
+  async function fill() {
+    await openOnce()
+    while (buffer.length === 0 && pos > 0) {
+      const start = Math.max(0, pos - CHUNK)
+      const size = pos - start
+      const chunk = Buffer.allocUnsafe(size)
+      let offset = 0
+      while (offset < size) {
+        const { bytesRead } = await handle.read(chunk, offset, size - offset, start + offset)
+        if (bytesRead === 0) break
+        offset += bytesRead
+      }
+      bytes += offset
+      pos = start
+      const text = chunk.subarray(0, offset).toString('utf8') + pending
+      const parts = text.split('\n')
+      // start > 0 时第一段可能是被切断的半行，留到下一块拼接。
+      pending = pos > 0 ? parts.shift() : ''
+      for (const part of parts) {
+        const line = part.trim()
+        if (line !== '') buffer.push(line)
+      }
+    }
+    if (buffer.length === 0 && pending.trim() !== '') {
+      buffer.push(pending.trim())
+      pending = ''
+    }
+  }
+
+  return {
+    get bytesRead() {
+      return bytes
+    },
+    async next() {
+      await fill()
+      if (buffer.length === 0) return null
+      const line = buffer.pop()
+      try {
+        const event = JSON.parse(line)
+        if (event !== null && typeof event === 'object' && !Array.isArray(event)) return { event }
+        return { event: null }
+      } catch {
+        return { event: null }
+      }
+    },
+    async close() {
+      if (handle !== null) {
+        await handle.close().catch(() => {})
+        handle = null
+      }
+    },
+  }
+}
+
+function matchesFilters(event, filters) {
+  if (!event) return false
+  if (filters.nodeId && event.nodeId !== filters.nodeId) return false
+  if (filters.attemptId !== undefined && event.attemptId !== filters.attemptId) return false
+  if (filters.kinds && !filters.kinds.has(event.kind)) return false
+  if (filters.since && filters.since.type === 'seq') {
+    if (!Number.isFinite(event.seq) || event.seq <= filters.since.value) return false
+  }
+  if (filters.sinceTs !== null) {
+    const ts = typeof event.ts === 'string' ? Date.parse(event.ts) : Number.NaN
+    if (!Number.isFinite(ts) || ts <= filters.sinceTs) return false
+  }
+  return true
+}
+
+function eventOrder(event) {
+  const seq = Number.isInteger(event && event.seq) ? event.seq : -1
+  const ts = typeof event?.ts === 'string' ? Date.parse(event.ts) : Number.NaN
+  return { seq, ts: Number.isFinite(ts) ? ts : -1 }
+}
+
+/**
+ * `order=desc` 的尾部倒读：各文件同时从末尾取一条，做 k 路归并取最大 seq。
+ * 取够 limit 条就停——此时未读事件都在各文件头部之前，seq 不会大于已取的最小值，
+ * 所以结果就是全局最新的 limit 条，不需要全量解析。
+ */
+async function readEventsTail(loc, meta, filters) {
+  const files = await listEventFiles(loc)
+  const iterators = files.map(file => makeReverseLineIterator(file))
+  const matched = []
+  let scanned = 0
+  let skipped = 0
+  let exhausted = false
+  try {
+    while (matched.length < filters.limit) {
+      let bestIndex = -1
+      let bestSeq = -Infinity
+      let bestTs = -Infinity
+      for (let index = 0; index < iterators.length; index += 1) {
+        const iterator = iterators[index]
+        if (iterator.done) continue
+        if (iterator.head === undefined) {
+          iterator.head = await iterator.next()
+          if (iterator.head === null) {
+            iterator.done = true
+            continue
+          }
+        }
+        const order = eventOrder(iterator.head.event)
+        if (bestIndex === -1 || order.seq > bestSeq || (order.seq === bestSeq && order.ts > bestTs)) {
+          bestIndex = index
+          bestSeq = order.seq
+          bestTs = order.ts
+        }
+      }
+      if (bestIndex === -1) {
+        exhausted = true
+        break
+      }
+      const iterator = iterators[bestIndex]
+      const item = iterator.head
+      iterator.head = undefined
+      scanned += 1
+      if (!item.event) {
+        skipped += 1
+        continue
+      }
+      // 该文件剩余事件 seq 只会更小（文件内按 seq 递增追加），可以安全收工。
+      if (filters.since && filters.since.type === 'seq'
+        && Number.isFinite(item.event.seq) && item.event.seq <= filters.since.value) {
+        exhausted = true
+        break
+      }
+      if (matchesFilters(item.event, filters)) matched.push(item.event)
+    }
+  } finally {
+    for (const iterator of iterators) await iterator.close()
+  }
+  const scannedBytes = iterators.reduce((sum, iterator) => sum + iterator.bytesRead, 0)
+  const hasFilters = Boolean(filters.nodeId || filters.attemptId !== undefined || filters.kinds || filters.since)
+  let total
+  let truncated
+  let totalExact
+  if (exhausted) {
+    total = matched.length
+    truncated = false
+    totalExact = true
+  } else if (!hasFilters) {
+    // 无过滤时 run.json 的 eventCount 就是精确总数，不必再扫一遍。
+    total = Math.max(meta.eventCount, matched.length)
+    truncated = true
+    totalExact = true
+  } else {
+    // 有过滤且提前停：total 是「已读到的匹配数」（≥ limit），truncated 明确表示还有未读区间。
+    total = matched.length
+    truncated = true
+    totalExact = false
+  }
+  return {
+    events: matched,
+    total,
+    totalExact,
+    truncated,
+    skipped: exhausted ? skipped : 0,
+    scannedEvents: scanned,
+    scannedBytes,
+    tail: true,
+  }
+}
+
 /**
  * 读事件流：过滤 + 分页 + 排序。
+ *
+ * `order=desc` 走尾部倒读（只解析需要的尾部），`order=asc` 仍旧全量读后正序分页。
  *
  * @param {string} runsRoot
  * @param {string} runId
@@ -463,8 +1103,15 @@ function parseSince(value) {
  * @returns {Promise<{ events: object[], total: number, truncated: boolean, skipped: number } | null>}
  */
 export async function readEvents(runsRoot, runId, options = {}) {
-  const all = await readAllEvents(runsRoot, runId)
-  if (!all) return null
+  const loc = locate(runsRoot, runId)
+  if (!loc) return null
+  let meta
+  try {
+    meta = await readMetaUnlocked(loc)
+  } catch {
+    return null
+  }
+  if (!meta) return null
 
   let nodeId
   if (options.nodeId !== undefined && options.nodeId !== null && options.nodeId !== '') {
@@ -510,27 +1157,24 @@ export async function readEvents(runsRoot, runId, options = {}) {
   }
 
   const sinceTs = since && since.type === 'ts' ? since.value : null
-  const filtered = all.events.filter(event => {
-    if (nodeId && event.nodeId !== nodeId) return false
-    if (attemptId !== undefined && event.attemptId !== attemptId) return false
-    if (kinds && !kinds.has(event.kind)) return false
-    if (since && since.type === 'seq') {
-      if (!Number.isFinite(event.seq) || event.seq <= since.value) return false
-    }
-    if (sinceTs !== null) {
-      const ts = typeof event.ts === 'string' ? Date.parse(event.ts) : Number.NaN
-      if (!Number.isFinite(ts) || ts <= sinceTs) return false
-    }
-    return true
-  })
+  const filters = { nodeId, attemptId, kinds, since, sinceTs, limit }
 
+  if (order === 'desc') {
+    return readEventsTail(loc, meta, filters)
+  }
+
+  const all = await readAllEventsUnlocked(loc, meta)
+  const filtered = all.events.filter(event => matchesFilters(event, filters))
   const total = filtered.length
-  const ordered = order === 'desc' ? [...filtered].reverse() : filtered
   return {
-    events: ordered.slice(0, limit),
+    events: filtered.slice(0, limit),
     total,
+    totalExact: true,
     truncated: total > limit,
     skipped: all.skipped,
+    scannedEvents: all.events.length,
+    scannedBytes: null,
+    tail: false,
   }
 }
 
@@ -678,6 +1322,16 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
         throw new RunError(400, 'events', `单条事件超过 ${MAX_EVENT_BYTES} 字节（事件行上限 8KB）`)
       }
     }
+    // 06 §13.4：普通事件不得占用 run/start / run/end 的保留额度。
+    const ordinaryCount = normalized.filter(event => !RUN_LEVEL_KINDS.has(event.kind)).length
+    if (ordinaryCount > 0 && meta.eventCount + normalized.length > NORMAL_EVENT_LIMIT) {
+      throw new RunError(
+        400,
+        'events',
+        `普通事件已达保留额度上限 ${NORMAL_EVENT_LIMIT}（总上限 ${MAX_RUN_EVENTS}，其中 ${RESERVED_TERMINAL_EVENTS} 条留给 run/start、run/end）`
+          + `；已有 ${meta.eventCount}，本批普通事件 ${ordinaryCount}`,
+      )
+    }
     const firstSeq = normalized[0].seq
     const lastSeq = normalized[normalized.length - 1].seq
 
@@ -691,81 +1345,107 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
       groups.get(rel).push(event)
     }
 
-    for (const [rel, events] of groups) {
-      const abs = resolve(loc.dir, rel)
-      if (!isInside(loc.dir, abs)) throw new RunError(500, 'runId', '事件路径越出 run 目录')
-      await ensureDirMode(dirname(abs))
-      const text = events.map(event => `${JSON.stringify(event)}\n`).join('')
-      const handle = await open(abs, 'a', FILE_MODE)
-      try {
-        await handle.writeFile(text, 'utf8')
-      } finally {
-        await handle.close()
-      }
-      await chmod(abs, FILE_MODE).catch(() => {})
-    }
-
-    // §8.6：计数器在追加时原子更新，列表只需读 run.json。
-    const progress = meta.progress
-    let tokenTotal = meta.tokenTotal
-    let unkeyedCalls = meta.unkeyedCalls
-    let tokenTotalApprox = meta.tokenTotalApprox
-    const hasUsageEvents = normalized.some(event => event.kind === 'model/call')
-    let ledger = null
-    if (hasUsageEvents) {
-      const loaded = await readUsageLedger(loc.dir)
-      ledger = loaded.ledger
-      if (loaded.corrupt) tokenTotalApprox = true
-    }
-
-    for (const event of normalized) {
-      if (!event.data) continue
-      if (event.kind === 'run/start') {
-        if (Number.isInteger(event.data.nodeTotal) && event.data.nodeTotal >= 0) {
-          meta.nodeTotal = event.data.nodeTotal
+    try {
+      for (const [rel, events] of groups) {
+        const abs = resolve(loc.dir, rel)
+        if (!isInside(loc.dir, abs)) throw new RunError(500, 'runId', '事件路径越出 run 目录')
+        await ensureDirMode(dirname(abs))
+        const text = events.map(event => `${JSON.stringify(event)}\n`).join('')
+        const handle = await open(abs, 'a', FILE_MODE)
+        try {
+          await handle.writeFile(text, 'utf8')
+        } finally {
+          await handle.close()
         }
-        if (typeof event.data.flowId === 'string' && event.data.flowId !== '') meta.flowId = event.data.flowId
-        if (typeof event.data.flowName === 'string' && event.data.flowName !== '') meta.flowName = event.data.flowName
-        continue
+        await chmod(abs, FILE_MODE).catch(() => {})
       }
-      if (event.kind === 'run/end') {
-        if (['done', 'aborted', 'failed'].includes(event.data.status)) meta.status = event.data.status
-        if (typeof event.ts === 'string') meta.endedAt = event.ts
-        continue
+
+      // §8.6：计数器在追加时原子更新，列表只需读 run.json。
+      const progress = meta.progress
+      let tokenTotal = meta.tokenTotal
+      let unkeyedCalls = meta.unkeyedCalls
+      let tokenTotalApprox = meta.tokenTotalApprox
+      const hasUsageEvents = normalized.some(event => event.kind === 'model/call')
+      let ledger = null
+      if (hasUsageEvents) {
+        const loaded = await readUsageLedger(loc.dir)
+        ledger = loaded.ledger
+        if (loaded.corrupt) tokenTotalApprox = true
       }
-      if (event.kind === 'node/start' || event.kind === 'node/end' || event.kind === 'reject/trigger') {
-        applyProgressEvent(progress, event)
-        continue
-      }
-      if (event.kind === 'model/call') {
-        const usage = event.data.usage
-        const total = usageTotal(usage)
-        const callId = event.data.callId
-        if (typeof callId === 'string' && callId !== '') {
-          const key = `${event.traceId}\u0000${callId}`
-          const previous = Number.isFinite(ledger.keys[key]) ? ledger.keys[key] : 0
-          tokenTotal += total - previous
-          ledger.keys[key] = total
-        } else {
-          // §8.1：没有 callId 的用量按逐条累加，并单列供核对。
-          tokenTotal += total
-          unkeyedCalls += 1
+
+      for (const event of normalized) {
+        if (!event.data) continue
+        if (event.kind === 'run/start') {
+          if (Number.isInteger(event.data.nodeTotal) && event.data.nodeTotal >= 0) {
+            meta.nodeTotal = event.data.nodeTotal
+          }
+          if (typeof event.data.flowId === 'string' && event.data.flowId !== '') meta.flowId = event.data.flowId
+          if (typeof event.data.flowName === 'string' && event.data.flowName !== '') meta.flowName = event.data.flowName
+          if (event.data.engine === 'stub' || event.data.engine === 'real') meta.engine = event.data.engine
+          // 防御式兼容：老引擎直接写 run/start 而不调 startRun() 时，也把 pending 切成 running，
+          // 否则 sweep / 列表会把一个已经在跑的 run 当成没开始。新引擎仍应显式调 startRun()。
+          if (meta.status === 'pending' && meta.started !== true) {
+            meta.status = 'running'
+            meta.started = true
+            meta.startedAt = typeof event.ts === 'string' ? event.ts : now.toISOString()
+          }
+          continue
+        }
+        if (event.kind === 'run/end') {
+          if (TERMINAL_STATUS.has(event.data.status)) meta.status = event.data.status
+          meta.started = true
+          if (typeof event.ts === 'string') meta.endedAt = event.ts
+          continue
+        }
+        if (event.kind === 'node/start' || event.kind === 'node/end' || event.kind === 'reject/trigger') {
+          applyProgressEvent(progress, event)
+          continue
+        }
+        if (event.kind === 'model/call') {
+          const usage = event.data.usage
+          const total = usageTotal(usage)
+          const callId = event.data.callId
+          if (typeof callId === 'string' && callId !== '') {
+            const key = `${event.traceId}\u0000${callId}`
+            const previous = Number.isFinite(ledger.keys[key]) ? ledger.keys[key] : 0
+            tokenTotal += total - previous
+            ledger.keys[key] = total
+          } else {
+            // §8.1：没有 callId 的用量按逐条累加，并单列供核对。
+            tokenTotal += total
+            unkeyedCalls += 1
+          }
         }
       }
-    }
 
-    meta.eventCount += normalized.length
-    meta.lastSeq = lastSeq
-    meta.seq = lastSeq
-    meta.nodeDone = countPassed(progress)
-    meta.tokenTotal = tokenTotal
-    meta.unkeyedCalls = unkeyedCalls
-    meta.tokenTotalApprox = tokenTotalApprox
-    meta.updatedAt = now.toISOString()
-    await writeMetaUnlocked(loc, meta)
-    if (ledger) {
-      // 计数器已落盘；账本写失败只影响下一次追加的替换精度，不回滚已写入的事件。
-      await writeUsageLedger(loc.dir, ledger).catch(() => {})
+      meta.eventCount += normalized.length
+      meta.lastSeq = lastSeq
+      meta.seq = lastSeq
+      meta.nodeDone = countPassed(progress)
+      meta.tokenTotal = tokenTotal
+      meta.unkeyedCalls = unkeyedCalls
+      meta.tokenTotalApprox = tokenTotalApprox
+      meta.updatedAt = now.toISOString()
+      await writeMetaUnlocked(loc, meta)
+      if (ledger) {
+        // 计数器已落盘；账本写失败只影响下一次追加的替换精度，不回滚已写入的事件。
+        await writeUsageLedger(loc.dir, ledger).catch(() => {})
+      }
+    } catch (error) {
+      // 06 §13.4：写盘失败也必须能落终态——原子改 run.json 为 failed + 写 .error 侧车。
+      await markStorageFailure(loc, error).catch(() => {})
+      const failedMeta = normalizeMeta({
+        ...meta,
+        status: 'failed',
+        started: true,
+        endedAt: now.toISOString(),
+        live: null,
+        updatedAt: now.toISOString(),
+      }, loc.id)
+      await writeMetaUnlocked(loc, failedMeta).catch(() => {})
+      if (error instanceof RunError) throw error
+      // 不回原始错误信息（可能带宿主绝对路径），细节在 .error 侧车里。
+      throw new RunError(500, 'storage', '事件写盘失败，run 已被原子标记为 failed（细节见 .error 侧车文件）')
     }
 
     return { events: normalized, run: meta, firstSeq, lastSeq }
@@ -846,6 +1526,8 @@ export async function listRuns(runsRoot, options = {}) {
       flowId: meta.flowId,
       flowName: meta.flowName,
       status: meta.status,
+      started: meta.started,
+      engine: meta.engine,
       startedAt: meta.startedAt,
       endedAt: meta.endedAt,
       nodeDone: meta.nodeDone,
@@ -908,9 +1590,11 @@ export async function readRunDetail(runsRoot, runId) {
   }
 
   const progress = computeProgress(all.events)
+  const storageError = await readStorageError(loc.dir)
   return {
     run: {
       ...meta,
+      ...(storageError ? { storageError } : {}),
       // §8.3 / §8.6：nodeDone / tokenTotal 一律取 run.json 计数器，保证
       // GET /runs 与 GET /runs/<id> 同口径同值；progress 仅供核对。
       nodeDone: meta.nodeDone,

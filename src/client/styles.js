@@ -84,6 +84,21 @@ export const CSS = `
 .fs-dot.saving{background:var(--dsw-alias-state-business-primary)}
 .fs-dot.error{background:var(--fs-r1-error)}
 
+/* 顶栏运行控制（06 §11）：运行 / 停止 + 「当前节点 · 第 N 轮 · attempt M」 */
+.fs-runbar{display:flex;align-items:center;gap:4px;flex:none}
+.fs-live{
+  display:inline-flex;align-items:center;gap:6px;flex:none;max-width:290px;min-width:0;
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+  font-variant-numeric:tabular-nums;
+}
+.fs-live-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-live-dot{
+  flex:none;width:8px;height:8px;border-radius:50%;
+  background:var(--dsw-alias-state-business-primary);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent);
+}
+@media (max-width:1200px){.fs-live{max-width:190px}}
+
 /* ══ 主体三栏 ══════════════════════════════════════════ */
 .fs-body{display:flex;flex:1;min-height:0;min-width:0}
 
@@ -122,6 +137,16 @@ export const CSS = `
 }
 .fs-canvas.panning{cursor:grabbing}
 .fs-canvas.linking{cursor:crosshair}
+/* M1：运行中锁结构：可平移 / 查看，但拖拽与连线入口不再呈现可编辑态。 */
+.fs-canvas.locked{cursor:default}
+.fs-canvas.locked .fs-node{cursor:default}
+.fs-canvas.locked .fs-port{display:none}
+.fs-canvas-lock{
+  position:absolute;left:12px;top:12px;z-index:6;max-width:62%;padding:5px 9px;
+  border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2);
+  border:1px solid var(--dsw-alias-border-l2);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-secondary);pointer-events:none;
+}
 .fs-world{position:absolute;left:0;top:0;transform-origin:0 0;width:0;height:0}
 .fs-edges{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 
@@ -132,6 +157,11 @@ export const CSS = `
   transition:border-color .15s,box-shadow .15s;
 }
 .fs-node:hover{border-color:var(--dsw-alias-border-l4)}
+.fs-node.locked{cursor:default}
+/* M3：far 档（<45%）保留纯形状角标（✓ / ↺ / ✕ / 双环 ◎），不靠颜色；
+   near / mid 隐藏它，让位给「形状 + 文字」角标。 */
+.fs-state-mark{display:none}
+.fs-node.has-state .fs-state-mark{display:none}
 .fs-node.selected{
   border-color:var(--dsw-alias-brand-primary);
   box-shadow:0 0 0 4px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
@@ -141,8 +171,8 @@ export const CSS = `
   outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:3px;
   box-shadow:0 0 0 4px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent);
 }
-.fs-node.kind-start{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-1));border-radius:999px}
-.fs-node.kind-end{background:var(--dsw-alias-bg-layer-2);border-radius:999px}
+.fs-node.kind-start{background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-1));border-radius:var(--dsw-radius-xl)}
+.fs-node.kind-end{background:var(--dsw-alias-bg-layer-2);border-radius:var(--dsw-radius-xl)}
 .fs-node-title{
   font-size:14px;line-height:22px;font-weight:500;color:var(--dsw-alias-label-primary);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px;
@@ -160,6 +190,39 @@ export const CSS = `
 .fs-tag.skill{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
 .fs-tag.reject{color:var(--fs-r2-warn);box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--fs-r1-warn) 35%, transparent)}
 .fs-tag.status{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
+
+/* 运行态（06 §11）：形状 + 文字是主通道，颜色只加速。
+   运行中 = business 环；通过 / 打回 / 失败只改描边与角标文字，不新造颜色。 */
+.fs-node.run-state-running{
+  border-color:var(--dsw-alias-state-business-primary);
+  outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px;
+}
+.fs-node.run-state-passed{border-color:var(--fs-r1-success)}
+.fs-node.run-state-rejected{border-color:var(--fs-r1-warn)}
+.fs-node.run-state-failed{border-color:var(--fs-r1-error)}
+.fs-node.run-state-skipped{border-color:var(--dsw-alias-border-l4)}
+.fs-tag.state{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
+.fs-tag.state.business{
+  color:var(--dsw-alias-state-business-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
+}
+.fs-tag.state.success{
+  color:var(--fs-r2-success);
+  background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent);
+}
+.fs-tag.state.warn{
+  color:var(--fs-r2-warn);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);
+}
+.fs-tag.state.error{
+  color:var(--fs-r2-error);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
+}
+.fs-tag.state.idle{
+  color:var(--dsw-alias-label-tertiary);background:transparent;
+  box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2);
+}
+.fs-tag.state.neutral{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}
 
 .fs-members{display:flex;align-items:center;gap:6px;height:20px;margin-top:2px;overflow:hidden}
 .fs-member{
@@ -205,6 +268,8 @@ export const CSS = `
 .fs-canvas-note{position:absolute;right:12px;top:12px;padding:5px 9px;border-radius:var(--dsw-radius-sm);
   background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);
   font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);pointer-events:none;z-index:5}
+/* B1：事件窗口截断提示与「还有 N 列」错开，避免两条 note 叠在一起。 */
+.fs-canvas-event-note{top:40px}
 
 /* 键盘连线待定：候选节点高亮 + 「到 <节点名>」可读列表 */
 .fs-link-picker{position:absolute;left:12px;top:12px;z-index:6;display:flex;flex-direction:column;gap:6px;
@@ -226,11 +291,25 @@ export const CSS = `
 /* 缩放等级：只降内容，不动位置 */
 .fs-canvas[data-lod="mid"] .fs-node-summary{display:none}
 .fs-canvas[data-lod="mid"] .fs-node-tags{display:none}
+/* 运行态角标在紧凑档保留：状态是运行时的主信息，不能因为缩放只剩颜色。
+   设计态标签（skill 数量等）照旧隐藏，避免挤爆卡片。 */
+.fs-canvas[data-lod="mid"] .fs-node.has-state .fs-node-tags{display:flex}
+.fs-canvas[data-lod="mid"] .fs-node.has-state .fs-node-tags .fs-tag.skill{display:none}
 .fs-canvas[data-lod="far"] .fs-node-summary,
 .fs-canvas[data-lod="far"] .fs-node-tags,
 .fs-canvas[data-lod="far"] .fs-node-title,
 .fs-canvas[data-lod="far"] .fs-members{display:none}
 .fs-canvas[data-lod="far"] .fs-node{padding:0;min-height:0}
+/* M3：far 档把状态压成纯形状角标；双环 ◎ 表示运行中，不依赖颜色也能分辨。 */
+.fs-canvas[data-lod="far"] .fs-node.has-state .fs-state-mark{
+  display:flex;position:absolute;inset:0;align-items:center;justify-content:center;
+  font-size:16px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);
+  pointer-events:none;
+}
+.fs-canvas[data-lod="far"] .fs-node.run-state-running .fs-state-mark{
+  width:18px;height:18px;margin:auto;border:2px double var(--dsw-alias-label-primary);
+  border-radius:var(--dsw-radius-panel);
+}
 .fs-canvas[data-lod="far"] .fs-edge-label{display:none}
 .fs-canvas[data-lod="far"]{background-size:40px 40px}
 
@@ -244,7 +323,23 @@ export const CSS = `
   height:40px;padding:0 16px;border-bottom:1px solid var(--dsw-alias-border-l1);
   font-size:13px;line-height:20px;font-weight:500;
 }
-.fs-panel-body{flex:1;overflow-y:auto;padding:16px 16px 24px;display:flex;flex-direction:column;gap:24px}
+.fs-panel-body{
+  flex:1;overflow-y:auto;padding:16px 16px 24px;display:flex;flex-direction:column;gap:24px;
+  border:0;margin:0;min-width:0;
+}
+.fs-panel-body:disabled{opacity:.72}
+.fs-panel.locked .fs-panel-body{overflow-y:auto}
+.fs-panel-lock-badge{
+  flex:none;font-size:12px;line-height:16px;font-weight:400;
+  color:var(--fs-r2-warn);padding:0 8px;border-radius:var(--dsw-radius-xs);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);
+}
+.fs-lock-banner{
+  flex:none;margin:8px 12px 0;padding:6px 8px;border-radius:var(--dsw-radius-sm);
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 32%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, var(--dsw-alias-bg-layer-1));
+  color:var(--fs-r2-warn);font-size:12px;line-height:16px;
+}
 .fs-group{display:flex;flex-direction:column;gap:8px}
 .fs-group-title{font-size:13px;line-height:20px;font-weight:500;color:var(--dsw-alias-label-secondary)}
 .fs-field{display:flex;flex-direction:column;gap:4px}
@@ -390,6 +485,39 @@ export const CSS = `
   flex:none;max-width:34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   font-size:13px;line-height:20px;font-weight:500;color:var(--dsw-alias-label-primary);
 }
+/* M4：40px 收起条的主值 = 验收条目通过率；token 明细下沉到展开态。 */
+.fs-log-main{
+  flex:none;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-size:14px;line-height:20px;font-weight:500;color:var(--dsw-alias-label-primary);
+  font-variant-numeric:tabular-nums;
+}
+.fs-log-main.missing{color:var(--dsw-alias-label-tertiary);font-weight:400}
+/* 展开态五项聚合 + token 四段（04 §3.2）：一行迷你 stat，不再回流 40px 条。 */
+.fs-log-stats{
+  flex:none;display:flex;align-items:stretch;gap:16px;height:46px;padding:4px 10px;
+  overflow-x:auto;overflow-y:hidden;border-top:1px solid var(--dsw-alias-border-l1);
+}
+.fs-log-stats-empty{
+  display:flex;align-items:center;height:40px;font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.fs-stat{
+  display:flex;flex-direction:column;justify-content:center;flex:none;min-width:72px;max-width:220px;
+  padding-left:6px;border-left:2px solid var(--dsw-alias-border-l3);min-height:0;
+}
+.fs-stat-success{border-left-color:var(--fs-r1-success)}
+.fs-stat-error{border-left-color:var(--fs-r1-error)}
+.fs-stat-warn{border-left-color:var(--fs-r1-warn)}
+.fs-stat-brand,.fs-stat-business{border-left-color:var(--dsw-alias-state-business-primary)}
+.fs-stat-label{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
+.fs-stat-value{
+  font-size:14px;line-height:18px;font-weight:500;color:var(--dsw-alias-label-primary);
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.fs-stat-hint{
+  font-size:12px;line-height:14px;color:var(--dsw-alias-label-tertiary);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 .fs-log-tokens{
   flex:none;font-family:var(--dsw-font-markdown-code-font-family);font-size:12px;line-height:16px;
   font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);white-space:nowrap;
@@ -502,6 +630,16 @@ export const CSS = `
 .fs-log-event:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .fs-log-event.active,.fs-log-event[aria-selected="true"]{
   background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
+}
+/* 06 §11：live.currentNodeId 对应的事件行在左侧加一道 business 竖条（文字仍是主通道）。 */
+.fs-log-event.current{box-shadow:inset 2px 0 0 var(--dsw-alias-state-business-primary)}
+/* m10：「当前」文字徽标，不再只靠颜色竖条。 */
+.fs-log-current-badge{
+  flex:none;display:inline-flex;align-items:center;height:16px;padding:0 5px;
+  border-radius:var(--dsw-radius-xs);font-size:12px;line-height:14px;font-weight:500;
+  color:var(--dsw-alias-state-business-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 14%, transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-business-primary) 38%, transparent);
 }
 .fs-log-glyph{flex:none;width:12px;text-align:center;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
 .fs-log-ts{

@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -19,8 +19,9 @@ mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 process.env.DSH_HOME = mkdtempSync(join(repoRoot, '.tmp', 'home-'))
 const home = process.env.DSH_HOME
 
-const { apply } = await import('../src/index.js')
+const { apply, AUTH_ENV } = await import('../src/index.js')
 const store = await import('../src/store.js')
+const runstore = await import('../src/runstore.js')
 const { validateFlow } = await import('../src/model.js')
 
 let checks = 0
@@ -45,8 +46,12 @@ function makeCtx(services = {}) {
     effect(fn) {
       return fn()
     },
-    logger: { warn() {} },
+    logger: { warn() {}, error() {}, info() {} },
     get(name) {
+      // 默认给一个「通过」的 connection 服务；显式传 connection: undefined 可测 fail-closed。
+      if (name === 'connection' && !Object.hasOwn(services, name)) {
+        return { requestRejection: () => undefined }
+      }
       return services[name]
     },
   }
@@ -58,9 +63,13 @@ function call(route, method, url, body, headers = {}) {
   return new Promise(resolve => {
     const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
     const req = Readable.from(payload)
+    const remoteAddress = headers['__remoteAddress'] || '127.0.0.1'
+    const cleanHeaders = { ...headers }
+    delete cleanHeaders.__remoteAddress
     req.method = method
     req.url = url
-    req.headers = { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080', ...headers }
+    req.headers = { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080', ...cleanHeaders }
+    req.socket = { remoteAddress }
     const res = {
       statusCode: 0,
       headers: {},
@@ -216,6 +225,64 @@ await check('跨站 Origin 被拒绝', async () => {
   assert.equal(result.status, 403)
 })
 
+await check('§13.1 拿不到 connection 服务 → fail-closed 503（可读原因）', async () => {
+  const withoutConnection = makeCtx({ connection: undefined })
+  apply(withoutConnection)
+  const result = await call(withoutConnection.routes[0], 'GET', '/api/flow-studio/health')
+  assert.equal(result.status, 503)
+  assert.equal(result.json.code, 'AUTH_SERVICE_UNAVAILABLE')
+  assert.match(result.json.error, /鉴权服务不可用/)
+  assert.ok(!result.body.includes(home), '503 不能泄露内部路径')
+})
+
+await check('§13.1 connection 返回 401/403 时原样返回，不再只靠 Origin', async () => {
+  for (const rejection of [401, 403]) {
+    const gated = makeCtx({ connection: { requestRejection: () => rejection } })
+    apply(gated)
+    const result = await call(gated.routes[0], 'GET', '/api/flow-studio/flows')
+    assert.equal(result.status, rejection)
+    assert.equal(result.json.ok, false)
+  }
+  // requestRejection 抛错同样 fail-closed。
+  const throwing = makeCtx({ connection: { requestRejection: () => { throw new Error('boom') } } })
+  apply(throwing)
+  const result = await call(throwing.routes[0], 'GET', '/api/flow-studio/flows')
+  assert.equal(result.status, 503)
+})
+
+await check('§13.1 FLOW_STUDIO_TOKEN < 16 字符 → 启动即拒绝并告警', async () => {
+  const warnings = []
+  const strictCtx = makeCtx()
+  strictCtx.logger.warn = message => warnings.push(message)
+  process.env[AUTH_ENV] = 'too-short'
+  try {
+    assert.throws(() => apply(strictCtx), /至少 16 个字符/)
+    assert.ok(warnings.some(message => message.includes('拒绝启动')))
+  } finally {
+    delete process.env[AUTH_ENV]
+  }
+})
+
+await check('§13.7 flow 目录 0700、flow 文件 0600（与 run 日志同口径）', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  await store.saveFlow(dir, id, { name: '权限检查', nodes: [], edges: [] })
+  assert.equal(statSync(dir).mode & 0o777, 0o700)
+  assert.equal(statSync(join(dir, `${id}.json`)).mode & 0o777, 0o600)
+})
+
+await check('§13.3 DELETE /runs/<id> 在持有租约时 409', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 0 })
+  await runstore.claimLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  const blocked = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(blocked.status, 409)
+  assert.match(blocked.json.error, /租约/)
+  await runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host' })
+  const deleted = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(deleted.status, 200)
+})
+
 await check('未知接口 404，未知方法 405', async () => {
   const unknown = await call(route, 'GET', '/api/flow-studio/nope')
   assert.equal(unknown.status, 404)
@@ -233,11 +300,13 @@ await check('写入的文件真的落在 DSH_HOME 下', async () => {
   assert.ok(raw.updatedAt)
 })
 
-await check('health 报出目录与 schema 版本', async () => {
+await check('health 报出目录与 schema 版本（已通过 connection 鉴权）', async () => {
   const result = await call(route, 'GET', '/api/flow-studio/health')
   assert.equal(result.status, 200)
   assert.equal(result.json.schemaVersion, 1)
+  assert.equal(result.json.auth, 'connection')
   assert.ok(result.json.dir.includes('flow-studio'))
+  assert.ok(result.json.runsDir.includes('runs'))
 })
 
 rmSync(home, { recursive: true, force: true })

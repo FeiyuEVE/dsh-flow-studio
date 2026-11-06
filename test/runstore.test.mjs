@@ -77,11 +77,14 @@ const created = []
 try {
   console.log('runstore.js · 建 run 与落盘')
 
-  await check('createRun：id 形状、元数据、目录 0700 / 文件 0600', async () => {
+  await check('createRun：pending 未开始、id 形状、元数据、目录 0700 / 文件 0600', async () => {
     const meta = await makeRun()
     created.push(meta.id)
     assert.match(meta.id, /^r-[a-z0-9]+-[a-z0-9]{4}$/)
-    assert.equal(meta.status, 'running')
+    // 06 §13.2：建出来必须是 pending，started=false；真正开跑走 startRun()。
+    assert.equal(meta.status, 'pending')
+    assert.equal(meta.started, false)
+    assert.equal(meta.engine, 'real')
     assert.equal(meta.nodeTotal, 3)
     assert.equal(meta.eventCount, 0)
     assert.equal(meta.seq, 0)
@@ -91,6 +94,7 @@ try {
     const disk = JSON.parse(readFileSync(join(dir, 'run.json'), 'utf8'))
     assert.equal(disk.id, meta.id)
     assert.equal(disk.name, '测试 run')
+    assert.equal(disk.status, 'pending')
   })
 
   await check('连续新建的 runId 不重复', async () => {
@@ -597,6 +601,226 @@ try {
     const { runs, skipped } = await store.listRuns(join(home, 'flow-studio', 'never-created'), { limit: 10 })
     assert.deepEqual(runs, [])
     assert.deepEqual(skipped, [])
+  })
+  console.log('runstore.js · §13.2 / §13.3 生命周期、租约与启动修复')
+
+  await check('§13.2 startRun：pending → running，started 标志落盘；二次 startRun 409', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const started = await store.startRun(runsRoot, meta.id, { now: NOW })
+    assert.equal(started.status, 'running')
+    assert.equal(started.started, true)
+    assert.equal(started.startedAt, NOW.toISOString())
+    const disk = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    assert.equal(disk.status, 'running')
+    assert.equal(disk.started, true)
+    await assert.rejects(
+      () => store.startRun(runsRoot, meta.id),
+      error => error.status === 409,
+    )
+    // 「开始过」判据是 started，不是 eventCount。
+    await store.writeRunMeta(runsRoot, meta.id, { eventCount: 0 })
+    await assert.rejects(() => store.startRun(runsRoot, meta.id), error => error.status === 409)
+  })
+
+  await check('§13.2 并发两次 startRun 只有一个成功', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const results = await Promise.allSettled([
+      store.startRun(runsRoot, meta.id),
+      store.startRun(runsRoot, meta.id),
+    ])
+    const fulfilled = results.filter(item => item.status === 'fulfilled')
+    const rejected = results.filter(item => item.status === 'rejected')
+    assert.equal(fulfilled.length, 1)
+    assert.equal(rejected.length, 1)
+    assert.equal(rejected[0].reason.status, 409)
+    console.log(`  · 并发 startRun: ${results.map(item => item.status).join(' / ')}`)
+  })
+
+  await check('§13.3 租约：第二实例 claim 409、续租/释放校验持有者', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const now = new Date('2026-11-06T12:00:00.000Z')
+    const lease = await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ttlMs: 60_000, now })
+    assert.equal(lease.pid, 111)
+    assert.equal(lease.host, 'h1')
+    assert.equal((await store.readLease(runsRoot, meta.id, { now })).pid, 111)
+    assert.equal(statSync(join(runsRoot, meta.id, 'lock.json')).mode & 0o777, 0o600)
+
+    await assert.rejects(
+      () => store.claimLease(runsRoot, meta.id, { pid: 222, host: 'h2', ttlMs: 60_000, now }),
+      error => error.status === 409 && /租约/.test(error.reason),
+    )
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, { pid: 222, host: 'h2', now }),
+      error => error.status === 409,
+    )
+    const renewed = await store.renewLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 120_000, now: new Date(now.getTime() + 30_000),
+    })
+    assert.equal(renewed.ttlMs, 120_000)
+    assert.equal(renewed.heartbeatAt, new Date(now.getTime() + 30_000).toISOString())
+
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 222, host: 'h2' }),
+      error => error.status === 409,
+    )
+    assert.equal(await store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }), true)
+    assert.equal(await store.readLease(runsRoot, meta.id, { now }), null)
+  })
+
+  await check('§13.3 租约过期后可被抢；sweep 只处理 running 并把过期租约 run 标 failed（含「引擎中断」）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ttlMs: 1000, now: t0 })
+    // 未过期时读得到；过期后读不到并被清掉。
+    assert.ok(await store.readLease(runsRoot, meta.id, { now: new Date(t0.getTime() + 500) }))
+    assert.equal(await store.readLease(runsRoot, meta.id, { now: new Date(t0.getTime() + 2000) }), null)
+    const stolen = await store.claimLease(runsRoot, meta.id, {
+      pid: 333, host: 'h3', ttlMs: 1000, now: new Date(t0.getTime() + 2000),
+    })
+    assert.equal(stolen.pid, 333)
+
+    const swept = await store.sweepExpiredLeases(runsRoot, { now: new Date(t0.getTime() + 60_000) })
+    assert.ok(swept.includes(meta.id))
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.equal(await store.readLease(runsRoot, meta.id, { now: new Date(t0.getTime() + 60_000) }), null)
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const runEnd = all.events.find(item => item.kind === 'run/end')
+    assert.equal(runEnd.data.status, 'failed')
+    assert.match(runEnd.data.reason, /引擎中断/)
+
+    // pending 的 run 即使有租约也不会被 sweep（只扫 running）。
+    const pending = await makeRun()
+    created.push(pending.id)
+    const t1 = new Date('2026-11-06T12:00:00.000Z')
+    await store.claimLease(runsRoot, pending.id, { pid: 1, host: 'h', ttlMs: 1000, now: t1 })
+    const sweptPending = await store.sweepExpiredLeases(runsRoot, { now: new Date(t1.getTime() + 60_000) })
+    assert.ok(!sweptPending.includes(pending.id))
+    assert.equal((await store.readRunMeta(runsRoot, pending.id)).status, 'pending')
+  })
+
+  await check('§13.4 启动修复：run.jsonl 有 run/end 但 run.json 非终态 → 修正为终态', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.startRun(runsRoot, meta.id)
+    await store.appendEvents(runsRoot, meta.id, [
+      event('run/start', { runId: meta.id, nodeId: undefined, attemptId: undefined }),
+      event('run/end', { runId: meta.id, nodeId: undefined, attemptId: undefined }),
+    ], { now: NOW })
+    // 人为制造不一致：run.json 退回 running。
+    await store.writeRunMeta(runsRoot, meta.id, { status: 'running', endedAt: null })
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).status, 'running')
+    const repaired = await store.repairRunStates(runsRoot)
+    assert.ok(repaired.includes(meta.id))
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'done')
+    assert.ok(after.endedAt)
+    console.log(`  · repaired=${repaired.length} run → ${after.status}`)
+  })
+
+  await check('§13.4 事件额度：普通事件上限 = 总上限 − 64，run/end 仍能落终态', async () => {
+    const meta = await makeRun({ nodeTotal: 0 })
+    created.push(meta.id)
+    await store.writeRunMeta(runsRoot, meta.id, { eventCount: 199936, lastSeq: 199936, seq: 199936 })
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [event('node/start', { runId: meta.id })], { now: NOW }),
+      error => error.status === 400 && /200000|保留额度/.test(error.reason),
+    )
+    const terminal = await store.appendEvents(runsRoot, meta.id, [
+      event('run/end', { runId: meta.id, nodeId: undefined, attemptId: undefined, data: { status: 'failed' } }),
+    ], { now: NOW })
+    assert.equal(terminal.events[0].seq, 199937)
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).status, 'failed')
+    console.log('  · 普通事件 400（保留 64 条）；run/end 200 落终态')
+  })
+
+  await check('§13.4 写盘失败 → run.json 原子 failed + .error 侧车，GET detail 带 storageError', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 用一个普通文件占住 n_a 目录路径，让节点事件写盘必然失败。
+    writeFileSync(join(runsRoot, meta.id, 'n_a'), 'not a dir')
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [event('node/start', { runId: meta.id, nodeId: 'n_a' })], { now: NOW }),
+      error => error.status === 500 && error.field === 'storage',
+    )
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.ok(existsSync(join(runsRoot, meta.id, '.error')))
+    const detail = await store.readRunDetail(runsRoot, meta.id)
+    assert.ok(detail.run.storageError)
+    assert.equal(detail.run.storageError.code, 'EEXIST')
+    assert.ok(!detail.run.storageError.error.includes(runsRoot), 'storageError 不暴露 runs 绝对路径')
+    console.log(`  · storageError=${JSON.stringify(detail.run.storageError)}`)
+  })
+
+  console.log('runstore.js · §13.7 尾部倒读')
+
+  await check('§13.7 desc 读 1000 条走尾部倒读：scannedEvents < total，不全量解析', async () => {
+    const meta = await makeRun({ nodeTotal: 1 })
+    created.push(meta.id)
+    const started = Date.now()
+    for (let batch = 0; batch < 10; batch += 1) {
+      const events = []
+      for (let index = 0; index < 200; index += 1) {
+        events.push(event('tool/call', {
+          runId: meta.id,
+          nodeId: 'n_a',
+          attemptId: 1,
+          data: { name: 'bash', ok: true, argumentsDigest: 'x'.repeat(200) },
+        }))
+      }
+      await store.appendEvents(runsRoot, meta.id, events, { now: NOW })
+    }
+    const descStart = process.hrtime.bigint()
+    const desc = await store.readEvents(runsRoot, meta.id, { order: 'desc', limit: 1000 })
+    const descMs = Number(process.hrtime.bigint() - descStart) / 1e6
+    const ascStart = process.hrtime.bigint()
+    const asc = await store.readEvents(runsRoot, meta.id, { limit: 1000 })
+    const ascMs = Number(process.hrtime.bigint() - ascStart) / 1e6
+
+    assert.equal(desc.events.length, 1000)
+    assert.equal(desc.total, 2000)
+    assert.equal(desc.truncated, true)
+    assert.equal(desc.tail, true)
+    assert.equal(desc.scannedEvents, 1000, 'desc 只解析 limit 条，不读全部 2000 条')
+    assert.equal(asc.scannedEvents, 2000, 'asc 仍是全量读（对照组）')
+    assert.deepEqual(desc.events.slice(0, 3).map(item => item.seq), [2000, 1999, 1998])
+    console.log(`  · desc limit=1000: scannedEvents=${desc.scannedEvents}/2000, ${descMs.toFixed(1)}ms`)
+    console.log(`  · asc  limit=1000: scannedEvents=${asc.scannedEvents}/2000, ${ascMs.toFixed(1)}ms`)
+    console.log(`  · 造数耗时 ${Date.now() - started}ms（2000 条 tool/call）`)
+  })
+
+  await check('§13.8 listRuns / run.json 带 engine 与 started', async () => {
+    const meta = await store.createRun(runsRoot, {
+      flowId: 'flow-a', flowName: '默认流程', nodeTotal: 0, engine: 'stub',
+    })
+    created.push(meta.id)
+    assert.equal(meta.engine, 'stub')
+    const { runs } = await store.listRuns(runsRoot, { limit: 100 })
+    const item = runs.find(run => run.id === meta.id)
+    assert.equal(item.engine, 'stub')
+    assert.equal(item.started, false)
+    assert.equal(item.status, 'pending')
+  })
+
+  await check('§13.3 / §13.2 run/start 兼容：老引擎不调 startRun 时也能把 pending 切成 running', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.appendEvents(runsRoot, meta.id, [
+      event('run/start', {
+        runId: meta.id, nodeId: undefined, attemptId: undefined,
+        data: { flowId: 'flow-a', flowName: '默认流程', nodeTotal: 3, engine: 'stub' },
+      }),
+    ], { now: NOW })
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'running')
+    assert.equal(after.started, true)
+    assert.equal(after.engine, 'stub')
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

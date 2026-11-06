@@ -12,6 +12,7 @@
  *   GET/POST        /api/flow-studio/flows, /flows/<id> …
  *   GET/POST        /api/flow-studio/runs
  *   GET/DELETE      /api/flow-studio/runs/<runId>
+ *   POST            /api/flow-studio/runs/<runId>/start|stop
  *   GET/POST        /api/flow-studio/runs/<runId>/events
  *   GET             /api/flow-studio/runs/<runId>/summary
  *   GET             /api/flow-studio/runs/<runId>/export
@@ -19,14 +20,16 @@
  * @module @feiyueve/dsh-flow-studio
  */
 
-import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
+import { readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
+import { createEngine } from './engine.js'
 import { NODE_KIND, validateFlow } from './model.js'
-import { checkRunId, renderRunMarkdown, summarize } from './runlog.js'
+import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
-  readRunDetail, readRunMeta, runsDir,
+  readLease, readRunDetail, readRunMeta, repairRunStates, runsDir, sweepExpiredLeases,
 } from './runstore.js'
 import {
   checkId, deleteFlow, flowsDir, listFlows, newFlowId, readFlow, saveFlow,
@@ -55,6 +58,9 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024
 
 /** 面板路由前缀。 */
 const BASE = '/api/flow-studio'
+
+/** 06 §13.7：`/summary` 按 lastSeq 的增量缓存（runId → 上次聚合结果）。 */
+const summaryCache = new Map()
 
 function sendJson(res, status, payload) {
   if (res.headersSent) {
@@ -131,20 +137,32 @@ function isSameOrigin(req) {
   }
 }
 
-/** §8.5：配置了 token 就返回它；没配置返回 null（退回同源校验）。 */
-function configuredToken() {
-  const raw = process.env[AUTH_ENV]
-  if (typeof raw !== 'string') return null
+/** 06 §13.1：FLOW_STUDIO_TOKEN 至少 16 字符，否则启动即拒绝。 */
+export const TOKEN_MIN_LENGTH = 16
+
+/** §13.1：配置了 token 就返回 {present, valid, token}；没配置视为未启用。 */
+function inspectToken(env = process.env) {
+  const raw = env[AUTH_ENV]
+  if (typeof raw !== 'string') return { present: false, valid: false, token: null }
   const token = raw.trim()
-  return token === '' ? null : token
+  if (token === '') return { present: false, valid: false, token: null }
+  return { present: true, valid: token.length >= TOKEN_MIN_LENGTH, token }
 }
 
-function requestToken(req, url) {
+/** 兼容导出：返回当前生效的 token；未配置或配置过短（fail-closed）返回 null。 */
+export function configuredToken() {
+  const inspected = inspectToken()
+  return inspected.valid ? inspected.token : null
+}
+
+function requestToken(req, url, { allowQueryToken = false } = {}) {
   const header = req.headers.authorization
   if (typeof header === 'string') {
     const match = /^Bearer\s+(.+)$/i.exec(header.trim())
     if (match) return match[1].trim()
   }
+  // 06 §13.1：`?token=` 只保留给 export（浏览器 <a download> 带不了请求头）。
+  if (!allowQueryToken) return null
   const fromQuery = url.searchParams.get('token')
   return typeof fromQuery === 'string' && fromQuery !== '' ? fromQuery : null
 }
@@ -157,11 +175,79 @@ function tokenMatches(expected, provided) {
   return timingSafeEqual(a, b)
 }
 
-/** 返回 true 表示放行；token 档位下必须带对得上的 Bearer 或 ?token=。 */
-function authorize(req, url) {
-  const expected = configuredToken()
-  if (expected === null) return true
-  return tokenMatches(expected, requestToken(req, url))
+/** 返回 true 表示放行。token 档位只认 Authorization: Bearer（export 另允许 ?token=）。 */
+function authorize(req, url, options = {}) {
+  const inspected = inspectToken()
+  if (!inspected.present) return true
+  // 配置了但不足 16 字符：不悄悄退回同源，直接拒绝（启动时也会拒绝注册）。
+  if (!inspected.valid) return false
+  return tokenMatches(inspected.token, requestToken(req, url, options))
+}
+
+/**
+ * 06 §13.1：handler 最前面接回宿主鉴权。
+ * 拿到数字（401/403）原样返回；拿不到 connection 服务或它抛错 → fail-closed 503。
+ * @returns {number | null} null 表示放行
+ */
+function connectionRejection(env, req) {
+  let connection
+  try {
+    connection = env && env.ctx && typeof env.ctx.get === 'function' ? env.ctx.get('connection') : undefined
+    if (!connection && env && env.ctx) connection = env.ctx.connection
+  } catch {
+    return 503
+  }
+  if (!connection || typeof connection.requestRejection !== 'function') return 503
+  try {
+    const rejection = connection.requestRejection(req)
+    if (rejection === undefined || rejection === null) return null
+    if (Number.isInteger(rejection)) return rejection
+    return 503
+  } catch {
+    return 503
+  }
+}
+
+/** 回环请求判定（127.0.0.1 / ::1 / IPv4-mapped）。 */
+function isLoopbackRequest(req) {
+  const raw = req && req.socket && typeof req.socket.remoteAddress === 'string'
+    ? req.socket.remoteAddress
+    : ''
+  return raw === '127.0.0.1' || raw === '::1' || raw === '::ffff:127.0.0.1'
+}
+
+/**
+ * 06 §13.8：`FLOW_STUDIO_STUB_ENGINE=1` 必须同时 `FLOW_STUDIO_TESTBED=1` 才生效；
+ * 否则忽略并告警（引擎构造函数仍会被显式 stub 参数覆盖，不让它自己去猜 env）。
+ */
+export function resolveStubMode(env = process.env) {
+  const requested = env.FLOW_STUDIO_STUB_ENGINE === '1'
+  const testbed = env.FLOW_STUDIO_TESTBED === '1'
+  return { requested, testbed, stub: requested && testbed }
+}
+
+/**
+ * 证据文件校验（06 §13.7）：模型自述的 evidenceRef / reportRef 必须
+ *   - 在 run 目录内（相对路径、无 ..）；
+ *   - 文件真实存在；
+ *   - 内容 sha256 与对应 artifact/write 事件记录的 sha256 一致。
+ * @param {string} runDir
+ * @returns {(ref: string, expectedSha: string) => boolean}
+ */
+function makeEvidenceVerifier(runDir) {
+  return (ref, expectedSha) => {
+    if (typeof ref !== 'string' || !isSafeRelPath(ref)) return false
+    const abs = join(runDir, ref)
+    try {
+      const info = statSync(abs)
+      if (!info.isFile()) return false
+      if (typeof expectedSha !== 'string' || expectedSha === '') return false
+      const digest = createHash('sha256').update(readFileSync(abs)).digest('hex')
+      return digest === expectedSha.toLowerCase()
+    } catch {
+      return false
+    }
+  }
 }
 
 function newTraceId() {
@@ -241,6 +327,27 @@ function assertSafeRawPath(req) {
  * @param {{ dir: string, runsRoot: string, ctx: any }} env
  */
 async function handle(req, res, env) {
+  // 06 §13.1：鉴权必须是 handler 的第一件事，不能只靠 Origin。
+  const rejection = connectionRejection(env, req)
+  if (rejection !== null) {
+    if (rejection === 503) {
+      sendJson(res, 503, {
+        ok: false,
+        code: 'AUTH_SERVICE_UNAVAILABLE',
+        error: '鉴权服务不可用（拿不到 connection 服务或其 requestRejection 抛错），已按 fail-closed 拒绝请求',
+      })
+      return
+    }
+    sendJson(res, rejection, {
+      ok: false,
+      code: rejection === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN',
+      error: rejection === 401
+        ? '未授权：需要通过宿主 connection 鉴权（缺少或无效的登录凭据）'
+        : '拒绝访问：请求未通过宿主的同源 / 信任校验',
+    })
+    return
+  }
+
   if (!isSameOrigin(req)) {
     sendJson(res, 403, { ok: false, error: '拒绝跨站请求' })
     return
@@ -261,7 +368,7 @@ async function handle(req, res, env) {
       sendJson(res, error.status, error.toPayload())
       return
     }
-    if (error && (error.status === 400 || error.status === 413)) {
+    if (error && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
       sendJson(res, error.status, { ok: false, error: error.message })
       return
     }
@@ -272,24 +379,30 @@ async function handle(req, res, env) {
 async function route(req, res, env) {
   assertSafeRawPath(req)
   const url = new URL(req.url || '/', 'http://localhost')
-  // §8.5：token 档位下所有接口（含 /health）都要先过鉴权。
-  if (!authorize(req, url)) {
-    sendJson(res, 401, { ok: false, error: '未授权：需要 Authorization: Bearer <token> 或 ?token=<token>' })
-    return
-  }
   const rest = url.pathname.slice(BASE.length)
   const parts = rest.split('/').filter(part => part.length > 0)
+  // 06 §13.1：token 档位只认 Authorization: Bearer；`?token=` 仅 export 路由保留
+  //（浏览器 <a download> 没法带请求头）。
+  const isExportRoute = parts[0] === 'runs' && parts.length === 3 && parts[2] === 'export'
+  const authed = authorize(req, url, { allowQueryToken: isExportRoute })
+  if (!authed) {
+    sendJson(res, 401, { ok: false, error: '未授权：需要 Authorization: Bearer <token>' })
+    return
+  }
 
   // GET /api/flow-studio/health
   if (parts.length === 1 && parts[0] === 'health') {
+    // 06 §13.1：目录只在「已通过鉴权」或「回环请求」时返回，避免把宿主路径泄露给 LAN。
+    const exposePaths = authed || isLoopbackRequest(req)
     sendJson(res, 200, {
       ok: true,
-      dir: env.dir,
-      runsDir: env.runsRoot,
+      ...(exposePaths ? { dir: env.dir, runsDir: env.runsRoot } : {}),
       // §8.5：运维一眼看出当前鉴权档位。
-      auth: configuredToken() === null ? 'origin-only' : 'token',
+      auth: inspectToken().valid ? 'token' : 'connection',
       version: PLUGIN_VERSION,
       schemaVersion: 1,
+      // 06 §12 / §13.8：stub 判定结果（只有 TESTBED=1 才算数）。
+      engine: env.engine ? env.engine.engineName : 'real',
       skills: Boolean(env.ctx.get && env.ctx.get('skills')),
     })
     return
@@ -400,6 +513,8 @@ async function handleRuns(req, res, env, url, parts) {
         flowName: flow.name,
         name: name || flow.name,
         nodeTotal,
+        // 06 §13.8：run.json.engine 从建 run 那一刻就带上，列表 / 聚合都读得到。
+        engine: env.engine && env.engine.engineName === 'stub' ? 'stub' : 'real',
       })
       sendJson(res, 200, { ok: true, run })
       return
@@ -421,8 +536,18 @@ async function handleRuns(req, res, env, url, parts) {
       return
     }
     if (req.method === 'DELETE') {
+      // 06 §13.3：持有执行租约（正在跑）的 run 不允许删除。
+      const lease = await readLease(root, runId)
+      if (lease) {
+        throw new RunError(
+          409,
+          'runId',
+          `该 run 正被 ${lease.pid}@${lease.host} 持有执行租约，运行中不能删除`,
+        )
+      }
       const existed = await deleteRun(root, runId)
       if (!existed) throw new RunError(404, 'runId', 'run 不存在')
+      summaryCache.delete(runId)
       sendJson(res, 200, { ok: true })
       return
     }
@@ -447,7 +572,13 @@ async function handleRuns(req, res, env, url, parts) {
           order: url.searchParams.get('order') || 'asc',
         })
         if (!result) throw new RunError(404, 'runId', 'run 不存在')
-        sendJson(res, 200, { ok: true, events: result.events, total: result.total, truncated: result.truncated })
+        sendJson(res, 200, {
+          ok: true,
+          events: result.events,
+          total: result.total,
+          totalExact: result.totalExact !== false,
+          truncated: result.truncated,
+        })
         return
       }
       if (req.method === 'POST') {
@@ -468,6 +599,23 @@ async function handleRuns(req, res, env, url, parts) {
       return
     }
 
+    if (action === 'start' || action === 'stop') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 POST' })
+        return
+      }
+      if (!env.engine) throw new RunError(500, 'engine', '执行引擎未初始化')
+      if (action === 'start') {
+        // 06 §10：返回 202；已有运行中 run / 已开始过 → 409（由引擎抛 EngineError）。
+        const run = await env.engine.start(runId)
+        sendJson(res, 202, { ok: true, run })
+        return
+      }
+      const run = await env.engine.stop(runId)
+      sendJson(res, 200, { ok: true, run })
+      return
+    }
+
     if (action === 'summary') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { ok: false, error: '只支持 GET' })
@@ -475,9 +623,31 @@ async function handleRuns(req, res, env, url, parts) {
       }
       const meta = await readRunMeta(root, runId)
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+      // 06 §13.7 增量缓存：lastSeq / eventCount / engine 都没变就复用上一次聚合结果。
+      const cached = summaryCache.get(runId)
+      if (cached && cached.lastSeq === meta.lastSeq
+        && cached.eventCount === meta.eventCount && cached.engine === meta.engine) {
+        sendJson(res, 200, {
+          ok: true,
+          cached: true,
+          summary: { ...cached.summary, computedAt: new Date().toISOString() },
+        })
+        return
+      }
       const all = await readAllEvents(root, runId)
       const events = all ? all.events : []
-      sendJson(res, 200, { ok: true, summary: summarize(events) })
+      const summary = summarize(events, {
+        engine: meta.engine === 'stub' ? 'stub' : undefined,
+        lastSeq: meta.lastSeq,
+        verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+      })
+      summaryCache.set(runId, {
+        lastSeq: meta.lastSeq,
+        eventCount: meta.eventCount,
+        engine: meta.engine,
+        summary,
+      })
+      sendJson(res, 200, { ok: true, cached: false, summary })
       return
     }
 
@@ -490,7 +660,12 @@ async function handleRuns(req, res, env, url, parts) {
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
       const all = await readAllEvents(root, runId)
       const events = all ? all.events : []
-      const markdown = renderRunMarkdown(meta, events, summarize(events))
+      const summary = summarize(events, {
+        engine: meta.engine === 'stub' ? 'stub' : undefined,
+        lastSeq: meta.lastSeq,
+        verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+      })
+      const markdown = renderRunMarkdown(meta, events, summary)
       const body = Buffer.from(markdown, 'utf8')
       res.writeHead(200, {
         'content-type': 'text/markdown; charset=utf-8',
@@ -536,6 +711,55 @@ async function listSkills(ctx) {
 export function apply(ctx) {
   const dir = flowsDir()
   const runsRoot = runsDir()
+  const log = (level, message) => {
+    try {
+      const logger = ctx.logger
+      if (!logger) return
+      const fn = level === 'error' ? logger.error : level === 'warn' ? logger.warn : logger.info
+      if (typeof fn === 'function') fn.call(logger, message)
+    } catch {
+      // 日志失败不该影响引擎。
+    }
+  }
+
+  // 06 §13.1：TOKEN 配了但不足 16 字符 → 启动即拒绝并告警（不悄悄退回低档位）。
+  const tokenInfo = inspectToken()
+  if (tokenInfo.present && !tokenInfo.valid) {
+    log('warn', `flow-studio: ${AUTH_ENV} 只有 ${tokenInfo.token.length} 个字符，要求 ≥${TOKEN_MIN_LENGTH}；拒绝启动`)
+    throw new Error(`${AUTH_ENV} 必须至少 ${TOKEN_MIN_LENGTH} 个字符（当前 ${tokenInfo.token.length}），flow-studio 拒绝启动`)
+  }
+
+  // 06 §13.8：stub 引擎必须同时开 TESTBED，否则忽略并告警。
+  const stubInfo = resolveStubMode()
+  if (stubInfo.requested && !stubInfo.testbed) {
+    log('warn', 'flow-studio: 检测到 FLOW_STUDIO_STUB_ENGINE=1，但未设置 FLOW_STUDIO_TESTBED=1；已忽略桩引擎，按 real 运行')
+  }
+
+  const engine = createEngine({
+    ctx,
+    runsRoot,
+    flowsRoot: dir,
+    // 显式传 stub 判定，避免引擎侧自己只看 FLOW_STUDIO_STUB_ENGINE 就启用桩。
+    stub: stubInfo.stub,
+    log,
+  })
+  // 06 §9 / §13.3 / §13.4：启动时先修 run.json 与 run.jsonl 的终态不一致，
+  // 再清理崩溃残留的 running run（含过期租约），不自动续跑。
+  repairRunStates(runsRoot)
+    .then(repaired => {
+      if (repaired.length > 0) log('warn', `flow-studio: 启动修复 ${repaired.length} 个非终态 run：${repaired.join(', ')}`)
+    })
+    .then(() => engine.sweepStaleRuns())
+    .then(swept => {
+      if (swept.length > 0) log('warn', `flow-studio: 清理 ${swept.length} 个残留 run：${swept.join(', ')}`)
+    })
+    .then(() => sweepExpiredLeases(runsRoot))
+    .then(recovered => {
+      if (recovered.length > 0) log('warn', `flow-studio: 清理过期租约并标记 failed：${recovered.join(', ')}`)
+    })
+    .catch(error => {
+      log('warn', `flow-studio: 清理残留 run / 租约失败：${error.message}`)
+    })
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
@@ -548,7 +772,7 @@ export function apply(ctx) {
         res.end('not found')
         return
       }
-      handle(req, res, { dir, runsRoot, ctx }).catch(error => {
+      handle(req, res, { dir, runsRoot, ctx, engine }).catch(error => {
         if (!res.headersSent) {
           sendInternalError(res, { ctx }, error)
           return

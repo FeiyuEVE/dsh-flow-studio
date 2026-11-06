@@ -8,9 +8,10 @@
 import assert from 'node:assert/strict'
 
 import {
-  EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, computeAcceptance, computeFindings,
-  computeProgress, computeQuality, computeRejects, computeSkillUsage, computeTests, computeTokens,
-  isSafeRelPath, normalizeEvent, renderRunMarkdown, summarize,
+  EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex, computeAcceptance,
+  computeConflicts, computeFindings, computeProgress, computeQuality, computeRejects,
+  computeSkillUsage, computeTests, computeTokens, isSafeRelPath, normalizeEvent, renderRunMarkdown,
+  summarize, summarizeAcceptance,
 } from '../src/runlog.js'
 
 let checks = 0
@@ -770,6 +771,113 @@ check('export markdown 含 run 头、指标小节与质量结论', () => {
   assert.ok(markdown.includes('## Token'))
   assert.ok(markdown.includes('## 质量结论'))
   assert.ok(markdown.includes('`unknown`'))
+})
+
+check('§13.7 summarize.acceptance：当前有效 attempt 的通过率（passed / total / rate）', () => {
+  const events = fullEvidence()
+  events.push(ev('acceptance/verdict', {
+    nodeId: 'n_acc', attemptId: 1,
+    data: { itemId: 'acc-2', status: 'fail', decidedBy: 'auto' },
+  }))
+  const acceptance = summarizeAcceptance(events)
+  assert.deepEqual(acceptance, { passed: 1, total: 2, rate: 0.5 })
+  const summary = summarize(events)
+  assert.deepEqual(summary.acceptance, acceptance)
+  // 旧 attempt 的验收条目不进当前通过率。
+  const withOldAttempt = events.concat([
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 2,
+      data: { itemId: 'acc-1', status: 'pass', decidedBy: 'auto', evidenceRef: 'artifacts/acc2.md' },
+    }),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 2,
+      data: { itemId: 'acc-2', status: 'pass', decidedBy: 'auto', evidenceRef: 'artifacts/acc3.md' },
+    }),
+  ])
+  assert.deepEqual(summarizeAcceptance(withOldAttempt), { passed: 2, total: 2, rate: 1 })
+})
+
+check('§13.7 model-claim 证据：artifact path+sha256 对不上 → unknown；对上 + 文件校验通过 → pass', () => {
+  const sha = 'a'.repeat(64)
+  const artifact = ev('artifact/write', {
+    nodeId: 'n_acc', attemptId: 1,
+    data: { path: 'evidence/acc.md', bytes: 3, kind: 'md', sha256: sha },
+  })
+  const claim = (ref, extra = { provenance: 'model-claim' }) => ev('acceptance/verdict', {
+    nodeId: 'n_acc', attemptId: 1,
+    extra,
+    data: { itemId: 'acc-1', status: 'pass', decidedBy: 'auto', evidenceRef: ref },
+  })
+  const good = [artifact, claim('evidence/acc.md')]
+  const index = collectArtifactIndex(good)
+  assert.equal(index.get('evidence/acc.md'), sha)
+  assert.equal(computeAcceptance(good, { artifacts: index }).state, 'pass', '纯函数层只校验 path+sha256')
+  assert.equal(
+    computeAcceptance(good, { artifacts: index, verifyEvidence: () => false }).state,
+    'unknown',
+    'Host 层文件不存在 / sha 不符时必须 unknown',
+  )
+  assert.equal(
+    computeAcceptance(good, { artifacts: index, verifyEvidence: () => true }).state,
+    'pass',
+  )
+  const forged = [artifact, claim('evidence/forged.md')]
+  const forgedResult = computeAcceptance(forged, { artifacts: collectArtifactIndex(forged), verifyEvidence: () => true })
+  assert.equal(forgedResult.state, 'unknown')
+  assert.equal(forgedResult.unverified, 1)
+  assert.match(forgedResult.reason, /证据对不上/)
+  assert.match(forgedResult.unverifiedRefs[0], /artifact\/write/)
+  // 没有 model-claim 标记的老事件保持原口径（只要求有 ref）。
+  assert.equal(computeAcceptance([claim('any/path.md', {})]).state, 'pass')
+  // 模型自述的 check/form 必须给可复核 reportRef，executedAt 不算证据。
+  const checkEvent = ev('check/form', {
+    nodeId: 'n_check', attemptId: 1,
+    extra: { provenance: 'model-claim' },
+    data: {
+      ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
+      passedChecks: 3, totalChecks: 3, executedAt: '2026-11-06T10:00:00.000Z',
+    },
+  })
+  const quality = computeQuality([artifact, claim('evidence/acc.md'), checkEvent], {
+    artifacts: index,
+    verifyEvidence: () => true,
+  })
+  assert.equal(quality.evidence.checks.state, 'unknown')
+  assert.match(quality.evidence.checks.reason, /报告对不上|reportRef/)
+})
+
+check('§13.7 跨节点重复标识 → 对应指标 unknown，并返回 conflicts', () => {
+  const events = [
+    ev('acceptance/verdict', { nodeId: 'n_a', attemptId: 1, data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'a.md' } }),
+    ev('acceptance/verdict', { nodeId: 'n_b', attemptId: 1, data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'b.md' } }),
+    ev('test/report', { nodeId: 'n_a', attemptId: 1, data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: 'a.json' } }),
+    ev('test/report', { nodeId: 'n_b', attemptId: 1, data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: 'b.json' } }),
+  ]
+  const conflicts = computeConflicts(events)
+  assert.deepEqual(conflicts.acceptance, [{ id: 'R1', nodes: ['n_a', 'n_b'] }])
+  assert.deepEqual(conflicts.tests, [{ id: 'unit', nodes: ['n_a', 'n_b'] }])
+  const quality = computeQuality(events, { conflicts })
+  assert.equal(quality.evidence.acceptance.state, 'unknown')
+  assert.equal(quality.evidence.tests.state, 'unknown')
+  assert.match(quality.evidence.acceptance.reason, /跨节点重复/)
+  const summary = summarize(events)
+  assert.equal(summary.conflicts.acceptance.length, 1)
+  assert.equal(summary.conflicts.tests.length, 1)
+})
+
+check('§13.7 stub 引擎：quality 强制 unknown，label 前缀「桩」，summary.engine=stub', () => {
+  const quality = computeQuality(fullEvidence(), { engine: 'stub' })
+  assert.equal(quality.state, 'unknown')
+  assert.ok(quality.label.startsWith('桩'), quality.label)
+  assert.equal(quality.stub, true)
+  const summary = summarize(fullEvidence(), { engine: 'stub' })
+  assert.equal(summary.engine, 'stub')
+  assert.equal(summary.quality.state, 'unknown')
+  const fromEvent = summarize([
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 2, engine: 'stub' } }),
+    ...fullEvidence().slice(1),
+  ])
+  assert.equal(fromEvent.engine, 'stub', 'run/start.data.engine=stub 也要被识别')
 })
 
 console.log(`\n${checks} 组通过`)

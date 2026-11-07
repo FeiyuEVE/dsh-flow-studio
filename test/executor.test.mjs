@@ -767,9 +767,31 @@ await check('真实 sh -c：prompt 临时文件在超时路径清理', async () 
 // 下面全部用真进程 / 真 /proc，不 mock child_process。
 // ---------------------------------------------------------------------------
 
-/** 进程是否还存在（EPERM 说明存在但没权限，仍算存活）。 */
+/** 从 /proc/<pid>/stat 读进程状态字符（'R'/'S'/'Z'…）；拿不到返回 null。 */
+function readState(pid) {
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return null
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    return typeof rest[0] === 'string' && rest[0] !== '' ? rest[0] : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 进程是否**还在跑**（EPERM 说明存在但没权限，仍算存活）。
+ *
+ * 僵尸（state==='Z'）算「不在了」：它已经没有代码在跑，只剩一个等待收割的进程表项。
+ * 这条区分在容器里必须做——node:24-slim 这类镜像的 PID 1 常常是 `sleep infinity`
+ * （不收割子进程），被 kill 的孙进程会以 Z 状态留在表里，`kill(pid, 0)` 依旧成功；
+ * 判定「必须不存在」时把它当活的会误报。宿主上 PID 1 会正常收割，所以这条在宿主上
+ * 无行为差异。
+ */
 function isAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
+  const state = readState(pid)
+  if (state === 'Z') return false
   try {
     process.kill(pid, 0)
     return true

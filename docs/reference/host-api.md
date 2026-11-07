@@ -119,6 +119,15 @@
 - 会话中途换模型时的提示（`installModelSelection`）只在路径 1 由
   `sessionController.composeAgent` 自带；路径 2 刻意省略，见上。
 
+## 节点会话的预热轮（首轮精简规避）
+
+新建节点会话会先收到一条**不调工具的预热消息**，正式任务从第二轮开始。原因：首轮精简插件（`@feiyueve/dsh-minimal-first-turn`）把**新根会话的第一轮**工具面裁到最小对（`bash` + `str_replace_editor`），下一轮才恢复 preset 的完整清单——节点会话是程序化顶层会话，同样被裁，于是「主管 + 子 agent」节点在第一轮看不到 `subagent`，派不出成员；开发 / 测试节点也拿不到 `glob` / `grep` / `todo_write`。
+
+- 只对**本次新建**的会话预热；打回重跑 / `restart` 复用的冷会话不再预热（它们早已走过第一轮）。
+- 预热失败（宿主报错 / abort）**不阻断节点**：warn 之后照常发正式任务，最坏退化成 0.9.1 的行为。
+- 关闭：环境变量 `FLOW_STUDIO_WARMUP_FIRST_TURN=0`，或构造参数 `warmUpFirstTurn: false`。
+- 判据（排障用）：`node/start` 之后、正式 attempt 之前，会话里多出一条以「【引擎预热 · 本会话第 1 轮】」开头的 user 消息；引擎日志有「发送预热轮 / 预热轮完成」。
+
 ## 阶段节点的打回工具（`flow_node_reject`）
 
 阶段节点主管在自己的 attempt 进行中可以直接调用模型工具 `flow_node_reject`，
@@ -172,6 +181,7 @@ supervision、事件序号都是已经发生过的事实；原地续跑要么改
 | `FLOW_STUDIO_RUN_TIMEOUT_MS` / `FLOW_STUDIO_NODE_TIMEOUT_MS` | 墙钟上限默认 2h / 单节点 20min；`start` 的显式参数优先于它 |
 | `FLOW_STUDIO_NODE_ALARM_MS` | 节点自审闹钟间隔（默认 600000 = 10 分钟） |
 | `FLOW_STUDIO_NODE_RETRIES` | 节点重试次数（0–5，默认 1） |
+| `FLOW_STUDIO_WARMUP_FIRST_TURN` | `=0` 关闭新建节点会话的**预热轮**（默认开）。见[节点会话的预热轮](#节点会话的预热轮首轮精简规避) |
 | `FLOW_STUDIO_WAKER_HOURLY_LIMIT` / `FLOW_STUDIO_WAKER_MIN_INTERVAL_MS` | 同一发起会话的 run 级唤醒预算（默认 30 次/小时、最小间隔 120s） |
 | `FLOW_STUDIO_FLOW_MACHINE` | `=0` 回退 0.8.x 的旧主循环（逃生门，留一个发布周期） |
 | `FLOW_STUDIO_STUB_ENGINE` | 桩引擎（容器测试台用；不调模型，只验证编排 / 事件 / 指标 / 打回 / 落盘） |

@@ -71,6 +71,8 @@ v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：sessio
 - 生效值与来源写进 `node/start.data.agentPreset` / `agentPresetSource` 与
   `run.json.agentPreset`，排障时先看这里——「节点改不了代码」通常就是 preset 丢了。
 
+新建的节点会话还有一条**预热轮**：引擎先发一句「只回 ok」的消息，正式任务从第二轮开始。这样做是为了绕开首轮精简插件——它会把新会话第一轮的工具面裁到 `bash` + `str_replace_editor`，团队主管那一轮里就没有 `subagent` 可派了。预热轮只在新建会话时出现，打回重跑不会再发。
+
 另外，有出向 reject 边的阶段节点会额外拿到 `flow_node_reject` 工具（等价于
 verdict=reject）；没有出向 reject 边的节点不会注册它。详见
 [Host 接口](../reference/host-api.md#阶段节点的打回工具flow_node_reject)。

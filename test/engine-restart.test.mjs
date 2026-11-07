@@ -197,6 +197,9 @@ function fakeHost(engineRef, behaviorOf) {
       followup(payload) {
         const nodeId = nodeOfSession(sessionId)
         const envelope = envelopeOf(payload)
+        // v0.9.2：新建会话先收到一条预热轮（无 attempt/nonce 契约）。真实宿主回一句 ok
+        // 就结束这一轮，不参与正式结论；否则测试会把预热轮当成节点结论。
+        if (!envelope) return
         const registrations = [...registry.keys()]
         const call = { sessionId, nodeId, registrations, envelope }
         calls.push(call)

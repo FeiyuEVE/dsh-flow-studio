@@ -100,6 +100,24 @@ export const PROMPT_MAX_CHARS = 8000
  * `FLOW_STUDIO_NODE_RETRIES` 可覆盖；为防配置把人拖死，钳制在 0–5（最多 6 次尝试）。
  */
 export const DEFAULT_NODE_RETRIES = 1
+/**
+ * 新建节点会话的「预热轮」文本（v0.9.2）。
+ *
+ * 为什么需要：首轮精简插件（`@feiyueve/dsh-minimal-first-turn`）会把**新根会话的第
+ * 一轮**工具面裁到最小对（`bash` + `str_replace_editor`），下一轮才恢复 preset 的
+ * 完整工具面。节点会话每次 attempt 都可能新建会话，于是一个「主管 + 子 agent」节点
+ * 在第一轮里**看不到 `subagent`**——派不出成员，父子结构形同虚设；开发 / 测试节点
+ * 也拿不到 `glob` / `grep` / `todo_write` 这些常用工具。
+ *
+ * 解法：会话建好后先发一条**不调工具的**预热消息，让被精简的第一轮消耗在它身上；
+ * 正式任务从第二轮开始，拿到的就是 preset 的完整工具面。代价是一次很小的模型调用；
+ * `FLOW_STUDIO_WARMUP_FIRST_TURN=0` 或构造参数 `warmUpFirstTurn:false` 可关闭。
+ */
+export const DEFAULT_WARMUP_TEXT =
+  '【引擎预热 · 本会话第 1 轮】这是工作流引擎为刷新工具面发送的预热消息：本轮的可用工具'
+  + '可能被首轮精简裁剪过。不要调用任何工具、不要写结论，只回复一行 `ok`。'
+  + '下一轮你会收到本阶段的正式任务与输出格式要求。'
+
 export const MAX_NODE_RETRIES = 5
 
 /**
@@ -1605,6 +1623,15 @@ class FlowEngine {
     this.engineName = this.stub ? 'stub' : 'real'
     this.parent = options.parent || null
     this.resolveParentFn = typeof options.resolveParent === 'function' ? options.resolveParent : null
+    // v0.9.2：新建节点会话的「预热轮」（见 DEFAULT_WARMUP_TEXT）。默认开启：
+    // 首轮精简会把新会话第一轮的工具面裁到 bash + str_replace_editor，团队节点因此
+    // 派不出子 agent。开关：构造参数 warmUpFirstTurn > 环境变量 FLOW_STUDIO_WARMUP_FIRST_TURN。
+    this.warmUpFirstTurn = options.warmUpFirstTurn === undefined
+      ? process.env.FLOW_STUDIO_WARMUP_FIRST_TURN !== '0'
+      : options.warmUpFirstTurn === true
+    this.warmUpText = typeof options.warmUpText === 'string' && options.warmUpText.trim() !== ''
+      ? options.warmUpText.trim()
+      : DEFAULT_WARMUP_TEXT
     // 07 §3.1：节点主管会话的 cwd / preset（可注入；没有就交给宿主默认）。
     this.cwd = typeof options.cwd === 'string' && options.cwd !== '' ? options.cwd : null
     this.agentPreset = typeof options.agentPreset === 'string' && options.agentPreset !== ''
@@ -3466,6 +3493,9 @@ class FlowEngine {
     // v0.9.2（任务 2）：按**当前流程结构**决定是否给这个节点会话挂 `flow_node_reject`。
     // 注册必须发生在 followup 之前：宿主在进入第一轮 step 时才解析可见工具清单。
     this._syncNodeRejectTool({ agent, sessionId, runId, node, attempt, flow })
+    // v0.9.2：把「被首轮精简裁剪的第一轮」消耗在预热消息上，正式任务从第二轮开始，
+    // 拿到的才是 preset 的完整工具面（团队主管才有 subagent 可派）。
+    await this._warmUpNodeSession({ agent, sessionId, node, attempt, signal })
     let prompted
     try {
       prompted = await this._promptNodeSession({
@@ -3492,6 +3522,57 @@ class FlowEngine {
       dispose: handle && typeof handle.dispose === 'function'
         ? () => handle.dispose()
         : async () => {},
+    }
+  }
+
+  /**
+   * 新建节点会话的预热轮（v0.9.2）：消耗掉「首轮精简」裁剪的那一轮。
+   *
+   * 背景见 {@link DEFAULT_WARMUP_TEXT}：`minimal-first-turn` 把新根会话**第一轮**的
+   * 工具面裁到 `bash` + `str_replace_editor`，下一轮才恢复 preset 的完整清单。节点
+   * 会话是程序化顶层会话，同样会被裁——于是团队节点在第一轮看不到 `subagent`，
+   * 派不出成员；开发 / 测试节点也拿不到 `glob` / `grep` / `todo_write`。
+   *
+   * 这里只做一件很小的事：发一条不调工具的文本消息并等这一轮结束。失败（宿主报错、
+   * 超时、abort）**不阻断节点**——最坏情况是退化成「没有预热」，与 v0.9.1 行为一致，
+   * 但要留一条能诊断的 warn。
+   *
+   * 只在 `_createNodeSession`（会话是本次新建）里调用：复用的冷会话早已走过第一轮，
+   * 不需要也不能再预热（否则每次打回重跑都多一轮）。
+   */
+  async _warmUpNodeSession({ agent, sessionId, node, attempt, signal }) {
+    if (!this.warmUpFirstTurn) return
+    if (!agent || typeof agent.followup !== 'function') return
+    if (signal && signal.aborted) return
+    const started = Date.now()
+    try {
+      if (typeof this.log === 'function') {
+        this.log(
+          'info',
+          `flow-studio: 节点「${node.id}」attempt ${attempt} 会话 ${sessionId} 发送预热轮`
+          + '（消耗首轮精简的裁剪轮，正式任务从第二轮开始）',
+        )
+      }
+      // 与 `_promptNodeSession` 同一发送形状：`followup(payload)` + `whenIdle()`。
+      agent.followup(buildFollowupPayload({
+        text: this.warmUpText,
+        runId: this.active && this.active.runId ? this.active.runId : '',
+        nodeId: node.id,
+        from: 'flow-studio',
+      }))
+      const idle = typeof agent.whenIdle === 'function' ? agent.whenIdle() : null
+      if (idle && typeof idle.then === 'function') await raceAbort(Promise.resolve(idle), signal)
+      this.log(
+        'info',
+        `flow-studio: 节点「${node.id}」attempt ${attempt} 预热轮完成（${Date.now() - started}ms）`,
+      )
+    } catch (error) {
+      // 预热失败不阻断节点：正式提示词照发，只是可能用上被裁剪的工具面。
+      this.log(
+        'warn',
+        `flow-studio: 节点「${node.id}」attempt ${attempt} 预热轮失败（${error && error.message ? error.message : String(error)}），`
+        + '继续发送正式任务（若角色需要 subagent / glob 等工具，可能因首轮精简而缺失）',
+      )
     }
   }
 

@@ -136,3 +136,13 @@
 - **验证时顺手挖出来的真 bug（不属于本次新增功能，但会毁掉可靠性）**：`npm test` 偶发在一条**旧**用例上红——`run.json.status` 是 `failed`，而事件流里明明是 `run/end done`。根因链：插件挂载时的启动恢复（`repairRunStates` → `sweepStaleRuns` → `sweepExpiredLeases`，fire-and-forget）会调 `cleanupTempFiles` **无条件**删除 run 目录里所有 `*.tmp-*`；它与另一个引擎正在进行的原子写并发时，会在 `write` 与 `rename` 之间把临时文件删掉，`rename` 拿到 `ENOENT`，`appendEvents` 的 catch 于是把**已经跑完**的 run 标成 `failed`（并写 `.error` 侧车）。两处修复：① 清理加**年龄闸门**（默认只删 60 秒之前的，临时文件生命周期是毫秒级）——这是根因修复；② `writeTempAtomic` 对 `ENOENT` **换名重试一次**（其它错误仍是存储故障，重试无意义）。两条都补了能红的回归（「刚写出来的临时文件不能被清理」+「临时文件被外部删掉一次后原子写仍然成功」）。
 - **已知边界**：续跑 run 刻意走旧主循环（它支持显式起点），因此不写状态机快照；冷会话能否 `resume` 不预先逐个探测，失败时在节点处给带节点与 sessionId 的中文 `503`；preset 真实存在性由宿主 registry 判断，插件只做安全 id 校验，不维护会过期的白名单。
 - **测试**：**23 个测试文件 / 802 组**全绿（含发布门禁 `test/build.test.mjs` 的 8 组 / 56 条断言；10 个功能套件显式计数合计 3998 条断言）。本版新增 `test/engine-restart.test.mjs`（5 组 / 55 条断言）与 `engine.test.mjs` 的 6 组（路由成对、preset 三来源、setup 挂载、只有 `agentPresets` 的 fallback、resume 带 setup、preset 不存在报 400），以及 `runstore.test.mjs` 的 2 组竞态回归。关键用例做过**红→绿**双向验证（把修复改回旧行为对应用例必红；`engine-restart` 的门控与 provider 成对两条在旧代码快照上确认变红）。
+
+## 0.9.3 — 节点会话的预热轮（团队主管才派得出子 agent）
+
+0.9.2 让节点会话真的挂上了 preset，但**实测发现工具面还是不够**：首轮精简插件（`@feiyueve/dsh-minimal-first-turn`）会把**新根会话的第一轮**工具面裁到最小对（`bash` + `str_replace_editor`），下一轮才恢复 preset 的完整清单。节点会话是程序化顶层会话，同样被裁——于是「主管 + 子 agent」节点在第一轮里根本看不到 `subagent`，派不出成员，父子结构形同虚设；开发 / 测试节点也没有 `glob` / `grep` / `todo_write` 可用。
+
+- **修法**：新建节点会话建好后，引擎先发一条**不调工具的预热消息**（「只回 ok」），把被裁剪的第一轮消耗掉；正式任务从第二轮开始，拿到的是 preset 的完整工具面。预热失败（宿主报错 / abort）不阻断节点，只留一条 warn 并照常发正式任务——最坏退化成 0.9.1 的行为。
+- **只在新建会话时预热**：打回重跑 / `restart` 复用的冷会话早已走过第一轮，不会再发（否则每次返工都多一轮小开销）。
+- **可关**：`FLOW_STUDIO_WARMUP_FIRST_TURN=0` 或构造参数 `warmUpFirstTurn: false`；关掉后行为与 0.9.2 逐字节一致。
+- **排障判据**：`node/start` 之后会话里会多出一条以「【引擎预热 · 本会话第 1 轮】」开头的 user 消息；引擎日志有「发送预热轮 / 预热轮完成」两行。
+- **测试**：**23 个测试文件 / 804 组**全绿（`engine-restart` 5 组 / 55 条断言、`engine` 111 组 / 886 条断言；10 个功能套件显式计数合计 4015 条断言）。新增 2 组：预热轮先于正式任务且打回复用不重复预热、`warmUpFirstTurn:false` 时只有正式任务。另外把测试里的三个假宿主改成「真宿主口径」——预热轮（无 attempt/nonce 契约）只回 ok 并结束这一轮，`whenIdle()` 改成**每轮一个新的 promise**（旧假宿主一个 promise 用到底，加预热轮后必然卡住或抢跑）。

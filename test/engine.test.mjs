@@ -257,6 +257,10 @@ function fenced(value) {
  */
 function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').structured } = {}) {
   const created = []
+  /** 每次 followup 的 payload（v0.9.2 起用于断言「预热轮先于正式任务」）。 */
+  const payloads = []
+  /** 活会话表：打回重跑 / 续跑复用同一 sessionId 时靠它取回 agent（对齐真实宿主 agents.get）。 */
+  const agentsById = new Map()
   const ctx = {
     on() {
       return () => {}
@@ -271,11 +275,13 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
         async create(options) {
           created.push(options)
           const sessionId = options.sessionId
-          return {
-            agent: {
+          const agent = {
               session: { id: sessionId, header: {} },
               followup(payload) {
+                payloads.push({ sessionId, payload })
                 const envelope = envelopeOf(payload)
+                // v0.9.2：预热轮（无 attempt/nonce）只回 ok，不参与结论。
+                if (!envelope) return
                 const base = resultFor(options)
                 const structured = envelope ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base } : base
                 engineRef.value.handleSessionEvent({ id: sessionId }, {
@@ -289,14 +295,17 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
                 })
               },
               async whenIdle() {},
-            },
-            async dispose() {},
           }
+          agentsById.set(sessionId, agent)
+          return { agent, async dispose() {} }
+        },
+        get(sessionId) {
+          return agentsById.get(sessionId) || null
         },
       }
     },
   }
-  return { ctx, created }
+  return { ctx, created, payloads }
 }
 
 /**
@@ -387,14 +396,22 @@ function nodeAlarmAgents(engineRef, behavior) {
         async create(options) {
           created.push(options)
           const sessionId = options.sessionId
+          // 真实宿主的 whenIdle() 是**每轮一个新的 promise**：一轮结束就换一个。
+          // v0.9.2 引入预热轮后这一点变得必须——否则预热轮把唯一的 promise 解决掉，
+          // 正式任务那一轮永远等不到 idle。
           let finishIdle = null
-          const idle = new Promise(resolve => {
-            finishIdle = resolve
-          })
+          let idle = null
+          const armIdle = () => {
+            idle = new Promise(resolve => {
+              finishIdle = resolve
+            })
+          }
+          armIdle()
           const agent = {
             session: { id: sessionId, header: {} },
             status: 'working',
             followup(payload) {
+              armIdle()
               const emit = text => engineRef.value.handleSessionEvent({ id: sessionId }, {
                 type: 'assistant/message',
                 data: {
@@ -402,6 +419,13 @@ function nodeAlarmAgents(engineRef, behavior) {
                 },
               })
               const envelope = envelopeOf(payload)
+              // v0.9.2：预热轮没有 attempt/nonce 契约 —— 真实宿主回一句 ok 就结束这一轮，
+              // 不调用测试的行为回调（否则会把预热轮误当成正式任务）。
+              if (!envelope) {
+                emit('ok')
+                finishIdle()
+                return
+              }
               behavior({
                 engine: engineRef.value,
                 sessionId,
@@ -574,15 +598,104 @@ try {
     A.equal('origin' in (created[0].meta || {}), false)
     A.equal('delegationDepth' in (created[0].meta || {}), false)
     // 提示词经 buildFollowupPayload 投递，并要求 ```json 代码块（create 无 schema 通道）。
-    A.equal(payloads.length, 1)
-    A.equal(payloads[0].role, 'user')
-    A.equal(payloads[0].source.kind, 'flow-studio')
-    A.equal(payloads[0].source.room, `${run.id}/n_spawn`)
-    A.ok(payloads[0].content[0].text.includes('## 输出格式'))
-    A.ok(payloads[0].content[0].text.includes('```json'))
+    // v0.9.2 起新建会话会先发一条预热轮（消耗首轮精简的裁剪轮），所以这里是 2 条：
+    // 第 1 条预热、第 2 条正式任务。
+    A.equal(payloads.length, 2)
+    A.ok(payloads[0].content[0].text.includes('引擎预热'), '第一条必须是预热轮')
+    const prompted = payloads[1]
+    A.equal(prompted.role, 'user')
+    A.equal(prompted.source.kind, 'flow-studio')
+    A.equal(prompted.source.room, `${run.id}/n_spawn`)
+    A.ok(prompted.content[0].text.includes('## 输出格式'))
+    A.ok(prompted.content[0].text.includes('```json'))
     // 07 §3「降级必须可见」：正常路径在 run.json 与 run/start 里都要写 top-level。
     A.equal(readRawRun(run.id).sessionMode, 'top-level')
     A.equal((await eventsOf(run.id)).find(event => event.kind === 'run/start').data.sessionMode, 'top-level')
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.9.2 · 新建会话的预热轮（首轮精简规避）')
+
+  const isWarmupPayload = payload => {
+    const text = payload && Array.isArray(payload.content)
+      ? payload.content.filter(block => block && block.type === 'text').map(block => block.text).join('\n')
+      : ''
+    return text.includes('引擎预热')
+  }
+
+  await check('预热轮：每个新建会话先发一条、正式任务在第二轮；打回复用会话不重复预热', async () => {
+    const flow = flowOf('flow-warmup', [
+      startNode(), stage('n_a', '上游', 300), stage('n_b', '复核', 600), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      reject('e3', 'n_b', 'n_a'),
+      next('e4', 'n_b', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-warmup', 2)
+    const engineRef = { value: null }
+    const attemptsSeen = new Map()
+    const { ctx, created, payloads } = agentsCreateCtx(engineRef, {
+      resultFor: options => {
+        const nodeId = options.sessionId.includes('--n_b') ? 'n_b' : 'n_a'
+        const seen = (attemptsSeen.get(nodeId) || 0) + 1
+        attemptsSeen.set(nodeId, seen)
+        // n_b 第一次正式判定打回 n_a，让 n_a 走 attempt 2（复用同一会话）。
+        if (nodeId === 'n_b' && seen === 1) {
+          return { verdict: 'reject', summary: '证据不足', rejectReason: '缺验收证据', rejectTarget: 'n_a' }
+        }
+        return passResult(nodeId).structured
+      },
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    // 两个阶段节点各建一个会话；打回重跑复用 n_a 的会话，所以 create 只有 2 次。
+    A.equal(created.length, 2)
+    const bySession = new Map()
+    for (const entry of payloads) {
+      if (!bySession.has(entry.sessionId)) bySession.set(entry.sessionId, [])
+      bySession.get(entry.sessionId).push(entry.payload)
+    }
+    A.equal(bySession.size, 2)
+    let warmups = 0
+    for (const [sessionId, list] of bySession) {
+      A.ok(isWarmupPayload(list[0]), `${sessionId} 的第一条必须是预热轮`)
+      warmups += list.filter(isWarmupPayload).length
+      A.equal(list.filter(isWarmupPayload).length, 1, `${sessionId} 只预热一次（打回复用不重复预热）`)
+    }
+    A.equal(warmups, 2)
+    // 打回链：n_b attempt1 reject → n_a attempt2 pass → n_b attempt2 pass。
+    // 两个会话都是「预热 + 两次 attempt」= 3 条，且都只预热一次。
+    const aSession = [...bySession.keys()].find(id => id.includes('--n_a'))
+    const bSession = [...bySession.keys()].find(id => id.includes('--n_b'))
+    A.equal(bySession.get(aSession).length, 3, 'n_a：预热 + attempt1 + attempt2')
+    A.equal(bySession.get(bSession).length, 3, 'n_b：预热 + attempt1(reject) + attempt2(pass)')
+    // 正式任务必须是第二条（第二轮），且带 attempt/nonce 契约。
+    A.ok(!isWarmupPayload(bySession.get(aSession)[1]))
+    A.ok(envelopeOf(bySession.get(aSession)[1]), '正式任务必须带 attempt/nonce 契约')
+  })
+
+  await check('预热轮可关：warmUpFirstTurn:false → 只有正式任务（1 条），且不再有预热文本', async () => {
+    const flow = flowOf('flow-warmup-off', [startNode(), stage('n_only', '单节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_only'),
+      next('e2', 'n_only', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-warmup-off', 1)
+    const engineRef = { value: null }
+    const { ctx, payloads } = agentsCreateCtx(engineRef, { resultFor: () => passResult('n_only').structured })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, warmUpFirstTurn: false })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    A.equal(payloads.length, 1, '关闭预热后只应有一条消息')
+    A.equal(isWarmupPayload(payloads[0].payload), false)
+    A.ok(envelopeOf(payloads[0].payload), '那一条必须是带契约的正式任务')
   })
 
   // -------------------------------------------------------------------------
@@ -1943,6 +2056,8 @@ try {
       },
       followup(payload) {
         const envelope = envelopeOf(payload)
+        // v0.9.2：预热轮（无 attempt/nonce）只回 ok。
+        if (!envelope) return
         const base = structuredPass('n_model')
         const structured = envelope
           ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base }

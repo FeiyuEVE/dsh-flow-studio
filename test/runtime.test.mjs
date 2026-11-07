@@ -865,6 +865,7 @@ try {
       const agentsById = new Map()
       let mainPrompt = ''
       let releaseIdle = null
+      let lastWasWarmup = false
       const idleGate = new Promise(resolve => { releaseIdle = resolve })
       let engine = null
       const ctx = {
@@ -885,6 +886,11 @@ try {
                     ? payload.content[0].text
                     : ''
                   if (typeof text !== 'string') return
+                  // v0.9.2：预热轮（无 attempt/nonce 契约）不算主提示词，且不让它卡住 idle。
+                  if (text.includes('引擎预热')) {
+                    lastWasWarmup = true
+                    return
+                  }
                   if (!text.includes('【节点自审闹钟】')) {
                     mainPrompt = text
                     return
@@ -913,7 +919,15 @@ try {
                     },
                   })
                 },
-                async whenIdle() { await idleGate },
+                // 预热轮那一轮已经"结束"，正式任务这一轮才被 idleGate 挂住（本用例要用它
+                // 把节点维持在运行中，好让 runtime.wake 拿到 attempt/nonce 凭证）。
+                async whenIdle() {
+                  if (lastWasWarmup) {
+                    lastWasWarmup = false
+                    return
+                  }
+                  await idleGate
+                },
               }
               agentsById.set(sessionId, agent)
               return { agent, dispose: async () => {} }

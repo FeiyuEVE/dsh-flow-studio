@@ -3,7 +3,8 @@
  *
  * 这里是纯函数层，不碰 fs —— 落盘在 `runstore.js`。契约见
  * `docs/design/05-run-log.md`：
- *   - 未知 kind 一律拒绝，不静默存（基础白名单 EVENT_KINDS + 收件箱扩展 INBOX_EVENT_KINDS）；
+ *   - 未知 kind 一律拒绝，不静默存（基础白名单 EVENT_KINDS + INBOX / NODE_STATUS /
+ *     MACHINE 三个扩展白名单，校验器接受并集）；
  *   - 必填字段缺失就报错（`usage` 缺桶不补 0）；
  *   - `ts` 非法 / 缺失用服务端时间补齐，并归一成 UTC ISO-8601；
  *   - `extra` 有界（键 ≤16、单串 ≤256、总字节 ≤2048），超限丢弃不报错；
@@ -59,6 +60,22 @@ export const NODE_STATUS_EVENT_KINDS = Object.freeze([
   'node/status',
 ])
 
+/**
+ * 08 §7 扩展白名单：状态机转移观测（`machine/transition`）。
+ *
+ * 与 `INBOX_EVENT_KINDS` / `NODE_STATUS_EVENT_KINDS` 同理单独列出，不污染 05 §2 冻结的
+ * 17 种基础事件（既有单测按长度 17 断言）。校验器接受的是所有扩展白名单的并集。
+ *
+ * **只作观测**：这条事件不参与 progress / quality / 打回 / 重跑口径，写坏了也不该
+ * 影响流程推进。`data` 契约见 `validateData` 的 `case 'machine/transition'`：
+ * `from` 可选（≤64，空串 = 没写）、`to` / `event` 必填（≤64）、`version` 可选（≤200）、
+ * `attempt` 可选（≥1 的整数，`0` / `1.5` / `'2'` 一律整条拒绝）。
+ * 未知 data 键按本文件既有口径保留（前向兼容，体积由 8KB 单条上限兜住）。
+ */
+export const MACHINE_EVENT_KINDS = Object.freeze([
+  'machine/transition',
+])
+
 /** 单条事件序列化后的上限（字节，不含行尾换行）。 */
 export const MAX_EVENT_BYTES = 8 * 1024
 
@@ -79,7 +96,9 @@ export const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
 /** 用量四桶（互斥，reasoning 是 output 的子集，不另计）。 */
 export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
 
-const KIND_SET = new Set([...EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS])
+const KIND_SET = new Set([
+  ...EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS, ...MACHINE_EVENT_KINDS,
+])
 
 /**
  * run 级事件写到 run.jsonl；其余都要求 nodeId + attemptId（§1 目录布局）。
@@ -135,6 +154,11 @@ const MESSAGE_REPLY_KIND = new Set(['session', 'http', 'none'])
 /** 06 §16：message/out.delivery 白名单。 */
 export const MESSAGE_DELIVERY_KINDS = Object.freeze(['session', 'http', 'local'])
 const MESSAGE_DELIVERY = new Set(MESSAGE_DELIVERY_KINDS)
+
+/** 08 §7：machine/transition 的 from / to / event 长度上限（与节点 id 同口径）。 */
+export const MACHINE_TRANSITION_MAX_CHARS = 64
+/** 08 §7：状态机版本哈希的长度上限（与 `run.json.machine.version` 同口径）。 */
+export const MACHINE_VERSION_MAX_CHARS = 200
 
 /** 顶层保留字段；其余未识别字段折叠进有界的 `extra`。 */
 const RESERVED_FIELDS = new Set([
@@ -374,6 +398,19 @@ function validateData(kind, data) {
     if (result.present) out[key] = result.value
     else delete out[key]
     return null
+  }
+  /**
+   * 可选字符串，但**空串 / 纯空白视为「没写」**（不整条拒绝）。
+   * 用于纯观测字段（machine/transition 的 from / version）：引擎没值时写空串是很自然
+   * 的事，不该因此丢一条观测事件；非空则按 putStr 的同一口径校验（类型 / 长度）。
+   */
+  const putOptionalText = (key, max = 256) => {
+    const value = data[key]
+    if (typeof value === 'string' && value.trim() === '') {
+      delete out[key]
+      return null
+    }
+    return putStr(key, max, false)
   }
   const putEnum = (key, allowed) => {
     const value = data[key]
@@ -713,6 +750,27 @@ function validateData(kind, data) {
         }
         out.blockers = blockers
       }
+      break
+    }
+    case 'machine/transition': {
+      // 08 §7：状态机转移的观测事件。节点级事件（顶层 nodeId + attemptId 仍由
+      // normalizeEvent 要求），data 里的 from / to 是**机器状态名**（阶段节点 id 或
+      // #running / #done / #failed / #aborted），所以只按有界字符串校验，不套 run id 字符集。
+      // from 可选：起点是初始态（#running 的 initial）时没有「上一个节点」，空串按没写处理。
+      let bad = putOptionalText('from', MACHINE_TRANSITION_MAX_CHARS)
+      if (bad) return bad
+      bad = putStr('to', MACHINE_TRANSITION_MAX_CHARS)
+        || putStr('event', MACHINE_TRANSITION_MAX_CHARS)
+      if (bad) return bad
+      // 版本哈希：与 run.json.machine.version 同口径（≤200）；空串同样视为没写。
+      bad = putOptionalText('version', MACHINE_VERSION_MAX_CHARS)
+      if (bad) return bad
+      // 与本文件其它 attempt 同口径：只认 ≥1 的整数，0 / 1.5 / '2' 一律整条拒绝
+      // （观测事件也不做隐式字符串转数字，免得日志里出现两种类型）。
+      bad = putInt('attempt', { required: false, min: 1 })
+      if (bad) return bad
+      // 未知 data 键按 validateData 顶部 `out = { ...data }` 的既有口径保留（前向兼容，
+      // 单条 8KB 上限兜住体积）；message/in、message/out 的严格白名单是例外，不照抄。
       break
     }
     default:
@@ -2272,6 +2330,25 @@ function usageText(usage) {
   return usage.reasoning === undefined ? base : `${base}（reasoning ${usage.reasoning} 含在 out 内）`
 }
 
+/**
+ * 状态机转移的一行摘要（日志抽屉的事件行 / 导出时间线共用同一口径）：
+ * `n_a → n_b · PASS`；有 `attempt` 时追加 ` · attempt=2`。
+ *
+ * 缺 `from`（初始态出发）时写 `?` —— 不编造起点；`to` / `event` 缺失时同样写 `?`
+ * （校验器已经拦过，这里只是展示层的防御）。没有 attempt 就**不**补 `attempt=1`。
+ *
+ * @param {Record<string, unknown>} data `machine/transition` 的 data
+ * @returns {string}
+ */
+export function machineTransitionSummary(data) {
+  const info = isPlainObject(data) ? data : {}
+  const pick = value => (typeof value === 'string' && value.trim() !== '' ? value : '?')
+  const parts = [`${pick(info.from)} → ${pick(info.to)}`]
+  if (typeof info.event === 'string' && info.event.trim() !== '') parts.push(info.event)
+  if (Number.isInteger(info.attempt) && info.attempt >= 1) parts.push(`attempt=${info.attempt}`)
+  return parts.join(' · ')
+}
+
 function eventDigest(event) {
   const data = event && event.data ? event.data : {}
   switch (event && event.kind) {
@@ -2283,6 +2360,8 @@ function eventDigest(event) {
       return `${data.title || ''} · ${data.mode}${Array.isArray(data.skills) && data.skills.length > 0 ? ` · skills: ${data.skills.join(', ')}` : ''}`
     case 'node/end':
       return `status=${data.status} · ${data.durationMs}ms`
+    case 'machine/transition':
+      return machineTransitionSummary(data)
     case 'member/start':
       return `${data.name || ''}${data.role ? `（${data.role}）` : ''}`
     case 'member/end':

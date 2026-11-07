@@ -25,6 +25,9 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import {
   MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkMemberId, checkRunId, computeProgress,
   normalizeEvent, progressFromNodeStates,
+  // 08 §7：事件 kind 白名单与 runlog **同源**（基础 17 种 + 各扩展白名单），
+  // 这里不再手写第二份字符串——手抄那份曾经漏掉 `node/status`，过滤直接 400。
+  EVENT_KINDS as BASE_EVENT_KINDS, INBOX_EVENT_KINDS, NODE_STATUS_EVENT_KINDS, MACHINE_EVENT_KINDS,
 } from './runlog.js'
 import { resolveHome } from './store.js'
 
@@ -46,6 +49,25 @@ const MAX_META_BYTES = 1024 * 1024
  * 绝不静默。
  */
 export const MAX_NODE_STATUS_BYTES = 256 * 1024
+
+/**
+ * 引擎状态机快照（`run.json.machine`，XState `getPersistedSnapshot()`）的字节预算：24 KiB。
+ *
+ * 语义是「缓存，不是真相」：快照随时可以被下一次 `getPersistedSnapshot()` 覆盖，
+ * 丢了只丢一个恢复起点，**绝不能因此让 run 的元数据写不进去**。所以超预算不 400，
+ * 而是丢掉 `snapshot`、保留 `version`，并落 `machineTruncated: true`（可见，不静默）。
+ *
+ * 与 `nodeStatus` 是**两条独立通道**：本预算只量 `snapshot` 自身，machine 既不参与
+ * `nodeStatus` 的 256 KiB 预算，也不因 nodeStatus 被裁剪而受影响。
+ */
+export const MAX_MACHINE_SNAPSHOT_BYTES = 24 * 1024
+/** 快照版本号的字符上限（非空字符串，必填；读侧超限整条丢弃）。 */
+const MACHINE_VERSION_MAX_CHARS = 200
+/** `savedAt` 的长度上限（ISO 字符串远短于此，纯属兜底）。 */
+const MACHINE_SAVED_AT_MAX_CHARS = 64
+/** `machine` 的内层白名单；其余键写侧进 `droppedKeys`（`machine.<key>`）。 */
+const MACHINE_KEYS = ['version', 'snapshot', 'savedAt']
+
 /** nodeStatus 的节点数上限（与引擎侧 `_rememberNodeStatus` 同口径）。 */
 const NODE_STATUS_MAX_NODES = 200
 /** 单节点 members / blockers 条数上限。 */
@@ -434,6 +456,9 @@ function normalizeMeta(raw, id) {
   const engine = source.engine === 'stub' ? 'stub' : 'real'
   // 07 §11（R8）：节点自审状态先做形状收敛 + 字节预算裁剪（D2）。
   const nodeStatus = source.nodeStatus === undefined ? null : normalizeNodeStatus(source.nodeStatus)
+  // D4：engine 状态机快照（缓存不是真相）：读路径宽松 + 24 KiB 独立预算。
+  // 与 nodeStatus 互不影响——两条通道各自量各自的字节。
+  const machine = normalizeMachine(source.machine)
   const meta = {
     v: 1,
     id,
@@ -484,6 +509,14 @@ function normalizeMeta(raw, id) {
     // G2 额外契约：limits（{ runTimeoutMs?, nodeTimeoutMs? }，两个可选正整数）。
     // 未传不出现；读侧非法值直接丢弃，写侧由 validateMetaPatch 严格 400。
     ...(source.limits === undefined ? {} : { limits: normalizeLimits(source.limits) }),
+    // D4：engine 状态机快照。整条替换语义：未传 / 传 null → 不出现（清除）；
+    // version 不合法 → 整条丢弃（读路径宽松，不报错）。
+    ...(machine.value === null ? {} : { machine: machine.value }),
+    // 快照被裁过必须可见（绝不静默）；machine 整条不在时这个标志也没有意义，
+    // 所以跟着一起清掉（`machine: null` 能同时清掉两个键）。
+    ...(machine.value !== null && (source.machineTruncated === true || machine.truncated)
+      ? { machineTruncated: true }
+      : {}),
   }
   if (nodeStatus !== null && nodeStatus.truncated && nodeStatus.stats) {
     // 诊断细节不落盘（不进 JSON），但写回值上能直接读到裁了多少，便于测试与排障。
@@ -746,6 +779,75 @@ function normalizeNodeStatus(raw) {
 
   stats.bytesAfter = bytes
   return { value, truncated, stats }
+}
+
+/**
+ * 比 `isPlainObject` 更严一档的「普通数据对象」判定：数组 / null / null 原型对象 /
+ * 类实例（Date、Map、XState 内部类型…）都不算。
+ *
+ * 用在 `machine` 与 `machine.snapshot` 上：这两处的内容会被原样写进 run.json
+ * 当作恢复起点，形状必须能被 JSON 往返，不能是「看起来像对象」的别的东西。
+ */
+function isPlainDataObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.getPrototypeOf(value) === Object.prototype
+}
+
+/**
+ * 量快照的序列化字节数。循环引用 / BigInt 等不可序列化内容 → Infinity，
+ * 由调用方按「超预算」裁掉：快照只是缓存，不能因为一个坏对象让整份元数据写不进去。
+ */
+function machineSnapshotBytes(value) {
+  try {
+    return measureJsonBytes(value)
+  } catch {
+    return Infinity
+  }
+}
+
+/**
+ * D4：`run.json.machine`（引擎状态机快照，XState `getPersistedSnapshot()`）的读路径收敛。
+ *
+ * 语义是「缓存，不是真相」，所以读路径**永远宽松、绝不报错**：
+ *   - `version` 必须是非空字符串且 ≤200 字符，否则**整条 machine 丢弃**——没有版本号
+ *     的快照无法安全恢复，留着只会误导引擎；
+ *   - `snapshot` 必须是普通数据对象且序列化 ≤24 KiB；超限或形状不对 → 只丢这一个键、
+ *     保留 `version`，并置 `machineTruncated: true`（可见，不静默）；
+ *   - `savedAt` 是 ISO 字符串且 ≤64 字符才保留，否则丢该键；
+ *   - 未知内层键在这里丢弃；**写侧**会在 `droppedKeys` 里以 `machine.<key>` 报出来。
+ *
+ * 与 `nodeStatus` 是两条独立通道：本函数只量 `snapshot` 自身，既不参与 nodeStatus 的
+ * 256 KiB 预算，也不因 nodeStatus 被裁剪而受影响。
+ *
+ * @returns {{ value: object | null, truncated: boolean }}
+ */
+function normalizeMachine(raw) {
+  if (!isPlainDataObject(raw)) return { value: null, truncated: false }
+  const version = typeof raw.version === 'string'
+    && raw.version.trim() !== ''
+    && raw.version.length <= MACHINE_VERSION_MAX_CHARS
+    ? raw.version
+    : null
+  if (version === null) return { value: null, truncated: false }
+  const machine = { version }
+  let truncated = false
+  if (hasOwn(raw, 'snapshot')) {
+    const bytes = isPlainDataObject(raw.snapshot) ? machineSnapshotBytes(raw.snapshot) : null
+    if (bytes !== null && bytes <= MAX_MACHINE_SNAPSHOT_BYTES) {
+      machine.snapshot = raw.snapshot
+    } else {
+      truncated = true
+    }
+  }
+  if (typeof raw.savedAt === 'string'
+    && raw.savedAt !== ''
+    && raw.savedAt.length <= MACHINE_SAVED_AT_MAX_CHARS
+    && normalizeIso(raw.savedAt) !== null) {
+    // 原样保留（不改成 toISOString 的规范形式）：savedAt 是给人看的落盘时间，
+    // 偏移量信息比「统一成 Z」更有用，也避免读一次改一次。
+    machine.savedAt = raw.savedAt
+  }
+  return { value: machine, truncated }
 }
 
 function text2(value, fallback) {
@@ -1079,6 +1181,9 @@ const META_FIELD_KEYS = new Set([
   'startOptions',
   // G2 额外契约：引擎侧写入的超时配置（{ runTimeoutMs?, nodeTimeoutMs? }，可选正整数）
   'limits',
+  // D4：engine 状态机快照（{ version, snapshot?, savedAt? }）+ 裁剪标志。
+  // `machineTruncated` 显式出现时必须是布尔或 null（false / null 表示清除）。
+  'machine', 'machineTruncated',
 ])
 
 function hasOwn(object, key) {
@@ -1108,6 +1213,33 @@ function validateMetaPatch(patch) {
   }
   if (hasOwn(patch, 'nodeStatusTruncated') && typeof patch.nodeStatusTruncated !== 'boolean') {
     throw new RunError(400, 'nodeStatusTruncated', 'nodeStatusTruncated 必须是布尔值')
+  }
+  // D4：engine 状态机快照。整条替换语义，`version` 必填。
+  // 注意：`snapshot` 超 24 KiB **不** 400（快照是缓存不是真相，超预算走读路径的裁剪，
+  // 绝不能因为一个缓存字段让 run 的元数据写不进去）；只有形状错才 400。
+  if (hasOwn(patch, 'machine') && patch.machine !== null) {
+    if (!isPlainDataObject(patch.machine)) {
+      throw new RunError(400, 'machine', 'machine 必须是 { version, snapshot?, savedAt? } 对象或 null')
+    }
+    const machine = patch.machine
+    if (typeof machine.version !== 'string' || machine.version.trim() === '') {
+      throw new RunError(400, 'machine',
+        `machine.version 必须是 1–${MACHINE_VERSION_MAX_CHARS} 字符的非空字符串`)
+    }
+    if (machine.version.length > MACHINE_VERSION_MAX_CHARS) {
+      throw new RunError(400, 'machine', `machine.version 超过 ${MACHINE_VERSION_MAX_CHARS} 字符`)
+    }
+    if (hasOwn(machine, 'snapshot') && !isPlainDataObject(machine.snapshot)) {
+      throw new RunError(400, 'machine',
+        'machine.snapshot 必须是普通对象（数组 / null / 类实例都不行；清空快照请省略该键）')
+    }
+  }
+  // D4：`machineTruncated` 是布尔标志；显式 `false` / `null` 都表示「清除」
+  // （null 与 machine: null 一样当作清空，不算类型错）。
+  if (hasOwn(patch, 'machineTruncated')
+    && patch.machineTruncated !== null
+    && typeof patch.machineTruncated !== 'boolean') {
+    throw new RunError(400, 'machineTruncated', 'machineTruncated 必须是布尔值或 null')
   }
   // 06 §13.8：startOptions 只接受 { workspace?: string, worktree?: string }，类型错必须 400。
   if (hasOwn(patch, 'startOptions') && patch.startOptions !== null) {
@@ -2137,6 +2269,12 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
         if (!LIMITS_KEYS.includes(key)) droppedKeys.push(`limits.${key}`)
       }
     }
+    // D4 machine 同理：内层多余键丢弃但可见（`machine.<key>`）。
+    if (isPlainDataObject(source.machine)) {
+      for (const key of Object.keys(source.machine)) {
+        if (!MACHINE_KEYS.includes(key)) droppedKeys.push(`machine.${key}`)
+      }
+    }
     let existing
     try {
       existing = await readMetaUnlocked(loc)
@@ -2941,15 +3079,12 @@ export async function readEvents(runsRoot, runId, options = {}) {
   }
 }
 
-// 与 runlog 的事件白名单（EVENT_KINDS + INBOX_EVENT_KINDS）保持一致；
-// 单独列一份避免这里 import 整个校验器。
+// 与 runlog 的事件白名单**同源**（基础 17 种 + 收件箱 / 节点状态 / 状态机转移扩展），
+// 不再手写第二份字符串：手抄那份曾经漏掉 `node/status`，`?kinds=` 过滤直接 400。
+// `whitelistKind` 只作用于 `readEvents` 的 kinds 过滤器；写路径的白名单在 runlog 的
+// 校验器里，所以这里放宽**不会**让未校验的事件进库。
 const EVENT_KINDS = new Set([
-  'run/start', 'run/end', 'node/start', 'node/end', 'member/start', 'member/end',
-  'model/call', 'tool/call', 'skill/load', 'artifact/write', 'reject/trigger',
-  'review/finding', 'review/verdict', 'check/form',
-  'acceptance/verdict', 'test/report', 'agent/message',
-  // 06 §16：流程收件箱事件。
-  'message/in', 'message/out',
+  ...BASE_EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS, ...MACHINE_EVENT_KINDS,
 ])
 
 function whitelistKind(kind) {

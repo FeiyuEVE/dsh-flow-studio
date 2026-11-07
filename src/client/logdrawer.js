@@ -60,6 +60,8 @@ export const WATCH_EVENT_KINDS = Object.freeze([
   'node/start', 'node/end',
   'member/start', 'member/end',
   'reject/trigger',
+  // v0.9：状态机转移观测（08 §7）。收进增量窗口，跑的过程中就能看到状态推进。
+  'machine/transition',
 ])
 /** 后台标签页（document.hidden）的轮询间隔：降到 15s，不跟前台抢请求（M5）。 */
 export const HIDDEN_POLL_MS = 15000
@@ -82,6 +84,8 @@ export const EVENT_KINDS = [
   'test/report',
   'message/in', 'message/out',
   'node/status',
+  // v0.9：状态机转移（XState 内核）。from → to · EVENT。
+  'machine/transition',
 ]
 
 const STATUS_TEXT = {
@@ -101,6 +105,7 @@ const STATUS_TEXT = {
 }
 
 const EVENT_GLYPH = {
+  'machine/transition': '⇢',
   'run/start': '▶',
   'run/end': '■',
   'node/start': '▷',
@@ -1044,6 +1049,15 @@ export function eventSummary(event) {
   const data = isObject(event.data) ? event.data : {}
   const parts = []
   switch (event.kind) {
+    case 'machine/transition': {
+      // 不能 import ../runlog.js：它 import 了 node:buffer，会被打进浏览器 bundle。
+      // 这里与 runlog.machineTransitionSummary 保持同一口径（有测试同时钉住两边）。
+      const to = text(data.to, '?')
+      const ev = text(data.event, '?')
+      parts.push((data.from ? text(data.from) + ' → ' + to : to) + ' · ' + ev)
+      if (data.attempt !== undefined) parts.push('attempt=' + num(data.attempt))
+      break
+    }
     case 'run/start':
       parts.push('流程 ' + (text(data.flowName, text(data.flowId, '未知流程'))))
       if (data.nodeTotal !== undefined) parts.push(num(data.nodeTotal) + ' 个阶段')

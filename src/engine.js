@@ -48,6 +48,32 @@ import {
 // 用命名空间导入 + 可选链兜底：并行改动尚未落地时引擎仍能工作（否则 ESM 命名导入会直接报错）。
 import * as runstoreModule from './runstore.js'
 import { flowsDir, readFlow } from './store.js'
+// 08 §3/§4/§6：状态机内核（flow → XState v5 machine）。引擎只负责「把节点结论变成
+// 机器事件、再把机器状态翻回下一个阶段节点」；转移语义本身全在 flowmachine.js。
+import {
+  FLOW_EVENTS,
+  compileFlowToMachine,
+  flowMachineImplementations,
+  machineEventsFromRun,
+  machineVersion,
+  replayMachine,
+} from './flowmachine.js'
+import { createActor } from './xstate-vendor.js'
+
+/**
+ * 进 `machineVersion` 的引擎版本（08 §6）。**只放影响转移的版本号**：改节点标题、
+ * 坐标、role、skills、model 不该让快照失效，所以它们不进哈希。当前语义就是 v1，
+ * 与 `machineVersion(flow)` 的默认值一致，测试可直接用默认参数复算。
+ */
+export const FLOW_MACHINE_ENGINE_VERSION = '1'
+
+/**
+ * 灰度开关（08 §7）：`FLOW_STUDIO_FLOW_MACHINE=0` 回退旧主循环（逃生门），
+ * 其余值（含未设置）走 actor 驱动。每次 run 开始时读，测试可逐 run 切换。
+ */
+export function flowMachineEnabled() {
+  return process.env.FLOW_STUDIO_FLOW_MACHINE !== '0'
+}
 
 /** 单节点默认超时：20 分钟（06 §9）。 */
 export const DEFAULT_NODE_TIMEOUT_MS = 20 * 60 * 1000
@@ -757,10 +783,14 @@ export function validateFlowForRun(flow) {
       errors.push({ message: `reject 边「${edge.id}」指向了不存在的节点`, edgeId: edge.id })
       continue
     }
-    // 打回目标必须是阶段节点：start/end 不执行，回退到它们会让主循环停在非法节点。
-    if (byId.get(edge.to).kind !== NODE_KIND.STAGE) {
+    // 打回线**两端**都必须是阶段节点：start/end 不执行，回退到它们会让主循环停在
+    // 非法节点。08 §3.1 / flowmachine 的编译口径同样是「两端都 stage」；这里对齐到
+    // 更严的一侧，避免「校验通过、编译期才 FLOW_MACHINE_INVALID」。
+    const fromNode = byId.get(edge.from)
+    const toNode = byId.get(edge.to)
+    if (fromNode.kind !== NODE_KIND.STAGE || toNode.kind !== NODE_KIND.STAGE) {
       errors.push({
-        message: `打回线「${byId.get(edge.from).title || edge.from} → ${byId.get(edge.to).title || edge.to}」的目标不是阶段节点`,
+        message: `打回线「${edge.from} → ${edge.to}」的两端都必须是阶段节点`,
         edgeId: edge.id,
       })
       continue
@@ -1620,6 +1650,13 @@ class FlowEngine {
     this.closing = false
     this.sealedSessionEventDrops = 0
     this.failedNode = null
+    // 08 §6：当前 run 的 actor / 机器版本 / 最近一次写入 run.json.machine 的指纹。
+    // 放实例字段是为了 SELF_CHECK 观测与「同值不重写」节流；_resetRunState 每次清空。
+    this.machineActor = null
+    this.machineVersion = null
+    // runId → 最近一次写入 run.json.machine 的指纹（同一 engine 实例可能先后跑多个 run；
+    // 不能用一个实例级字符串，否则另一个 run 的同形快照会被误判成「同值不重写」）。
+    this.machineFingerprints = new Map()
     this.sessionBindings = new Map()
     this.pendingSessionEvents = []
     this.pendingSessionLimit = 4000
@@ -2101,6 +2138,9 @@ class FlowEngine {
       if (oldest !== undefined) this.nodeStatus.delete(oldest)
     }
     this.nodeStatus.set(nodeId, entry)
+    // 08 §4：SELF_CHECK 只更新机器 context 的观测字段，不触发转移；正式结论仍由
+    // 主循环发 PASS / REJECT / FAIL。没有 actor（flag=0 / 未跑状态机）时是 no-op。
+    this._observeMachineSelfCheck(parsed.verdict)
     // live 是同步快照；即使事件写入排队，前端下一次轮询也能立刻看到。
     if (this.live) this.live.nodeStatus = this._nodeStatusSnapshot()
 
@@ -3348,6 +3388,12 @@ class FlowEngine {
     this.sealedSessionEventDrops = 0
     // 06 §9：最近一次节点级失败的坐标；run/end failed 用 failedNodeId 指认「死在哪」。
     this.failedNode = null
+    // 08 §6：状态机运行态只属于一次 run。
+    this.machineActor = null
+    this.machineVersion = null
+    // runId → 最近一次写入 run.json.machine 的指纹（同一 engine 实例可能先后跑多个 run；
+    // 不能用一个实例级字符串，否则另一个 run 的同形快照会被误判成「同值不重写」）。
+    this.machineFingerprints = new Map()
     this.maxTotalSteps = this.configuredMaxTotalSteps
     this.sessionBindings.clear()
     this.pendingSessionEvents = []
@@ -3472,8 +3518,17 @@ class FlowEngine {
 
   // -- 主循环 -------------------------------------------------------------
 
-  /** 06 §13.5：循环内的访问集 / 步数 / 墙钟三重终止性防护。 */
+  /**
+   * 08 §7：主循环入口。默认走状态机（actor 决定「在哪 / 该不该结束」）；
+   * `FLOW_STUDIO_FLOW_MACHINE=0` 时回退 v0.8 的旧循环（逃生门，行为逐字节保留）。
+   */
   async _loop(runId, flow, stageTotal) {
+    if (!flowMachineEnabled()) return this._loopLegacy(runId, flow, stageTotal)
+    return this._loopMachine(runId, flow, stageTotal)
+  }
+
+  /** v0.8 旧主循环（逃生门）：while + switch 推进，保留一个发布周期后删除。 */
+  async _loopLegacy(runId, flow, stageTotal) {
     const active = this.active
     const signal = active.controller.signal
     const maxSteps = this.maxTotalSteps || stageTotal * 3
@@ -3845,6 +3900,760 @@ class FlowEngine {
       await this._cleanupActive()
       // 07 §5：由 runtime 创建的实例，收尾后通知 runtime 把本实例从注册表摘掉（不轮询）。
       this._notifySettled(runId)
+    }
+  }
+
+  // -- 状态机驱动的主循环（08 §3–§7） --------------------------------------
+
+  /**
+   * 08 §3–§7：actor 驱动的主循环。
+   *
+   * 分工：
+   *   - **状态机**（flowmachine.js）只回答「当前在哪个阶段、该不该结束」；
+   *   - **引擎**仍执行节点（`_executeNode` 及其内部的 `_runNode` /
+   *     `_promptNodeSession` / `_runExternalNode`）、落证据、拼打回上下文、写
+   *     supervision / 节点闹钟 / 订阅 / 实时快照；
+   *   - 每个节点结论 → 一条机器事件 → `actor.getSnapshot().value` → 下一个阶段。
+   *
+   * 与旧循环逐段对齐的部分：步数上限、墙钟、取消、节点重试、失败隔离、
+   * reject/trigger、passedNodes / rejectContexts / visited 维护、run/end 收口。
+   * 只把「selectNextNode / selectRejectTarget 推进」换成机器事件。
+   */
+  async _loopMachine(runId, flow, stageTotal) {
+    const active = this.active
+    const signal = active.controller.signal
+    const maxSteps = this.maxTotalSteps || stageTotal * 3
+    const visited = new Set()
+    let node = null
+    let aborted = false
+    let arrivedByReject = false
+    let steps = 0
+    // G1-d：与旧循环同一口径（显式 start 参数 > 环境变量 > 默认）。
+    const runTimeoutMs = this._effectiveRunTimeoutMs()
+    const deadline = setTimeout(() => {
+      this.runTimedOut = true
+      active.controller.abort(new Error(`run 超过墙钟上限（${runTimeoutMs}ms）`))
+    }, runTimeoutMs)
+    const leaseTimer = active.lease && typeof runstoreModule.renewLease === 'function'
+      ? setInterval(() => {
+        runstoreModule.renewLease(this.runsRoot, runId).catch(error => {
+          this.log('warn', `flow-studio: 续租失败（${runId}）：${error.message}`)
+        })
+      }, 30000)
+      : null
+    if (leaseTimer && typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    let endPatch = null
+    const byId = byIdMap(flow)
+    let compiled = null
+    let actor = null
+    try {
+      // 编译是纯函数；不合法（FLOW_MACHINE_INVALID）按「状态机初始化失败」收口。
+      try {
+        compiled = compileFlowToMachine(flow, {
+          engineVersion: FLOW_MACHINE_ENGINE_VERSION,
+          runTimeoutMs,
+        })
+      } catch (error) {
+        this.log('error', `flow-studio: 状态机编译失败（${runId}）：${error.message}`)
+      }
+      let restored = { actor: null, source: null, error: null }
+      if (compiled) {
+        const provided = compiled.machine.provide(flowMachineImplementations(compiled.meta))
+        restored = await this._restoreMachineActor(runId, provided, compiled.version, compiled.meta.stageIds)
+      } else {
+        restored.error = new Error('流程无法编译成状态机')
+      }
+      if (!restored.actor) {
+        const detail = clip(
+          restored.error && restored.error.message ? restored.error.message : '状态机初始化失败（未知原因）',
+          256,
+        )
+        const reason = clip(`machine-restore-failed：${detail}`, 2000)
+        this.log('error', `flow-studio: run ${runId} 状态机恢复失败：${detail}`)
+        endPatch = [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: { status: 'failed', reason },
+          extra: { error: 'MachineRestoreFailed', detail },
+        }]
+        return
+      }
+      actor = restored.actor
+      this.machineActor = actor
+      this.machineVersion = compiled.version
+      this.log('info', `flow-studio: run ${runId} 状态机${restored.source === 'snapshot' ? '从快照恢复' : `从事件流重放（${restored.replayed} 条）`}`)
+      // 08 §6：新 run 也先落一份初态快照（之后每次转移覆盖；同值不重写）。
+      await this._persistMachine(runId, compiled.version, actor)
+
+      for (;;) {
+        const position = this._machinePosition(actor.getSnapshot().value)
+        if (position.terminal) break
+        if (!position.nodeId) {
+          throw new Error(`状态机停在无法识别的状态：${JSON.stringify(actor.getSnapshot().value)}`)
+        }
+        node = byId.get(position.nodeId)
+        if (!node) throw new Error(`状态机指向不存在的节点「${position.nodeId}」`)
+        if (node.kind !== NODE_KIND.STAGE) {
+          throw new Error(`节点「${node.title || node.id}」不是阶段节点，无法执行`)
+        }
+        // attemptId 与 v0.8 同口径：每个节点每执行一次 +1（不只是被打回的目标）。
+        // 机器 context.attempts 只记「打回目标」，所以取两者较大值做下限：
+        //   - 本进程内正常推进：this.attempts 是权威（含被打回方 n_b 的第 2 次）；
+        //   - 从快照/事件恢复：this.attempts 为空，用机器 context 兜底。
+        const attempt = Math.max(
+          this.attempts.get(node.id) || 0,
+          this._machineAttemptUsed(actor, node.id),
+        ) + 1
+        this.attempts.set(node.id, attempt)
+
+        if (this.runTimedOut) {
+          await this._sendMachineEvent(actor, {
+            type: FLOW_EVENTS.CLOCK_TIMEOUT,
+            kind: 'run',
+            reason: `run 超过墙钟上限（${runTimeoutMs}ms）`,
+          }, { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
+        }
+        if (signal.aborted) {
+          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: '已停止' },
+            { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          aborted = true
+          break
+        }
+        if (!arrivedByReject && visited.has(node.id)) {
+          // 06 §13.5：next 边成环（不是打回）→ node/end failed + run/end failed，不得 done。
+          // 注意：compileFlowToMachine 也会拒绝 next 成环；这条是运行时第二道防线。
+          this.round += 1
+          const traceId = nodeTraceId(runId, node.id, attempt)
+          await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
+          const cycleReason = `next 边成环：节点「${node.title || node.id}」被重复访问（不是打回）`
+          await this._sendMachineEvent(actor, {
+            type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason: cycleReason,
+          }, { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          await this._failNode(runId, node, attempt, traceId, cycleReason, { cycle: true })
+          throw new Error(cycleReason)
+        }
+        arrivedByReject = false
+        visited.add(node.id)
+        this.round += 1
+        steps += 1
+        const traceId = nodeTraceId(runId, node.id, attempt)
+        if (steps > maxSteps) {
+          // 06 §13.5：run 级步数上限（阶段数 × 3）。
+          await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
+          const limitReason = `超过 run 级步数上限（阶段数 × 3 = ${maxSteps}），已执行 ${steps} 步`
+          await this._sendMachineEvent(actor, {
+            type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason: limitReason,
+          }, { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          await this._failNode(runId, node, attempt, traceId, limitReason, { maxTotalSteps: maxSteps })
+          throw new Error(`超过 run 级步数上限（阶段数 × 3 = ${maxSteps}）`)
+        }
+        const previous = this.lastResults.get(node.id) || null
+        const rejectContext = this.rejectContexts.get(node.id) || null
+        const startedAt = this.now()
+        this.current = {
+          node,
+          attempt,
+          round: this.round,
+          traceId,
+          startedAt,
+          members: new Map(),
+          memberSeq: 0,
+        }
+        await this._setLive({
+          currentNodeId: node.id,
+          attempt,
+          round: this.round,
+          since: isoOf(startedAt),
+          phase: 'spawn',
+          // §13.12：节点级快照字段在每次换节点时重置；tokens 是 run 级累计，不清零。
+          nodeTitle: clip(String(node.title || node.id), LIVE_NODE_TITLE_MAX_CHARS),
+          nodeMode: node.mode === EXEC_MODE.TEAM ? 'team' : 'single',
+          activeMemberId: null,
+          lastTool: null,
+          lastMessage: null,
+          members: [],
+        })
+        await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
+
+        let outcome = null
+        let lastError = null
+        let retries = 0
+        // 06 §9：节点级失败先重试（默认 1 次）。重试不新增 attemptId。
+        for (;;) {
+          try {
+            outcome = await this._executeNode(runId, flow, node, attempt, stageTotal, {
+              traceId, previous, rejectContext, startedAt, signal,
+            })
+            break
+          } catch (error) {
+            lastError = error
+            // 用户停止 / run 墙钟：重试只会被同一个信号再打断，直接走中止/超时收尾。
+            if (signal.aborted || this.runTimedOut) break
+            if (retries >= this.nodeRetries) break
+            retries += 1
+            const retryReason = clip(error.message || String(error), 256)
+            this.log('warn', `flow-studio: 节点「${node.id}」attempt ${attempt} 失败，第 ${retries}/${this.nodeRetries} 次重试：${retryReason}`)
+            await this._setLive({ phase: 'spawn', since: isoOf(this.now()) })
+            await this._append(runId, [
+              this._nodeStartEvent(node, attempt, traceId, { retry: retries, retryReason }),
+            ]).catch(() => {})
+          }
+        }
+
+        if (!outcome) {
+          const error = lastError || new Error('节点执行失败（原因未知）')
+          const durationMs = Math.max(0, this.now().getTime() - startedAt.getTime())
+          const validationError = error instanceof StructuredOutputError ? error.validationError : undefined
+          const reason = clip(error.message || String(error), 256)
+          const extra = {
+            reason,
+            ...(retries > 0 ? { retries } : {}),
+            ...(validationError ? { validationError: clip(validationError, 256) } : {}),
+            ...(error instanceof NodeTimeoutError ? { timeout: true, timeoutMs: error.timeoutMs } : {}),
+            ...(signal.aborted && !this.runTimedOut ? { aborted: true } : {}),
+            ...(this.runTimedOut ? { runTimeout: true } : {}),
+          }
+          await this._append(runId, [{
+            kind: 'node/end',
+            nodeId: node.id,
+            attemptId: attempt,
+            traceId,
+            data: { status: 'failed', durationMs, ...(retries > 0 ? { retries } : {}) },
+            extra,
+          }]).catch(() => {})
+          this.current = null
+          this.failedNode = { nodeId: node.id, attempt, reason: clip(error.message || String(error), 2000) }
+          // 08 §4：用户 cancel → CANCEL（#aborted）；run 墙钟 / 节点墙钟 → CLOCK_TIMEOUT；
+          // 其余节点执行失败 → FAIL。判定顺序与旧循环的收口顺序一致。
+          const failureEvent = this.runTimedOut
+            ? { type: FLOW_EVENTS.CLOCK_TIMEOUT, kind: 'run', reason }
+            : (signal.aborted
+              ? { type: FLOW_EVENTS.CANCEL, reason: '已停止' }
+              : (error instanceof NodeTimeoutError
+                ? { type: FLOW_EVENTS.CLOCK_TIMEOUT, kind: 'node', nodeId: node.id, reason }
+                : { type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason }))
+          await this._sendMachineEvent(actor, failureEvent,
+            { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          if (this.runTimedOut) throw error
+          if (signal.aborted) {
+            aborted = true
+            break
+          }
+          // 06 §9：失败隔离——重试用尽只判该节点失败，已通过节点的事件/产物全部保留。
+          break
+        }
+
+        const durationMs = Math.max(0, this.now().getTime() - startedAt.getTime())
+        this.lastResults.set(node.id, {
+          attempt,
+          verdict: outcome.verdict,
+          summary: outcome.summary,
+          findings: outcome.findings,
+          artifactPaths: outcome.artifactPaths,
+          acceptance: outcome.acceptance,
+          tests: outcome.tests,
+          checks: outcome.checks,
+          evidence: outcome.evidence,
+        })
+        this.rejectContexts.delete(node.id)
+
+        if (outcome.verdict === 'reject') {
+          const nodeEndExtra = {
+            ...(outcome.membersPartial ? { membersPartial: true } : {}),
+            ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+          }
+          await this._append(runId, [{
+            kind: 'node/end',
+            nodeId: node.id,
+            attemptId: attempt,
+            traceId,
+            data: {
+              status: 'rejected',
+              durationMs,
+              ...(retries > 0 ? { retries } : {}),
+              ...(outcome.membersPartial ? { membersPartial: true } : {}),
+              // 08 §6：把「模型显式点名的打回目标」写进事件流，重放才能复现同一条转移
+              //（flowmachine.machineEventsFromRun 优先读 data.rejectTarget）。
+              ...(typeof outcome.rejectTarget === 'string' && outcome.rejectTarget !== ''
+                ? { rejectTarget: clip(outcome.rejectTarget, 64) }
+                : {}),
+            },
+            ...(Object.keys(nodeEndExtra).length > 0 ? { extra: nodeEndExtra } : {}),
+          }])
+          const machineEvent = {
+            type: FLOW_EVENTS.REJECT,
+            nodeId: node.id,
+            attempt,
+            ...(typeof outcome.rejectTarget === 'string' && outcome.rejectTarget !== ''
+              ? { rejectTarget: outcome.rejectTarget }
+              : {}),
+          }
+          const moved = await this._sendMachineEvent(actor, machineEvent,
+            { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+          const position = this._machinePosition(moved.snapshot.value)
+          const machineContext = moved.snapshot.context || {}
+          if (position.terminal) {
+            const rejectReason = clip(outcome.rejectReason || '未提供打回原因', 2000)
+            if (position.terminal === 'failed' && machineContext.finishedBy === 'max-rounds') {
+              // 08 §3.2：超重跑上限由机器判 #failed；引擎仍补旧的「目标节点
+              // node/end failed」与 reject/trigger，事件口径与 v0.8 一致。
+              const targetId = typeof machineContext.rejectTarget === 'string'
+                ? machineContext.rejectTarget
+                : null
+              const target = targetId ? byId.get(targetId) : null
+              if (target) {
+                const edge = this._rejectTriggerEdge(flow, node, targetId)
+                await this._appendRejectTrigger(runId, edge, node, attempt, traceId, targetId, rejectReason)
+                const used = machineContext.attempts && Number.isInteger(machineContext.attempts[targetId])
+                  ? machineContext.attempts[targetId]
+                  : 0
+                // 超限时补的是「目标节点上一次 attempt」的 node/end failed，不是下一次：
+                // 本进程已执行过就用执行次数，恢复后用 context.attempts + 1。
+                const targetAttempt = Math.max(this.attempts.get(targetId) || 0, used + 1)
+                const maxRounds = Number.isInteger(compiled.meta.maxRounds[targetId])
+                  && compiled.meta.maxRounds[targetId] >= 1
+                  ? compiled.meta.maxRounds[targetId]
+                  : (Number.isInteger(target.maxRounds) && target.maxRounds >= 1 ? target.maxRounds : 2)
+                const limitReason = `超打回上限：目标「${target.title || target.id}」已重跑 ${used} 次（上限 ${maxRounds}）`
+                const targetTraceId = nodeTraceId(runId, target.id, targetAttempt)
+                this.attempts.set(target.id, targetAttempt)
+                await this._failNode(runId, target, targetAttempt, targetTraceId, limitReason,
+                  { rejectLimit: true, maxRounds })
+                throw new Error(limitReason)
+              }
+            }
+            const failReason = clip(machineContext.reason || `节点「${node.title || node.id}」判定打回，但状态机无法继续`,
+              2000)
+            this.failedNode = { nodeId: node.id, attempt, reason: failReason }
+            throw new Error(failReason)
+          }
+          const targetId = position.nodeId
+          const target = targetId ? byId.get(targetId) : null
+          if (!target || target.kind !== NODE_KIND.STAGE) {
+            throw new Error(`状态机打回到「${String(targetId)}」，但流程里没有这个阶段节点`)
+          }
+          const edge = this._rejectTriggerEdge(flow, node, targetId)
+          if (!edge) {
+            throw new Error(`状态机打回到「${targetId}」，但流程里没有对应的 reject 边`)
+          }
+          const reason = clip(outcome.rejectReason || '未提供打回原因', 2000)
+          await this._appendRejectTrigger(runId, edge, node, attempt, traceId, targetId, reason)
+          const targetPrevious = this.lastResults.get(target.id) || null
+          // 06 §13.7 B4：把上一轮（目标节点上次 attempt）的证据标识下传，要求本轮全量重报。
+          const previousEvidence = targetPrevious && targetPrevious.evidence ? targetPrevious.evidence : null
+          this.rejectContexts.set(target.id, {
+            fromNodeId: node.id,
+            fromTitle: node.title || node.id,
+            fromAttempt: attempt,
+            reason,
+            rejectTarget: typeof outcome.rejectTarget === 'string' ? outcome.rejectTarget : undefined,
+            findings: outcome.findings,
+            previousEvidence,
+          })
+          // 06 §13.10：打回时把失效路径从 passed 集合移除（只保留沿 next 能到达新目标的记录）。
+          this._invalidatePassedFrom(flow, target.id)
+          // 同一条失效路径上的节点允许被重新执行（否则会被访问集误判成 next 成环）。
+          for (const visitedId of [...visited]) {
+            if (visitedId === target.id || canReachViaNext(flow, target.id, visitedId)) {
+              visited.delete(visitedId)
+            }
+          }
+          arrivedByReject = true
+          continue
+        }
+
+        // PASS：先照旧写 node/end passed / passedNodes，再让机器推进。
+        await this._append(runId, [{
+          kind: 'node/end',
+          nodeId: node.id,
+          attemptId: attempt,
+          traceId,
+          data: {
+            status: 'passed',
+            durationMs,
+            ...(retries > 0 ? { retries } : {}),
+            ...(outcome.membersPartial ? { membersPartial: true } : {}),
+          },
+          ...((outcome.membersPartial || outcome.completedBy) ? {
+            extra: {
+              ...(outcome.membersPartial ? { membersPartial: true } : {}),
+              ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+            },
+          } : {}),
+        }])
+        this.passedNodes.push({
+          nodeId: node.id,
+          title: node.title || node.id,
+          attempt,
+          summary: outcome.summary,
+          artifactPaths: outcome.artifactPaths,
+        })
+        this.current = null
+        const moved = await this._sendMachineEvent(actor,
+          { type: FLOW_EVENTS.PASS, nodeId: node.id, attempt },
+          { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
+        const passPosition = this._machinePosition(moved.snapshot.value)
+        if (passPosition.terminal === 'done') break
+        if (passPosition.terminal) {
+          const failReason = clip(
+            (moved.snapshot.context && moved.snapshot.context.reason)
+            || `状态机在 PASS 后进入 ${passPosition.terminal}`,
+            2000,
+          )
+          this.failedNode = { nodeId: node.id, attempt, reason: failReason }
+          throw new Error(failReason)
+        }
+        if (!passPosition.nodeId) {
+          throw new Error(`状态机在 PASS 后停在无法识别的状态：${JSON.stringify(moved.snapshot.value)}`)
+        }
+        // 下一步在循环顶部按 actor.getSnapshot().value 重新取，不用 selectNextNode。
+      }
+
+      if (this.runTimedOut) {
+        const position = this._machinePosition(actor.getSnapshot().value)
+        if (!position.terminal && position.nodeId) {
+          await this._sendMachineEvent(actor, {
+            type: FLOW_EVENTS.CLOCK_TIMEOUT,
+            kind: 'run',
+            reason: `run 超过墙钟上限（${runTimeoutMs}ms）`,
+          }, {
+            runId,
+            nodeId: position.nodeId,
+            attemptId: this._machineAttemptOf(actor, position.nodeId),
+            version: compiled.version,
+          })
+        }
+        throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
+      }
+      if (signal.aborted && !aborted) {
+        const position = this._machinePosition(actor.getSnapshot().value)
+        if (!position.terminal && position.nodeId) {
+          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: '已停止' }, {
+            runId,
+            nodeId: position.nodeId,
+            attemptId: this._machineAttemptOf(actor, position.nodeId),
+            version: compiled.version,
+          })
+        }
+        aborted = true
+      }
+      const finalPosition = this._machinePosition(actor.getSnapshot().value)
+      if (this.failedNode && !aborted) {
+        // 06 §9 失败隔离：节点失败收口为 run failed，但已通过节点的事件 / 产物一条不动；
+        // failedNodeId 明确告诉查看者「死在哪」，而不是只有一个笼统 reason。
+        const failure = this.failedNode
+        endPatch = [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: {
+            status: 'failed',
+            reason: clip(failure.reason || '节点执行失败', 2000),
+            failedNodeId: failure.nodeId,
+          },
+          extra: {
+            error: 'NodeFailure',
+            detail: clip(failure.reason || '', 256),
+            nodeId: failure.nodeId,
+            ...(Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
+          },
+        }]
+      } else if (aborted || finalPosition.terminal === 'aborted') {
+        endPatch = [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: { status: 'aborted', reason: '已停止' },
+        }]
+      } else if (finalPosition.terminal === 'failed') {
+        // 恢复到一个已经失败的快照 / 机器在没有节点失败记录时收成 #failed。
+        const machineContext = actor.getSnapshot().context || {}
+        const reason = clip(machineContext.reason || '状态机判定失败', 2000)
+        endPatch = [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: { status: 'failed', reason },
+          extra: {
+            error: 'MachineFailure',
+            detail: clip(reason, 256),
+            ...(typeof machineContext.currentNodeId === 'string'
+              ? { nodeId: machineContext.currentNodeId }
+              : {}),
+          },
+        }]
+      } else {
+        endPatch = [{
+          kind: 'run/end',
+          traceId: runTraceId(runId),
+          data: { status: 'done' },
+        }]
+      }
+    } catch (error) {
+      const timedOut = this.runTimedOut
+      const abortedNow = !timedOut && (signal.aborted || isAbortError(error))
+      // 06 §9：失败坐标为 null 时退回 this.current（例如在主循环外抛错时仍尽量指认节点）。
+      const failure = this.failedNode
+        || (this.current ? { nodeId: this.current.node.id, attempt: this.current.attempt } : null)
+      endPatch = [{
+        kind: 'run/end',
+        traceId: runTraceId(runId),
+        data: abortedNow
+          ? { status: 'aborted', reason: '已停止' }
+          : {
+            status: 'failed',
+            reason: clip(error.message || String(error), 2000),
+            ...(failure ? { failedNodeId: failure.nodeId } : {}),
+          },
+        ...(abortedNow ? {} : {
+          extra: {
+            error: clip(error.name || 'Error', 64),
+            detail: clip(error.message || String(error), 256),
+            ...(failure ? { nodeId: failure.nodeId } : {}),
+            ...(failure && Number.isInteger(failure.attempt) ? { attempt: failure.attempt } : {}),
+            ...(error instanceof StructuredOutputError ? { validationError: clip(error.validationError, 256) } : {}),
+            ...(error instanceof NodeTimeoutError ? { timeout: true } : {}),
+            ...(timedOut ? { runTimeout: true } : {}),
+          },
+        }),
+      }]
+    } finally {
+      clearTimeout(deadline)
+      if (leaseTimer) clearInterval(leaseTimer)
+      // -------------------------------------------------------------------
+      // G1-a 收尾顺序（顺序本身就是这段代码的正确性）：
+      //   ① 封口 → ② dispose 节点会话 → ③ 等一次 eventQueue → ④ 写 run/end
+      //   → live:null → ⑤ 释放租约 → 再等一次 eventQueue → _cleanupActive。
+      // 与旧循环逐条一致；状态机只多了一个 finally 里的引用清理。
+      // -------------------------------------------------------------------
+      this._sealSessionEvents(runId)
+      await this._disposeRunSessions(runId)
+      await this.eventQueue.catch(() => {})
+      if (endPatch) {
+        try {
+          await this._append(runId, endPatch)
+        } catch (writeError) {
+          this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+        }
+      }
+      await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
+      // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
+      await this._patchRunBinding(runId)
+      if (active.lease && typeof runstoreModule.releaseLease === 'function') {
+        await runstoreModule.releaseLease(this.runsRoot, runId).catch(error => {
+          this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
+        })
+      }
+      await this._cleanupActive()
+      // 收尾后不再接受 INBOX / SELF_CHECK 观测；下次 run 会重建。
+      this.machineActor = null
+      this.machineVersion = null
+      if (this.machineFingerprints instanceof Map) this.machineFingerprints.delete(runId)
+      this._notifySettled(runId)
+    }
+  }
+
+  /**
+   * 08 §3.1：把 `actor.getSnapshot().value` 翻译成「终态 / 阶段节点 id」。
+   * 顶层 running 的 value 是 `{ running: 'n_a' }`；终态是 `'done'|'failed'|'aborted'`。
+   */
+  _machinePosition(value) {
+    if (value === 'done' || value === 'failed' || value === 'aborted') return { terminal: value, nodeId: null }
+    if (value && typeof value === 'object' && typeof value.running === 'string' && value.running !== '') {
+      return { terminal: null, nodeId: value.running }
+    }
+    return { terminal: null, nodeId: null }
+  }
+
+  /** 机器状态标签：阶段用节点 id，终态补 `#`（与 runlog 的 machine/transition 口径一致）。 */
+  _machineLabel(value) {
+    if (value === 'done' || value === 'failed' || value === 'aborted') return `#${value}`
+    if (value && typeof value === 'object' && typeof value.running === 'string' && value.running !== '') {
+      return value.running
+    }
+    return ''
+  }
+
+  /** 机器 context.attempts[nodeId]（只记打回目标；没记过 = 0）。 */
+  _machineAttemptUsed(actor, nodeId) {
+    let attempts = null
+    try {
+      const snapshot = actor && typeof actor.getSnapshot === 'function' ? actor.getSnapshot() : null
+      attempts = snapshot && snapshot.context ? snapshot.context.attempts : null
+    } catch {
+      attempts = null
+    }
+    const used = attempts && typeof attempts === 'object' ? attempts[nodeId] : undefined
+    return Number.isInteger(used) && used >= 0 ? used : 0
+  }
+
+  /** 阶段节点下一次执行的 attemptId（恢复后也能从机器 context 兜底）。 */
+  _machineAttemptOf(actor, nodeId) {
+    return Math.max(this.attempts.get(nodeId) || 0, this._machineAttemptUsed(actor, nodeId)) + 1
+  }
+
+  /** 取一条 reject 边（只用于 reject/trigger 的 edgeId，不参与「走哪条」的决策）。 */
+  _rejectTriggerEdge(flow, node, targetId) {
+    return (flow.edges || []).find(edge =>
+      edge.kind === EDGE_KIND.REJECT && edge.from === node.id && edge.to === targetId) || null
+  }
+
+  /** 写 reject/trigger（唯一真相仍是 runlog 事件流；edge 缺失时返回 false）。 */
+  async _appendRejectTrigger(runId, edge, node, attempt, traceId, targetId, reason) {
+    if (!edge) return false
+    await this._append(runId, [{
+      kind: 'reject/trigger',
+      nodeId: node.id,
+      attemptId: attempt,
+      traceId,
+      data: {
+        edgeId: String(edge.id),
+        fromNodeId: node.id,
+        toNodeId: targetId,
+        reason,
+      },
+    }])
+    return true
+  }
+
+  /**
+   * 给 actor 发一条事件；若状态真的变了，追加一条 `machine/transition` 观测事件
+   *（节点级：nodeId + attemptId 必带）并按节流口径落一次快照。
+   *
+   * 观测事件写失败只 warn，不影响决策（08 §7：它就是给人看的）。
+   */
+  async _sendMachineEvent(actor, event, { runId, nodeId, attemptId, version } = {}) {
+    if (!actor) return null
+    const before = this._machineLabel(actor.getSnapshot().value)
+    actor.send(event)
+    const snapshot = actor.getSnapshot()
+    const after = this._machineLabel(snapshot.value)
+    if (after !== before && typeof nodeId === 'string' && Number.isInteger(attemptId) && attemptId >= 1) {
+      try {
+        await this._append(runId, [{
+          kind: 'machine/transition',
+          nodeId,
+          attemptId,
+          traceId: nodeTraceId(runId, nodeId, attemptId),
+          data: {
+            ...(before === '' ? {} : { from: before }),
+            to: after,
+            event: String(event.type),
+            version,
+            attempt: attemptId,
+          },
+        }], { live: false })
+      } catch (error) {
+        this.log('warn', `flow-studio: 写 machine/transition 失败（${nodeId}）：${error.message}`)
+      }
+      await this._persistMachine(runId, version, actor)
+    }
+    return { before, after, snapshot }
+  }
+
+  /**
+   * 08 §6：把快照写进 `run.json.machine`。
+   *
+   * 节流口径：**每次转移后写一次、同值不重写**（fingerprint = version + 快照 JSON，
+   * 不含 savedAt）。`snapshot` 先 JSON 往返，保证是 runstore 要求的普通数据对象；
+   * 超 24 KiB 由 runstore 自己裁并置 `machineTruncated`，引擎**不手写**该标志。
+   */
+  async _persistMachine(runId, version, actor) {
+    if (!actor || typeof version !== 'string' || version === '') return null
+    try {
+      const persisted = actor.getPersistedSnapshot()
+      const snapshot = JSON.parse(JSON.stringify(persisted))
+      const fingerprint = `${version}\u0000${JSON.stringify(snapshot)}`
+      if (!(this.machineFingerprints instanceof Map)) this.machineFingerprints = new Map()
+      if (this.machineFingerprints.get(runId) === fingerprint) return null
+      this.machineFingerprints.set(runId, fingerprint)
+      return await this._patchRunBinding(runId, {
+        machine: { version, snapshot, savedAt: isoOf(this.now()) },
+      })
+    } catch (error) {
+      this.log('warn', `flow-studio: 写 run.json.machine 失败（${runId}）：${error.message}`)
+      return null
+    }
+  }
+
+  /**
+   * 08 §6 恢复算法：
+   *   1) `run.json.machine.version === 本地版本` 且快照可用 → `createActor({ snapshot })`；
+   *   2) 否则从事件流重放（`machineEventsFromRun` + `replayMachine`）；
+   *   3) 都失败 → 返回 `{ actor: null, error }`，由调用方按 `machine-restore-failed` 收口。
+   */
+  async _restoreMachineActor(runId, provided, version, stageIds) {
+    let snapshotError = null
+    let stored = null
+    try {
+      const meta = await readRunMeta(this.runsRoot, runId)
+      stored = meta && meta.machine && typeof meta.machine === 'object' ? meta.machine : null
+    } catch (error) {
+      snapshotError = error
+    }
+    const expectedVersion = typeof version === 'string' && version !== ''
+      ? version
+      : machineVersion({ nodes: [] })
+    // XState 对「快照里的状态 id 不存在」可能延迟到微任务才抛（会变成进程级
+    // uncaughtException），所以在 createActor 之前先用本机状态表做形状校验。
+    const knownStages = new Set(Array.isArray(stageIds) ? stageIds : [])
+    const snapshotValue = stored && stored.snapshot && isPlainObject(stored.snapshot)
+      ? stored.snapshot.value
+      : undefined
+    const snapshotPosition = this._machinePosition(snapshotValue)
+    const snapshotShapeOk = snapshotPosition.terminal !== null
+      || (snapshotPosition.nodeId !== null && (knownStages.size === 0 || knownStages.has(snapshotPosition.nodeId)))
+    if (stored && stored.version === expectedVersion && isPlainObject(stored.snapshot) && snapshotShapeOk) {
+      try {
+        const actor = createActor(provided, { snapshot: stored.snapshot })
+        // XState v5 **不会**同步抛「快照不兼容」：它把错误塞进 snapshot.status='error'，
+        // 并对没接 error 通道的 actor 用 setTimeout(() => { throw err }) 异步重抛——
+        // 那会变成进程级 uncaughtException（会打死 dsh-web）。所以必须在 start 之前
+        // 订阅 error，并在 start 后用 status 复核：任何非 active 都当恢复失败走重放。
+        let restoreError = null
+        let restorePhase = true
+        actor.subscribe({
+          error: error => {
+            if (restorePhase) restoreError = restoreError || error
+            else this.log('error', `flow-studio: 状态机错误（${runId}）：${error && error.message ? error.message : String(error)}`)
+          },
+        })
+        actor.start()
+        const restoredSnapshot = actor.getSnapshot()
+        if (restoreError) throw restoreError
+        if (!restoredSnapshot || restoredSnapshot.status !== 'active') {
+          throw new Error(`快照恢复失败：机器进入 ${restoredSnapshot && restoredSnapshot.status ? restoredSnapshot.status : '未知'} 状态`)
+        }
+        const position = this._machinePosition(restoredSnapshot.value)
+        if (position.terminal === null && position.nodeId === null) {
+          throw new Error('快照恢复后的状态无法识别')
+        }
+        restorePhase = false
+        return { actor, source: 'snapshot', snapshotError: null }
+      } catch (error) {
+        snapshotError = error
+        this.log('warn', `flow-studio: 快照恢复失败（${runId}），改走事件重放：${error.message}`)
+      }
+    } else if (stored && stored.version === expectedVersion && isPlainObject(stored.snapshot)) {
+      snapshotError = new Error(`快照里的机器状态不可识别：${JSON.stringify(snapshotValue)}`)
+      this.log('warn', `flow-studio: 快照形状不合法（${runId}），改走事件重放`)
+    }
+    try {
+      const all = await readAllEvents(this.runsRoot, runId)
+      const machineEvents = machineEventsFromRun(all ? all.events : [])
+      const replayed = replayMachine(provided, machineEvents)
+      return { actor: replayed.actor, source: 'replay', replayed: replayed.replayed, snapshotError }
+    } catch (error) {
+      return { actor: null, source: null, error, snapshotError }
+    }
+  }
+
+  /** 把「自审回报」作为观测事件交给 actor（不触发转移，只更新 context；08 §4）。 */
+  _observeMachineSelfCheck(verdict) {
+    const actor = this.machineActor
+    if (!actor || typeof actor.send !== 'function') return
+    try {
+      actor.send({ type: FLOW_EVENTS.SELF_CHECK, verdict: verdict === undefined ? null : verdict })
+    } catch (error) {
+      this.log('warn', `flow-studio: 状态机观测事件 SELF_CHECK 发送失败：${error.message}`)
     }
   }
 

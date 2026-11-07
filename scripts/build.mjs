@@ -42,11 +42,13 @@ const root = resolve(here, '..')
  * 拷贝循环、产物数量断言、src↔lib 字节比对、scripts/verify-build.mjs 全部从它派生。
  */
 export const HOST_MODULES = [
+  'xstate-vendor.js',
   'index.js',
   'model.js',
   'store.js',
   'runlog.js',
   'runstore.js',
+  'flowmachine.js',
   'engine.js',
   'runtime.js',
   'worktree.js',

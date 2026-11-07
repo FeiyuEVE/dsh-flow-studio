@@ -1,6 +1,6 @@
 # dsh-flow-studio
 
-**当前版本：0.8.2**
+**当前版本：0.9.0**
 
 > DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 端用画布拖拽节点，把一条研发流水线画出来，
 > 每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来，
@@ -139,6 +139,23 @@ findings 未解决/已复验、打回计数、阶段进度（打回后旧通过�
 按 `run.json.nodeStatus`（非终态节点）+ `sessions.json` 的 sessionId 重新登记，首轮
 `now + 10min` 排期（重启瞬间不刷一轮）；缺 sessionId 的节点跳过并计数，重复初始化幂等。
 调度器状态本身仍是内存态。
+
+**0.9.0 把「转移决策」换成了状态机内核**（[08 状态机](docs/design/08-state-machine.md)）：
+
+- **只换转移决策**：节点之间的推进从手写 `while + switch` 换成 XState v5 actor——分支、打回、
+  重跑上限、取消、超时都变成机器里的转移与 guard。**节点执行、证据落盘、会话生命周期、supervision
+  全没动**：引擎仍用原来的 `_executeNode` / `_promptNodeSession` / `_runExternalNode` 跑节点，只把
+  「下一个去哪」交给 actor。
+- **XState v5 已 vendored 进仓**：`src/xstate-vendor.js` 是 esbuild 打成的单文件 ESM
+  （`xstate@5.33.3`，只 bundle、未改逻辑），**不新增 npm 运行时依赖**；
+  `node scripts/vendor-xstate.mjs` 可幂等重建，`--check` 校验已提交产物；
+  MIT 许可与 tarball 溯源见 [`THIRD-PARTY.md`](THIRD-PARTY.md)。
+- **事件流是唯一真相，快照只是缓存**：`run.json.machine = { version, snapshot, savedAt }`
+  供恢复加速（runstore 白名单 + 24 KiB 预算，超限裁剪并置 `machineTruncated`），任何冲突以
+  runlog 事件流为准（08 §6）。每次转移额外写一条 `machine/transition` **观测事件**（日志抽屉里的
+  `⇢`）——它只给人看、不参与决策，也不进冻结的 17 种基础事件。
+- **逃生门**：`FLOW_STUDIO_FLOW_MACHINE=0` 回退 0.8.x 的旧主循环（行为逐字节保留，留一个发布周期）。
+- **测试**：**21 个测试文件 / 759 组**全绿（不含 `test/build.test.mjs` 发布门禁）。
 
 ## 在会话里开流程，让主 agent 自己盯着
 
@@ -358,11 +375,23 @@ v0.7 起**保存宽松、启动严格**：`POST /flows` / `PUT /flows/<id>` 只�
 ```sh
 npm install
 npm run build      # src/client/entry.js -> lib/client.js（esbuild，单文件 ≈403 KB，含 React Flow 12）+ 复制 Host 模块
-npm test           # 20 个自检文件，共 713 组（其中 8 个套件显式计数，合计 3525 条断言）
+npm test           # 22 个自检文件（含 build.test.mjs 发布门禁）；21 个功能套件共 759 组（其中 9 个套件显式计数，合计 3869 条断言）
 node scripts/verify-build.mjs  # 只读发布前校验：src↔lib 逐字节一致 + main 入口存在（npm pack 前也会自动 build）
 node test/render.test.mjs   # SSR + 构建产物加载，78 组
 bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引擎）
 ```
+
+### 测试纪律：不要对 XState 内部对象做断言
+
+0.9.0 发布前差点被一条测试写法搞挂：对 **XState 内部对象**（`StateNode`、`transition`、`snapshot`、
+`machine.states.*`）做 `assert.equal` / `assert.deepEqual`。断言失败时 Node 会 `inspect` 整个机器引用图——
+**单次失败实测分配约 4 GB**（rss 51 MB → 4126 MB），进程 45 秒涨到 22 GB，打爆宿主 dsh-web 的
+24 GB cgroup，服务被重启。
+
+- **只对纯数据断言**：`machine.config.initial`、`Object.keys(machine.states)`、
+  `transition.target.map(n => n.id)`、JSON 往返后的快照（`JSON.parse(JSON.stringify(snapshot))`）。
+- 需要看结构时先降维成普通对象，永远不要把 `StateNode` / actor 本体交给断言库。
+- 跑测试一律带时间与内存上限：`timeout 300 node --max-old-space-size=2048 test/xxx.test.mjs`。
 
 - `test/model.test.mjs` —— 出厂模板合法（六个阶段默认「主管 + 3 个子 agent」，往返保存不丢成员）、坏数据收敛、四类结构错误能被抓出来、未知字段进 `extras` 不丢。
 - `test/geometry.test.mjs` —— 世界边界唯一来源、fit 公式与 15% 地板、6 槽与第 7 条降级、tie-break 与输入顺序无关。
@@ -377,7 +406,13 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 - `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器；
   D 组覆盖 `nodeStatus` 的 256 KiB 字节预算与裁剪顺序、`nodeStatusTruncated`、损坏 `run.json` 备份且拒绝覆盖、并发 append 的 seq 单调、`startOptions` 白名单。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
-- `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、
+- `test/flowmachine.test.mjs` —— 状态机编译纯函数：版本哈希只含影响转移的字段、状态/边集与 flow 一致、
+  pass 链 / 显式与兜底打回 / 打回上限 / 未知 verdict / 超时与取消、持久化往返、事件流重放等价、
+  非法 flow 矩阵（12 组 / 251 断言）。
+- `test/engine-machine.test.mjs` —— 引擎 × 状态机：同一组行为用例分别跑 actor 驱动与
+  `FLOW_STUDIO_FLOW_MACHINE=0` 旧循环；机器专属覆盖 `run.json.machine` 落盘、`machine/transition`、
+  快照恢复 / 版本不匹配重放 / 恢复失败收口（25 组 / 136 断言）。
+- `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑（含 reject 边两端必须是阶段节点的启动校验）、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、
   预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门；
   v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）；
   v0.8 组覆盖节点闹钟：建会话即登记、attempt 结束注销先于 run 收尾、打回重跑重新登记、`node/status`
@@ -421,7 +456,8 @@ bash scripts/e2e-docker.sh  # 容器测试台端到端（真装真跑，桩引�
 
 已交付：0.3 运行日志与指标、0.4 执行引擎、0.5 会话内启停与健康审计、0.6 流程收件箱、
 0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision）、
-0.8 节点闹钟（每个节点主管会话的结构化自审与提前完成信号）。
+0.8 节点闹钟（每个节点主管会话的结构化自审与提前完成信号）、
+0.9 状态机内核（XState v5 vendored，转移决策 actor 化）。
 
 未排期：
 

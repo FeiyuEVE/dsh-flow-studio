@@ -46,7 +46,8 @@ $DSH_HOME/flow-studio/runs/
 | `run/start` | `flowId`、`flowName`、`nodeTotal` | 引擎 |
 | `run/end` | `status`（`done`/`aborted`/`failed`）、`reason?` | 引擎 |
 | `node/start` | `title`、`mode`（`single`/`team`）、`model?`、`skills[]` | 引擎 |
-| `node/end` | `status`（`passed`/`rejected`/`failed`/`skipped`）、`durationMs` | 引擎 |
+| `node/end` | `status`（`passed`/`rejected`/`failed`/`skipped`）、`durationMs`、`rejectTarget?`（判定打回时指定的上游目标节点 id；08 §6 事件重放靠它复现显式打回目标，没指定时不出现） | 引擎 |
+| `machine/transition` | `from?`、`to`、`event`、`version?`、`attempt?`（`from`/`to`/`event` ≤64 字符，`version` ≤200，`attempt` 为 ≥1 的整数） | 引擎 |
 | `member/start` | `name`、`role?`、`model?` | 引擎 |
 | `member/end` | `status`（`passed`/`failed`/`aborted`/`partial`）、`durationMs` | 引擎 |
 | `model/call` | `provider`、`model`、`usage`（见 §3）、`stopReason?` | 宿主事件归集 |
@@ -58,6 +59,8 @@ $DSH_HOME/flow-studio/runs/
 | `review/finding` | `id`、`severity`（`P0`/`P1`/`P2`）、`category?`、`title`、`status`（`open`/`accepted`/`fixed`/`verified`/`dismissed`） | `structured_output` |
 | `review/verdict` | `verdict`（`approve`/`reject`）、`findingCount` | `structured_output` |
 | `check/form` | `ruleSetId`、`ruleSetVersion`、`executor`、`state`（`pass`/`fail`/`skipped`/`na`）、`passedChecks?`、`totalChecks?`、`reportRef?` | 规范检查器 |
+
+`machine/transition` 属于 v1.6 扩展事件（08 §7），**不进**本节冻结的 17 种基础事件：它**纯观测**、不参与转移决策；与 `INBOX_EVENT_KINDS`、`NODE_STATUS_EVENT_KINDS` 同模式单独导出为 `MACHINE_EVENT_KINDS`、校验器取并集，为的是扩展不污染冻结契约。
 
 ## 3 用量（token）四桶
 

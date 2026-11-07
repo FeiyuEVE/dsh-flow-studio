@@ -2,22 +2,33 @@
 /**
  * 运行日志纯函数自检：事件校验 / 归一化 / 有界 extra / 聚合口径 / quality 不给绿灯。
  *
- * 不需要浏览器也不碰 fs：直接 `node test/runlog.test.mjs`。
+ * 不需要浏览器；除「落盘后 readAllEvents 读回」一组用 `.tmp/` 造临时 run 目录外，其余
+ * 都是纯函数、不碰 fs：直接 `node test/runlog.test.mjs`。
  */
 
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
-  EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex, computeAcceptance,
-  computeAgentActivity, computeConflicts, computeFindings, computeProgress, computeQuality, computeRejects,
-  computeSkillUsage, computeStaleFails, computeTests, computeTokens, isSafeRelPath, normalizeEvent,
-  renderRunMarkdown, summarize, summarizeAcceptance,
+  EVENT_KINDS, MACHINE_EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex,
+  computeAcceptance, computeAgentActivity, computeConflicts, computeFindings, computeProgress, computeQuality,
+  computeRejects, computeSkillUsage, computeStaleFails, computeTests, computeTokens, isSafeRelPath,
+  machineTransitionSummary, normalizeEvent, renderRunMarkdown, summarize, summarizeAcceptance,
 } from '../src/runlog.js'
 import * as engineModule from '../src/engine.js'
 
 let checks = 0
 function check(name, fn) {
   fn()
+  checks += 1
+  console.log(`  ✓ ${name}`)
+}
+
+/** 需要 await 的检查（落盘 / readAllEvents 往返）：顺序执行，不并发。 */
+async function checkAsync(name, fn) {
+  await fn()
   checks += 1
   console.log(`  ✓ ${name}`)
 }
@@ -1474,6 +1485,120 @@ check('v0.8 节点闹钟：node/status 的坏输入逐条拒绝（枚举/越界/
     kind: 'node/status',
     data: { state: 'working', progress: 1, members: Array.from({ length: 21 }, () => ({ name: 'x' })) },
   }), 'data.members')
+})
+
+console.log('runlog.js · 状态机转移观测（machine/transition，08 §7）')
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+/** machine/transition 事件夹具；顶层 nodeId + attemptId 沿用节点级事件口径。 */
+function transition(over = {}, dataOver = {}) {
+  return base({
+    kind: 'machine/transition',
+    nodeId: 'n_a',
+    data: { from: 'n_a', to: 'n_b', event: 'PASS', ...dataOver },
+    ...over,
+  })
+}
+
+check('machine/transition 白名单：走独立扩展数组，v1.0 的 EVENT_KINDS 仍是 17 种且不可变', () => {
+  assert.ok(Object.isFrozen(MACHINE_EVENT_KINDS), '扩展白名单同样不可变')
+  assert.deepEqual([...MACHINE_EVENT_KINDS], ['machine/transition'])
+  assert.equal(EVENT_KINDS.length, 17, 'machine/transition 不进 05 §2 冻结的 17 种基础事件')
+  assert.equal(EVENT_KINDS.includes('machine/transition'), false)
+  assert.equal(ok(transition()).kind, 'machine/transition')
+})
+
+check('machine/transition 最小合法：只有 to + event 通过（from / version / attempt 不补默认值）', () => {
+  const event = ok(base({ kind: 'machine/transition', data: { to: 'n_b', event: 'PASS' } }))
+  assert.deepEqual(event.data, { to: 'n_b', event: 'PASS' })
+  // from / version 的空串与纯空白都视为「没写」，不整条拒绝、也不写回空串。
+  for (const blank of ['', '   ']) {
+    const minimal = ok(base({ kind: 'machine/transition', data: { from: blank, version: blank, to: 'n_b', event: 'PASS' } }))
+    assert.equal(Object.hasOwn(minimal.data, 'from'), false)
+    assert.equal(Object.hasOwn(minimal.data, 'version'), false)
+  }
+})
+
+check('machine/transition 必填 / 有界：to、event 缺失或空串、from 超 64、version 超 200 → 拒绝', () => {
+  bad(base({ kind: 'machine/transition', data: { event: 'PASS' } }), 'data.to')
+  bad(base({ kind: 'machine/transition', data: { to: '', event: 'PASS' } }), 'data.to')
+  bad(base({ kind: 'machine/transition', data: { to: '   ', event: 'PASS' } }), 'data.to')
+  bad(base({ kind: 'machine/transition', data: { to: 'n'.repeat(65), event: 'PASS' } }), 'data.to')
+  bad(base({ kind: 'machine/transition', data: { to: 'n_b' } }), 'data.event')
+  bad(base({ kind: 'machine/transition', data: { to: 'n_b', event: '' } }), 'data.event')
+  bad(base({ kind: 'machine/transition', data: { to: 'n_b', event: 'P'.repeat(65) } }), 'data.event')
+  bad(transition({}, { from: 'a'.repeat(65) }), 'data.from')
+  bad(transition({}, { version: 'v'.repeat(201) }), 'data.version')
+  // 只放宽「空串」，不放宽类型：数字 / 对象照旧拒绝。
+  bad(transition({}, { from: 7 }), 'data.from')
+  bad(transition({}, { version: 7 }), 'data.version')
+})
+
+check('machine/transition attempt：0 / 1.5 / "2" / 负数 → 整条拒绝；1 与 2 通过', () => {
+  bad(transition({}, { attempt: 0 }), 'data.attempt')
+  bad(transition({}, { attempt: 1.5 }), 'data.attempt')
+  bad(transition({}, { attempt: '2' }), 'data.attempt')
+  bad(transition({}, { attempt: -1 }), 'data.attempt')
+  bad(transition({}, { attempt: Number.POSITIVE_INFINITY }), 'data.attempt')
+  assert.equal(ok(transition({}, { attempt: 1 })).data.attempt, 1)
+  assert.equal(ok(transition({}, { attempt: 2 })).data.attempt, 2)
+})
+
+check('machine/transition 未知多余键：按 validateData 既有口径保留（不是 message/* 的严格白名单）', () => {
+  const event = ok(transition({}, { note: '额外字段', nested: { a: 1 } }))
+  assert.equal(event.data.note, '额外字段')
+  assert.deepEqual(event.data.nested, { a: 1 })
+  // 已知字段仍按契约归一化：空 from 被删掉，不会被「保留未知键」的口径带回来。
+  const withBlank = ok(transition({}, { from: '', note: 'x' }))
+  assert.equal(Object.hasOwn(withBlank.data, 'from'), false)
+  assert.equal(withBlank.data.note, 'x')
+})
+
+check('machine/transition 是节点级事件：缺 nodeId / attemptId 一样拒绝（run 级写法不合法）', () => {
+  bad({ ...base({ kind: 'machine/transition', data: { to: 'n_b', event: 'PASS' } }), nodeId: undefined }, 'nodeId')
+  bad({ ...base({ kind: 'machine/transition', data: { to: 'n_b', event: 'PASS' } }), attemptId: undefined }, 'attemptId')
+})
+
+check('摘要行两态：无 attempt = `n_a → n_b · PASS`；有 attempt 追加 ` · attempt=2`', () => {
+  assert.equal(machineTransitionSummary({ from: 'n_a', to: 'n_b', event: 'PASS' }), 'n_a → n_b · PASS')
+  assert.equal(
+    machineTransitionSummary({ from: 'n_a', to: 'n_b', event: 'PASS', attempt: 2 }),
+    'n_a → n_b · PASS · attempt=2',
+  )
+  // 初始态没有 from：不编造起点；非整数 attempt 不展示。
+  assert.equal(machineTransitionSummary({ to: 'n_a', event: 'CLOCK_TIMEOUT' }), '? → n_a · CLOCK_TIMEOUT')
+  assert.equal(
+    machineTransitionSummary({ from: 'n_a', to: '#done', event: 'PASS', attempt: 1.5 }),
+    'n_a → #done · PASS',
+  )
+})
+
+await checkAsync('machine/transition 全字段：通过校验，落盘后 readAllEvents 原样读回', async () => {
+  const event = ok(transition({}, {
+    from: 'n_a',
+    to: 'n_b',
+    event: 'REJECT',
+    version: 'v1-0123456789abcdef',
+    attempt: 2,
+  }))
+  assert.deepEqual(event.data, {
+    from: 'n_a', to: 'n_b', event: 'REJECT', version: 'v1-0123456789abcdef', attempt: 2,
+  })
+  const store = await import('../src/runstore.js')
+  mkdirSync(join(REPO_ROOT, '.tmp'), { recursive: true })
+  const home = mkdtempSync(join(REPO_ROOT, '.tmp', 'runlog-machine-'))
+  try {
+    const runsRoot = store.runsDir(home)
+    const meta = await store.createRun(runsRoot, { id: RUN, flowId: 'flow-machine', nodeTotal: 2 })
+    await store.appendEvents(runsRoot, meta.id, [event], { now: NOW })
+    const read = await store.readAllEvents(runsRoot, meta.id)
+    assert.equal(read.events.length, 1)
+    // seq 由 runstore 追加；其余字段（含 data 全字段）必须原样回来。
+    assert.deepEqual(read.events[0], { ...event, seq: 1 })
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 console.log(`\n${checks} 组通过`)

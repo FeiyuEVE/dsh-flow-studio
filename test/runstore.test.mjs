@@ -1902,6 +1902,324 @@ process.stdout.write('OK:' + total)
     assert.ok(!('warnings' in plain.worktree))
     console.log('  · root/warnings 透传；root=123 / 相对路径 → 丢键；warnings 非数组 → 忽略、非法项过滤、每条≤500、最多 20')
   })
+
+  console.log('runstore.js · D4 machine 状态机快照（24 KiB 独立预算）')
+
+  await check('D4 machine：正常写入 / 落盘 / 读回 deepEqual（含 savedAt）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const machine = {
+      version: 'xstate-5.19.0',
+      snapshot: {
+        status: 'active',
+        value: { flow: 'run', node: 'n_1' },
+        context: { attempt: 2, nodeIds: ['n_1', 'n_2'], retry: { count: 1, lastError: null } },
+        children: {},
+        historyValue: {},
+      },
+      savedAt: '2026-11-07T02:15:00.000Z',
+    }
+    const written = await store.writeRunMeta(runsRoot, meta.id, { machine })
+    assert.deepEqual(written.machine, machine, 'writeRunMeta 返回值应原样带 machine')
+    assert.ok(!('machineTruncated' in written), '没裁剪就不该出现裁剪标志')
+    assert.equal(written.droppedKeys, undefined, '没有未知键时不该有 droppedKeys')
+
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.deepEqual(disk.machine, machine, '落盘必须原样保留（含 savedAt）')
+    assert.ok(!('machineTruncated' in disk), '未裁剪时 machineTruncated 不该凭空出现')
+    const reread = await store.readRunMeta(runsRoot, meta.id)
+    assert.deepEqual(reread.machine, machine, '读回必须 deepEqual')
+    assert.ok(!('machineTruncated' in reread))
+    // savedAt 长度上限 64：正常 ISO 带偏移量也能原样保留（不改写成 Z）。
+    const offset = await store.writeRunMeta(runsRoot, meta.id, {
+      machine: { version: 'xstate-5.19.0', savedAt: '2026-11-07T10:15:00+08:00' },
+    })
+    assert.equal(offset.machine.savedAt, '2026-11-07T10:15:00+08:00')
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).machine.savedAt, '2026-11-07T10:15:00+08:00')
+
+    // 整条替换语义：再写一次就换掉，不是深合并（旧 snapshot 不会残留）。
+    const replaced = { version: 'xstate-5.20.0', snapshot: { status: 'done' }, savedAt: '2026-11-07T03:00:00.000Z' }
+    const second = await store.writeRunMeta(runsRoot, meta.id, { machine: replaced })
+    assert.deepEqual(second.machine, replaced)
+    assert.deepEqual(JSON.parse(readFileSync(metaPath, 'utf8')).machine, replaced)
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).machine, replaced)
+    console.log(`  · machine（snapshot ${Buffer.byteLength(JSON.stringify(machine.snapshot), 'utf8')} 字节）写入 / 读回 deepEqual；整条替换生效`)
+  })
+
+  await check('D4 snapshot 超 24 KiB：只裁快照（version / savedAt 保留）、machineTruncated 落盘且读回可见', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    // 同 patch 里放一份正常 nodeStatus：machine 被裁不得牵连另一条通道。
+    const nodeStatus = { n_1: { state: 'working', progress: 50, summary: '跑着' } }
+    const snapshot = {
+      status: 'active',
+      value: 'node',
+      context: { log: Array.from({ length: 40 }, (_, index) => `L${index}-${'x'.repeat(1024)}`) },
+    }
+    const snapshotBytes = Buffer.byteLength(JSON.stringify(snapshot), 'utf8')
+    assert.ok(snapshotBytes > store.MAX_MACHINE_SNAPSHOT_BYTES, `夹具应超 24 KiB（实际 ${snapshotBytes}）`)
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, {
+      nodeStatus,
+      machine: { version: 'xstate-5.19.0', snapshot, savedAt: '2026-11-07T04:00:00.000Z' },
+    })
+    assert.deepEqual(written.machine, { version: 'xstate-5.19.0', savedAt: '2026-11-07T04:00:00.000Z' },
+      '超预算只丢 snapshot，version 与 savedAt 必须保留')
+    assert.equal(written.machineTruncated, true, '裁剪必须可观测（不静默）')
+    assert.equal(written.machine.snapshot, undefined)
+    assert.equal(written.nodeStatus.n_1.state, 'working', 'nodeStatus 不得受 machine 裁剪影响')
+    assert.equal(written.nodeStatus.n_1.progress, 50)
+    assert.ok(!('nodeStatusTruncated' in written), 'machine 裁剪不得置 nodeStatusTruncated')
+
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.deepEqual(disk.machine, { version: 'xstate-5.19.0', savedAt: '2026-11-07T04:00:00.000Z' })
+    assert.equal(disk.machineTruncated, true, 'machineTruncated 必须落盘')
+    assert.ok(!('snapshot' in disk.machine), '超预算的 snapshot 不能落盘')
+    assert.equal(disk.nodeStatus.n_1.state, 'working')
+    assert.ok(!('nodeStatusTruncated' in disk))
+
+    const reread = await store.readRunMeta(runsRoot, meta.id)
+    assert.deepEqual(reread.machine, disk.machine, '读回仍是「version 在、snapshot 不在」')
+    assert.equal(reread.machineTruncated, true, '读回必须仍能看到裁剪标志')
+    console.log(`  · snapshot ${snapshotBytes} 字节 → 裁掉；version/savedAt 保留；machineTruncated=true 落盘；nodeStatus 原样`)
+  })
+
+  await check('D4 写路径严格：machine 非对象 / version 空或超 200 / snapshot 非对象 → 400 且未落盘', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    await store.writeRunMeta(runsRoot, meta.id, { machine: { version: 'v-good', snapshot: { status: 'idle' } } })
+    const before = readFileSync(metaPath, 'utf8')
+    const cases = [
+      [{ machine: 'nope' }, 'machine', /machine/],
+      [{ machine: 42 }, 'machine', /machine/],
+      [{ machine: [] }, 'machine', /machine/],
+      [{ machine: {} }, 'machine', /version/],
+      [{ machine: { version: '' } }, 'machine', /version/],
+      [{ machine: { version: '   ' } }, 'machine', /version/],
+      [{ machine: { version: 7 } }, 'machine', /version/],
+      [{ machine: { version: 'v'.repeat(201) } }, 'machine', /200/],
+      [{ machine: { version: 'v', snapshot: [] } }, 'machine', /snapshot/],
+      [{ machine: { version: 'v', snapshot: 'nope' } }, 'machine', /snapshot/],
+      [{ machine: { version: 'v', snapshot: null } }, 'machine', /snapshot/],
+      [{ machineTruncated: 'yes' }, 'machineTruncated', /布尔/],
+      [{ machineTruncated: 1 }, 'machineTruncated', /布尔/],
+    ]
+    for (const [patch, field, pattern] of cases) {
+      await assert.rejects(
+        () => store.writeRunMeta(runsRoot, meta.id, patch),
+        error => error.status === 400 && error.field === field && pattern.test(error.reason),
+        `应拒绝：${JSON.stringify(patch).slice(0, 80)}`,
+      )
+    }
+    assert.equal(readFileSync(metaPath, 'utf8'), before, '被拒的 patch 一个字节都不能落盘')
+    // 被拒之后旧 machine 原样还在（400 不破坏已有快照）。
+    assert.deepEqual((await store.readRunMeta(runsRoot, meta.id)).machine,
+      { version: 'v-good', snapshot: { status: 'idle' } })
+    console.log(`  · ${cases.length} 类非法 machine patch 全部 400（field=machine / machineTruncated）且未落盘`)
+  })
+
+  await check('D4 与 nodeStatus 独立：同一 patch 里约 260 KiB nodeStatus 被裁、machine 完整保留', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 30 节点 × 20 成员 × 200 字姓名 + 200 字备注 ≈ 280 KiB：规范化后刚好压着 256 KiB 预算并略微超出，
+    // 触发 D2 的裁剪（先摘 note），同时检验 machine 完全不受影响。
+    const nodeStatus = nodeStatusFixture(30, { membersPerNode: 20, nameChars: 200, noteChars: 200 })
+    const nodeBytes = Buffer.byteLength(JSON.stringify(nodeStatus), 'utf8')
+    assert.ok(nodeBytes > store.MAX_NODE_STATUS_BYTES, `夹具应超 256 KiB（实际 ${nodeBytes}）`)
+    assert.ok(nodeBytes < store.MAX_NODE_STATUS_BYTES * 1.2, `夹具应「接近」预算（实际 ${nodeBytes}）`)
+    const machine = {
+      version: 'xstate-5.19.0',
+      snapshot: { status: 'active', value: 'n_0', context: { attempt: 1 } },
+      savedAt: '2026-11-07T05:00:00.000Z',
+    }
+
+    const written = await store.writeRunMeta(runsRoot, meta.id, { nodeStatus, machine })
+    assert.equal(written.nodeStatusTruncated, true, 'nodeStatus 超预算必须裁剪')
+    assert.deepEqual(written.machine, machine, 'nodeStatus 裁剪不得动 machine')
+    assert.ok(!('machineTruncated' in written), 'nodeStatus 裁剪不得置 machineTruncated')
+
+    const disk = JSON.parse(readFileSync(join(runsRoot, meta.id, 'run.json'), 'utf8'))
+    assert.deepEqual(disk.machine, machine, 'machine 必须原样落盘（两条通道各量各的字节）')
+    assert.ok(!('machineTruncated' in disk))
+    assert.equal(disk.nodeStatusTruncated, true)
+    const statusBytes = Buffer.byteLength(JSON.stringify(disk.nodeStatus), 'utf8')
+    assert.ok(statusBytes <= store.MAX_NODE_STATUS_BYTES,
+      `落盘 nodeStatus ${statusBytes} 字节应 ≤ 预算 ${store.MAX_NODE_STATUS_BYTES}`)
+    assert.ok(Object.keys(disk.nodeStatus).length > 0, '裁剪不是整块清空')
+    const reread = await store.readRunMeta(runsRoot, meta.id)
+    assert.deepEqual(reread.machine, machine)
+    assert.ok(!('machineTruncated' in reread))
+    console.log(`  · nodeStatus ${nodeBytes} → ${statusBytes} 字节（已裁）；machine ${Buffer.byteLength(JSON.stringify(disk.machine), 'utf8')} 字节原样`)
+  })
+
+  await check('D4 未传 machine → run.json 无该键；machine:null 清除（含 machineTruncated）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    // 未传过 → run.json 里不该出现 machine / machineTruncated（不凭空造键）。
+    let disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.ok(!('machine' in disk), '未传就不该出现 machine')
+    assert.ok(!('machineTruncated' in disk), '未传就不该出现 machineTruncated')
+
+    // 写一条被裁剪的 machine（带 machineTruncated:true），再由 machine:null 一次清干净。
+    await store.writeRunMeta(runsRoot, meta.id, {
+      machine: { version: 'v1', snapshot: { pad: 'p'.repeat(40 * 1024) } },
+    })
+    disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.deepEqual(disk.machine, { version: 'v1' })
+    assert.equal(disk.machineTruncated, true)
+
+    const cleared = await store.writeRunMeta(runsRoot, meta.id, { machine: null })
+    assert.ok(!('machine' in cleared), 'machine:null 必须清除整条快照')
+    assert.ok(!('machineTruncated' in cleared), 'machine:null 必须连裁剪标志一起清除')
+    disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.ok(!('machine' in disk), '清除后 run.json 里不该再有 machine')
+    assert.ok(!('machineTruncated' in disk), '清除后 run.json 里不该再有 machineTruncated')
+    assert.ok(!('machine' in (await store.readRunMeta(runsRoot, meta.id))))
+
+    // machineTruncated 显式 false / null 都能清除标志（machine 本体保留）。
+    await store.writeRunMeta(runsRoot, meta.id, {
+      machine: { version: 'v2', snapshot: { pad: 'p'.repeat(40 * 1024) } },
+    })
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).machineTruncated, true)
+    await store.writeRunMeta(runsRoot, meta.id, { machineTruncated: false })
+    const afterFalse = await store.readRunMeta(runsRoot, meta.id)
+    assert.ok(!('machineTruncated' in afterFalse))
+    assert.deepEqual(afterFalse.machine, { version: 'v2' })
+
+    // 再置回 true，然后用 null 清除（null 不算类型错，与 false 同义）。
+    await store.writeRunMeta(runsRoot, meta.id, { machineTruncated: true })
+    assert.equal((await store.readRunMeta(runsRoot, meta.id)).machineTruncated, true)
+    await store.writeRunMeta(runsRoot, meta.id, { machineTruncated: null })
+    const afterNull = await store.readRunMeta(runsRoot, meta.id)
+    assert.ok(!('machineTruncated' in afterNull), 'machineTruncated:null 必须清除标志')
+    assert.deepEqual(afterNull.machine, { version: 'v2' })
+    console.log('  · 未传不出现；machine:null 连裁剪标志一起清除；machineTruncated:false / null 都能清除')
+  })
+
+  await check('D4 未知内层键进 droppedKeys（machine.xxx）；读路径对坏 machine 宽松', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const written = await store.writeRunMeta(runsRoot, meta.id, {
+      machine: {
+        version: 'v1',
+        snapshot: { status: 'idle' },
+        savedAt: '2026-11-07T06:00:00.000Z',
+        status: 'should-be-dropped',
+        checksum: 'abc',
+        nested: { a: 1 },
+      },
+    })
+    assert.deepEqual([...written.droppedKeys].sort(), ['machine.checksum', 'machine.nested', 'machine.status'])
+    assert.deepEqual(written.machine,
+      { version: 'v1', snapshot: { status: 'idle' }, savedAt: '2026-11-07T06:00:00.000Z' })
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    assert.deepEqual(disk.machine, written.machine, '未知内层键不落盘')
+    // droppedKeys 仍是不进 JSON 的不可枚举诊断属性。
+    assert.equal(Object.prototype.propertyIsEnumerable.call(written, 'droppedKeys'), false)
+    assert.ok(!JSON.stringify(written).includes('droppedKeys'))
+    assert.ok(!('droppedKeys' in disk))
+
+    // 读路径宽松：手改坏的 machine 只丢 machine（或其中坏键），绝不报错、不影响其它字段。
+    // ① version 坏（非字符串 / 超 200 字符 / 空）→ 整条 machine 丢弃。
+    for (const badVersion of [42, 'v'.repeat(201), '', null]) {
+      const raw = JSON.parse(readFileSync(metaPath, 'utf8'))
+      raw.machine = { version: badVersion, snapshot: { a: 1 } }
+      raw.machineTruncated = true
+      raw.name = '手工改过的 run'
+      writeFileSync(metaPath, `${JSON.stringify(raw, null, 2)}\n`)
+      const reread = await store.readRunMeta(runsRoot, meta.id)
+      assert.ok(reread, `version=${String(badVersion)}：run 必须仍然可读`)
+      assert.equal(reread.name, '手工改过的 run', '其它字段不受影响')
+      assert.ok(!('machine' in reread), `version=${String(badVersion)}：坏版本号应整条丢弃`)
+      assert.ok(!('machineTruncated' in reread), '没有 machine 时裁剪标志也没有意义')
+    }
+
+    // ② snapshot 坏 / 超限 → 丢 snapshot、保 version，并标裁剪（可见，不静默）。
+    for (const [label, badSnapshot] of [
+      ['字符串', 'nope'],
+      ['数组', [{ a: 1 }]],
+      ['null', null],
+      ['超 24 KiB', { pad: 'q'.repeat(40 * 1024) }],
+    ]) {
+      const raw = JSON.parse(readFileSync(metaPath, 'utf8'))
+      raw.machine = { version: 'v9', snapshot: badSnapshot, savedAt: '2026-11-07T06:00:00.000Z' }
+      delete raw.machineTruncated
+      writeFileSync(metaPath, `${JSON.stringify(raw, null, 2)}\n`)
+      const reread = await store.readRunMeta(runsRoot, meta.id)
+      assert.deepEqual(reread.machine,
+        { version: 'v9', savedAt: '2026-11-07T06:00:00.000Z' }, `snapshot=${label}：只丢快照`)
+      assert.equal(reread.machineTruncated, true, `snapshot=${label}：裁剪必须可见`)
+    }
+
+    // ③ savedAt 坏（非 ISO / 超 64 字符）→ 只丢该键；未知内层键读侧也丢弃。
+    for (const badSavedAt of ['not-a-date', 'x'.repeat(65), 123]) {
+      const raw = JSON.parse(readFileSync(metaPath, 'utf8'))
+      raw.machine = {
+        version: 'v9', snapshot: { a: 1 }, savedAt: badSavedAt, status: 'x', checksum: 'y',
+      }
+      delete raw.machineTruncated
+      writeFileSync(metaPath, `${JSON.stringify(raw, null, 2)}\n`)
+      const reread = await store.readRunMeta(runsRoot, meta.id)
+      assert.deepEqual(reread.machine, { version: 'v9', snapshot: { a: 1 } },
+        `savedAt=${String(badSavedAt).slice(0, 12)}：只丢该键，未知内层键也丢弃`)
+      assert.ok(!('machineTruncated' in reread), 'savedAt 坏不算快照裁剪')
+    }
+    console.log('  · 未知内层键 → droppedKeys 的 machine.xxx；读路径 4 类坏 version / 4 类坏 snapshot / 3 类坏 savedAt 全部宽松收敛')
+  })
+
+  await check('readEvents 扩展 kind：machine/transition（节点级）/ node/status 不再 400 且能正常过滤', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // machine/transition 是**节点级**事件（必须带 nodeId + attemptId）；event() 默认补齐。
+    const appended = await store.appendEvents(runsRoot, meta.id, [
+      event('node/start', { runId: meta.id }),
+      event('machine/transition', {
+        runId: meta.id,
+        data: { from: 'idle', to: 'running', event: 'START', version: 'v-abc123' },
+      }),
+      event('machine/transition', {
+        runId: meta.id,
+        nodeId: 'n_2',
+        data: { from: 'n_1', to: 'n_2', event: 'NODE_DONE', version: 'v-abc123' },
+      }),
+      event('node/status', { runId: meta.id, data: { state: 'working', progress: 10 } }),
+    ], { now: NOW })
+    assert.equal(appended.events.length, 4)
+
+    // 以前这里的 kinds 白名单是手抄的，扩展 kind 会被当未知类型 400。
+    const machine = await store.readEvents(runsRoot, meta.id, { kinds: ['machine/transition'], limit: 10 })
+    assert.equal(machine.total, 2, 'machine/transition 过滤应可用且只命中该类事件')
+    assert.ok(machine.events.every(item => item.kind === 'machine/transition'))
+    assert.deepEqual(machine.events.map(item => item.data.event), ['START', 'NODE_DONE'])
+    // 节点级事实：nodeId + attemptId 都在事件上（不是 run 级事件）。
+    assert.equal(machine.events[0].nodeId, 'n_1')
+    assert.equal(machine.events[0].attemptId, 1)
+    assert.equal(machine.events[1].nodeId, 'n_2')
+
+    // node/status 是同源的另一个扩展 kind：此前同样漏在白名单外。
+    const status = await store.readEvents(runsRoot, meta.id, { kinds: ['node/status'], limit: 10 })
+    assert.equal(status.total, 1)
+    assert.equal(status.events[0].data.state, 'working')
+
+    // 两个扩展 kind 一起过滤。
+    const both = await store.readEvents(runsRoot, meta.id, {
+      kinds: ['machine/transition', 'node/status'], limit: 10,
+    })
+    assert.equal(both.total, 3)
+    assert.deepEqual(both.events.map(item => item.seq), [2, 3, 4])
+
+    // 白名单只放宽到「runlog 认得的 kind」，未知类型仍然 400。
+    await assert.rejects(
+      () => store.readEvents(runsRoot, meta.id, { kinds: ['machine/nope'], limit: 10 }),
+      error => error.status === 400 && error.field === 'kind',
+    )
+    console.log(`  · machine/transition ${machine.total} 条、node/status ${status.total} 条、二者合并 ${both.total} 条；未知 kind 仍 400`)
+  })
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

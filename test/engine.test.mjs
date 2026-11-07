@@ -1471,6 +1471,30 @@ try {
     A.equal((await eventsOf(run.id)).filter(event => event.kind === 'node/start').length, 0)
   })
 
+  await check('reject 边两端都必须是阶段节点：end → stage 在 start 前 400（与 flowmachine 同口径）', async () => {
+    const flow = flowOf('flow-rej-from-end', [startNode(), stage('n_a', '开发', 300), endNode()], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_end'),
+      reject('e3', 'n_end', 'n_a'),
+    ])
+    await saveFlow(flow)
+
+    // 纯校验器：必须 ok:false，且错误挂在对应 edgeId 上、文案与 flowmachine 一致。
+    const validation = engineModule.validateFlowForRun(flow)
+    A.equal(validation.ok, false)
+    const hit = validation.errors.find(item => item.edgeId === 'e3')
+    A.ok(Boolean(hit), '必须有一条错误挂在 edgeId=e3 上')
+    A.match(hit.message, /打回线「n_end → n_a」的两端都必须是阶段节点/)
+
+    // 启动路径：engine.start 是 POST /runs/<id>/start 的底层入口，必须 400 且不开跑。
+    const run = await makeRun('flow-rej-from-end', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+    await assert.rejects(() => engine.start(run.id), error => error instanceof EngineError
+      && error.status === 400 && /两端都必须是阶段节点/.test(error.message))
+    assertionCount += 1
+    A.equal((await eventsOf(run.id)).filter(event => event.kind === 'node/start').length, 0)
+  })
+
   await check('run 级步数上限（阶段数 × 3）：超限 failed，不 done', async () => {
     const flow = flowOf('flow-steps', [startNode(), stage('n_a', '开发', 300, { maxRounds: 99 }), stage('n_b', '测试', 600), endNode()], [
       next('e1', 'n_start', 'n_a'),

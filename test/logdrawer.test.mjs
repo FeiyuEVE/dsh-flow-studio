@@ -32,7 +32,7 @@ const {
   AGENT_ACTIVITY_LIMIT, DRAWER_ZOOM_LEVELS, FsLogDrawer, LogTextOverlay,
   activityMessagesOf, drawerEscapeAction, drawerZoomInfo, eventKey, eventLongTextOf,
   lowerDrawerZoom, nodeActivityOf, nodeArtifactsOf, nodeToolsOf, nodeUsageOf,
-  normalizeDrawerZoom, raiseDrawerZoom, EVENT_KINDS, eventSummary,
+  normalizeDrawerZoom, raiseDrawerZoom, EVENT_KINDS, WATCH_EVENT_KINDS, eventSummary,
 } = await import('../src/client/logdrawer.js')
 const { CSS } = await import('../src/client/styles.js')
 
@@ -418,6 +418,19 @@ check('v0.8 事件表：node/status 与 v1.1/v1.6 的 kind 都在列，且有可
   const testLine = eventSummary({ kind: 'test/report', data: { suite: 'unit', executed: 10, passed: 9, failed: 1 } })
   assert.match(testLine, /9\/10/)
   assert.match(testLine, /1 失败/)
+})
+
+check('v0.9 状态机转移：machine/transition 在 kind 表与增量窗口里，摘要可读', () => {
+  assert.ok(EVENT_KINDS.includes('machine/transition'), 'machine/transition 应在 EVENT_KINDS 里')
+  assert.ok(WATCH_EVENT_KINDS.includes('machine/transition'), '运行中增量也要拉转移事件')
+  const withFrom = eventSummary({ kind: 'machine/transition', data: { from: 'n_a', to: 'n_b', event: 'PASS', attempt: 2 } })
+  assert.match(withFrom, /n_a → n_b/)
+  assert.match(withFrom, /PASS/)
+  assert.match(withFrom, /attempt=2/)
+  const resolved = eventSummary({ kind: 'machine/transition', data: { to: '#done', event: 'PASS' } })
+  assert.match(resolved, /#done/)
+  assert.doesNotMatch(resolved, /attempt=/)
+  assert.doesNotMatch(resolved, /未识别/)
 })
 
 console.log(`\n${checks} 组通过`)

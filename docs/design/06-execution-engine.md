@@ -660,8 +660,9 @@ v0.7 的推荐路径是**内建 supervision**：runtime 的唯一调度器轮询
 | `message/in` | `id`、`from`、`text`、`targetNodeId?`、`replyKind?` | `from` ≤200 字符；`text` 按码点截断到 2000；`targetNodeId` 必须是合法节点 id；`replyKind` ∈ session / http / none |
 | `message/out` | `id`、`inReplyTo?`、`text`、`nodeId?`、`delivery` | `text` 按码点截断到 2000；`delivery` ∈ session / http / local |
 
-`EVENT_KINDS`（05 §2 的 17 种基础契约）保持冻结；收件箱事件单独导出为 `INBOX_EVENT_KINDS`，
-校验器接受两者的并集。HTTP 入口的正文上限是 4000 字符，落事件时再截到 2000。
+`EVENT_KINDS`（05 §2 的 17 种基础契约）保持冻结；扩展事件各自独立导出、谁也不追加进 `EVENT_KINDS`：
+收件箱是 `INBOX_EVENT_KINDS`（§16.3）、节点自审是 `NODE_STATUS_EVENT_KINDS`（§19）、状态机转移观测是
+`MACHINE_EVENT_KINDS`（08 §7），校验器接受这几个数组的并集。HTTP 入口的正文上限是 4000 字符，落事件时再截到 2000。
 
 ### 16.4 消息路由表（`POST /api/flow-studio/runs/<runId>/messages`）
 

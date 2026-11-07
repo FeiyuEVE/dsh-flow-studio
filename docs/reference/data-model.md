@@ -45,11 +45,29 @@
 
 ### 保存宽松、启动严格
 
-v0.7 起：`POST /flows` / `PUT /flows/<id>` 只拒绝「不是 JSON 对象」的请求体，`validation.errors` 非空也照存（画布 600ms 防抖自动保存，半成品必须存得下）；真正拦人的是 `POST /runs/<id>/start` 与 `flow_start` 的 `validateFlowForRun`，非法流程返回 400，不会开跑。运行前校验与引擎同一口径（成环 / 多出边 / 打回指向非阶段节点），在发请求之前就拦住。
+v0.7 起：`POST /flows` / `PUT /flows/<id>` 都**不因 `validation.errors` 拒绝**（画布 600ms 防抖自动保存，半成品必须存得下），`nodes: []` / `edges: []`（用户删光节点）同样照存。保存类 400 只剩请求体形状与整份替换的完整性：请求体不是 JSON 对象；`PUT` 额外要求 body 存在、`version` 是正整数、`nodes` / `edges` 是数组（`FLOW_BODY_INCOMPLETE`，0.9.1 起；否则 `normalizeFlow` 会把流程写成空图）；主机开关关闭时含 `executor:'custom'` 的流程也 400（`CUSTOM_EXECUTOR_DISABLED`）；逐条列在 [Host 接口](host-api.md)。真正拦人的是 `POST /runs/<id>/start` 与 `flow_start` 的 `validateFlowForRun`，非法流程返回 400，不会开跑。运行前校验与引擎同一口径（成环 / 多出边 / 打回指向非阶段节点），在发请求之前就拦住。
 
 ### 并发保存
 
 流程文件带 `version`，保存是乐观锁：版本不符返回 **409** 且磁盘零改动；客户端弹出「用我的版本覆盖 / 载入服务器版本」两条出口，不再后写静默覆盖先写。还没有多人实时编辑（看不到对方光标、没有自动合并）。
+
+### 历史备份
+
+0.9.1 起每次覆盖保存前，先把磁盘上的旧版本另存一份——「整份替换」不该是不可逆的；这是兜底，不是主路径（备份失败不挡保存）。布局在 `flows/` 同目录：
+
+```text
+$DSH_HOME/flow-studio/flows/
+  <id>.json                      # 当前版本（原子写）
+  .history/
+    <id>.v<version>.json         # 覆盖前的那一版；每份流程只留最近 3 份
+    deleted/
+      <id>.v<version>.json       # 删除流程后从活动历史挪进来的归档
+```
+
+- 备份以 `version` 命名；同一个 `<id>` 的同一个 `version` **绝不覆盖**已有备份——删除后撤销、按新文件从 v1 重建再保存会再次走到 v1，旧证据必须留着。
+- `.history/` 是目录不是流程文件：不出现在 `GET /flows` 列表里，读取 / 保存路径也不会把它当流程。
+- 保留策略只作用于活动备份：每次写入后按 `version` 倒序只留最近 3 份；`deleted/` 是归档，不参与轮转（需要清理由运维手动处理）。
+- `DELETE /flows/<id>` 成功删掉文件后，才把该 id 的活动历史挪进 `.history/deleted/`（归档重名时加时间戳后缀）；历史目录不存在时静默跳过，不影响删除的返回语义（文件本来就不存在仍是 `false`）。
 
 ## Run 落盘布局
 

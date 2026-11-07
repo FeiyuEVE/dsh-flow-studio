@@ -21,7 +21,7 @@ npm install          # 只在依赖变化时需要
 npm run build
 ```
 
-预期：`lib/client.js` 是 esbuild 单文件（≈403 KB，含 React Flow 12），Host 模块被复制进 `lib/`。构建末尾门禁会核对清单、`lib/` 的 `.js` 集合与 `src↔lib` 逐字节一致。
+预期：`lib/client.js` 是 esbuild 单文件（≈440 KB，含 React Flow 12），Host 模块被复制进 `lib/`。构建末尾门禁会核对清单、`lib/` 的 `.js` 集合与 `src↔lib` 逐字节一致。
 
 ## 3. 发布前校验
 

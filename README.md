@@ -69,7 +69,7 @@ dsh plugin --profile web add ./dsh-flow-studio
 ```sh
 npm install
 npm run build   # src/client/entry.js → lib/client.js（单文件）+ 复制 Host 模块
-npm test        # 22 个自检文件（含发布门禁）；21 个功能套件共 759 组
+npm test        # 22 个自检文件（含发布门禁）；21 个功能套件共 772 组
 ```
 
 完整的本机准备、构建校验、测试纪律（含 XState 内存事故）与发版流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

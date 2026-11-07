@@ -15,9 +15,9 @@ npm install
 ## 构建与发布前校验
 
 ```sh
-npm run build                    # src/client/entry.js → lib/client.js（esbuild 单文件，≈403 KB，含 React Flow 12）+ 复制 Host 模块
+npm run build                    # src/client/entry.js → lib/client.js（esbuild 单文件，≈440 KB，含 React Flow 12）+ 复制 Host 模块
 node scripts/verify-build.mjs    # 只读校验：lib/ 的 .js 集合与清单一致、src↔lib 逐字节相同、main 入口存在
-node test/render.test.mjs        # SSR + 构建产物加载，78 组
+node test/render.test.mjs        # SSR + 构建产物加载，86 组
 bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
@@ -29,7 +29,7 @@ bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩
 npm test
 ```
 
-**22 个自检文件**：`test/build.test.mjs`（发布门禁）+ 21 个功能套件共 **759 组**（其中 9 个套件显式计数，合计 3869 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
+**22 个自检文件**：`test/build.test.mjs`（发布门禁）+ 21 个功能套件共 **772 组**（其中 9 个套件显式计数，合计 3869 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
 
 ### 测试套件地图
 
@@ -96,7 +96,7 @@ chore(release): 0.4.1
 
 摘要（完整步骤与验证结果见 [发版手册](docs/cookbook/release.md)）：
 
-1. 确认 `package.json` 版本与 `docs/history/releases.md` 对应段落一致。
+1. 确认 `package.json` 版本与 `docs/history/releases.md` 对应段落一致；顺带同步 README / CONTRIBUTING 里的易腐数字（测试组数、`lib/client.js` 体积）。
 2. `npm run build` → `node scripts/verify-build.mjs` → `npm test`（带时间上限）。
 3. `npm pack` 检查包内容（`lib`、`THIRD-PARTY.md`、`cordis.patch.yml`、`locale/*.json`、`icon.svg`）。
 4. `npm publish` 到 `@feiyueve` 私源（scope 已在 `~/.npmrc` 指向私源）。

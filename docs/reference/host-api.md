@@ -13,9 +13,9 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/flows` | 流程摘要列表（目录为空时自动种一份出厂模板） |
-| POST | `/flows` | 新建；**200 + `{ok, flow, validation}`**，`validation.errors` 非空也照存；只有请求体不是 JSON 对象才 400 |
+| POST | `/flows` | 新建；**200 + `{ok, flow, validation}`**，`validation.errors` 非空也照存；保存类 400 只有请求体不是 JSON 对象，以及主机未开 `FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR` 却含 `executor:'custom'`（`CUSTOM_EXECUTOR_DISABLED`） |
 | GET | `/flows/<id>` | 读整份（含 `version`）+ 校验结果 |
-| PUT | `/flows/<id>` | 整份覆盖保存；`validation.errors` 只报告不拦保存（仍会 400 的只有：body 不是 JSON 对象 / 缺 body / `version` 不是正整数）；版本冲突回 409（`FLOW_VERSION_CONFLICT`），成功回传新 `version` |
+| PUT | `/flows/<id>` | 整份覆盖保存；`validation.errors` 只报告不拦保存（仍会 400 的只有：body 不是 JSON 对象 / 缺 body / `version` 不是正整数 / `nodes`、`edges` 键缺失或不是数组（`FLOW_BODY_INCOMPLETE`）/ 主机未开 `FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR` 却含 `executor:'custom'`（`CUSTOM_EXECUTOR_DISABLED`））；`nodes: []` / `edges: []` 仍然 200（0.7 宽松口径，空图是合法的整份替换）；版本冲突回 409（`FLOW_VERSION_CONFLICT`），成功回传新 `version` |
 | DELETE | `/flows/<id>` | 删除 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
 | GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
@@ -29,6 +29,8 @@
 | DELETE | `/runs/<runId>/worktree` | 删该 run 的 worktree（显式传 `root`、`force` 恒 true；返回 `{ok, removed, reason, branchRemoved}`） |
 | GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论）+ `nodeStatus` |
 | GET | `/runs/<runId>/export` | 导出 markdown（唯一允许 `?token=` 的接口） |
+
+保存的宽松口径（0.7 拍板）：`validation.errors` 非空照存；`nodes: []` / `edges: []`（用户删光节点）也是合法整份替换，仍然 200。`PUT` 只是额外要求这两个键**存在且是数组**（`FLOW_BODY_INCOMPLETE`），不对节点 / 连线内容做内容级校验——那留给启动 run 的 `validateFlowForRun`。
 
 ## 收件箱与回复通道
 

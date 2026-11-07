@@ -494,7 +494,7 @@ try {
     // 用集合比对，以后新增工具不会因为一条计数断言就红。
     A.deepEqual(
       tools.map(tool => tool.name).sort(),
-      ['flow_list', 'flow_reply', 'flow_send_message', 'flow_start',
+      ['flow_list', 'flow_reply', 'flow_restart', 'flow_send_message', 'flow_start',
         'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
     )
     const reply = tools.find(tool => tool.name === 'flow_reply')

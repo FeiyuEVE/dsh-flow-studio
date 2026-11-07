@@ -262,6 +262,10 @@ function agentsCreateCtx(engineRef, { resultFor = () => passResult('n_x').struct
       return () => {}
     },
     get(name) {
+      // 0.2.2 宿主的模型路由来源：节点没配 model 时用它补齐 provider + model。
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+      }
       if (name !== 'agents') return undefined
       return {
         async create(options) {
@@ -375,6 +379,9 @@ function nodeAlarmAgents(engineRef, behavior) {
       return () => {}
     },
     get(name) {
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+      }
       if (name !== 'agents') return undefined
       return {
         async create(options) {
@@ -511,6 +518,9 @@ try {
         return () => {}
       },
       get(name) {
+        if (name === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+        }
         if (name !== 'agents') return undefined
         return {
           // 07 §3.1：默认路径只认 agents.create（不再走 subagents.startActivation）。
@@ -1903,55 +1913,120 @@ try {
   console.log('engine v1.1 · 模型覆盖 M5（§13.11）')
 
   /**
-   * 0.2.2-rc.1 假宿主：`agents.create` 校验 `agentOptions.provider` 是非空字符串，
-   * 缺失直接 throw（复现新宿主的硬要求）。`selection === null` 表示宿主没有
-   * `agentDefaultModel` 服务（拿不到默认模型路由）。
+   * 0.2.2-rc.1 假宿主：`agents.create` 校验 provider + model 成对（缺一个直接 throw，
+   * 复现新宿主硬要求）。`selection === null` 表示宿主没有 `agentDefaultModel` 服务。
+   *
+   * `composition` 模拟 preset 组合服务：
+   *   - `'sessionController'`：`get('sessionController').composeAgent(id)`（Web 同一条路径）；
+   *   - `'agentPresets'`：只有 `get('agentPresets').resolve / mount / list`（fallback 路径）；
+   *   - `null`：两个服务都没有（引擎应 warn，不传 setup）。
    */
-  function strictProviderHost(engineRef, { selection = { provider: 'deepseek', model: 'deepseek-chat' } } = {}) {
+  function strictProviderHost(engineRef, {
+    selection = { provider: 'deepseek', model: 'deepseek-chat' },
+    composition = null,
+  } = {}) {
     const created = []
+    const composed = []
+    const presetResolved = []
+    const presetMounted = []
+    const resumed = []
+    const failPresets = new Set()
+    let setupCalls = 0
+    const setupSpy = async () => { setupCalls += 1 }
+    const agentFor = sessionId => ({
+      session: { id: sessionId, header: {} },
+      ctx: {
+        tools: {
+          register: () => () => {},
+          restrict: () => () => {},
+        },
+      },
+      followup(payload) {
+        const envelope = envelopeOf(payload)
+        const base = structuredPass('n_model')
+        const structured = envelope
+          ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base }
+          : base
+        engineRef.value.handleSessionEvent({ id: sessionId }, {
+          type: 'assistant/message',
+          data: {
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
+            },
+          },
+        })
+      },
+      async whenIdle() {},
+    })
     const ctx = {
       on() { return () => {} },
       get(name) {
         if (name === 'agentDefaultModel' && selection) {
           return { currentSelection: () => selection }
         }
+        if (name === 'sessionController' && composition === 'sessionController') {
+          return {
+            async composeAgent(presetId) {
+              composed.push(presetId)
+              if (presetId !== undefined && failPresets.has(presetId)) {
+                throw new Error(`agent-preset/not-found: ${presetId}`)
+              }
+              return {
+                agentPreset: presetId === undefined ? 'host-default' : presetId,
+                setup: setupSpy,
+              }
+            },
+          }
+        }
+        if (name === 'agentPresets' && composition === 'agentPresets') {
+          return {
+            async resolve(presetId) {
+              presetResolved.push(presetId)
+              if (presetId !== undefined && failPresets.has(presetId)) {
+                throw new Error(`agent-preset/not-found: ${presetId}`)
+              }
+              return { id: presetId === undefined ? 'host-default' : presetId }
+            },
+            async mount(agentCtx, presetId) {
+              presetMounted.push(presetId)
+            },
+            async list() {
+              return [{ id: 'standard' }, { id: 'ptc' }, { id: 'minimal' }]
+            },
+          }
+        }
         if (name !== 'agents') return undefined
         return {
           async create(options) {
             const agentOptions = options.agentOptions
+            // 0.2.2 宿主：provider 与 model 必须成对，缺一个都在创建期 / 首轮 preStep 失败。
             if (!agentOptions || typeof agentOptions.provider !== 'string' || agentOptions.provider === '') {
               throw new TypeError('agentOptions.provider 必须是非空字符串（0.2.1-rc.5+ 宿主硬要求）')
+            }
+            if (typeof agentOptions.model !== 'string' || agentOptions.model === '') {
+              throw new TypeError('agentOptions.model 必须是非空字符串（provider + model 必须成对）')
             }
             created.push(options)
             const sessionId = options.sessionId
             return {
-              agent: {
-                session: { id: sessionId, header: {} },
-                followup(payload) {
-                  const envelope = envelopeOf(payload)
-                  const base = structuredPass('n_model')
-                  const structured = envelope
-                    ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base }
-                    : base
-                  engineRef.value.handleSessionEvent({ id: sessionId }, {
-                    type: 'assistant/message',
-                    data: {
-                      message: {
-                        role: 'assistant',
-                        content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
-                      },
-                    },
-                  })
-                },
-                async whenIdle() {},
-              },
+              agent: agentFor(sessionId),
               async dispose() {},
             }
+          },
+          get() { return null },
+          async resume(options) {
+            resumed.push(options)
+            return { agent: agentFor(options.resumeSessionId), async dispose() {} }
           },
         }
       },
     }
-    return { ctx, created }
+    return {
+      ctx, created, composed, presetResolved, presetMounted, resumed, failPresets,
+      get setupCalls() { return setupCalls },
+      setupSpy,
+    }
   }
 
   await check('node.model：注入 activate 收到 agentOptions={model}，node/start 记录 model', async () => {
@@ -2035,32 +2110,69 @@ try {
     A.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
   })
 
-  await check('宿主没有 agentDefaultModel：保持旧行为（不因本改动崩），并 warn 缺 provider', async () => {
+  await check('宿主没有 agentDefaultModel 且节点只有 model：503 可诊断失败，不创建注定失败的会话', async () => {
     const flow = flowOf('flow-model-nohost', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-reasoner' }), endNode()], [
       next('e1', 'n_start', 'n_model'),
       next('e2', 'n_model', 'n_end'),
     ])
     await saveFlow(flow)
     const run = await makeRun('flow-model-nohost', 1)
-    const logs = []
     const engineRef = { value: null }
     const { ctx, created } = strictProviderHost(engineRef, { selection: null })
-    const engine = createEngine({
-      runsRoot,
-      flowsRoot,
-      ctx,
-      nodeRetries: 0,
-      log: (level, message) => logs.push(`${level}:${message}`),
-    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeRetries: 0 })
+    engineRef.value = engine
+    // `_resolveCreateAgentOptions` 直接抛 EngineError(503)（创建之前）。
+    let thrown = null
+    try {
+      engine._resolveCreateAgentOptions({ model: 'deepseek-reasoner' }, { nodeId: 'n_model' })
+    } catch (error) {
+      thrown = error
+    }
+    A.ok(thrown instanceof EngineError, '拿不到 selection 且不成对时必须抛 EngineError')
+    A.equal(thrown.status, 503)
+    A.match(thrown.message, /宿主未提供 agentDefaultModel/)
+    A.match(thrown.message, /节点未配置/)
+    // 走完整 run：run 失败、事件里有可诊断原因、宿主一次 create 都没收到。
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'failed')
+    A.equal(created.length, 0, '拿不到 selection 时不得凭空造 provider，也不得创建会话')
+    const runEnd = (await eventsOf(run.id)).find(event => event.kind === 'run/end')
+    A.match(runEnd.data.reason, /宿主未提供 agentDefaultModel/)
+  })
+
+  await check('无 agentDefaultModel 但节点显式 provider+model：成对路由照常创建（不依赖宿主默认）', async () => {
+    const flow = flowOf('flow-model-pair', [startNode(), stage('n_model', '业务', 300, { model: 'gpt-5', provider: 'openai' }), endNode()], [
+      next('e1', 'n_start', 'n_model'),
+      next('e2', 'n_model', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-model-pair', 1)
+    const engineRef = { value: null }
+    const { ctx, created } = strictProviderHost(engineRef, { selection: null })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx })
     engineRef.value = engine
     await engine.start(run.id)
     const final = await engine.wait(run.id)
-    // 旧行为原样透传 {model}，新宿主会拒绝创建 → run 失败，但引擎不崩、有可诊断 warn。
-    A.equal(final.status, 'failed')
-    A.equal(created.length, 0, '拿不到 selection 时不得凭空造 provider')
-    A.ok(
-      logs.some(line => line.startsWith('warn:') && /宿主未提供默认模型/.test(line) && /provider/.test(line)),
-      `必须留下「宿主未提供默认模型，节点模型缺 provider」的 warn，实际日志：${JSON.stringify(logs)}`,
+    A.equal(final.status, 'done')
+    A.equal(created.length, 1)
+    A.deepEqual(created[0].agentOptions, { provider: 'openai', model: 'gpt-5' })
+  })
+
+  await check('节点显式 provider（仅 provider）+ 宿主 selection：补宿主 model，仍成对', async () => {
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx: {
+        on() { return () => {} },
+        get: name => (name === 'agentDefaultModel'
+          ? { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) }
+          : undefined),
+      },
+    })
+    A.deepEqual(
+      engine._resolveCreateAgentOptions({ provider: 'openai' }),
+      { provider: 'openai', model: 'deepseek-chat' },
     )
   })
 
@@ -2079,6 +2191,202 @@ try {
       engine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5' }),
       { provider: 'openai', model: 'gpt-5' },
     )
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine v0.9.2 P0 · 节点会话 agentPreset（永远显式，默认 standard）')
+
+  await check('agentPreset 三种来源：节点值 / 流程值 / 兜底 standard，且 agentOptions 仍成对', async () => {
+    // ① 节点级：node.agentPreset 优先于流程值。
+    const nodeFlow = flowOf('flow-preset-node', [
+      startNode(), stage('n_model', '业务', 300, { agentPreset: 'ptc' }), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    nodeFlow.agentPreset = 'minimal'
+    await saveFlow(nodeFlow)
+    const nodeRun = await makeRun('flow-preset-node', 1)
+    const engineRef = { value: null }
+    const nodeHost = strictProviderHost(engineRef)
+    const nodeEngine = createEngine({ runsRoot, flowsRoot, ctx: nodeHost.ctx })
+    engineRef.value = nodeEngine
+    await nodeEngine.start(nodeRun.id)
+    A.equal((await nodeEngine.wait(nodeRun.id)).status, 'done')
+    A.equal(nodeHost.created[0].meta.agentPreset, 'ptc', '节点值优先')
+    A.equal(typeof nodeHost.created[0].agentOptions.provider, 'string')
+    A.equal(typeof nodeHost.created[0].agentOptions.model, 'string')
+    const nodeStart = (await eventsOf(nodeRun.id)).find(event => event.kind === 'node/start')
+    A.equal(nodeStart.data.agentPreset, 'ptc')
+    A.equal(nodeStart.data.agentPresetSource, 'node')
+    const nodeMeta = await store.readRunMeta(runsRoot, nodeRun.id)
+    A.deepEqual(nodeMeta.agentPreset, { value: 'minimal', source: 'flow' }, 'run.json 记录 run 级默认（流程）')
+
+    // ② 流程级：没有节点值时用流程默认。
+    const flowLevel = flowOf('flow-preset-flow', [
+      startNode(), stage('n_model', '业务', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    flowLevel.agentPreset = 'minimal'
+    await saveFlow(flowLevel)
+    const flowRun = await makeRun('flow-preset-flow', 1)
+    const flowHost = strictProviderHost(engineRef)
+    const flowEngine = createEngine({ runsRoot, flowsRoot, ctx: flowHost.ctx })
+    engineRef.value = flowEngine
+    await flowEngine.start(flowRun.id)
+    A.equal((await flowEngine.wait(flowRun.id)).status, 'done')
+    A.equal(flowHost.created[0].meta.agentPreset, 'minimal', '流程值生效')
+    const flowStart = (await eventsOf(flowRun.id)).find(event => event.kind === 'node/start')
+    A.equal(flowStart.data.agentPresetSource, 'flow')
+
+    // ③ 都没有：兜底 standard（不再让宿主给「无 preset 裸组合」）。
+    const bareFlow = flowOf('flow-preset-default', [
+      startNode(), stage('n_model', '业务', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(bareFlow)
+    const bareRun = await makeRun('flow-preset-default', 1)
+    const bareHost = strictProviderHost(engineRef)
+    const bareEngine = createEngine({ runsRoot, flowsRoot, ctx: bareHost.ctx })
+    engineRef.value = bareEngine
+    await bareEngine.start(bareRun.id)
+    A.equal((await bareEngine.wait(bareRun.id)).status, 'done')
+    A.equal(bareHost.created[0].meta.agentPreset, 'standard', '兜底 standard')
+    A.equal(typeof bareHost.created[0].agentOptions.provider, 'string')
+    const bareStart = (await eventsOf(bareRun.id)).find(event => event.kind === 'node/start')
+    A.equal(bareStart.data.agentPresetSource, 'default')
+    const bareMeta = await store.readRunMeta(runsRoot, bareRun.id)
+    A.deepEqual(bareMeta.agentPreset, { value: 'standard', source: 'default' })
+  })
+
+  await check('P0 组合：sessionController.composeAgent 的 setup 原样传给 agents.create（只写 meta 不够）', async () => {
+    const flow = flowOf('flow-compose-sc', [
+      startNode(), stage('n_model', '业务', 300, { agentPreset: 'ptc' }), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-compose-sc', 1)
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef, { composition: 'sessionController' })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    // start 先解析 run 级默认（standard），节点创建时再按节点 preset（ptc）解析。
+    A.equal(host.composed[0], 'standard')
+    A.equal(host.composed[host.composed.length - 1], 'ptc', 'composeAgent 收到节点 preset')
+    A.equal(host.created[0].meta.agentPreset, 'ptc')
+    A.equal(typeof host.created[0].setup, 'function', 'agents.create 必须带 setup')
+    A.equal(host.created[0].setup, host.setupSpy, 'setup 必须是 composeAgent 返回的那个（Web 同一条路径）')
+  })
+
+  await check('P0 组合 fallback：只有 agentPresets 时 resolve + setup 里 mount，setup 传给 create', async () => {
+    const flow = flowOf('flow-compose-presets', [
+      startNode(), stage('n_model', '业务', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    flow.agentPreset = 'minimal'
+    await saveFlow(flow)
+    const run = await makeRun('flow-compose-presets', 1)
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef, { composition: 'agentPresets' })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    A.deepEqual(host.presetResolved, ['minimal'], 'presets.resolve 收到流程默认 preset')
+    A.equal(host.created[0].meta.agentPreset, 'minimal')
+    A.equal(typeof host.created[0].setup, 'function')
+    const fakeAgentCtx = { name: 'fake-agent-ctx' }
+    await host.created[0].setup(fakeAgentCtx)
+    A.deepEqual(host.presetMounted, ['minimal'], 'setup 里必须 mount 解析后的 preset')
+  })
+
+  await check('P0 组合 resume：冷会话 agents.resume 也带 setup（按节点 preset 解析）', async () => {
+    const flow = flowOf('flow-compose-resume', [
+      startNode(), stage('n_model', '业务', 300, { agentPreset: 'ptc' }), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-compose-resume', 1)
+    await store.writeNodeSessions(runsRoot, run.id, {
+      n_model: { sessionId: 'cold-n_model', createdAt: new Date().toISOString(), lastUsedAt: new Date().toISOString() },
+    })
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef, { composition: 'sessionController' })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    A.equal(host.created.length, 0, '已有会话 → 不新建，走 resume')
+    A.equal(host.resumed.length, 1)
+    A.equal(host.resumed[0].resumeSessionId, 'cold-n_model')
+    A.equal(typeof host.resumed[0].setup, 'function', 'resume 必须也带 setup，否则续跑会话掉回裸工具面')
+    A.equal(host.composed[host.composed.length - 1], 'ptc', 'resume 按节点 preset 解析组合')
+  })
+
+  await check('P0 组合降级：profile 没有 standard → 退回宿主默认，事件/run.json 报实际 id + default-fallback', async () => {
+    // ① 只有 agentPresets：resolve('standard') not-found → resolve(undefined) = host-default。
+    const flow = flowOf('flow-compose-fallback', [
+      startNode(), stage('n_model', '业务', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-compose-fallback', 1)
+    const logs = []
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef, { composition: 'agentPresets' })
+    host.failPresets.add('standard')
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx: host.ctx,
+      log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    A.deepEqual(host.presetResolved, ['standard', undefined], '先试 standard，失败后按 undefined 取宿主默认')
+    A.equal(host.created[0].meta.agentPreset, 'host-default')
+    A.equal(typeof host.created[0].setup, 'function')
+    await host.created[0].setup({ name: 'fake-ctx' })
+    A.deepEqual(host.presetMounted, ['host-default'], 'mount 用宿主默认的解析 id')
+    const nodeStart = (await eventsOf(run.id)).find(event => event.kind === 'node/start')
+    A.equal(nodeStart.data.agentPreset, 'host-default', 'node/start 报实际生效 id')
+    A.equal(nodeStart.data.agentPresetSource, 'default-fallback')
+    const meta = await store.readRunMeta(runsRoot, run.id)
+    A.deepEqual(meta.agentPreset, { value: 'host-default', source: 'default-fallback' })
+    A.ok(logs.some(line => line.includes('当前 profile 没有「standard」') && line.includes('host-default')))
+
+    // ② sessionController 路径同样降级到 composeAgent(undefined)。
+    const flow2 = flowOf('flow-compose-fallback-sc', [
+      startNode(), stage('n_model', '业务', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(flow2)
+    const run2 = await makeRun('flow-compose-fallback-sc', 1)
+    const host2 = strictProviderHost(engineRef, { composition: 'sessionController' })
+    host2.failPresets.add('standard')
+    const engine2 = createEngine({ runsRoot, flowsRoot, ctx: host2.ctx })
+    engineRef.value = engine2
+    await engine2.start(run2.id)
+    A.equal((await engine2.wait(run2.id)).status, 'done')
+    A.deepEqual(host2.composed, ['standard', undefined])
+    A.equal(host2.created[0].meta.agentPreset, 'host-default')
+    A.equal(host2.created[0].setup, host2.setupSpy)
+  })
+
+  await check('P0 组合：preset 不存在 → 可读错误（节点 + preset id + 可用列表），不创建会话', async () => {
+    const flow = flowOf('flow-compose-bad', [
+      startNode(), stage('n_model', '业务', 300, { agentPreset: 'bogus' }), endNode(),
+    ], [next('e1', 'n_start', 'n_model'), next('e2', 'n_model', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-compose-bad', 1)
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef, { composition: 'agentPresets' })
+    // 让 resolve 对不存在的 id 抛错（模拟宿主 agent-preset/not-found）。
+    host.failPresets.add('bogus')
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'failed')
+    A.equal(host.created.length, 0)
+    const runEnd = (await eventsOf(run.id)).find(event => event.kind === 'run/end')
+    A.match(runEnd.data.reason, /agentPreset「bogus」不可用/)
+    A.match(runEnd.data.reason, /n_model/)
+    A.match(runEnd.data.reason, /可用 preset/)
+    A.match(runEnd.data.reason, /standard/)
   })
 
   // -------------------------------------------------------------------------

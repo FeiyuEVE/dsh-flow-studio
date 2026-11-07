@@ -51,3 +51,26 @@ v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：sessio
 - 收件箱事件（`message/in` / `message/out`）的字段与有界截断：[运行日志](../reference/run-log.md)
 - `POST /runs/<id>/messages`、`POST /runs/<id>/inbox`、`GET /runs/<id>/messages` 的参数：[Host 接口](../reference/host-api.md#收件箱与回复通道)
 - 会话、收件箱与 worktree 的落盘文件：[数据模型](../reference/data-model.md#run-落盘布局)
+
+## 节点会话的 agent preset 与工具面（0.9.2）
+
+节点会话是**顶层会话**，但顶层 ≠ 自带完整工具。0.2.2 宿主对没有
+`meta.agentPreset` 的程序化会话给的是几乎没工具的裸组合（`working_directory` /
+`memory_recall` 之类），所以引擎现在**永远显式**传 preset：
+
+`node.agentPreset` > 本次 start 覆盖 > 引擎配置 > 流程级默认 > `standard`。
+
+- **只写 `meta.agentPreset` 不会挂组合**：组合在 `agents.create` / `agents.resume`
+  的 `setup` 回调里装配。引擎优先走 `sessionController.composeAgent`（与 Web 同一条
+  路径），其次只挂 `agentPresets.mount`；两个服务都没有时只 warn，不静默假装挂上；
+- `standard` 是 web profile 里带完整工具面（bash / 文件读写 / subagent）的那套；
+  当前 profile 没有 `standard` 时，引擎兜底会退回宿主默认 preset，来源记为
+  `default-fallback`（显式配置的 preset 不存在则直接报 400，不降级）；
+- 节点 / 流程的 preset id 只做安全字符校验，真实存在性由宿主 registry 判断
+  （插件注册的 `digital-human` / `specialist` 也能用）；
+- 生效值与来源写进 `node/start.data.agentPreset` / `agentPresetSource` 与
+  `run.json.agentPreset`，排障时先看这里——「节点改不了代码」通常就是 preset 丢了。
+
+另外，有出向 reject 边的阶段节点会额外拿到 `flow_node_reject` 工具（等价于
+verdict=reject）；没有出向 reject 边的节点不会注册它。详见
+[Host 接口](../reference/host-api.md#阶段节点的打回工具flow_node_reject)。

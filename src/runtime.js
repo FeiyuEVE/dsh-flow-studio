@@ -56,13 +56,14 @@ import { readdir } from 'node:fs/promises'
 import { hostname } from 'node:os'
 
 import { auditWorkflow as defaultAuditWorkflow } from './audit.js'
-import { Engine, EngineError, createEngine } from './engine.js'
+import { Engine, EngineError, createEngine, validateFlowForRun } from './engine.js'
 import { buildFollowupPayload } from './inbox.js'
 import { checkRunId } from './runlog.js'
 import {
-  appendEvents, claimLease, listRuns, readAllEvents, readLease, readNodeSessions, readRunMeta,
-  releaseLease, runsDir, writeRunMeta,
+  appendEvents, claimLease, createRun, listRuns, readAllEvents, readLease, readNodeSessions,
+  readRunMeta, releaseLease, runsDir, writeNodeSessions, writeRunMeta,
 } from './runstore.js'
+import { RESTARTABLE_STATUSES, prepareRestart } from './restart.js'
 import { flowsDir, readFlow } from './store.js'
 import { NODE_ALARM_DEFAULT_MS, NodeSupervisionScheduler, SupervisionScheduler } from './supervise.js'
 
@@ -1257,6 +1258,162 @@ export function createRuntime(options = {}) {
     return engine.stop(runId)
   }
 
+  /** 宿主 agents 服务（可选依赖；restart 用它判断「旧会话还能不能 resume」）。 */
+  function agentsService() {
+    const ctx = options.ctx
+    if (!ctx) return null
+    try {
+      if (typeof ctx.get === 'function') return ctx.get('agents') || null
+      return ctx.agents || null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 失败 / 中止后重启（v0.9.2 · 任务 3）。
+   *
+   * 语义：**新建一个 run**，继承旧 run 已完成的进度与节点会话，从旧 run 失败 /
+   * 中止的节点继续；旧 run 保持终态、一个字都不改写。
+   *
+   * 步骤：
+   *   ① 校验旧 run：必须存在且是 failed / aborted（pending/running/done 都 400，中文原因）；
+   *   ② 校验当前流程结构（`validateFlowForRun`）；从旧事件流推导续跑起点与已完成节点；
+   *   ③ 读旧 `sessions.json`，只把当前流程里仍存在的阶段节点会话复制进新 run
+   *      （新 run 的引擎 `_loadNodeSessions` 会加载它，冷会话靠 `agents.resume` 续跑）；
+   *   ④ 写 `run.json.restart`（fromRunId / 第几次续跑 / 旧失败原因 / 跳过节点 / note）；
+   *   ⑤ 带 `resumePlan` 启动新 run（续跑 run 走旧主循环，支持显式起点）。
+   *
+   * 为什么不改写旧 run 做 continuation：旧 run 的 run/end、租约、supervision、
+   * 事件序号都是「已经发生过的事实」；原地续跑要么改写历史终态（违反审计），要么
+   * 让 run.json 的 status 在 done/failed 之间来回跳（前端 / 指标会看到两次收尾）。
+   * 新 run 有独立事件流，`restart.fromRunId` + `restart.attempt` 足以还原世系。
+   *
+   * @param {string} oldRunId
+   * @param {{ note?: string }} [restartOptions]
+   * @returns {Promise<{ run: object, restart: object, plan: object }>}
+   */
+  async function restart(oldRunId, restartOptions = {}) {
+    if (!checkRunId(oldRunId)) throw new EngineError(400, 'runId 不合法')
+    if (runs.has(oldRunId)) {
+      throw new EngineError(400, `run 还在运行中（${oldRunId}），不能重启：先等它收尾或 stop 再续跑`)
+    }
+    const oldMeta = await readRunMeta(runsRoot, oldRunId)
+    if (!oldMeta) throw new EngineError(404, `run 不存在（${oldRunId}）`)
+    if (!RESTARTABLE_STATUSES.has(oldMeta.status)) {
+      if (oldMeta.status === 'pending' || oldMeta.status === 'running') {
+        throw new EngineError(400, `run 还没结束（当前 ${oldMeta.status}），不能重启：先等它收尾或 stop 再续跑`)
+      }
+      throw new EngineError(400, `run 已成功结束（${oldMeta.status}），不需要重启`)
+    }
+    const flow = await readFlow(flowsRoot, oldMeta.flowId)
+    if (!flow) throw new EngineError(404, `流程不存在（${oldMeta.flowId}）`)
+    const validation = validateFlowForRun(flow)
+    if (!validation.ok) {
+      throw new EngineError(
+        400,
+        `当前流程结构不合法，不能续跑：${validation.errors.map(item => item.message).join('；')}`,
+      )
+    }
+    const { plan } = await prepareRestart({ runsRoot, runId: oldRunId, flow })
+    const stages = (flow.nodes || []).filter(node => node.kind === 'stage')
+    const stageIds = new Set(stages.map(node => node.id))
+    const oldSessions = await readNodeSessions(runsRoot, oldRunId)
+    const inherited = {}
+    for (const [nodeId, entry] of Object.entries(oldSessions)) {
+      if (!stageIds.has(nodeId)) continue
+      if (!entry || typeof entry.sessionId !== 'string' || entry.sessionId === '') continue
+      inherited[nodeId] = entry
+    }
+    // 只有真的要复用旧会话时才要求 agents 能力；没有会话可继承（stub / 纯新节点）照常重启。
+    if (Object.keys(inherited).length > 0) {
+      const agents = agentsService()
+      const canAttach = Boolean(agents
+        && (typeof agents.get === 'function' || typeof agents.resume === 'function'))
+      if (!canAttach) {
+        throw new EngineError(
+          503,
+          '旧 run 有可继承的节点会话，但宿主 agents 服务不可用（既没有 get 也没有 resume），'
+          + '无法在原会话续跑；请恢复 agents 服务后重启，或从画布另建一个全新 run',
+        )
+      }
+    }
+    const attempt = (oldMeta.restart && Number.isInteger(oldMeta.restart.attempt)
+      ? oldMeta.restart.attempt
+      : 0) + 1
+    const note = typeof restartOptions.note === 'string' && restartOptions.note.trim() !== ''
+      ? restartOptions.note.trim().slice(0, 500)
+      : undefined
+    const name = `${oldMeta.name || oldMeta.flowName || oldMeta.flowId}（续跑 ${attempt}）`
+    const created = await createRun(runsRoot, {
+      flowId: oldMeta.flowId,
+      flowName: oldMeta.flowName || oldMeta.flowId,
+      name,
+      nodeTotal: stages.length,
+      engine: oldMeta.engine === 'stub' ? 'stub' : 'real',
+    })
+    // 继承旧 run 的节点会话：新 run 的 engine.start → _loadNodeSessions 会读这份表；
+    // 每个节点仍用同一个 sessionId，冷会话由 _followupNodeSession → agents.resume 续上。
+    if (Object.keys(inherited).length > 0) {
+      await writeNodeSessions(runsRoot, created.id, inherited)
+    }
+    const restartInfo = {
+      fromRunId: oldRunId,
+      attempt,
+      oldStatus: oldMeta.status,
+      oldReason: plan.oldFailure.reason,
+      startNodeId: plan.startNodeId,
+      skippedNodeIds: plan.skipped.map(item => item.nodeId),
+      inheritedNodeIds: Object.keys(inherited),
+      at: now().toISOString(),
+      ...(note === undefined ? {} : { note }),
+    }
+    const workspacePath = (oldMeta.worktree && oldMeta.worktree.enabled === true
+      && typeof oldMeta.worktree.path === 'string' && oldMeta.worktree.path !== '')
+      ? oldMeta.worktree.path
+      : (oldMeta.workspace && typeof oldMeta.workspace.path === 'string' ? oldMeta.workspace.path : null)
+    await writeRunMeta(runsRoot, created.id, {
+      restart: restartInfo,
+      ...(workspacePath === null ? {} : { startOptions: { workspace: workspacePath, worktree: 'off' } }),
+    })
+    // 续跑 run 同样带上工作区绑定（引擎 start 会再校验一次，这里提前定死便于 202 即读）。
+    if (oldMeta.workspace && typeof oldMeta.workspace === 'object') {
+      await writeRunMeta(runsRoot, created.id, { workspace: oldMeta.workspace })
+    }
+    // 保留旧 run 的监视/回复约定：新 run 的 wakerSessionId 沿用旧 run 的 supervision。
+    const wakerSessionId = oldMeta.supervision && typeof oldMeta.supervision.wakerSessionId === 'string'
+      ? oldMeta.supervision.wakerSessionId
+      : undefined
+    if (wakerSessionId) {
+      await writeRunMeta(runsRoot, created.id, {
+        supervision: { enabled: false, wakerSessionId, reason: 'restarted' },
+      }).catch(() => {})
+    }
+    const started = await start(created.id, {
+      ...(workspacePath === null ? {} : { workspace: workspacePath, worktree: 'off' }),
+      resumePlan: {
+        fromRunId: oldRunId,
+        startNodeId: plan.startNodeId,
+        skipped: plan.skipped,
+        oldFailure: plan.oldFailure,
+      },
+    })
+    log(
+      'info',
+      `flow-studio: run ${created.id} 从 ${oldRunId} 续跑（第 ${attempt} 次，起点 ${plan.startNodeId}，`
+      + `跳过 ${plan.skipped.length} 个已完成节点，继承 ${Object.keys(inherited).length} 个会话）`,
+    )
+    return {
+      run: started,
+      restart: restartInfo,
+      plan: {
+        startNodeId: plan.startNodeId,
+        skipped: plan.skipped.map(item => item.nodeId),
+        inherited: Object.keys(inherited),
+      },
+    }
+  }
+
   /** 等指定 run 收尾：在跑就等它，已收尾（或没在本进程跑过）就读 run.json 终态。 */
   async function wait(runId) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
@@ -1678,6 +1835,7 @@ export function createRuntime(options = {}) {
     runs,
     start,
     stop,
+    restart,
     wait,
     sweep,
     get,

@@ -29,6 +29,42 @@ export const EXEC_MODE = { SINGLE: 'single', TEAM: 'team' }
 /** 节点执行器：dsh 内建 / codex CLI / 自定义命令（07 §6）。 */
 export const EXECUTOR = { DSH: 'dsh', CODEX: 'codex', CUSTOM: 'custom' }
 
+/**
+ * 节点会话的 agent preset（v0.9.2 P0）。
+ *
+ * 背景：0.2.2 宿主对「没有 `meta.agentPreset` 的程序化会话」给的是一个几乎没有
+ * 工具的裸组合（实测只有 working_directory / memory_recall 等）；节点必须显式
+ * 指定 preset，才会拿到 bash / 文件读写 / subagent 等完整工具面。
+ *
+ * `standard` 是本机 web profile 里带完整工具面的那套，也是引擎的**兜底默认值**。
+ * 这里只做「安全 id」校验（小写字母 / 数字 / `-` / `_`，≤64）；preset 是否真实
+ * 存在由宿主 registry 在创建会话时判断——插件可以注册 `digital-human` 这类
+ * 自定义 id，插件不能在模型层维护一份会过期的白名单。
+ */
+export const DEFAULT_AGENT_PRESET = 'standard'
+
+/** 本机常见 preset id（文档 / UI 下拉参考；运行时仍以宿主 registry 为准）。 */
+export const KNOWN_AGENT_PRESETS = Object.freeze(['standard', 'ptc', 'minimal', 'cordis'])
+
+/** preset id 的字符上限与字符集。 */
+export const AGENT_PRESET_MAX_CHARS = 64
+const AGENT_PRESET_PATTERN = /^[a-z0-9][a-z0-9_-]*$/
+
+/** 合法的 preset id：非空、≤64、小写字母开头且只含小写字母/数字/-/_。 */
+export function isAgentPresetId(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= AGENT_PRESET_MAX_CHARS
+    && AGENT_PRESET_PATTERN.test(value)
+}
+
+/** 收敛 preset：空 / 非字符串 / 非法字符一律退回空串（= 未配置，交给上层继承）。 */
+export function normalizeAgentPreset(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  return isAgentPresetId(trimmed) ? trimmed : ''
+}
+
 /** 单个流程允许的上限，防止误操作把面板拖死。 */
 export const LIMITS = {
   nodes: 60,
@@ -70,6 +106,7 @@ export function blankNode(kind, x, y, title) {
     maxRounds: 2,
     team: [],
     model: '',
+    agentPreset: '',
     executor: EXECUTOR.DSH,
     executorCommand: '',
   }
@@ -94,6 +131,7 @@ export function blankFlow(name) {
     id: '',
     name: name || '未命名流程',
     description: '',
+    agentPreset: '',
     createdAt: now,
     updatedAt: now,
     nodes: [],
@@ -124,6 +162,7 @@ export function defaultFlow() {
     maxRounds: 2,
     team: [],
     model: '',
+    agentPreset: '',
     executor: EXECUTOR.DSH,
     executorCommand: '',
     ...extra,
@@ -248,7 +287,7 @@ function clip(value, max) {
  */
 const NODE_KNOWN_FIELDS = new Set([
   'id', 'kind', 'title', 'x', 'y', 'mode', 'role', 'task',
-  'skills', 'outputs', 'maxRounds', 'model', 'team', 'executor', 'executorCommand', 'extras',
+  'skills', 'outputs', 'maxRounds', 'model', 'agentPreset', 'team', 'executor', 'executorCommand', 'extras',
 ])
 const EDGE_KNOWN_FIELDS = new Set(['id', 'from', 'to', 'kind', 'label', 'extras'])
 const MEMBER_KNOWN_FIELDS = new Set(['name', 'role', 'task', 'extras'])
@@ -447,6 +486,8 @@ export function normalizeFlow(raw, fallbackName) {
           ? Math.min(LIMITS.maxRounds, Math.max(1, Math.round(item.maxRounds)))
           : 2,
         model: clip(String(item.model || ''), 120),
+        // v0.9.2 P0：空 = 继承流程默认；非法 id 当未配置（不阻断保存，宿主会兜底 standard）。
+        agentPreset: normalizeAgentPreset(item.agentPreset),
         executor: Object.values(EXECUTOR).includes(item.executor) ? item.executor : EXECUTOR.DSH,
         executorCommand: clip(String(item.executorCommand || ''), LIMITS.executorCommandLen),
         team,
@@ -484,6 +525,8 @@ export function normalizeFlow(raw, fallbackName) {
     id: String(src.id || ''),
     name: clip(String(src.name || ''), LIMITS.titleLen) || fallbackName || '未命名流程',
     description: clip(String(src.description || ''), 400),
+    // v0.9.2 P0：流程级默认 preset（空 = 引擎兜底 standard）。
+    agentPreset: normalizeAgentPreset(src.agentPreset),
     createdAt: typeof src.createdAt === 'string' ? src.createdAt : now,
     updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : now,
     nodes,

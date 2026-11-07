@@ -1802,6 +1802,35 @@ async function handleRuns(req, res, env, url, parts) {
       return
     }
 
+    if (action === 'restart') {
+      // v0.9.2 · 任务 3：失败 / 中止后重启 —— 新建 run、继承旧 run 的完成进度与节点会话。
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 POST' })
+        return
+      }
+      if (!env.engine) throw new RunError(500, 'engine', '执行引擎未初始化')
+      if (typeof env.engine.restart !== 'function') {
+        throw new RunError(500, 'engine', '执行引擎不支持 restart（运行时未升级）')
+      }
+      const body = await readBody(req)
+      let note
+      if (body && typeof body === 'object' && !Array.isArray(body) && body.note !== undefined && body.note !== null) {
+        if (typeof body.note !== 'string') throw new RunError(400, 'note', 'note 必须是字符串')
+        const trimmed = body.note.trim()
+        if (trimmed.length > 500) throw new RunError(400, 'note', 'note 超过 500 字符')
+        if (trimmed !== '') note = trimmed
+      }
+      const result = await env.engine.restart(runId, note === undefined ? {} : { note })
+      sendJson(res, 202, {
+        ok: true,
+        run: result.run,
+        restart: result.restart,
+        plan: result.plan,
+        hint: `已新建续跑 run ${result.run && result.run.id ? result.run.id : ''}；旧 run ${runId} 的终态与事件不会被改写。`,
+      })
+      return
+    }
+
     if (action === 'start' || action === 'stop') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { ok: false, error: '只支持 POST' })

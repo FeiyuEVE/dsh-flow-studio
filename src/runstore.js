@@ -459,6 +459,12 @@ function normalizeMeta(raw, id) {
   // D4：engine 状态机快照（缓存不是真相）：读路径宽松 + 24 KiB 独立预算。
   // 与 nodeStatus 互不影响——两条通道各自量各自的字节。
   const machine = normalizeMachine(source.machine)
+  // v0.9.2：`restart` 用 undefined 区分「没传」与「显式清除」；显式 null / 坏形状都落成 null。
+  const restart = source.restart === undefined ? null : normalizeRestart(source.restart)
+  // v0.9.2 P0：run.json.agentPreset = { value, source }；未知 / 坏形状整条省略。
+  const agentPresetBinding = source.agentPreset === undefined
+    ? null
+    : normalizeBinding(source.agentPreset, AGENT_PRESET_KEYS)
   const meta = {
     v: 1,
     id,
@@ -496,6 +502,8 @@ function normalizeMeta(raw, id) {
     ...(source.workspace === undefined ? {} : { workspace: normalizeBinding(source.workspace, WORKSPACE_KEYS) }),
     ...(source.worktree === undefined ? {} : { worktree: normalizeWorktree(source.worktree) }),
     ...(source.supervision === undefined ? {} : { supervision: normalizeBinding(source.supervision, SUPERVISION_KEYS) }),
+    // v0.9.2 P0：本次 run 生效的默认 agent preset + 来源（node/start 事件另有节点级覆盖）。
+    ...(agentPresetBinding === null ? {} : { agentPreset: agentPresetBinding }),
     ...(nodeStatus === null ? {} : { nodeStatus: nodeStatus.value }),
     // D2：预算裁剪必须可观测（绝不静默）；一旦发生过裁剪就持久化这个标志。
     ...(source.nodeStatusTruncated === true || (nodeStatus !== null && nodeStatus.truncated)
@@ -503,6 +511,8 @@ function normalizeMeta(raw, id) {
       : {}),
     // D3：节点 → 会话 id 的映射（形如 `{ [nodeId]: sessionId }`），由调用方经 patch 写入。
     ...(source.sessions === undefined ? {} : { sessions: normalizeMetaSessions(source.sessions) }),
+    // v0.9.2：失败后重启的续跑记录（从哪个 run / 第几次 / 旧失败原因 / 跳过节点）。
+    ...(restart === null ? {} : { restart }),
     // D3：创建 run 时记下的发起参数（06 §13.8）。只保留 { workspace?, worktree? }；
     // 未传就不出现（绝不凭空造一个空对象），传了空对象则保留为空对象。
     ...(source.startOptions === undefined ? {} : { startOptions: normalizeStartOptions(source.startOptions) }),
@@ -918,6 +928,49 @@ function normalizeLimits(raw) {
   return out
 }
 
+/**
+ * v0.9.2「失败后重启」的续跑记录（`run.json.restart`）。
+ *
+ * 新 run 用这份 meta 说明「我从哪个终态 run 续出来、旧 run 为什么失败、这是第几次
+ * 续跑、从哪个节点开始、哪些节点已完成而跳过」。读路径宽松（形状坏就整条省略），
+ * 写路径严格（`validateMetaPatch` 校验 fromRunId / attempt）。
+ */
+const RESTART_TEXT_MAX_CHARS = 2000
+const RESTART_NOTE_MAX_CHARS = 500
+const RESTART_NODE_IDS_MAX = 512
+
+function normalizeRestart(raw) {
+  if (!isPlainObject(raw)) return null
+  const fromRunId = typeof raw.fromRunId === 'string' && checkRunId(raw.fromRunId) ? raw.fromRunId : null
+  if (fromRunId === null) return null
+  const out = {
+    fromRunId,
+    attempt: Number.isInteger(raw.attempt) && raw.attempt >= 1 ? raw.attempt : 1,
+  }
+  if (raw.oldStatus === 'failed' || raw.oldStatus === 'aborted') out.oldStatus = raw.oldStatus
+  if (typeof raw.oldReason === 'string' && raw.oldReason !== '') {
+    out.oldReason = raw.oldReason.length > RESTART_TEXT_MAX_CHARS
+      ? raw.oldReason.slice(0, RESTART_TEXT_MAX_CHARS)
+      : raw.oldReason
+  }
+  if (typeof raw.startNodeId === 'string' && checkRunId(raw.startNodeId)) out.startNodeId = raw.startNodeId
+  if (Array.isArray(raw.skippedNodeIds)) {
+    out.skippedNodeIds = [...new Set(raw.skippedNodeIds
+      .filter(item => typeof item === 'string' && checkRunId(item)))]
+      .slice(0, RESTART_NODE_IDS_MAX)
+  }
+  if (Array.isArray(raw.inheritedNodeIds)) {
+    out.inheritedNodeIds = [...new Set(raw.inheritedNodeIds
+      .filter(item => typeof item === 'string' && checkRunId(item)))]
+      .slice(0, RESTART_NODE_IDS_MAX)
+  }
+  if (typeof raw.note === 'string' && raw.note.trim() !== '') {
+    out.note = raw.note.trim().slice(0, RESTART_NOTE_MAX_CHARS)
+  }
+  if (typeof raw.at === 'string' && raw.at !== '') out.at = raw.at.slice(0, 64)
+  return out
+}
+
 /** 节点会话模式（07 §3）：未知值一律 null，不猜一个看起来合理的。 */
 const SESSION_MODES = new Set(['top-level', 'legacy-subagent', 'injected', 'stub', 'unavailable'])
 const WORKSPACE_KEYS = ['id', 'path', 'realpath', 'isGit', 'gitRoot']
@@ -928,6 +981,8 @@ const WORKTREE_WARNING_MAX_CHARS = 500
 /** worktree.root 的长度上限（超过就整键丢弃：截断后的绝对路径会变成错误的删除前缀）。 */
 const WORKTREE_ROOT_MAX_CHARS = 2048
 const SUPERVISION_KEYS = ['enabled', 'wakerSessionId', 'lastWokeAt', 'nextDueAt', 'wakes', 'failures', 'reason']
+/** v0.9.2 P0：run.json.agentPreset = { value, source }（本次 run 生效的默认 preset）。 */
+const AGENT_PRESET_KEYS = ['value', 'source']
 
 function normalizeSessionMode(value) {
   return SESSION_MODES.has(value) ? value : null
@@ -1175,7 +1230,7 @@ const META_FIELD_KEYS = new Set([
   'lastSeq', 'seq', 'unkeyedCalls', 'tokenTotalApprox', 'createdAt', 'updatedAt',
   'progress', 'live', 'input', 'inbox',
   // 07 §4/§5/§7 运行绑定 + 07 §11 节点自审状态（D3 白名单）
-  'sessionMode', 'workspace', 'worktree', 'supervision', 'nodeStatus',
+  'sessionMode', 'workspace', 'worktree', 'supervision', 'agentPreset', 'nodeStatus',
   'nodeStatusTruncated', 'sessions',
   // 06 §13.8：创建 run 时记下的发起参数（runtime.patchRunJson 的唯一写路径）
   'startOptions',
@@ -1184,6 +1239,8 @@ const META_FIELD_KEYS = new Set([
   // D4：engine 状态机快照（{ version, snapshot?, savedAt? }）+ 裁剪标志。
   // `machineTruncated` 显式出现时必须是布尔或 null（false / null 表示清除）。
   'machine', 'machineTruncated',
+  // v0.9.2：失败后重启的续跑记录（runtime.restart 写入；形状见 normalizeRestart）。
+  'restart',
 ])
 
 function hasOwn(object, key) {
@@ -1203,7 +1260,7 @@ function validateMetaPatch(patch) {
   if (hasOwn(patch, 'sessionMode') && patch.sessionMode !== null && !SESSION_MODES.has(patch.sessionMode)) {
     throw new RunError(400, 'sessionMode', `sessionMode 必须是 ${[...SESSION_MODES].join(' / ')} 之一或 null`)
   }
-  for (const [key, label] of [['workspace', 'workspace'], ['worktree', 'worktree'], ['supervision', 'supervision']]) {
+  for (const [key, label] of [['workspace', 'workspace'], ['worktree', 'worktree'], ['supervision', 'supervision'], ['agentPreset', 'agentPreset']]) {
     if (hasOwn(patch, key) && patch[key] !== null && !isPlainObject(patch[key])) {
       throw new RunError(400, label, `${label} 必须是对象或 null`)
     }
@@ -1213,6 +1270,19 @@ function validateMetaPatch(patch) {
   }
   if (hasOwn(patch, 'nodeStatusTruncated') && typeof patch.nodeStatusTruncated !== 'boolean') {
     throw new RunError(400, 'nodeStatusTruncated', 'nodeStatusTruncated 必须是布尔值')
+  }
+  // v0.9.2：续跑记录。写路径严格：null 表示清除；否则必须是对象且 fromRunId 合法。
+  if (hasOwn(patch, 'restart') && patch.restart !== null) {
+    if (!isPlainObject(patch.restart)) {
+      throw new RunError(400, 'restart', 'restart 必须是对象或 null')
+    }
+    if (typeof patch.restart.fromRunId !== 'string' || !checkRunId(patch.restart.fromRunId)) {
+      throw new RunError(400, 'restart.fromRunId', 'restart.fromRunId 必须是合法的 runId')
+    }
+    if (patch.restart.attempt !== undefined
+      && (!Number.isInteger(patch.restart.attempt) || patch.restart.attempt < 1)) {
+      throw new RunError(400, 'restart.attempt', 'restart.attempt 必须是 ≥1 的整数')
+    }
   }
   // D4：engine 状态机快照。整条替换语义，`version` 必填。
   // 注意：`snapshot` 超 24 KiB **不** 400（快照是缓存不是真相，超预算走读路径的裁剪，

@@ -870,6 +870,9 @@ try {
       const ctx = {
         on() { return () => {} },
         get(name) {
+          if (name === 'agentDefaultModel') {
+            return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+          }
           if (name !== 'agents') return undefined
           return {
             create(createOptions) {

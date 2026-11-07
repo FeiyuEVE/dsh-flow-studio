@@ -22,6 +22,7 @@
 | GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` / `nodeStatus` |
 | POST | `/runs/<runId>/start` | 真正开跑（`pending`→`running` 原子转换；同一 runId 已在跑 → 409；流程非法 → 400） |
 | POST | `/runs/<runId>/stop` | 停止（协作式取消，写 `run/end aborted`） |
+| POST | `/runs/<runId>/restart` | **失败 / 中止后重启**：基于旧 run 的完成进度**新建一个 run**（202），继承旧节点会话、跳过已完成节点、从旧失败节点继续；旧 run 终态与事件不改写。可选 body `{note}`（≤500 字）。只接受 `failed` / `aborted`；`pending` / `running` → 400（先等收尾或 stop），`done` → 400（不需要重启）；当前流程结构不合法 / 续跑起点已不存在 → 400 可读原因 |
 | GET/DELETE | `/runs/<runId>` | run 详情（节点与 attempt 索引 + `progress.nodes` + 工作区 / worktree / sessionMode / supervision / nodeStatus）；`?light=1` 走轻量分支（run 元信息 + `live` + `nodeStatus` + 工作区/worktree 摘要，**不读取也不解析事件**，客户端运行中 2s 轮询用它）/ 删除整个 run（租约持有中 → 409） |
 | GET/POST | `/runs/<runId>/supervision` | 读 `run.json.supervision` + 调度器状态 / 开或关内建 supervision（`{enabled, wakerSessionId?}`；对已收尾 run 开启 → 400） |
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验；只收观测类事件） |
@@ -52,12 +53,113 @@
 | `flow_start` | 在**当前会话**启动 run，并默认开启内建 supervision | `flowId` / `flowName`、`task` / `name`、`workspace`、`worktree`、`runTimeoutMs` / `nodeTimeoutMs` |
 | `flow_watch` | 只读审查整个工作流 | `runId` 或 `runIds`（≤20，二选一） |
 | `flow_stop` | 停止 run | `runId` |
+| `flow_restart` | 把 failed / aborted run 重启为**新 run**并在原会话续跑 | `runId`（旧 run）、`note?`（≤500 字）；返回 `newRunId` + `restart{fromRunId, attempt, startNodeId, skippedNodeIds, inheritedNodeIds, ...}` |
 | `flow_supervise` | 手动开关 run 级 supervision | `runId`、`enabled` |
 | `flow_send_message` | 往收件箱发消息 | `runId?`、`nodeId?`、`text`、`reply?` |
 | `flow_reply` | 节点内 agent 回复来源 | `text`、`inReplyTo?` |
 | `flow_worktrees` | 列 / 回收 worktree | `action`、`keepRunIds?` |
 
 用法闭环见 [在会话里开流程](../guide/session-driven.md)。
+
+## 节点会话的模型路由与 agent preset（0.9.2 P0）
+
+`ctx.agents.create()` 建节点主管会话时，引擎**永远显式**传两样东西；任何一样解析
+不出来都会在创建之前给可诊断的 503，而不是建一个注定首轮失败的会话：
+
+1. **模型路由必须成对**：`agentOptions = {provider, model}`。
+   - 节点显式 provider / model 优先（流程模型里 `provider` 会落在 `node.extras.provider`，
+     引擎两处都认）；缺的一项由宿主 `agentDefaultModel` 的
+     `currentSelection()` 补齐；
+   - 节点自定义 `model` 时**不**移植宿主的 `reasoningEffort`（不同模型档位不可移植），
+     只有节点自己给了才带；
+   - 拿不到 `agentDefaultModel` 且节点配置不成对（含空配置）→
+     `503`，文案含「宿主未提供 agentDefaultModel，且节点未配置 provider/model」。
+     0.2.2-rc.1 的首轮 `preStep` 会抛 `agent "…" has no provider/model`，且
+     `agent/request` waterfall 已不允许再改路由，所以这里必须提前拦住。
+
+2. **agent preset 必须显式，而且必须挂组合**：`meta.agentPreset` **只写 session
+   header**（鉴权 / 投影用），**不会挂载 preset 组合**。组合只在
+   `agents.create()` / `agents.resume()` 的 `setup` 回调里挂载
+   （`dsh-agent-loop/lib/index.js:1567`），Web 的正确形状是
+   `create({ sessionId, agentOptions, meta:{cwd, agentPreset}, setup: composition.setup })`
+   （`dsh-api-session-controller/lib/index.js:424-439`）。0.2.2 宿主对没有组合的程序化
+   会话给的是几乎没有工具的裸组合——开发节点改不了代码、测试节点跑不了测试、
+   团队主管没有 `subagent` 工具。
+
+   **引擎的 composition 解析顺序**：
+   1. `ctx.get('sessionController').composeAgent(presetId)` —— 与 Web 同一条路径
+      （挂 preset + 模型切换提示），首选；create 与 resume **两处**都传
+      `setup: composition.setup`；
+   2. 只有 `ctx.get('agentPresets')` → `presets.resolve(id)`，并在 setup 里
+      `presets.mount(agentCtx, resolvedId)`。这里不装 `installModelSelection`：
+      它只是「会话中途换模型时追加一条提示」的 `agent/pre-step` 监听，不影响工具面 /
+      路由；插件不为它引入 `@deepseek-ai/dsh-agent` 依赖（宿主能力一律 `ctx.get`）；
+   3. 两个服务都没有 → 不传 `setup`，但留一条可诊断 warn（节点会掉回裸工具面）。
+
+解析顺序（第一个非空生效）：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | 节点 `agentPreset` | 画布上按节点覆盖（空 = 继承） |
+| 2 | 本次 start 的 `agentPreset` | `engine.start(runId, {agentPreset})` 显式覆盖 |
+| 3 | 引擎配置 `agentPreset` | 插件 / runtime 构造参数 |
+| 4 | 流程级 `agentPreset` | 流程 JSON 的默认值（空 = 继承） |
+| 5 | **`standard`** | 引擎兜底；本机 web profile 里带完整工具面的那套 |
+| 5' | 宿主默认 preset | 当来源是兜底 `standard`、而当前 profile **没有** `standard` 时，改用 `composeAgent(undefined)` / `presets.resolve(undefined)` 取宿主默认；`agentPresetSource` 记为 **`default-fallback`**，事件 / run.json 报实际 id |
+
+- 节点 / 流程的 `agentPreset` 只做安全 id 校验（小写字母 / 数字 / `-` / `_`，≤64）；
+  preset 是否真实存在由宿主 registry 在创建会话时判断——插件可以注册
+  `digital-human` / `specialist` 这类自定义 id，模型层不维护会过期的白名单。
+- 生效值与来源写进 `node/start.data.agentPreset` / `agentPresetSource`
+  （`node` / `start` / `engine` / `flow` / `default` / `default-fallback`）与
+  `run.json.agentPreset`（`{value, source}`，run 级默认），供 UI 显示。
+- **降级原则**：来源是 `default`（引擎自己兜底）时，`standard` 不存在可以降级到宿主
+  默认；来源是 `node` / `flow` / `start` / `engine`（用户显式配置）时**不降级**，
+  直接 `400`，文案点明节点、preset id 与「去节点检查器 / 流程设置改，或改空用默认」。
+- 会话中途换模型时的提示（`installModelSelection`）只在路径 1 由
+  `sessionController.composeAgent` 自带；路径 2 刻意省略，见上。
+
+## 阶段节点的打回工具（`flow_node_reject`）
+
+阶段节点主管在自己的 attempt 进行中可以直接调用模型工具 `flow_node_reject`，
+语义**等价于结构化结论 `verdict=reject`**：
+
+- 参数：`reason`（必填，≤2000 字）、`findings`（可选数组）、`rejectTarget`（可选，
+  必须是该节点某条 reject 边的目标）；
+- 工具只把 `{reason, findings, rejectTarget}` 登记到引擎的「本轮待生效打回」槽位；
+  本轮 `whenIdle` 收口时与既有结构化结论合流（工具打回优先于模型文本里的 `pass`），
+  之后**完全复用**既有通道：`node/end{status:'rejected'}` → `selectRejectTarget()` →
+  `reject/trigger` → 目标节点 attempt+1 重跑。没有第二套状态、不新增事件 kind。
+
+**结构门控（硬规则）**：
+
+- 只有当前流程里存在 `edges.some(e => e.from === node.id && e.kind === 'reject')`
+  的**阶段节点**才注册；没有出向 reject 边 → 不注册（会话工具清单里根本不出现）；
+- 开始 / 结束节点不注册；
+- 每次 attempt / 复用冷会话都会按**当前流程结构**重算：结构加边 → 补挂，删边 →
+  用注册返回的 disposer 撤掉；run 结束 / attempt 结束时统一 dispose。
+
+## 失败后重启（`restart`）
+
+`POST /runs/<runId>/restart` 与模型工具 `flow_restart` 共用同一条实现
+（`runtime.restart`），语义是**新建一个续跑 run**，而不是把旧 run 改回 running：
+
+- 只接受 `failed` / `aborted`；非终态与 `done` 都给 400 可读原因；
+- 用旧 run 的事件流推导续跑起点（`run/end` 的 failedNodeId → 最后一条
+  `node/end failed` → 中止时未收口的 `node/start`）与**已完成节点**；
+- 新 run 继承旧 `sessions.json` 里当前流程仍存在的阶段节点会话（同一 node 复用
+  原 sessionId；冷会话走 `agents.resume`）；
+- 已完成节点不重跑，它们的 summary / 产物路径作为上游上下文注入；
+- 新 run 从旧失败节点继续（续跑 run 走旧主循环，支持显式起点）；
+- 旧 run 保持终态、事件一条不改；
+- 新 run 的 `run.json.restart` 记录
+  `{fromRunId, attempt, oldStatus, oldReason, startNodeId, skippedNodeIds, inheritedNodeIds, note?, at}`，
+  `run/start.data.restart` 同步落日志（`attempt` = 第几次续跑）。
+
+**为什么用新 run 而不是同一 run 的 continuation**：旧 run 的 `run/end`、租约、
+supervision、事件序号都是已经发生过的事实；原地续跑要么改写历史终态（破坏审计），
+要么让 `status` 在 `failed` → `running` → `done` 之间来回跳（前端 / 指标会看到两次
+收尾）。新 run 有独立事件流，`restart.fromRunId` + `restart.attempt` 足以还原世系。
 
 ## 权限与安全开关
 

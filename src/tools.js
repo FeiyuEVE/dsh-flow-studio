@@ -2113,6 +2113,104 @@ export function createFlowTools(deps) {
       },
     },
 
+    // ── flow_restart（v0.9.2 · 任务 3：失败后重启并在原会话续跑） ──────────
+    {
+      name: 'flow_restart',
+      description:
+        '把一次**已失败 / 已中止**的流程 run 重启为**新 run**，并从旧 run 失败 / 中止的节点继续。'
+        + '新 run 继承旧 run 的节点会话（同一 node 复用原 sessionId，冷会话靠 agents.resume 续跑）、'
+        + '跳过已完成节点（用它们的 summary 作为上游上下文），旧 run 保持终态、事件一个字不改。'
+        + 'runId 必填（旧 run）；note 可选（写进新 run 的 restart 记录，例如为什么重启）。'
+        + '只接受 failed / aborted：pending / running 先等收尾或 flow_stop；done 不需要重启。'
+        + '成功返回新 run（newRunId）与 restart{fromRunId, attempt, startNodeId, skippedNodeIds, ...}；'
+        + '失败时 error/hint 给出中文原因（非终态 run / 流程结构不合法 / 会话无法继承）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string', description: '旧 run 的 id（必须是 failed / aborted）' },
+          note: { type: 'string', description: '可选：重启原因 / 备注（≤500 字符，写进新 run 的 restart 记录）' },
+        },
+        required: ['runId'],
+      },
+      output: outputFor({
+        fromRunId: { type: 'string', description: '被重启的旧 run id' },
+        newRunId: { type: 'string', description: '新建的续跑 run id' },
+        status: nullable({ type: 'string', description: '新 run 当前状态（通常为 running）' }),
+        restart: anyJson('续跑记录：{fromRunId, attempt, oldStatus, oldReason, startNodeId, skippedNodeIds, inheritedNodeIds, note?}'),
+        plan: anyJson('实际执行的续跑计划：{startNodeId, skipped[], inherited[]}'),
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        const skipped = value.plan && Array.isArray(value.plan.skipped) ? value.plan.skipped : []
+        return [{
+          type: 'text',
+          text: `已从 ${value.fromRunId} 创建续跑 run ${value.newRunId}（状态 ${value.status}）。`
+            + `起点 ${value.plan && value.plan.startNodeId ? value.plan.startNodeId : '未知'}，`
+            + `跳过 ${skipped.length} 个已完成节点。旧 run 终态未被改写。`,
+        }]
+      }),
+      timeoutMs: TIMEOUT_STOP_MS,
+      async execute(args) {
+        let runId
+        let note
+        try {
+          runId = optionalString(args, 'runId', { max: 128 })
+          if (runId === undefined) {
+            throw new ParamError(
+              '缺少必填参数 runId',
+              '传旧 run 的 id（failed / aborted）；不知道就用 flow_list / flow_watch 查。',
+            )
+          }
+          if (!checkRunId(runId)) {
+            throw new ParamError(
+              `runId「${runId}」不合法（只允许字母、数字、点、下划线、连字符，1–64 位）`,
+              'runId 来自 flow_start / flow_watch 的返回值，原样传。',
+            )
+          }
+          note = optionalString(args, 'note', { max: 500 })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          return failure(`读取参数失败：${messageOf(error)}`, '按参数说明改正后重发。')
+        }
+        if (typeof deps.engine.restart !== 'function') {
+          return failure(
+            '当前运行时没有 restart 能力（运行时未升级 / 旧版本）',
+            '升级 dsh-flow-studio 到包含 restart 的版本后再试；旧 run 的进度不会因此丢失。',
+          )
+        }
+        try {
+          const result = await deps.engine.restart(runId, note === undefined ? {} : { note })
+          const run = result && result.run ? result.run : null
+          return jsonSafe({
+            ok: true,
+            fromRunId: runId,
+            newRunId: run && typeof run.id === 'string' ? run.id : '',
+            status: run && typeof run.status === 'string' ? run.status : 'running',
+            restart: result && result.restart ? result.restart : null,
+            plan: result && result.plan ? result.plan : null,
+          })
+        } catch (error) {
+          const status = error && Number.isInteger(error.status) ? error.status : null
+          if (status === 400) {
+            return failureOf(error, { action: '重启 run ' })
+          }
+          if (status === 404) {
+            return failure(messageOf(error), '先 flow_watch 确认这个 run 存在，再重启。')
+          }
+          if (status === 503) {
+            return failure(
+              messageOf(error),
+              '宿主 agents 服务不可用 / 旧会话无法 resume：恢复服务后再重启，或从画布另建全新 run。',
+            )
+          }
+          return failure(
+            `重启 run 失败：${messageOf(error)}`,
+            '稍后重试一次；仍失败就告诉主人（旧 run 不会被改写，可先导出日志排查）。',
+            true,
+          )
+        }
+      },
+    },
+
     // ── flow_supervise ─────────────────────────────────────────────────────
     {
       name: 'flow_supervise',

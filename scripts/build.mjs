@@ -50,6 +50,8 @@ export const HOST_MODULES = [
   'runstore.js',
   'flowmachine.js',
   'engine.js',
+  'node-tools.js',
+  'restart.js',
   'runtime.js',
   'worktree.js',
   'executor.js',

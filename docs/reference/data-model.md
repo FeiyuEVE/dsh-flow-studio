@@ -11,6 +11,7 @@
   "schemaVersion": 1,
   "id": "flow-ab12cd34ef",
   "name": "标准研发流水线",
+  "agentPreset": "",                       // 流程级默认 preset，空 = 引擎兜底 standard
   "nodes": [
     {
       "id": "n_req", "kind": "stage",        // start | stage | end
@@ -21,7 +22,8 @@
       "skills": ["java-service"],            // 引用的 skill 名
       "outputs": "需求清单 R1..Rn + 风险表",   // 期望产物
       "maxRounds": 2,                        // 打回上限
-      "model": "",                           // 模型覆盖，空 = 跟随会话
+      "model": "",                           // 模型覆盖，空 = 跟随宿主默认
+      "agentPreset": "",                     // 节点会话 preset，空 = 继承流程/引擎，兜底 standard
       "executor": "dsh",                     // dsh（默认）| codex | custom
       "executorCommand": "",                 // custom 必填；codex 可填可执行文件路径
       "team": [{ "name": "接口实现", "role": "……", "task": "……" }]
@@ -36,7 +38,9 @@
 
 节点只有三种 `kind`：`start` / `stage` / `end`；只有阶段节点有角色、任务、skill 与主从配置。连线只有两种 `kind`：`next`（正常流转）/ `reject`（打回，目标必须是上游）。
 
-**未识别字段原样收进 `extras`**（有界：键 ≤16、单串 ≤256、总字节 ≤2048、深度 ≤3；坏输入不抛错），后续加字段不会被保存链静默丢掉。
+**未识别字段原样收进 `extras`**（有界：键 ≤16、单串 ≤256、总字节 ≤2048、深度 ≤3；坏输入不抛错），后续加字段不会被保存链静默丢掉。例如节点显式 `provider` 目前不是已知字段，会落在 `extras.provider`，引擎解析模型路由时同样优先使用它。
+
+`agentPreset` 只做安全 id 校验（小写字母 / 数字 / `-` / `_`，≤64）；空 = 继承流程 / 引擎默认，最终兜底 `standard`。preset 是否真实存在由宿主 registry 在创建会话时判断（插件可注册 `digital-human` / `specialist` 等自定义 id）。
 
 ### 校验分两级
 

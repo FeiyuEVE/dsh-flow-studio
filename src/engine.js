@@ -30,7 +30,7 @@ import { existsSync } from 'node:fs'
 import { chmod, lstat, mkdir, readdir, readFile, realpath as realpathAsync, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
-import { EDGE_KIND, EXEC_MODE, EXECUTOR, NODE_KIND } from './model.js'
+import { DEFAULT_AGENT_PRESET, EDGE_KIND, EXEC_MODE, EXECUTOR, NODE_KIND } from './model.js'
 import { checkRunId, isSafeRelPath, normalizeEvent } from './runlog.js'
 import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 // 07 §4（R1+R4）：工作区解析 / worktree 决策是 start 时的一次性判断，纯逻辑 + 真 git。
@@ -59,6 +59,10 @@ import {
   replayMachine,
 } from './flowmachine.js'
 import { createActor } from './xstate-vendor.js'
+// v0.9.2 前置（任务 2）：阶段节点的打回工具。工具定义是纯函数，不 import 引擎。
+import {
+  createNodeRejectTool, rejectTargetsOf, shouldRegisterNodeRejectTool,
+} from './node-tools.js'
 
 /**
  * 进 `machineVersion` 的引擎版本（08 §6）。**只放影响转移的版本号**：改节点标题、
@@ -1981,42 +1985,62 @@ class FlowEngine {
 
   /**
    * 创建节点会话用的 `agentOptions`：新版 dsh 的节点会话**必须**能解析出模型路由，
-   * 即 `agentOptions` 里 provider 与 model 成对（只给 model 时，0.2.2-rc.1 的
-   * `agents.create` 本身不抛错，但首轮 preStep 会抛 `agent "…" has no provider/model`；
-   * 更早的 rc5 直接在创建期拒绝）。规则：
-   *   - 节点侧显式给了非空 provider：原样返回（节点配置优先，不被宿主默认覆盖）；
-   *   - 没给 agentOptions：返回完整的宿主默认 selection（把默认模型路由固定下来）；
-   *   - 只给了 model：用宿主默认 provider 补齐，model 保持节点配置；
-   *   - 宿主没有 `agentDefaultModel` 服务：原样返回保持旧行为，并在「有 model 没 provider」
-   *     时记一条 warn（可诊断，不要让会话创建静默失败）。
-   * 节点自定了 model 时**不**把宿主的 `reasoningEffort` 带过去：不同模型的 effort
-   * 档位不可移植，只有 agentOptions 自己给了才传。
+   * 即 `agentOptions` 里 provider 与 model 成对。0.2.2-rc.1 的 `agents.create`
+   * 本身不一定在创建期抛错，但**首轮 preStep 之前**解析不出路由就抛
+   * `agent "…" has no provider/model`（`dsh-agent-loop/lib/index.js:671-672`），
+   * 且 `agent/request` waterfall 已不允许再改 provider/model。
+   *
+   * 规则（v0.9.2 起，见 `docs/reference/host-api.md` §「节点会话的模型路由与 agent preset」）：
+   *   - 有宿主 `agentDefaultModel` selection：
+   *       provider = 节点显式 provider（非空）> 宿主 provider；
+   *       model    = 节点显式 model（非空）> 宿主 model；
+   *       reasoningEffort **只在节点自己给了才带**（不同模型档位不可移植，
+   *       也不要把宿主默认档位移植到节点自定模型上）。
+   *   - 没有 selection，但节点自己给了 provider + model → 原样返回成对路由；
+   *   - 没有 selection，且节点配置**不成对**（含空 agentOptions） →
+   *       抛 `EngineError(503, 可诊断文案)`。绝不静默创建注定首轮失败的会话。
+   *
+   * 「agentOptions 为空时不传该字段」的旧约定已**废弃**：调用方现在必须显式传
+   * 成对路由（见 `_createNodeSession`）。
    */
-  _resolveCreateAgentOptions(agentOptions) {
+  _resolveCreateAgentOptions(agentOptions, context = {}) {
     const selection = this._defaultAgentSelection()
-    const hasProvider = Boolean(agentOptions)
-      && typeof agentOptions.provider === 'string' && agentOptions.provider !== ''
-    const hasModel = Boolean(agentOptions)
-      && typeof agentOptions.model === 'string' && agentOptions.model !== ''
-    if (!selection) {
-      if (hasModel && !hasProvider) {
-        this.log(
-          'warn',
-          'flow-studio: 宿主未提供默认模型（agentDefaultModel 不可用），节点模型缺 provider；'
-          + '新宿主（0.2.1-rc.5+）可能拒绝创建该节点会话',
-        )
+    const source = agentOptions && typeof agentOptions === 'object' && !Array.isArray(agentOptions)
+      ? agentOptions
+      : null
+    const hasProvider = Boolean(source)
+      && typeof source.provider === 'string' && source.provider !== ''
+    const hasModel = Boolean(source)
+      && typeof source.model === 'string' && source.model !== ''
+    const nodeEffort = source && typeof source.reasoningEffort === 'string' && source.reasoningEffort !== ''
+      ? source.reasoningEffort
+      : undefined
+    if (selection) {
+      return {
+        provider: hasProvider ? source.provider : selection.provider,
+        model: hasModel ? source.model : selection.model,
+        ...(nodeEffort === undefined ? {} : { reasoningEffort: nodeEffort }),
       }
-      return agentOptions
     }
-    if (!agentOptions || Object.keys(agentOptions).length === 0) return selection
-    if (hasProvider) return agentOptions
-    return {
-      provider: selection.provider,
-      model: hasModel ? agentOptions.model : selection.model,
-      ...(typeof agentOptions.reasoningEffort === 'string' && agentOptions.reasoningEffort !== ''
-        ? { reasoningEffort: agentOptions.reasoningEffort }
-        : {}),
+    if (hasProvider && hasModel) {
+      return {
+        provider: source.provider,
+        model: source.model,
+        ...(nodeEffort === undefined ? {} : { reasoningEffort: nodeEffort }),
+      }
     }
+    const nodeLabel = context && typeof context.nodeId === 'string' && context.nodeId !== ''
+      ? `节点「${context.nodeTitle || context.nodeId}」`
+      : '节点'
+    const configured = `provider=${hasProvider ? source.provider : '（未配置）'}`
+      + ` / model=${hasModel ? source.model : '（未配置）'}`
+    throw new EngineError(
+      503,
+      `${nodeLabel}无法确定模型路由：宿主未提供 agentDefaultModel（拿不到默认 provider/model），`
+      + `且节点未配置成对的 provider/model（当前 ${configured}）。`
+      + '新宿主（0.2.1-rc.5+）的节点会话必须在首轮 preStep 之前解析出模型路由；'
+      + '请在节点上同时配置 provider 与 model，或让宿主提供 agentDefaultModel 后再开跑。',
+    )
   }
 
   /**
@@ -2397,6 +2421,8 @@ class FlowEngine {
     // 清掉上一条 assistant 文本 / 正式结论缓存，避免把上一轮的结果误当成本轮输出。
     this.lastAssistantBySession.delete(sessionId)
     this.lastStructuredBySession.delete(sessionId)
+    // v0.9.2（任务 2）：上一轮残留的「工具登记打回」不能跨 attempt 生效。
+    if (this.pendingNodeRejects instanceof Map) this.pendingNodeRejects.delete(sessionId)
     // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
     this.bindSession(sessionId, { nodeId: node.id, attemptId: attempt, memberId: null, traceId }, { rebind: true })
     // C2：先登记本轮凭证再 followup —— 注入式宿主可能同步把回报喂进 handleSessionEvent。
@@ -2443,12 +2469,16 @@ class FlowEngine {
         })
         // C2：提前收口用的是**正式结论对象**（带 artifacts / findings / acceptance /
         // tests / checks），不是状态块的精简投影 —— 证据不再被静默丢掉。
-        const structured = { ...winner.structured }
+        let structured = { ...winner.structured }
         if (structured.verdict === 'reject' && !structured.rejectReason) {
           structured.rejectReason = typeof structured.summary === 'string' && structured.summary.trim() !== ''
             ? structured.summary
             : '自审回报判定打回（self-check）'
         }
+        // v0.9.2（任务 2）：主管在回合中调用 flow_node_reject → 以打回结论收口，
+        // 后续走既有的 reject 边 / reject/trigger 通道。
+        structured = this._applyPendingNodeReject({ sessionId, node, attempt, structured })
+        this.pendingNodeRejects.delete(sessionId)
         return { structured, completedBy: 'self-check' }
       }
       // 回合先到（或没有自审信号）：保持既有语义，先等 whenIdle 再解析。
@@ -2487,16 +2517,31 @@ class FlowEngine {
       // 既没有正式结论、也没有本 attempt 的正式结论缓存时，把最后一条消息里的可解析
       // 对象原样交给 normalizeStructured 报「缺少 verdict」（保持既有失败语义）。
       if (!structured && lastParsed) structured = lastParsed
+      // v0.9.2（任务 2）：有工具登记时允许「没有正式 JSON 结论」——主管已经用工具
+      // 明确宣告打回，不该再因为末尾没贴 JSON 被当成结构不合格重试/失败。
+      const pendingReject = this.pendingNodeRejects instanceof Map
+        ? this.pendingNodeRejects.get(sessionId)
+        : null
+      const hasPendingReject = Boolean(pendingReject)
+        && pendingReject.nodeId === node.id
+        && pendingReject.attempt === attempt
+      if (!structured && hasPendingReject) {
+        structured = {}
+      }
       if (!structured) {
         throw new StructuredOutputError(
           `会话 ${sessionId} 的最近一条 assistant 消息里没有可解析的正式 JSON 结论`
           + `（需要 verdict=pass/reject，且回显 attempt=${attempt} 与一次性 nonce）`,
         )
       }
+      structured = this._applyPendingNodeReject({ sessionId, node, attempt, structured })
+      if (this.pendingNodeRejects instanceof Map) this.pendingNodeRejects.delete(sessionId)
       return { structured, completedBy: null }
     } finally {
       this._disarmSelfCheck(sessionId, selfCheck)
       if (this.attemptEnvelopes.get(sessionId) === envelope) this.attemptEnvelopes.delete(sessionId)
+      // v0.9.2（任务 2）：attempt 收口后清掉工具登记（失败 / 中止时也不留给下一轮）。
+      if (this.pendingNodeRejects instanceof Map) this.pendingNodeRejects.delete(sessionId)
       // G1-b：attempt 结束即清理正式结论缓存（不跨轮使用；迟到的回报已被 attemptEnvelopes 挡住）。
       const settled = this.lastStructuredBySession.get(sessionId)
       if (settled && settled.attempt === attempt) this.lastStructuredBySession.delete(sessionId)
@@ -2507,7 +2552,7 @@ class FlowEngine {
    * 复用已有节点会话（sessions.json / 本 run 内已登记）：活会话直接 followup，
    * 冷会话或已被压缩的会话先 resume。
    */
-  async _followupNodeSession({ runId, node, attempt, prompt, combined, traceId, entry }) {
+  async _followupNodeSession({ runId, node, attempt, prompt, combined, traceId, entry, flow }) {
     const agents = this._agentsService()
     const sessionId = entry.sessionId
     let agent = null
@@ -2524,7 +2569,31 @@ class FlowEngine {
       const resumeOptions = { resumeSessionId: sessionId }
       const selection = this._defaultAgentSelection()
       if (selection) resumeOptions.agentOptions = selection
-      const resumed = await raceAbort(agents.resume(resumeOptions), combined)
+      // v0.9.2 P0 修正：**resume 也靠 setup 挂组合**（`dsh-agent-loop` 的 initializeAgent
+      // 不读 session header 的 agentPreset）。漏了这里，打回重跑 / restart 续跑的冷会话
+      // 会重新掉回裸工具面——「续跑之后节点又改不了代码」就是这条。
+      const presetInfo = this._sessionPresetInfo(node, flow)
+      const composition = await raceAbort(
+        this._resolveAgentComposition(presetInfo.value, { node, source: presetInfo.source }),
+        combined,
+      )
+      if (typeof composition.setup === 'function') resumeOptions.setup = composition.setup
+      let resumed
+      try {
+        resumed = await raceAbort(agents.resume(resumeOptions), combined)
+      } catch (error) {
+        if (combined && combined.aborted) throw abortError(combined)
+        // 冷会话 resume 失败（宿主删了会话 / 持久化丢了 / preset 组合挂载失败）：
+        // 给一条能定位到节点与 sessionId 的中文错误，而不是裸宿主异常。
+        if (error instanceof EngineError) throw error
+        throw new EngineError(
+          503,
+          `节点「${node.title || node.id}」(${node.id}) 的会话 ${sessionId} 无法 resume：`
+          + `${error && error.message ? error.message : String(error)}；`
+          + '该会话可能已被宿主删除 / 持久化丢失，或 preset 组合挂载失败。'
+          + '可改用 restart 之外的新 run，或到设置页确认会话持久化与 agentPreset 后重试。',
+        )
+      }
       agent = resumed && resumed.agent ? resumed.agent : null
       mode = 'resumed'
     }
@@ -2533,6 +2602,9 @@ class FlowEngine {
     }
     // 07 §11.1：attempt 结束时注销过闹钟；打回重跑复用同一会话，要重新登记。
     this._registerNodeSupervision(runId, node, attempt, sessionId)
+    // v0.9.2（任务 2）：复用旧会话时按**当前流程结构**重算工具集：有出向 reject 边
+    // 就补挂（或换绑到本 attempt），边被删掉了就撤掉（见 `_syncNodeRejectTool`）。
+    this._syncNodeRejectTool({ agent, sessionId, runId, node, attempt, flow })
     let prompted
     try {
       prompted = await this._promptNodeSession({
@@ -2552,6 +2624,148 @@ class FlowEngine {
     }
   }
 
+  // -- v0.9.2（任务 2）：阶段节点打回工具（flow_node_reject） ---------------
+
+  /**
+   * 按**当前流程结构**重算并（重）挂某节点会话的打回工具。
+   *
+   * 门控规则（硬要求）：
+   *   - 只给**阶段节点**、且 `flow.edges` 里存在 `from === node.id && kind === 'reject'`
+   *     出向边的会话注册；
+   *   - 没有出向 reject 边 → 不注册（并把该会话上一次的注册撤掉）；
+   *   - 开始 / 结束节点不注册；
+   *   - 每次 attempt / 复用冷会话都会调用本方法，所以「结构加边后重启能补挂、
+   *     删边后能撤掉」是自然结果，不需要另存一份结构指纹。
+   *
+   * @returns {boolean} 本次是否注册成功（false = 不该注册 / 宿主没有 tools 服务）
+   */
+  _syncNodeRejectTool({ agent, sessionId, runId, node, attempt, flow }) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    // 先撤旧注册：attempt 变了闭包要换，结构变了要消失，两者都走同一条路。
+    this._disposeNodeRejectTool(sessionId)
+    if (!shouldRegisterNodeRejectTool(flow, node)) return false
+    const tools = agent && agent.ctx && agent.ctx.tools
+    if (!tools || typeof tools.register !== 'function') {
+      // 兼容旧宿主 / 纯注入测试环境：没有 tools 服务时只是不挂工具，节点照常执行。
+      this.log(
+        'warn',
+        `flow-studio: 节点「${node.id}」有出向 reject 边，但宿主没有 agent.ctx.tools 服务，`
+        + '跳过 flow_node_reject 注册（结构化 verdict=reject 仍可用）',
+      )
+      return false
+    }
+    const tool = createNodeRejectTool({
+      nodeId: node.id,
+      runId,
+      attempt,
+      sessionId,
+      rejectTargets: rejectTargetsOf(flow, node.id),
+      onReject: payload => this._recordNodeReject({
+        sessionId, runId, nodeId: node.id, attempt, ...payload,
+      }),
+    })
+    let dispose
+    try {
+      dispose = tools.register(tool)
+    } catch (error) {
+      this.log('warn', `flow-studio: 注册 flow_node_reject 失败（节点 ${node.id}）：${error.message}`)
+      return false
+    }
+    if (typeof dispose !== 'function') {
+      this.log('warn', `flow-studio: flow_node_reject 注册未返回 disposer（节点 ${node.id}），跳过登记`)
+      return false
+    }
+    this.nodeTools.set(sessionId, { nodeId: node.id, attempt, dispose })
+    return true
+  }
+
+  /** 撤掉某个会话的打回工具注册（幂等；单个 disposer 抛错只告警）。 */
+  _disposeNodeRejectTool(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    if (!(this.nodeTools instanceof Map)) return false
+    const entry = this.nodeTools.get(sessionId)
+    if (!entry) return false
+    this.nodeTools.delete(sessionId)
+    try {
+      entry.dispose()
+    } catch (error) {
+      this.log('warn', `flow-studio: 注销 flow_node_reject 失败（${sessionId}）：${error.message}`)
+    }
+    return true
+  }
+
+  /** run 收尾 / 换 run：把全部节点工具按 disposer 撤掉。 */
+  _disposeAllNodeRejectTools() {
+    if (!(this.nodeTools instanceof Map)) return
+    for (const sessionId of [...this.nodeTools.keys()]) this._disposeNodeRejectTool(sessionId)
+  }
+
+  /**
+   * 工具回调：登记「本轮 attempt 打回」，等本轮 whenIdle 收口时并入结构化结论。
+   *
+   * 为什么不立刻写 `reject/trigger`：工具是在节点回合**中途**被调用的，此时还没有
+   * 本轮结论、也还没到「选目标 / 校验 maxRounds」的时机。把登记挂在引擎的
+   * `pendingNodeRejects` 上、在 `_promptNodeSession` 收口时改成 `verdict='reject'`，
+   * 就能完整复用既有的 node/end → selectRejectTarget → reject/trigger 通道，
+   * 不产生第二套状态，也不会出现「工具写了 reject 但回合又回了 pass」的双写。
+   */
+  _recordNodeReject({ sessionId, runId, nodeId, attempt, reason, findings, rejectTarget }) {
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      return { ok: false, error: '会话 id 缺失，无法登记打回', hint: '这是引擎内部错误，请结束本轮。' }
+    }
+    if (!this.current || !this.active || this.active.runId !== runId) {
+      return { ok: false, error: '当前没有正在执行的 run', hint: '打回工具只在节点 attempt 执行期间可用。' }
+    }
+    if (this.current.node.id !== nodeId || this.current.attempt !== attempt) {
+      return {
+        ok: false,
+        error: `当前执行的是节点「${this.current.node.id}」attempt ${this.current.attempt}，`
+          + `与工具绑定的「${nodeId}」attempt ${attempt} 不一致`,
+        hint: '这是过期会话里的旧工具注册；请结束本轮，下一次 attempt 会重新注册。',
+      }
+    }
+    const trimmed = typeof reason === 'string' ? reason.trim().slice(0, 2000) : ''
+    if (trimmed === '') {
+      return { ok: false, error: '打回原因不能为空', hint: '在 reason 里写清需要返工什么。' }
+    }
+    this.pendingNodeRejects.set(sessionId, {
+      nodeId,
+      attempt,
+      reason: trimmed,
+      findings: Array.isArray(findings) ? findings.slice(0, 50) : [],
+      rejectTarget: typeof rejectTarget === 'string' && rejectTarget !== '' ? rejectTarget : undefined,
+      at: isoOf(this.now()),
+    })
+    this.log('info', `flow-studio: 节点「${nodeId}」attempt ${attempt} 通过 flow_node_reject 登记打回`)
+    return { ok: true }
+  }
+
+  /**
+   * 把「工具登记的打回」并入本轮结构化结论。有登记时 reject 优先于模型文本
+   *（否则主管点了打回、又顺手回了 pass，语义会打架）；没有登记时原样返回。
+   * 返回 null 表示「没有可用结论」。
+   */
+  _applyPendingNodeReject({ sessionId, node, attempt, structured }) {
+    if (!(this.pendingNodeRejects instanceof Map)) return structured
+    const pending = this.pendingNodeRejects.get(sessionId)
+    if (!pending || pending.nodeId !== node.id || pending.attempt !== attempt) return structured
+    const base = structured && typeof structured === 'object' && !Array.isArray(structured) ? structured : {}
+    const findings = Array.isArray(pending.findings) && pending.findings.length > 0
+      ? pending.findings
+      : (Array.isArray(base.findings) ? base.findings : [])
+    const summary = typeof base.summary === 'string' && base.summary.trim() !== ''
+      ? base.summary
+      : `主管通过 flow_node_reject 宣告打回：${pending.reason}`
+    return {
+      ...base,
+      verdict: 'reject',
+      rejectReason: pending.reason,
+      ...(pending.rejectTarget ? { rejectTarget: pending.rejectTarget } : {}),
+      findings,
+      summary,
+    }
+  }
+
   /**
    * run 收尾统一释放会话：用 Set 去重，单个失败只告警。
    * 中途节点失败不提前 dispose（节点可能还要被二次激活）。
@@ -2559,6 +2773,8 @@ class FlowEngine {
   async _disposeRunSessions(runId) {
     // 07 §11.1：run 收尾后不再叫醒这个 run 的任何节点会话（与 runtime 收尾同口径、幂等）。
     this._unregisterRunSupervision(runId)
+    // v0.9.2（任务 2）：run 结束就撤掉所有 flow_node_reject 注册（disposer 挂在 run 生命周期上）。
+    this._disposeAllNodeRejectTools()
     const handles = [...this.disposalHandles]
     this.disposalHandles.clear()
     this.nodeSessions.clear()
@@ -2719,6 +2935,8 @@ class FlowEngine {
     if (this.workspaceRecord) binding.workspace = this.workspaceRecord
     if (this.worktreeRecord) binding.worktree = this.worktreeRecord
     if (this.sessionMode) binding.sessionMode = this.sessionMode
+    // v0.9.2 P0：本次 run 生效的默认 preset + 来源（节点级覆盖见 node/start.data.agentPreset）。
+    if (this.runPresetInfo) binding.agentPreset = { ...this.runPresetInfo }
     // G1-d：本次 run 实际生效的墙钟上限（`run.json.limits`）。runstore 的
     // normalizeMeta 白名单里已有 `limits`（G2 契约），所以 readRunMeta 也能读回；
     // 形状由 runstore 收敛（两个可选正整数）。
@@ -2959,11 +3177,187 @@ class FlowEngine {
     return { workspace, worktree, warnings }
   }
 
-  /** 节点主管会话的 agent preset（per-start > 引擎配置；都没有就交给宿主默认）。 */
-  _sessionPreset() {
-    if (typeof this.startAgentPreset === 'string' && this.startAgentPreset !== '') return this.startAgentPreset
-    if (typeof this.agentPreset === 'string' && this.agentPreset !== '') return this.agentPreset
-    return undefined
+  /**
+   * 节点主管会话实际生效的 agent preset + 来源（v0.9.2 P0）。
+   *
+   * 优先级：节点 `agentPreset` > 本次 start 显式 `agentPreset` > 引擎配置
+   * `agentPreset` > 流程级 `agentPreset` > 兜底 `standard`。
+   *
+   * **永远返回具体值**：0.2.2 宿主对没有 `meta.agentPreset` 的程序化会话给的是
+   * 几乎没有工具的裸组合（实测只有 working_directory / memory_recall 之类），
+   * 节点会话必须显式带 preset，才不会出现「开发节点改不了代码、测试节点跑不了测试」。
+   *
+   * @returns {{ value: string, source: 'node'|'start'|'engine'|'flow'|'default' }}
+   */
+  _sessionPresetInfo(node, flow) {
+    const nodePreset = node && typeof node.agentPreset === 'string' ? node.agentPreset.trim() : ''
+    if (nodePreset !== '') return { value: nodePreset, source: 'node' }
+    if (typeof this.startAgentPreset === 'string' && this.startAgentPreset !== '') {
+      return { value: this.startAgentPreset, source: 'start' }
+    }
+    if (typeof this.agentPreset === 'string' && this.agentPreset !== '') {
+      return { value: this.agentPreset, source: 'engine' }
+    }
+    const flowPreset = flow && typeof flow.agentPreset === 'string' ? flow.agentPreset.trim() : ''
+    if (flowPreset !== '') return { value: flowPreset, source: 'flow' }
+    // 默认值可能是「standard」也可能是 start() 里降级后的宿主默认（`default-fallback`）。
+    // node/start 事件据此报告**实际生效**的 id，而不是我们请求的那个。
+    if (this.runPresetInfo && typeof this.runPresetInfo.value === 'string' && this.runPresetInfo.value !== '') {
+      return {
+        value: this.runPresetInfo.value,
+        source: this.runPresetInfo.source === 'default-fallback' ? 'default-fallback' : 'default',
+      }
+    }
+    return { value: DEFAULT_AGENT_PRESET, source: 'default' }
+  }
+
+  /**
+   * 解析 agent preset 的**组合装配**（v0.9.2 P0 修正）。
+   *
+   * 踩坑结论（改这块前先看这三处宿主源码）：
+   *   - `meta.agentPreset` 只写进 session header（鉴权 / 投影用），**不会挂载组合**：
+   *     `dsh-session/lib/index.js:1840`；
+   *   - 组合只在 `agents.create()` / `agents.resume()` 的 `setup` 回调里挂载：
+   *     `dsh-agent-loop/lib/index.js:1567`（`setup?.(agent.ctx, agent)`），
+   *     引擎**不读** header 补挂；
+   *   - Web 侧唯一正确的调用形状（`dsh-api-session-controller/lib/index.js:424-439`）：
+   *     `create({ sessionId, agentOptions, meta:{cwd, agentPreset}, setup: composition.setup })`，
+   *     其中 `composition = await sessionController.composeAgent(requested)`。
+   *
+   * 解析优先级：
+   *   1. `ctx.get('sessionController').composeAgent(presetId)` —— 与 Web 完全同一条路径
+   *      （挂 preset + 装模型切换提示），首选；
+   *   2. 只有 `ctx.get('agentPresets')` → `presets.resolve(id)` + `setup` 里
+   *      `presets.mount(agentCtx, resolvedId)`。这里**不**装 `installModelSelection`：
+   *      那只是「会话中途换模型时追加一条提示」的 `agent/pre-step` 监听
+   *      （`dsh-agent/lib/index.js:231-243`），不影响工具面 / 模型路由；插件也不为它
+   *      引入 `@deepseek-ai/dsh-agent` 的跨包依赖（本插件所有宿主能力走 `ctx.get`）；
+   *   3. 两个服务都没有 → 不传 setup，但留一条可诊断 warn（节点会掉回裸工具面）。
+   *
+   * preset 不存在（`presets.resolve` / `composeAgent` 抛错）→ `EngineError(400)`，
+   * 文案点明节点与 preset id，并尽量附上可用 preset 列表。
+   *
+   * @param {string} presetId
+   * @param {{ node?: object }} [context]
+   * @returns {Promise<{ agentPreset: string, setup?: Function, source: string }>}
+   */
+  async _resolveAgentComposition(presetId, context = {}) {
+    const source = context && typeof context.source === 'string' ? context.source : ''
+    // run 级默认组合在 start() 里已经解析过一次：默认 / 默认降级两种情况直接复用，
+    // 避免每个节点重复 compose，也保证 node/start 报出的实际 id 与创建时一致。
+    if (this.runComposition && (source === 'default' || source === 'default-fallback')) {
+      return this.runComposition
+    }
+    const requested = typeof presetId === 'string' && presetId !== '' ? presetId : DEFAULT_AGENT_PRESET
+    try {
+      return await this._composeWithHostPresetServices(requested)
+    } catch (error) {
+      // 原则：**我们自己的兜底失败可以降级，用户显式配置失败必须报错**。
+      if (source === 'default') {
+        try {
+          const composition = await this._composeWithHostPresetServices(undefined)
+          this.log(
+            'warn',
+            `flow-studio: 当前 profile 没有「${requested}」preset（${error.message}），`
+            + `已退回宿主默认「${composition.agentPreset}」`,
+          )
+          return { ...composition, source: 'default-fallback' }
+        } catch (fallbackError) {
+          throw await this._agentPresetError(requested, fallbackError, context, ['default-fallback'], 503)
+        }
+      }
+      throw await this._agentPresetError(requested, error, context, [])
+    }
+  }
+
+  /**
+   * 实际调用宿主 preset 服务（`sessionController` 优先，其次 `agentPresets`）。
+   * `requested === undefined` 表示「要宿主自己的默认 preset」（fallback 用）。
+   */
+  async _composeWithHostPresetServices(requested) {
+    const ctx = this.ctx
+    const get = name => {
+      if (!ctx || typeof ctx.get !== 'function') return undefined
+      try {
+        return ctx.get(name)
+      } catch {
+        return undefined
+      }
+    }
+    const sessionController = get('sessionController')
+    if (sessionController && typeof sessionController.composeAgent === 'function') {
+      const composition = requested === undefined
+        ? await sessionController.composeAgent(undefined)
+        : await sessionController.composeAgent(requested)
+      if (composition && typeof composition === 'object') {
+        return {
+          agentPreset: typeof composition.agentPreset === 'string' && composition.agentPreset !== ''
+            ? composition.agentPreset
+            : (requested || DEFAULT_AGENT_PRESET),
+          setup: typeof composition.setup === 'function' ? composition.setup : undefined,
+          source: 'sessionController',
+        }
+      }
+    }
+    const presets = get('agentPresets')
+    if (presets && typeof presets.resolve === 'function') {
+      const resolved = requested === undefined
+        ? await presets.resolve(undefined)
+        : await presets.resolve(requested)
+      const resolvedId = resolved && typeof resolved.id === 'string' && resolved.id !== ''
+        ? resolved.id
+        : (requested || DEFAULT_AGENT_PRESET)
+      let setup
+      if (typeof presets.mount === 'function') {
+        // 少了 installModelSelection 的「模型切换提示」：见方法头注释第 2 条。
+        setup = async agentCtx => {
+          await presets.mount(agentCtx, resolvedId)
+        }
+      }
+      return { agentPreset: resolvedId, setup, source: 'agentPresets' }
+    }
+    if (requested !== undefined) {
+      this.log(
+        'warn',
+        `flow-studio: 宿主没有 sessionController / agentPresets 服务，节点会话将没有 preset`
+        + ` 工具面（meta.agentPreset=${requested} 只写 header，不会挂组合）；`
+        + '请升级宿主或检查 agentPresets 服务是否加载',
+      )
+    }
+    return { agentPreset: requested || DEFAULT_AGENT_PRESET, setup: undefined, source: 'none' }
+  }
+
+  /** preset 解析失败：可读的 EngineError(400)，尽量附可用 id 列表。 */
+  async _agentPresetError(presetId, cause, context = {}, via = [], status = 400) {
+    const node = context && context.node ? context.node : null
+    const nodeLabel = node && typeof node.id === 'string'
+      ? `节点「${node.title || node.id}」(${node.id})`
+      : '节点'
+    let available = []
+    try {
+      const presets = this.ctx && typeof this.ctx.get === 'function' ? this.ctx.get('agentPresets') : undefined
+      if (presets && typeof presets.list === 'function') {
+        const rows = await presets.list()
+        available = (Array.isArray(rows) ? rows : (rows && Array.isArray(rows.presets) ? rows.presets : []))
+          .map(row => (row && (row.id || row.name)) || '')
+          .filter(id => typeof id === 'string' && id !== '')
+          .slice(0, 20)
+      }
+    } catch {
+      available = []
+    }
+    const detail = cause && cause.message ? cause.message : String(cause)
+    const fallbackNote = via.includes('default-fallback')
+      ? '（这是引擎兜底 standard 失败后的宿主默认预设；宿主 preset 服务本身可能不可用）'
+      : ''
+    return new EngineError(
+      status,
+      `${nodeLabel}的 agentPreset「${presetId}」不可用（${via.filter(item => item !== 'default-fallback').join(' / ') || 'preset 服务'} 解析失败：${detail}）${fallbackNote}。`
+      + (available.length > 0
+        ? `可用 preset：${available.join(' / ')}。`
+        : '请到宿主设置页确认已注册的 preset id（如 standard / ptc / minimal / cordis）。')
+      + '若只是想用完整工具面，把节点的 agentPreset 留空即可回退到宿主默认（standard）。',
+    )
   }
 
   /**
@@ -2995,27 +3389,37 @@ class FlowEngine {
 
   /**
    * 07 §3.1：用 `agents.create` 新建一个顶层节点主管会话。
-   * `agentOptions` 必须带 provider（0.2.1-rc.5+ 宿主硬要求），由
-   * `_resolveCreateAgentOptions` 用宿主默认模型兜底。
+   * `agentOptions` 现在**必须**是成对的 provider + model（v0.9.2）：解析不出来就
+   * 在创建之前抛 503（`_resolveCreateAgentOptions`），不创建注定首轮失败的会话。
    */
-  async _createNodeSession({ prompt, signal, onSession, agentOptions, node, attempt, runId, traceId }) {
+  async _createNodeSession({ prompt, signal, onSession, agentOptions, node, attempt, runId, traceId, flow }) {
     const agents = this._agentsService()
     const sessionId = nodeSessionId(runId, node.id, attempt)
     // 只放会话元数据：cwd / agentPreset。父会话 / origin / 委派深度一律不传。
     const meta = {}
     const cwd = this._sessionCwd()
     if (cwd) meta.cwd = cwd
-    const preset = this._sessionPreset()
-    if (preset) meta.agentPreset = preset
-    // 宿主硬要求 agentOptions.provider：节点 model 只给了 model，这里补齐路由。
-    const resolvedAgentOptions = this._resolveCreateAgentOptions(agentOptions)
+    // v0.9.2 P0：**永远**显式传 agentPreset（节点 / start / 引擎 / 流程 / 兜底 standard）。
+    const presetInfo = this._sessionPresetInfo(node, flow)
+    // 只写 meta.agentPreset 不会挂组合：必须把 composition.setup 一起传进 agents.create
+    // （见 `_resolveAgentComposition` 方法头的宿主源码指路）。
+    const composition = await this._resolveAgentComposition(presetInfo.value, {
+      node,
+      source: presetInfo.source,
+    })
+    meta.agentPreset = composition.agentPreset
+    // v0.9.2：显式传成对路由（不再有「agentOptions 为空就不传」的分支）。
+    // 06 §13.11 M5：node.model 必须真正传给会话创建（不只是界面上填）。
+    const resolvedAgentOptions = this._resolveCreateAgentOptions(agentOptions, {
+      nodeId: node.id,
+      nodeTitle: node.title,
+    })
     const createOptions = {
       sessionId,
       ...(Object.keys(meta).length > 0 ? { meta } : {}),
-      // 06 §13.11 M5：node.model 必须真正传给会话创建（不只是界面上填）。
-      ...(resolvedAgentOptions && Object.keys(resolvedAgentOptions).length > 0
-        ? { agentOptions: resolvedAgentOptions }
-        : {}),
+      agentOptions: resolvedAgentOptions,
+      // 路径 3（没有 preset 服务）时 setup 为 undefined → 不传该字段（并有 warn）。
+      ...(typeof composition.setup === 'function' ? { setup: composition.setup } : {}),
     }
     if (signal && signal.aborted) throw abortError(signal)
 
@@ -3054,6 +3458,14 @@ class FlowEngine {
     }
     // 07 §11.1：agents.create 成功后立刻登记节点闹钟（attempt 结束 / run 收尾再注销）。
     this._registerNodeSupervision(runId, node, attempt, sessionId)
+    // v0.9.2（任务 3）：会话一建好就落 sessions.json —— 即使本轮 prompt 失败（节点
+    // 结构不合格 / 超时），失败节点的 sessionId 也必须留得下来，restart 才能在原会话
+    // 续跑。`_executeNode` 成功返回后还会再记一次（补 handle / agent）。
+    this._recordNodeSession(runId, node.id, sessionId, { handle, agent, attempt })
+    await this._persistNodeSessions(runId)
+    // v0.9.2（任务 2）：按**当前流程结构**决定是否给这个节点会话挂 `flow_node_reject`。
+    // 注册必须发生在 followup 之前：宿主在进入第一轮 step 时才解析可见工具清单。
+    this._syncNodeRejectTool({ agent, sessionId, runId, node, attempt, flow })
     let prompted
     try {
       prompted = await this._promptNodeSession({
@@ -3064,6 +3476,7 @@ class FlowEngine {
       // run 级收口，run 结束时统一 handle.dispose()（不删会话文件）。
       // 07 §11.1：这一轮 attempt 已经结束，先摘闹钟（重试 / 打回会重新登记）。
       this._unregisterNodeSupervision(sessionId)
+      this._disposeNodeRejectTool(sessionId)
       if (handle && typeof handle.dispose === 'function') this.disposalHandles.add(handle)
       throw error
     }
@@ -3085,6 +3498,10 @@ class FlowEngine {
   /**
    * 兼容路径：旧宿主没有 `agents.create` 时，仍用 `ctx.subagents.startActivation`
    * 起一个 spawn 子会话（不是 R2 的默认实现；真实宿主不会走到这里）。
+   *
+   * v0.9.2 P0：这里**不需要** composition.setup。子 agent 走 `composeFrom` 继承
+   * 父会话的 preset revision（`agentPresets.composeFrom(ctx, parent)`），不是
+   * `agents.create` 的顶层组合装配；给 startActivation 传 setup 反而没有接收者。
    */
   async _legacyActivate({ prompt, outputSchema, signal, label, onSession, agentOptions }) {
     const subagents = this._subagentService()
@@ -3093,8 +3510,11 @@ class FlowEngine {
     }
     const parent = await this._resolveParent()
     if (!parent) throw new EngineError(503, '没有可用的父会话：无法启动子 agent')
-    // 与 `_createNodeSession` 同一口径：agentOptions 缺 provider 时用宿主默认模型补齐。
-    const resolvedAgentOptions = this._resolveCreateAgentOptions(agentOptions)
+    // 兼容路径不是 `agents.create`：没有 agentOptions 就沿用旧行为（不传路由）。
+    // 只有节点真的配了模型时才走同一套「provider + model 成对」校验 / 补齐。
+    const resolvedAgentOptions = agentOptions === undefined || agentOptions === null
+      ? undefined
+      : this._resolveCreateAgentOptions(agentOptions)
     let started
     try {
       started = await subagents.startActivation({
@@ -3218,6 +3638,13 @@ class FlowEngine {
     const active = { runId, flow: null, controller, promise: null, starting: true, engine: this }
     this.active = active
     this._resetRunState()
+    // v0.9.2（任务 3）：失败后重启的续跑计划。**只**由 runtime.restart 传入：
+    // `{ startNodeId, skipped:[{nodeId,title,attempt,summary,artifactPaths}], oldFailure }`。
+    // 普通 start 传 undefined，行为与之前逐字节一致。
+    this.resumePlan = options && typeof options === 'object' && options.resumePlan
+      && typeof options.resumePlan === 'object'
+      ? options.resumePlan
+      : null
     // G1-d：本次 run 实际生效的墙钟上限（run.json.limits 的唯一来源）。
     this.runLimits = limits
     // 06 §15：把本次 start 的父会话覆盖挂到运行态上；_cleanupActive() 负责清掉。
@@ -3276,6 +3703,24 @@ class FlowEngine {
       const validation = validateFlowForRun(flow)
       if (!validation.ok) {
         throw new EngineError(400, `流程不合法，不能开跑：${validation.errors.map(item => item.message).join('；')}`)
+      }
+      // v0.9.2 P0：流程级 agentPreset 参与节点会话路由；run 级生效值写进 run.json
+      // （`agentPreset: {value, source}`）供 UI 显示。
+      this.flowAgentPreset = typeof flow.agentPreset === 'string' ? flow.agentPreset : ''
+      this.runPresetInfo = this._sessionPresetInfo(null, flow)
+      // 默认 preset（我们自己塞的 standard）可能在别的 profile 不存在：start 当场解析一次。
+      // - 成功：runPresetInfo 记实际生效 id；
+      // - 失败：`_composeWithHostPresetServices(undefined)` 降级到宿主默认，source 改成
+      //   `default-fallback`（node/start / run.json 都报实际 id）；
+      // - 值本身是用户显式配的（node/flow/start/engine）→ 不在这里降级，创建会话时报 400。
+      if (this.runPresetInfo.source === 'default') {
+        this.runComposition = await this._resolveAgentComposition(this.runPresetInfo.value, {
+          source: 'default',
+        })
+        this.runPresetInfo = {
+          value: this.runComposition.agentPreset,
+          source: this.runComposition.source === 'default-fallback' ? 'default-fallback' : 'default',
+        }
       }
       const stages = (flow.nodes || []).filter(node => node.kind === NODE_KIND.STAGE)
 
@@ -3339,6 +3784,9 @@ class FlowEngine {
       active.flow = flow
       active.starting = false
       this.maxTotalSteps = this.maxTotalSteps || stages.length * 3
+      // v0.9.2（任务 3）：续跑计划要在写 run/start / 进入循环之前落到运行态：
+      // 已通过节点进 passedNodes（上游上下文），起点由 _loopLegacy 显式指定。
+      this._applyResumePlan(runId, flow)
 
       const appended = await this._append(runId, [{
         kind: 'run/start',
@@ -3364,6 +3812,19 @@ class FlowEngine {
           ...(this.sessionMode ? { sessionMode: this.sessionMode } : {}),
           // 降级原因（git 不可用 / worktree 建失败）：不新造 kind，挂在 run/start.data 上。
           ...(startWarnings.length > 0 ? { worktreeWarning: clip(startWarnings.join('；'), 2000) } : {}),
+          // v0.9.2（任务 3）：续跑痕迹写进日志（run.json.restart 另有一份，供列表/详情直接读）。
+          ...(this.resumePlan
+            ? {
+              restart: {
+                fromRunId: clip(String(this.resumePlan.fromRunId || ''), 64),
+                startNodeId: clip(String(this.resumePlan.startNodeId || ''), 64),
+                skippedNodeIds: (this.resumePlan.skipped || []).map(item => clip(String(item.nodeId), 64)).slice(0, 200),
+                ...(this.resumePlan.oldFailure && typeof this.resumePlan.oldFailure.reason === 'string'
+                  ? { oldReason: clip(this.resumePlan.oldFailure.reason, 2000) }
+                  : {}),
+              },
+            }
+            : {}),
         },
       }])
       this.live.lastEventSeq = appended.lastSeq
@@ -3432,6 +3893,14 @@ class FlowEngine {
     this.lastResults = new Map()
     this.rejectContexts = new Map()
     this.passedNodes = []
+    // v0.9.2（任务 3）：续跑起点只属于本次 start（start() 在 reset 之后显式赋值）。
+    this.resumePlan = null
+    this.resumeStartNodeId = null
+    this.resumeSkippedIds = new Set()
+    // v0.9.2 P0：preset 解析结果只属于本次 run。
+    this.flowAgentPreset = null
+    this.runPresetInfo = null
+    this.runComposition = null
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
@@ -3470,6 +3939,11 @@ class FlowEngine {
 
   /** 06 §16：每 run 从零开始的收件箱 / 节点会话运行态（跨 run 的 sessionIndex 不清）。 */
   _resetInboxState() {
+    // v0.9.2（任务 2）：节点工具注册也归 run 生命周期。换 run / 收尾时先按 disposer
+    // 撤掉旧注册（不依赖宿主卸载时机），再把表清空。
+    if (this.nodeTools instanceof Map) this._disposeAllNodeRejectTools()
+    this.nodeTools = new Map()
+    this.pendingNodeRejects = new Map()
     this.nodeSessions = new Map()
     this.disposalHandles = new Set()
     this.startupMessages = []
@@ -3575,8 +4049,83 @@ class FlowEngine {
    * `FLOW_STUDIO_FLOW_MACHINE=0` 时回退 v0.8 的旧循环（逃生门，行为逐字节保留）。
    */
   async _loop(runId, flow, stageTotal) {
+    // v0.9.2（任务 3）：续跑 run 走旧主循环——它支持显式起点 + 预置 passedNodes；
+    // 状态机从初态开始，没有「跳到第 N 个节点」的合法入口（详见设计说明）。
+    if (this.resumePlan) return this._loopLegacy(runId, flow, stageTotal)
     if (!flowMachineEnabled()) return this._loopLegacy(runId, flow, stageTotal)
     return this._loopMachine(runId, flow, stageTotal)
+  }
+
+  /**
+   * 把续跑计划落到运行态（v0.9.2 · 任务 3）。
+   *
+   * 只做三件事：
+   *   ① 校验起点在当前流程里仍是阶段节点；
+   *   ② 已通过节点进 `passedNodes`（下游提示词的「上游产物」从这里取）与
+   *      `lastResults`（previous / 证据上下文）；**不**预置 attempts —— 新 run 的
+   *      attempt 编号从 1 重新计，避免把旧 run 的 maxRounds 计数带进新 run 直接撞上限；
+   *   ③ 记下 `resumeStartNodeId` / `resumeSkippedIds`，由 `_loopLegacy` 用作起点。
+   */
+  _applyResumePlan(runId, flow) {
+    const plan = this.resumePlan
+    if (!plan) return
+    const byId = new Map()
+    for (const node of flow && Array.isArray(flow.nodes) ? flow.nodes : []) {
+      if (node && typeof node.id === 'string') byId.set(node.id, node)
+    }
+    const startNode = typeof plan.startNodeId === 'string' ? byId.get(plan.startNodeId) : null
+    if (!startNode || startNode.kind !== NODE_KIND.STAGE) {
+      throw new EngineError(
+        400,
+        `续跑起点不合法：节点「${plan.startNodeId || '（缺失）'}」在当前流程里不存在或不是阶段节点`,
+      )
+    }
+    this.resumeStartNodeId = startNode.id
+    this.resumeSkippedIds = new Set()
+    this.passedNodes = []
+    for (const entry of Array.isArray(plan.skipped) ? plan.skipped : []) {
+      const nodeId = entry && typeof entry.nodeId === 'string' ? entry.nodeId : ''
+      if (nodeId === '' || nodeId === startNode.id) continue
+      const node = byId.get(nodeId)
+      if (!node || node.kind !== NODE_KIND.STAGE) continue
+      const attempt = Number.isInteger(entry.attempt) && entry.attempt >= 1 ? entry.attempt : 1
+      const summary = typeof entry.summary === 'string' ? entry.summary : ''
+      const artifactPaths = Array.isArray(entry.artifactPaths)
+        ? entry.artifactPaths.filter(item => typeof item === 'string')
+        : []
+      this.passedNodes.push({
+        nodeId,
+        title: node.title || nodeId,
+        attempt,
+        summary,
+        artifactPaths,
+      })
+      this.lastResults.set(nodeId, {
+        attempt,
+        verdict: 'pass',
+        summary,
+        findings: [],
+        artifactPaths,
+        acceptance: undefined,
+        tests: undefined,
+        checks: undefined,
+        evidence: undefined,
+      })
+      this.resumeSkippedIds.add(nodeId)
+    }
+    this.log(
+      'info',
+      `flow-studio: run ${runId} 续跑：从节点「${startNode.id}」继续，跳过 ${this.resumeSkippedIds.size} 个已完成节点`,
+    )
+  }
+
+  /** 续跑起点（没有续跑计划时为 null，调用方回落到 selectFirstNode）。 */
+  _resumeStartNode(flow) {
+    if (!this.resumePlan || typeof this.resumeStartNodeId !== 'string') return null
+    for (const node of flow && Array.isArray(flow.nodes) ? flow.nodes : []) {
+      if (node && node.id === this.resumeStartNodeId) return node
+    }
+    return null
   }
 
   /** v0.8 旧主循环（逃生门）：while + switch 推进，保留一个发布周期后删除。 */
@@ -3589,6 +4138,11 @@ class FlowEngine {
     let aborted = false
     let arrivedByReject = false
     let steps = 0
+    // v0.9.2（任务 3）：续跑时从计划的起点开始；已通过节点先放进 visited，
+    // 避免「重跑上游」被误判成 next 成环（打回时 _invalidate 会按既有逻辑移除它们）。
+    if (this.resumePlan) {
+      for (const nodeId of this.resumeSkippedIds) visited.add(nodeId)
+    }
     // G1-d：用本次 run 实际生效的墙钟上限（显式 start 参数 > 环境变量 > 默认），
     // 收口时 live 已清空，所以这里先取本地值，别在定时器里再读 this。
     const runTimeoutMs = this._effectiveRunTimeoutMs()
@@ -3609,7 +4163,7 @@ class FlowEngine {
     // 保证「run/end 之后不再有任何事件」。
     let endPatch = null
     try {
-      node = selectFirstNode(flow)
+      node = this._resumeStartNode(flow) || selectFirstNode(flow)
       if (!node) throw new Error('流程没有可执行节点：开始节点没有 next 出边')
       while (node && node.kind !== NODE_KIND.END) {
         if (this.runTimedOut) throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
@@ -4728,6 +5282,8 @@ class FlowEngine {
    * 这样不新增事件 kind、不改 runlog.js 契约，时间线也能看出「这条是重试」。
    */
   _nodeStartEvent(node, attempt, traceId, extra = {}) {
+    // v0.9.2 P0：每个节点实际生效的 preset 与来源（节点级覆盖也能在这里看到）。
+    const presetInfo = this._sessionPresetInfo(node, this.active && this.active.flow)
     return {
       kind: 'node/start',
       nodeId: node.id,
@@ -4736,6 +5292,8 @@ class FlowEngine {
       data: {
         title: clip(String(node.title || node.id), 512),
         mode: node.mode === EXEC_MODE.TEAM ? 'team' : 'single',
+        agentPreset: presetInfo.value,
+        agentPresetSource: presetInfo.source,
         ...(typeof node.model === 'string' && node.model.trim() !== '' ? { model: clip(node.model, 128) } : {}),
         skills: Array.isArray(node.skills)
           ? node.skills.filter(name => typeof name === 'string' && name.trim() !== '').slice(0, 12).map(name => clip(name, 64))
@@ -4968,8 +5526,21 @@ class FlowEngine {
       inboxText,
     })
     // 06 §13.11 M5：node.model 传给子 agent（注入的 activate 同样能收到 agentOptions）。
+    // v0.9.2：节点显式 provider 优先于宿主默认。流程模型里 provider 不是已知字段时
+    // 会落在 `node.extras.provider`（model.js 的 extras 往返容器），两处都认。
     const model = typeof node.model === 'string' && node.model.trim() !== '' ? clip(node.model.trim(), 128) : ''
-    const agentOptions = model === '' ? undefined : { model }
+    const rawProvider = typeof node.provider === 'string' && node.provider.trim() !== ''
+      ? node.provider
+      : (node.extras && typeof node.extras.provider === 'string' ? node.extras.provider : '')
+    const provider = typeof rawProvider === 'string' && rawProvider.trim() !== ''
+      ? clip(rawProvider.trim(), 128)
+      : ''
+    const agentOptions = model === '' && provider === ''
+      ? undefined
+      : {
+        ...(provider === '' ? {} : { provider }),
+        ...(model === '' ? {} : { model }),
+      }
 
     let structuredRaw
     // 07 §11（R8）：本 attempt 绑定的会话 id / 是否由自审提前完成（node/end.extra 用）。
@@ -5017,7 +5588,7 @@ class FlowEngine {
           attemptSessionId = existingSession.sessionId
           try {
             const reused = await this._followupNodeSession({
-              runId, node, attempt, prompt, signal, combined, traceId, entry: existingSession,
+              runId, node, attempt, prompt, signal, combined, traceId, entry: existingSession, flow,
             })
             structuredRaw = reused.structured
             completedBy = reused.completedBy || null
@@ -5056,6 +5627,8 @@ class FlowEngine {
               // 07 §3.1：默认实现用 (runId, node, attempt) 生成稳定的顶层会话 id。
               runId,
               traceId,
+              // v0.9.2（任务 2）：默认实现据此决定是否给会话挂 `flow_node_reject`。
+              flow,
               ...(agentOptions ? { agentOptions } : {}),
             }), combined)
           } catch (error) {
@@ -5125,6 +5698,9 @@ class FlowEngine {
       // 07 §11.1：attempt 结束（passed / rejected / failed / abort）→ 立刻注销该会话闹钟。
       // 外部 executor 没有会话（attemptSessionId 为 null），这里安全 no-op。
       this._unregisterNodeSupervision(attemptSessionId)
+      // v0.9.2（任务 2）：节点结束 / attempt 结束就撤掉打回工具；下一次 attempt 会按
+      // 当前流程结构重新计算并重挂（结构变化不会留下过期的注册）。
+      this._disposeNodeRejectTool(attemptSessionId)
       clearTimeout(timer)
       // 06 §16：会话句柄**不在这里** dispose（节点可能被二次激活）。
       // 统一由 run 收尾的 _disposeRunSessions() 释放，stop 也走同一条路径。
@@ -6046,6 +6622,14 @@ class FlowEngine {
     this.workspaceRecord = null
     this.worktreeRecord = null
     this.sessionMode = null
+    // v0.9.2（任务 3）：续跑计划也不跨 run。
+    this.resumePlan = null
+    this.resumeStartNodeId = null
+    this.resumeSkippedIds = new Set()
+    // v0.9.2 P0：preset 解析结果只属于本次 run。
+    this.flowAgentPreset = null
+    this.runPresetInfo = null
+    this.runComposition = null
     this.live = null
     this.current = null
     this.sessionBindings.clear()

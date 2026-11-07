@@ -18,6 +18,7 @@
 | `flow_start` | 在当前会话里启动 run | `flowId` / `flowName` 二选一；`task` / `name`；`workspace`；`worktree`（`auto` / `on` / `off`）；`runTimeoutMs` / `nodeTimeoutMs`。返回 `runId`、`supervision`、`workspace` |
 | `flow_watch` | 审查整个工作流（只读，不修复不停止） | `runId` 或 `runIds`（`runIds: string[]`，≤20，去重；二选一）。多 run 模式返回每个 run 一份结论 + 一份 `merged` 合并建议，同一次调用里每个 run 的事件只读一次 |
 | `flow_stop` | 停掉这次运行 | `runId`；写 `run/end aborted`，不在运行中会返回可读原因 |
+| `flow_restart` | 把失败 / 中止的 run 重启为**新 run** 并在原会话续跑 | `runId`（旧 run，必须 failed / aborted）、`note?`；返回 `newRunId` + `restart{fromRunId, attempt, startNodeId, skippedNodeIds, inheritedNodeIds}` |
 | `flow_supervise` | 手动开 / 关某个 run 的内建定时自审 | `runId` + `enabled`；已收尾的 run 开启会被拒 |
 | `flow_send_message` | 往流程收件箱发外部消息 | `runId?`、`nodeId?`、`text`（≤4000 字符）、`reply?`；返回投递方式 `injected` / `resumed` / `started` / `queued` |
 | `flow_reply` | 节点里的 agent 回复「把消息发进流程的来源」 | `text`、`inReplyTo?`；按会话反查 run / node，不用手填 id |
@@ -37,6 +38,39 @@
 - **工作区是必填的**（0.8.1 起）：`POST /runs`、`POST /runs/<id>/start`、`flow_start` 都要求显式给出，引擎不再回落服务进程的 `process.cwd()`；显式值与会话 cwd 都拿不到时 `flow_start` 直接失败。配置了 `FLOW_STUDIO_WORKSPACE_ROOTS` 时还必须落在允许的根目录内（realpath 比较）。
 - **时限**：`flow_start` 与 `POST /start` 都可传 `runTimeoutMs` / `nodeTimeoutMs`（默认 2 小时 / 20 分钟），生效值写进 `run.json.limits`。长任务（>2 小时）必须显式调大 `runTimeoutMs`，否则开局就注定被超时收掉。
 - **节点会话是顶层会话**（不是挂在父会话下的子 agent），它的 `cwd` 用 worktree 路径或工作区路径；外部 executor 同理。判据与释放规则见 [收件箱与节点会话](inbox-and-sessions.md#节点会话是顶层会话)。
+
+## 失败后重启：新 run + 原会话续跑
+
+`flow_restart`（HTTP 等价入口 `POST /runs/<runId>/restart`）不把旧 run 改回
+running，而是**新建一个续跑 run**：
+
+- 只接受 `failed` / `aborted`；`pending` / `running` 先等收尾或 `flow_stop`，
+  `done` 不需要重启；
+- 新 run 继承旧 run 的节点会话（同一个 node 复用原 sessionId，冷会话靠
+  `agents.resume` 续跑），从旧 run 失败 / 中止的节点继续；
+- 已完成节点不重跑，它们的 summary 与产物路径作为上游上下文注入；
+- 旧 run 保持终态、事件一条不改；新 run 的 `restart.fromRunId` /
+  `restart.attempt` / `startNodeId` / `skippedNodeIds` 可在 `run.json` 与
+  `run/start.data.restart` 里核对（`attempt` = 第几次续跑）；
+- 重启时按**当前流程结构**重算每节点工具集：结构加边 → 补挂
+  `flow_node_reject`，删边 → 撤掉。
+
+失败原因都可诊断：非终态 run、已成功 run、当前流程结构不合法、续跑起点被删、
+宿主 `agents` 服务不可用（无法继承会话）都会返回中文 4xx / 503，而不是静默从零重跑。
+
+## 节点会话的模型与 agent preset
+
+节点会话走 `agents.create()` 时，引擎**永远显式**传成对的
+`agentOptions = {provider, model}` 与 `meta.agentPreset`：
+
+- 模型路由：节点显式 provider / model 优先，缺的一项由宿主 `agentDefaultModel`
+  补齐；两边都拿不到 → 开跑前 503（文案说明「宿主未提供 agentDefaultModel，
+  且节点未配置 provider/model」），不会创建注定首轮失败的会话；
+- preset：节点 `agentPreset` > 本次 start 覆盖 > 引擎配置 > 流程级默认 >
+  **`standard`** 兜底。0.2.2 宿主对没有 preset 的程序化会话给的是几乎没有工具的
+  裸组合，所以这里不能留空；
+- 生效值与来源写在 `node/start.data.agentPreset` / `agentPresetSource` 与
+  `run.json.agentPreset`（`{value, source}`），画布 / 详情页可直接显示。
 
 ## 常见坑
 

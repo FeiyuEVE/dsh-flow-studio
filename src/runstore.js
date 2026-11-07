@@ -15,7 +15,8 @@
  */
 
 import { Buffer } from 'node:buffer'
-import { createHash, randomInt } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createHash, randomInt, randomUUID } from 'node:crypto'
 import {
   chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile,
 } from 'node:fs/promises'
@@ -24,6 +25,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkMemberId, checkRunId, computeProgress,
+  isInstanceScopedEnd,
   normalizeEvent, progressFromNodeStates,
   // 08 §7：事件 kind 白名单与 runlog **同源**（基础 17 种 + 各扩展白名单），
   // 这里不再手写第二份字符串——手抄那份曾经漏掉 `node/status`，过滤直接 400。
@@ -437,6 +439,19 @@ function normalizeLive(source) {
   return live
 }
 
+/**
+ * 0.11 R1：run.json.execution = { epoch, ownerId, state }。
+ * epoch 单调递增，每次 claim +1；ownerId 是 claim 时的随机身份；state ∈ active/released/settled。
+ */
+function normalizeExecution(raw) {
+  if (!isPlainObject(raw)) return null
+  const epoch = Number.isInteger(raw.epoch) && raw.epoch >= 0 ? raw.epoch : null
+  const ownerId = typeof raw.ownerId === 'string' && raw.ownerId !== '' ? raw.ownerId.slice(0, 128) : ''
+  const state = raw.state === 'active' || raw.state === 'released' || raw.state === 'settled' ? raw.state : 'active'
+  if (epoch === null && ownerId === '') return null
+  return { epoch: epoch === null ? 0 : epoch, ownerId, state }
+}
+
 function normalizeMeta(raw, id) {
   const source = raw && typeof raw === 'object' ? raw : {}
   const now = new Date().toISOString()
@@ -461,6 +476,8 @@ function normalizeMeta(raw, id) {
   // D4：engine 状态机快照（缓存不是真相）：读路径宽松 + 24 KiB 独立预算。
   // 与 nodeStatus 互不影响——两条通道各自量各自的字节。
   const machine = normalizeMachine(source.machine)
+  // 0.11 R1：持久执行世代 {epoch, ownerId, state}。老 run 没有这个字段 → 不出现。
+  const execution = normalizeExecution(source.execution)
   // v0.9.2：`restart` 用 undefined 区分「没传」与「显式清除」；显式 null / 坏形状都落成 null。
   const restart = source.restart === undefined ? null : normalizeRestart(source.restart)
   // v0.9.2 P0：run.json.agentPreset = { value, source }；未知 / 坏形状整条省略。
@@ -521,6 +538,7 @@ function normalizeMeta(raw, id) {
     // G2 额外契约：limits（{ runTimeoutMs?, nodeTimeoutMs? }，两个可选正整数）。
     // 未传不出现；读侧非法值直接丢弃，写侧由 validateMetaPatch 严格 400。
     ...(source.limits === undefined ? {} : { limits: normalizeLimits(source.limits) }),
+    ...(execution === null ? {} : { execution }),
     // D4：engine 状态机快照。整条替换语义：未传 / 传 null → 不出现（清除）；
     // version 不合法 → 整条丢弃（读路径宽松，不报错）。
     ...(machine.value === null ? {} : { machine: machine.value }),
@@ -970,6 +988,16 @@ function normalizeRestart(raw) {
     out.note = raw.note.trim().slice(0, RESTART_NOTE_MAX_CHARS)
   }
   if (typeof raw.at === 'string' && raw.at !== '') out.at = raw.at.slice(0, 64)
+  // 0.11 R2：准入 429 后保留可重试标记；同一个 childRunId 下一次 restart 复用它。
+  if (isPlainObject(raw.startRejected)) {
+    const rejected = raw.startRejected
+    out.startRejected = {
+      code: typeof rejected.code === 'string' && rejected.code !== '' ? rejected.code.slice(0, 64) : 'RUN_CONCURRENCY_LIMIT',
+      reason: typeof rejected.reason === 'string' ? rejected.reason.slice(0, 64) : 'queue-full',
+      at: typeof rejected.at === 'string' ? rejected.at.slice(0, 64) : '',
+      retryable: rejected.retryable !== false,
+    }
+  }
   return out
 }
 
@@ -1542,7 +1570,8 @@ function normalizeLease(raw) {
   const acquiredAt = typeof raw.acquiredAt === 'string' && Number.isFinite(Date.parse(raw.acquiredAt))
     ? new Date(Date.parse(raw.acquiredAt)).toISOString()
     : heartbeatAt
-  return { pid, host, ttlMs, acquiredAt, heartbeatAt }
+  const ownerId = typeof raw.ownerId === 'string' && raw.ownerId !== '' ? raw.ownerId : null
+  return { pid, host, ttlMs, acquiredAt, heartbeatAt, ...(ownerId ? { ownerId } : {}) }
 }
 
 function leaseExpired(lease, now) {
@@ -1553,9 +1582,37 @@ function leaseOwner(lease) {
   return `${lease.pid}@${lease.host}`
 }
 
+/**
+ * 0.11 R1（返工）：持久执行 fence。options 里带 ownerId / leaseEpoch（或 guard）时，
+ * 存储层在**自己的锁内**复核 run.json.execution，不符就 409 LEASE_FENCED 且整批不写。
+ */
+function fenceMatches(meta, options) {
+  if (!options || (options.leaseEpoch === undefined && options.ownerId === undefined)) return true
+  const current = meta && meta.execution
+  if (!current) return false
+  const epochOk = options.leaseEpoch === undefined
+    || String(current.epoch) === String(options.leaseEpoch)
+  const ownerOk = options.ownerId === undefined || current.ownerId === options.ownerId
+  return epochOk && ownerOk
+}
+
+function assertFence(meta, options) {
+  if (!fenceMatches(meta, options)) {
+    throw new RunError(409, 'runId', '执行世代已失效（lease-fenced），旧实例不能写入该 run', {
+      code: 'LEASE_FENCED',
+    })
+  }
+}
+
 function leaseOwnerMatches(lease, options) {
   const pid = Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid
   const host = typeof options.host === 'string' && options.host !== '' ? options.host : hostname()
+  // 0.11 R1：调用方带了 ownerId 时按 ownerId 精确比较（防同 pid@host 的 ABA）；
+  // 没带时保持 0.10 的 pid/host 兼容（旧调用方不传 ownerId）。
+  if (typeof options.ownerId === 'string' && options.ownerId !== ''
+    && typeof lease.ownerId === 'string' && lease.ownerId !== '') {
+    return lease.ownerId === options.ownerId
+  }
   return lease.pid === pid && lease.host === host
 }
 
@@ -1819,6 +1876,8 @@ function leaseOptions(options = {}) {
     ttlMs,
     pid: Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid,
     host: typeof options.host === 'string' && options.host !== '' ? options.host : hostname(),
+    // 0.11 R1：每次 claim 的随机 owner 身份；renew/release 带同一个值才允许。
+    ownerId: typeof options.ownerId === 'string' && options.ownerId !== '' ? options.ownerId : randomUUID(),
   }
 }
 
@@ -1863,49 +1922,45 @@ export async function readLease(runsRoot, runId, options = {}) {
 export async function claimLease(runsRoot, runId, options = {}) {
   const loc = requireLoc(runsRoot, runId)
   if (!await readMetaUnlocked(loc)) throw new RunError(404, 'runId', 'run 不存在')
-  const { now, ttlMs, pid, host } = leaseOptions(options)
+  const { now, ttlMs, pid, host, ownerId } = leaseOptions(options)
   const path = leasePath(loc.dir)
-  return withLock(loc.id, async () => {
+  // 0.11 R1（本轮）：整个 claim 在跨进程 meta.lock 内完成，并且**先**递增持久 execution、
+  // **再**发布 lock.json。这样「新租约对外可见」与「旧 owner 的 fence 失效」是同一个
+  // 临界区：任何在飞旧写要么先拿到 meta.lock（claim 等它写完，之后才 409），要么在
+  // claim 之后拿锁（看到新 epoch 被 fence 拒绝）。不存在「新租约已可见但旧写仍提交」。
+  return withLock(loc.id, () => withMetaLock(loc, async () => {
     const iso = now.toISOString()
-    const lease = { pid, host, ttlMs, acquiredAt: iso, heartbeatAt: iso }
+    const lease = { pid, host, ttlMs, acquiredAt: iso, heartbeatAt: iso, ownerId }
     const text = `${JSON.stringify(lease, null, 2)}\n`
-    const owned = async () => {
-      const current = await readLeaseFile(loc.dir)
-      return Boolean(current && current.pid === pid && current.host === host && current.acquiredAt === iso)
-    }
     const busy = existing => new RunError(
       409,
       'runId',
       `该 run 正被 ${leaseOwner(existing)} 持有执行租约（心跳 ${existing.heartbeatAt}），不能重复启动`,
     )
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      if (await createExclusive(path, text)) {
-        if (await owned()) return lease
-        throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
-      }
-      const state = await readLeaseState(loc.dir)
-      // 持有者刚好释放：直接重试创建。
-      if (state.kind === 'missing') continue
-      const existing = state.kind === 'ok' ? state.lease : null
-      // 未过期的有效租约：409。不可解析（0 字节 / 坏 JSON）按「可接管」处理，
-      // 但必须走下面的接管选举，不能直接 unlink——否则并发接管会出现两个赢家。
-      if (existing && !leaseExpired(existing, now)) throw busy(existing)
-      if (!await winTakeoverElection(loc.dir)) {
-        // 输掉选举：等赢家落定，再重读（通常已经被新租约挡住）。
-        await sleep(TAKEOVER_ELECTION_MS)
-        continue
-      }
-      const again = await readLeaseState(loc.dir)
-      if (again.kind === 'missing') continue
-      if (again.kind === 'ok' && !leaseExpired(again.lease, now)) throw busy(again.lease)
-      await unlink(path).catch(() => {})
-      if (await createExclusive(path, text)) {
-        if (await owned()) return lease
-        throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
-      }
+    const state = await readLeaseState(loc.dir)
+    if (state.kind === 'ok' && !leaseExpired(state.lease, now)) throw busy(state.lease)
+    // 过期 / 缺失 / 损坏：先推进持久世代（旧实例的 fence 从此刻起全部失效）。
+    const latest = await readMetaUnlocked(loc)
+    if (!latest) throw new RunError(404, 'runId', 'run 不存在')
+    const previous = latest.execution && Number.isInteger(latest.execution.epoch) ? latest.execution.epoch : 0
+    const epoch = previous + 1
+    latest.execution = { epoch, ownerId, state: 'active' }
+    latest.updatedAt = now.toISOString()
+    await writeMetaUnlocked(loc, normalizeMeta(latest, loc.id))
+    lease.epoch = epoch
+    // 让新租约对外可见：旧文件先清掉（过期/损坏），再 O_EXCL 创建。
+    if (state.kind !== 'missing') await unlink(path).catch(() => {})
+    if (!await createExclusive(path, text)) {
+      // meta.lock 已串行化所有 claim；走到这里只能是外部异常文件，保守失败。
+      throw new RunError(409, 'runId', '执行租约文件发布失败，请重试')
     }
-    throw new RunError(409, 'runId', '并发抢占执行租约失败，请重试')
-  })
+    const current = await readLeaseFile(loc.dir)
+    if (!(current && current.pid === pid && current.host === host
+      && current.ownerId === ownerId && current.acquiredAt === iso)) {
+      throw new RunError(409, 'runId', '执行租约刚被其它进程接管，请重试')
+    }
+    return lease
+  }))
 }
 
 /**
@@ -2020,8 +2075,10 @@ export async function finalizeEpoch(runsRoot, runId, options = {}) {
     // 接管者 / 旧路径已经写了终态：不覆盖，只报告幂等。
     return { ok: true, appended: false, idempotent: true, status: all.meta.status }
   }
-
-  const event = {
+  // 0.11 R1（返工）：判权与追加在**同一个 append 锁事务**里完成。
+  // 先尝试 run 范围收口；appendEvents 的 guard 在它自己的锁内复核持久 epoch/owner，
+  // 已被接管就抛 LEASE_FENCED（整批不写、不改 status），再追加 instance 范围事实。
+  const baseEvent = {
     v: 1,
     ts: now.toISOString(),
     runId: loc.id,
@@ -2032,21 +2089,189 @@ export async function finalizeEpoch(runsRoot, runId, options = {}) {
     extra: {
       code: 'LEASE_LOST',
       leaseLost: true,
-      terminalScope: 'run',
       cause: typeof options.cause === 'string' && options.cause !== '' ? options.cause : 'lease-lost',
       idempotencyKey,
       ...(expectedEpoch !== '' ? { leaseEpoch: expectedEpoch } : {}),
       ...(ownerId !== '' ? { ownerId } : {}),
     },
   }
-  const appended = await appendEvents(runsRoot, runId, [event], { now })
+  let appended
+  let terminalScope
+  try {
+    appended = await appendEvents(runsRoot, runId, [{ ...baseEvent, extra: { ...baseEvent.extra, terminalScope: 'run' } }], {
+      now,
+      guard: meta => {
+        if (!fenceMatches(meta, { ownerId: ownerId || undefined, leaseEpoch: expectedEpoch || '0' })) {
+          throw new RunError(409, 'runId', '执行世代已失效（lease-fenced），旧实例不能收口 run', {
+            code: 'LEASE_FENCED',
+          })
+        }
+      },
+    })
+    terminalScope = 'run'
+  } catch (error) {
+    if (!error || error.code !== 'LEASE_FENCED') throw error
+    appended = await appendEvents(runsRoot, runId, [{ ...baseEvent, extra: { ...baseEvent.extra, terminalScope: 'instance' } }], { now })
+    terminalScope = 'instance'
+  }
   return {
     ok: true,
     appended: true,
     idempotent: false,
-    event: appended.events[0] || event,
-    status: 'failed',
+    terminalScope,
+    event: appended.events[0] || baseEvent,
+    status: terminalScope === 'run' ? 'failed' : all.meta.status,
   }
+}
+
+/**
+ * 0.11 R5（返工）：构造宿主证据验证器（index / runtime 共用同一实现）。
+ * 事件可信元数据优先读扁平键（extra 有界化只保留标量），并重读持久化报告副本核对 sha256。
+ *
+ * @param {object[]} records 私有 verification 登记
+ * @param {object[]} events 该 run 的全部事件
+ * @param {string} runId
+ * @param {string} runDir runs/<runId> 绝对路径
+ * @returns {(event: object) => boolean}
+ */
+export function buildHostExecutionVerifier(records, events, runId, runDir) {
+  const byId = new Map()
+  for (const record of records || []) {
+    if (record && typeof record.executionId === 'string') byId.set(record.executionId, record)
+  }
+  const reportCopies = new Map()
+  for (const event of events || []) {
+    if (!event || event.kind !== 'artifact/write' || !event.data) continue
+    const extra = event.extra && typeof event.extra === 'object' ? event.extra : {}
+    const nested = extra.verification && typeof extra.verification === 'object' ? extra.verification : {}
+    const executionId = typeof extra.verificationId === 'string' ? extra.verificationId : nested.executionId
+    const kind = typeof extra.verificationKind === 'string' ? extra.verificationKind : nested.kind
+    if (typeof executionId !== 'string' || executionId === '' || kind !== 'report-copy') continue
+    if (typeof event.data.path === 'string') reportCopies.set(executionId, event.data.path)
+  }
+  return event => {
+    const extra = event && event.extra && typeof event.extra === 'object' ? event.extra : {}
+    const nested = extra.verification && typeof extra.verification === 'object' ? extra.verification : {}
+    const executionId = typeof extra.verificationId === 'string' ? extra.verificationId : nested.executionId
+    if (typeof executionId !== 'string' || executionId === '') return false
+    const record = byId.get(executionId)
+    if (!record || record.runId !== runId) return false
+    if (typeof record.nodeId === 'string' && record.nodeId !== '' && event.nodeId !== record.nodeId) return false
+    if (Number.isInteger(record.attempt) && event.attemptId !== record.attempt) return false
+    if (typeof record.reportSha256 === 'string' && record.reportSha256 !== '') {
+      const rel = reportCopies.get(executionId)
+      if (!rel) return false
+      try {
+        const body = readFileSync(join(runDir, rel))
+        const digest = createHash('sha256').update(body).digest('hex')
+        if (digest !== record.reportSha256) return false
+      } catch {
+        return false
+      }
+    }
+    return true
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0.11 R5（F4）：受保护的宿主执行登记与防伪凭证
+// ---------------------------------------------------------------------------
+
+/** 只有 createHostExecutionReceipt() 造出来的对象才在 WeakSet 里（能力凭证）。 */
+const HOST_EXECUTION_RECEIPTS = new WeakSet()
+
+/**
+ * 造一张宿主执行凭证。真实调用点只有引擎在 runHostCheck 真正返回之后；
+ * 模型 / HTTP / 普通 artifact writer 都拿不到这个对象。
+ * @param {string} executionId
+ * @returns {object} 冻结的凭证
+ */
+export function createHostExecutionReceipt(executionId) {
+  if (typeof executionId !== 'string' || executionId === '') {
+    throw new RunError(400, 'executionId', '宿主执行凭证需要非空 executionId')
+  }
+  const receipt = Object.freeze({ executionId, nonce: randomUUID() })
+  HOST_EXECUTION_RECEIPTS.add(receipt)
+  return receipt
+}
+
+function verificationDir(dir, executionId) {
+  if (typeof executionId !== 'string' || !/^[A-Za-z0-9._-]{1,96}$/.test(executionId)) return null
+  return join(dir, 'verification', executionId)
+}
+
+/**
+ * 登记一次宿主执行：只有持凭证的调用方才能写入私有 verification/<executionId>/record.json。
+ * 普通 artifact/write / HTTP 通道无法登记，因此 producer='host' 字符串本身不授信。
+ *
+ * @param {string} runsRoot
+ * @param {string} runId
+ * @param {object} record 宿主执行记录（必须含 executionId / runId / nodeId / attempt）
+ * @param {{ receipt: object, reportBytes?: Buffer }} [options]
+ */
+export async function recordHostExecution(runsRoot, runId, record, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  const receipt = options.receipt
+  if (!receipt || !HOST_EXECUTION_RECEIPTS.has(receipt)) {
+    throw new RunError(403, 'verification', '没有宿主执行凭证，不能登记可信执行')
+  }
+  if (!isPlainObject(record) || typeof record.executionId !== 'string' || record.executionId === '') {
+    throw new RunError(400, 'verification', '宿主执行记录缺少 executionId')
+  }
+  if (receipt.executionId !== record.executionId) {
+    throw new RunError(403, 'verification', '宿主执行凭证与记录不匹配')
+  }
+  const dir = verificationDir(loc.dir, record.executionId)
+  if (!dir) throw new RunError(400, 'verification', 'executionId 不合法')
+  await ensureDirMode(dir)
+  const bounded = {
+    executionId: record.executionId,
+    runId: loc.id,
+    nodeId: typeof record.nodeId === 'string' ? record.nodeId : '',
+    attempt: Number.isInteger(record.attempt) ? record.attempt : null,
+    checkId: typeof record.checkId === 'string' ? record.checkId.slice(0, 128) : '',
+    commandDigest: typeof record.commandDigest === 'string' ? record.commandDigest : '',
+    expectedExitCode: Number.isInteger(record.expectedExitCode) ? record.expectedExitCode : null,
+    exitCode: Number.isInteger(record.exitCode) ? record.exitCode : null,
+    state: record.state === 'pass' || record.state === 'fail' || record.state === 'skipped' ? record.state : 'fail',
+    reasonCode: typeof record.reasonCode === 'string' ? record.reasonCode.slice(0, 128) : null,
+    reportPath: typeof record.reportPath === 'string' ? record.reportPath.slice(0, 512) : null,
+    reportSha256: typeof record.reportSha256 === 'string' ? record.reportSha256 : null,
+    startedAt: typeof record.startedAt === 'string' ? record.startedAt : null,
+    finishedAt: typeof record.finishedAt === 'string' ? record.finishedAt : null,
+    recordedAt: new Date().toISOString(),
+  }
+  const text = `${JSON.stringify(bounded, null, 2)}\n`
+  await writeTempAtomic(join(dir, 'record.json'), text)
+  return { path: `${record.executionId}/record.json`, record: bounded }
+}
+
+/**
+ * 读一个 run 的全部宿主执行登记（损坏条目跳过；最多 200 条）。
+ * @returns {Promise<object[]>}
+ */
+export async function readHostExecutions(runsRoot, runId) {
+  const loc = locate(runsRoot, runId)
+  if (!loc) return []
+  let entries
+  try {
+    entries = await readdir(join(loc.dir, 'verification'), { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[A-Za-z0-9._-]{1,96}$/.test(entry.name)) continue
+    try {
+      const parsed = JSON.parse(await readFile(join(loc.dir, 'verification', entry.name, 'record.json'), 'utf8'))
+      if (!isPlainObject(parsed) || parsed.executionId !== entry.name) continue
+      out.push(parsed)
+    } catch {
+      // 坏记录不授信。
+    }
+    if (out.length >= 200) break
+  }
+  return out
 }
 
 /**
@@ -2342,7 +2567,8 @@ export async function repairRunStates(runsRoot, options = {}) {
       } catch {
         continue
       }
-      if (event && event.kind === 'run/end' && event.data && TERMINAL_STATUS.has(event.data.status)) {
+      if (event && event.kind === 'run/end' && event.data && TERMINAL_STATUS.has(event.data.status)
+        && !isInstanceScopedEnd(event)) {
         lastEnd = event
       }
     }
@@ -2431,7 +2657,7 @@ export async function readRunMeta(runsRoot, runId) {
  * @returns {Promise<object>} 写入后的完整 meta（可能带不可枚举的 `droppedKeys` /
  *   `nodeStatusBudget` 诊断属性）
  */
-export async function writeRunMeta(runsRoot, runId, patch = {}) {
+export async function writeRunMeta(runsRoot, runId, patch = {}, options = {}) {
   const loc = requireLoc(runsRoot, runId)
   // 进程内 withLock → 跨进程 meta.lock：两个 dsh 进程并发 patch 也不会互相覆盖。
   return withLock(loc.id, () => withMetaLock(loc, async () => {
@@ -2472,6 +2698,8 @@ export async function writeRunMeta(runsRoot, runId, patch = {}) {
       const backup = await backupCorruptMeta(loc).catch(() => null)
       throw corruptMetaError(error, backup)
     }
+    // 0.11 R1（返工）：带 fence 的元数据写（live / 绑定）同样在锁内复核世代。
+    assertFence(existing, options)
     const merged = normalizeMeta({ ...(existing || {}), ...source }, loc.id)
     merged.updatedAt = new Date().toISOString()
     if (!existing) merged.createdAt = merged.updatedAt
@@ -3444,6 +3672,9 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
   return withLock(loc.id, () => withMetaLock(loc, async () => {
     const meta = await readMetaUnlocked(loc)
     if (!meta) throw new RunError(404, 'runId', 'run 不存在')
+    // 0.11 R1（返工）：业务写必须带持久 owner/epoch，或在锁内 guard 里复核。
+    assertFence(meta, options)
+    if (typeof options.guard === 'function') await options.guard(meta)
 
     const list = Array.isArray(rawEvents)
       ? rawEvents
@@ -3559,9 +3790,12 @@ export async function appendEvents(runsRoot, runId, rawEvents, options = {}) {
           continue
         }
         if (event.kind === 'run/end') {
+          // 0.11 R1：instance 范围的失权事实不参与生命周期投影（不改 status/endedAt）。
+          if (event.extra && event.extra.terminalScope === 'instance') continue
           if (TERMINAL_STATUS.has(event.data.status)) meta.status = event.data.status
           meta.started = true
           if (typeof event.ts === 'string') meta.endedAt = event.ts
+          if (meta.execution && meta.execution.state === 'active') meta.execution.state = 'settled'
           continue
         }
         if (event.kind === 'node/start' || event.kind === 'node/end' || event.kind === 'reject/trigger') {

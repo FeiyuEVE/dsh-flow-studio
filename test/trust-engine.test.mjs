@@ -337,6 +337,234 @@ try {
     A.equal(summary.quality.evidence.tests.authoritativePassed, 0)
     A.ok(summary.quality.state !== 'pass', '自报 29/29 不能把 quality 洗绿')
   })
+  // -------------------------------------------------------------------------
+  // R6（F5）：acceptance 的引擎自写报告也降级 claimed
+  // -------------------------------------------------------------------------
+  await check('R6/F5：acceptance 无独立 evidenceRef（引擎自写）→ claimed/unknown', async () => {
+    const flow = flowOf('flow-acc-claimed', [
+      startNode(), stage('n_acc', '验收', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_acc'), next('e2', 'n_acc', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-acc-claimed', 1)
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => ({
+        structured: {
+          verdict: 'pass',
+          summary: '自报验收通过',
+          acceptance: [{ itemId: 'R1', status: 'pass', decidedBy: 'auto' }],
+        },
+        sessionId: `sess-${node.id}`,
+        dispose: async () => {},
+      }),
+    })
+    await engine.start(run.id, { workspace })
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const verdict = events.find(event => event.kind === 'acceptance/verdict')
+    const summary = summarize(events)
+    A.equal(final.status, 'done')
+    A.equal(verdict.extra && verdict.extra.generatedReport, true, '引擎自写 acceptance.json 必须打标记')
+    A.equal(summary.quality.evidence.acceptance.state, 'unknown')
+    A.match(String(summary.quality.evidence.acceptance.reason), /自报报告/)
+    A.equal(summary.quality.evidence.acceptance.claimedPassed, 1)
+    A.equal(summary.quality.evidence.acceptance.authoritativePassed, 0)
+  })
+
+  // -------------------------------------------------------------------------
+  // R5（F4）：受保护的宿主执行登记 + 防伪凭证；伪造 host 事件不算权威
+  // -------------------------------------------------------------------------
+  await check('R5/F4：真实宿主执行有私有登记；伪造 producer=host / 跨节点引用不授信', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const flow = flowOf('flow-host-registry', [
+        startNode(),
+        stage('n_reg', '实现', 300, { check: { command: 'exit 1', expectExitCode: 0 } }),
+        endNode(),
+      ], [next('e1', 'n_start', 'n_reg'), next('e2', 'n_reg', 'n_end')])
+      await saveFlow(flow)
+      const run = await makeRun('flow-host-registry', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      await engine.wait(run.id)
+
+      const executions = await store.readHostExecutions(runsRoot, run.id)
+      A.equal(executions.length, 1, '真实宿主执行必须登记到 verification/')
+      const record = executions[0]
+      A.equal(record.runId, run.id)
+      A.equal(record.nodeId, 'n_reg')
+      A.equal(record.state, 'fail')
+      A.match(record.commandDigest, /^[0-9a-f]{64}$/)
+
+      const verify = event => {
+        const extra = event && event.extra && typeof event.extra === 'object' ? event.extra : {}
+        const nested = extra.verification && typeof extra.verification === 'object' ? extra.verification : {}
+        const executionId = typeof extra.verificationId === 'string' ? extra.verificationId : nested.executionId
+        if (typeof executionId !== 'string') return false
+        const hit = executions.find(item => item.executionId === executionId)
+        if (!hit) return false
+        return hit.nodeId === event.nodeId && hit.attempt === event.attemptId
+      }
+      // 伪造：同 ruleSetId 的 pass + 已知 executionId，但节点 / attempt 对不上。
+      await store.appendEvents(runsRoot, run.id, [{
+        v: 1,
+        kind: 'check/form',
+        nodeId: 'n_reg',
+        attemptId: 2,
+        traceId: 'tr-forged',
+        extra: {
+          provenance: 'host',
+          producer: 'host',
+          authority: 'host',
+          verificationId: record.executionId,
+        },
+        data: {
+          ruleSetId: 'host:n_reg',
+          ruleSetVersion: '0.11',
+          executor: 'host',
+          state: 'pass',
+          passedChecks: 1,
+          totalChecks: 1,
+          executedAt: '2026-11-07T00:00:00.000Z',
+        },
+      }])
+      const events = await eventsOf(run.id)
+      const trusted = summarize(events, { verifyHostExecution: verify })
+      A.ok(trusted.quality.state !== 'pass', '伪造的更高 attempt pass 不能把质量洗绿')
+      A.ok(trusted.quality.evidence.checks.state !== 'pass', '伪造 host pass 不得成为权威通过')
+      A.equal(trusted.quality.evidence.checks.authoritativePassed, 0, '未登记 host 事件不计权威通过')
+      // 同一批事件不传验证器时，纯函数仍按旧口径（基线兼容）；但伪造者拿不到
+      // runstore 的私有登记，HTTP/summary 路径始终传验证器。
+      const forgedOnly = events.filter(event => !(event.kind === 'check/form'
+        && event.extra && event.extra.producer === 'host' && event.attemptId === 1))
+      A.equal(summarize(forgedOnly, { verifyHostExecution: verify }).quality.evidence.checks.authoritativePassed, 0,
+        '没有登记的 host 事件不得计入权威通过')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // R1×R5：宿主检查执行中续租 409 → 取消检查，失权后不得补 check/artifact
+  // -------------------------------------------------------------------------
+  await check('R1×R5：宿主检查执行中失权 → 取消检查，不写 check/artifact，只落 lease-lost end', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const flow = flowOf('flow-check-lease', [
+        startNode(),
+        stage('n_checklease', '实现', 300, { check: { command: 'sleep 2', expectExitCode: 0, timeoutMs: 5000 } }),
+        endNode(),
+      ], [next('e1', 'n_start', 'n_checklease'), next('e2', 'n_checklease', 'n_end')])
+      await saveFlow(flow)
+      const run = await makeRun('flow-check-lease', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      // 等宿主检查真正开始（check 命令 spawn 后约 300ms），再模拟续租 409。
+      await new Promise(resolve => setTimeout(resolve, 400))
+      engine._handleLeaseLost(run.id, Object.assign(new Error('执行租约已被其它实例接管'), { status: 409 }))
+      const final = await Promise.race([
+        engine.wait(run.id),
+        new Promise(resolve => setTimeout(() => resolve(null), 5000)),
+      ])
+      A.ok(Boolean(final), '失权后必须在 5s 内收口')
+      const events = await eventsOf(run.id)
+      A.equal(final.status, 'failed')
+      A.equal(events.some(event => event.kind === 'check/form'), false, '失权后不得补写宿主检查结果')
+      A.equal(events.some(event => event.kind === 'artifact/write'
+        && event.extra && event.extra.producer === 'host'), false, '失权后不得补写宿主执行产物')
+      const end = events.filter(event => event.kind === 'run/end').at(-1)
+      A.equal(end.extra && end.extra.code, 'LEASE_LOST')
+      A.equal(end.extra && end.extra.terminalScope, 'run')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // R2：排队入口冻结的流程快照优先（排队期间保存流程不改变实际检查命令）
+  // -------------------------------------------------------------------------
+  await check('R2：engine.start 的 flowSnapshot 优先于当前保存的流程（检查命令被冻结）', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const flowId = 'flow-snapshot'
+      const saved = flowOf(flowId, [
+        startNode(), stage('n_snap', '实现', 300), endNode(),
+      ], [next('e1', 'n_start', 'n_snap'), next('e2', 'n_snap', 'n_end')])
+      await saveFlow(saved)
+      // 快照：同一个节点配置了会失败的宿主检查。
+      const snapshot = flowOf(flowId, [
+        startNode(),
+        stage('n_snap', '实现', 300, { check: { command: 'exit 1', expectExitCode: 0 } }),
+        endNode(),
+      ], [next('e1', 'n_start', 'n_snap'), next('e2', 'n_snap', 'n_end')])
+      const run = await makeRun(flowId, 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace, flowSnapshot: snapshot })
+      const final = await engine.wait(run.id)
+      const events = await eventsOf(run.id)
+      const hostEvent = events.find(event => event.kind === 'check/form'
+        && event.extra && event.extra.producer === 'host')
+      A.equal(final.status, 'done')
+      A.ok(Boolean(hostEvent), '必须执行快照里的检查命令（当前保存流程没有 check）')
+      A.equal(hostEvent.data.state, 'fail')
+      A.equal(summarize(events).quality.state, 'fail')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // R1/E1（0.11 第二轮）：接管者已持新 epoch 时，旧实例只能记 instance 事实
+  // -------------------------------------------------------------------------
+  await check('R1/E1：接管者 epoch 已更新 → 旧实例只记 terminalScope=instance，不改 run.status', async () => {
+    const flow = oneStageFlow('flow-lease-takeover')
+    await saveFlow(flow)
+    const run = await makeRun('flow-lease-takeover', 1)
+    const entered = deferred()
+    const gate = deferred()
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => {
+        entered.resolve()
+        await gate.promise
+        return passOf(node.id)
+      },
+    })
+    try {
+      await engine.start(run.id, { workspace })
+      await entered.promise
+      // 模拟另一个进程已接管：持久 execution 变成 epoch=99 / owner=other。
+      await store.writeRunMeta(runsRoot, run.id, {
+        execution: { epoch: 99, ownerId: 'owner-other', state: 'active' },
+      })
+      // 旧实例在收到下一次续租 409 之前就尝试写业务事件：持久 fence 必须拒绝。
+      const staleWrite = await engine._append(run.id, [{
+        kind: 'node/start', nodeId: 'n_stale', attemptId: 1, traceId: 'tr-stale',
+        data: { title: 'stale', mode: 'single', skills: [] },
+      }])
+      A.equal(staleWrite.dropped, 1, '跨 owner 的旧实例业务写必须被 fence 丢弃')
+      A.equal(engine.leaseLost, true, 'fence 拒绝必须等价于失权')
+      A.equal((await eventsOf(run.id)).some(event => event.nodeId === 'n_stale'), false,
+        'fence 拒绝的事件不得落盘')
+      const final = await Promise.race([
+        engine.wait(run.id),
+        new Promise(resolve => setTimeout(() => resolve(null), 3000)),
+      ])
+      A.ok(Boolean(final), '旧实例必须在 3s 内收口')
+      const events = await eventsOf(run.id)
+      const end = events.filter(event => event.kind === 'run/end').at(-1)
+      A.equal(end.extra && end.extra.terminalScope, 'instance', '接管后旧实例只能写 instance 范围事实')
+      A.equal(final.status, 'running', '接管者的 run.status 不能被旧实例改成 failed')
+      const meta = await store.readRunMeta(runsRoot, run.id)
+      A.equal(meta.execution.epoch, 99, '接管者的持久 epoch 不被覆盖')
+      A.equal(meta.execution.ownerId, 'owner-other')
+    } finally {
+      gate.resolve()
+      await engine.stop(run.id).catch(() => {})
+    }
+  })
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

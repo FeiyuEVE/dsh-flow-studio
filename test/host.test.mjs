@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
@@ -2129,6 +2130,98 @@ await check('R4/S3：外部假 pass 被标 external/unverified，质量 headline
   const exported = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
   assert.equal(exported.status, 200)
   assert.match(exported.body, /外部观察|外部未验证/, '导出必须保留外部观察附录并标明未验证')
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 R5（返工）：宿主报告完整性按持久化副本核验；summary 缓存随报告失效
+// ---------------------------------------------------------------------------
+await check('R5：summary 只认已登记且报告副本 sha256 匹配的 host 证据；副本删除后缓存失效', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  await runstore.startRun(runsRoot, run.id)
+  const copyRel = 'n_reg/artifacts/1/host-check-report.json'
+  const copyAbs = join(runsRoot, run.id, copyRel)
+  mkdirSync(dirname(copyAbs), { recursive: true })
+  const reportBody = '{"suite":"unit","passed":1}'
+  writeFileSync(copyAbs, reportBody)
+  const reportSha = createHash('sha256').update(reportBody).digest('hex')
+  await runstore.appendEvents(runsRoot, run.id, [
+    {
+      v: 1, kind: 'artifact/write', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-reg',
+      extra: { producer: 'host', authority: 'host', verificationId: 'hc-reg-1', verificationKind: 'report-copy' },
+      data: { path: copyRel, bytes: Buffer.byteLength(reportBody), kind: 'json', sha256: reportSha },
+    },
+    {
+      v: 1, kind: 'check/form', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-reg',
+      extra: { producer: 'host', authority: 'host', verificationId: 'hc-reg-1' },
+      data: {
+        ruleSetId: 'host:n_reg', ruleSetVersion: '0.11', executor: 'host', state: 'pass',
+        passedChecks: 1, totalChecks: 1, executedAt: new Date().toISOString(),
+      },
+    },
+  ])
+  // 持凭证登记一条真实宿主执行（普通事件 / HTTP 无法构造这个 receipt）。
+  const receipt = runstore.createHostExecutionReceipt('hc-reg-1')
+  await runstore.recordHostExecution(runsRoot, run.id, {
+    executionId: 'hc-reg-1',
+    runId: run.id,
+    nodeId: 'n_reg',
+    attempt: 1,
+    checkId: 'host:n_reg',
+    commandDigest: 'a'.repeat(64),
+    expectedExitCode: 0,
+    exitCode: 0,
+    state: 'pass',
+    reasonCode: null,
+    reportPath: 'reports/unit.json',
+    reportSha256: reportSha,
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+  }, { receipt })
+
+  const first = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(first.status, 200)
+  assert.equal(first.json.summary.quality.evidence.checks.state, 'pass')
+  assert.equal(first.json.summary.quality.evidence.checks.authoritativePassed, 1)
+  assert.equal(first.json.cached, false)
+
+  const cached = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(cached.json.cached, true, '报告未变时缓存可命中')
+  assert.equal(cached.json.summary.quality.evidence.checks.authoritativePassed, 1)
+
+  // 跨读端一致性：export 必须与 summary 用同一验证器，不能把同一权威通过误降 unknown。
+  const exportBefore = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportBefore.status, 200)
+  assert.match(exportBefore.body, /\| 规范 \| pass \|/, 'export 必须保留已登记的宿主权威通过')
+
+  // 报告内容篡改（长度相同）也必须撤销权威并让缓存失效；取消哈希比较时这条必红。
+  writeFileSync(copyAbs, '{"suite":"unit","passed":0}')
+  const afterTamper = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(afterTamper.json.cached, false, '报告内容篡改后缓存必须失效')
+  assert.equal(afterTamper.json.summary.quality.evidence.checks.authoritativePassed, 0,
+    '报告内容与登记 sha256 不符时不得授信')
+  assert.notEqual(afterTamper.json.summary.quality.evidence.checks.state, 'pass')
+  const exportTamper = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportTamper.status, 200)
+  assert.match(exportTamper.body, /\| 规范 \| unknown \|/, '报告篡改后 export 也必须降 unknown')
+
+  // 恢复原始报告：验证器与缓存都应回到权威通过。
+  writeFileSync(copyAbs, reportBody)
+  const restored = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(restored.json.summary.quality.evidence.checks.authoritativePassed, 1,
+    '恢复原始报告后重新授信')
+
+  rmSync(copyAbs, { force: true })
+  const afterDelete = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(afterDelete.json.cached, false, '报告副本删除后缓存必须失效')
+  assert.equal(afterDelete.json.summary.quality.evidence.checks.authoritativePassed, 0,
+    '报告副本缺失时不得继续给权威通过')
+  assert.notEqual(afterDelete.json.summary.quality.evidence.checks.state, 'pass')
+  const exportAfter = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportAfter.status, 200)
+  assert.match(exportAfter.body, /\| 规范 \| unknown \|/, '报告副本删除后 export 也必须降 unknown')
 })
 
 for (const dir of workspaceDirs) rmSync(dir, { recursive: true, force: true })

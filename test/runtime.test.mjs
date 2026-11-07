@@ -1979,6 +1979,87 @@ try {
     }
   })
 
+  // 0.11 R2：restart 在准入处被 429 时保留可重试 childRunId，释放后复用同一 child
+  await check('准入集成：restart 429 保留可重试 childRunId，释放后复用同一 child 启动', async () => {
+    const flowId = 'flow-adm-restart'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 0,
+      queueTimeoutMs: 1000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      // 占满唯一槽位。
+      const occupant = await makeAdmissionRun(flowId)
+      const startOccupant = runtime.start(occupant.id, { workspace: repoRoot })
+      await until(() => entered.includes(occupant.id), '占位 run 没有进入执行')
+
+      // 造一个已失败的旧 run（带 workspace 绑定 + 一条失败节点事件，便于推导续跑起点）。
+      const oldRun = await makeAdmissionRun(flowId)
+      await store.appendEvents(admissionRunsRoot, oldRun.id, [
+        {
+          v: 1, kind: 'run/start', traceId: 'tr-old', data: { flowId, flowName: flowId, nodeTotal: 1 },
+        },
+        {
+          v: 1, kind: 'node/start', nodeId: 'n_a', attemptId: 1, traceId: 'tr-old-node',
+          data: { title: '实现', mode: 'single', skills: [] },
+        },
+        {
+          v: 1, kind: 'node/end', nodeId: 'n_a', attemptId: 1, traceId: 'tr-old-node',
+          data: { status: 'failed', durationMs: 1 },
+        },
+      ])
+      await store.writeRunMeta(admissionRunsRoot, oldRun.id, {
+        status: 'failed',
+        started: true,
+        endedAt: new Date().toISOString(),
+        workspace: { path: repoRoot },
+      })
+
+      let firstError = null
+      try {
+        await runtime.restart(oldRun.id)
+      } catch (error) {
+        firstError = error
+      }
+      A.ok(firstError, '槽位被占时 restart 必须失败')
+      A.equal(firstError.status, 429)
+      A.ok(typeof firstError.childRunId === 'string' && firstError.childRunId !== '',
+        '429 必须带可重试的 childRunId')
+      const childId = firstError.childRunId
+      const childMeta = await store.readRunMeta(admissionRunsRoot, childId)
+      A.equal(childMeta.status, 'pending')
+      A.equal(childMeta.started, false, '未写出 run/start 的 child 仍是未开始')
+      A.ok(childMeta.restart && childMeta.restart.startRejected, '必须记 startRejected 供重试')
+
+      // 释放槽位后重试：同一个 child 被复用并真正启动。
+      gate.resolve()
+      A.equal((await startOccupant).status, 'running')
+      A.equal((await runtime.wait(occupant.id)).status, 'done')
+      const retried = await runtime.restart(oldRun.id)
+      A.equal(retried.run.id, childId, '重试必须复用同一个 childRunId')
+      A.equal((await runtime.wait(childId)).status, 'done')
+    } finally {
+      gate.resolve()
+      await runtime.dispose().catch(() => {})
+    }
+  })
+
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

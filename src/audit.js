@@ -17,7 +17,7 @@
  * @module @feiyueve/dsh-flow-studio/audit
  */
 
-import { computeProgress, summarize } from './runlog.js'
+import { computeProgress, isInstanceScopedEnd, summarize } from './runlog.js'
 
 /** verdict 全集；顺序即「从等不到终态」到「已收口」的阅读顺序。 */
 export const AUDIT_VERDICTS = Object.freeze([
@@ -264,6 +264,7 @@ function resolveStatus(run, sorted) {
   for (let index = sorted.length - 1; index >= 0; index -= 1) {
     const event = sorted[index]
     if (!event || event.kind !== 'run/end' || !isObject(event.data)) continue
+    if (isInstanceScopedEnd(event)) continue
     if (event.data.status === 'done' || event.data.status === 'failed' || event.data.status === 'aborted') {
       return { reported, effective: event.data.status }
     }
@@ -299,7 +300,7 @@ function findFailure(run, sorted) {
   for (let index = sorted.length - 1; index >= 0; index -= 1) {
     const event = sorted[index]
     if (!event || !isObject(event.data)) continue
-    if (event.kind === 'run/end' && event.data.status === 'failed' && reason === null) {
+    if (event.kind === 'run/end' && !isInstanceScopedEnd(event) && event.data.status === 'failed' && reason === null) {
       reason = textOf(event.data.reason)
     }
     if (event.kind === 'node/end' && event.data.status === 'failed') {
@@ -603,7 +604,7 @@ function inspect(options) {
   let summary = null
   if (sorted.length > 0) {
     try {
-      const summaryOptions = { now: new Date(nowMs) }
+      const summaryOptions = { now: new Date(nowMs), verifyHostExecution: options.verifyHostExecution }
       if (run && (run.engine === 'stub' || run.engine === 'real')) summaryOptions.engine = run.engine
       summary = summarize(sorted, summaryOptions)
     } catch {
@@ -764,6 +765,7 @@ function terminalResult(context) {
     for (let index = sorted.length - 1; index >= 0; index -= 1) {
       const event = sorted[index]
       if (!event || event.kind !== 'run/end' || !isObject(event.data)) continue
+      if (isInstanceScopedEnd(event)) continue
       if (event.data.status === 'aborted') {
         reason = textOf(event.data.reason)
         break

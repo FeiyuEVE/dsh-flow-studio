@@ -59,6 +59,7 @@
  */
 
 import { readdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { hostname } from 'node:os'
 
 import { auditWorkflow as defaultAuditWorkflow } from './audit.js'
@@ -67,7 +68,8 @@ import { Engine, EngineError, createEngine, validateFlowForRun } from './engine.
 import { buildFollowupPayload } from './inbox.js'
 import { checkRunId } from './runlog.js'
 import {
-  appendEvents, claimLease, createRun, listRuns, readAllEvents, readLease, readNodeSessions,
+  appendEvents, buildHostExecutionVerifier, claimLease, createRun, listRuns, readAllEvents, readHostExecutions,
+  readLease, readNodeSessions,
   readRunMeta, releaseLease, runsDir, writeNodeSessions, writeRunMeta,
 } from './runstore.js'
 import { RESTARTABLE_STATUSES, prepareRestart } from './restart.js'
@@ -869,9 +871,15 @@ export function createRuntime(options = {}) {
         flow = null
       }
     }
+    const hostExecutions = await readHostExecutions(runsRoot, runId).catch(() => [])
+    const hostById = new Map(hostExecutions
+      .filter(record => record && typeof record.executionId === 'string')
+      .map(record => [record.executionId, record]))
+    // 0.11 R5（返工）：自审 summary 与 HTTP 同口径（同一 runstore 验证器，含副本 sha256）。
+    const verifyHostExecution = buildHostExecutionVerifier(hostExecutions, events, runId, join(runsRoot, runId))
     let audited = null
     try {
-      audited = auditFn({ flow, events, run: meta, now: now() })
+      audited = auditFn({ flow, events, run: meta, now: now(), verifyHostExecution })
     } catch (error) {
       log('warn', `supervision: 审计 run ${runId} 失败：${error && error.message ? error.message : String(error)}`)
       audited = null
@@ -1322,20 +1330,31 @@ export function createRuntime(options = {}) {
       : (typeof startOptions.cwd === 'string' && startOptions.cwd !== ''
         ? startOptions.cwd
         : 'default')
+    // 0.11 R2：入队前冻结流程快照（含 node.check）；排队期间保存流程不改变实际执行命令。
+    let effectiveOptions = startOptions
+    if (!effectiveOptions.flowSnapshot) {
+      try {
+        const meta = await readRunMeta(runsRoot, runId)
+        const snapshot = meta && meta.flowId ? await readFlow(flowsRoot, meta.flowId) : null
+        if (snapshot) effectiveOptions = { ...effectiveOptions, flowSnapshot: snapshot }
+      } catch {
+        // 快照读失败不阻断启动：Engine 会按当前流程再读一次（旧路径）。
+      }
+    }
     pendingStarts.add(runId)
     let slotRelease = null
     try {
       slotRelease = await admission.acquire({
         runId,
         workspaceKey,
-        signal: startOptions ? startOptions.signal : undefined,
+        signal: effectiveOptions ? effectiveOptions.signal : undefined,
       })
     } catch (error) {
       pendingStarts.delete(runId)
       throw error
     }
     pendingStarts.delete(runId)
-    return startReserved(runId, startOptions, slotRelease)
+    return startReserved(runId, effectiveOptions, slotRelease)
   }
 
   /**
@@ -1470,14 +1489,20 @@ export function createRuntime(options = {}) {
     if (!oldMeta) throw new EngineError(404, `run 不存在（${oldRunId}）`)
     // 持久化互斥：已经有一个续跑自该 run 的子 run 时，再重启会重复复制会话。
     // 让用户继续/停止那个子 run（续跑失败就重启子 run），而不是并排两个。
+    let retryChild = null
     try {
       const listed = await listRuns(runsRoot, { limit: 100 })
       for (const item of listed.runs || []) {
         if (!item || item.id === oldRunId) continue
         const meta = await readRunMeta(runsRoot, item.id)
-        if (meta && meta.restart && meta.restart.fromRunId === oldRunId) {
-          throw new EngineError(400, `该 run 已经有续跑 run（${item.id}）；请继续或停止它，不要重复重启`)
+        if (!meta || !meta.restart || meta.restart.fromRunId !== oldRunId) continue
+        // 0.11 R2：上次 restart 在准入处被 429 拒绝、run/start 从未写出 → 同一个子 run
+        // 可重试（复用 childRunId / resumePlan），不能被「存在任意 child」永久挡住。
+        if (meta.restart.startRejected && meta.status === 'pending' && meta.started !== true) {
+          retryChild = meta
+          continue
         }
+        throw new EngineError(400, `该 run 已经有续跑 run（${item.id}）；请继续或停止它，不要重复重启`)
       }
     } catch (error) {
       if (error instanceof EngineError) throw error
@@ -1528,16 +1553,18 @@ export function createRuntime(options = {}) {
       ? restartOptions.note.trim().slice(0, 500)
       : undefined
     const name = `${oldMeta.name || oldMeta.flowName || oldMeta.flowId}（续跑 ${attempt}）`
-    const created = await createRun(runsRoot, {
-      flowId: oldMeta.flowId,
-      flowName: oldMeta.flowName || oldMeta.flowId,
-      name,
-      nodeTotal: stages.length,
-      engine: oldMeta.engine === 'stub' ? 'stub' : 'real',
-    })
+    const created = retryChild
+      ? { id: retryChild.id }
+      : await createRun(runsRoot, {
+        flowId: oldMeta.flowId,
+        flowName: oldMeta.flowName || oldMeta.flowId,
+        name,
+        nodeTotal: stages.length,
+        engine: oldMeta.engine === 'stub' ? 'stub' : 'real',
+      })
     // 继承旧 run 的节点会话：新 run 的 engine.start → _loadNodeSessions 会读这份表；
     // 每个节点仍用同一个 sessionId，冷会话由 _followupNodeSession → agents.resume 续上。
-    if (Object.keys(inherited).length > 0) {
+    if (!retryChild && Object.keys(inherited).length > 0) {
       await writeNodeSessions(runsRoot, created.id, inherited)
     }
     const restartInfo = {
@@ -1572,15 +1599,41 @@ export function createRuntime(options = {}) {
         supervision: { enabled: false, wakerSessionId, reason: 'restarted' },
       }).catch(() => {})
     }
-    const started = await start(created.id, {
-      ...(workspacePath === null ? {} : { workspace: workspacePath, worktree: 'off' }),
-      resumePlan: {
-        fromRunId: oldRunId,
-        startNodeId: plan.startNodeId,
-        skipped: plan.skipped,
-        oldFailure: plan.oldFailure,
-      },
-    })
+    let started
+    try {
+      started = await start(created.id, {
+        ...(workspacePath === null ? {} : { workspace: workspacePath, worktree: 'off' }),
+        resumePlan: {
+          fromRunId: oldRunId,
+          startNodeId: plan.startNodeId,
+          skipped: plan.skipped,
+          oldFailure: plan.oldFailure,
+        },
+      })
+    } catch (error) {
+      // 0.11 R2：准入拒绝（429）不删除子 run；记 startRejected 供下一次 restart 复用。
+      if (error && error.status === 429) {
+        await writeRunMeta(runsRoot, created.id, {
+          restart: {
+            ...restartInfo,
+            startRejected: {
+              code: error.code || 'RUN_CONCURRENCY_LIMIT',
+              reason: error.reason || 'queue-full',
+              at: now().toISOString(),
+              retryable: true,
+            },
+          },
+        }).catch(() => {})
+        if (error && typeof error === 'object') {
+          error.childRunId = created.id
+          error.retryable = true
+        }
+      } else {
+        // 其它启动失败：同样保留目录与 childRunId，避免调用方失去线索。
+        if (error && typeof error === 'object' && !error.childRunId) error.childRunId = created.id
+      }
+      throw error
+    }
     log(
       'info',
       `flow-studio: run ${created.id} 从 ${oldRunId} 续跑（第 ${attempt} 次，起点 ${plan.startNodeId}，`

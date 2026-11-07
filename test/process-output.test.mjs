@@ -15,6 +15,9 @@
 import assert from 'node:assert/strict'
 import { spawn as realSpawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   createBoundedOutput, redactDeep, redactText,
@@ -568,6 +571,200 @@ await check('真 node 子进程：非 0 退出时 result.tail / events 只见 [R
   const stderrEvent = result.events.find(event => event.kind === 'stderr')
   A.ok(stderrEvent && !stderrEvent.text.includes('supersecret'), '失败路径的 stderr 事件也不得含 canary')
   assertNoCanary(result, '失败路径')
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 R3/F3：20 轮 RSS 采样 + 孙进程退出证据
+// ---------------------------------------------------------------------------
+
+await check('R3/F3：20 轮无限输出后宿主 RSS 有界（末 5 中位 − 首 5 中位 ≤ 32MiB）', async () => {
+  const source = [
+    "const fs = require('node:fs')",
+    "const chunk = 'z'.repeat(65536)",
+    'for (;;) fs.writeSync(1, chunk)',
+  ].join('\n')
+  const command = nodeCommand(source)
+  const rss = name => process.memoryUsage()[name]
+  const median = list => {
+    const sorted = [...list].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+  const samples = []
+  const baseline = rss('rss')
+  for (let round = 0; round < 20; round += 1) {
+    const result = await within(runExternalExecutor({
+      spec: { kind: 'custom', command },
+      prompt: `RSS 轮 ${round}`,
+      cwd: process.cwd(),
+      timeoutMs: 5000,
+      maxOutputBytes: 262144,
+    }), 8000, `RSS 轮 ${round}`)
+    A.equal(result.reason, 'OUTPUT_LIMIT', `第 ${round + 1} 轮必须是 OUTPUT_LIMIT`)
+    samples.push(rss('rss'))
+  }
+  const firstFive = samples.slice(0, 5)
+  const lastFive = samples.slice(-5)
+  const growth = median(lastFive) - median(firstFive)
+  A.ok(growth <= 32 * 1024 * 1024,
+    `末 5 轮 RSS 中位数相对首 5 轮增长必须 ≤32MiB（实际 ${(growth / 1048576).toFixed(1)}MiB）`)
+  A.ok(Math.max(...samples) - baseline <= 128 * 1024 * 1024,
+    `采样期峰值相对基线必须 ≤128MiB（实际 ${((Math.max(...samples) - baseline) / 1048576).toFixed(1)}MiB）`)
+  console.log(`    · RSS 基线 ${(baseline / 1048576).toFixed(1)}MiB，增长中位差 ${(growth / 1048576).toFixed(1)}MiB`)
+})
+
+await check('R3/F3：超时杀整组后孙进程（ignore SIGTERM）不残留', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fs-grandchild-'))
+  const pidFile = join(dir, 'grandchild.pid')
+  const script = join(dir, 'grandchild.mjs')
+  writeFileSync(script, [
+    "import { spawn } from 'node:child_process'",
+    "import { writeFileSync } from 'node:fs'",
+    "import { writeSync } from 'node:fs'",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })",
+    'writeFileSync(process.env.FLOW_GRANDCHILD_PID, String(child.pid))',
+    'setInterval(() => {}, 1000)',
+  ].join('\n'))
+  process.env.FLOW_GRANDCHILD_PID = pidFile
+  let result = null
+  let pid = null
+  try {
+    result = await within(runExternalExecutor({
+      spec: { kind: 'custom', command: `${shq(process.execPath)} ${shq(script)}` },
+      prompt: '孙进程用例',
+      cwd: dir,
+      timeoutMs: 1200,
+    }), 5000, '孙进程')
+    pid = Number(readFileSync(pidFile, 'utf8'))
+  } finally {
+    delete process.env.FLOW_GRANDCHILD_PID
+  }
+  A.equal(result.reason, 'timeout', '超时收口 reason=timeout')
+  A.equal(result.killScope, 'group', 'POSIX 必须按进程组终止')
+  A.ok(Number.isInteger(pid) && pid > 0, '脚本必须记下孙进程 pid')
+  // SIGTERM 后 250ms 会 SIGKILL；给 1.2s 观察窗口。
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  // 判活：ESRCH = 已回收；容器里 PID 1 可能暂时不 reap，僵尸态（Z）同样算已退出。
+  let alive = true
+  try {
+    process.kill(pid, 0)
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]
+      alive = state !== 'Z'
+    } catch {
+      alive = false
+    }
+  } catch (error) {
+    alive = !(error && (error.code === 'ESRCH' || error.code === 'ENOENT'))
+  }
+  A.equal(alive, false, `孙进程 ${pid} 必须在宽限期后被终止（不残留；僵尸态视为已退出）`)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 R3 A3.2：隔离 runner（96MiB heap）+ 外部 10ms RSS 采样 + 20 轮父孙进程组
+// ---------------------------------------------------------------------------
+
+await check('R3/A3.2：隔离 96MiB runner 20 轮无限输出，外部 10ms 采样 RSS 有界、父孙进程全部退出', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fs-rss-runner-'))
+  const roundScript = join(dir, 'round.mjs')
+  const runnerScript = join(dir, 'runner.mjs')
+  const executorUrl = new URL('../src/executor.js', import.meta.url).href
+  writeFileSync(roundScript, [
+    "import { spawn } from 'node:child_process'",
+    "import { writeFileSync } from 'node:fs'",
+    "import { writeSync } from 'node:fs'",
+    "const child = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)\"], { stdio: 'ignore' })",
+    'writeFileSync(process.env.ROUND_PID_FILE, String(child.pid))',
+    'const chunk = Buffer.alloc(65536, 114)',
+    'for (;;) writeSync(1, chunk)',
+  ].join('\n'))
+  const childCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(roundScript)}`
+  writeFileSync(runnerScript, [
+    `import { runExternalExecutor } from ${JSON.stringify(executorUrl)}`,
+    "import { readFileSync } from 'node:fs'",
+    'const rounds = []',
+    'await new Promise(resolve => setTimeout(resolve, 500))',
+    'for (let index = 0; index < 20; index += 1) {',
+    '  const pidFile = `${process.env.ROUND_PID_DIR}/pid-${index}`',
+    '  process.env.ROUND_PID_FILE = pidFile',
+    '  const started = Date.now()',
+    '  const result = await runExternalExecutor({',
+    `    spec: { kind: 'custom', command: ${JSON.stringify(childCommand)} },`,
+    '    prompt: `round ${index}`,',
+    '    cwd: process.env.ROUND_PID_DIR,',
+    '    timeoutMs: 5000,',
+    '    maxOutputBytes: 262144,',
+    '  })',
+    '  // SIGTERM 后 250ms 才 SIGKILL：给组内孙进程一个宽限窗口再判活。',
+    '  await new Promise(resolve => setTimeout(resolve, 400))',
+    '  const pid = Number(readFileSync(pidFile, "utf8"))',
+    '  let grandchildAlive = true',
+    '  try {',
+    '    process.kill(pid, 0)',
+    '    try {',
+    '      const stat = readFileSync(`/proc/${pid}/stat`, "utf8")',
+    '      const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]',
+    '      grandchildAlive = state !== "Z"',
+    '    } catch { grandchildAlive = false }',
+    '  } catch { grandchildAlive = false }',
+    '  rounds.push({ index, reason: result.reason, code: result.code, killScope: result.killScope,',
+    '    ms: Date.now() - started, rss: process.memoryUsage().rss, grandchildAlive })',
+    '}',
+    'process.stdout.write(JSON.stringify({ rounds }) + "\\n")',
+  ].join('\n'))
+
+  const runner = realSpawn(process.execPath, ['--max-old-space-size=96', runnerScript], {
+    env: { ...process.env, ROUND_PID_DIR: dir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const baseline = []
+  const samples = []
+  const sampler = setInterval(() => {
+    try {
+      const status = readFileSync(`/proc/${runner.pid}/status`, 'utf8')
+      const match = /VmRSS:\s+(\d+)\s+kB/.exec(status)
+      if (!match) return
+      const rss = Number(match[1]) * 1024
+      samples.push(rss)
+      if (samples.length <= 50) baseline.push(rss)
+    } catch {
+      // runner 已退出
+    }
+  }, 10)
+  let stdout = ''
+  let stderr = ''
+  runner.stdout.on('data', chunk => { stdout += chunk })
+  runner.stderr.on('data', chunk => { stderr += chunk })
+  const exitCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      killLeftover(runner)
+      reject(new Error('隔离 runner 超过 30s 未结束'))
+    }, 30000)
+    runner.once('exit', code => { clearTimeout(timer); resolve(code) })
+    runner.once('error', error => { clearTimeout(timer); reject(error) })
+  })
+  clearInterval(sampler)
+
+  A.equal(exitCode, 0, `隔离 runner 必须 exit 0（stderr：${stderr.slice(0, 200)}）`)
+  const line = stdout.trim().split('\n').filter(Boolean).at(-1)
+  const rounds = JSON.parse(line).rounds
+  A.equal(rounds.length, 20, '必须完成 20 轮')
+  for (const round of rounds) {
+    A.equal(round.code, 'OUTPUT_LIMIT', `第 ${round.index + 1} 轮必须 OUTPUT_LIMIT`)
+    A.ok(round.ms < 5000, `第 ${round.index + 1} 轮必须在 5s 内终止（实际 ${round.ms}ms）`)
+    A.equal(round.killScope, 'group', `第 ${round.index + 1} 轮必须按进程组终止`)
+    A.equal(round.grandchildAlive, false, `第 ${round.index + 1} 轮孙进程必须退出 / 僵尸`)
+  }
+  const median = list => [...list].sort((a, b) => a - b)[Math.floor(list.length / 2)]
+  const growth = median(rounds.slice(-5).map(round => round.rss)) - median(rounds.slice(0, 5).map(round => round.rss))
+  A.ok(growth <= 32 * 1024 * 1024, `末 5 轮 RSS 中位差必须 ≤32MiB（实际 ${(growth / 1048576).toFixed(1)}MiB）`)
+  A.ok(baseline.length >= 5, '外部采样器必须采到基线样本')
+  const peakGrowth = Math.max(...samples) - median(baseline)
+  A.ok(peakGrowth <= 128 * 1024 * 1024,
+    `外部 10ms 采样峰值相对 500ms 基线必须 ≤128MiB（实际 ${(peakGrowth / 1048576).toFixed(1)}MiB）`)
+  console.log(`    · runner RSS 增长中位差 ${(growth / 1048576).toFixed(1)}MiB，外部峰值增量 ${(peakGrowth / 1048576).toFixed(1)}MiB，样本 ${samples.length}`)
+  rmSync(dir, { recursive: true, force: true })
 })
 
 console.log(`\n${checks} 组通过`)

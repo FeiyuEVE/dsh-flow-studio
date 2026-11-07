@@ -6,6 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync,
@@ -2446,6 +2447,186 @@ process.stdout.write('OK:' + total)
     assert.equal(Object.hasOwn(read.n_old, 'agentOptions'), false)
     assert.equal(Object.hasOwn(read.n_other, 'agentOptions'), false)
   })
+  // 0.11 R1：失权收口必须按持久 epoch/owner 条件写
+  await check('R1（0.11）：finalizeEpoch 按持久 epoch/owner 条件写，接管后旧实例只记 instance 事实', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const now = new Date()
+    // 第一个 owner：租约一创建就过期（ttl=1ms 且心跳在过去），随即可被接管。
+    const first = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 1, now: new Date(now.getTime() - 5000),
+    })
+    assert.equal(first.epoch, 1, '每次 claim 的持久 epoch 从 1 开始')
+    const second = await store.claimLease(runsRoot, meta.id, { pid: 222, host: 'h2', ttlMs: 60_000, now })
+    assert.equal(second.epoch, 2, '接管者拿到下一个 epoch')
+
+    // 持久 fence：旧 owner/epoch 的业务写必须被存储层拒绝（一条都不落盘）。
+    const before = (await store.readAllEvents(runsRoot, meta.id)).events.length
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_stale', attemptId: 1, traceId: 'tr-stale',
+        data: { title: 'stale', mode: 'single', skills: [] },
+      }], { ownerId: first.ownerId, leaseEpoch: 1 }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.length, before,
+      'fenced 写被拒绝后事件数不变')
+    const accepted = await store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_new', attemptId: 1, traceId: 'tr-new',
+      data: { title: 'new', mode: 'single', skills: [] },
+    }], { ownerId: second.ownerId, leaseEpoch: 2 })
+    assert.equal(accepted.events.length, 1, '现任 owner/epoch 的写允许')
+
+    const stale = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 1, ownerId: first.ownerId, idempotencyKey: 'loss:1', now,
+    })
+    assert.equal(stale.terminalScope, 'instance', '旧 epoch 只能记 instance 范围事实')
+    let after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'running', '接管者仍在跑时，旧实例不得把 run 改成 failed')
+    assert.equal(after.execution.epoch, 2, '接管者的 execution 不被旧实例覆盖')
+    assert.equal(after.execution.ownerId, second.ownerId)
+
+    const again = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 1, ownerId: first.ownerId, idempotencyKey: 'loss:1', now,
+    })
+    assert.equal(again.idempotent, true, '同一失权 epoch 的重复收口必须幂等')
+
+    const current = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 2, ownerId: second.ownerId, idempotencyKey: 'loss:2', now,
+    })
+    assert.equal(current.terminalScope, 'run', '现任 owner 收口才是 run 范围 failed')
+    after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.equal(after.execution.state, 'settled')
+  })
+
+  // 0.11 R1（本轮）：claimLease 的 execution 更新与 appendEvents fence 共用跨进程 meta.lock
+  await check('R1（本轮）：claim 更新 execution 与 append fence 共用跨进程 meta.lock（可控交错）', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const first = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 1, now: new Date(Date.now() - 5000),
+    })
+    assert.equal(first.epoch, 1)
+
+    // 父进程先持 meta.lock（appendEvents 的 guard 在锁内挂起）。
+    let enteredResolve
+    let releaseResolve
+    const entered = new Promise(resolve => { enteredResolve = resolve })
+    const release = new Promise(resolve => { releaseResolve = resolve })
+    const appendPromise = store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_hold', attemptId: 1, traceId: 'tr-hold',
+      data: { title: 'hold', mode: 'single', skills: [] },
+    }], {
+      guard: async () => {
+        enteredResolve()
+        await release
+      },
+    })
+    await entered
+
+    const childScript = join(home, 'claim-child.mjs')
+    writeFileSync(childScript, [
+      `import * as store from ${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)}`,
+      'try {',
+      '  const lease = await store.claimLease(process.argv[2], process.argv[3], {',
+      '    pid: 222, host: "h2", ttlMs: 60000, now: new Date(),',
+      '  })',
+      '  console.log("claimed", lease.epoch)',
+      '} catch (error) {',
+      '  console.error("claim-failed", error && error.code, error && error.message)',
+      '  process.exit(2)',
+      '}',
+    ].join('\n'))
+    const child = spawn(process.execPath, [childScript, runsRoot, meta.id], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let childOut = ''
+    let childErr = ''
+    child.stdout.on('data', chunk => { childOut += chunk })
+    child.stderr.on('data', chunk => { childErr += chunk })
+    const childExit = new Promise(resolve => child.once('exit', resolve))
+
+    // 子进程跨进程 claim 必须停在 meta.lock 上：期间 execution 仍是旧 epoch。
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const during = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(during.execution.epoch, 1,
+      `另一进程的 claim 必须被 meta.lock 挡住（child stderr: ${childErr.slice(0, 200)}）`)
+    // 新租约在 epoch 更新完成之前不得对外可见（原子可见性）。
+    const leaseDuring = JSON.parse(readFileSync(join(runsRoot, meta.id, 'lock.json'), 'utf8'))
+    assert.equal(leaseDuring.ownerId, first.ownerId,
+      'epoch 未更新前 lock.json 仍是旧 owner（新租约不可见）')
+
+    releaseResolve()
+    await appendPromise
+    const code = await childExit
+    assert.equal(code, 0, `子进程 claim 失败：${childErr.slice(0, 300)}`)
+    assert.match(childOut, /claimed 2/, '锁释放后子进程拿到 epoch 2')
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2)
+    // 新 epoch 生效后，旧 owner 的在飞写即使此刻才提交也必须被 fence 拒绝。
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_inflight', attemptId: 1, traceId: 'tr-inflight',
+        data: { title: 'inflight', mode: 'single', skills: [] },
+      }], { ownerId: first.ownerId, leaseEpoch: 1 }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.some(event => event.nodeId === 'n_inflight'), false)
+  })
+
+  // 0.11 R5（本轮）：index / runtime 共用的验证器必须重读报告副本字节
+  await check('R5（本轮）：共享验证器重读报告副本 sha256，副本删除后撤销权威', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const rel = 'n_reg/artifacts/1/report.json'
+    const abs = join(runsRoot, meta.id, rel)
+    mkdirSync(dirname(abs), { recursive: true })
+    const body = '{"suite":"unit","passed":1}'
+    writeFileSync(abs, body)
+    const sha = createHash('sha256').update(body).digest('hex')
+    await store.appendEvents(runsRoot, meta.id, [
+      {
+        v: 1, kind: 'artifact/write', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-v',
+        extra: { producer: 'host', authority: 'host', verificationId: 'hc-v1', verificationKind: 'report-copy' },
+        data: { path: rel, bytes: Buffer.byteLength(body), kind: 'json', sha256: sha },
+      },
+      {
+        v: 1, kind: 'check/form', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-v',
+        extra: { producer: 'host', authority: 'host', verificationId: 'hc-v1' },
+        data: {
+          ruleSetId: 'host:n_reg', ruleSetVersion: '0.11', executor: 'host', state: 'pass',
+          passedChecks: 1, totalChecks: 1, executedAt: new Date().toISOString(),
+        },
+      },
+    ])
+    const receipt = store.createHostExecutionReceipt('hc-v1')
+    await store.recordHostExecution(runsRoot, meta.id, {
+      executionId: 'hc-v1',
+      runId: meta.id,
+      nodeId: 'n_reg',
+      attempt: 1,
+      checkId: 'host:n_reg',
+      commandDigest: 'b'.repeat(64),
+      expectedExitCode: 0,
+      exitCode: 0,
+      state: 'pass',
+      reasonCode: null,
+      reportPath: 'reports/unit.json',
+      reportSha256: sha,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    }, { receipt })
+
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const execs = await store.readHostExecutions(runsRoot, meta.id)
+    const verify = store.buildHostExecutionVerifier(execs, all.events, meta.id, join(runsRoot, meta.id))
+    const checkEvent = all.events.find(event => event.kind === 'check/form')
+    assert.equal(verify(checkEvent), true, '报告副本字节与登记 sha256 一致时授信')
+    rmSync(abs, { force: true })
+    assert.equal(verify(checkEvent), false, '报告副本删除后不得继续授信')
+  })
+
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

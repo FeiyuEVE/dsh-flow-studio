@@ -5586,7 +5586,10 @@ try {
     A.deepEqual(a2Findings.map(event => event.data.id), ['n_a:BF1'], '打回方的 finding 复报后归属目标节点，不成 n_a:n_b:BF1')
     A.equal(allIds.some(id => /^n_a:n_a:/.test(id)), false, '不许出现双前缀 id')
     A.equal(allIds.some(id => /^n_a:n_b:/.test(id)), false, '不许出现跨节点双前缀 id')
-    A.equal(summary.quality.evidence.acceptance.state, 'pass', '复报后旧 fail 能判成 pass')
+    // 0.11 R6（F5）：无独立 evidenceRef 的 acceptance 退到引擎自写报告 = claimed，不再判 pass。
+    A.equal(summary.quality.evidence.acceptance.state, 'unknown', '自报报告只能 unknown')
+    A.match(String(summary.quality.evidence.acceptance.reason), /自报报告/, '必须说明缺独立证据')
+    A.ok(summary.quality.evidence.acceptance.claimedPassed >= 1, '至少一条验收通过被降级为 claimed')
     A.equal(summary.quality.evidence.acceptance.staleFails, undefined, '旧 n_a:R1 复判为通过，staleFails 必须为空')
   })
 

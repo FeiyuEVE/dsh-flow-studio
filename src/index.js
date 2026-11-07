@@ -41,7 +41,8 @@ import {
 } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
-  readLease, readRunDetail, readRunMessages, readRunMeta, repairRunStates, runsDir,
+  buildHostExecutionVerifier, readHostExecutions, readLease, readRunDetail, readRunMessages, readRunMeta,
+  repairRunStates, runsDir,
   sweepExpiredLeases, writeRunInbox, writeRunMeta,
 } from './runstore.js'
 import { workspaceIdFor } from './worktree.js'
@@ -322,6 +323,57 @@ function makeEvidenceVerifier(runDir) {
       return false
     }
   }
+}
+
+/**
+ * 0.11 R5（F4）：宿主检查的权威验证器。只有 runstore 私有 verification 登记过的
+ * executionId + 同节点/attempt + 报告 hash 对得上，才承认 producer='host'。
+ * 普通 artifact/write、外部 HTTP 或手写 extra.producer 都过不了这一关。
+ */
+function hostVerificationOf(event) {
+  const extra = event && event.extra && typeof event.extra === 'object' ? event.extra : {}
+  const nested = extra.verification && typeof extra.verification === 'object' ? extra.verification : {}
+  return {
+    executionId: typeof extra.verificationId === 'string' ? extra.verificationId
+      : (typeof nested.executionId === 'string' ? nested.executionId : ''),
+    kind: typeof extra.verificationKind === 'string' ? extra.verificationKind
+      : (typeof nested.kind === 'string' ? nested.kind : ''),
+    reportSha256: typeof extra.reportSha256 === 'string' ? extra.reportSha256
+      : (typeof nested.reportSha256 === 'string' ? nested.reportSha256 : ''),
+  }
+}
+
+function makeHostExecutionVerifier(runId, records, events = [], runDir = '') {
+  // 与 runtime 自审共用 runstore 的同一实现（报告副本 sha256 必核）。
+  return buildHostExecutionVerifier(records, events, runId, runDir)
+}
+
+/**
+ * 0.11 R5（返工）：宿主证据指纹。记录或任一报告副本的字节变化都会改变指纹，
+ * summary 缓存据此失效，避免删除 / 损坏报告后仍复用旧的权威结论。
+ */
+function hostEvidenceDigest(runId, records, events = [], runDir = '') {
+  const hash = createHash('sha256')
+  hash.update(String(runId))
+  const sorted = [...(records || [])].sort((a, b) => String(a.executionId).localeCompare(String(b.executionId)))
+  for (const record of sorted) {
+    hash.update(JSON.stringify(record))
+    if (typeof record.reportSha256 === 'string' && record.reportSha256 !== '') {
+      const copy = (events || []).find(event => event && event.kind === 'artifact/write'
+        && hostVerificationOf(event).executionId === record.executionId
+        && hostVerificationOf(event).kind === 'report-copy')
+      if (!copy) {
+        hash.update('report-missing')
+        continue
+      }
+      try {
+        hash.update(createHash('sha256').update(readFileSync(join(runDir, copy.data.path))).digest('hex'))
+      } catch {
+        hash.update('report-unreadable')
+      }
+    }
+  }
+  return hash.digest('hex')
 }
 
 function newTraceId() {
@@ -2136,10 +2188,16 @@ async function handleRuns(req, res, env, url, parts) {
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
       // 07 §4 / §7：summary 也要能读到 workspace / worktree / supervision（与列表 / 详情同口径）。
       const extrasPayload = { ...runWorkspaceFields(meta), ...runBindingFields(meta) }
-      // 06 §13.7 增量缓存：lastSeq / eventCount / engine 都没变就复用上一次聚合结果。
+      // 06 §13.7 增量缓存 + 0.11 R5（返工）宿主证据指纹：报告副本被删除 / 损坏后
+      // 事件 seq 不会变，缓存必须失效，不能继续返回旧的权威结论。
+      const all = await readAllEvents(root, runId)
+      const events = all ? all.events : []
+      const hostExecutions = await readHostExecutions(root, runId)
+      const hostDigest = hostEvidenceDigest(runId, hostExecutions, events, join(root, runId))
       const cached = summaryCache.get(runId)
       if (cached && cached.lastSeq === meta.lastSeq
-        && cached.eventCount === meta.eventCount && cached.engine === meta.engine) {
+        && cached.eventCount === meta.eventCount && cached.engine === meta.engine
+        && cached.hostDigest === hostDigest) {
         sendJson(res, 200, {
           ok: true,
           cached: true,
@@ -2148,17 +2206,17 @@ async function handleRuns(req, res, env, url, parts) {
         })
         return
       }
-      const all = await readAllEvents(root, runId)
-      const events = all ? all.events : []
       const summary = summarize(events, {
         engine: meta.engine === 'stub' ? 'stub' : undefined,
         lastSeq: meta.lastSeq,
         verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+        verifyHostExecution: makeHostExecutionVerifier(runId, hostExecutions, events, join(root, runId)),
       })
       summaryCache.set(runId, {
         lastSeq: meta.lastSeq,
         eventCount: meta.eventCount,
         engine: meta.engine,
+        hostDigest,
         summary,
       })
       sendJson(res, 200, { ok: true, cached: false, summary, ...extrasPayload })
@@ -2174,10 +2232,12 @@ async function handleRuns(req, res, env, url, parts) {
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
       const all = await readAllEvents(root, runId)
       const events = all ? all.events : []
+      const hostExecutions = await readHostExecutions(root, runId)
       const summary = summarize(events, {
         engine: meta.engine === 'stub' ? 'stub' : undefined,
         lastSeq: meta.lastSeq,
         verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+        verifyHostExecution: makeHostExecutionVerifier(runId, hostExecutions, events, join(root, runId)),
       })
       const markdown = renderRunMarkdown(meta, events, summary)
       const body = Buffer.from(markdown, 'utf8')

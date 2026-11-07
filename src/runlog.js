@@ -1383,6 +1383,16 @@ const EVIDENCE_LABELS = {
   p0p1: 'P0 缺陷',
 }
 
+/**
+ * 0.11 R1：这条 run/end 是否只是「旧执行实例失权」的事实。
+ * instance 范围不参与生命周期投影（run 仍是接管者的 run），只在时间线/审计里可见。
+ * @param {object} event
+ */
+export function isInstanceScopedEnd(event) {
+  return Boolean(event && event.kind === 'run/end'
+    && event.extra && event.extra.terminalScope === 'instance')
+}
+
 /** 外部观察附录的有界上限（§6：外部统计可以增加，但必须有界）。 */
 export const EXTERNAL_OBSERVATION_LIMIT = 50
 
@@ -1490,14 +1500,28 @@ function isModelClaim(event) {
  * 注意：`authority` 只是验证结果的投影，不是调用方可声明的权限；本函数只分类，
  * 不因为字符串写了 'host' 就跳过子产物 / 报告核验（核验仍在各指标内做）。
  *
+ * 0.11 R5（F4）：`extra.producer='host'` 只是声明；传入 `options.verifyHostExecution`
+ * 时必须是宿主登记过的真实执行（凭证 + executionId + 节点/attempt 对齐），否则按
+ * claimed 处理。不传验证器时保持旧的纯函数信任（离线复算 / 既有基线）。
+ *
  * @param {object} event
+ * @param {{ verifyHostExecution?: (event: object) => boolean }} [options]
  * @returns {'host' | 'engine' | 'model-claim' | 'external' | 'legacy'}
  */
-export function classifyEvidenceAuthority(event) {
+export function classifyEvidenceAuthority(event, options = {}) {
   const extra = event && typeof event.extra === 'object' && event.extra !== null ? event.extra : null
   if (!extra) return 'legacy'
   if (extra.source === 'external' || extra.producer === 'external') return 'external'
-  if (extra.producer === 'host' || extra.authority === 'host') return 'host'
+  if (extra.producer === 'host' || extra.authority === 'host') {
+    // 0.11 R6（返工）：纯函数没有文件/登记验证能力时不允许把 producer=host 当权威；
+    // 必须由调用方注入 verifyHostExecution 且明确通过，否则按 claimed 处理。
+    if (typeof options.verifyHostExecution !== 'function') return 'model-claim'
+    try {
+      return options.verifyHostExecution(event) === true ? 'host' : 'model-claim'
+    } catch {
+      return 'model-claim'
+    }
+  }
   if (extra.provenance === 'model-claim') return 'model-claim'
   if (extra.provenance === 'engine' || extra.provenance === 'stub-synthetic') return 'engine'
   return 'legacy'
@@ -1660,7 +1684,7 @@ export function computeAcceptance(events = [], options = {}) {
   const generatedReportRefs = []
   const countPass = (data, event) => {
     passed += 1
-    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
     else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.evidenceRef, owners) === 'self') {
       selfCertified += 1
@@ -1831,7 +1855,7 @@ export function computeTests(events = [], options = {}) {
   const suites = []
   const countPass = (suite, data, event) => {
     passedSuites += 1
-    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
     else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
@@ -1984,6 +2008,7 @@ function checkEvidence(events, options = {}) {
   let claimedPassed = 0
   let authoritativePassed = 0
   let generatedReport = 0
+  let unverifiedHost = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
   const generatedReportRefs = []
@@ -1994,7 +2019,7 @@ function checkEvidence(events, options = {}) {
   const hostStates = new Map()
   for (const event of sortEvents(internal)) {
     if (!event || event.kind !== 'check/form' || !event.data) continue
-    if (classifyEvidenceAuthority(event) !== 'host') continue
+    if (classifyEvidenceAuthority(event, options) !== 'host') continue
     const id = event.data.ruleSetId
     if (typeof id !== 'string' || id === '') continue
     const state = event.data.state
@@ -2005,7 +2030,7 @@ function checkEvidence(events, options = {}) {
   }
   const countPass = (ruleSetId, data, event) => {
     passed += 1
-    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
     else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
@@ -2041,6 +2066,13 @@ function checkEvidence(events, options = {}) {
       && data.totalChecks > 0 && data.passedChecks === data.totalChecks
     if (!countsOk) {
       incomplete += 1
+      continue
+    }
+    // 0.11 R5（F4）：声称来自宿主、但拿不出宿主执行登记凭证 → 不计通过。
+    const declaredHost = Boolean(event.extra
+      && (event.extra.producer === 'host' || event.extra.authority === 'host'))
+    if (declaredHost && classifyEvidenceAuthority(event, options) !== 'host') {
+      unverifiedHost += 1
       continue
     }
     if (isModelClaim(event)) {
@@ -2082,6 +2114,32 @@ function checkEvidence(events, options = {}) {
       failed,
       generatedReport,
       generatedReportRefs,
+      selfCertified,
+      selfOnly,
+      ...authority(),
+    }
+  }
+  if (unverifiedHost > 0) {
+    return {
+      state: 'unknown',
+      reason: `${unverifiedHost} 个规范检查声称来自宿主，但没有可验证的宿主执行登记（producer=host 不授信）`,
+      applicable,
+      passed,
+      failed,
+      unverifiedHost,
+      selfCertified,
+      selfOnly,
+      ...authority(),
+    }
+  }
+  if (unverifiedHost > 0) {
+    return {
+      state: 'unknown',
+      reason: `${unverifiedHost} 个规范检查声称来自宿主，但没有可验证的宿主执行登记（producer=host 不授信）`,
+      applicable,
+      passed,
+      failed,
+      unverifiedHost,
       selfCertified,
       selfOnly,
       ...authority(),
@@ -2317,7 +2375,12 @@ export function computeQuality(events = [], options = {}) {
     ? options.artifactOwners
     : collectArtifactOwners(internal)
   const scoped = currentAttemptEvents(internal)
-  const evidenceOptions = { artifacts, artifactOwners, verifyEvidence: options.verifyEvidence }
+  const evidenceOptions = {
+    artifacts,
+    artifactOwners,
+    verifyEvidence: options.verifyEvidence,
+    verifyHostExecution: options.verifyHostExecution,
+  }
   let checks = checkEvidence(scoped, evidenceOptions)
   let acceptance = computeAcceptance(scoped, evidenceOptions)
   let tests = computeTests(scoped, evidenceOptions)
@@ -2653,6 +2716,7 @@ export function summarize(events = [], options = {}) {
       conflicts,
       artifacts,
       verifyEvidence: options.verifyEvidence,
+      verifyHostExecution: options.verifyHostExecution,
     }),
   }
 }
@@ -2702,7 +2766,7 @@ function eventDigest(event) {
     case 'run/start':
       return `flow ${data.flowId || ''} ${data.flowName || ''} · 阶段 ${data.nodeTotal}`
     case 'run/end':
-      return `status=${data.status}${data.reason ? ` · ${data.reason}` : ''}`
+      return `${event.extra && event.extra.terminalScope === 'instance' ? '旧执行实例失权 · ' : ''}status=${data.status}${data.reason ? ` · ${data.reason}` : ''}`
     case 'node/start':
       return `${data.title || ''} · ${data.mode}${Array.isArray(data.skills) && data.skills.length > 0 ? ` · skills: ${data.skills.join(', ')}` : ''}`
     case 'node/end':

@@ -22,6 +22,7 @@ import { join } from 'node:path'
 import { selectFirstNode, selectNextNode } from './engine.js'
 import { NODE_KIND } from './model.js'
 import { RunError, readAllEvents, readRunMeta } from './runstore.js'
+import { isInstanceScopedEnd } from './runlog.js'
 
 /** 允许重启的旧 run 终态（done 已成功，running 还在跑，都不重启）。 */
 export const RESTARTABLE_STATUSES = new Set(['failed', 'aborted'])
@@ -127,7 +128,7 @@ export function planRestart({ flow, events }) {
       attempts[nodeId] = Math.max(attempts[nodeId] || 0, attempt)
     }
     if (event.kind === 'run/end') {
-      runEnd = event
+      if (!isInstanceScopedEnd(event)) runEnd = event
       continue
     }
     if (nodeId === null) continue

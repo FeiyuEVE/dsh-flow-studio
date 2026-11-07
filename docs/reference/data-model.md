@@ -82,7 +82,9 @@ $DSH_HOME/flow-studio/runs/
     run.json                       # run 元数据（可变，原子写；跨进程 meta.lock）
     sessions.json                  # nodeId → { sessionId, createdAt, lastUsedAt, agentOptions? }（一个节点一个会话）
     messages.jsonl                 # 流程收件箱（append + 分页）
-    lock.json                      # 单写者租约（O_EXCL 创建）
+    lock.json                      # 单写者租约（O_EXCL 创建；含 ownerId，租约握手用）
+    verification/                  # 宿主检查私有登记（<executionId>/record.json；只有引擎持凭证可写；
+                                   #   record 含 commandDigest / exitCode / reportSha256 / 节点 / attempt）
     meta.lock                      # run.json 写的跨进程锁
     .error                         # 写盘失败等异常侧车（不静默挂住）
     <nodeId>/
@@ -98,7 +100,7 @@ $DSH_HOME/flow-studio/runs/
 
 ### `run.json` 字段
 
-`run.json` 是可变元数据，只有原子重写、没有事件改写。写入有跨进程锁，损坏时先备份并拒绝覆盖（不会被默认值重建，也不会让 `seq` 回退成 1,1）。白名单字段：
+`run.json` 是可变元数据，只有原子重写、没有事件改写。写入有跨进程 `meta.lock`（含租约 `execution` 世代更新与事件 fence 提交；claim 先递增 epoch 再发布 `lock.json`），损坏时先备份并拒绝覆盖（不会被默认值重建，也不会让 `seq` 回退成 1,1）。白名单字段：
 
 | 字段 | 含义 |
 |---|---|
@@ -114,6 +116,7 @@ $DSH_HOME/flow-studio/runs/
 | `progress` / `live` / `input` / `inbox` | 进度、运行时快照、启动输入、收件箱配置 |
 | `nodeDone` / `nodeTotal` / `tokenTotal` / `eventCount` / `lastSeq` / `seq` / `unkeyedCalls` / `tokenTotalApprox` | 计数与用量汇总（列表只读 `run.json`，不读全量事件） |
 | `sessions` | 会话索引（与 `sessions.json` 同源） |
+| `execution` | 持久执行世代 `{epoch, ownerId, state}`：每次 claim +1；`state ∈ active/released/settled`。失权收口按它做条件写 |
 
 `nodeStatus` 与 `machine` 是两条独立通道，各自量各自的预算；`nodeStatus` 被裁剪不影响 `machine`，反之亦然。
 

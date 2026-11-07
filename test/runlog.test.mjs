@@ -1705,8 +1705,11 @@ check('R4 来源判定：只认 extra.source / producer，不猜 host，也不�
   assert.equal(isExternalEvent({ kind: 'x', data: { external: true } }), false, 'data.external 只是来客自报，不能授信')
   assert.equal(isExternalEvent({ kind: 'x' }), false, '无 source 的旧事件是 legacy，不猜 host')
   assert.equal(classifyEvidenceAuthority({ extra: { source: 'external' } }), 'external')
-  assert.equal(classifyEvidenceAuthority({ extra: { producer: 'host' } }), 'host')
-  assert.equal(classifyEvidenceAuthority({ extra: { authority: 'host' } }), 'host')
+  // 0.11 R6（返工）：没有验证器的纯函数不得把 producer=host 当权威。
+  assert.equal(classifyEvidenceAuthority({ extra: { producer: 'host' } }), 'model-claim')
+  assert.equal(classifyEvidenceAuthority({ extra: { producer: 'host' } }, { verifyHostExecution: () => true }), 'host')
+  assert.equal(classifyEvidenceAuthority({ extra: { authority: 'host' } }), 'model-claim')
+  assert.equal(classifyEvidenceAuthority({ extra: { authority: 'host' } }, { verifyHostExecution: () => true }), 'host')
   assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'model-claim' } }), 'model-claim')
   assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'engine' } }), 'engine')
   assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'stub-synthetic' } }), 'engine')
@@ -1911,10 +1914,26 @@ check('R6 host check fail 与 model claimed pass 并存：host 优先 → qualit
       state: 'pass', passedChecks: 5, totalChecks: 5,
     },
   }))
-  const quality = computeQuality(events)
+  const quality = computeQuality(events, { verifyHostExecution: () => true })
   assert.equal(quality.state, 'fail')
   assert.equal(quality.evidence.checks.state, 'fail')
   assert.ok(quality.evidence.checks.failed >= 1)
+})
+
+check('R6（返工）：没有 verifyHostExecution 时 producer=host 只能算 claimed，不得成为权威通过', () => {
+  const events = fullEvidence()
+  const checkEvent = events.find(event => event.kind === 'check/form')
+  checkEvent.extra = { producer: 'host', authority: 'host' }
+  checkEvent.data.state = 'pass'
+  checkEvent.data.passedChecks = 5
+  checkEvent.data.totalChecks = 5
+  const noVerifier = computeQuality(events)
+  assert.equal(noVerifier.evidence.checks.authoritativePassed, 0)
+  assert.equal(noVerifier.evidence.checks.unverifiedHost, 1)
+  assert.notEqual(noVerifier.evidence.checks.state, 'pass')
+  const verified = computeQuality(events, { verifyHostExecution: () => true })
+  assert.equal(verified.evidence.checks.authoritativePassed, 1)
+  assert.equal(verified.evidence.checks.state, 'pass')
 })
 
 check('R6 三项指标都只被 claimed 覆盖（有真产物但均为模型自报）→ quality 至少 unknown，不刷绿', () => {

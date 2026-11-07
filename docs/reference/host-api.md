@@ -202,6 +202,7 @@
 - 已完成节点不重跑，它们的 summary / 产物路径作为上游上下文注入；
 - 新 run 从旧失败节点继续（续跑 run 走旧主循环，支持显式起点）；
 - 旧 run 保持终态、事件一条不改；
+- 0.11 起：restart 若在准入处被 429，响应带可重试的 `childRunId`，子 run 保持 pending 并记 `restart.startRejected`；同一旧 run 下一次 restart 会复用这个 child（不新建第二个），槽位释放后真正启动；
 - 新 run 的 `run.json.restart` 记录
   `{fromRunId, attempt, oldStatus, oldReason, startNodeId, skippedNodeIds, inheritedNodeIds, note?, at}`，
   `run/start.data.restart` 同步落日志（`attempt` = 第几次续跑）。

@@ -266,6 +266,21 @@ function nodeStatusShapeProblem(value) {
 /** 自审状态块里可能夹带的证据字段：只有状态块时也必须保留，不许静默丢掉。 */
 const SELF_CHECK_EVIDENCE_KEYS = ['artifacts', 'findings', 'acceptance', 'tests', 'checks']
 
+/**
+ * 状态块里是否同时带着**结论证据**。
+ *
+ * 真机事故（r-mw67vqpf-okns / n_dev）：主管把状态块与正式结论写进同一个对象
+ * （`{state:"done",progress:100,blockers:[],verdict:"pass",summary,…,"artifacts":[…]}`），
+ * 旧判定只看「有没有 state 键」就整块当状态块丢掉，节点被判 StructuredOutputError。
+ * 判据用「有没有结论证据字段」而不是「有没有 summary」：状态块本来就允许带 summary
+ * （进展摘要），但带 artifacts/findings/acceptance/tests/checks 说明它是结论。
+ * 只有状态、没有结论证据的块（含 C2 用例里那种 `verdict:pass` 的纯状态块）仍然不算结论。
+ */
+function carriesConclusionEvidence(value) {
+  if (!isPlainObject(value)) return false
+  return SELF_CHECK_EVIDENCE_KEYS.some(key => value[key] !== undefined && value[key] !== null)
+}
+
 /** 内存里的节点状态成员上限：与 runstore.normalizeNodeStatus 同口径，按数组尾部（最新）保留。 */
 const SELF_CHECK_MEMBERS_MAX = 20
 
@@ -1485,18 +1500,37 @@ export function parseAssistantStructured(raw, options = {}) {
     ? { attempt: opts.attempt, nonce: opts.nonce }
     : null
   const onReject = typeof opts.onReject === 'function' ? opts.onReject : null
+  // v0.9.5：只给「已经补要过一次结论」的收口路径用（见 `_collectTeamConclusion` 的调用点）。
+  // 默认 false，严格判定完全不变：状态块永远不是结论。
+  const allowMerged = opts.allowMergedConclusion === true
   let fallback = null
+  let merged = null
   for (const parsed of parsedJsonObjectsOf(raw)) {
-    const formal = (parsed.verdict === 'pass' || parsed.verdict === 'reject') && !isNodeSelfCheckBlock(parsed)
-    if (formal) {
+    const hasVerdict = parsed.verdict === 'pass' || parsed.verdict === 'reject'
+    const isStatusBlock = isNodeSelfCheckBlock(parsed)
+    if (hasVerdict && !isStatusBlock) {
+      // 纯正式结论：出现即返回（它优先于同一条回复里任何合并块）。
       if (expected && !attemptEnvelopeMatches(parsed, expected)) {
         if (onReject) onReject(parsed, parsed.attempt !== expected.attempt ? 'attempt-mismatch' : 'nonce-mismatch')
         continue
       }
       return parsed
     }
+    // 合并块（状态 + 结论同一个对象）：只有补要过结论、且是**完成态并带结论证据**时才认。
+    // 真机事故（r-mw67vqpf-okns / n_dev）：主管把状态字段写进了正式结论
+    // （`{state:"done",progress:100,verdict:"pass",…,"artifacts":[…]}`），严格判定把它整块
+    // 当状态块丢掉 → 补要结论后仍被判 StructuredOutputError，白跑一轮还重试一次。
+    if (allowMerged && hasVerdict && isStatusBlock && parsed.state === 'done'
+      && carriesConclusionEvidence(parsed)) {
+      if (expected && !attemptEnvelopeMatches(parsed, expected)) {
+        if (onReject) onReject(parsed, parsed.attempt !== expected.attempt ? 'attempt-mismatch' : 'nonce-mismatch')
+        continue
+      }
+      if (merged === null) merged = parsed
+      continue
+    }
     // 自审状态块不能当节点结论，也不能当 fallback。
-    if (isNodeSelfCheckBlock(parsed)) continue
+    if (isStatusBlock) continue
     // 非正式对象也要过凭证：旧 attempt 的迟到摘要不能被当成本轮输出。
     if (expected && !attemptEnvelopeMatches(parsed, expected)) {
       if (onReject) onReject(parsed, parsed.attempt !== expected.attempt ? 'attempt-mismatch' : 'nonce-mismatch')
@@ -1504,6 +1538,7 @@ export function parseAssistantStructured(raw, options = {}) {
     }
     if (fallback === null) fallback = parsed
   }
+  if (merged !== null) return merged
   return fallback
 }
 
@@ -2571,6 +2606,28 @@ class FlowEngine {
           })
           lastIsFormal = Boolean(lastParsed)
             && (lastParsed.verdict === 'pass' || lastParsed.verdict === 'reject')
+          // v0.9.5：补要结论后仍然解析不到时，再看一次「状态块 + 结论合并」的形状。
+          // 真机事故（r-mw67vqpf-okns / n_dev）：主管把 state/progress 写进了正式结论，
+          // 严格判定把它当状态块丢掉，节点被判 StructuredOutputError（还重试一次）。
+          // 只在**已经补要过一次**的这条路径上放宽，并且要求 state=done + 带结论证据，
+          // 正常回合（没有补要）的严格语义不变。
+          if (!lastIsFormal) {
+            const merged = parseAssistantStructured(raw, {
+              attempt,
+              nonce: envelope.nonce,
+              onReject: rejectEnvelope,
+              allowMergedConclusion: true,
+            })
+            if (merged && (merged.verdict === 'pass' || merged.verdict === 'reject')) {
+              this.log(
+                'warn',
+                `flow-studio: 节点「${node.id}」attempt ${attempt} 补要结论后拿到的是「状态块 + 结论」合并块，`
+                + '按结论收口（verdict=' + merged.verdict + '）',
+              )
+              lastParsed = merged
+              lastIsFormal = true
+            }
+          }
         }
       }
       let structured = lastIsFormal ? lastParsed : null

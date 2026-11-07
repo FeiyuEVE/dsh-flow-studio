@@ -826,6 +826,95 @@ try {
     A.match(summary.summary, /回执已收齐/)
   })
 
+  await check('团队节点收口：补要后交「状态块+结论」合并块 → 0.9.5 兜底按结论收口（不再白跑）', async () => {
+    const flow = flowOf('flow-team-merged', [
+      startNode(),
+      stage('n_tm', '团队', 300, {
+        mode: 'team',
+        team: [{ name: '成员甲', role: '写文件', task: '写 member-a.md' }],
+      }),
+      endNode(),
+    ], [
+      next('e1', 'n_start', 'n_tm'),
+      next('e2', 'n_tm', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-team-merged', 1)
+    const engineRef = { value: null }
+    const leadSessionId = nodeSessionId(run.id, 'n_tm', 1)
+    const logs = []
+    const ctx = {
+      on() { return () => {} },
+      get(name) {
+        if (name === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+        }
+        if (name !== 'agents') return undefined
+        return {
+          async create() {
+            return {
+              agent: {
+                session: { id: leadSessionId, header: {} },
+                followup(payload) {
+                  const text = payload.content.map(block => block.text || '').join('\n')
+                  const envelope = envelopeOf(payload)
+                  if (!envelope) return
+                  if (text.includes('引擎补充指令')) {
+                    // 真机事故形状：状态字段与结论写在**同一个对象**里（r-mw67vqpf-okns / n_dev）。
+                    engineRef.value.handleSessionEvent({ id: leadSessionId }, {
+                      type: 'assistant/message',
+                      data: {
+                        message: {
+                          role: 'assistant',
+                          content: [{
+                            type: 'text',
+                            text: fenced({
+                              attempt: envelope.attempt,
+                              nonce: envelope.nonce,
+                              ...passResult('n_tm').structured,
+                              state: 'done',
+                              progress: 100,
+                              blockers: [],
+                            }),
+                          }],
+                        },
+                      },
+                    })
+                    return
+                  }
+                  engineRef.value.handleSessionEvent({ id: leadSessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: '成员还在跑，先等回执。' }],
+                      },
+                    },
+                  })
+                },
+                async whenIdle() {},
+              },
+              async dispose() {},
+            }
+          },
+          get() { return null },
+        }
+      },
+    }
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, teamWaitMs: 0, log: (...args) => logs.push(args.join(' ')),
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+    const nodeEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_tm')
+    A.equal(nodeEnd.data.status, 'passed')
+    A.equal(events.filter(event => event.kind === 'node/end' && event.data.status === 'failed').length, 0)
+    A.ok(logs.some(line => /合并块/.test(line)), '命中兜底必须留一条可观测 warn')
+  })
+
   await check('预热轮可关：warmUpFirstTurn:false → 只有正式任务（1 条），且不再有预热文本', async () => {
     const flow = flowOf('flow-warmup-off', [startNode(), stage('n_only', '单节点', 300), endNode()], [
       next('e1', 'n_start', 'n_only'),
@@ -4063,6 +4152,52 @@ try {
     A.deepEqual(parseAssistantStructured(JSON.stringify(verdict)), verdict)
     // 状态块没有 state 时仍按旧行为退回（不是自审块，不改变既有语义）。
     A.deepEqual(parseAssistantStructured(fenced({ summary: '只有摘要' })), { summary: '只有摘要' })
+    // ④ 完成态状态块与结论写在**同一个对象**里（真机事故 r-mw67vqpf-okns / n_dev）：
+    //    严格判定仍然不认（状态块永远不是结论）；只有「补要结论后」的放宽路径认。
+    const merged = {
+      attempt: 4,
+      nonce: 'nonce-merged',
+      verdict: 'pass',
+      summary: '实现完成',
+      state: 'done',
+      progress: 100,
+      blockers: [],
+      artifacts: [{ name: 'a.md', content: 'x' }],
+    }
+    A.equal(parseAssistantStructured(fenced(merged), { attempt: 4, nonce: 'nonce-merged' }), null)
+    A.deepEqual(
+      parseAssistantStructured(fenced(merged), { attempt: 4, nonce: 'nonce-merged', allowMergedConclusion: true }),
+      merged,
+    )
+    // ⑤ 放宽也有限度：in-progress 夹 verdict、或完成态但没有结论证据，都不算。
+    const inProgress = {
+      attempt: 4, nonce: 'nonce-merged', verdict: 'pass', state: 'working', progress: 40,
+    }
+    A.equal(
+      parseAssistantStructured(fenced(inProgress), { attempt: 4, nonce: 'nonce-merged', allowMergedConclusion: true }),
+      null,
+    )
+    const noEvidence = {
+      attempt: 4, nonce: 'nonce-merged', verdict: 'pass', state: 'done', progress: 100, blockers: [],
+    }
+    A.equal(
+      parseAssistantStructured(fenced(noEvidence), { attempt: 4, nonce: 'nonce-merged', allowMergedConclusion: true }),
+      null,
+    )
+    // ⑥ 合并块里的凭证也要对；同一条回复里有纯结论时优先纯结论。
+    A.equal(
+      parseAssistantStructured(fenced({ ...merged, attempt: 3 }), {
+        attempt: 4, nonce: 'nonce-merged', allowMergedConclusion: true,
+      }),
+      null,
+    )
+    const pure = { attempt: 4, nonce: 'nonce-merged', verdict: 'reject', summary: '正式打回' }
+    A.deepEqual(
+      parseAssistantStructured(`${fenced(merged)}\n${fenced(pure)}`, {
+        attempt: 4, nonce: 'nonce-merged', allowMergedConclusion: true,
+      }),
+      pure,
+    )
   })
 
   await check('⑩ 自审采集只认状态报告：正常 verdict JSON 不会被记成一次状态上报', async () => {

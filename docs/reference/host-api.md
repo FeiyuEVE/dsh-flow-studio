@@ -139,6 +139,21 @@
 
 排障：引擎日志有「等成员收口 Nms」「本轮没有正式结论（团队节点），补发一次收口指令」。关闭等待（`FLOW_STUDIO_TEAM_WAIT_MS=0`）只会跳过第 1 步，补要结论照旧。
 
+### 补要之后的最后一道兜底：状态块 + 结论合并（v0.9.5）
+
+真机事故（run `r-mw67vqpf-okns` / 节点 `n_dev`）：主管补要结论后交的是**一个对象同时含状态与结论**
+（`{"state":"done","progress":100,"blockers":[],"verdict":"pass",...,"artifacts":[...]}`），
+而严格判定「有 `state` 键就是自审状态块」把整块丢掉 → 补要过一次仍然 `StructuredOutputError`，
+节点白跑一轮还重试一次。
+
+现在的规则（**只在补要结论之后**才生效，正常回合严格语义不变）：
+
+- 放宽只认**完成态 + 带结论证据**的合并块：`state === 'done'` 且至少带一个证据字段
+  （`artifacts` / `findings` / `acceptance` / `tests` / `checks`）；
+- `state !== 'done'`（如 `working`）的状态块里夹 `verdict` 仍然**不算**结论，避免「没干完先报 pass」；
+- 合并块里的 `attempt` / `nonce` 同样要匹配；同一条回复里若有**纯正式结论**，仍然优先纯结论；
+- 命中时引擎日志留一条 warn：`补要结论后拿到的是「状态块 + 结论」合并块，按结论收口`。
+
 ## 阶段节点的打回工具（`flow_node_reject`）
 
 阶段节点主管在自己的 attempt 进行中可以直接调用模型工具 `flow_node_reject`，

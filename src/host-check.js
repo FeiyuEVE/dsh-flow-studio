@@ -30,6 +30,7 @@
  *   reportSha256: string|null,        // 绑定下面这份**已脱敏**最终副本字节（F3）
  *   reportBytes: Buffer|null,         // 报告字节的**已脱敏独立副本**（可直接写进公开目录）
  *   reportByteLength: number,         // 最终副本字节数（脱敏后长度）
+ *   reportOpaque: boolean,            // true = 非 UTF-8/二进制报告：副本已按字节脱敏，但不可当文本解析
  *   killScope: 'group'|'process'|null, orphanWarning: string|null,
  *   startedAt: string, finishedAt: string, message: string|null,
  * }
@@ -107,34 +108,98 @@ function hostCheckInvalid(field, message) {
   return error
 }
 
-/** 与环境无关的保守脱敏：Bearer / sk- / key=value / ≥32 连续可疑串。 */
-function redactText(raw) {
-  let text = typeof raw === 'string' ? raw : String(raw ?? '')
-  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
-  text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
-  text = text.replace(
+/**
+ * 命令行里「带值」的敏感参数名（`--token <value>` / `--api-key=<value>` 等）。
+ *
+ * 参数名必须是**完整**的：名字后面只接受空白或 `=`，因此 `--token-file`、`--tokenize`、
+ * `--tokens` 不会被当成 `--token`，它们后面的普通文件名/参数也不会被吞掉。值只吃
+ * 一个 shell 词（引号内可含空格），后面的正常参数（URL、report.json 等）原样保留。
+ *
+ * 导出 pattern 字符串（而不是带 `g` 的 RegExp 实例）供同源规则复用：带 `g` 的对象
+ * 在 `test`/`exec` 之间共享 `lastIndex`，跨模块复用会埋并发/顺序 bug。
+ */
+export const SECRET_FLAG_PATTERN = `(^|[\\s"'\`;|&(=,\\[])(--?(?:token|password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|auth[_-]?token|secret[_-]?key|private[_-]?key|credentials?|authorization|cookie|session[_-]?key|ssh[_-]?key))(\\s*=\\s*|\\s+)(?:"([^"]*)"|'([^']*)'|([^\\s"'\`;|&)]+))`
+
+/** 本模块内部使用的敏感参数规则（`replace` 会重置 `lastIndex`，模块内单线程安全）。 */
+const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
+
+/**
+ * 高置信凭据规则（1–4）：Bearer / Basic / Token + sk- + 敏感命令行参数 + key:value。
+ *
+ * 这些规则都基于**明确的凭据形态**，不是长度启发式，因此可以安全地作用在不可判读的
+ * 二进制字节上（按 latin1 逐字节映射后只替换命中的 ASCII 段，其余字节不变）。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function redactHighConfidence(text) {
+  let out = text
+  // 1) Authorization 头里的认证方案 + 凭据（凭据两侧的引号必须成对，不能吞掉外层引号）
+  out = out.replace(
+    /\b(Bearer|Basic|Token)\s+(?:"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,})/gi,
+    '$1 [REDACTED]',
+  )
+  // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
+  out = out.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
+  // 3) 空格/等号分隔的命令行参数：--token <value> / --api-key=<value> / -H ... 等。
+  //    参数名后必须是空白或 =，所以 --token-file 不会被误判；值只吃一个 shell 词。
+  out = out.replace(SECRET_FLAG, (match, lead, flag, separator, doubleQuoted, singleQuoted) => {
+    if (doubleQuoted !== undefined) return `${lead}${flag}${separator}"[REDACTED]"`
+    if (singleQuoted !== undefined) return `${lead}${flag}${separator}'[REDACTED]'`
+    return `${lead}${flag}${separator}[REDACTED]`
+  })
+  // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
+  out = out.replace(
     /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
     (match, prefix, value) => {
-      if (/^Bearer$/i.test(String(value).replace(/["']/g, ''))) return match
+      if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
       return `${prefix}"[REDACTED]"`
     },
   )
-  text = text.replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
-  return text
+  return out
 }
 
-/** 应用调用方给的脱敏函数；函数自身抛错时退回内置实现（绝不让脱敏失败带崩执行）。 */
+/**
+ * 与环境无关的保守脱敏：高置信规则 + ≥32 连续可疑串。
+ *
+ * 与 engine 的 `redactArguments` 同源的文本规则，额外补齐「空格 / 引号」形态：
+ *   - `--token <value>`、`--api-key <value>`、`--token=<value>`（值可带引号）；
+ *   - `-H "Authorization: Bearer <value>"` / `Authorization: Basic <value>`。
+ *
+ * 只用于**可判读文本**（outputTail / 文本报告副本）。二进制报告只跑
+ * `redactHighConfidence`，不要用这里第 5 条的 ≥32 启发式——它在 PDF / 图片 /
+ * 长十六进制头这类不可判读字节上会大量假阳性，把「无凭据二进制逐字节不变」的前提
+ * 直接打破。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function redactSensitiveText(raw) {
+  const text = typeof raw === 'string' ? raw : String(raw ?? '')
+  // 5) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
+  return redactHighConfidence(text).replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
+}
+
+/**
+ * 应用脱敏函数（内置规则**总是**再跑一遍）。
+ *
+ * `redact` 由调用方（engine 传入 `redactArguments`）提供；它是同源规则的旧副本，
+ * 不认识 `--token <value>` 这类空格形态。这里在调用方规则之后**再叠加**内置规则，
+ * 保证即使调用方规则较旧，outputTail / 报告副本也不会漏掉空格形态凭据。
+ * 调用方函数自身抛错时只跳过它，内置规则照跑（绝不让脱敏失败带崩执行）。
+ */
 function applyRedact(text, redact) {
   if (typeof text !== 'string') return text
+  let out = text
   if (typeof redact === 'function') {
     try {
-      const out = redact(text)
-      return typeof out === 'string' ? out : String(out ?? '')
+      const value = redact(out)
+      out = typeof value === 'string' ? value : String(value ?? '')
     } catch {
-      return redactText(text)
+      out = text
     }
   }
-  return redactText(text)
+  return redactSensitiveText(out)
 }
 
 /** 按 UTF-8 字节安全截尾：不写出半个多字节字符。 */
@@ -156,30 +221,43 @@ function decodeOutputTail(buffer, redact) {
  * 0.11 · F3：公开报告副本的脱敏 + 最终副本 hash。
  *
  * 报告原文件不可信（可能带 `token=canary`），本函数只在内存里处理独立副本：
- *   1. 只有能无损 UTF-8 往返的报告才按文本脱敏；二进制/非法 UTF-8 原样保留，
- *      避免把非文本报告改坏（脱敏规则只针对文本凭据）；
+ *   1. 能无损 UTF-8 往返的报告按文本脱敏（全套规则，含 ≥32 启发式）；二进制 / 非法
+ *      UTF-8 报告**不原样复制**，而是把 buffer 按 latin1（1 字节 = 1 字符，完全可逆）
+ *      映射后**只跑高置信规则**（Bearer/Basic/Token、sk-、`--token <值>`、key:value），
+ *      把命中的凭据字节段替换成 `[REDACTED]`。**不跑** ≥32 启发式，也不用调用方的
+ *      文本 redact（engine 的旧副本同样含该启发式）——PDF / 图片 / 长十六进制头在
+ *      启发式下会大量假阳性，破坏「非命中字节逐字节保留」的证据前提。非命中的字节
+ *      逐字节保留，因此「不含凭据的二进制报告」仍是逐字节相同的证据（sha256 不变、
+ *      验证器照常通过）；公开副本同时以 `opaque:true` 标注「不可当文本解析」。
  *   2. 脱敏后的副本若与原文不同，**先**重新编码成最终副本，**再**对这份最终
  *      字节算 sha256 / 长度（顺序反了会得到源文件 hash，验证器会判不符）；
  *   3. 不写回原文件，保留调用方 cwd 里的原始报告。
  *
  * @param {Buffer|null} buffer 报告采集到的独立字节副本
  * @param {(text: string) => string} [redact]
- * @returns {{ buffer: Buffer|null, sha256: string|null, bytes: number }}
+ * @returns {{ buffer: Buffer|null, sha256: string|null, bytes: number, opaque: boolean }}
  */
 function redactReportCopy(buffer, redact) {
-  if (!Buffer.isBuffer(buffer)) return { buffer: null, sha256: null, bytes: 0 }
-  const finalize = (bytes) => ({
+  if (!Buffer.isBuffer(buffer)) return { buffer: null, sha256: null, bytes: 0, opaque: false }
+  const finalize = (bytes, opaque = false) => ({
     buffer: bytes,
     sha256: createHash('sha256').update(bytes).digest('hex'),
     bytes: bytes.length,
+    opaque,
   })
   if (buffer.length === 0) return finalize(buffer)
   const text = buffer.toString('utf8')
-  // 有损解码（二进制 / 非法 UTF-8）不做文本脱敏，否则会静默改坏报告字节。
-  if (!Buffer.from(text, 'utf8').equals(buffer)) return finalize(buffer)
-  const redacted = applyRedact(text, redact)
-  if (redacted === text) return finalize(buffer)
-  return finalize(Buffer.from(redacted, 'utf8'))
+  if (Buffer.from(text, 'utf8').equals(buffer)) {
+    const redacted = applyRedact(text, redact)
+    if (redacted === text) return finalize(buffer)
+    return finalize(Buffer.from(redacted, 'utf8'))
+  }
+  // 二进制 / 非法 UTF-8：latin1 1:1 映射保证除凭据段外的字节完全不变。
+  // 只用高置信规则：任何长度启发式都会在真实二进制上误伤非凭据字节。
+  const latin1 = buffer.toString('latin1')
+  const redacted = redactHighConfidence(latin1)
+  if (redacted === latin1) return finalize(buffer, true)
+  return finalize(Buffer.from(redacted, 'latin1'), true)
 }
 
 /** 单行消息的兜底长度，避免把整段 stderr / 异常栈塞进结果。 */
@@ -464,6 +542,7 @@ export async function runHostCheck(options = {}) {
     reportSha256: null,
     reportBytes: null,
     reportByteLength: 0,
+    reportOpaque: false,
     killScope: null,
     orphanWarning: null,
     startedAt,
@@ -785,6 +864,7 @@ export async function runHostCheck(options = {}) {
         reportSha256: publicReport.sha256,
         reportBytes: publicReport.buffer,
         reportByteLength: publicReport.bytes,
+        reportOpaque: publicReport.opaque,
       })
     }
 

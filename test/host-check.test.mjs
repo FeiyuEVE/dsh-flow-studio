@@ -20,7 +20,7 @@ import {
   CHECK_LIMITS, defaultFlow, normalizeFlow, normalizeNodeCheck, validateFlow, validateNodeCheck,
 } from '../src/model.js'
 import {
-  HOST_CHECK_REASON, buildHostCheckInvocation, runHostCheck,
+  HOST_CHECK_REASON, buildHostCheckInvocation, redactSensitiveText, runHostCheck,
 } from '../src/host-check.js'
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-host-check-'))
@@ -144,6 +144,124 @@ await check('F3 reportPath：公开报告副本先脱敏、再按最终副本算
   )
   // 副本语义：只脱敏内存副本，不写回调用方 cwd 的原始报告。
   assert.equal(readFileSync(join(dir, 'reports/secret.json'), 'utf8'), raw)
+})
+
+await check('F3 reportPath：正常 UTF-8 文本报告照旧脱敏，非凭据内容逐字保留', async () => {
+  const dir = freshCwd()
+  const raw = '{"ok":true,"note":"plain text","token":"canary-utf8-2a"}'
+  const result = await runHostCheck({
+    check: {
+      command: `mkdir -p reports && printf '%s' '${raw}' > reports/utf8.json`,
+      reportPath: 'reports/utf8.json',
+    },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes.toString('utf8')
+  assert.equal(copy.includes('canary-utf8-2a'), false, '文本报告里的凭据必须脱敏')
+  assert.equal(copy.includes('"ok":true'), true, '非凭据字段必须原样保留')
+  assert.equal(copy.includes('plain text'), true, '非凭据文本必须原样保留')
+  assert.equal(result.reportByteLength, Buffer.byteLength(copy))
+  assert.equal(result.reportSha256, createHash('sha256').update(copy).digest('hex'))
+  assert.equal(readFileSync(join(dir, 'reports/utf8.json'), 'utf8'), raw, '不写回源报告')
+})
+
+await check('F3 reportPath：二进制 / 非法 UTF-8 报告按字节脱敏，公开副本不含 canary', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-bin-9c1f'
+  mkdirSync(join(dir, 'reports'))
+  const head = Buffer.from([0xff, 0xfe, 0x00, 0x89])
+  const tail = Buffer.from([0x80, 0x81, 0x82])
+  const seed = Buffer.concat([
+    head,
+    Buffer.from(`\u0000prefix token=${canary} suffix\u0001`, 'utf8'),
+    tail,
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/probe.bin', reportPath: 'reports/probe.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  assert.ok(Buffer.isBuffer(result.reportBytes), '公开副本必须是独立 Buffer')
+  const copy = result.reportBytes
+  assert.equal(copy.includes(Buffer.from(canary)), false, '二进制公开副本不得包含原始凭据字节')
+  assert.equal(copy.includes(Buffer.from('[REDACTED]')), true, '命中的凭据字节段必须替换为 [REDACTED]')
+  assert.equal(result.reportOpaque, true, '二进制报告必须标注 opaque')
+  assert.equal(result.reportByteLength, copy.length, '长度必须对脱敏后的最终字节计算')
+  assert.equal(
+    result.reportSha256,
+    createHash('sha256').update(copy).digest('hex'),
+    'hash 必须绑定脱敏后的最终字节（顺序不能反）',
+  )
+  // 非凭据字节逐字节保留：只替换命中的凭据段，不整体重编码。
+  assert.deepEqual(Array.from(copy.subarray(0, head.length)), Array.from(head))
+  assert.deepEqual(Array.from(copy.subarray(copy.length - tail.length)), Array.from(tail))
+  assert.equal(readFileSync(join(dir, 'reports/probe.bin')).equals(seed), true, '不写回源报告')
+})
+
+await check('reportPath：不含凭据的二进制报告逐字节原样通过（不被脱敏判坏）', async () => {
+  const dir = freshCwd()
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.from([
+    0xff, 0xfe, 0x00, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0x81,
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/clean.bin', reportPath: 'reports/clean.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass', '不含凭据的二进制报告仍必须能作为证据通过验证')
+  assert.equal(result.reportBytes.equals(seed), true, '非凭据二进制必须逐字节原样保留')
+  assert.equal(result.reportByteLength, seed.length)
+  assert.equal(result.reportSha256, createHash('sha256').update(seed).digest('hex'))
+})
+
+await check('reportPath：二进制里的 ≥32 ASCII 串（非凭据）不被启发式误伤', async () => {
+  const dir = freshCwd()
+  mkdirSync(join(dir, 'reports'))
+  // 64 个十六进制字符：文本路径的「≥32 连续可疑串」启发式会命中，二进制路径必须放过。
+  const hex = 'abcdef0123456789'.repeat(4)
+  const seed = Buffer.concat([
+    Buffer.from([0xff, 0xfe, 0x00, 0x89]),
+    Buffer.from(`header ${hex} tail`, 'utf8'),
+    Buffer.from([0x80, 0x81]),
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/hex.bin', reportPath: 'reports/hex.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  assert.equal(
+    result.reportBytes.equals(seed),
+    true,
+    '二进制路径不得用 ≥32 启发式改写非凭据字节（否则 sha256 与逐字节证据都会被破坏）',
+  )
+  assert.equal(result.reportByteLength, seed.length)
+  assert.equal(result.reportSha256, createHash('sha256').update(seed).digest('hex'))
+})
+
+await check('F3 reportPath：二进制里的空格形态凭据也按字节脱敏', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-bin-space-6d2e'
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from(`\u0000curl --token ${canary} --api-key ${canary}-key --verbose http://127.0.0.1/x\u0001`, 'utf8'),
+    Buffer.from([0x80, 0x81]),
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/space.bin', reportPath: 'reports/space.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes
+  assert.equal(copy.includes(Buffer.from(canary)), false, '二进制副本不得含空格形态凭据')
+  assert.equal(copy.includes(Buffer.from(`${canary}-key`)), false)
+  assert.equal(copy.includes(Buffer.from('--verbose')), true, '后面的正常参数（--verbose）不能被吞掉')
+  assert.equal(copy.includes(Buffer.from('http://127.0.0.1/x')), true, '后面的 URL 不能被吞掉')
 })
 
 await check('reportPath：执行前已存在且未更新 → fail / HOST_CHECK_REPORT_STALE', async () => {
@@ -310,6 +428,56 @@ await check('输出含 canary token → outputTail 脱敏且不含原值', async
     assert.equal(result.outputTail.includes(secret), false, `outputTail 泄漏了凭据：${secret}`)
   }
   assert.ok(Buffer.byteLength(result.outputTail, 'utf8') <= 16 * 1024, 'outputTail 必须 ≤16KiB')
+})
+
+await check('输出含 --token <value> 空格形态 → outputTail 也必须脱敏', async () => {
+  const canary = 'canary-space-4b7d'
+  const line = `curl --token ${canary} --api-key ${canary}-key -H "Authorization: Bearer ${canary}-bearer" http://127.0.0.1/report.json`
+  const result = await runHostCheck({
+    check: { command: `printf '%s\\n' '${line}'` },
+    cwd: freshCwd(),
+  })
+  assert.equal(result.state, 'pass')
+  for (const secret of [canary, `${canary}-key`, `${canary}-bearer`]) {
+    assert.equal(result.outputTail.includes(secret), false, `outputTail 泄漏了空格/引号形态凭据：${secret}`)
+  }
+  assert.match(result.outputTail, /--token \[REDACTED\]/, '--token 的值必须替换')
+  assert.match(result.outputTail, /--api-key \[REDACTED\]/, '--api-key 的值必须替换')
+  assert.match(result.outputTail, /Bearer \[REDACTED\]/, 'Authorization Bearer 必须替换')
+  assert.equal(
+    result.outputTail.includes('http://127.0.0.1/report.json'),
+    true,
+    '后面的正常 URL / 文件名不能被吞掉',
+  )
+})
+
+await check('脱敏规则反例：--token-file / --tokenize / 裸 --token 不吞后续正常文件名', () => {
+  // 命中：等号与空格两种形态
+  const equals = redactSensitiveText('--token=canary-a')
+  assert.equal(equals.includes('canary-a'), false, '--token=<value> 必须脱敏')
+  assert.match(equals, /--token=.*\[REDACTED\]/)
+  assert.equal(redactSensitiveText('--token canary-b'), '--token [REDACTED]')
+  assert.equal(redactSensitiveText('--api-key canary-c'), '--api-key [REDACTED]')
+  assert.equal(
+    redactSensitiveText('-H "Authorization: Bearer canary-d"'),
+    '-H "Authorization: Bearer [REDACTED]"',
+  )
+  // 反例：--token 只是更长参数名的前缀 / 没有值 → 一律不动，后面的文件名保留
+  for (const text of [
+    'cat --token-file reports/unit.json',
+    'npm run --tokenize reports/unit.json',
+    'grep --tokens reports/unit.json',
+    'printf --token',
+  ]) {
+    assert.equal(redactSensitiveText(text), text, `不应改动：${text}`)
+  }
+  // 只吃一个值：后面的 URL / 文件名原样保留
+  assert.equal(
+    redactSensitiveText('curl --token canary-e http://127.0.0.1/report.json'),
+    'curl --token [REDACTED] http://127.0.0.1/report.json',
+  )
+  // 引号值（含空格）整体替换，引号保留
+  assert.equal(redactSensitiveText('--password "two words" tail'), '--password "[REDACTED]" tail')
 })
 
 await check('真实 spawn 失败（PATH 不可解析 sh）→ fail / HOST_CHECK_SPAWN', async () => {

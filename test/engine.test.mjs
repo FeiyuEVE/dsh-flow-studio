@@ -5967,7 +5967,60 @@ try {
       const finalSha = createHash('sha256').update(Buffer.from(reportText, 'utf8')).digest('hex')
       A.equal(record.reportSha256, finalSha, 'reportSha256 必须绑定脱敏后的最终副本')
       A.equal(record.reportBytes, Buffer.byteLength(reportText))
+      A.equal(record.reportOpaque, false, '可解析的文本报告必须 reportOpaque=false')
       A.equal(readFileSync(join(workspace, 'report.json'), 'utf8'), rawReport, '不写回源报告')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
+  })
+
+  await check('F3（0.11 N3）：二进制报告副本按字节脱敏且记录 reportOpaque=true，源文件不被写回', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const canary = 'canary-bin-9f21'
+      const workspace = join(home, 'ws-hostcheck-bincopy')
+      mkdirSync(workspace, { recursive: true })
+      // 非 UTF-8 报告：0xFF 0xFE 开头 + 一条 key:value 形态凭据。printf 解释 \377 等转义。
+      const command = `printf '\\377\\376token=${canary}\\000tail' > report.json`
+      const flow = flowOf('flow-hostcheck-bincopy', [
+        startNode(),
+        stage('n_hc_bin', '实现', 300, { check: { command, expectExitCode: 0, reportPath: 'report.json' } }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_hc_bin'),
+        next('e2', 'n_hc_bin', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-hostcheck-bincopy', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const events = await eventsOf(run.id)
+      const hostWrites = events.filter(event => event.kind === 'artifact/write'
+        && event.extra && event.extra.producer === 'host')
+      const reportWrite = hostWrites.find(event => /-report\./.test(event.data.path))
+      const recordWrite = hostWrites.find(event => /host-check-hc-[0-9a-f]+\.json$/.test(event.data.path)
+        && !/-report\./.test(event.data.path))
+      A.ok(Boolean(reportWrite), '必须落盘报告副本')
+      A.ok(Boolean(recordWrite), '必须落盘执行记录')
+
+      // 公开副本按字节读：源报告是非 UTF-8，用 latin1 回读才能逐字节判断。
+      const copyBytes = readFileSync(join(runsRoot, run.id, reportWrite.data.path))
+      A.equal(copyBytes.includes(Buffer.from(canary, 'utf8')), false, '二进制公开副本不得含原始凭据字节')
+      A.ok(copyBytes.includes(Buffer.from('[REDACTED]', 'utf8')), '二进制公开副本必须保留 [REDACTED] 标记')
+      A.equal(copyBytes[0], 0xFF, '非凭据字节必须逐字节保留（首字节）')
+      A.equal(copyBytes[1], 0xFE, '非凭据字节必须逐字节保留（次字节）')
+
+      const record = JSON.parse(readFileSync(join(runsRoot, run.id, recordWrite.data.path), 'utf8'))
+      A.equal(record.reportOpaque, true, '二进制报告必须 reportOpaque=true')
+      A.equal(record.reportSha256, createHash('sha256').update(copyBytes).digest('hex'),
+        'reportSha256 必须绑定按字节脱敏后的最终副本')
+      A.equal(record.reportBytes, copyBytes.length)
+      // 源报告保留原样（不写回），canary 仍在私有目录里，这是设计允许的。
+      A.ok(readFileSync(join(workspace, 'report.json')).includes(Buffer.from(canary, 'utf8')),
+        '不写回源报告：源文件应仍含原始内容')
     } finally {
       delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }

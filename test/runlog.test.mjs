@@ -158,6 +158,35 @@ check('agent/message 文本脱敏：Bearer / sk- / password / api_key 的值不�
   assert.ok(event.data.text.includes('[REDACTED]'))
 })
 
+check('engine.redactArguments 与宿主检查摘要：空格/引号分隔的凭据也不落原文（0.11 N3 接线）', () => {
+  // 旧实现只认 `key:value|key=value`，`--token <值>` 这种空格形态会原样进 commandSummary。
+  const flagSecrets = [
+    'curl --token canary-space-9f http://127.0.0.1/report.json',
+    'cli --api-key=canary-eq-77 --verbose',
+    'curl -H "Authorization: Bearer canary-header-3" http://x',
+    "run --password 'canary two words'",
+  ]
+  for (const raw of flagSecrets) {
+    const redacted = engineModule.redactArguments(raw)
+    for (const canary of ['canary-space-9f', 'canary-eq-77', 'canary-header-3', 'canary two words']) {
+      assert.equal(redacted.includes(canary), false, `脱敏后不得含 ${canary}：${redacted}`)
+    }
+    assert.ok(redacted.includes('[REDACTED]'), `必须保留 [REDACTED] 标记：${redacted}`)
+    // 非凭据部分必须原样保留，不能因为脱敏把命令改得不可读。
+    assert.ok(redacted.includes('--token') || redacted.includes('--api-key')
+      || redacted.includes('Authorization:') || redacted.includes('--password'), `参数名必须保留：${redacted}`)
+  }
+  // 参数名必须完整：`--token-file` 后面的正常文件名不能被吞掉。
+  const notSecret = 'cat --token-file reports/unit.json'
+  assert.equal(engineModule.redactArguments(notSecret), notSecret, '--token-file 不得被当成 --token')
+  // summarizeHostCheckCommand 走同一条规则，并且仍然按 200 字符截断。
+  const summary = engineModule.summarizeHostCheckCommand('run --token canary-sum-1 --out report.json')
+  assert.equal(summary.includes('canary-sum-1'), false, `commandSummary 不得含原始 token：${summary}`)
+  assert.ok(summary.length <= 203, `摘要仍需有界：${summary.length}`)
+  // 截断口径：用不含可疑串的长命令，验证仍按 200 截断（`x` 连写会先被 ≥32 规则替换）。
+  assert.equal(engineModule.summarizeHostCheckCommand('run --check '.repeat(50)).length, 200, '超长命令截断到 200')
+})
+
 check('合法 node/start 归一化：补齐 memberId=null、ts 转 UTC', () => {
   const event = ok(base())
   assert.equal(event.v, 1)

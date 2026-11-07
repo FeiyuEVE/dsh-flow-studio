@@ -1,10 +1,13 @@
 /**
  * 外部进程输出的共享有界保留与脱敏原语（0.11 R3 / S2）。
  *
- * 这个模块只做三件事，且刻意保持零业务依赖（只 import `node:buffer`）：
- *   1. `redactText`：与 `engine.redactArguments` 同源的四条凭据脱敏规则（逐字复制，
- *      见下方注释）。放在这里是为了让 executor / host-check 等 Host 侧模块共享同一套
- *      规则，而不反向 import engine（engine 依赖 fs / runlog，浏览器侧也会间接加载）。
+ * 这个模块只做三件事，且刻意保持零业务依赖（除 `node:buffer` 外，仅共享
+ * `host-check.js` 导出的**纯字符串** `SECRET_FLAG_PATTERN`，不引入该模块的任何
+ * 执行路径 —— 它导出的是模式常量，不是函数或单例）：
+ *   1. `redactText`：与 `host-check.redactSensitiveText` 同源的凭据脱敏规则，但第 4 条
+ *      （≥32 超长串）保留了下方注释里说明的两处精化。放在这里是为了让 executor 等
+ *      Host 侧模块共享同一套规则，而不反向 import engine（engine 依赖 fs / runlog，
+ *      浏览器侧也会间接加载）。
  *   2. `redactDeep`：对事件对象 / 数组 / 字符串做递归脱敏；键数、深度、循环引用都有界，
  *      保证 onEvent、结果、错误消息里不会出现未脱敏的字符串。
  *   3. `createBoundedOutput`：按 **原始 UTF-8 字节**（decode 之前）累计收到多少字节，
@@ -25,6 +28,11 @@
  */
 
 import { Buffer } from 'node:buffer'
+
+// 0.11 N3 接线：敏感标志位（`--token <值>` 这类空格/引号分隔形态）的**模式字符串**
+// 只在 host-check.js 维护一份，这里复用而不是再抄一遍。导入的是常量字符串，不会把
+// host-check 的执行路径（spawn / fs）带进本模块的调用链。
+import { SECRET_FLAG_PATTERN } from './host-check.js'
 
 /** 默认输出字节上限：8 MiB（stdout + stderr 原始输入字节）。 */
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024
@@ -81,13 +89,24 @@ function positiveIntOr(value, fallback) {
  * @param {unknown} raw
  * @returns {string}
  */
+/** 敏感标志位规则实例（`replace` 会重置 `lastIndex`，模块内串行调用安全）。 */
+const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
+
 export function redactText(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '')
   // 1) Authorization: Bearer <token>
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
-  // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
+  // 2) 敏感标志位：`--token <值>` / `--api-key=<值>` 等空格或等号分隔形态
+  //    （N3 接线）。参数名必须完整（名字后只接受空白或 `=`），所以 `--token-file` /
+  //    `--tokenize` 的后续正常文件名不会被吞；值只吃一个 shell 词，引号内可含空格。
+  text = text.replace(SECRET_FLAG, (match, lead, flag, separator, doubleQuoted, singleQuoted) => {
+    if (doubleQuoted !== undefined) return `${lead}${flag}${separator}"[REDACTED]"`
+    if (singleQuoted !== undefined) return `${lead}${flag}${separator}'[REDACTED]'`
+    return `${lead}${flag}${separator}[REDACTED]`
+  })
+  // 3) sk- 开头的 API key（保留前缀给排查看，值抹掉）
   text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
-  // 3) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
+  // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
   text = text.replace(
     /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
     (match, prefix, value) => {
@@ -95,8 +114,8 @@ export function redactText(raw) {
       return `${prefix}"[REDACTED]"`
     },
   )
-  // 4) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
-  //    与 engine 的兼容差异：
+  // 5) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
+  //    与 host-check.redactSensitiveText 的兼容差异：
   //      a. 必须至少跨两类字符才判敏感（见上方说明）；
   //      b. 路径形态（含 `/`，且每段都是 `[A-Za-z0-9._~-]+`）放行——custom executor
   //         的答案里经常出现 `/repo/.tmp/…/pwned`、`src/client/very-long-file-name.ts`
@@ -116,7 +135,7 @@ export function redactText(raw) {
 }
 
 /**
- * 判断规则 4 的候选串是否是路径（而非凭据）。
+ * 判断规则 5 的候选串是否是路径（而非凭据）。
  *
  * 只看形态：至少一个 `/`，每段非空且只含 `A-Za-z0-9._~-`（绝对路径的首段为空，
  * 跳过）。URL 的 `//` 会产生空段，因此不会被误判成路径；JWT / 哈希通常不含 `/`。

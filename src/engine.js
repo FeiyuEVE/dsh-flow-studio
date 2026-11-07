@@ -40,7 +40,7 @@ import { createWorktree, decideWorktree, resolveWorkspace, workspaceIdFor } from
 // 07 §6（R6）：外部 executor（codex / custom）的运行与事件归一化。
 import { normalizeExecutor, runExternalExecutor, toStrictOutputSchema } from './executor.js'
 // 0.11 · R5：宿主独立检查执行器（保存的 check 命令 + 报告采集）。
-import { runHostCheck } from './host-check.js'
+import { redactSensitiveText, runHostCheck } from './host-check.js'
 // 07 §11（R8）：节点自审回报解析。用命名空间导入而不是命名导入——v0.8 的
 // `parseNodeStatus` 与引擎改动并行落地，命名导入在对方尚未写完时会让本模块
 // 直接 import 失败；拿不到时下面按「没有自审回报」处理，引擎行为与 v0.7 一致。
@@ -419,24 +419,19 @@ export function redactArguments(raw) {
   return redactArgumentsText(text)
 }
 
-/** `redactArguments` 的实现体（拆出来便于宿主检查摘要复用，导出 API 不变）。 */
+/**
+ * `redactArguments` 的实现体（拆出来便于宿主检查摘要复用，导出 API 不变）。
+ *
+ * 0.11 接线：规则不再在本模块维护第四份副本，直接委托 `host-check.redactSensitiveText`
+ * —— 它比这份旧实现多认「空格 / 引号分隔」的凭据形态（`--token <值>`、
+ * `-H "Authorization: Bearer <值>"`、`Basic` / `Token` 方案），正是复核 N3 指出的
+ * `commandSummary` 泄漏面。engine → host-check 的依赖本来就存在（`runHostCheck`）。
+ *
+ * `process-output.redactText` 仍保留自己的第 4 条精化规则（放行长路径），只与该模块
+ * 共享「敏感标志位」这一条模式常量，见那边的注释。
+ */
 function redactArgumentsText(value) {
-  let text = value
-  // 1) Authorization: Bearer <token>
-  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
-  // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
-  text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
-  // 3) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
-  text = text.replace(
-    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
-    (match, prefix, tokenValue) => {
-      if (/^Bearer$/i.test(String(tokenValue).replace(/["']/g, ''))) return match
-      return `${prefix}"[REDACTED]"`
-    },
-  )
-  // 4) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
-  text = text.replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
-  return text
+  return redactSensitiveText(value)
 }
 
 /**
@@ -6705,6 +6700,8 @@ class FlowEngine {
         reportPath: null,
         reportSha256: null,
         reportBytes: null,
+        // 0.11 N3：没有报告副本时一律不是 opaque（字段保持稳定形状）。
+        reportOpaque: false,
         killScope: null,
         orphanWarning: null,
         startedAt: isoOf(this.now()),
@@ -6736,6 +6733,8 @@ class FlowEngine {
       reportPath: verification.reportPath,
       reportSha256: verification.reportSha256,
       reportBytes: verification.reportByteLength,
+      // 0.11 N3：非 UTF-8/二进制报告的公开副本是按字节高置信脱敏的，不能当文本解析。
+      reportOpaque: verification.reportOpaque === true,
       state,
       reasonCode: verification.reasonCode,
       killScope: verification.killScope,
@@ -6816,6 +6815,7 @@ class FlowEngine {
           registryPath,
           reportPath: verification.reportPath,
           reportSha256: verification.reportSha256,
+          reportOpaque: verification.reportOpaque === true,
           killScope: verification.killScope,
           truncated: verification.truncated,
         },

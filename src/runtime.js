@@ -655,6 +655,8 @@ export function nodeSelfCheckPrompt(entry = {}) {
  */
 export function createRuntime(options = {}) {
   const runs = new Map()
+  /** 0.10 审查 F11：同一旧 run 的 restart 正在处理时不允许并发出第二个续跑 run。 */
+  const restarting = new Set()
   const sessionIndex = new Map()
   const startedBy = new Map()
   /** G7-b：dispose 之后恢复扫描不再往调度器里登记新闹钟。 */
@@ -1295,11 +1297,41 @@ export function createRuntime(options = {}) {
    */
   async function restart(oldRunId, restartOptions = {}) {
     if (!checkRunId(oldRunId)) throw new EngineError(400, 'runId 不合法')
+    // 0.10 审查 F11：并发 restart 会各自复制同一批 sessions.json，产生两个续跑 run
+    // 同时 resume 同一会话。这里做进程内互斥 + 持久化子 run 检查（跨请求/跨进程第二道）。
+    if (restarting.has(oldRunId)) {
+      throw new EngineError(400, `run 正在重启中（${oldRunId}），请等上一次 restart 返回后再试`)
+    }
+    restarting.add(oldRunId)
+    try {
+      return await restartOnce(oldRunId, restartOptions)
+    } finally {
+      restarting.delete(oldRunId)
+    }
+  }
+
+  /** restart 的实际实现（互斥壳见上）。 */
+  async function restartOnce(oldRunId, restartOptions = {}) {
     if (runs.has(oldRunId)) {
       throw new EngineError(400, `run 还在运行中（${oldRunId}），不能重启：先等它收尾或 stop 再续跑`)
     }
     const oldMeta = await readRunMeta(runsRoot, oldRunId)
     if (!oldMeta) throw new EngineError(404, `run 不存在（${oldRunId}）`)
+    // 持久化互斥：已经有一个续跑自该 run 的子 run 时，再重启会重复复制会话。
+    // 让用户继续/停止那个子 run（续跑失败就重启子 run），而不是并排两个。
+    try {
+      const listed = await listRuns(runsRoot, { limit: 100 })
+      for (const item of listed.runs || []) {
+        if (!item || item.id === oldRunId) continue
+        const meta = await readRunMeta(runsRoot, item.id)
+        if (meta && meta.restart && meta.restart.fromRunId === oldRunId) {
+          throw new EngineError(400, `该 run 已经有续跑 run（${item.id}）；请继续或停止它，不要重复重启`)
+        }
+      }
+    } catch (error) {
+      if (error instanceof EngineError) throw error
+      // 列表读失败不阻塞 restart（互斥仍由进程内 Set 保护）。
+    }
     if (!RESTARTABLE_STATUSES.has(oldMeta.status)) {
       if (oldMeta.status === 'pending' || oldMeta.status === 'running') {
         throw new EngineError(400, `run 还没结束（当前 ${oldMeta.status}），不能重启：先等它收尾或 stop 再续跑`)

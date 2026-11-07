@@ -76,6 +76,29 @@ export const MACHINE_EVENT_KINDS = Object.freeze([
   'machine/transition',
 ])
 
+/**
+ * 0.10 §2.2 扩展白名单：节点会话「可用工具」快照（`node/tools`，R6）。
+ *
+ * 与 `INBOX_EVENT_KINDS` / `NODE_STATUS_EVENT_KINDS` / `MACHINE_EVENT_KINDS` 同理单独列出，
+ * **不进** 05 §2 冻结的 17 种 `EVENT_KINDS`（既有单测按长度 17 断言）；校验器接受的是
+ * 所有扩展白名单的并集。`data` 契约见 `validateData` 的 `case 'node/tools'`：
+ * `tools`（字符串数组，去重、排序、≤64 项、每项 1–64 字符、只允许 `[A-Za-z0-9._:-]`）、
+ * `toolsSource ∈ {session, unavailable}`、`count === tools.length`、`truncated` 可选布尔。
+ * 这条事件回答「这个会话的注册表里有哪些工具」，**不是**「上一轮实际被准入的工具」。
+ */
+export const NODE_TOOLS_EVENT_KINDS = Object.freeze([
+  'node/tools',
+])
+
+/** `node/tools.data.tools` 的条数上限。 */
+export const NODE_TOOLS_MAX = 64
+
+/** `node/tools.data.tools` 单个工具名的字符数上限。 */
+export const NODE_TOOL_NAME_MAX = 64
+
+/** `node/tools.data.tools` 单个工具名的字符集（宽松到能装下 `flow_node_reject`）。 */
+export const NODE_TOOL_NAME_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/
+
 /** 单条事件序列化后的上限（字节，不含行尾换行）。 */
 export const MAX_EVENT_BYTES = 8 * 1024
 
@@ -98,6 +121,7 @@ export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 
 
 const KIND_SET = new Set([
   ...EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS, ...MACHINE_EVENT_KINDS,
+  ...NODE_TOOLS_EVENT_KINDS,
 ])
 
 /**
@@ -139,6 +163,8 @@ const NODE_STATUS_MAX_MEMBERS = 20
 const NODE_STATUS_MAX_BLOCKERS = 20
 const NODE_STATUS_MAX_SUMMARY = 2000
 const NODE_STATUS_MAX_TEXT = 200
+/** 0.10 §2.2：node/tools 的 toolsSource 白名单。 */
+const NODE_TOOLS_SOURCE = new Set(['session', 'unavailable'])
 /** §8.2：agent/message.data.text 的上限（字符，按 Unicode 码点）。 */
 export const AGENT_MESSAGE_MAX_CHARS = 2000
 /** §8.3：每个节点保留的最近 agent/message 条数 / 全局总量上限。 */
@@ -771,6 +797,36 @@ function validateData(kind, data) {
       if (bad) return bad
       // 未知 data 键按 validateData 顶部 `out = { ...data }` 的既有口径保留（前向兼容，
       // 单条 8KB 上限兜住体积）；message/in、message/out 的严格白名单是例外，不照抄。
+      break
+    }
+    case 'node/tools': {
+      // 0.10 §2.2（R6）：节点会话的可用工具快照。契约是「引擎采集端已经去重 + 排序」，
+      // 但校验器仍按硬判据整条拒绝坏输入（重复 / 超量 / 非法字符），不做静默清洗。
+      const tools = data.tools
+      if (!Array.isArray(tools)) return err('tools', '必须是字符串数组')
+      if (tools.length > NODE_TOOLS_MAX) return err('tools', `最多 ${NODE_TOOLS_MAX} 项`)
+      const seen = new Set()
+      for (const item of tools) {
+        if (typeof item !== 'string' || item.trim() === '') {
+          return err('tools', '每一项都必须是非空字符串')
+        }
+        if (item.length > NODE_TOOL_NAME_MAX) return err('tools', `单项不超过 ${NODE_TOOL_NAME_MAX} 字符`)
+        if (!NODE_TOOL_NAME_PATTERN.test(item)) {
+          return err('tools', '工具名只允许 [A-Za-z0-9._:-]')
+        }
+        if (seen.has(item)) return err('tools', `不允许重复的工具名：${item}`)
+        seen.add(item)
+      }
+      out.tools = [...tools]
+      let bad = putEnum('toolsSource', NODE_TOOLS_SOURCE)
+      if (bad) return bad
+      bad = putInt('count', { min: 0 })
+      if (bad) return bad
+      if (out.count !== tools.length) {
+        return err('count', `必须等于 tools.length（${tools.length}）`)
+      }
+      bad = putBool('truncated', { required: false })
+      if (bad) return bad
       break
     }
     default:
@@ -2362,6 +2418,11 @@ function eventDigest(event) {
       return `status=${data.status} · ${data.durationMs}ms`
     case 'machine/transition':
       return machineTransitionSummary(data)
+    case 'node/tools':
+      // 0.10 §2.2（R6）：事件表里至少让人看出「这个会话的注册表里有几个工具」。
+      return `可用工具 ${data.count} 个`
+        + (data.toolsSource === 'unavailable' ? ' · 宿主未提供工具枚举' : '')
+        + (data.truncated ? ' · 已截断' : '')
     case 'member/start':
       return `${data.name || ''}${data.role ? `（${data.role}）` : ''}`
     case 'member/end':

@@ -63,9 +63,11 @@ running，而是**新建一个续跑 run**：
 节点会话走 `agents.create()` 时，引擎**永远显式**传成对的
 `agentOptions = {provider, model}` 与 `meta.agentPreset`：
 
-- 模型路由：节点显式 provider / model 优先，缺的一项由宿主 `agentDefaultModel`
-  补齐；两边都拿不到 → 开跑前 503（文案说明「宿主未提供 agentDefaultModel，
-  且节点未配置 provider/model」），不会创建注定首轮失败的会话；
+- 模型路由：**同一来源必须成对**。节点显式 provider + model 整对优先；节点只配一半
+  → 开跑前 503（`MODEL_ROUTE_CONFLICT` / `MODEL_ROUTE_UNAVAILABLE`），**不再**用宿主
+  `agentDefaultModel` 补缺的一项。节点完全没配才回退：`sessions.json` 记录的会话对
+  （resume）> 宿主默认整对；宿主只回一半 → `MODEL_ROUTE_PARTIAL_HOST`。
+  规则与错误码见 [方案 §4.1](../plan/0.10-方案.md)；
 - preset：节点 `agentPreset` > 本次 start 覆盖 > 引擎配置 > 流程级默认 >
   **`standard`** 兜底。0.2.2 宿主对没有 preset 的程序化会话给的是几乎没有工具的
   裸组合，所以这里不能留空；

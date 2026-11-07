@@ -1843,6 +1843,43 @@ await check('G7 light=1 不读事件文件：run.jsonl 不可读时仍 200，完
   assert.equal(missing.status, 404)
 })
 
+console.log('G7 · GET /runs/<id> 详情字段（sessions / agentPreset / restart）与 light 字段集')
+
+await check('详情带 sessions / agentPreset / restart；light=1 明确不含这三个字段', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 2 })
+  const oldRun = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 2 })
+  await runstore.writeRunMeta(runsRoot, run.id, {
+    sessions: { n_a: 's-1', n_b: 's-2' },
+    agentPreset: { value: 'standard', source: 'default' },
+    restart: {
+      fromRunId: oldRun.id,
+      attempt: 1,
+      startNodeId: 'n_b',
+      skippedNodeIds: ['n_a'],
+      inheritedNodeIds: ['n_a', 'n_b'],
+    },
+  })
+
+  // 客户端详情（非 light）必须原样透传 run.json 的白名单字段。
+  const detail = await call(route, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.equal(detail.status, 200, JSON.stringify(detail.json))
+  assert.deepEqual(detail.json.run.sessions, { n_a: 's-1', n_b: 's-2' })
+  assert.deepEqual(detail.json.run.agentPreset, { value: 'standard', source: 'default' })
+  assert.equal(detail.json.run.restart.fromRunId, oldRun.id)
+  assert.equal(detail.json.run.restart.startNodeId, 'n_b')
+  assert.deepEqual(detail.json.run.restart.skippedNodeIds, ['n_a'])
+  assert.deepEqual(detail.json.run.restart.inheritedNodeIds, ['n_a', 'n_b'])
+
+  // light=1 是固定字段集：不返回 sessions / agentPreset / restart（客户端走非 light 取详情）。
+  const light = await call(route, 'GET', `/api/flow-studio/runs/${run.id}?light=1`)
+  assert.equal(light.status, 200)
+  for (const field of ['sessions', 'agentPreset', 'restart']) {
+    assert.equal(Object.hasOwn(light.json.run, field), false, `light 不得返回 ${field}`)
+  }
+  assert.equal(light.json.run.nodeTotal, 2, 'light 仍返回固定字段集里的计数')
+})
+
 console.log('E3-b · 外部 events 通道只收观测类事件')
 
 await check('E3-b POST /runs/<id>/events 拒绝全部生命周期 kind（400，且 run 状态/事件数不变）', async () => {

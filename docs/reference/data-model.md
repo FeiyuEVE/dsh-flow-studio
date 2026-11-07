@@ -80,7 +80,7 @@ $DSH_HOME/flow-studio/runs/
   <runId>/
     run.jsonl                      # run 级事件：开始 / 结束 / 状态变更（append-only）
     run.json                       # run 元数据（可变，原子写；跨进程 meta.lock）
-    sessions.json                  # nodeId → sessionId（一个节点一个会话）
+    sessions.json                  # nodeId → { sessionId, createdAt, lastUsedAt, agentOptions? }（一个节点一个会话）
     messages.jsonl                 # 流程收件箱（append + 分页）
     lock.json                      # 单写者租约（O_EXCL 创建）
     meta.lock                      # run.json 写的跨进程锁

@@ -53,7 +53,7 @@ const {
   interactionState, isEdgeActive, lodText, nodeAriaLabel, snapToGridEnabled, stateShape, wheelPanDelta,
 } = await import('../src/client/canvas.js')
 const { SNAP_GRID, lodOf, rejectPathRects, snapPosition } = await import('../src/client/geometry.js')
-const { Inspector } = await import('../src/client/inspector.js')
+const { Inspector, nextActiveSkill } = await import('../src/client/inspector.js')
 const { PreviewDialog, IssuesDialog } = await import('../src/client/dialogs.js')
 const { FlowList, isGroupOpen, nextGroupToggles } = await import('../src/client/flowlist.js')
 const {
@@ -65,11 +65,11 @@ const { FlowStudioPage, runControlState } = await import('../src/client/page.js'
 const {
   RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, conflictTarget, createSaveQueue,
   deleteFlowRequest, firstErrorTarget, emptyGraphBlockReason, flowSavePayload, mergeSavedFlow,
-  progressOf, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
+  progressOf, restartRunSequence, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
   saveStateAfterSuccess, startFailurePlan,
 } = await import('../src/client/page.js')
 const {
-  EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
+  DRAWER_OPEN_HEIGHT, EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
   LOG_ASSUMED_CONTAINER_HEIGHT, LOG_DEFAULT_HEIGHT, LOG_HEIGHT_STORAGE_KEY, LOG_KEEP_CANVAS,
   LOG_MIN_HEIGHT, WATCH_EVENT_KINDS, acceptanceOf, backoffDelay, clampLogHeight, conclusionOf,
   deriveNodeStates, drawerActionFor, eventCountText, eventKey, eventSummary, eventWindowNote,
@@ -86,6 +86,7 @@ const {
   readEventsPath, readRunPath, requestFailureText, runActionFailureText,
 } = await import('../src/client/api.js')
 const { CSS } = await import('../src/client/styles.js')
+const { createPlugin } = await import('../src/client/plugin.js')
 
 const flow = model.defaultFlow()
 flow.id = 'flow-test'
@@ -129,6 +130,53 @@ check('键盘连线待定：候选列出「到 <节点名>」并高亮当前目�
   assert.ok(html.includes('Tab 切换 · Enter 确认 · Esc 取消'), '缺少键盘操作提示')
 })
 
+// ── 0.10 R2：节点卡三键 aria / END 两键 / overflow / 76×28 几何 ──────────────
+check('0.10 R2 三键 aria-label 数量（7/8/8，END 只有两键）与 CSS 不再裁剪工具条', () => {
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: null,
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  const count = pattern => (html.match(pattern) || []).length
+  assert.equal(count(/aria-label="新增下游节点"/g), 7, '8 个节点里 END 之外应有 7 个「新增下游节点」')
+  assert.equal(count(/aria-label="删除节点"/g), 8, '每个节点都有「删除节点」')
+  assert.equal(count(/aria-label="打开检查器"/g), 8, '每个节点都有「打开检查器」')
+  assert.equal(count(/class="fs-node-tools"/g), 8, '每个节点各一条工具条')
+  const endAt = html.indexOf('data-node-id="n_end"')
+  assert.ok(endAt > 0, '找不到结束节点')
+  const endBlock = html.slice(endAt, endAt + 4000)
+  assert.equal((endBlock.match(/class="fs-node-tool /g) || []).length, 2, 'END 节点只能有两个工具按钮')
+  assert.ok(endBlock.includes('aria-label="删除节点"'))
+  assert.ok(endBlock.includes('aria-label="打开检查器"'))
+  assert.ok(!endBlock.includes('aria-label="新增下游节点"'), 'END 节点不能新增下游')
+
+  // .fs-node 不再 overflow:hidden；工具条 / 按钮尺寸原样（76×28 几何）。
+  const nodeAt = CSS.indexOf('.fs-node{')
+  const nodeBlock = CSS.slice(nodeAt, CSS.indexOf('}', nodeAt) + 1)
+  assert.ok(nodeBlock.length > 0, '找不到 .fs-node 样式块')
+  assert.ok(!nodeBlock.includes('overflow:hidden'), '.fs-node 不能再用 overflow:hidden 裁掉三键')
+  assert.ok(nodeBlock.includes('overflow:visible'), '.fs-node 应为 overflow:visible')
+  const toolsAt = CSS.indexOf('.fs-node-tools{')
+  const toolsBlock = CSS.slice(toolsAt, CSS.indexOf('}', toolsAt) + 1)
+  assert.ok(/gap:2px/.test(toolsBlock), '.fs-node-tools gap 应为 2px')
+  assert.ok(/padding:2px/.test(toolsBlock), '.fs-node-tools padding 应为 2px')
+  assert.ok(/border:1px/.test(toolsBlock), '.fs-node-tools border 应为 1px')
+  const toolAt = CSS.indexOf('.fs-node-tool{')
+  const toolBlock = CSS.slice(toolAt, CSS.indexOf('}', toolAt) + 1)
+  assert.ok(/width:22px;height:22px/.test(toolBlock), '.fs-node-tool 应为 22×22 热区')
+  // 外框 76×28 = 3×22 + 2×2(gap) + 2×2(padding) + 2×1(border)；22×3 + 2×2 + 2×1 = 28。
+  assert.equal(3 * 22 + 2 * 2 + 2 * 2 + 2 * 1, 76)
+  assert.equal(22 + 2 * 2 + 2 * 1, 28)
+  // far 档仍隐藏三键（既有语义，不改）。
+  assert.ok(CSS.includes('[data-lod="far"] .fs-node-tools{display:none}'), 'far 档仍应隐藏工具条')
+  // :focus-within 与 focus-visible ring 保留（overflow:visible 后不再被裁）。
+  assert.ok(CSS.includes('.fs-node:focus-within .fs-node-tools'), '缺少 focus-within 浮出规则')
+  assert.ok(CSS.includes('.fs-node-tool:focus-visible'), '缺少工具按钮 focus ring')
+})
+
 check('打回线超过 6 条：画 +N 汇总角标并提示已并入最外航道', () => {
   const crowded = model.defaultFlow()
   crowded.id = 'flow-crowded'
@@ -166,6 +214,8 @@ check('检查器（节点）渲染出执行方式与 skills 选择器', () => {
     flow,
     selection: { kind: 'node', id: 'n_req' },
     skills: [{ name: 'java-service', description: 'Java 服务开发规范', whenToUse: '' }],
+    // 0.10 R7：收起态不再常驻渲染选项；本用例通过显式展开入口验证列表能渲染。
+    initialSkillsOpen: true,
     onPatchNode() {},
     onPatchEdge() {},
     onDeleteNode() {},
@@ -178,6 +228,7 @@ check('检查器（节点）渲染出执行方式与 skills 选择器', () => {
   assert.ok(html.includes('单个 agent'))
   assert.ok(html.includes('主管 + 子 agent'))
   assert.ok(html.includes('java-service'), '技能列表没渲染出来')
+  assert.ok(html.includes('role="listbox"'), '展开态应有 listbox')
   assert.ok(html.includes('资深需求分析师'), '角色内容没回填')
   assert.ok(html.includes('连接到…'), '单指针连线入口没渲染')
   assert.ok(html.includes('到 方案设计'), '连线目标没有可读名字')
@@ -220,6 +271,108 @@ check('没有选中时检查器给出操作提示', () => {
     onRemoveMember() {},
   }))
   assert.ok(html.includes('双击空白处新增节点'))
+})
+
+// ── 0.10 R7：skills 内联 combobox（结构设计 §3.2 / S4）──────────────────────
+check('0.10 R7 skills combobox：收起态只渲染触发按钮；展开态有 listbox/option 与完整 aria', () => {
+  const skills = [
+    { name: 'java-service', description: 'Java 服务开发规范', whenToUse: '' },
+    { name: 'ts-style', description: 'TypeScript 规范', whenToUse: '' },
+  ]
+  const props = {
+    flow,
+    selection: { kind: 'node', id: 'n_req' },
+    skills,
+    onPatchNode() {},
+    onPatchEdge() {},
+    onDeleteNode() {},
+    onDeleteEdge() {},
+    onAddMember() {},
+    onPatchMember() {},
+    onRemoveMember() {},
+  }
+  // 收起态：只渲染触发按钮，不渲染 listbox / option（选项不在 DOM 里）。
+  const collapsed = render(React.createElement(Inspector, props))
+  assert.ok(collapsed.includes('未选择'), '收起态触发按钮应显示「未选择」')
+  assert.ok(!collapsed.includes('role="listbox"'), '收起态不能渲染 listbox')
+  assert.ok(!collapsed.includes('role="option"'), '收起态不能渲染 option')
+  assert.ok(!collapsed.includes('java-service'), '收起态不能常驻渲染选项')
+  assert.ok(/aria-haspopup="listbox"/.test(collapsed), '触发按钮缺 aria-haspopup')
+  assert.ok(/aria-expanded="false"/.test(collapsed), '收起态 aria-expanded 应为 false')
+  assert.ok(/aria-controls="fs-skills-list"/.test(collapsed), '触发按钮缺 aria-controls')
+
+  // 展开态（测试入口只认 Inspector.initialSkillsOpen）。
+  const expanded = render(React.createElement(Inspector, { ...props, initialSkillsOpen: true }))
+  assert.ok(expanded.includes('role="listbox"'), '展开态缺少 listbox')
+  assert.ok(expanded.includes('role="option"'), '展开态缺少 option')
+  assert.ok(expanded.includes('aria-selected="false"'), '未选项 aria-selected 应为 false')
+  assert.ok(/aria-expanded="true"/.test(expanded), '展开态 aria-expanded 应为 true')
+  assert.ok(expanded.includes('class="fs-skills-search"'), '缺少搜索框')
+  assert.ok(expanded.includes('role="combobox"'), '搜索框缺 combobox 角色')
+  assert.ok(expanded.includes('aria-autocomplete="list"'), '搜索框缺 aria-autocomplete')
+  assert.ok(expanded.includes('id="fs-skills-list"'), 'listbox 缺稳定 id')
+  assert.ok(expanded.includes('java-service'), '展开态应渲染选项')
+  assert.equal((expanded.match(/role="option"/g) || []).length, 2, '两个 skill 应渲染两个 option')
+  // 触发按钮不能也叫 combobox（会变成两个 combobox）。
+  const triggerAt = expanded.indexOf('fs-skills-trigger')
+  assert.ok(triggerAt > 0)
+  assert.ok(!/class="fs-skills-trigger"[^>]*role="combobox"/.test(expanded), '触发按钮不能带 combobox 角色')
+})
+
+check('0.10 R1 审查 F7：检查器有 provider 输入，且只填一半时给成对提示', () => {
+  const flowWithModelOnly = {
+    ...flow,
+    nodes: flow.nodes.map(node => node.id === 'n_req'
+      ? { ...node, model: 'gpt-5', extras: { ...(node.extras || {}), provider: '' } }
+      : node),
+  }
+  const html = render(React.createElement(Inspector, {
+    flow: flowWithModelOnly,
+    selection: { kind: 'node', id: 'n_req' },
+    skills: [],
+    initialSkillsOpen: false,
+  }))
+  assert.ok(html.includes('aria-label="provider（与 model 成对）"'), '缺少 provider 输入（只填 model 会 503）')
+  assert.ok(html.includes('provider 与 model 当前只填了一个'), '只填一半时必须给可见提示')
+})
+
+check('0.10 R7 skills 上限：达到 12 时未选项 aria-disabled 且提示「最多 12 个」，chips 外层保留', () => {
+  const names = Array.from({ length: 13 }, (_, index) => 'skill-' + (index + 1))
+  const selectedNames = names.slice(0, 12)
+  const limitFlow = {
+    ...flow,
+    nodes: flow.nodes.map(node => (node.id === 'n_req' ? { ...node, skills: selectedNames } : node)),
+  }
+  const html = render(React.createElement(Inspector, {
+    flow: limitFlow,
+    selection: { kind: 'node', id: 'n_req' },
+    skills: names.map(name => ({ name, description: '', whenToUse: '' })),
+    initialSkillsOpen: true,
+    onPatchNode() {},
+    onPatchEdge() {},
+    onDeleteNode() {},
+    onDeleteEdge() {},
+    onAddMember() {},
+    onPatchMember() {},
+    onRemoveMember() {},
+  }))
+  assert.ok(html.includes('已选 12 / 12'), '触发按钮应显示「已选 12 / 12」')
+  assert.ok(html.includes('aria-disabled="true"'), '达到上限时未选项应 aria-disabled')
+  assert.ok(html.includes('最多 12 个'), '达到上限时应提示「最多 12 个」')
+  assert.ok(html.includes('aria-selected="true"'), '已选项 aria-selected 应为 true')
+  // chips 外层（结构设计 :304-315）不动：已选 skill 仍由外层 chips 渲染。
+  assert.ok(html.includes('class="fs-chips"'), 'chips 外层不能丢')
+  assert.ok((html.match(/class="fs-chip"/g) || []).length === 12, 'chips 应保留 12 个已选项')
+  // 新类名都在样式里，且不产生裸 hex。
+  for (const selector of [
+    '.fs-skills-combo', '.fs-skills-trigger', '.fs-skills-panel', '.fs-skills-search',
+    '.fs-skills-option', '.fs-skills-option.on', '.fs-skills-empty', '.fs-skills-limit',
+  ]) {
+    assert.ok(CSS.includes(selector), 'styles.js 缺少 ' + selector)
+  }
+  const comboAt = CSS.indexOf('.fs-skills-combo')
+  const comboBlock = CSS.slice(comboAt, comboAt + 2500)
+  assert.ok(!/#[0-9a-f]{3,8}/i.test(comboBlock), 'skills 新样式不能出现裸 hex')
 })
 
 check('流转预览列出阶段与打回', () => {
@@ -2102,6 +2255,80 @@ await checkAsync('G5-d：左栏与抽屉共用一份 runs 数据源，只发一�
   }
 })
 
+// ── 0.10 R8：保存 → 重启的顺序（flush 失败 → restart 0 次）────────────────────
+await checkAsync('0.10 R8 restartRunSequence：先 flush 后 POST；flush 有 warning 时 restart 0 次', async () => {
+  const order = []
+  const ok = await restartRunSequence({
+    run: { id: 'run-failed', status: 'failed', flowId: 'flow-test' },
+    flushBeforeRestart: async () => {
+      order.push('flush')
+      return ''
+    },
+    restartRun: async id => {
+      order.push('restart:' + id)
+      return { ok: true, run: { id: 'run-new', status: 'running' }, restart: { fromRunId: id } }
+    },
+  })
+  assert.equal(ok.ok, true, 'flush 成功后应返回 ok')
+  assert.deepEqual(order, ['flush', 'restart:run-failed'], '顺序必须是 flush → restart')
+  assert.equal(ok.run.id, 'run-new', '应返回 Host 的新 run')
+  assert.equal(ok.restart.fromRunId, 'run-failed')
+
+  let restartCalls = 0
+  const blocked = await restartRunSequence({
+    run: { id: 'run-failed', status: 'failed', flowId: 'flow-test' },
+    flushBeforeRestart: async () => '「流程」的改动没能保存，已存本地草稿',
+    restartRun: async () => {
+      restartCalls += 1
+      return { ok: true, run: { id: 'run-new' } }
+    },
+  })
+  assert.equal(blocked.ok, false, '保存失败必须中止重启')
+  assert.equal(restartCalls, 0, '保存失败时 restart 必须 0 次')
+  assert.match(blocked.warning, /改动没能保存/, '必须把 flush 的 warning 原样带回')
+  assert.match(blocked.error, /改动没能保存/, '抽屉显示的错误文案也要带上原因')
+
+  // flush 抛错同样视为中止（不能继续 POST）。
+  let throwCalls = 0
+  const thrown = await restartRunSequence({
+    run: { id: 'run-failed' },
+    flushBeforeRestart: async () => { throw new Error('保存接口 500') },
+    restartRun: async () => { throwCalls += 1 },
+  })
+  assert.equal(thrown.ok, false)
+  assert.equal(throwCalls, 0, 'flush 抛错时也不能发 restart')
+  assert.match(thrown.error, /保存接口 500/)
+
+  // POST 失败：折叠成 {ok:false,error}，不自动重试。
+  let postCalls = 0
+  const failed = await restartRunSequence({
+    run: { id: 'run-failed' },
+    flushBeforeRestart: async () => '',
+    restartRun: async () => {
+      postCalls += 1
+      throw new Error('重启失败：run 或流程已不存在，刷新后重试')
+    },
+  })
+  assert.equal(failed.ok, false)
+  assert.equal(postCalls, 1, '非幂等接口只发一次，不自动重试')
+  assert.match(failed.error, /run 或流程已不存在/)
+})
+
+check('0.10 R7 审查 F4：过滤后 active 指向隐藏项时，键盘不切换隐藏项', () => {
+  const visible = [{ name: 'java-service' }, { name: 'python' }]
+  // ↑↓：active 不在可见列表 → 落到首/尾，不是停在隐藏项。
+  assert.equal(nextActiveSkill(visible, 'hidden-skill', 'ArrowDown'), 'java-service')
+  assert.equal(nextActiveSkill(visible, 'hidden-skill', 'ArrowUp'), 'python')
+  // Enter / Space：隐藏项返回 null（不切换），不允许“看不见却被选中”。
+  assert.equal(nextActiveSkill(visible, 'hidden-skill', 'Enter'), null)
+  assert.equal(nextActiveSkill(visible, 'hidden-skill', ' '), null)
+  // 可见项：正常前后移动 / 切换。
+  assert.equal(nextActiveSkill(visible, 'java-service', 'ArrowDown'), 'python')
+  assert.equal(nextActiveSkill(visible, 'python', 'ArrowUp'), 'java-service')
+  assert.equal(nextActiveSkill(visible, 'python', 'Enter'), 'python')
+  assert.equal(nextActiveSkill([], 'x', 'ArrowDown'), null)
+})
+
 // ── B. 构建产物 ────────────────────────────────────────────────────────────
 console.log('lib/client.js')
 
@@ -2164,6 +2391,57 @@ check('打包产物在假浏览器环境里能加载并注册成对的两个 slo
 
   const iconHtml = render(React.createElement(icon.component, { size: 18, active: true }))
   assert.ok(iconHtml.includes('<svg'), '侧栏图标不是 SVG')
+})
+
+// ── 0.10 R4：plugin 源码级 —— main slot inject 返回懒取的 openSession ────────
+check('0.10 R4 plugin：apply 内定义 openSession（懒取 uiWorkspace / 返回 boolean / 不 await）', () => {
+  const plugin = createPlugin(() => React)
+  assert.deepEqual(plugin.inject, ['slots'], 'inject 数组仍应只有 slots')
+  let getCalls = 0
+  const registrations = []
+  const slots = {
+    register(options, component) {
+      return { ...options, component }
+    },
+    inject(ownerKey, callback) {
+      registrations.push({ ownerKey, ...callback() })
+      return () => {}
+    },
+  }
+  const ctx = {
+    slots,
+    // apply() 期间读 ctx.get 会直接失败：证明只在调用时懒取。
+    get() {
+      getCalls += 1
+      throw new Error('apply 期间不应读取 ctx.get')
+    },
+  }
+  plugin.apply(ctx)
+  assert.equal(getCalls, 0, 'apply() 期间不能调用 ctx.get')
+  const main = registrations.find(item => item.name === 'main')
+  assert.ok(main, '没有注册 main 槽')
+  assert.equal(typeof main.inject, 'function', 'main slot 缺少 inject')
+  const injected = main.inject()
+  assert.equal(typeof injected.openSession, 'function', 'inject 应返回 openSession')
+  assert.equal(injected.openSession('sess-1'), false, '服务缺失时 openSession 应返回 false')
+
+  // 宿主提供 uiWorkspace：同步调用一次、参数原样、返回 true。
+  const calls = []
+  const workspace = { openSession(target) { calls.push(target) } }
+  const ctx2 = { slots, get: name => (name === 'uiWorkspace' ? workspace : undefined) }
+  plugin.apply(ctx2)
+  const main2 = registrations.filter(item => item.name === 'main').pop()
+  const openSession = main2.inject().openSession
+  assert.equal(openSession('sess-9'), true)
+  assert.deepEqual(calls, ['sess-9'], 'openSession 必须原样转交节点会话 id')
+  // 宿主 openSession 抛错：吞掉并返回 false（跳转失败不拖垮面板）。
+  const ctx3 = {
+    slots,
+    get: () => ({ openSession() { throw new Error('navigation failed') } }),
+  }
+  plugin.apply(ctx3)
+  const main3 = registrations.filter(item => item.name === 'main').pop()
+  assert.equal(main3.inject().openSession('sess-x'), false)
 })
 
 // ── v0.7：外部执行器 / 工作区分组 / supervision 只读展示 ──────────────────
@@ -2471,34 +2749,79 @@ check('v0.8 §11.4：节点多于 6 个时区块内部滚动，整块只读不�
 // ── 0.9.1：抽屉上边缘可拖动拉伸 ───────────────────────────────────────────
 console.log('抽屉高度（可拖拽 / 键盘 / 持久化）')
 
-check('抽屉高度 clamp：正常值原样 / 低于 120 / 超过容器−180 / NaN·null·负数 / 容器过矮', () => {
-  assert.equal(LOG_MIN_HEIGHT, 120)
+// ── 0.10 R3：默认 340 / 指标条 min-height:58（测试阶段量测后修正）────────────
+check('0.10 R3 抽屉默认 340、指标条 min-height:58 且内容盒 ≥48、事件区高度预算 ≥80', () => {
+  assert.equal(DRAWER_OPEN_HEIGHT, 340, 'DRAWER_OPEN_HEIGHT 应为 340')
+  assert.equal(LOG_DEFAULT_HEIGHT, 340, 'LOG_DEFAULT_HEIGHT 应为 340')
+  assert.ok(CSS.includes('.fs-log.open{height:340px}'), '.fs-log.open 应为 340px')
+  assert.ok(!CSS.includes('.fs-log.open{height:200px}'), '.fs-log.open 不能还是 200px')
+  const statsAt = CSS.indexOf('.fs-log-stats{')
+  const statsBlock = CSS.slice(statsAt, CSS.indexOf('}', statsAt) + 1)
+  assert.ok(statsBlock.includes('min-height:58px'), '指标条应为 min-height:58px（不是死高）')
+  assert.ok(statsBlock.includes('height:auto'), '指标条高度必须 auto，横向滚动条出现时能长高')
+  assert.ok(!/(^|;|\{)height:46px/.test(statsBlock), '指标条不能回到 46px 死高')
+  assert.ok(/padding:4px 10px/.test(statsBlock), '指标条内边距应保持 4px 10px')
+  assert.ok(statsBlock.includes('border-top:1px'), '指标条上边框应保持 1px')
+  // 内容盒 = 58 − 上下 padding 8 − border-top 1 = 49 ≥ 48。
+  assert.ok(58 - 8 - 1 >= 48, '58px 内容盒必须 ≥ 48')
+  assert.match(CSS, /\.fs-log\.zoom-full \.fs-log-stats\{min-height:58px\}/, '全屏档指标条也应为 min-height:58px')
+
+  // 事件区高度预算（测试阶段真实浏览器量测的固定开销，见 docs/plan/0.10-开发记录.md §R3）：
+  // 以 Chromium 实测 341 高抽屉、事件列表 97 为基准，固定开销 = 341 − 97 = 244
+  //（根 border 1 + grip 6 + bar 40 + body border 1 + 指标区 head 24 + 指标条 67 含横滚条
+  // + 列头 28 + 筛选 28 + 分页 27 = 222，另有 22px 来自各段间 padding / 折叠区）。
+  // 事件列表 = 默认高度 − 244，必须 ≥ 80。
+  const EVENT_LIST_FIXED = 244
+  assert.ok(LOG_DEFAULT_HEIGHT - EVENT_LIST_FIXED >= 80,
+    '默认档事件列表必须 ≥80px（实际 ' + (LOG_DEFAULT_HEIGHT - EVENT_LIST_FIXED) + '）')
+  // 120px 档指标 hint 曾被裁：最小值必须让指标区（head 24 + 指标条 67）完整可见。
+  assert.equal(LOG_MIN_HEIGHT, 200, '下拉最小高度应为 200')
+  assert.ok(LOG_MIN_HEIGHT - 48 >= 24 + 67, '最小高度也必须完整容纳指标区（三行 hint 不被裁）')
+
+  // SSR：展开态 7 个 stat 都在（三行不靠把内容裁掉）。
+  const html = render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: logSummary,
+  }))
+  assert.equal((html.match(/class="fs-stat fs-stat-/g) || []).length, 7, '展开态应有 7 个 stat')
+  for (const needle of ['验收通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次']) {
+    assert.ok(html.includes(needle), '缺少指标「' + needle + '」')
+  }
+  // 收起态仍是 40px 条（R3 只改展开档）。
+  assert.ok(CSS.includes('.fs-log{') && /\.fs-log\{[^}]*height:40px/.test(CSS), '收起条仍应是 40px')
+})
+
+check('抽屉高度 clamp：正常值原样 / 低于 200 / 超过容器−180 / NaN·null·负数 / 容器过矮', () => {
+  assert.equal(LOG_MIN_HEIGHT, 200)
   assert.equal(LOG_KEEP_CANVAS, 180)
-  assert.equal(LOG_DEFAULT_HEIGHT, 200)
+  assert.equal(LOG_DEFAULT_HEIGHT, 340)
   // 正常值原样（整数 px）。
-  assert.equal(clampLogHeight(320, 900), 320)
+  assert.equal(clampLogHeight(340, 900), 340)
   assert.equal(clampLogHeight(420, 900), 420)
-  // 低于下限 → 120。
-  assert.equal(clampLogHeight(100, 900), 120)
-  assert.equal(clampLogHeight(0, 900), 120)
+  // 低于下限 → 200。
+  assert.equal(clampLogHeight(100, 900), 200)
+  assert.equal(clampLogHeight(0, 900), 200)
   // 超过「容器 − 180」→ 收敛到上限（900 − 180 = 720）。
   assert.equal(clampLogHeight(5000, 900), 720)
   assert.equal(clampLogHeight(720, 900), 720)
   assert.equal(logHeightMax(900), 720)
-  // 非数 / 空 / 负数 → 120，不是 NaN。
+  // 非数 / 空 / 负数 → 200，不是 NaN。
   for (const bad of [NaN, Infinity, -Infinity, null, undefined, -30, '-30', 'abc']) {
     const value = clampLogHeight(bad, 900)
-    assert.equal(value, 120, '坏期望值 ' + String(bad) + ' 应退回 120')
+    assert.equal(value, 200, '坏期望值 ' + String(bad) + ' 应退回 200')
     assert.equal(Number.isInteger(value), true)
   }
-  // 容器过矮（250 < 120 + 180）→ 120，不允许出现负数。
-  assert.equal(clampLogHeight(200, 250), 120)
-  assert.equal(clampLogHeight(999, 250), 120)
-  assert.equal(logHeightMax(250), 120)
-  assert.equal(clampLogHeight(500, 290), 120)
-  // 300 − 180 = 120 正好是下限；380 − 180 = 200 正好是默认值。
-  assert.equal(clampLogHeight(200, 300), 120)
+  // 容器过矮（250 < 200 + 180）→ 200，不允许出现负数。
+  assert.equal(clampLogHeight(200, 250), 200)
+  assert.equal(clampLogHeight(999, 250), 200)
+  assert.equal(logHeightMax(250), 200)
+  assert.equal(clampLogHeight(500, 290), 200)
+  // 380 − 180 = 200 正好是下限；520 − 180 = 340 > 默认值。
   assert.equal(clampLogHeight(200, 380), 200)
+  assert.equal(clampLogHeight(340, 520), 340)
   // 小数收敛成整数 px。
   assert.equal(clampLogHeight(420.6, 900), 421)
   assert.equal(Number.isInteger(clampLogHeight(300, 481.7)), true)
@@ -2512,10 +2835,10 @@ check('抽屉高度 clamp：正常值原样 / 低于 120 / 超过容器−180 / 
 check('拖拽条键盘位：↑↓ 24 / PgUp PgDn 96 / Home 最小 / End 最大 / Esc 默认 / 未知键 null', () => {
   const container = 900
   assert.equal(logHeightFromKey('ArrowUp', 200, container), 224)
-  assert.equal(logHeightFromKey('ArrowDown', 200, container), 176)
+  assert.equal(logHeightFromKey('ArrowDown', 400, container), 376)
   assert.equal(logHeightFromKey('PageUp', 200, container), 296)
   assert.equal(logHeightFromKey('PageDown', 400, container), 304)
-  assert.equal(logHeightFromKey('Home', 400, container), 120)
+  assert.equal(logHeightFromKey('Home', 400, container), 200)
   assert.equal(logHeightFromKey('End', 200, container), 720)
   assert.equal(logHeightFromKey('Escape', 500, container), LOG_DEFAULT_HEIGHT)
   // 不认识的键必须返回 null（调用方据此决定不 preventDefault）。
@@ -2525,14 +2848,14 @@ check('拖拽条键盘位：↑↓ 24 / PgUp PgDn 96 / Home 最小 / End 最大 
   // 步进结果也 clamp：顶到 / 底到边界就不再动。
   assert.equal(logHeightFromKey('ArrowUp', 720, container), 720)
   assert.equal(logHeightFromKey('PageUp', 700, container), 720)
-  assert.equal(logHeightFromKey('ArrowDown', 120, container), 120)
-  assert.equal(logHeightFromKey('PageDown', 130, container), 120)
-  // 当前值为 null（没设置过）时从默认 200 起算。
-  assert.equal(logHeightFromKey('ArrowUp', null, container), 224)
-  // 容器过矮：End / Esc / ↑ 都收敛到 120，不会给出负数。
-  assert.equal(logHeightFromKey('End', 200, 250), 120)
-  assert.equal(logHeightFromKey('Escape', 500, 250), 120)
-  assert.equal(logHeightFromKey('ArrowUp', 200, 300), 120)
+  assert.equal(logHeightFromKey('ArrowDown', 200, container), 200)
+  assert.equal(logHeightFromKey('PageDown', 130, container), 200)
+  // 当前值为 null（没设置过）时从默认 340 起算。
+  assert.equal(logHeightFromKey('ArrowUp', null, container), 364)
+  // 容器过矮：End / Esc / ↑ 都收敛到 200，不会给出负数。
+  assert.equal(logHeightFromKey('End', 200, 250), 200)
+  assert.equal(logHeightFromKey('Escape', 500, 250), 200)
+  assert.equal(logHeightFromKey('ArrowUp', 200, 300), 200)
 })
 
 check('抽屉高度持久化：合法值读回、坏值退回 null、写默认值删键', () => {
@@ -2545,7 +2868,7 @@ check('抽屉高度持久化：合法值读回、坏值退回 null、写默认�
     }
   }
   const storage = makeStorage()
-  // 没设置过 → null（调用方按默认 200 渲染），不是 0 / NaN。
+  // 没设置过 → null（调用方按默认 340 渲染），不是 0 / NaN。
   assert.equal(readStoredLogHeight(storage), null)
   writeStoredLogHeight(storage, 420)
   assert.equal(storage.getItem(LOG_HEIGHT_STORAGE_KEY), '420')
@@ -2592,7 +2915,7 @@ check('抽屉高度 SSR：initialLogHeight 落到内联 height；拖拽条带完
   assert.ok(separator.includes('aria-label="调整执行记录高度"'), '拖拽条缺 aria-label')
   assert.ok(separator.includes('tabindex="0"'), '拖拽条必须可 Tab 聚焦')
   assert.ok(separator.includes('title="拖动调整执行记录高度，双击恢复默认"'), '拖拽条缺 title')
-  assert.ok(separator.includes('aria-valuemin="120"'), 'aria-valuemin 应为 120')
+  assert.ok(separator.includes('aria-valuemin="200"'), 'aria-valuemin 应为 200')
   assert.ok(separator.includes('aria-valuemax="720"'), 'aria-valuemax 应为容器口径上限（SSR 假设 900 → 720）')
   assert.ok(separator.includes('aria-valuenow="420"'), 'aria-valuenow 应为当前高度 420')
   // 收起态：40px 折叠条，不出现拖拽条（也就没有 separator）。

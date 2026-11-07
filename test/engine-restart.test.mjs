@@ -161,6 +161,7 @@ function envelopeOf(payload) {
 function fakeHost(engineRef, behaviorOf) {
   const created = []
   const resumed = []
+  const resumeOptions = []
   const live = new Map()
   const sessions = new Set()
   const calls = []
@@ -205,6 +206,28 @@ function fakeHost(engineRef, behaviorOf) {
         calls.push(call)
         const behavior = behaviorOf(nodeId, call) || { kind: 'pass' }
         if (behavior.kind === 'fail') return
+        if (behavior.kind === 'reject') {
+          // 0.10 R9：模型直接给结构化 verdict=reject（不经过打回工具）。
+          const structured = {
+            attempt: envelope.attempt,
+            nonce: envelope.nonce,
+            verdict: 'reject',
+            summary: `${nodeId} 判定打回`,
+            rejectReason: behavior.reason || '验收不通过，打回返工',
+            ...(behavior.rejectTarget === undefined ? {} : { rejectTarget: behavior.rejectTarget }),
+            findings: [{ id: `${nodeId}-F1`, severity: 'P1', title: '验收不通过', status: 'open' }],
+          }
+          engineRef.value.handleSessionEvent({ id: sessionId }, {
+            type: 'assistant/message',
+            data: {
+              message: {
+                role: 'assistant',
+                content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
+              },
+            },
+          })
+          return
+        }
         if (behavior.kind === 'tool-reject') {
           const tool = registry.get('flow_node_reject')
           if (!tool) {
@@ -268,6 +291,8 @@ function fakeHost(engineRef, behaviorOf) {
             throw new Error(`会话 ${sessionId} 不存在，无法 resume`)
           }
           resumed.push(sessionId)
+          // 0.10 R1：记录完整 resume 入参，断言 agentOptions 是成对路由。
+          resumeOptions.push(options)
           live.set(sessionId, agentFor(sessionId))
           return {
             agent: live.get(sessionId),
@@ -283,6 +308,7 @@ function fakeHost(engineRef, behaviorOf) {
     ctx,
     created,
     resumed,
+    resumeOptions,
     calls,
     registrationsOf: sessionId => [...registryOf(sessionId).keys()],
     /** 模拟宿主重启后仍能 resume 的历史会话（session 持久化在宿主侧，不在 run 目录里）。 */
@@ -466,6 +492,14 @@ await check('restart：新 run 继承旧会话、跳过已完成节点、旧 run
   A.equal(newEvents.some(event => event.kind === 'node/start' && event.nodeId === 'n_a'), false)
   A.equal(newEvents.some(event => event.kind === 'node/start' && event.nodeId === 'n_b'), true)
   A.ok(host.resumed.includes(old.sessions.n_b.sessionId), 'B 的冷会话必须靠 agents.resume 续跑')
+  // 2b) 0.10 R1：创建时实际传的成对路由落进 sessions.json；restart 继承它；resume 收到同一对。
+  A.deepEqual(old.sessions.n_b.agentOptions, { provider: 'test-provider', model: 'test-model' },
+    '创建时实际传的路由对必须落进 sessions.json')
+  A.deepEqual(newSessions.n_b.agentOptions, { provider: 'test-provider', model: 'test-model' },
+    '新 run 继承旧 run 的 sessions.json route')
+  const bResume = host.resumeOptions.find(options => options.resumeSessionId === old.sessions.n_b.sessionId)
+  A.ok(bResume, 'B 必须走 resume')
+  A.deepEqual(bResume.agentOptions, { provider: 'test-provider', model: 'test-model' })
   // 3) 工具按新结构补挂：B 现在有出向 reject 边。
   const bCalls = host.calls.filter(call => call.nodeId === 'n_b' && Array.isArray(call.registrations))
   A.ok(bCalls.length > 0)
@@ -563,6 +597,163 @@ await check('restart 的失败原因可诊断：非终态 / 已成功 / 结构�
   A.ok(doneError, 'done run 不能重启')
   A.equal(doneError.status, 400)
   A.match(doneError.message, /不需要重启/)
+})
+
+// ---------------------------------------------------------------------------
+console.log('任务 2 · R9 旁路：无出向 reject 边但模型仍判 reject')
+
+await check('无 reject 边 → 保留失败（不降级 pass）+ 可行动文案 + node/end.extra.rejectBypass', async () => {
+  const flow = flowOf('flow-bypass', [
+    startNode(), stage('n_a', 'A', 300), stage('n_b', 'B', 600), endNode(),
+  ], [
+    next('e1', 'n_start', 'n_a'),
+    next('e2', 'n_a', 'n_b'),
+    next('e3', 'n_b', 'n_end'),
+    // 故意没有从 n_b 出发的 reject 边。
+  ])
+  await saveFlow(flow)
+  const run = await makeRun('flow-bypass', 2)
+  const engineRef = { value: null }
+  const host = fakeHost(engineRef, nodeId => (nodeId === 'n_b' ? { kind: 'reject' } : { kind: 'pass' }))
+  host.rememberNodes(flow.nodes)
+  const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx, nodeRetries: 0 })
+  engineRef.value = engine
+  await engine.start(run.id)
+  const final = await engine.wait(run.id)
+  A.equal(final.status, 'failed', '旁路必须保留失败（不降级为 pass）')
+
+  const events = await eventsOf(run.id)
+  const runEnd = events.find(event => event.kind === 'run/end')
+  A.equal(runEnd.data.status, 'failed')
+  A.match(runEnd.data.reason, /没有任何 reject 边|没有配置任何 reject 边/)
+  A.match(runEnd.data.reason, /补一条从该节点出发的打回边/, '必须给可行动的指引')
+  A.match(runEnd.data.reason, /修复后重启/)
+  A.match(runEnd.data.reason, /或把结论改为 pass/)
+
+  const rejectedEnd = events.find(event => (
+    event.kind === 'node/end' && event.nodeId === 'n_b' && event.data.status === 'rejected'
+  ))
+  A.ok(rejectedEnd, 'n_b 必须留下 node/end rejected')
+  A.equal(rejectedEnd.extra.rejectBypass, 'no-edge')
+  // 不降级：没有把 n_b 写成 passed，也没有 reject/trigger。
+  A.equal(
+    events.some(event => event.kind === 'node/end' && event.nodeId === 'n_b' && event.data.status === 'passed'),
+    false,
+  )
+  A.equal(events.some(event => event.kind === 'reject/trigger'), false)
+  // 旁路只影响被判定打回的节点：A 仍 passed。
+  A.equal(
+    events.some(event => event.kind === 'node/end' && event.nodeId === 'n_a' && event.data.status === 'passed'),
+    true,
+  )
+})
+
+await check('R9 旁路在 legacy 主循环同样生效（逃生门路径不能漏补丁）', async () => {
+  const flow = flowOf('flow-bypass-legacy', [
+    startNode(), stage('n_a', 'A', 300), stage('n_b', 'B', 600), endNode(),
+  ], [
+    next('e1', 'n_start', 'n_a'),
+    next('e2', 'n_a', 'n_b'),
+    next('e3', 'n_b', 'n_end'),
+  ])
+  await saveFlow(flow)
+  const run = await makeRun('flow-bypass-legacy', 2)
+  const engineRef = { value: null }
+  const host = fakeHost(engineRef, nodeId => (nodeId === 'n_b' ? { kind: 'reject' } : { kind: 'pass' }))
+  host.rememberNodes(flow.nodes)
+  const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx, nodeRetries: 0 })
+  engineRef.value = engine
+  const previous = process.env.FLOW_STUDIO_FLOW_MACHINE
+  process.env.FLOW_STUDIO_FLOW_MACHINE = '0'
+  try {
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'failed', 'legacy 路径也必须保留失败（不降级 pass）')
+    const events = await eventsOf(run.id)
+    const runEnd = events.find(event => event.kind === 'run/end')
+    A.match(runEnd.data.reason, /补一条从该节点出发的打回边/)
+    A.match(runEnd.data.reason, /修复后重启/)
+    const rejectedEnd = events.find(event => (
+      event.kind === 'node/end' && event.nodeId === 'n_b' && event.data.status === 'rejected'
+    ))
+    A.ok(rejectedEnd, 'legacy 路径也要写 node/end rejected')
+    A.equal(rejectedEnd.extra.rejectBypass, 'no-edge',
+      '删掉 legacy 路径的 rejectBypass 必须变红')
+    A.equal(events.some(event => event.kind === 'reject/trigger'), false)
+  } finally {
+    if (previous === undefined) delete process.env.FLOW_STUDIO_FLOW_MACHINE
+    else process.env.FLOW_STUDIO_FLOW_MACHINE = previous
+  }
+})
+
+await check('A9.4 收尾：run 结束后 nodeTools 注册表清空，宿主 disposer 全部调用', async () => {
+  const flow = flowOf('flow-dispose-all', [
+    startNode(), stage('n_a', 'A', 300), stage('n_c', 'C', 900), endNode(),
+  ], [
+    next('e1', 'n_start', 'n_a'),
+    next('e2', 'n_a', 'n_c'),
+    next('e3', 'n_c', 'n_end'),
+    reject('r1', 'n_c', 'n_a'),
+  ])
+  await saveFlow(flow)
+  const run = await makeRun('flow-dispose-all', 2)
+  const engineRef = { value: null }
+  const host = fakeHost(engineRef, () => ({ kind: 'pass' }))
+  host.rememberNodes(flow.nodes)
+  const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+  engineRef.value = engine
+  await engine.start(run.id)
+  A.equal((await engine.wait(run.id)).status, 'done')
+  A.equal(engine.nodeTools.size, 0, 'run 收尾后引擎侧注册表必须为空')
+  for (const sessionId of new Set(host.calls.map(call => call.sessionId))) {
+    A.deepEqual(host.registrationsOf(sessionId), [],
+      'run 收尾后宿主注册表必须为空（disposer 已调用）：' + sessionId)
+  }
+})
+
+await check('restart 服务端互斥：同一旧 run 的第二个重启被 400（审查 F11）', async () => {
+  const old = await failedAtB({ flowId: 'flow-restart-mutex', withRejectEdge: false })
+  const engineRef = { value: null }
+  const host = fakeHost(engineRef, () => ({ kind: 'pass' }))
+  host.rememberNodes(old.flow.nodes)
+  host.adoptSessions(old.sessions)
+  const runtime = createRuntime({
+    ctx: host.ctx,
+    runsRoot,
+    flowsRoot,
+    worktree: 'off',
+    cwd: testWorkspace,
+    nodeRetries: 0,
+    logger: () => {},
+  })
+  engineRef.value = { handleSessionEvent: (session, event) => {
+    const engine = runtime.list().map(id => runtime.get(id)).find(Boolean)
+    if (engine) engine.handleSessionEvent(session, event)
+  } }
+  // 第一次重启成功；第二次（顺序）必须因「已有续跑 run」被拒，不能复制第二份会话。
+  const first = await runtime.restart(old.run.id)
+  await runtime.wait(first.run.id)
+  let second = null
+  try {
+    await runtime.restart(old.run.id)
+  } catch (error) {
+    second = error
+  }
+  A.ok(second, '第二次 restart 必须失败，不能并排复制会话')
+  A.equal(second.status, 400, '应给可读 400（不是 500）')
+  A.match(second.message, /已经有续跑 run/)
+  // 并发也只有一个成功（进程内互斥 + 子 run 检查双保险）。
+  const before = (await store.listRuns(runsRoot, { limit: 100 })).runs
+    .filter(item => item.id !== old.run.id).length
+  const results = await Promise.allSettled([
+    runtime.restart(old.run.id),
+    runtime.restart(old.run.id),
+  ])
+  A.equal(results.filter(item => item.status === 'fulfilled').length, 0,
+    '已有续跑 run 时并发请求全部被拒')
+  const after = (await store.listRuns(runsRoot, { limit: 100 })).runs
+    .filter(item => item.id !== old.run.id).length
+  A.equal(after, before, '被拒的重启不能新增 run')
 })
 
 console.log(`\n${checks} 组通过（${assertionCount} 条断言）`)

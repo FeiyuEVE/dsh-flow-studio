@@ -11,7 +11,7 @@
 import {
   EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, runBlockers, summarize, validateFlow,
 } from '../model.js'
-import { api, createRunsSource, runActionFailureText } from './api.js'
+import { api, createRunsSource, restartFailureText, runActionFailureText } from './api.js'
 import { FlowCanvas } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
@@ -61,6 +61,47 @@ export const STOP_CONFIRM_DELAY_MS = 400
 
 /** M6：5s 内没有确认就自动解除，并播报（aria-live 由调用方负责）。 */
 export const STOP_CONFIRM_TIMEOUT_MS = 5000
+
+/**
+ * 0.10 R8：「修复后重启」的请求顺序（纯函数，SSR 可直接单测）。
+ *
+ * 顺序不可反：**先 await flush（保存当前流程）**，warning 非空就中止（restartRun 0 次），
+ * 只有 flush 成功才 `POST /runs/<id>/restart`。先重启会让 Host 读到磁盘上的旧结构
+ * （加边 / 删边不生效），而且接口非幂等，失败后不得自动重试。
+ *
+ * @param {{run?: object, flushBeforeRestart?: () => Promise<string>|string,
+ *   restartRun?: (id: string) => Promise<object>}} [options]
+ * @returns {Promise<{ok: boolean, run?: object, restart?: object, warning?: string, error?: string}>}
+ */
+export async function restartRunSequence({ run, flushBeforeRestart, restartRun } = {}) {
+  if (!isObject(run) || typeof run.id !== 'string' || run.id === '') {
+    return { ok: false, error: '重启失败：没有可重启的 run，刷新后重试' }
+  }
+  let warning = ''
+  try {
+    warning = typeof flushBeforeRestart === 'function' ? await flushBeforeRestart() : ''
+  } catch (failure) {
+    warning = '保存当前流程失败：' + (failure && failure.message ? failure.message : '未知原因')
+  }
+  if (typeof warning === 'string' && warning !== '') {
+    return { ok: false, warning, error: warning }
+  }
+  if (typeof restartRun !== 'function') {
+    return { ok: false, error: '重启失败：当前 Host 不支持 restart 接口' }
+  }
+  try {
+    const result = await restartRun(run.id)
+    const nextRun = result && isObject(result.run) ? result.run : null
+    if (!nextRun) return { ok: false, error: '重启失败：Host 响应里没有新 run，刷新后确认' }
+    return {
+      ok: true,
+      run: nextRun,
+      restart: result && isObject(result.restart) ? result.restart : null,
+    }
+  } catch (failure) {
+    return { ok: false, error: failure && failure.message ? failure.message : '重启失败：未知原因' }
+  }
+}
 
 /** 校验收口（B2）：错误 → 目标节点/连线 + 可播报文案。纯函数，SSR 也能单测。 */
 export function firstErrorTarget(issues) {
@@ -587,8 +628,10 @@ export function runControlState(run, {
  *   `draftNotice`：`{flowId, record: {savedAt, flow}}`），SSR 不跑 effect 也能验横幅状态。
  * @param {boolean} [props.initialLogOpen] 抽屉初始是否展开。
  * @param {number|null} [props.initialLogHeight] 抽屉展开高度（SSR / 测试用）；
- *   省略时读 localStorage（`dsh-flow-studio.logHeight`），再省略用默认 200。
+ *   省略时读 localStorage（`dsh-flow-studio.logHeight`），再省略用默认 240。
  * @param {string} [props.initialWorkspace] 预置工作区绝对路径（SSR / 测试用）；省略则读 localStorage。
+ * @param {((sessionId: string) => boolean|void)|null} [props.openSession] 0.10 R4：宿主注入的
+ *   节点会话跳转（plugin.js 懒取 uiWorkspace）。不传时抽屉降级为「复制会话 id」。
  */
 export function FlowStudioPage({
   initialFlow = null,
@@ -599,6 +642,7 @@ export function FlowStudioPage({
   initialLogHeight = null,
   initialError = '',
   initialWorkspace = '',
+  openSession = null,
 } = {}) {
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
 
@@ -621,7 +665,7 @@ export function FlowStudioPage({
   const [conflict, setConflict] = useState(null)
   const [logOpen, setLogOpen] = useState(Boolean(initialLogOpen))
   /**
-   * 抽屉展开高度（px）。null = 没设置过 → 抽屉用默认 200。
+   * 抽屉展开高度（px）。null = 没设置过 → 抽屉用默认 240。
    * 初值优先级：测试注入 initialLogHeight → localStorage → null（SSR / 隐私模式）。
    * 拖动中只 setState（不写盘），松手 / 键盘确认才 writeStoredLogHeight。
    */
@@ -1771,6 +1815,43 @@ export function FlowStudioPage({
     }
   }
 
+  /**
+   * 0.10 R8：抽屉「修复后重启」→ 保存链（flush）→ `POST /runs/<id>/restart` → 聚焦新 run。
+   * 保存链留在页面（抽屉不 import 保存逻辑）；保存失败时不发 POST、不改旧 run。
+   */
+  const restartFlowRun = useCallback(async run => {
+    const result = await restartRunSequence({
+      run,
+      // page.js:913-921：有改动先保存，返回 warning 即中止。
+      flushBeforeRestart: flushBeforeLeave,
+      restartRun: async id => {
+        try {
+          return await api.restartRun(id)
+        } catch (failure) {
+          throw new Error(restartFailureText(
+            failure && failure.status,
+            failure && failure.data,
+            failure && failure.message,
+          ))
+        }
+      },
+    })
+    if (!result.ok) {
+      const message = result.error || result.warning || '重启失败'
+      setError(message)
+      setAnnounce(message)
+      return result
+    }
+    const nextRun = result.run
+    setLogOpen(true)
+    setLogFocus({ id: nextRun.id, nonce: Date.now() })
+    setLogSync(value => value + 1)
+    const message = '已从失败节点续跑，新 run「' + (nextRun.name || nextRun.id) + '」'
+    setError('')
+    setAnnounce(message)
+    return result
+  }, [flushBeforeLeave])
+
   const saveLabel = saveState === 'dirty' ? '未保存'
     : saveState === 'saving' ? '保存中…'
       : saveState === 'error' ? '保存失败 · 本地草稿'
@@ -2062,6 +2143,9 @@ export function FlowStudioPage({
       initialSummary: runView ? runView.summary : null,
       initialDetail: runView ? runView.detail : null,
       initialEvents: runView ? runView.events : null,
+      // 0.10 R4/R8：宿主会话跳转（可选，缺失时抽屉降级复制 id）+ 修复后重启回调。
+      openSession,
+      onRestartRun: restartFlowRun,
       // 复用画布既有选中逻辑：选中节点 + 收起抽屉，让画布拿回高度。
       onJumpToNode: id => {
         const current = flowRef.current

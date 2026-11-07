@@ -2,7 +2,7 @@
  * 运行日志抽屉：底部可折叠的 run 列表 / 事件流 / 事件详情。
  *
  * 数据契约见 docs/design/05-run-log.md（§5 接口、§6 客户端）；布局见 DESIGN §7
- * （收起 40px / 展开 200px、最多 2 个自由数字、1Hz 节流）。
+ * （收起 40px / 展开 340px、最多 2 个自由数字、1Hz 节流）。
  *
  * 四条行为纪律：
  *  1. **按运行态轮询**。挂载时取一次列表；展开时每 5s 刷新；run 在跑时**无论开合**
@@ -23,10 +23,10 @@ import { h, rt } from './runtime.js'
 
 /** 收起条高度（DESIGN §7）。 */
 export const DRAWER_CLOSED_HEIGHT = 40
-/** 展开高度（DESIGN §7）。 */
-export const DRAWER_OPEN_HEIGHT = 200
+/** 展开高度（DESIGN §7；0.10 R3 实测 240 时事件区被压成 0，改 340 让事件列表 ≥80）。 */
+export const DRAWER_OPEN_HEIGHT = 340
 /**
- * 抽屉高度三档（A：详情可放大）：默认 200px / 拉高 / 全屏（占满视口，遮住画布）。
+ * 抽屉高度三档（A：详情可放大）：默认 340px / 拉高 / 全屏（占满视口，遮住画布）。
  * 档位顺序即「放大」的步进顺序；Esc 逐档往回退（全屏 → 拉高 → 默认）。
  */
 export const DRAWER_ZOOM_LEVELS = Object.freeze(['normal', 'tall', 'full'])
@@ -36,13 +36,13 @@ export const DRAWER_TALL_VH = 70
 // ── 可拖动高度（拖拽条 / 键盘 / 持久化；纯函数，SSR 也能单测）──────────────
 /**
  * 展开抽屉的高度边界：
- *  - `LOG_MIN_HEIGHT`：再矮连 40px 折叠条 + 46px 聚合条都挤不下；
+ *  - `LOG_MIN_HEIGHT`：再矮指标条三行（label/value/hint）会被 body 裁掉；200 是实测下限；
  *  - `LOG_KEEP_CANVAS`：给顶栏 + 画布留出的最小高度（上限 = 容器高度 − 180）；
- *  - `LOG_DEFAULT_HEIGHT`：没设置过 / 双击 / Esc 时的高度。
+ *  - `LOG_DEFAULT_HEIGHT`：没设置过 / 双击 / Esc 时的高度（340：预留事件区 ≥80）。
  */
-export const LOG_MIN_HEIGHT = 120
+export const LOG_MIN_HEIGHT = 200
 export const LOG_KEEP_CANVAS = 180
-export const LOG_DEFAULT_HEIGHT = 200
+export const LOG_DEFAULT_HEIGHT = 340
 /**
  * 拿不到容器高度（SSR、首帧还没量测）时按这个高度算上限：口径确定、可断言，
  * 浏览器里量到真实高度后再用同一套 clamp 收敛一次。
@@ -81,6 +81,8 @@ export const LIVE_POLL_MS = 2000
 export const WATCH_EVENT_KINDS = Object.freeze([
   'run/start', 'run/end',
   'node/start', 'node/end',
+  // 0.10 R6：节点会话可用工具快照（扩展白名单），节点内运行时就能看到工具清单。
+  'node/tools',
   'member/start', 'member/end',
   'reject/trigger',
   // v0.9：状态机转移观测（08 §7）。收进增量窗口，跑的过程中就能看到状态推进。
@@ -107,6 +109,8 @@ export const EVENT_KINDS = [
   'test/report',
   'message/in', 'message/out',
   'node/status',
+  // 0.10 R6：节点会话可用工具（服务端扩展白名单；字段见 docs/plan/0.10-方案.md §4.2）。
+  'node/tools',
   // v0.9：状态机转移（XState 内核）。from → to · EVENT。
   'machine/transition',
 ]
@@ -144,9 +148,23 @@ const EVENT_GLYPH = {
   'review/finding': '!',
   'review/verdict': '§',
   'check/form': '✓',
+  'node/tools': '⚒',
 }
 
 // ── 小工具 ────────────────────────────────────────────────────────────────
+
+/** 0.10 R5：`agentPresetSource` 的六种来源 → 可读文案；未知来源原样显示。 */
+export const PRESET_SOURCE_TEXT = Object.freeze({
+  node: '节点配置',
+  start: '本次启动',
+  engine: '引擎配置',
+  flow: '流程默认',
+  default: '兜底 standard',
+  'default-fallback': '降级宿主默认',
+})
+
+/** 0.10 R8：只有这两种终态允许「修复后重启」原地续跑。 */
+export const RESTARTABLE_STATUSES = Object.freeze(['failed', 'aborted'])
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -224,8 +242,8 @@ export function logContainerHeightOf(containerHeight) {
 }
 
 /**
- * 当前容器允许的最大抽屉高度 = 容器高度 − 180；容器过矮（连 120 + 180 都不够）
- * 时退回最小值 120，**绝不出现负数或 NaN**。
+ * 当前容器允许的最大抽屉高度 = 容器高度 − 180；容器过矮（连 200 + 180 都不够）
+ * 时退回最小值 200，**绝不出现负数或 NaN**。
  */
 export function logHeightMax(containerHeight) {
   const container = logContainerHeightOf(containerHeight)
@@ -233,8 +251,8 @@ export function logHeightMax(containerHeight) {
 }
 
 /**
- * 把任意期望高度收敛到 [120, 容器 − 180] 的整数 px。
- * `undefined` / `NaN` / `null` / 负数一律按下限 120 处理（不向后兼容坏输入）。
+ * 把任意期望高度收敛到 [200, 容器 − 180] 的整数 px。
+ * `undefined` / `NaN` / `null` / 负数一律按下限 200 处理（不向后兼容坏输入）。
  */
 export function clampLogHeight(desired, containerHeight) {
   const max = logHeightMax(containerHeight)
@@ -245,10 +263,10 @@ export function clampLogHeight(desired, containerHeight) {
 /**
  * 拖拽条键位 → 新高度（已 clamp）。
  * ArrowUp +24 / ArrowDown −24 / PageUp +96 / PageDown −96 / Home 最小 / End 最大 /
- * Escape 默认 200；**不认识的键返回 null**，调用方不要 preventDefault。
+ * Escape 默认 340；**不认识的键返回 null**，调用方不要 preventDefault。
  *
  * @param {string} key event.key
- * @param {number|null} current 当前生效高度（null = 还没设置过，按默认 200 起算）
+ * @param {number|null} current 当前生效高度（null = 还没设置过，按默认 340 起算）
  * @param {number} containerHeight 容器高度（见 logContainerHeightOf 的口径）
  * @returns {number|null}
  */
@@ -285,7 +303,7 @@ export function readStoredLogHeight(storage) {
 }
 
 /**
- * 记住拖出来的高度；null / 默认 200 表示「没设置过」——删键而不是写 200，
+ * 记住拖出来的高度；null / 默认 340 表示「没设置过」——删键而不是写 340，
  * 这样下次读回 null，双击恢复默认后才真的回到初始状态。
  */
 export function writeStoredLogHeight(storage, value) {
@@ -518,6 +536,51 @@ export function formatTokens(value) {
   return String(Math.round(total))
 }
 
+/** `run.json.sessions`：只收 `{string → 非空 string}`，其余键值跳过；非 plain object → null。 */
+function normalizeSessionMap(value) {
+  if (!isObject(value)) return null
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof key !== 'string' || key === '') continue
+    if (typeof item !== 'string' || item === '') continue
+    out[key] = item
+  }
+  return out
+}
+
+/** `run.json.agentPreset`：{value ≤64, source ≤32}；value 空 → null。 */
+function normalizeAgentPreset(value) {
+  if (!isObject(value)) return null
+  const presetValue = typeof value.value === 'string' ? value.value.trim() : ''
+  if (presetValue === '') return null
+  const source = typeof value.source === 'string' ? value.source.trim() : ''
+  return { value: presetValue.slice(0, 64), source: source.slice(0, 32) }
+}
+
+/** `run.json.supervision`：只保留 wakerSessionId（≤128）；没有就 null。 */
+function normalizeSupervision(value) {
+  if (!isObject(value)) return null
+  const waker = typeof value.wakerSessionId === 'string' ? value.wakerSessionId.trim() : ''
+  if (waker === '') return null
+  // 0.10 审查 F12：runstore 的绑定字符串上限是 2048；这里截 128 会把长 id 复制错。
+  return { wakerSessionId: waker.slice(0, 2048) }
+}
+
+/** `run.json.restart`：fromRunId 非法 → null；其余字段可选。 */
+function normalizeRestart(value) {
+  if (!isObject(value)) return null
+  const fromRunId = typeof value.fromRunId === 'string' ? value.fromRunId : ''
+  if (fromRunId.trim() === '') return null
+  const restart = { fromRunId, attempt: optionalNum(value.attempt) }
+  const startNodeId = typeof value.startNodeId === 'string' ? value.startNodeId : ''
+  if (startNodeId !== '') restart.startNodeId = startNodeId
+  if (Array.isArray(value.skippedNodeIds)) {
+    restart.skippedNodeIds = value.skippedNodeIds.filter(item => typeof item === 'string' && item !== '')
+  }
+  if (typeof value.note === 'string' && value.note !== '') restart.note = value.note
+  return restart
+}
+
 /** 单条 run 的摘要归一化；缺 id/name 也不丢，只是不可选中。 */
 export function normalizeRun(raw, index = 0) {
   const source = isObject(raw) ? raw : {}
@@ -551,8 +614,138 @@ export function normalizeRun(raw, index = 0) {
      */
     progress: isObject(source.progress) ? source.progress : null,
     eventCount: optionalNum(source.eventCount),
+    // 0.10 R4/R5/R8：run.json 的四个字段显式映射，缺失一律 null（不补 {}）。
+    sessions: normalizeSessionMap(source.sessions),
+    agentPreset: normalizeAgentPreset(source.agentPreset),
+    supervision: normalizeSupervision(source.supervision),
+    restart: normalizeRestart(source.restart),
     index,
   }
+}
+
+/**
+ * 0.10 R4：节点会话目标。优先级 run.sessions[nodeId] → 该节点最近事件的 ref.sessionId → 无。
+ * 返回 `{sessionId, source:'run.sessions'|'event.ref'|'none'}`；能否跳转由 UI 的 openSession 决定。
+ */
+export function sessionTargetOf(run, nodeId, events) {
+  const id = text(nodeId, '')
+  const sessions = isObject(run && run.sessions) ? run.sessions : null
+  if (id !== '' && sessions && typeof sessions[id] === 'string' && sessions[id] !== '') {
+    return { sessionId: sessions[id], source: 'run.sessions' }
+  }
+  if (id !== '') {
+    const ordered = sortEventsAsc(events)
+    for (let at = ordered.length - 1; at >= 0; at -= 1) {
+      const event = ordered[at]
+      if (!isObject(event) || text(event.nodeId, '') !== id) continue
+      const ref = isObject(event.ref) ? event.ref : null
+      const sessionId = ref && typeof ref.sessionId === 'string' ? ref.sessionId : ''
+      if (sessionId !== '') return { sessionId, source: 'event.ref' }
+    }
+  }
+  return { sessionId: '', source: 'none' }
+}
+
+/**
+ * 0.10 R5：preset 值与来源。节点最近一条 `node/start.data.agentPreset` 优先，
+ * 其次 run.agentPreset；都没有返回 `{value:'', sourceText:'—'}`。
+ */
+export function presetInfoOf(events, run, nodeId) {
+  const id = text(nodeId, '')
+  if (id !== '') {
+    const ordered = sortEventsAsc(events)
+    for (let at = ordered.length - 1; at >= 0; at -= 1) {
+      const event = ordered[at]
+      if (!isObject(event) || text(event.kind, '') !== 'node/start') continue
+      if (text(event.nodeId, '') !== id) continue
+      const data = isObject(event.data) ? event.data : {}
+      const value = typeof data.agentPreset === 'string' ? data.agentPreset.trim() : ''
+      if (value === '') continue
+      const source = typeof data.agentPresetSource === 'string' ? data.agentPresetSource : ''
+      return { value, source, sourceText: PRESET_SOURCE_TEXT[source] || source || '—' }
+    }
+  }
+  const preset = isObject(run && run.agentPreset) ? run.agentPreset : null
+  const value = preset && typeof preset.value === 'string' ? preset.value : ''
+  if (value !== '') {
+    const source = typeof preset.source === 'string' ? preset.source : ''
+    return { value, source, sourceText: PRESET_SOURCE_TEXT[source] || source || '—' }
+  }
+  return { value: '', source: '', sourceText: '—' }
+}
+
+/**
+ * 0.10 R5/R6：节点本轮的 executor 种类（只认 `node/start.data.executor`）。
+ * 外部执行器（codex / custom）没有节点会话，UI 必须用**可见文案**说明，而不是只写 title。
+ * 旧 run / 旧事件没有该字段 → 空串（按未知处理，不臆造 dsh）。
+ */
+export function nodeExecutorOf(events, nodeId) {
+  const id = text(nodeId, '')
+  if (id === '') return ''
+  const ordered = sortEventsAsc(events)
+  for (let at = ordered.length - 1; at >= 0; at -= 1) {
+    const event = ordered[at]
+    if (!isObject(event) || text(event.kind, '') !== 'node/start') continue
+    if (text(event.nodeId, '') !== id) continue
+    const data = isObject(event.data) ? event.data : {}
+    return typeof data.executor === 'string' ? data.executor : ''
+  }
+  return ''
+}
+
+/**
+ * 0.10 R6：节点会话可用工具（只认 `node/tools` 事件，绝不回退 `tool/call` 历史）。
+ * 返回 `{present, tools, toolsSource:'session'|'unavailable'|'none', count, truncated}`。
+ */
+export function nodeToolsAvailableOf(events, nodeId) {
+  const id = text(nodeId, '')
+  let latest = null
+  if (id !== '') {
+    const ordered = sortEventsAsc(events)
+    for (let at = ordered.length - 1; at >= 0; at -= 1) {
+      const event = ordered[at]
+      if (!isObject(event) || text(event.kind, '') !== 'node/tools') continue
+      if (text(event.nodeId, '') !== id) continue
+      latest = event
+      break
+    }
+  }
+  if (!latest) {
+    return { present: false, tools: [], toolsSource: 'none', count: 0, truncated: false }
+  }
+  const data = isObject(latest.data) ? latest.data : {}
+  const tools = Array.isArray(data.tools)
+    ? data.tools.filter(item => typeof item === 'string' && item !== '')
+    : []
+  const toolsSource = data.toolsSource === 'session' || data.toolsSource === 'unavailable'
+    ? data.toolsSource
+    : (tools.length > 0 ? 'session' : 'unavailable')
+  const counted = optionalNum(data.count)
+  return {
+    present: true,
+    tools,
+    toolsSource,
+    count: counted === null ? tools.length : counted,
+    truncated: data.truncated === true,
+  }
+}
+
+/**
+ * 0.10 R8：能否在当前流程里原地重启。仅 failed / aborted，且 run.flowId === 当前流程。
+ * 返回 `{ok, reason}`；reason 直接做按钮 title（跨流程提示先打开所属流程）。
+ */
+export function canRestartInPlace(run, currentFlowId) {
+  if (!isObject(run)) return { ok: false, reason: '没有可重启的 run' }
+  const status = text(run.status, '').toLowerCase()
+  if (!RESTARTABLE_STATUSES.includes(status)) {
+    return { ok: false, reason: '只有失败或中止的 run 才能修复后重启（当前：' + statusText(status) + '）' }
+  }
+  const runFlowId = text(run.flowId, '')
+  const current = text(currentFlowId, '')
+  if (current === '' || runFlowId !== current) {
+    return { ok: false, reason: '先打开该 run 所属流程再重启' }
+  }
+  return { ok: true, reason: '' }
 }
 
 /**
@@ -1273,6 +1466,14 @@ export function eventSummary(event) {
         parts.push('阻塞 ' + num(data.blockers.length) + ' 条')
       }
       if (data.summary) parts.push(text(data.summary))
+      break
+    }
+    case 'node/tools': {
+      const tools = Array.isArray(data.tools) ? data.tools.filter(tool => typeof tool === 'string') : []
+      const count = data.count !== undefined ? num(data.count) : tools.length
+      parts.push('可用工具 ' + count + ' 个')
+      if (data.toolsSource === 'unavailable') parts.push('宿主未提供工具枚举')
+      if (data.truncated === true) parts.push('已截断')
       break
     }
     default:
@@ -2163,7 +2364,7 @@ function clipForLabel(value, max = 60) {
  * @param {{kind: string, id: string}|null} [props.focusNode] 画布当前选中的节点；
  *   抽屉展开时用它打开节点运行详情（点节点即可看该 agent 在干什么）。
  * @param {number} [props.syncToken] 变化时立即强制刷新一次（开始 / 停止后）。
- * @param {number|null} [props.height] 展开高度（px）；null / 不传 = 默认 200。
+ * @param {number|null} [props.height] 展开高度（px）；null / 不传 = 默认 340。
  *   只作用于默认档（normal）：通过拖拽条 / 键盘调整，拖动中由 `onHeightChange` 回传。
  * @param {number} [props.containerHeight] 外层容器（.fs-root）高度，用来算上限
  *   「容器 − 180」；0 / 没量测（SSR）按 900 的确定口径（见 LOG_ASSUMED_CONTAINER_HEIGHT）。
@@ -2172,8 +2373,12 @@ function clipForLabel(value, max = 60) {
  * @param {(height: number|null) => void} [props.onHeightCommit] 松手 / 键盘确认后的落库回调
  *   （调用方写 localStorage；null = 清掉设置）。
  * @param {() => void} [props.onResetHeight] 双击拖拽条：恢复默认并清掉持久化。
+ * @param {(sessionId: string) => boolean|void} [props.openSession] 0.10 R4：宿主跳转节点会话。
+ *   不传时降级为「复制会话 id」（复用抽屉现有复制反馈）。
+ * @param {(run: object) => Promise<object>} [props.onRestartRun] 0.10 R8：页面侧「保存 → POST」的
+ *   重启回调（Flush 成功才发 POST）；抽屉只按返回值显示错误 / 清 restarting。
  *
- * 不传 height / 回调时行为与旧版一致：收起 40px、展开默认 200px（CSS 口径）。
+ * 不传 height / 回调时行为与旧版一致：收起 40px、展开默认 340px（CSS 口径）。
  */
 export function FsLogDrawer({
   open = false,
@@ -2199,12 +2404,14 @@ export function FsLogDrawer({
   focusRun = null,
   focusNode = null,
   syncToken = 0,
-  // 可拖动高度（不传时保持旧行为：展开 200 / 收起 40）。
+  // 可拖动高度（不传时保持默认：展开 340 / 收起 40）。
   height = null,
   containerHeight = 0,
   onHeightChange = null,
   onHeightCommit = null,
   onResetHeight = null,
+  openSession = null,
+  onRestartRun = null,
 } = {}) {
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
 
@@ -2235,6 +2442,9 @@ export function FsLogDrawer({
   const [activeIndex, setActiveIndex] = useState(0)
   const [selectedEventKey, setSelectedEventKey] = useState(text(initialSelectedEventKey, ''))
   const [copyState, setCopyState] = useState('')
+  /** 0.10 R8：重启在途（按钮 disabled）与错误（.fs-log-banner role=alert，只播一次）。 */
+  const [restarting, setRestarting] = useState(false)
+  const [restartError, setRestartError] = useState('')
   /** 高度档（A1）：默认 / 拉高 / 全屏；Esc 逐档往回退。 */
   const [zoom, setZoom] = useState(() => normalizeDrawerZoom(initialZoom))
   /**
@@ -3064,7 +3274,7 @@ export function FsLogDrawer({
     if (typeof event.preventDefault === 'function') event.preventDefault()
     if (typeof event.stopPropagation === 'function') event.stopPropagation()
     if (event.key === 'Escape') {
-      // Esc = 恢复默认 200 并清持久化（与双击同一口径）。
+      // Esc = 恢复默认 340 并清持久化（与双击同一口径）。
       resetHeightToDefault()
       return
     }
@@ -3160,6 +3370,96 @@ export function FsLogDrawer({
     })
   }
 
+  /** 0.10 R4：复制节点会话 id，复用抽屉现有 copyState 反馈（不新增第二套提示）。 */
+  const copySessionId = (sessionId, feedback = '已复制') => {
+    if (sessionId === '') return Promise.resolve()
+    return copyText(sessionId).then(
+      () => { if (mounted.current) setCopyState(feedback) },
+      () => { if (mounted.current) setCopyState('复制失败') },
+    ).finally(() => {
+      if (typeof setTimeout !== 'function') return
+      setTimeout(() => { if (mounted.current) setCopyState('') }, 1600)
+    })
+  }
+
+  /**
+   * 0.10 R4 的三段降级：有 openSession → 打开节点会话；没有 → 复制会话 id；
+   * 没有 sessionId → disabled + title 说明原因。调用恰好一次、不 await、不重试。
+   */
+  const sessionAction = (sessionId, key, label = '打开节点会话') => {
+    if (sessionId === '') {
+      return h('button', {
+        key,
+        type: 'button',
+        className: 'fs-log-mini fs-log-session',
+        disabled: true,
+        title: '该节点还没有节点会话（外部执行器没有节点会话，或该节点还没开始运行）',
+      }, label)
+    }
+    if (typeof openSession === 'function') {
+      return h('button', {
+        key,
+        type: 'button',
+        className: 'fs-log-mini fs-log-session',
+        'aria-label': label + ' ' + sessionId,
+        title: '在宿主里' + label + ' ' + sessionId,
+        onClick: () => {
+          // 0.10 R4 修正：运行期跳转失败不能静默；降级为复制 id + 明确反馈。
+          let opened = false
+          try {
+            opened = openSession(sessionId) !== false
+          } catch {
+            opened = false
+          }
+          if (!opened) return copySessionId(sessionId, '宿主不支持跳转，已复制')
+          return undefined
+        },
+      }, label)
+    }
+    return h('button', {
+      key,
+      type: 'button',
+      className: 'fs-log-mini fs-log-session',
+      'aria-label': '复制会话 id ' + sessionId,
+      title: '当前宿主不支持跳转；复制节点会话 id ' + sessionId,
+      onClick: () => copySessionId(sessionId),
+    }, copyState || '复制会话 id')
+  }
+
+  // 0.10 R4：run 级入口 = 发起会话（supervision.wakerSessionId）；节点详情之外也能跳。
+  const runSessionId = feedRun && isObject(feedRun.supervision)
+    && typeof feedRun.supervision.wakerSessionId === 'string'
+    && feedRun.supervision.wakerSessionId !== ''
+    ? feedRun.supervision.wakerSessionId
+    : ''
+  // 0.10 R8：只有 failed/aborted 渲染按钮；跨流程 disabled + title（canRestartInPlace）。
+  const restartInfo = feedRun
+    ? canRestartInPlace(feedRun, flowId)
+    : { ok: false, reason: '' }
+  const restartVisible = Boolean(feedRun)
+    && RESTARTABLE_STATUSES.includes(text(feedRun.status, '').toLowerCase())
+  const lineageText = feedRun && isObject(feedRun.restart)
+    ? '续跑自 ' + feedRun.restart.fromRunId
+      + ' · 第 ' + (feedRun.restart.attempt === null ? '—' : String(feedRun.restart.attempt)) + ' 次'
+      + ' · 起点 ' + (feedRun.restart.startNodeId || '—')
+    : ''
+  /** 重启：页面侧回调负责 flush → POST → focus；这里只按返回值显示错误 / 清 restarting。 */
+  const restartRun = async () => {
+    if (!feedRun || restarting || !restartInfo.ok || typeof onRestartRun !== 'function') return
+    setRestarting(true)
+    setRestartError('')
+    try {
+      const result = await onRestartRun(feedRun)
+      if (!result || result.ok !== true) {
+        setRestartError(text(result && result.error, '重启失败：未知原因'))
+      }
+    } catch (failure) {
+      setRestartError('重启失败：' + messageOf(failure))
+    } finally {
+      setRestarting(false)
+    }
+  }
+
   const onEventKeyDown = event => {
     const key = event.key
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', 'Escape'].includes(key)) return
@@ -3205,6 +3505,11 @@ export function FsLogDrawer({
         const meta = statusText(runStatusOf(run))
           + (info.recorded ? ' · ' + formatTokens(info.total) + ' tok' : '')
           + ' · ' + nodeProgressText(run)
+          // 0.10 审查 F9：run 级 preset 与来源（方案 §3 R5）。
+          + (run.agentPreset && run.agentPreset.value
+            ? ' · preset ' + run.agentPreset.value
+              + (run.agentPreset.source ? '（' + (PRESET_SOURCE_TEXT[run.agentPreset.source] || run.agentPreset.source) + '）' : '')
+            : '')
         return h('button', {
           key: run.id || 'run-' + index,
           type: 'button',
@@ -3298,6 +3603,9 @@ export function FsLogDrawer({
       loadedCount: events.length,
     })
     const ref = refLabel(detailEvent.ref)
+    const refSessionId = isObject(detailEvent.ref) && typeof detailEvent.ref.sessionId === 'string'
+      ? detailEvent.ref.sessionId
+      : ''
     const longText = eventLongTextOf(detailEvent)
     return h('div', { className: 'fs-log-detail-body' },
       h('div', { className: 'fs-log-detail-meta' },
@@ -3315,6 +3623,10 @@ export function FsLogDrawer({
       h('pre', { className: 'fs-log-json' }, safeJson(detailEvent)),
       h('div', { className: 'fs-log-ref' },
         'ref：' + (ref === '' ? '无（没有指回原始会话日志）' : ref)),
+      refSessionId !== ''
+        ? h('div', { className: 'fs-log-node-actions fs-log-ref-actions' },
+          sessionAction(refSessionId, 'ref-session'))
+        : null,
       nodeId === ''
         ? h('div', { className: 'fs-log-ref' }, 'run 级事件，没有节点归属')
         : h('div', { className: 'fs-log-node' },
@@ -3404,6 +3716,37 @@ export function FsLogDrawer({
         h('span', { className: 'fs-log-artifact-path', title: artifact.path }, artifact.path),
         h('span', { className: 'fs-log-artifact-meta' },
           artifact.kind + ' · ' + artifact.bytesText + ' · ' + artifact.timeText)))
+    // 0.10 R4/R5/R6：节点会话入口、preset 来源、节点会话可用工具（只认 node/tools）。
+    const sessionTarget = sessionTargetOf(feedRun, activity.nodeId, events)
+    const presetInfo = presetInfoOf(events, feedRun, activity.nodeId)
+    const availableTools = nodeToolsAvailableOf(events, activity.nodeId)
+    const toolsDetails = availableTools.tools.length === 0 && !availableTools.truncated
+      ? null
+      : h('details', { className: 'fs-log-available-tools' },
+        h('summary', { className: 'fs-log-tools-summary' },
+          '查看工具清单（' + availableTools.tools.length + ' 个'
+          + (availableTools.truncated ? '，已截断' : '') + '）'),
+        h('div', { className: 'fs-log-tool-chips' },
+          availableTools.tools.map(name => h('span', {
+            key: name,
+            className: 'fs-log-tool-chip',
+          }, name))))
+    const nodeExecutor = nodeExecutorOf(events, activity.nodeId)
+    const externalExecutor = nodeExecutor !== '' && nodeExecutor !== 'dsh'
+    const availableToolsBlock = h('div', { className: 'fs-log-node-block' },
+      h('div', { className: 'fs-log-node-block-title' },
+        '节点会话可用工具（' + availableTools.count + ' 个）'),
+      !availableTools.present
+        ? h('div', { className: 'fs-log-tools-empty' },
+          externalExecutor
+            ? '外部执行器（' + nodeExecutor + '）没有节点会话，未记录工具清单'
+            : '未记录')
+        : availableTools.toolsSource === 'unavailable'
+          ? h('div', null,
+            h('div', { className: 'fs-log-tools-empty' }, '宿主未提供工具枚举'),
+            // 采集失败时若打回工具已注册，仍把已知的那部分列出来（清单不完整）。
+            toolsDetails)
+          : toolsDetails)
     const failureBlock = activity.failureReason === ''
       ? null
       : h('div', { className: 'fs-log-failure', role: 'alert' },
@@ -3445,6 +3788,11 @@ export function FsLogDrawer({
         'attempt：' + (activity.attempt === null ? '—' : String(activity.attempt))),
       activity.reworkCount > 0 ? h('span', { className: 'fs-log-fact' }, '返工：' + activity.reworkCount + ' 次') : null,
       h('span', { className: 'fs-log-fact' }, '事件：' + activity.eventCount + ' 条'),
+      h('span', { className: 'fs-log-fact fs-log-preset' },
+        presetInfo.value === ''
+          ? 'preset：—'
+          : 'preset：' + presetInfo.value + '（来源：' + presetInfo.sourceText + '）'),
+      sessionAction(sessionTarget.sessionId, 'node-session'),
       onJumpToNode
         ? h('button', {
           type: 'button',
@@ -3462,6 +3810,7 @@ export function FsLogDrawer({
     h('div', { className: 'fs-log-node-block' },
       h('div', { className: 'fs-log-node-block-title' }, '最近工具调用'),
       toolBlock),
+    availableToolsBlock,
     h('div', { className: 'fs-log-node-block' },
       h('div', { className: 'fs-log-node-block-title' }, 'token 用量'),
       h('div', { className: 'fs-log-node-line' }, 'token：' + activity.tokenText),
@@ -3592,11 +3941,40 @@ export function FsLogDrawer({
             ? h('button', { key: 'copy', type: 'button', className: 'fs-log-action', onClick: copyRunId },
               copyState || '复制 runId')
             : null,
+          // 0.10 R8：仅 failed/aborted 渲染；跨流程 disabled + title；restarting 时 disabled。
+          restartVisible
+            ? h('button', {
+              key: 'restart',
+              type: 'button',
+              className: 'fs-log-action fs-log-restart',
+              disabled: restarting || !restartInfo.ok || typeof onRestartRun !== 'function',
+              title: !restartInfo.ok
+                ? restartInfo.reason
+                : (typeof onRestartRun !== 'function'
+                  ? '当前宿主不支持修复后重启'
+                  : '先保存当前流程，再从失败节点续跑（不自动重试）'),
+              onClick: () => { void restartRun() },
+            }, restarting ? '重启中…' : '修复后重启')
+            : null,
           h('button', { key: 'collapse', type: 'button', className: 'fs-log-action', onClick: onToggle }, '收起'),
         ]
         : null))
 
   const body = !open ? null : h('div', { className: 'fs-log-body', id: 'fs-log-body' },
+    // 0.10 R4：run 级「打开发起会话」入口（supervision.wakerSessionId）。
+    runSessionId !== ''
+      ? h('div', { className: 'fs-log-run-session fs-log-lineage' },
+        h('span', null, '发起会话 ' + runSessionId),
+        sessionAction(runSessionId, 'run-session', '打开发起会话'))
+      : null,
+    // 0.10 R8：续跑世系放 body 顶部（40px 动作条空间不动）。
+    lineageText !== ''
+      ? h('div', { className: 'fs-log-lineage' }, lineageText)
+      : null,
+    // 重启失败用既有 role=alert 只播一次；不自动重试（接口非幂等）。
+    restartError !== ''
+      ? h('div', { className: 'fs-log-banner', role: 'alert' }, restartError)
+      : null,
     runError !== '' && runs.length > 0
       ? h('div', { className: 'fs-log-banner', role: 'alert' },
         h('span', null, runError),

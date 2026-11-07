@@ -71,44 +71,148 @@ function Segmented({ value, options, onChange }) {
     }, option.label)))
 }
 
-function SkillsPicker({ value, skills, onChange }) {
-  const { useState } = rt.React
+/**
+ * 0.10 审查 F4：键盘选择必须在**当前可见选项**里移动/切换。
+ * 过滤后 active 指向隐藏项时：↑↓ 落到可见首/尾，Enter/Space 返回 null（不切换隐藏项）。
+ * @returns {string|null} 下一个 active 名；null = 本键不处理
+ */
+export function nextActiveSkill(visible, active, key) {
+  const list = Array.isArray(visible) ? visible : []
+  if (list.length === 0) return null
+  const index = list.findIndex(skill => skill && skill.name === active)
+  if (key === 'ArrowDown') {
+    return index < 0 ? list[0].name : list[(index + 1) % list.length].name
+  }
+  if (key === 'ArrowUp') {
+    return index < 0 ? list[list.length - 1].name : list[(index - 1 + list.length) % list.length].name
+  }
+  if (key === 'Enter' || key === ' ') {
+    return index < 0 ? null : list[index].name
+  }
+  return null
+}
+
+/**
+ * 0.10 R7：skills 内联 combobox（结构设计 §3.2）。
+ *  - 收起态只渲染触发按钮（文本「已选 N / 12」/「未选择」），不渲染 listbox/option；
+ *  - 展开态在文档流内向下推开（检查器是滚动容器，浮层会被裁）；
+ *  - 选项 `div[role=option]`（不是 button，避免重复语义），键盘走搜索框的 onKeyDown；
+ *  - 达到 12 时未选项 `aria-disabled="true"` + 「最多 12 个」，已选仍可取消。
+ */
+function SkillsPicker({ value, skills, onChange, initialOpen = false, idPrefix = 'fs-skills' }) {
+  const { useState, useEffect, useRef } = rt.React
+  const [expanded, setExpanded] = useState(initialOpen === true)
   const [filter, setFilter] = useState('')
-  const selected = new Set(value)
+  const [active, setActive] = useState('')
+  const triggerRef = useRef(null)
+  const searchRef = useRef(null)
+  const selected = new Set(Array.isArray(value) ? value : [])
+  const limit = LIMITS.skillsPerNode
   const keyword = filter.trim().toLowerCase()
   const visible = keyword === ''
     ? skills
     : skills.filter(skill => (skill.name + ' ' + skill.description).toLowerCase().includes(keyword))
 
+  useEffect(() => {
+    if (!expanded) return
+    const node = searchRef.current
+    if (node && typeof node.focus === 'function') node.focus()
+  }, [expanded])
+
+  const close = () => {
+    setExpanded(false)
+    setActive('')
+    const node = triggerRef.current
+    if (node && typeof node.focus === 'function') node.focus()
+  }
+
   const toggle = name => {
     const next = new Set(selected)
     if (next.has(name)) next.delete(name)
-    else if (next.size < LIMITS.skillsPerNode) next.add(name)
+    else if (next.size < limit) next.add(name)
     else return
     onChange([...next])
   }
 
-  return h('div', { className: 'fs-skills' },
+  const onSearchKeyDown = event => {
+    if (!event) return
+    const key = event.key
+    if (key === 'ArrowDown' || key === 'ArrowUp') {
+      event.preventDefault()
+      const next = nextActiveSkill(visible, active, key)
+      if (next !== null) setActive(next)
+      return
+    }
+    if (key === 'Enter' || key === ' ') {
+      const target = nextActiveSkill(visible, active, key)
+      if (target === null) return
+      event.preventDefault()
+      toggle(target)
+      return
+    }
+    if (key === 'Escape') {
+      event.preventDefault()
+      close()
+    }
+  }
+
+  const activeIndex = visible.findIndex(skill => skill.name === active)
+  const listId = idPrefix + '-list'
+  const label = selected.size > 0 ? '已选 ' + selected.size + ' / ' + limit : '未选择'
+
+  const panel = !expanded ? null : h('div', { className: 'fs-skills-panel' },
     h('input', {
-      className: 'fs-skills-filter',
+      ref: searchRef,
+      className: 'fs-skills-search',
+      role: 'combobox',
+      'aria-autocomplete': 'list',
+      'aria-expanded': 'true',
+      'aria-controls': listId,
+      'aria-activedescendant': activeIndex >= 0 ? idPrefix + '-opt-' + activeIndex : undefined,
       placeholder: '搜索 ' + skills.length + ' 个可用 skill…',
       value: filter,
       onChange: event => setFilter(event.target.value),
+      onKeyDown: onSearchKeyDown,
     }),
-    h('div', { className: 'fs-skills-list' },
+    h('div', { className: 'fs-skills-listbox', role: 'listbox', id: listId, 'aria-label': '可选 skill' },
       skills.length === 0
-        ? h('div', { className: 'fs-empty-panel', style: { padding: '12px 8px' } }, '当前 profile 没有已注册的 skill')
+        ? h('div', { className: 'fs-skills-empty' }, '当前 profile 没有已注册的 skill')
         : visible.length === 0
-          ? h('div', { className: 'fs-empty-panel', style: { padding: '12px 8px' } }, '没有匹配的 skill')
-          : visible.map(skill => h('label', { key: skill.name, className: 'fs-skill' },
-            h('input', {
-              type: 'checkbox',
-              checked: selected.has(skill.name),
-              onChange: () => toggle(skill.name),
-            }),
-            h('div', { style: { minWidth: 0 } },
-              h('div', { className: 'fs-skill-name' }, skill.name),
-              skill.description ? h('div', { className: 'fs-skill-desc' }, skill.description) : null)))))
+          ? h('div', { className: 'fs-skills-empty' }, '没有匹配的 skill')
+          : visible.map((skill, index) => {
+            const isSelected = selected.has(skill.name)
+            const atLimit = !isSelected && selected.size >= limit
+            return h('div', {
+              key: skill.name,
+              id: idPrefix + '-opt-' + index,
+              className: 'fs-skills-option' + (isSelected ? ' on' : ''),
+              role: 'option',
+              'aria-selected': isSelected ? 'true' : 'false',
+              'aria-disabled': atLimit ? 'true' : 'false',
+              tabIndex: -1,
+              onClick: () => toggle(skill.name),
+            },
+            h('span', { className: 'fs-skills-option-name' }, skill.name),
+            atLimit ? h('span', { className: 'fs-skills-limit' }, '最多 ' + limit + ' 个') : null,
+            skill.description
+              ? h('span', { className: 'fs-skills-option-desc' }, skill.description)
+              : null)
+          })))
+
+  return h('div', { className: 'fs-skills-combo' },
+    h('button', {
+      ref: triggerRef,
+      type: 'button',
+      className: 'fs-skills-trigger',
+      'aria-haspopup': 'listbox',
+      'aria-expanded': expanded ? 'true' : 'false',
+      'aria-controls': listId,
+      onClick: () => {
+        if (expanded) close()
+        else setExpanded(true)
+      },
+    }, label),
+    panel)
 }
 
 function MemberCard({ member, index, onPatch, onRemove }) {
@@ -132,7 +236,7 @@ function MemberCard({ member, index, onPatch, onRemove }) {
     }))
 }
 
-function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge }) {
+function NodeForm({ node, flow, skills, skillsOpen = false, onPatch, onDelete, onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge }) {
   const isStage = node.kind === NODE_KIND.STAGE
   const rejectEdges = flow.edges.filter(edge => edge.from === node.id && edge.kind === EDGE_KIND.REJECT)
   const targets = flow.nodes.filter(item => item.id !== node.id)
@@ -312,14 +416,35 @@ function NodeForm({ node, flow, skills, onPatch, onDelete, onAddMember, onPatchM
                   onClick: () => onPatch({ skills: node.skills.filter(item => item !== name) }),
                 }, '×'))))
               : null,
-            h(SkillsPicker, { value: node.skills, skills, onChange: next => onPatch({ skills: next }) }))),
-        h(Field, { label: '模型覆盖', hint: '留空跟随会话默认' },
-          h('input', {
-            className: 'fs-input',
-            placeholder: '例如 deepseek-chat',
-            value: node.model,
-            onChange: event => onPatch({ model: event.target.value }),
-          })),
+            h(SkillsPicker, {
+              value: node.skills,
+              skills,
+              onChange: next => onPatch({ skills: next }),
+              initialOpen: skillsOpen,
+              idPrefix: 'fs-skills',
+            }))),
+        h(Field, { label: '模型覆盖', hint: 'provider 与 model 必须成对；都留空跟随会话默认' },
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            h('input', {
+              className: 'fs-input',
+              placeholder: 'provider，例如 deepseek',
+              'aria-label': 'provider（与 model 成对）',
+              value: (node.extras && typeof node.extras.provider === 'string') ? node.extras.provider : '',
+              onChange: event => onPatch({
+                extras: { ...(node.extras || {}), provider: event.target.value },
+              }),
+            }),
+            h('input', {
+              className: 'fs-input',
+              placeholder: 'model，例如 deepseek-chat',
+              value: node.model,
+              onChange: event => onPatch({ model: event.target.value }),
+            }),
+            // 0.10 审查 F7：只填一半会在运行期 503；这里提前给出可见提示（不阻断保存）。
+            ((node.model || '').trim() !== '') !== (((node.extras && node.extras.provider) || '').trim() !== '')
+              ? h('div', { className: 'fs-hint', role: 'status', style: { color: 'var(--fs-r1-warn)' } },
+                'provider 与 model 当前只填了一个：运行会 503 并要求成对配置。')
+              : null)),
         rejectEdges.length > 0
           ? h(Field, { label: '打回上限', hint: '超过就交给人工' },
             h('input', {
@@ -384,6 +509,8 @@ export function Inspector({
   onPatchNode, onPatchEdge, onDeleteNode, onDeleteEdge,
   onAddMember, onPatchMember, onRemoveMember, onConnect, onNudge,
   locked = false, lockReason = '',
+  // 0.10 R7（结构设计 S4）：测试 / SSR 只认这个入口；SkillsPicker 内部接 initialOpen + idPrefix。
+  initialSkillsOpen = false,
 }) {
   let title = '配置'
   let executorBadge = ''
@@ -404,6 +531,7 @@ export function Inspector({
         node,
         flow,
         skills,
+        skillsOpen: initialSkillsOpen,
         onPatch: patch => onPatchNode(node.id, patch),
         onDelete: () => onDeleteNode(node.id),
         onAddMember,

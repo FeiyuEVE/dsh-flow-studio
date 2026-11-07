@@ -91,6 +91,31 @@ export function requestFailureText(status, data) {
 }
 
 /**
+ * 0.10 R8：`POST /runs/<id>/restart` 的失败文案。202 成功；失败按 HTTP 分流：
+ *  - 400：Host 原文（起点不在 next 路径 / 结构不合法 / run 还在跑…）；
+ *  - 404：run 或流程已不存在；
+ *  - 500：执行引擎未启用 / 不支持 restart；
+ *  - 503：有可继承会话但宿主 agents 不可用；
+ *  - 网络错误（没有 status）：用 error.message。
+ */
+export function restartFailureText(status, data, message) {
+  const detail = data && typeof data.error === 'string' ? data.error.trim() : ''
+  if (status === 400) {
+    // 0.10 审查 F5：page.js 会把 api 抛出的通用错误文案（请求失败（HTTP 400））当 message
+    // 传进来；400 且 Host 没给 detail 时不能用它覆盖可行动兜底。
+    const generic = typeof message === 'string' && /^请求失败（HTTP \d+）/.test(message)
+    return '重启失败：' + (detail || (!generic && message) || '请求不合法，刷新后重试')
+  }
+  if (status === 404) return '重启失败：run 或流程已不存在，刷新后重试'
+  if (status === 500) return '重启失败：执行引擎未启用或版本不匹配'
+  if (status === 503) return '重启失败：宿主 agents 不可用，无法在原会话续跑'
+  if (typeof status === 'number' && status > 0) {
+    return '重启失败：' + (detail || message || ('Host 返回 HTTP ' + status))
+  }
+  return '重启失败：' + (message || '连不上 Host 或响应不可读')
+}
+
+/**
  * 运行控制失败文案（06 §10/§11）。409 是**业务态**而不是故障：
  *  - `start` 撞上全局运行锁 → 「已有 run 在运行」；
  *  - `stop` 时目标已经不在跑 → 「不在运行中」。
@@ -99,6 +124,8 @@ export function requestFailureText(status, data) {
 export function runActionFailureText(action, status, data) {
   const detail = data && typeof data.error === 'string' ? data.error.trim() : ''
   const suffix = detail === '' ? '' : '（Host：' + detail + '）'
+  // 0.10 R8：restart 的文案与上面同一套 HTTP 口径，不再复述 start/stop 的 409 分支。
+  if (action === 'restart') return restartFailureText(status, data, detail)
   const prefix = action === 'stop' ? '停止失败：' : '开始失败：'
   if (status === 409) {
     if (action === 'stop') {
@@ -432,6 +459,8 @@ export const api = {
   // F2：start 也带请求体 {workspace}（后端缺 workspace 会 400，不再回落到进程 cwd）。
   startRun: (id, body) => request('POST', `/runs/${segment(id)}/start`, body),
   stopRun: id => request('POST', `/runs/${segment(id)}/stop`),
+  // 0.10 R8：202 `{ok, run, restart, plan, hint}`；非幂等，调用方不得自动重试。
+  restartRun: (id, body) => request('POST', `/runs/${segment(id)}/restart`, body || {}),
 }
 
 /**

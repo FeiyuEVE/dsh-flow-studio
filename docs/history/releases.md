@@ -165,3 +165,21 @@
 - **为什么不在解析器里无条件认合并块**：现有用例明确锁死「只有状态块（哪怕自带 `verdict:pass`、带全套证据）不得判完成」——那是防止「进度块冒充结论」的假绿闸门。放宽只放在「已经明确要过一次结论、模型仍这样交」的补偿路径上，两种语义各守一边。
 - **测试**：**23 个测试文件 / 806 组**全绿（`engine` 113 组 / 906 条断言，+1 组 / +10 条）。新增一组端到端（团队节点补要结论后回合并块 → `node/end passed`、`final.status done`、零失败事件、日志有合并块 warn）+ 5 条解析器断言（严格模式仍拒合并块、放宽模式认「完成态 + 证据」、放宽模式仍拒 in-progress 与无证据、凭证不符仍丢、同回复内纯结论优先）。做了**红→绿**双向验证：把 `src/engine.js` 改回旧行为，端到端那条直接红成 `'failed' !== 'done'`（就是真机症状），解析器断言红成 `null`。
 - **已知边界**：合并块里若没有证据字段（只有 `verdict` + 摘要），仍然不算结论——那种形状与状态块无法区分，宁可让节点按原语义失败并在界面上暴露，也不赌一次假绿。
+
+## 0.10.0 — 九条改进落地（这一版是插件自己的流水线在容器里开发出来的）
+
+0.9.x 把引擎修到「节点能干活」，0.10 修的是**用户看得见的那一层**：卡片上的三个按钮点不到、指标条永远少半行、会话跳不过去、preset 与工具清单不可见、skills 只能翻复选列表、失败后只能在终端里 restart。九条诉求按需求 → 方案 → 结构 → 开发 → 测试 → 审查六阶段做下来，3 轮节点内打回返工（`n_dev` attempt 3、`n_test` attempt 3、`n_review` attempt 2），产物与裁决见 `docs/plan/0.10-*.md`。
+
+- **R1 模型路由同源成对（P0）**：新增纯函数 `resolveModelRoute`，create 与 resume 共用一个解析器，来源只有 `node` / `session` / `host` 三种且必须**同源**——节点只配 `provider` 时不再拿宿主的 `model` 拼一对（旧实现允许 `openai + deepseek-chat`，现有用例还把它断言成合法，本轮改掉）；缺一半在**创建前** 503 并写明补哪一个字段；`sessions.json` 条目新增可选 `agentOptions`，冷会话 resume 带的还是这一对。resume 之后读 `agent.model.current()` 核对实际模型，不一致只 `warn` 不失败（宿主优先级是「会话已记录 > 上次请求 > agentOptions」，插件改不了已记录的 selection，就不假装能改）。
+- **R2 三键不裁切（P1）**：`.fs-node` 的 `overflow` 由 `hidden` 改 `visible`——整卡裁剪本来只为圆角服务，卡片内部各元素（标题/摘要省略号、tags/members）各自已有裁剪。卡片尺寸仍是 208×96（主从 208×116），悬浮工具条 3×22px 完整落在卡外。真实浏览器实测：`elementFromPoint` 命中按钮自身、祖先链无裁剪、hover 与 `:focus-within` 均可见、Tab+Enter 可点。
+- **R3 指标横条（P1）**：`.fs-log-stats` 由写死 `height:46px` 改 `min-height:58px; height:auto`，三行（值 / 标签 / 副说明）不再被裁；展开抽屉默认高度 200→340px，事件区实测 151px / 可见 3 行；200px 最小档 7 个 hint 一个不裁。
+- **R4 跳会话详情（P1）**：`ctx.get('uiWorkspace')` **懒取**（不写进 `inject`：必需服务缺失会让整块面板停在 PENDING），`openSession(sessionId)` 经 slot props 注入；节点详情「打开节点会话」与 run 头部「打开发起会话」两个入口，拿不到服务时降级成复制 id 并说明原因，不假装能跳。
+- **R5 preset 与来源可见（P2）**：`normalizeRun` 之前显式映射把 `sessions` 与 `agentPreset` 丢了（UI 就算写也拿不到），本轮先在归一化层补两个字段（坏形状降级 `null`）再渲染；节点详情显示「preset：<id>（来源：节点配置 / 流程 / 引擎 / 宿主兜底…）」，run 列表行也带 preset；只读展示，编辑入口留 0.11。
+- **R6 可用工具清单（P1）**：新增 `node/tools` 事件（不塞 `node/start`——`node/start` 早于 `agents.create`，创建前根本拿不到工具面），在 `_syncNodeRejectTool` **之后**采集，上限 64 个 × 64 字符、单条事件 ≤8KB；客户端分「可用工具」与「最近工具调用」两区，`tools.definitions` 抛错 / 无定义 / 被裁剪三条降级路径都留 warn，不静默空白。
+- **R7 skills 下拉多选（P2）**：检查器改成**内联 combobox**（不用浮层——检查器是滚动容器，浮层必被裁），保留搜索、chips、12 个上限与键盘契约（↑↓ / Enter / Space / Esc），并修掉「隐藏项仍被 Space 选中」的守卫 bug。
+- **R8 失败后重启 UI（P1）**：动作条新增「重启」；顺序不可反——**先 `flushBeforeLeave` 保存流程**，warning 非空就中止（一次 restart 都不发），只有 flush 成功才 `POST /runs/<id>/restart`（否则 Host 读到磁盘上的旧结构，A8.3「加边→重启→补挂工具」会假绿）；服务端同时加进程内互斥与「已有续跑 run → 400」（旧 run 不能被两个新 run 同时续）；错误码按 400/403/404/409/503 给可读文案。
+- **R9 打回旁路（P1）**：无出向打回边的节点仍不挂 `flow_node_reject`；但主管若用文本 `verdict=reject` 打回，旧实现会直接判 run 失败且不说原因——本轮**保留失败**（把打回降级成 pass 是正确性风险），只把文案改成可行动（「补一条 reject 边，或用重启在原会话续跑」）并在 `node/end` 写 `extra.rejectBypass='no-edge'`。
+- **验证**：`npm test` **EXIT 0**，23 个 `.test.mjs` / **855 组**（`engine` 127 组 / 1042 条断言、`engine-restart` 9 / 88、`render` 99、`logdrawer` 62 / 937；发布门禁 8 / 56，功能套件显式计数合计 3986 条）；`npm run build` **EXIT 0**（`lib/client.js` 472,988 B < 上限 524,288），`verify-build` **EXIT 0**；`docs/design/` 零 diff；无新增源码文件与依赖；未 push / 未 publish / 未重启任何服务（容器内的 dev 实例除外，那是测试环境）。
+- **真实浏览器证据**（测试节点在容器内解包 Chromium + puppeteer-core 量测，夹具不入库）：R2 三键 22×22 可命中；R3 指标条 67px 外框 / 58 内容盒、7 个 stat 三行齐、事件区 151px/3 行；R4 两个入口点击各调用一次、参数精确；R5 节点详情 `preset：ptc（来源：节点配置）`；R7 收起/展开/键盘/上限。
+- **已知边界（不阻塞，记录在案）**：① skills 搜索框在已有 active 时仍把 Space 当选择键（设计锁定，若要空格当搜索词需改契约）；② `page.js` 里有两处 340/200 的旧注释与结构文档不一致；③ `openSession` 不做归属校验、restart 错误横幅跨 run 残留等 F13–F17 观察项按 P2 accepted；④ 「start 失败留下 pending 子 run，会挡住旧 run 的 restart」是新暴露的 E13，发布补丁或 0.11 处理。
+- **怎么产出的**：这一版由 flow-studio 自己的六阶段流水线在容器里跑出来（`r-mw67vqpf-okns` 死在 `n_dev` → 修引擎发 0.9.5 → `restart` 续跑成 `r-mw6aiqyp-25z6` → done）。中途那次死在 `n_dev` 不是流程问题，而是 0.9.5 修的那个「状态块 + 结论合并」解析缺口——同一份代码先把自己踩的坑修掉，再跑完剩下的阶段。

@@ -34,7 +34,7 @@ const supervise = await import('../src/supervise.js')
 const {
   createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
   loadUpstreamArtifactContents, MAX_NODE_RETRIES, UPSTREAM_ARTIFACT_READ_MAX_BYTES,
-  nodeSessionId, ENGINE_OUTPUT_SCHEMA, parseAssistantStructured,
+  nodeSessionId, ENGINE_OUTPUT_SCHEMA, parseAssistantStructured, resolveModelRoute,
 } = engineModule
 
 /**
@@ -2403,7 +2403,9 @@ try {
     A.equal(events.find(event => event.kind === 'node/start').data.model, 'deepseek-chat')
   })
 
-  await check('node.model：默认 agents.create 补齐 provider，节点 model 优先且不带宿主 reasoningEffort', async () => {
+  await check('node.model：节点只配 model + 宿主整对 → 503 conflict（禁止跨来源拼），不发 create', async () => {
+    // 0.10 R1（S6/S7）：旧行为「宿主补 provider」被严格化 —— 节点半对一律失败，
+    // 不许拿宿主默认 / 会话记录补齐。
     const flow = flowOf('flow-model-spawn', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-reasoner' }), endNode()], [
       next('e1', 'n_start', 'n_model'),
       next('e2', 'n_model', 'n_end'),
@@ -2412,16 +2414,31 @@ try {
     const run = await makeRun('flow-model-spawn', 1)
     const engineRef = { value: null }
     const { ctx, created } = strictProviderHost(engineRef)
-    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeRetries: 0 })
     engineRef.value = engine
+    // 直接调用：半对 + 宿主整对 → EngineError(503)，不再是「补齐」。
+    let direct = null
+    try {
+      engine._resolveCreateAgentOptions({ model: 'deepseek-reasoner' }, { nodeId: 'n_model' })
+    } catch (error) {
+      direct = error
+    }
+    A.ok(direct instanceof EngineError, '节点半对 + 宿主整对必须抛 EngineError')
+    A.equal(direct.status, 503)
+    A.match(direct.message, /只配置了 model=deepseek-reasoner/)
+    A.match(direct.message, /不允许与宿主默认/)
+    A.match(direct.message, /补全 provider 与 model，或都留空/)
+    // 走完整 run：run 失败、reason 可诊断、agents.create 一次都没收到。
     await engine.start(run.id)
     const final = await engine.wait(run.id)
-    A.equal(final.status, 'done')
-    A.equal(created.length, 1)
-    A.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'deepseek-reasoner' })
-    A.equal('reasoningEffort' in created[0].agentOptions, false, '节点自定 model 时不得带宿主 reasoningEffort')
+    A.equal(final.status, 'failed')
+    A.equal(created.length, 0, '节点半对不得跨来源补齐后创建会话')
+    const runEnd = (await eventsOf(run.id)).find(event => event.kind === 'run/end')
+    A.match(runEnd.data.reason, /只配置了 model=deepseek-reasoner/)
+    // node/start 在主循环里先写，因此仍可观测（可观测性契约）。
+    A.equal((await eventsOf(run.id)).filter(event => event.kind === 'node/start').length, 1)
 
-    // 宿主默认 selection 里带 reasoningEffort 时同样不得移植给节点自定 model；
+    // 宿主默认 selection 带 reasoningEffort：节点整对时**不得**移植宿主档位；
     // 节点自己给了 reasoningEffort 才传。
     const effortEngine = createEngine({
       runsRoot,
@@ -2434,13 +2451,27 @@ try {
       },
     })
     A.deepEqual(
-      effortEngine._resolveCreateAgentOptions({ model: 'deepseek-reasoner' }),
-      { provider: 'deepseek', model: 'deepseek-reasoner' },
+      effortEngine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5' }),
+      { provider: 'openai', model: 'gpt-5' },
+    )
+    A.equal(
+      'reasoningEffort' in effortEngine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5' }),
+      false,
+      '节点整对时不得带宿主 reasoningEffort',
     )
     A.deepEqual(
-      effortEngine._resolveCreateAgentOptions({ model: 'deepseek-reasoner', reasoningEffort: 'low' }),
-      { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'low' },
+      effortEngine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5', reasoningEffort: 'low' }),
+      { provider: 'openai', model: 'gpt-5', reasoningEffort: 'low' },
     )
+    // 节点半对自己带 effort 也一样失败（半对优先于 effort）。
+    let effortConflict = null
+    try {
+      effortEngine._resolveCreateAgentOptions({ model: 'deepseek-reasoner', reasoningEffort: 'low' })
+    } catch (error) {
+      effortConflict = error
+    }
+    A.ok(effortConflict instanceof EngineError)
+    A.equal(effortConflict.status, 503)
   })
 
   await check('node.model：节点没设 model 时显式固定宿主默认模型路由（provider + model）', async () => {
@@ -2510,7 +2541,7 @@ try {
     A.deepEqual(created[0].agentOptions, { provider: 'openai', model: 'gpt-5' })
   })
 
-  await check('节点显式 provider（仅 provider）+ 宿主 selection：补宿主 model，仍成对', async () => {
+  await check('节点显式 provider（仅 provider）+ 宿主 selection → 503 conflict；agents.create 0 次', async () => {
     const engine = createEngine({
       runsRoot,
       flowsRoot,
@@ -2521,10 +2552,35 @@ try {
           : undefined),
       },
     })
-    A.deepEqual(
-      engine._resolveCreateAgentOptions({ provider: 'openai' }),
-      { provider: 'openai', model: 'deepseek-chat' },
-    )
+    let thrown = null
+    try {
+      engine._resolveCreateAgentOptions({ provider: 'openai' })
+    } catch (error) {
+      thrown = error
+    }
+    A.ok(thrown instanceof EngineError, '仅 provider + 宿主整对必须失败')
+    A.equal(thrown.status, 503)
+    A.match(thrown.message, /只配置了 provider=openai/)
+    A.match(thrown.message, /不允许与宿主默认/)
+
+    // 走完整 run：run 失败 + 宿主一次 create 都没收到。
+    const flow = flowOf('flow-provider-only', [
+      startNode(), stage('n_half', '业务', 300, { provider: 'openai' }), endNode(),
+    ], [next('e1', 'n_start', 'n_half'), next('e2', 'n_half', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-provider-only', 1)
+    const engineRef = { value: null }
+    const host = strictProviderHost(engineRef)
+    const runEngine = createEngine({
+      runsRoot, flowsRoot, ctx: host.ctx, nodeRetries: 0,
+    })
+    engineRef.value = runEngine
+    await runEngine.start(run.id)
+    const final = await runEngine.wait(run.id)
+    A.equal(final.status, 'failed')
+    A.equal(host.created.length, 0, '节点半对时不得创建会话')
+    const runEnd = (await eventsOf(run.id)).find(event => event.kind === 'run/end')
+    A.match(runEnd.data.reason, /只配置了 provider=openai/)
   })
 
   await check('节点侧显式 provider 优先：不被宿主默认模型覆盖', async () => {
@@ -2542,6 +2598,488 @@ try {
       engine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5' }),
       { provider: 'openai', model: 'gpt-5' },
     )
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine 0.10 · 模型路由同源成对（R1 / S7）')
+
+  await check('resolveModelRoute 规则表：node 整对优先、session、host、三处全无', () => {
+    const host = { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }
+    const session = { provider: 'openai', model: 'gpt-5' }
+    // ① node 整对：source=node；宿主 effort 不移植。
+    A.deepEqual(
+      resolveModelRoute({ node: { id: 'n_a', provider: 'openai', model: 'gpt-5' }, host, origin: 'create' }),
+      { ok: true, provider: 'openai', model: 'gpt-5', source: 'node' },
+    )
+    // ② node 整对 + node effort：只取 node 自己的 effort。
+    A.deepEqual(
+      resolveModelRoute({
+        node: { id: 'n_a', provider: 'openai', model: 'gpt-5', reasoningEffort: 'low' }, host,
+      }),
+      { ok: true, provider: 'openai', model: 'gpt-5', reasoningEffort: 'low', source: 'node' },
+    )
+    // ③ 无 node + session 整对（即使 host 也有整对）→ session 优先复用。
+    A.deepEqual(
+      resolveModelRoute({ session, host, origin: 'resume' }),
+      { ok: true, provider: 'openai', model: 'gpt-5', source: 'session' },
+    )
+    // ④ 无 node + session 无 + host 整对 → host，且**不带**宿主 effort。
+    const hostOnly = resolveModelRoute({ host, origin: 'create' })
+    A.deepEqual(hostOnly, { ok: true, provider: 'deepseek', model: 'deepseek-chat', source: 'host' })
+    A.equal('reasoningEffort' in hostOnly, false, '宿主 effort 永不移植')
+    // ⑤ 三处都没有 → UNAVAILABLE，文案含 A1.2 的两句。
+    const none = resolveModelRoute({ node: { id: 'n_b' }, host: null, session: null })
+    A.equal(none.ok, false)
+    A.equal(none.code, 'MODEL_ROUTE_UNAVAILABLE')
+    A.match(none.message, /宿主未提供 agentDefaultModel/)
+    A.match(none.message, /节点未配置/)
+    // ⑥ 节点只给 effort（provider/model 都空）不算半对：按宿主解析后带上节点 effort。
+    A.deepEqual(
+      resolveModelRoute({ node: { id: 'n_b', reasoningEffort: 'medium' }, host }),
+      { ok: true, provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'medium', source: 'host' },
+    )
+  })
+
+  await check('resolveModelRoute S7 分流：节点半对 → 另一来源有整对 CONFLICT / 没有则 UNAVAILABLE', () => {
+    const host = { provider: 'deepseek', model: 'deepseek-chat' }
+    const session = { provider: 'openai', model: 'gpt-5' }
+    // 只 provider + 宿主整对 → CONFLICT（禁止节点 provider + 宿主 model）。
+    const providerHalf = resolveModelRoute({ node: { id: 'n_b', provider: 'openai' }, host })
+    A.equal(providerHalf.ok, false)
+    A.equal(providerHalf.code, 'MODEL_ROUTE_CONFLICT')
+    A.match(providerHalf.message, /只配置了 provider=openai/)
+    A.match(providerHalf.message, /不允许与宿主默认/)
+    // 只 model + 宿主整对 → CONFLICT（反向同理）。
+    const modelHalfHost = resolveModelRoute({ node: { id: 'n_b', model: 'gpt-5' }, host })
+    A.equal(modelHalfHost.ok, false)
+    A.equal(modelHalfHost.code, 'MODEL_ROUTE_CONFLICT')
+    A.match(modelHalfHost.message, /只配置了 model=gpt-5/)
+    // 只 model + 只有 session 整对（宿主没配）→ 仍是 CONFLICT：节点半对不允许跨来源补齐。
+    const modelHalfSession = resolveModelRoute({ node: { id: 'n_b', model: 'gpt-5' }, session })
+    A.equal(modelHalfSession.ok, false)
+    A.equal(modelHalfSession.code, 'MODEL_ROUTE_CONFLICT')
+    // 只 model + 宿主也没整对 → UNAVAILABLE（文案含「宿主未提供 agentDefaultModel」）。
+    const modelHalfAlone = resolveModelRoute({ node: { id: 'n_b', model: 'gpt-5' }, host: null })
+    A.equal(modelHalfAlone.ok, false)
+    A.equal(modelHalfAlone.code, 'MODEL_ROUTE_UNAVAILABLE')
+    A.match(modelHalfAlone.message, /宿主未提供 agentDefaultModel/)
+    // 只 provider + 宿主半对 → 也不许拼：UNAVAILABLE；文案必须说「宿主只返回一半」，
+    // 不能误导成「宿主未提供」（F4：半对/半对仍称宿主未提供）。
+    const bothHalf = resolveModelRoute({ node: { id: 'n_b', provider: 'openai' }, host: { model: 'deepseek-chat' } })
+    A.equal(bothHalf.ok, false)
+    A.equal(bothHalf.code, 'MODEL_ROUTE_UNAVAILABLE')
+    A.match(bothHalf.message, /宿主 agentDefaultModel 只返回了 provider\/model 的一半/)
+    A.match(bothHalf.message, /model=deepseek-chat/)
+    A.equal(/宿主未提供 agentDefaultModel/.test(bothHalf.message), false,
+      '宿主返回了半对时不得说「宿主未提供」')
+  })
+
+  await check('R1 半对诊断分流：宿主缺席才说「未提供」，宿主半对说「只返回一半」', () => {
+    const absent = resolveModelRoute({ node: { id: 'n_b', model: 'gpt-5' }, host: null })
+    A.match(absent.message, /宿主未提供 agentDefaultModel/)
+    A.equal(/只返回了 provider\/model 的一半/.test(absent.message), false)
+    const half = resolveModelRoute({ node: { id: 'n_b', provider: 'openai' }, host: { provider: 'deepseek' } })
+    A.match(half.message, /只返回了 provider\/model 的一半/)
+    A.equal(/宿主未提供 agentDefaultModel/.test(half.message), false)
+    // 宿主完全没有 selection 对象（undefined）→ 仍按「未提供」。
+    const missing = resolveModelRoute({ node: { id: 'n_b', provider: 'openai' } })
+    A.match(missing.message, /宿主未提供 agentDefaultModel/)
+  })
+
+  await check('R1 节点字段超长不能被当成未配置而静默回退宿主（审查 F10）', () => {
+    const longProvider = 'p'.repeat(65)
+    const result = resolveModelRoute({
+      node: { id: 'n_long', provider: longProvider, model: 'gpt-5' },
+      host: { provider: 'deepseek', model: 'deepseek-chat' },
+    })
+    A.equal(result.ok, false, '超长 provider 必须失败，不能静默用宿主')
+    A.equal(result.code, 'MODEL_ROUTE_UNAVAILABLE')
+    A.match(result.message, /字段超长/)
+    A.match(result.message, /provider 最多 64 字符/)
+    const longModel = resolveModelRoute({
+      node: { id: 'n_long', provider: 'openai', model: 'm'.repeat(129) },
+      host: null,
+    })
+    A.equal(longModel.ok, false)
+    A.match(longModel.message, /model 最多 128 字符/)
+  })
+
+  await check('resolveModelRoute host 半对 → PARTIAL_HOST；坏形状不抛错、坏 session 整条忽略', () => {
+    const partial = resolveModelRoute({ node: { id: 'n_b' }, host: { provider: 'deepseek' } })
+    A.equal(partial.ok, false)
+    A.equal(partial.code, 'MODEL_ROUTE_PARTIAL_HOST')
+    A.match(partial.message, /provider\/model 的一半/)
+    A.match(partial.message, /model=（缺失）/)
+    // 不抛异常是硬契约：空 / 非对象的输入也只返回失败对象。
+    for (const input of [undefined, null, 'x', 42, [], { node: 'x', host: [], session: 42 }]) {
+      let result = null
+      let thrown = null
+      try {
+        result = input === undefined ? resolveModelRoute() : resolveModelRoute(input)
+      } catch (error) {
+        thrown = error
+      }
+      A.equal(thrown, null, 'resolveModelRoute 绝不抛异常')
+      A.equal(result.ok, false)
+      A.equal(typeof result.message, 'string')
+    }
+    // session 坏形状（半对 / 超长）整条忽略 → 回退 host 整对。
+    for (const badSession of [
+      { provider: 'openai' },
+      { provider: 'x'.repeat(65), model: 'gpt-5' },
+      { provider: 'openai', model: 'x'.repeat(129) },
+      {},
+      null,
+    ]) {
+      A.deepEqual(
+        resolveModelRoute({
+          node: { id: 'n_b' },
+          session: badSession,
+          host: { provider: 'deepseek', model: 'deepseek-chat' },
+          origin: 'resume',
+        }),
+        { ok: true, provider: 'deepseek', model: 'deepseek-chat', source: 'host' },
+      )
+    }
+  })
+
+  /** 0.10 R1/R6 fixture：agents.create 宿主，agent.ctx.tools.definitions 可注入。 */
+  function routedHost(engineRef, { definitions, toolsService = true, agentModel = null } = {}) {
+    const created = []
+    const resumed = []
+    const logs = []
+    const live = new Map()
+    const agentFor = sessionId => {
+      const tools = { register: () => () => {} }
+      if (definitions !== undefined) {
+        tools.definitions = typeof definitions === 'function' ? definitions : () => definitions
+      }
+      return {
+        session: { id: sessionId, header: {} },
+        ...(agentModel ? { model: { current: () => agentModel } } : {}),
+        ...(toolsService ? { ctx: { tools } } : {}),
+        followup(payload) {
+          const envelope = envelopeOf(payload)
+          if (!envelope) return
+          const nodeId = sessionId.includes('--') ? sessionId.split('--').pop() : 'n_a'
+          const structured = { attempt: envelope.attempt, nonce: envelope.nonce, ...structuredPass(nodeId) }
+          engineRef.value.handleSessionEvent({ id: sessionId }, {
+            type: 'assistant/message',
+            data: {
+              message: {
+                role: 'assistant',
+                content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
+              },
+            },
+          })
+        },
+        async whenIdle() {},
+      }
+    }
+    const ctx = {
+      on() { return () => {} },
+      get(name) {
+        if (name === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) }
+        }
+        if (name !== 'agents') return undefined
+        return {
+          async create(options) {
+            if (!options.agentOptions
+              || typeof options.agentOptions.provider !== 'string' || options.agentOptions.provider === ''
+              || typeof options.agentOptions.model !== 'string' || options.agentOptions.model === '') {
+              throw new TypeError('agentOptions 必须成对')
+            }
+            created.push(options)
+            live.set(options.sessionId, agentFor(options.sessionId))
+            return { agent: live.get(options.sessionId), async dispose() {} }
+          },
+          get(sessionId) {
+            return live.get(sessionId) || null
+          },
+          async resume(options) {
+            resumed.push(options)
+            live.set(options.resumeSessionId, agentFor(options.resumeSessionId))
+            return { agent: live.get(options.resumeSessionId), async dispose() {} }
+          },
+        }
+      },
+    }
+    return { ctx, created, resumed, logs }
+  }
+
+  await check('R1 resume：agents.resume 收到成对 agentOptions（sessions.json 记录的会话对）', async () => {
+    const flow = flowOf('flow-route-resume', [startNode(), stage('n_a', 'A', 300), endNode()], [
+      next('e1', 'n_start', 'n_a'), next('e2', 'n_a', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-route-resume', 1)
+    await store.writeNodeSessions(runsRoot, run.id, {
+      n_a: {
+        sessionId: 'cold-route-n_a',
+        createdAt: new Date().toISOString(),
+        lastUsedAt: new Date().toISOString(),
+        agentOptions: { provider: 'openai', model: 'gpt-5' },
+      },
+    })
+    const engineRef = { value: null }
+    const host = routedHost(engineRef)
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    A.equal(host.created.length, 0, '已有会话 → 不新建')
+    A.equal(host.resumed.length, 1)
+    A.deepEqual(host.resumed[0].agentOptions, { provider: 'openai', model: 'gpt-5' })
+    A.equal(host.resumed[0].resumeSessionId, 'cold-route-n_a')
+    // sessions.json 里的 route 被继承并保留（不是被下一次 persist 抹掉）。
+    const persisted = await store.readNodeSessions(runsRoot, run.id)
+    A.deepEqual(persisted.n_a.agentOptions, { provider: 'openai', model: 'gpt-5' })
+  })
+
+  await check('R1 resume 实际模型不一致 → 不失败但留可诊断 warn（审查 F1）', async () => {
+    const flow = flowOf('flow-route-resume-warn', [startNode(), stage('n_a', 'A', 300), endNode()], [
+      next('e1', 'n_start', 'n_a'), next('e2', 'n_a', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-route-resume-warn', 1)
+    await store.writeNodeSessions(runsRoot, run.id, {
+      n_a: {
+        sessionId: 'cold-route-warn_n_a',
+        createdAt: new Date().toISOString(),
+        lastUsedAt: new Date().toISOString(),
+        agentOptions: { provider: 'openai', model: 'gpt-5' },
+      },
+    })
+    const engineRef = { value: null }
+    // 宿主优先「会话已记录的选择」：实际生效 gpt-7，与请求的 gpt-5 不同。
+    const host = routedHost(engineRef, { agentModel: { provider: 'openai', model: 'gpt-7' } })
+    const logs = []
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx: host.ctx, log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done', '模型漂移只 warn，不失败')
+    A.ok(logs.some(line => line.startsWith('warn:')
+      && /实际模型 openai\/gpt-7/.test(line)
+      && /本次请求 openai\/gpt-5/.test(line)), '必须留下实际模型与请求模型的 warn')
+  })
+
+  await check('R1 resume：旧 entry 无 agentOptions 时回退宿主整对；节点显式对优先于会话对', async () => {
+    // ① 旧文件（无 agentOptions）→ 回退 host。
+    const flow = flowOf('flow-route-resume-old', [startNode(), stage('n_a', 'A', 300), endNode()], [
+      next('e1', 'n_start', 'n_a'), next('e2', 'n_a', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-route-resume-old', 1)
+    await store.writeNodeSessions(runsRoot, run.id, {
+      n_a: { sessionId: 'cold-old-n_a', createdAt: new Date().toISOString(), lastUsedAt: new Date().toISOString() },
+    })
+    const engineRef = { value: null }
+    const host = routedHost(engineRef)
+    const engine = createEngine({ runsRoot, flowsRoot, ctx: host.ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done')
+    A.equal(host.resumed.length, 1)
+    A.deepEqual(host.resumed[0].agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
+    // 解析结果被记进 sessions.json（下一次 resume 就有会话对可复用）。
+    A.deepEqual(
+      (await store.readNodeSessions(runsRoot, run.id)).n_a.agentOptions,
+      { provider: 'deepseek', model: 'deepseek-chat' },
+    )
+
+    // ② 节点显式整对 > 会话记录的对。
+    const nodeFlow = flowOf('flow-route-resume-node', [
+      startNode(), stage('n_a', 'A', 300, { provider: 'anthropic', model: 'claude-x' }), endNode(),
+    ], [next('e1', 'n_start', 'n_a'), next('e2', 'n_a', 'n_end')])
+    await saveFlow(nodeFlow)
+    const nodeRun = await makeRun('flow-route-resume-node', 1)
+    await store.writeNodeSessions(runsRoot, nodeRun.id, {
+      n_a: {
+        sessionId: 'cold-node-n_a',
+        createdAt: new Date().toISOString(),
+        lastUsedAt: new Date().toISOString(),
+        agentOptions: { provider: 'openai', model: 'gpt-5' },
+      },
+    })
+    const engineRef2 = { value: null }
+    const host2 = routedHost(engineRef2)
+    const engine2 = createEngine({ runsRoot, flowsRoot, ctx: host2.ctx })
+    engineRef2.value = engine2
+    await engine2.start(nodeRun.id)
+    A.equal((await engine2.wait(nodeRun.id)).status, 'done')
+    A.deepEqual(host2.resumed[0].agentOptions, { provider: 'anthropic', model: 'claude-x' })
+    A.deepEqual(
+      (await store.readNodeSessions(runsRoot, nodeRun.id)).n_a.agentOptions,
+      { provider: 'anthropic', model: 'claude-x' },
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('engine 0.10 · 节点可用工具快照（node/tools，R6）')
+
+  const toolsFlow = () => flowOf('flow-node-tools', [
+    startNode(), stage('n_a', 'A', 300), stage('n_b', 'B', 600), endNode(),
+  ], [
+    next('e1', 'n_start', 'n_a'),
+    next('e2', 'n_a', 'n_b'),
+    next('e3', 'n_b', 'n_end'),
+    reject('r1', 'n_b', 'n_a'),
+  ])
+
+  async function runWithTools(hostOptions, flowId, extraEngineOptions = {}) {
+    const flow = { ...toolsFlow(), id: flowId }
+    await saveFlow(flow)
+    const run = await makeRun(flowId, 2)
+    const engineRef = { value: null }
+    const host = routedHost(engineRef, hostOptions)
+    const logs = []
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx: host.ctx,
+      log: (level, message) => logs.push(`${level}:${message}`),
+      ...extraEngineOptions,
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    return { flow, run, engine, host, logs, final, events }
+  }
+
+  await check('R6 有/无出向 reject 边：node/tools 里 flow_node_reject 只出现在有边的节点', async () => {
+    const { final, events } = await runWithTools({ definitions: () => [
+      { name: 'read' }, { name: 'bash' }, { name: 'write' },
+    ] }, 'flow-node-tools-gate')
+    A.equal(final.status, 'done')
+    const toolsEvents = events.filter(event => event.kind === 'node/tools')
+    A.equal(toolsEvents.length, 2, '每个阶段节点各一条（每次 attempt 一条）')
+    const byNode = new Map(toolsEvents.map(event => [event.nodeId, event]))
+    // 排序 + 去重：read/bash/write → bash/read/write；n_b 另加 flow_node_reject（字典序在 b 之后）。
+    A.deepEqual(byNode.get('n_a').data, {
+      tools: ['bash', 'read', 'write'], toolsSource: 'session', count: 3,
+    })
+    A.deepEqual(byNode.get('n_b').data, {
+      tools: ['bash', 'flow_node_reject', 'read', 'write'], toolsSource: 'session', count: 4,
+    })
+    A.equal(byNode.get('n_a').attemptId, 1)
+    A.match(byNode.get('n_a').traceId, /^tr-.+-n_a-1$/, 'traceId 与 node/start 同口径')
+    A.equal(byNode.get('n_a').extra, undefined, '合法事件不该被塞 extra')
+  })
+
+  await check('R6 排序 / 去重 / 64 截断 / truncated 标记', async () => {
+    // 乱序 + 重复：采集端去重后按字典序。
+    const dup = await runWithTools({ definitions: () => [
+      { name: 'write' }, { name: 'bash' }, { name: 'write' }, { name: 'Bash' },
+    ] }, 'flow-node-tools-sort')
+    const dupEvent = dup.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.deepEqual(dupEvent.data.tools, ['Bash', 'bash', 'write'])
+    A.equal(dupEvent.data.count, 3)
+    // 70 项 → 截到 64 + truncated。
+    const many = Array.from({ length: 70 }, (_, index) => ({ name: `t${String(index).padStart(2, '0')}` }))
+    const truncated = await runWithTools({ definitions: () => many }, 'flow-node-tools-truncate')
+    const truncatedEvent = truncated.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.equal(truncatedEvent.data.tools.length, 64)
+    A.equal(truncatedEvent.data.count, 64)
+    A.equal(truncatedEvent.data.truncated, true)
+    A.equal(truncatedEvent.data.tools[0], 't00')
+    A.equal(truncatedEvent.data.tools[63], 't63')
+    // 8KB 预算：64 项 × 64 字符仍在单条上限内（防御性字节裁剪不会误伤合法清单）。
+    const longNames = Array.from({ length: 64 }, (_, index) => ({
+      name: `t${String(index).padStart(2, '0')}${'x'.repeat(61)}`,
+    }))
+    const longRun = await runWithTools({ definitions: () => longNames }, 'flow-node-tools-bytes')
+    const longEvent = longRun.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.equal(longEvent.data.count, 64)
+    A.equal(longEvent.data.truncated, undefined, '64×64 必须还在 8KB 内，不该触发字节裁剪')
+    A.ok(Buffer.byteLength(JSON.stringify(longEvent), 'utf8') < 8 * 1024)
+  })
+
+  await check('R6 64 截断必须保留 flow_node_reject（打回工具不被字典序吞掉）', async () => {
+    // 70 个按字典序排在 flow_node_reject 之前的工具名：旧实现 slice(0,64) 会把打回工具扔掉，
+    // 让「有出向 reject 边」在 node/tools 里不可核对。截断必须给它预留槽位。
+    const many = Array.from({ length: 70 }, (_, index) => ({ name: `a${String(index).padStart(2, '0')}` }))
+    const { final, events } = await runWithTools({ definitions: () => many }, 'flow-node-tools-keep-reject')
+    A.equal(final.status, 'done')
+    const rejectEvent = events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_b')
+    A.equal(rejectEvent.data.truncated, true)
+    A.equal(rejectEvent.data.count, 64)
+    A.equal(rejectEvent.data.tools.length, 64)
+    A.ok(rejectEvent.data.tools.includes('flow_node_reject'), '有出向 reject 边时截断也必须保留打回工具')
+    A.equal(rejectEvent.data.tools[63], 'flow_node_reject', '打回工具应占最后一个槽位')
+    // 无出向 reject 边的节点不凭空多出打回工具。
+    const plainEvent = events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.ok(!plainEvent.data.tools.includes('flow_node_reject'))
+  })
+
+  await check('R6 采集时机：definitions 每个 attempt 调 1 次，node/tools 晚于 node/start', async () => {
+    let definitionsCalls = 0
+    const { final, events } = await runWithTools({
+      definitions: () => { definitionsCalls += 1; return [{ name: 'bash' }] },
+    }, 'flow-node-tools-timing')
+    A.equal(final.status, 'done')
+    A.equal(definitionsCalls, 2, '两个阶段节点各一个 attempt → definitions 恰好 2 次')
+    for (const nodeId of ['n_a', 'n_b']) {
+      const start = events.find(event => event.kind === 'node/start' && event.nodeId === nodeId)
+      const tools = events.find(event => event.kind === 'node/tools' && event.nodeId === nodeId)
+      A.ok(start && tools)
+      A.ok(tools.seq > start.seq, nodeId + ' 的 node/tools 必须晚于 node/start（create/resume 之后才拿得到）')
+    }
+  })
+
+  await check('R6 无 tools 服务 → toolsSource=unavailable 且 run 不失败；definitions 抛错同样降级', async () => {
+    const noTools = await runWithTools({ toolsService: false }, 'flow-node-tools-none')
+    A.equal(noTools.final.status, 'done', '没有工具服务不能把节点跑挂')
+    A.ok(noTools.logs.some(line => line.startsWith('warn:') && /没有 agent\.ctx\.tools 服务/.test(line)),
+      '没有 tools 服务必须留 warn（审查 F8）')
+    const noneEvent = noTools.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.deepEqual(noneEvent.data, { tools: [], toolsSource: 'unavailable', count: 0 })
+    // 没有 tools 服务时连打回工具也注册不了（`_syncNodeRejectTool` 只 warn）→ 清单为空，
+    // 但节点照跑；有 tools 服务、只是没有 definitions 时，打回工具仍会并进清单。
+    const bEvent = noTools.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_b')
+    A.deepEqual(bEvent.data, { tools: [], toolsSource: 'unavailable', count: 0 })
+
+    const boom = await runWithTools({ definitions: () => { throw new Error('tools 服务炸了') } },
+      'flow-node-tools-throw')
+    A.ok(boom.logs.some(line => line.startsWith('warn:') && /枚举节点/.test(line)),
+      'definitions 抛错必须留 warn（审查 F8）')
+    A.equal(boom.final.status, 'done')
+    const boomEvent = boom.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_a')
+    A.deepEqual(boomEvent.data, { tools: [], toolsSource: 'unavailable', count: 0 })
+
+    // 有 tools 服务、只是没有 `definitions`（旧宿主）：仍按 unavailable，但本轮已注册的
+    // flow_node_reject 必须保留在清单里（不依赖宿主 definitions 是否可见）。
+    const noDefinitions = await runWithTools({}, 'flow-node-tools-no-definitions')
+    A.equal(noDefinitions.final.status, 'done')
+    const bNoDefs = noDefinitions.events.find(event => event.kind === 'node/tools' && event.nodeId === 'n_b')
+    A.deepEqual(bNoDefs.data, { tools: ['flow_node_reject'], toolsSource: 'unavailable', count: 1 })
+  })
+
+  await check('R6 append 失败不阻断节点：node/tools 写不进去只 warn，run 仍 done', async () => {
+    const flow = flowOf('flow-node-tools-append-fail', [
+      startNode(), stage('n_a', 'A', 300), endNode(),
+    ], [next('e1', 'n_start', 'n_a'), next('e2', 'n_a', 'n_end')])
+    await saveFlow(flow)
+    const run = await makeRun('flow-node-tools-append-fail', 1)
+    const engineRef = { value: null }
+    const host = routedHost(engineRef, { definitions: () => [{ name: 'bash' }] })
+    const logs = []
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx: host.ctx, log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    engineRef.value = engine
+    const originalAppend = engine._append.bind(engine)
+    engine._append = async (runId, events, options) => {
+      if (events.some(event => event && event.kind === 'node/tools')) throw new Error('磁盘满了')
+      return originalAppend(runId, events, options)
+    }
+    await engine.start(run.id)
+    A.equal((await engine.wait(run.id)).status, 'done', '采集失败不能阻断节点')
+    A.equal((await eventsOf(run.id)).some(event => event.kind === 'node/tools'), false)
+    A.ok(logs.some(line => line.startsWith('warn:') && /可用工具/.test(line)), '必须留 warn')
   })
 
   // -------------------------------------------------------------------------

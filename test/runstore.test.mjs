@@ -2273,12 +2273,178 @@ process.stdout.write('OK:' + total)
     assert.equal(both.total, 3)
     assert.deepEqual(both.events.map(item => item.seq), [2, 3, 4])
 
+    // 0.10 R6：node/tools 同样在「runlog 认得」的扩展白名单里，?kinds= 过滤不能 400。
+    await store.appendEvents(runsRoot, meta.id, [
+      event('node/tools', {
+        runId: meta.id,
+        data: { tools: ['bash', 'read'], toolsSource: 'session', count: 2 },
+      }),
+    ], { now: NOW })
+    const tools = await store.readEvents(runsRoot, meta.id, { kinds: ['node/tools'], limit: 10 })
+    assert.equal(tools.total, 1)
+    assert.deepEqual(tools.events[0].data.tools, ['bash', 'read'])
+    assert.equal(tools.events[0].data.count, 2)
+
     // 白名单只放宽到「runlog 认得的 kind」，未知类型仍然 400。
     await assert.rejects(
       () => store.readEvents(runsRoot, meta.id, { kinds: ['machine/nope'], limit: 10 }),
       error => error.status === 400 && error.field === 'kind',
     )
     console.log(`  · machine/transition ${machine.total} 条、node/status ${status.total} 条、二者合并 ${both.total} 条；未知 kind 仍 400`)
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runstore.js · 会话条目的 agentOptions（0.10 R1 / S2）')
+
+  await check('normalizeSessionAgentOptions：成对才通过；半对 / 坏形状 / 超长整条 null', () => {
+    assert.deepEqual(
+      store.normalizeSessionAgentOptions({ provider: 'openai', model: 'gpt-5' }),
+      { provider: 'openai', model: 'gpt-5' },
+    )
+    assert.deepEqual(
+      store.normalizeSessionAgentOptions({ provider: 'openai', model: 'gpt-5', reasoningEffort: 'low' }),
+      { provider: 'openai', model: 'gpt-5', reasoningEffort: 'low' },
+    )
+    // 空串 effort 视为没写（不整条作废）。
+    assert.deepEqual(
+      store.normalizeSessionAgentOptions({ provider: 'openai', model: 'gpt-5', reasoningEffort: '' }),
+      { provider: 'openai', model: 'gpt-5' },
+    )
+    for (const bad of [
+      null, undefined, 'openai', 42, [], {},
+      { provider: 'openai' },
+      { model: 'gpt-5' },
+      { provider: '', model: 'gpt-5' },
+      { provider: 'openai', model: '' },
+      { provider: '   ', model: 'gpt-5' },
+      { provider: 1, model: 'gpt-5' },
+      { provider: 'openai', model: 5 },
+      { provider: 'x'.repeat(65), model: 'gpt-5' },
+      { provider: 'openai', model: 'x'.repeat(129) },
+      { provider: 'openai', model: 'gpt-5', reasoningEffort: 3 },
+      { provider: 'openai', model: 'gpt-5', reasoningEffort: 'x'.repeat(65) },
+    ]) {
+      assert.equal(store.normalizeSessionAgentOptions(bad), null, JSON.stringify(bad))
+    }
+  })
+
+  await check('agentOptions 往返：writeNodeSessions 落盘、readNodeSessions 原样读回；无字段的旧条目不多出键', async () => {
+    const meta = await makeRun()
+    await store.writeNodeSessions(runsRoot, meta.id, {
+      n_pair: {
+        sessionId: 'sess-pair',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+        agentOptions: { provider: 'openai', model: 'gpt-5', reasoningEffort: 'high' },
+      },
+      n_old: {
+        sessionId: 'sess-old',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+      },
+    })
+    const read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.deepEqual(read.n_pair.agentOptions, {
+      provider: 'openai', model: 'gpt-5', reasoningEffort: 'high',
+    })
+    assert.equal(Object.hasOwn(read.n_old, 'agentOptions'), false, '旧条目不会凭空多出 agentOptions')
+    // 第二次整写（模拟引擎 persist）不能把字段抹掉。
+    await store.writeNodeSessions(runsRoot, meta.id, read)
+    assert.deepEqual(
+      (await store.readNodeSessions(runsRoot, meta.id)).n_pair.agentOptions,
+      { provider: 'openai', model: 'gpt-5', reasoningEffort: 'high' },
+    )
+  })
+
+  await check('agentOptions 坏形状：整条丢字段但保留 sessionId / 时间戳，不抛错', async () => {
+    const meta = await makeRun()
+    const path = join(runsRoot, meta.id, 'sessions.json')
+    writeFileSync(path, JSON.stringify({
+      n_half: {
+        sessionId: 'sess-half',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+        agentOptions: { provider: 'openai' },
+      },
+      n_number: {
+        sessionId: 'sess-number',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+        agentOptions: 42,
+      },
+      n_array: {
+        sessionId: 'sess-array',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+        agentOptions: ['openai', 'gpt-5'],
+      },
+      n_long: {
+        sessionId: 'sess-long',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+        agentOptions: { provider: 'x'.repeat(65), model: 'gpt-5' },
+      },
+    }))
+    const read = await store.readNodeSessions(runsRoot, meta.id)
+    for (const [nodeId, sessionId] of [
+      ['n_half', 'sess-half'], ['n_number', 'sess-number'], ['n_array', 'sess-array'], ['n_long', 'sess-long'],
+    ]) {
+      assert.equal(read[nodeId].sessionId, sessionId, `${nodeId} 必须保留 sessionId`)
+      assert.equal(Object.hasOwn(read[nodeId], 'agentOptions'), false, `${nodeId} 的坏 agentOptions 要整条丢弃`)
+      assert.equal(read[nodeId].createdAt, '2026-11-06T00:00:00.000Z')
+    }
+  })
+
+  await check('upsertNodeSession：同 session 保留旧 route、显式合法值覆盖、新 session 不继承', async () => {
+    const meta = await makeRun()
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_a', 'sess-1', {
+      now: new Date('2026-11-06T00:00:00.000Z'),
+      agentOptions: { provider: 'openai', model: 'gpt-5' },
+    })
+    // 同 sessionId、不传 agentOptions → 保留旧 route。
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_a', 'sess-1', {
+      now: new Date('2026-11-06T00:10:00.000Z'),
+    })
+    let read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.deepEqual(read.n_a.agentOptions, { provider: 'openai', model: 'gpt-5' })
+    // 同 sessionId、传坏形状 → 仍然保留旧 route（坏值不能把已有路由抹成空）。
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_a', 'sess-1', {
+      now: new Date('2026-11-06T00:20:00.000Z'),
+      agentOptions: { provider: 'only-half' },
+    })
+    read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.deepEqual(read.n_a.agentOptions, { provider: 'openai', model: 'gpt-5' })
+    // 同 sessionId、传新的合法值 → 覆盖。
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_a', 'sess-1', {
+      now: new Date('2026-11-06T00:30:00.000Z'),
+      agentOptions: { provider: 'deepseek', model: 'deepseek-chat' },
+    })
+    read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.deepEqual(read.n_a.agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
+    // 新 sessionId → 不凭空继承旧节点的 route。
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_a', 'sess-2', {
+      now: new Date('2026-11-06T00:40:00.000Z'),
+    })
+    read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.equal(read.n_a.sessionId, 'sess-2')
+    assert.equal(Object.hasOwn(read.n_a, 'agentOptions'), false, '新会话不得继承旧 route')
+  })
+
+  await check('旧文件没有 agentOptions：读回不带该键，upsert 其它节点也不会给它补一个', async () => {
+    const meta = await makeRun()
+    const path = join(runsRoot, meta.id, 'sessions.json')
+    writeFileSync(path, JSON.stringify({
+      n_old: {
+        sessionId: 'sess-old',
+        createdAt: '2026-11-06T00:00:00.000Z',
+        lastUsedAt: '2026-11-06T00:01:00.000Z',
+      },
+    }))
+    assert.equal(Object.hasOwn((await store.readNodeSessions(runsRoot, meta.id)).n_old, 'agentOptions'), false)
+    await store.upsertNodeSession(runsRoot, meta.id, 'n_other', 'sess-other')
+    const read = await store.readNodeSessions(runsRoot, meta.id)
+    assert.equal(Object.hasOwn(read.n_old, 'agentOptions'), false)
+    assert.equal(Object.hasOwn(read.n_other, 'agentOptions'), false)
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

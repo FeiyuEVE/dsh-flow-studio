@@ -31,7 +31,9 @@ import { chmod, lstat, mkdir, readdir, readFile, realpath as realpathAsync, writ
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 import { DEFAULT_AGENT_PRESET, EDGE_KIND, EXEC_MODE, EXECUTOR, NODE_KIND } from './model.js'
-import { checkRunId, isSafeRelPath, normalizeEvent } from './runlog.js'
+import {
+  MAX_EVENT_BYTES, NODE_TOOL_NAME_PATTERN, NODE_TOOLS_MAX, checkRunId, isSafeRelPath, normalizeEvent,
+} from './runlog.js'
 import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 // 07 §4（R1+R4）：工作区解析 / worktree 决策是 start 时的一次性判断，纯逻辑 + 真 git。
 import { createWorktree, decideWorktree, resolveWorkspace, workspaceIdFor } from './worktree.js'
@@ -714,6 +716,161 @@ export function canReachViaNext(flow, from, to) {
     }
   }
   return false
+}
+
+/** 模型路由（0.10 §2.1 / §4.1）：provider / model / effort 的长度上限。 */
+const MODEL_ROUTE_PROVIDER_MAX = 64
+const MODEL_ROUTE_MODEL_MAX = 128
+const MODEL_ROUTE_EFFORT_MAX = 64
+
+/** 路由字段：非空字符串、trim 后非空、不超过上限；其余一律视为「没配置」。 */
+function routeField(value, max) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed.length > max) return null
+  return trimmed
+}
+
+/** 取一个来源里的**整对**路由；半对 / 坏形状返回 null（绝不做字段级合并）。 */
+function routePair(source) {
+  if (!isPlainObject(source)) return null
+  const provider = routeField(source.provider, MODEL_ROUTE_PROVIDER_MAX)
+  const model = routeField(source.model, MODEL_ROUTE_MODEL_MAX)
+  if (provider === null || model === null) return null
+  return { provider, model }
+}
+
+/** 结构设计 S2：`sessions.json` 条目 `agentOptions` 的唯一归一化入口（形状由 runstore 拥有）。 */
+function normalizeSessionRoute(value) {
+  const normalize = runstoreModule.normalizeSessionAgentOptions
+  return typeof normalize === 'function' ? normalize(value) : null
+}
+
+/**
+ * 0.10 R1（方案 §2.1 / §4.1，结构设计 S1/S7）：解析节点会话的模型路由。
+ *
+ * **纯函数**：不读 ctx、不读 fs、不抛异常，只返回结果对象，便于单测与红→绿。
+ * create / resume / legacy spawn 三个调用点共用这一份规则（`_resolveCreateAgentOptions`、
+ * `_followupNodeSession`、`_legacyActivate`）。
+ *
+ * 规则（同源成对，硬判据）：
+ *   1. node 整对 → 用 node（`reasoningEffort` 只取 node 自己的，不移植宿主档位）；
+ *   2. node 半对（只有 provider 或只有 model）→ **禁止**拿 host/session 补齐：
+ *      - 另一来源（session / host）有整对 → `MODEL_ROUTE_CONFLICT`（S7）；
+ *      - 另一来源也没有整对 → `MODEL_ROUTE_UNAVAILABLE`（文案含「宿主未提供 agentDefaultModel」）；
+ *   3. 否则 session 整对 → 用 session（resume 优先复用创建时实际传的那一对）；
+ *   4. 否则 host 整对 → 用 host，**不带** host 的 `reasoningEffort`；
+ *   5. host 只回了一半 → `MODEL_ROUTE_PARTIAL_HOST`；
+ *   6. 都没有（或形状坏）→ `MODEL_ROUTE_UNAVAILABLE`。
+ *
+ * @param {{ node?: object, host?: object|null, session?: object|null, origin?: string }} [input]
+ * @returns {{ ok: true, provider: string, model: string, reasoningEffort?: string,
+ *   source: 'node'|'session'|'host' } | { ok: false,
+ *   code: 'MODEL_ROUTE_CONFLICT'|'MODEL_ROUTE_UNAVAILABLE'|'MODEL_ROUTE_PARTIAL_HOST',
+ *   message: string }}
+ */
+export function resolveModelRoute(input = {}) {
+  const source = isPlainObject(input) ? input : {}
+  const node = isPlainObject(source.node) ? source.node : null
+  const nodeProvider = routeField(node && node.provider, MODEL_ROUTE_PROVIDER_MAX)
+  const nodeModel = routeField(node && node.model, MODEL_ROUTE_MODEL_MAX)
+  const nodeEffort = routeField(node && node.reasoningEffort, MODEL_ROUTE_EFFORT_MAX)
+  const withNodeEffort = pair => ({
+    ...pair,
+    ...(nodeEffort === null ? {} : { reasoningEffort: nodeEffort }),
+  })
+  const rawTitle = node && typeof node.title === 'string' ? node.title.trim() : ''
+  const rawId = node && typeof node.id === 'string' ? node.id.trim() : ''
+  const nodeLabel = `节点「${rawTitle || rawId || '（未命名）'}」`
+  const sessionPair = routePair(source.session)
+  const hostPair = routePair(source.host)
+
+  // 0.10 审查 F10：节点字段**存在但超长**不能被当成「未配置」而静默回退宿主
+  //（那会把用户显式配置换掉）。直接给可诊断的 503，不创建会话。
+  const rawNodeProvider = node && typeof node.provider === 'string' ? node.provider.trim() : ''
+  const rawNodeModel = node && typeof node.model === 'string' ? node.model.trim() : ''
+  if ((rawNodeProvider !== '' && nodeProvider === null) || (rawNodeModel !== '' && nodeModel === null)) {
+    return {
+      ok: false,
+      code: 'MODEL_ROUTE_UNAVAILABLE',
+      message: `${nodeLabel}的模型路由字段超长：provider 最多 ${MODEL_ROUTE_PROVIDER_MAX} 字符、`
+        + `model 最多 ${MODEL_ROUTE_MODEL_MAX} 字符（当前 provider=${rawNodeProvider.length} / model=${rawNodeModel.length} 字符）。`
+        + '请缩短后再开跑，不会静默回退宿主默认。',
+    }
+  }
+  // 1) 节点整对：最具体的来源优先。
+  if (nodeProvider !== null && nodeModel !== null) {
+    return { ok: true, ...withNodeEffort({ provider: nodeProvider, model: nodeModel }), source: 'node' }
+  }
+  // 2) 节点半对：绝不跨来源拼（S7 按另一来源是否整对分流错误码）。
+  if (nodeProvider !== null || nodeModel !== null) {
+    const configured = nodeProvider !== null ? `provider=${nodeProvider}` : `model=${nodeModel}`
+    if (sessionPair || hostPair) {
+      return {
+        ok: false,
+        code: 'MODEL_ROUTE_CONFLICT',
+        message: `${nodeLabel}只配置了 ${configured}，不允许与宿主默认/会话记录拼成一对；`
+          + '请同时补全 provider 与 model，或都留空',
+      }
+    }
+    // 0.10 R1 修正：宿主**返回了半对**时不能说「宿主未提供 agentDefaultModel」，
+    // 否则会把「宿主坏了」误导成「宿主没配」。两边都不成对 → 仍判 503，但文案分开。
+    const rawHost = isPlainObject(source.host) ? source.host : null
+    const hostHalf = rawHost
+      ? (typeof rawHost.provider === 'string' && rawHost.provider.trim() !== '')
+        || (typeof rawHost.model === 'string' && rawHost.model.trim() !== '')
+      : false
+    if (hostHalf) {
+      return {
+        ok: false,
+        code: 'MODEL_ROUTE_UNAVAILABLE',
+        message: `${nodeLabel}只配置了 ${configured}，且宿主 agentDefaultModel 只返回了 provider/model 的一半`
+          + `（provider=${typeof rawHost.provider === 'string' && rawHost.provider.trim() !== '' ? rawHost.provider : '（缺失）'} / `
+          + `model=${typeof rawHost.model === 'string' && rawHost.model.trim() !== '' ? rawHost.model : '（缺失）'}）；`
+          + '两边都不成对，不能在节点与宿主之间拼成一对。请补全节点 provider 与 model，'
+          + '或让宿主返回成对的 provider + model 后再开跑。',
+      }
+    }
+    return {
+      ok: false,
+      code: 'MODEL_ROUTE_UNAVAILABLE',
+      message: `${nodeLabel}无法确定模型路由：宿主未提供 agentDefaultModel（拿不到默认 provider/model），`
+        + `且节点未配置成对的 provider/model（当前只配置了 ${configured}）。`
+        + '请在节点上同时配置 provider 与 model，或让宿主提供 agentDefaultModel 后再开跑。',
+    }
+  }
+  // 3) 会话记录里创建时实际传过的那一对（resume 复用，避免模型漂移）。
+  if (sessionPair) {
+    return { ok: true, ...withNodeEffort(sessionPair), source: 'session' }
+  }
+  // 4) 宿主默认整对（绝不带宿主 reasoningEffort——不同模型档位不可移植；
+  //    但节点自己显式给的 effort 仍要带上）。
+  if (hostPair) {
+    return { ok: true, ...withNodeEffort(hostPair), source: 'host' }
+  }
+  // 5) 宿主只回了一半：不是「没配」，要给可诊断的 PARTIAL_HOST。
+  if (isPlainObject(source.host)) {
+    const host = source.host
+    const hasProvider = typeof host.provider === 'string' && host.provider.trim() !== ''
+    const hasModel = typeof host.model === 'string' && host.model.trim() !== ''
+    if (hasProvider || hasModel) {
+      return {
+        ok: false,
+        code: 'MODEL_ROUTE_PARTIAL_HOST',
+        message: `宿主 agentDefaultModel 只返回了 provider/model 的一半：`
+          + `provider=${hasProvider ? host.provider : '（缺失）'} / model=${hasModel ? host.model : '（缺失）'}；`
+          + '无法确定节点会话的模型路由，请让宿主返回成对的 provider + model 后重试。',
+      }
+    }
+  }
+  // 6) 三处都没有成对路由。
+  return {
+    ok: false,
+    code: 'MODEL_ROUTE_UNAVAILABLE',
+    message: `${nodeLabel}无法确定模型路由：宿主未提供 agentDefaultModel（拿不到默认 provider/model），`
+      + '且节点未配置成对的 provider/model（provider=（未配置） / model=（未配置））。'
+      + '请在节点上同时配置 provider 与 model，或让宿主提供 agentDefaultModel 后再开跑。',
+  }
 }
 
 /** 在 next 边构成的有向图里找一条环（不含 reject 边）；有就返回节点 id 序列。 */
@@ -1891,6 +2048,8 @@ class FlowEngine {
       const sessions = await runstoreModule.readNodeSessions(this.runsRoot, runId)
       for (const [nodeId, entry] of Object.entries(sessions || {})) {
         if (!entry || typeof entry.sessionId !== 'string') continue
+        // 0.10 R1：把条目上记录的模型路由对一起带进内存，否则下一次 persist 会抹掉它。
+        const agentOptions = normalizeSessionRoute(entry.agentOptions)
         this.nodeSessions.set(nodeId, {
           sessionId: entry.sessionId,
           handle: null,
@@ -1898,6 +2057,7 @@ class FlowEngine {
           createdAt: entry.createdAt,
           lastUsedAt: entry.lastUsedAt,
           attempt: null,
+          ...(agentOptions ? { agentOptions } : {}),
         })
         this._rememberSessionOwner(entry.sessionId, runId, nodeId)
       }
@@ -1910,10 +2070,13 @@ class FlowEngine {
     const out = {}
     for (const [nodeId, entry] of this.nodeSessions) {
       if (!entry || typeof entry.sessionId !== 'string') continue
+      const agentOptions = normalizeSessionRoute(entry.agentOptions)
       out[nodeId] = {
         sessionId: entry.sessionId,
         createdAt: entry.createdAt,
         lastUsedAt: entry.lastUsedAt,
+        // 结构设计 S2：只在合法时输出，坏形状不落盘（读侧同样会丢字段）。
+        ...(agentOptions ? { agentOptions } : {}),
       }
     }
     return out
@@ -1932,16 +2095,22 @@ class FlowEngine {
   }
 
   /**
-   * 记录一个节点会话：`{ sessionId, handle, agent, createdAt, lastUsedAt, attempt }`。
+   * 记录一个节点会话：`{ sessionId, handle, agent, agentOptions, createdAt, lastUsedAt, attempt }`。
    * 07 §3.3：句柄与 `handle.agent` 分开存 —— 释放只对 handle，会话本身不删。
+   *
+   * 0.10 R1：`agentOptions` 是本次实际使用的模型路由对。同一 sessionId 时未显式传
+   * （或传了坏形状）就保留旧 route；换了 sessionId 就是新会话，不凭空继承旧节点的 route。
    */
   _recordNodeSession(runId, nodeId, sessionId, {
-    handle = null, agent = null, createdAt = null, attempt = null,
+    handle = null, agent = null, createdAt = null, attempt = null, agentOptions = null,
   } = {}) {
     if (typeof sessionId !== 'string' || sessionId === '') return
     const nowIso = isoOf(this.now())
     const previous = this.nodeSessions.get(nodeId)
     const sameSession = Boolean(previous && previous.sessionId === sessionId)
+    const explicitRoute = normalizeSessionRoute(agentOptions)
+    const keepRoute = sameSession ? normalizeSessionRoute(previous.agentOptions) : null
+    const route = explicitRoute || keepRoute
     const keepHandle = sameSession ? previous.handle || null : null
     const keepAgent = sameSession ? previous.agent || null : null
     this.nodeSessions.set(nodeId, {
@@ -1953,6 +2122,7 @@ class FlowEngine {
         || nowIso,
       lastUsedAt: nowIso,
       attempt: Number.isInteger(attempt) ? attempt : (sameSession ? previous.attempt ?? null : null),
+      ...(route ? { agentOptions: route } : {}),
     })
     this._rememberSessionOwner(sessionId, runId, nodeId, attempt)
     if (handle && typeof handle.dispose === 'function') this.disposalHandles.add(handle)
@@ -2046,26 +2216,28 @@ class FlowEngine {
     return null
   }
 
-  /** 冷会话 resume 时给一个可用的默认模型（取不到就用宿主默认）。 */
-  _defaultAgentSelection() {
+  /**
+   * 0.10 §2.1（R1）：`agentDefaultModel.currentSelection()` 的**原样**返回值。
+   *
+   * 不做「半对 → undefined」的静默收敛：半对要能走到 `resolveModelRoute` 的
+   * `MODEL_ROUTE_PARTIAL_HOST`；抛错按「宿主没提供」处理并留一条 warn
+   *（不让一个坏服务把 run 变成裸异常）。
+   */
+  _agentDefaultSelectionRaw() {
     try {
       const service = this.ctx && typeof this.ctx.get === 'function'
         ? this.ctx.get('agentDefaultModel')
         : null
-      const selection = service && typeof service.currentSelection === 'function'
-        ? service.currentSelection()
-        : null
-      if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return undefined
-      if (selection.provider === '' || selection.model === '') return undefined
-      return {
-        provider: selection.provider,
-        model: selection.model,
-        ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort !== ''
-          ? { reasoningEffort: selection.reasoningEffort }
-          : {}),
-      }
-    } catch {
-      return undefined
+      if (!service || typeof service.currentSelection !== 'function') return null
+      const selection = service.currentSelection()
+      return isPlainObject(selection) ? selection : null
+    } catch (error) {
+      this.log(
+        'warn',
+        `flow-studio: 读取宿主 agentDefaultModel 失败（按未提供处理）：${
+          error && error.message ? error.message : String(error)}`,
+      )
+      return null
     }
   }
 
@@ -2076,57 +2248,36 @@ class FlowEngine {
    * `agent "…" has no provider/model`（`dsh-agent-loop/lib/index.js:671-672`），
    * 且 `agent/request` waterfall 已不允许再改 provider/model。
    *
-   * 规则（v0.9.2 起，见 `docs/reference/host-api.md` §「节点会话的模型路由与 agent preset」）：
-   *   - 有宿主 `agentDefaultModel` selection：
-   *       provider = 节点显式 provider（非空）> 宿主 provider；
-   *       model    = 节点显式 model（非空）> 宿主 model；
-   *       reasoningEffort **只在节点自己给了才带**（不同模型档位不可移植，
-   *       也不要把宿主默认档位移植到节点自定模型上）。
-   *   - 没有 selection，但节点自己给了 provider + model → 原样返回成对路由；
-   *   - 没有 selection，且节点配置**不成对**（含空 agentOptions） →
-   *       抛 `EngineError(503, 可诊断文案)`。绝不静默创建注定首轮失败的会话。
+   * 0.10（R1）起规则收敛到纯函数 `resolveModelRoute`（同源成对，**禁止**跨来源拼接）：
+   *   - 节点整对 → 用节点的（`reasoningEffort` 只取节点自己的）；
+   *   - 节点半对 → 503（`MODEL_ROUTE_CONFLICT` / `MODEL_ROUTE_UNAVAILABLE`，见 S7）；
+   *   - 节点没配 → 宿主整对（不带宿主 effort）；
+   *   - 都没有 → 503 `MODEL_ROUTE_UNAVAILABLE`。绝不静默创建注定首轮失败的会话。
    *
-   * 「agentOptions 为空时不传该字段」的旧约定已**废弃**：调用方现在必须显式传
-   * 成对路由（见 `_createNodeSession`）。
+   * 方法名与调用方保持 0.9.x 不变。
    */
   _resolveCreateAgentOptions(agentOptions, context = {}) {
-    const selection = this._defaultAgentSelection()
-    const source = agentOptions && typeof agentOptions === 'object' && !Array.isArray(agentOptions)
-      ? agentOptions
-      : null
-    const hasProvider = Boolean(source)
-      && typeof source.provider === 'string' && source.provider !== ''
-    const hasModel = Boolean(source)
-      && typeof source.model === 'string' && source.model !== ''
-    const nodeEffort = source && typeof source.reasoningEffort === 'string' && source.reasoningEffort !== ''
-      ? source.reasoningEffort
-      : undefined
-    if (selection) {
-      return {
-        provider: hasProvider ? source.provider : selection.provider,
-        model: hasModel ? source.model : selection.model,
-        ...(nodeEffort === undefined ? {} : { reasoningEffort: nodeEffort }),
-      }
+    const source = isPlainObject(agentOptions) ? agentOptions : null
+    const node = {
+      ...(source || {}),
+      ...(context && typeof context.nodeId === 'string' && context.nodeId !== ''
+        ? { id: context.nodeId }
+        : {}),
+      ...(context && typeof context.nodeTitle === 'string' && context.nodeTitle !== ''
+        ? { title: context.nodeTitle }
+        : {}),
     }
-    if (hasProvider && hasModel) {
-      return {
-        provider: source.provider,
-        model: source.model,
-        ...(nodeEffort === undefined ? {} : { reasoningEffort: nodeEffort }),
-      }
+    const route = resolveModelRoute({
+      node,
+      host: this._agentDefaultSelectionRaw(),
+      origin: 'create',
+    })
+    if (!route.ok) throw new EngineError(503, route.message)
+    return {
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
     }
-    const nodeLabel = context && typeof context.nodeId === 'string' && context.nodeId !== ''
-      ? `节点「${context.nodeTitle || context.nodeId}」`
-      : '节点'
-    const configured = `provider=${hasProvider ? source.provider : '（未配置）'}`
-      + ` / model=${hasModel ? source.model : '（未配置）'}`
-    throw new EngineError(
-      503,
-      `${nodeLabel}无法确定模型路由：宿主未提供 agentDefaultModel（拿不到默认 provider/model），`
-      + `且节点未配置成对的 provider/model（当前 ${configured}）。`
-      + '新宿主（0.2.1-rc.5+）的节点会话必须在首轮 preStep 之前解析出模型路由；'
-      + '请在节点上同时配置 provider 与 model，或让宿主提供 agentDefaultModel 后再开跑。',
-    )
   }
 
   /**
@@ -2493,6 +2644,111 @@ class FlowEngine {
   }
 
   /**
+   * 0.10 §2.2（R6）：采集一次节点会话的「可用工具」并写 `node/tools`。
+   *
+   * 口径（必须写清楚，别和 `tool/call` 混淆）：这是**会话注册表可见的工具**，
+   * 不是「某一轮实际被准入的工具」。首轮精简（minimal-first-turn）是 step 级准入，
+   * 不影响注册表视图。
+   *
+   * 采集规则：
+   *   - `agent.ctx.tools.definitions(agent)` 返回数组 → `toolsSource='session'`，取 `definition.name`；
+   *   - 没有 tools 服务 / 抛错 / 返回非数组 → `toolsSource='unavailable'`（清单不完整，但不失败）；
+   *   - 本轮 `flow_node_reject` 注册成功（`_syncNodeRejectTool` 返回 true → `this.nodeTools` 有登记）
+   *     就并入：不依赖宿主 `definitions` 是否立刻可见；
+   *   - 去重 → 字典序 → 截 `NODE_TOOLS_MAX` → 防御性 8KB 字节裁剪（置 `truncated`）。
+   *
+   * 任何异常只 warn，不阻断节点。
+   */
+  async _recordNodeTools({ runId, node, attempt, traceId, agent, sessionId }) {
+    try {
+      let tools = []
+      let toolsSource = 'unavailable'
+      const toolsService = agent && agent.ctx ? agent.ctx.tools : null
+      if (!toolsService) {
+        this.log('warn', `flow-studio: 节点「${node && node.id}」没有 agent.ctx.tools 服务，node/tools 记为 unavailable`)
+      } else if (typeof toolsService.definitions !== 'function') {
+        this.log('warn', `flow-studio: 节点「${node && node.id}」的宿主没有 tools.definitions，node/tools 记为 unavailable`)
+      }
+      if (toolsService && typeof toolsService.definitions === 'function') {
+        try {
+          const definitions = toolsService.definitions(agent)
+          if (Array.isArray(definitions)) {
+            toolsSource = 'session'
+            for (const definition of definitions) {
+              if (!definition || typeof definition.name !== 'string') continue
+              tools.push(definition.name)
+            }
+          }
+        } catch (error) {
+          // 枚举失败按「拿不到注册表视图」处理：事件照写（unavailable），节点照跑。
+          toolsSource = 'unavailable'
+          this.log(
+            'warn',
+            `flow-studio: 枚举节点「${node && node.id}」的工具失败（按 unavailable 记录）：${
+              error && error.message ? error.message : String(error)}`,
+          )
+        }
+      }
+      // 0.10 审查 F8：definitions 返回非数组同样是降级，必须留痕（否则 UI 显示
+      // unavailable 却查不到原因）。
+      if (toolsSource === 'unavailable'
+        && toolsService && typeof toolsService.definitions === 'function') {
+        this.log('warn', `flow-studio: 节点「${node && node.id}」的 tools.definitions 未返回数组，node/tools 记为 unavailable`)
+      }
+      if (this.nodeTools instanceof Map && this.nodeTools.has(sessionId)) {
+        tools.push('flow_node_reject')
+      }
+      let list = [...new Set(tools)]
+        // 宿主工具名理论上都合法；非法名直接跳过，避免把整条观测事件拖成校验失败。
+        .filter(name => NODE_TOOL_NAME_PATTERN.test(name))
+        .sort()
+      // 0.10 R6 修正：打回工具是阶段节点的**能力证据**，不能被字典序截断吞掉。
+      // 截断时给它预留一个槽位（去掉名单里最靠后的一项），保证「有出向 reject 边」在
+      // node/tools 里始终可核对。
+      const hasRejectTool = list.includes('flow_node_reject')
+      const trimTo = size => {
+        if (!hasRejectTool) return list.slice(0, size)
+        const rest = list.filter(name => name !== 'flow_node_reject').slice(0, Math.max(0, size - 1))
+        return [...rest, 'flow_node_reject'].sort()
+      }
+      let truncated = false
+      if (list.length > NODE_TOOLS_MAX) {
+        list = trimTo(NODE_TOOLS_MAX)
+        truncated = true
+      }
+      const makeEvent = () => ({
+        kind: 'node/tools',
+        nodeId: node.id,
+        attemptId: attempt,
+        traceId,
+        data: {
+          tools: list,
+          toolsSource,
+          count: list.length,
+          ...(truncated ? { truncated: true } : {}),
+        },
+      })
+      let event = makeEvent()
+      // 最坏情况（64×64）也在 8KB 内；这里只做防御性兜底（追加时还要加 ts/runId/seq）。
+      let guard = 0
+      while (Buffer.byteLength(JSON.stringify(event), 'utf8') > MAX_EVENT_BYTES
+        && list.length > 0 && guard < 32) {
+        list = trimTo(Math.max(1, Math.floor(list.length / 2)))
+        truncated = true
+        event = makeEvent()
+        guard += 1
+      }
+      await this._append(runId, [event])
+    } catch (error) {
+      this.log(
+        'warn',
+        `flow-studio: 采集节点「${node && node.id}」的可用工具失败（不影响执行）：${
+          error && error.message ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  /**
    * 向一个节点会话投一轮提示词，然后从该会话最后一条 assistant 消息里解析结构化输出。
    *
    * 07 §3.1：新建（agents.create）与复用（followup）是**同一段协议**——都靠
@@ -2507,6 +2763,9 @@ class FlowEngine {
     // 清掉上一条 assistant 文本 / 正式结论缓存，避免把上一轮的结果误当成本轮输出。
     this.lastAssistantBySession.delete(sessionId)
     this.lastStructuredBySession.delete(sessionId)
+    // 0.10 §2.2（R6）：正式 followup 之前采集一次「可用工具」快照（每次 attempt 一条）。
+    // 采集失败只 warn，绝不阻断节点（工具面观测不能反过来把节点跑挂）。
+    await this._recordNodeTools({ runId, node, attempt, traceId, agent, sessionId })
     // v0.9.2（任务 2）：上一轮残留的「工具登记打回」不能跨 attempt 生效。
     if (this.pendingNodeRejects instanceof Map) this.pendingNodeRejects.delete(sessionId)
     // 同一会话被二次激活：把事件绑定改挂到新的 attemptId / traceId 上。
@@ -2677,12 +2936,20 @@ class FlowEngine {
   /**
    * 复用已有节点会话（sessions.json / 本 run 内已登记）：活会话直接 followup，
    * 冷会话或已被压缩的会话先 resume。
+   *
+   * 0.10 R1：resume 的 `agentOptions` 与 create 走**同一个** `resolveModelRoute`
+   * （node 显式对 > `sessions.json` 记录的会话对 > 宿主默认），失败按 503 抛出，
+   * `agents.resume` 调用次数为 0。`agentOptions` 入参是 `_executeNode` 按节点算出的
+   * 显式对（可能为 undefined）。
    */
-  async _followupNodeSession({ runId, node, attempt, prompt, combined, traceId, entry, flow }) {
+  async _followupNodeSession({
+    runId, node, attempt, prompt, combined, traceId, entry, flow, agentOptions,
+  }) {
     const agents = this._agentsService()
     const sessionId = entry.sessionId
     let agent = null
     let mode = 'injected'
+    let resolvedAgentOptions = null
     try {
       if (typeof agents.get === 'function') agent = agents.get(sessionId) || null
     } catch {
@@ -2692,9 +2959,24 @@ class FlowEngine {
       if (typeof agents.resume !== 'function') {
         throw new EngineError(503, `节点「${node.id}」的会话已不可用，且 agents.resume 不可用`)
       }
-      const resumeOptions = { resumeSessionId: sessionId }
-      const selection = this._defaultAgentSelection()
-      if (selection) resumeOptions.agentOptions = selection
+      // 0.10 §2.1（R1）：与 create 同一份规则；同源成对，跨来源拼接一律失败。
+      const route = resolveModelRoute({
+        node: {
+          ...(isPlainObject(agentOptions) ? agentOptions : {}),
+          id: node.id,
+          title: node.title,
+        },
+        host: this._agentDefaultSelectionRaw(),
+        session: entry.agentOptions,
+        origin: 'resume',
+      })
+      if (!route.ok) throw new EngineError(503, route.message)
+      resolvedAgentOptions = {
+        provider: route.provider,
+        model: route.model,
+        ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+      }
+      const resumeOptions = { resumeSessionId: sessionId, agentOptions: resolvedAgentOptions }
       // v0.9.2 P0 修正：**resume 也靠 setup 挂组合**（`dsh-agent-loop` 的 initializeAgent
       // 不读 session header 的 agentPreset）。漏了这里，打回重跑 / restart 续跑的冷会话
       // 会重新掉回裸工具面——「续跑之后节点又改不了代码」就是这条。
@@ -2722,6 +3004,28 @@ class FlowEngine {
       }
       agent = resumed && resumed.agent ? resumed.agent : null
       mode = 'resumed'
+      // 0.10 审查 F1：resume 之后核对宿主**实际生效**的模型。宿主优先级是
+      // 「会话已记录的 selection > 上次请求 > 本次 agentOptions」，旧会话可能仍用旧模型；
+      // 这里不失败，但必须留下可诊断的 warn，避免静默漂移。
+      if (agent && resolvedAgentOptions) {
+        try {
+          const actual = agent.model && typeof agent.model.current === 'function'
+            ? agent.model.current()
+            : null
+          if (actual && (actual.provider !== resolvedAgentOptions.provider
+            || actual.model !== resolvedAgentOptions.model)) {
+            this.log(
+              'warn',
+              `flow-studio: 节点「${node.id}」会话 ${sessionId} 实际模型 `
+              + `${actual.provider}/${actual.model} 与本次请求 `
+              + `${resolvedAgentOptions.provider}/${resolvedAgentOptions.model} 不同；`
+              + '宿主优先使用会话已记录的选择，节点模型只在新建会话时生效',
+            )
+          }
+        } catch {
+          // 读不到实际模型不影响续跑（不是所有宿主都暴露 model.current）。
+        }
+      }
     }
     if (!agent || typeof agent.followup !== 'function') {
       throw new EngineError(503, `节点「${node.id}」的会话 ${sessionId} 无法接收消息（没有 followup）`)
@@ -2747,6 +3051,7 @@ class FlowEngine {
       sessionId,
       mode,
       agent,
+      ...(resolvedAgentOptions ? { agentOptions: resolvedAgentOptions } : {}),
     }
   }
 
@@ -3587,7 +3892,9 @@ class FlowEngine {
     // v0.9.2（任务 3）：会话一建好就落 sessions.json —— 即使本轮 prompt 失败（节点
     // 结构不合格 / 超时），失败节点的 sessionId 也必须留得下来，restart 才能在原会话
     // 续跑。`_executeNode` 成功返回后还会再记一次（补 handle / agent）。
-    this._recordNodeSession(runId, node.id, sessionId, { handle, agent, attempt })
+    this._recordNodeSession(runId, node.id, sessionId, {
+      handle, agent, attempt, agentOptions: resolvedAgentOptions,
+    })
     await this._persistNodeSessions(runId)
     // v0.9.2（任务 2）：按**当前流程结构**决定是否给这个节点会话挂 `flow_node_reject`。
     // 注册必须发生在 followup 之前：宿主在进入第一轮 step 时才解析可见工具清单。
@@ -3767,10 +4074,12 @@ class FlowEngine {
     const parent = await this._resolveParent()
     if (!parent) throw new EngineError(503, '没有可用的父会话：无法启动子 agent')
     // 兼容路径不是 `agents.create`：没有 agentOptions 就沿用旧行为（不传路由）。
-    // 只有节点真的配了模型时才走同一套「provider + model 成对」校验 / 补齐。
+    // 只有节点真的配了模型时才走同一套「provider + model 成对」校验（R1 的第三个调用点）。
     const resolvedAgentOptions = agentOptions === undefined || agentOptions === null
       ? undefined
-      : this._resolveCreateAgentOptions(agentOptions)
+      : this._resolveCreateAgentOptions(agentOptions, {
+        ...(typeof label === 'string' && label !== '' ? { nodeId: label } : {}),
+      })
     let started
     try {
       started = await subagents.startActivation({
@@ -4558,9 +4867,14 @@ class FlowEngine {
         this.rejectContexts.delete(node.id)
 
         if (outcome.verdict === 'reject') {
+          // 0.10 R9（D9）：先解析打回目标再写 node/end —— 没有出向 reject 边时
+          // `extra.rejectBypass='no-edge'` 必须和这次 rejected 结论一起落盘（审计/筛选要用）。
+          // 旁路**保留失败**，不降级为 pass：把审查否定静默改成通过会污染验收/质量统计。
+          const choice = selectRejectTarget(flow, node, outcome.rejectTarget)
           const nodeEndExtra = {
             ...(outcome.membersPartial ? { membersPartial: true } : {}),
             ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+            ...(choice ? {} : { rejectBypass: 'no-edge' }),
           }
           await this._append(runId, [{
             kind: 'node/end',
@@ -4575,9 +4889,10 @@ class FlowEngine {
             },
             ...(Object.keys(nodeEndExtra).length > 0 ? { extra: nodeEndExtra } : {}),
           }])
-          const choice = selectRejectTarget(flow, node, outcome.rejectTarget)
           if (!choice) {
-            const reason = `节点「${node.title || node.id}」判定打回，但没有任何 reject 边（无法确定回退目标）`
+            // 0.10 R9：文案必须可行动 —— 要么补打回边后「修复后重启」续跑原会话，要么改结论。
+            const reason = `节点「${node.title || node.id}」判定打回，但没有任何 reject 边（无法确定回退目标）；`
+              + '补一条从该节点出发的打回边后，用「修复后重启」在原会话续跑；或把结论改为 pass'
             this.failedNode = { nodeId: node.id, attempt, reason }
             throw new Error(reason)
           }
@@ -5021,9 +5336,13 @@ class FlowEngine {
         this.rejectContexts.delete(node.id)
 
         if (outcome.verdict === 'reject') {
+          // 0.10 R9（D9）：与旧 `_loop` 同口径 —— 无出向 reject 边时这次 rejected
+          // 结论要带 `extra.rejectBypass='no-edge'`（状态机路径是默认路径，不能只在逃生门里做）。
+          const choice = selectRejectTarget(flow, node, outcome.rejectTarget)
           const nodeEndExtra = {
             ...(outcome.membersPartial ? { membersPartial: true } : {}),
             ...(outcome.completedBy ? { completedBy: outcome.completedBy } : {}),
+            ...(choice ? {} : { rejectBypass: 'no-edge' }),
           }
           await this._append(runId, [{
             kind: 'node/end',
@@ -5085,8 +5404,14 @@ class FlowEngine {
                 throw new Error(limitReason)
               }
             }
-            const failReason = clip(machineContext.reason || `节点「${node.title || node.id}」判定打回，但状态机无法继续`,
-              2000)
+            // 0.10 R9：没有出向 reject 边时，文案必须可行动（补边后「修复后重启」原会话续跑）。
+            // 旁路保留失败，不降级为 pass。
+            const baseFailReason = machineContext.reason
+              || `节点「${node.title || node.id}」判定打回，但状态机无法继续`
+            const failReason = clip(choice
+              ? baseFailReason
+              : `${baseFailReason}；补一条从该节点出发的打回边后，用「修复后重启」在原会话续跑；或把结论改为 pass`,
+            2000)
             this.failedNode = { nodeId: node.id, attempt, reason: failReason }
             throw new Error(failReason)
           }
@@ -5551,6 +5876,10 @@ class FlowEngine {
         agentPreset: presetInfo.value,
         agentPresetSource: presetInfo.source,
         ...(typeof node.model === 'string' && node.model.trim() !== '' ? { model: clip(node.model, 128) } : {}),
+        // 0.10 R5/R6：外部执行器没有节点会话；只对非 dsh 写该字段（旧读端忽略未知键）。
+        ...(typeof node.executor === 'string' && node.executor !== '' && node.executor !== 'dsh'
+          ? { executor: clip(node.executor, 32) }
+          : {}),
         skills: Array.isArray(node.skills)
           ? node.skills.filter(name => typeof name === 'string' && name.trim() !== '').slice(0, 12).map(name => clip(name, 64))
           : [],
@@ -5844,7 +6173,17 @@ class FlowEngine {
           attemptSessionId = existingSession.sessionId
           try {
             const reused = await this._followupNodeSession({
-              runId, node, attempt, prompt, signal, combined, traceId, entry: existingSession, flow,
+              runId,
+              node,
+              attempt,
+              prompt,
+              signal,
+              combined,
+              traceId,
+              entry: existingSession,
+              flow,
+              // 0.10 R1：节点上显式配置的对（provider 可能在 node.extras.provider）。
+              agentOptions,
             })
             structuredRaw = reused.structured
             completedBy = reused.completedBy || null
@@ -5852,6 +6191,8 @@ class FlowEngine {
               createdAt: existingSession.createdAt,
               agent: reused.agent || null,
               attempt,
+              // 0.10 R1：resume 解析出的对优先（同 session 时记录侧也会保留旧值）。
+              agentOptions: reused.agentOptions || existingSession.agentOptions || null,
             })
             await this._persistNodeSessions(runId)
           } catch (error) {

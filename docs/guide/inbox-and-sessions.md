@@ -22,9 +22,9 @@ POST /api/flow-studio/runs/<runId>/messages
 
 ## 一个节点一个会话
 
-`runs/<runId>/sessions.json` 记着 `nodeId → sessionId`，二次激活（打回重跑 / 收到新消息）复用同一会话：活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`，不再新开会话。run 结束或停止时统一 `dispose()` 句柄，**不删日志、不删会话文件**（仍可从列表点开 / `resume`）。
+`runs/<runId>/sessions.json` 记着 `nodeId → { sessionId, createdAt, lastUsedAt, agentOptions? }`（`agentOptions` 是创建时实际使用的模型对，resume 优先复用它；旧文件没有该字段时回退宿主默认），二次激活（打回重跑 / 收到新消息）复用同一会话：活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`，不再新开会话。run 结束或停止时统一 `dispose()` 句柄，**不删日志、不删会话文件**（仍可从列表点开 / `resume`）。
 
-节点里的 agent 用 `flow_reply` 回消息（工具按会话反查 run / node，不用手填 id）；别的 agent 用 `flow_send_message` 往流程里发消息。运行中可以 `POST /runs/<id>/inbox` 动态改回复目标，`GET /runs/<id>/messages` 看收件箱。
+运行日志抽屉的节点详情 / 事件 ref 行可以「打开节点会话」（无宿主跳转能力时复制会话 id）；run 级「打开发起会话」在抽屉顶部。节点里的 agent 用 `flow_reply` 回消息（工具按会话反查 run / node，不用手填 id）；别的 agent 用 `flow_send_message` 往流程里发消息。运行中可以 `POST /runs/<id>/inbox` 动态改回复目标，`GET /runs/<id>/messages` 看收件箱。
 
 ## 回复通道
 

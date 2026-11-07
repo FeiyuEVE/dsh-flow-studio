@@ -66,16 +66,23 @@
 `ctx.agents.create()` 建节点主管会话时，引擎**永远显式**传两样东西；任何一样解析
 不出来都会在创建之前给可诊断的 503，而不是建一个注定首轮失败的会话：
 
-1. **模型路由必须成对**：`agentOptions = {provider, model}`。
-   - 节点显式 provider / model 优先（流程模型里 `provider` 会落在 `node.extras.provider`，
-     引擎两处都认）；缺的一项由宿主 `agentDefaultModel` 的
-     `currentSelection()` 补齐；
+1. **模型路由必须同源成对**：`agentOptions = {provider, model}`，绝不跨来源拼。
+   - 节点显式 provider + model **整对**优先（流程模型里 `provider` 会落在
+     `node.extras.provider`，引擎两处都认）；节点只配一半 → `503`
+     （`MODEL_ROUTE_CONFLICT`；另一来源也没有整对时 `MODEL_ROUTE_UNAVAILABLE`），
+     **不再**用宿主默认补齐缺的一项；
+   - 节点完全没配才回退：`sessions.json` 记录的会话对（resume）> 宿主
+     `agentDefaultModel.currentSelection()` 的整对；宿主只返回一半 →
+     `MODEL_ROUTE_PARTIAL_HOST`；
    - 节点自定义 `model` 时**不**移植宿主的 `reasoningEffort`（不同模型档位不可移植），
      只有节点自己给了才带；
    - 拿不到 `agentDefaultModel` 且节点配置不成对（含空配置）→
      `503`，文案含「宿主未提供 agentDefaultModel，且节点未配置 provider/model」。
      0.2.2-rc.1 的首轮 `preStep` 会抛 `agent "…" has no provider/model`，且
      `agent/request` waterfall 已不允许再改路由，所以这里必须提前拦住。
+   - **resume 也走同一函数**：`agents.resume({ resumeSessionId, agentOptions, setup })`
+     的 `agentOptions` 来自节点显式对 > `sessions.json` 记录的会话对 > 宿主默认；
+     旧会话没有记录对时回退宿主。规则与错误码见 `docs/plan/0.10-方案.md` §4.1。
 
 2. **agent preset 必须显式，而且必须挂组合**：`meta.agentPreset` **只写 session
    header**（鉴权 / 投影用），**不会挂载 preset 组合**。组合只在
@@ -174,12 +181,20 @@
 - 每次 attempt / 复用冷会话都会按**当前流程结构**重算：结构加边 → 补挂，删边 →
   用注册返回的 disposer 撤掉；run 结束 / attempt 结束时统一 dispose。
 
+**没有出向 reject 边但模型仍判 reject（旁路）**：保留 run 失败，**不降级为 pass**；
+`node/end{status:'rejected'}` 的 `extra.rejectBypass='no-edge'` 标出旁路，失败原因提示
+「补一条从该节点出发的打回边后，用『修复后重启』在原会话续跑；或把结论改为 pass」。
+状态机默认路径与 `FLOW_STUDIO_FLOW_MACHINE=0` 的 legacy 路径同一口径。
+
 ## 失败后重启（`restart`）
 
 `POST /runs/<runId>/restart` 与模型工具 `flow_restart` 共用同一条实现
 （`runtime.restart`），语义是**新建一个续跑 run**，而不是把旧 run 改回 running：
 
 - 只接受 `failed` / `aborted`；非终态与 `done` 都给 400 可读原因；
+- **服务端互斥**：同一旧 run 的 restart 在途时并发请求直接 400；已经存在
+  `restart.fromRunId === 旧 run` 的续跑 run 时也 400（避免两个新 run 同时 resume 同一批
+  会话）。续跑失败请重启那个续跑 run，不要重复重启旧 run；
 - 用旧 run 的事件流推导续跑起点（`run/end` 的 failedNodeId → 最后一条
   `node/end failed` → 中止时未收口的 `node/start`）与**已完成节点**；
 - 新 run 继承旧 `sessions.json` 里当前流程仍存在的阶段节点会话（同一 node 复用

@@ -335,7 +335,7 @@ export const CSS = `
 .fs-node{
   position:relative;display:flex;flex-direction:column;gap:2px;width:100%;height:100%;
   padding:10px 12px 12px;border:1.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);
-  background:var(--dsw-alias-bg-layer-1);cursor:move;user-select:none;overflow:hidden;
+  background:var(--dsw-alias-bg-layer-1);cursor:move;user-select:none;overflow:visible;
   box-shadow:0 1px 2px color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);
   transition:border-color .15s,box-shadow .15s;
 }
@@ -690,6 +690,40 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
 .fs-skill-desc{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 
+/* 0.10 R7：内联 combobox（收起只留触发按钮；展开在文档流内，不用浮层以免被面板裁切）。 */
+.fs-skills-combo{display:flex;flex-direction:column;gap:6px;min-width:0}
+.fs-skills-trigger{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:32px;
+  padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);
+  font-family:inherit;font-size:13px;line-height:20px;text-align:left;cursor:pointer;
+}
+.fs-skills-trigger:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.fs-skills-trigger:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.fs-skills-panel{
+  display:flex;flex-direction:column;gap:6px;padding:8px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);
+}
+.fs-skills-search{
+  width:100%;height:30px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);
+  color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;line-height:20px;
+}
+.fs-skills-search:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.fs-skills-listbox{display:flex;flex-direction:column;gap:2px;max-height:280px;overflow-y:auto}
+.fs-skills-option{
+  display:flex;flex-direction:column;gap:2px;padding:6px 8px;border-radius:var(--dsw-radius-sm);
+  color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;cursor:pointer;
+}
+.fs-skills-option:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.fs-skills-option.on{background:var(--dsw-alias-bg-layer-2);box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+.fs-skills-option[aria-disabled="true"]{opacity:.55;cursor:not-allowed}
+.fs-skills-option-name{font-weight:500;word-break:break-all}
+.fs-skills-option-desc{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-skills-empty{padding:8px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.fs-skills-limit{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+
 .fs-member-card{border:1px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);padding:8px;
   display:flex;flex-direction:column;gap:6px;background:var(--dsw-alias-bg-base)}
 .fs-member-card-head{display:flex;align-items:center;gap:6px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
@@ -758,13 +792,13 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer}
 .fs-issue-link:hover{text-decoration:underline}
 
-/* ══ 运行日志抽屉（收起 40 / 展开 200，05 §6）════════════ */
+/* ══ 运行日志抽屉（收起 40 / 展开 340，05 §6）════════════ */
 .fs-log{
   flex:none;height:40px;display:flex;flex-direction:column;min-width:0;overflow:hidden;
   background:var(--dsw-alias-bg-layer-1);border-top:1px solid var(--dsw-alias-border-l2);
   transition:height .18s ease;
 }
-.fs-log.open{height:200px}
+.fs-log.open{height:340px}
 /* 上边缘拖拽条：平时一条 1px 分隔线，hover / focus-visible 变明显 + 2px focus ring。
    拖动期间根节点加 .resizing 关掉 height 过渡，否则会「拖不动 / 回弹」。 */
 .fs-log-grip{
@@ -813,7 +847,7 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
 .fs-log-main.missing{color:var(--dsw-alias-label-tertiary);font-weight:400}
 /* 展开态五项聚合 + token 四段（04 §3.2）：一行迷你 stat，不再回流 40px 条。 */
 .fs-log-stats{
-  flex:none;display:flex;align-items:stretch;gap:16px;height:46px;padding:4px 10px;
+  flex:none;display:flex;align-items:stretch;gap:16px;min-height:58px;height:auto;padding:4px 10px;
   overflow-x:auto;overflow-y:hidden;border-top:1px solid var(--dsw-alias-border-l1);
 }
 .fs-log-stats-empty{
@@ -905,6 +939,12 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   flex:none;display:flex;align-items:center;gap:8px;padding:2px 8px;
   border-bottom:1px solid var(--dsw-alias-border-l1);
   color:var(--fs-r2-error, var(--dsw-alias-state-error-primary));font-size:12px;line-height:16px;
+}
+/* 续跑世系（0.10 R8）：放 body 顶部，不挤 40px 动作条。 */
+.fs-log-lineage{
+  flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:2px 10px;
+  border-bottom:1px solid var(--dsw-alias-border-l1);
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);
 }
 .fs-log-grid{flex:1;min-height:0;display:grid;grid-template-columns:220px minmax(0,1fr) 300px;overflow:hidden}
 .fs-log-col{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
@@ -1036,7 +1076,7 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
 .fs-log.zoom-full .fs-log-grid{grid-template-columns:260px minmax(0,1fr) 440px}
 /* 头部与指标区固定，只有事件列表 / 详情各自滚动（拉高、全屏都不破版）。 */
 .fs-log.zoom-tall .fs-log-body,.fs-log.zoom-full .fs-log-body{overflow:hidden}
-.fs-log.zoom-full .fs-log-stats{height:52px}
+.fs-log.zoom-full .fs-log-stats{min-height:58px}
 .fs-log-region{flex:none;display:flex;flex-direction:column;min-width:0}
 .fs-log-region-head{
   flex:none;display:flex;align-items:center;gap:8px;height:24px;padding:0 10px;
@@ -1098,6 +1138,9 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
 }
 .fs-log-fact{white-space:nowrap}
+/* 节点详情里的会话入口 / preset（0.10 R4/R5）：只做间距，不新增颜色语义。 */
+.fs-log-session{flex:none}
+.fs-log-preset{white-space:nowrap}
 .fs-log-node-block{
   display:flex;flex-direction:column;gap:4px;min-width:0;padding:6px 8px;
   border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-xs);
@@ -1152,6 +1195,22 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;word-break:break-all;
   max-height:48px;overflow:hidden;
 }
+
+/* 节点会话可用工具（0.10 R6）：独立于「最近工具调用」，不复用 .fs-log-tool。 */
+.fs-log-available-tools{min-width:0}
+.fs-log-tools-summary{
+  font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);
+  cursor:pointer;list-style:revert;
+}
+.fs-log-tools-summary:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.fs-log-tool-chips{display:flex;flex-wrap:wrap;gap:4px;padding:6px 0 0}
+.fs-log-tool-chip{
+  display:inline-flex;align-items:center;min-height:18px;padding:0 6px;
+  border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-interactive-bg-hover);
+  font-family:var(--dsw-font-markdown-code-font-family);font-size:12px;line-height:16px;
+  color:var(--dsw-alias-label-secondary);word-break:break-all;
+}
+.fs-log-tools-empty{font-size:12px;line-height:16px;color:var(--dsw-alias-label-tertiary);padding:2px 0}
 
 /* 成员最近活动 / 已写产物。 */
 .fs-log-member{display:flex;flex-direction:column;gap:2px;min-width:0;padding:4px 0;

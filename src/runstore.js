@@ -28,6 +28,8 @@ import {
   // 08 §7：事件 kind 白名单与 runlog **同源**（基础 17 种 + 各扩展白名单），
   // 这里不再手写第二份字符串——手抄那份曾经漏掉 `node/status`，过滤直接 400。
   EVENT_KINDS as BASE_EVENT_KINDS, INBOX_EVENT_KINDS, NODE_STATUS_EVENT_KINDS, MACHINE_EVENT_KINDS,
+  // 0.10 §2.2（R6）：`node/tools` 也是扩展白名单的一员，`?kinds=node/tools` 不能 400。
+  NODE_TOOLS_EVENT_KINDS,
 } from './runlog.js'
 import { resolveHome } from './store.js'
 
@@ -2652,6 +2654,39 @@ export async function updateRunMessageStatus(runsRoot, runId, id, status, extra 
   return appendRunMessages(runsRoot, runId, [patch])
 }
 
+/**
+ * 0.10 §2.1（R1/S2）：`sessions.json` 条目的可选 `agentOptions`（节点会话创建时实际
+ * 传给 `agents.create` 的模型路由对）。
+ *
+ * 这是**形状**归一化，不是语义判断（「这一对能不能用」由引擎的 `resolveModelRoute` 决定）：
+ *   - provider / model 必须同时是非空字符串（≤64 / ≤128），半对整条作废；
+ *   - `reasoningEffort` 可选（≤64；空串视为没写）；
+ *   - 任何坏形状（数组 / 数字 / 半对 / 超长）返回 `null`，调用方整条丢弃该字段，
+ *     但**保留** sessionId 等其它字段（旧 run / 手改坏的文件不炸）。
+ *
+ * 读 / 写 / upsert 三处共用，避免条目形状出现第二份实现（结构设计 S2）。
+ *
+ * @param {unknown} value
+ * @returns {{ provider: string, model: string, reasoningEffort?: string } | null}
+ */
+export function normalizeSessionAgentOptions(value) {
+  if (!isPlainObject(value)) return null
+  const provider = value.provider
+  const model = value.model
+  if (typeof provider !== 'string' || provider.trim() === '' || provider.length > 64) return null
+  if (typeof model !== 'string' || model.trim() === '' || model.length > 128) return null
+  const out = { provider, model }
+  const effort = value.reasoningEffort
+  if (effort !== undefined && effort !== null) {
+    if (typeof effort !== 'string') return null
+    if (effort.trim() !== '') {
+      if (effort.length > 64) return null
+      out.reasoningEffort = effort
+    }
+  }
+  return out
+}
+
 /** 读节点会话表；文件缺失 / 坏 JSON / 字段不合法一律返回空表，不抛错。 */
 export async function readNodeSessions(runsRoot, runId) {
   const loc = locate(runsRoot, runId)
@@ -2675,10 +2710,12 @@ export async function readNodeSessions(runsRoot, runId) {
   for (const [nodeId, entry] of Object.entries(parsed)) {
     if (!checkRunId(nodeId) || !isPlainObject(entry)) continue
     if (typeof entry.sessionId !== 'string' || entry.sessionId.trim() === '' || entry.sessionId.length > 128) continue
+    const agentOptions = normalizeSessionAgentOptions(entry.agentOptions)
     out[nodeId] = {
       sessionId: entry.sessionId,
       createdAt: normalizeIso(entry.createdAt) || new Date().toISOString(),
       lastUsedAt: normalizeIso(entry.lastUsedAt) || normalizeIso(entry.createdAt) || new Date().toISOString(),
+      ...(agentOptions ? { agentOptions } : {}),
     }
   }
   return out
@@ -2691,10 +2728,12 @@ async function writeSessionsUnlocked(loc, sessions) {
     for (const [nodeId, entry] of Object.entries(sessions)) {
       if (!checkRunId(nodeId) || !isPlainObject(entry)) continue
       if (typeof entry.sessionId !== 'string' || entry.sessionId.trim() === '' || entry.sessionId.length > 128) continue
+      const agentOptions = normalizeSessionAgentOptions(entry.agentOptions)
       normalized[nodeId] = {
         sessionId: entry.sessionId,
         createdAt: normalizeIso(entry.createdAt) || new Date().toISOString(),
         lastUsedAt: normalizeIso(entry.lastUsedAt) || normalizeIso(entry.createdAt) || new Date().toISOString(),
+        ...(agentOptions ? { agentOptions } : {}),
       }
     }
   }
@@ -2717,6 +2756,11 @@ export async function writeNodeSessions(runsRoot, runId, sessions) {
 /**
  * 写入/更新一个节点的会话（读-改-写在同一把进程内锁 + 跨进程 meta.lock 里完成，
  * 两个进程同时 upsert 不会丢对方的条目）。
+ *
+ * 0.10 §2.1（R1）：`options.agentOptions` 是本次实际使用的模型路由对；同 sessionId
+ * 时未显式传（或传了坏形状）就保留旧 route，换 sessionId 则不继承。
+ *
+ * @param {{ now?: Date, resetCreatedAt?: boolean, agentOptions?: object }} [options]
  * @returns {Promise<Record<string, object>>} 写入后的会话表
  */
 export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, options = {}) {
@@ -2731,12 +2775,19 @@ export async function upsertNodeSession(runsRoot, runId, nodeId, sessionId, opti
   return withLock(loc.id, () => withMetaLock(loc, async () => {
     const current = await readNodeSessions(runsRoot, runId)
     const previous = current[nodeId]
+    const sameSession = Boolean(previous && previous.sessionId === sessionId)
+    // 0.10 §2.1（R1）：**同 sessionId** 才保留旧 route（除非本次显式传了新的合法值）；
+    // 换了 sessionId 就是新会话，不能凭空继承旧节点的 route（那会让模型路由漂移）。
+    const requested = normalizeSessionAgentOptions(options.agentOptions)
+    const inherited = sameSession && previous.agentOptions ? previous.agentOptions : null
+    const agentOptions = requested || inherited
     const entry = {
       sessionId,
-      createdAt: previous && previous.sessionId === sessionId && options.resetCreatedAt !== true
+      createdAt: sameSession && options.resetCreatedAt !== true
         ? previous.createdAt
         : now.toISOString(),
       lastUsedAt: now.toISOString(),
+      ...(agentOptions ? { agentOptions } : {}),
     }
     current[nodeId] = entry
     return writeSessionsUnlocked(loc, current)
@@ -3197,6 +3248,7 @@ export async function readEvents(runsRoot, runId, options = {}) {
 // 校验器里，所以这里放宽**不会**让未校验的事件进库。
 const EVENT_KINDS = new Set([
   ...BASE_EVENT_KINDS, ...INBOX_EVENT_KINDS, ...NODE_STATUS_EVENT_KINDS, ...MACHINE_EVENT_KINDS,
+  ...NODE_TOOLS_EVENT_KINDS,
 ])
 
 function whitelistKind(kind) {

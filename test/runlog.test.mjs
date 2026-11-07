@@ -12,7 +12,8 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  EVENT_KINDS, MACHINE_EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, checkRunId, collectArtifactIndex,
+  EVENT_KINDS, MACHINE_EVENT_KINDS, MAX_EVENT_BYTES, MAX_EXTRA_BYTES, NODE_TOOLS_EVENT_KINDS,
+  NODE_TOOL_NAME_MAX, NODE_TOOL_NAME_PATTERN, NODE_TOOLS_MAX, checkRunId, collectArtifactIndex,
   computeAcceptance, computeAgentActivity, computeConflicts, computeFindings, computeProgress, computeQuality,
   computeRejects, computeSkillUsage, computeStaleFails, computeTests, computeTokens, isSafeRelPath,
   machineTransitionSummary, normalizeEvent, renderRunMarkdown, summarize, summarizeAcceptance,
@@ -1599,6 +1600,89 @@ await checkAsync('machine/transition 全字段：通过校验，落盘后 readAl
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+console.log('runlog.js · 节点可用工具快照（node/tools，0.10 R6）')
+
+/** node/tools 事件夹具：节点级事件（nodeId + attemptId）。 */
+function nodeTools(tools = ['bash', 'read', 'write'], over = {}, dataOver = {}) {
+  return base({
+    kind: 'node/tools',
+    nodeId: 'n_a',
+    attemptId: 1,
+    data: { tools, toolsSource: 'session', count: tools.length, ...dataOver },
+    ...over,
+  })
+}
+
+check('node/tools 白名单：走独立扩展数组，EVENT_KINDS 仍是 17 种且不可变', () => {
+  assert.ok(Object.isFrozen(NODE_TOOLS_EVENT_KINDS), '扩展白名单不可变')
+  assert.deepEqual([...NODE_TOOLS_EVENT_KINDS], ['node/tools'])
+  assert.equal(EVENT_KINDS.length, 17, 'node/tools 不进 05 §2 冻结的 17 种基础事件')
+  assert.equal(EVENT_KINDS.includes('node/tools'), false)
+  assert.equal(NODE_TOOLS_MAX, 64)
+  assert.equal(NODE_TOOL_NAME_MAX, 64)
+  assert.ok(NODE_TOOL_NAME_PATTERN.test('flow_node_reject'), '下划线必须被允许（打回工具名）')
+  assert.ok(NODE_TOOL_NAME_PATTERN.test('a.b:c-d_e'), '点 / 冒号 / 连字符同样允许')
+  assert.equal(NODE_TOOL_NAME_PATTERN.test('has space'), false)
+  assert.equal(NODE_TOOL_NAME_PATTERN.test('x'.repeat(65)), false, '长度上限也在 pattern 里')
+})
+
+check('node/tools 合法：去重由采集端保证，校验器原样保留（含 truncated）', () => {
+  const event = ok(nodeTools(['bash', 'flow_node_reject', 'read']))
+  assert.equal(event.kind, 'node/tools')
+  assert.deepEqual(event.data, {
+    tools: ['bash', 'flow_node_reject', 'read'],
+    toolsSource: 'session',
+    count: 3,
+  })
+  const unavailable = ok(nodeTools([], {}, { toolsSource: 'unavailable' }))
+  assert.deepEqual(unavailable.data, { tools: [], toolsSource: 'unavailable', count: 0 })
+  const truncated = ok(nodeTools(['bash'], {}, { truncated: true }))
+  assert.equal(truncated.data.truncated, true)
+  // 没有 truncated 时不补默认值（与其它可选字段同口径）。
+  assert.equal(Object.hasOwn(event.data, 'truncated'), false)
+})
+
+check('node/tools 坏输入逐条拒绝：未知 source / 非数组 / >64 / 名字非法 / count 不等 / 重复', () => {
+  bad(nodeTools(['bash'], {}, { toolsSource: 'host' }), 'data.toolsSource')
+  bad(nodeTools(['bash'], {}, { toolsSource: undefined }), 'data.toolsSource')
+  bad(nodeTools('bash'), 'data.tools')
+  bad(nodeTools(['bash'.repeat(1)].concat(Array.from({ length: 64 }, (_, index) => `tool-${index}`))), 'data.tools')
+  bad(nodeTools(['']), 'data.tools')
+  bad(nodeTools(['has space']), 'data.tools')
+  bad(nodeTools(['x'.repeat(65)]), 'data.tools')
+  bad(nodeTools(['bash'], {}, { count: 2 }), 'data.count')
+  bad(nodeTools(['bash'], {}, { count: '1' }), 'data.count')
+  bad(nodeTools(['bash'], {}, { count: undefined }), 'data.count')
+  bad(nodeTools(['bash', 'bash']), 'data.tools')
+  bad(nodeTools(['bash'], {}, { truncated: 'yes' }), 'data.truncated')
+})
+
+check('node/tools digest：事件表里给出中文摘要，不是空行', () => {
+  const events = [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 1 } }),
+    ev('node/tools', { nodeId: 'n_a', attemptId: 1, data: { tools: ['bash', 'read'], toolsSource: 'session', count: 2 } }),
+  ]
+  const summary = summarize(events, { now: NOW })
+  const markdown = renderRunMarkdown({
+    id: RUN, name: '工具清单 run', flowId: 'f', flowName: 'F', status: 'running',
+    startedAt: NOW.toISOString(),
+  }, events, summary)
+  assert.ok(markdown.includes('可用工具 2 个'), 'node/tools 在时间线里要有摘要')
+})
+
+check('node/tools 8KB 边界：64×64 名字仍可通过；再塞未知大字段整条拒绝', () => {
+  const names = Array.from({ length: NODE_TOOLS_MAX }, (_, index) => (
+    `t${String(index).padStart(2, '0')}${'x'.repeat(61)}`
+  ))
+  for (const name of names) assert.equal(name.length, 64)
+  const full = ok(nodeTools(names))
+  assert.equal(full.data.count, 64)
+  const bytes = Buffer.byteLength(JSON.stringify(full), 'utf8')
+  assert.ok(bytes < MAX_EVENT_BYTES, `64 项 × 64 字符必须仍在 8KB 内（实际 ${bytes}）`)
+  // 未知 data 键按既有口径保留，体积由单条 8KB 上限兜住 → 超限整条拒绝。
+  bad(nodeTools(['bash'], {}, { blob: 'x'.repeat(MAX_EVENT_BYTES) }), 'event')
 })
 
 console.log(`\n${checks} 组通过`)

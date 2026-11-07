@@ -10,8 +10,8 @@
 | 事件信封字段、kind 与 `data` 字段、校验规则 | [design/05 §2](../design/05-run-log.md) 与 §8.1 / §8.2 |
 | token 四桶与替换语义 | [design/05 §3](../design/05-run-log.md) |
 | `summary` 聚合口径 | [design/05 §4](../design/05-run-log.md)、[design/04](../design/04-metrics.md) |
-| 收件箱、`node/status`、`machine/transition` 等扩展事件 | [design/05 §8.2](../design/05-run-log.md)、[design/07 §11](../design/07-runtime-0.7.md)、[design/08 §7](../design/08-state-machine.md) |
-| 代码侧的 kind 白名单 | `src/runlog.js` 的 `EVENT_KINDS` / `INBOX_EVENT_KINDS` / `NODE_STATUS_EVENT_KINDS` / `MACHINE_EVENT_KINDS` |
+| 收件箱、`node/status`、`node/tools`、`machine/transition` 等扩展事件 | [design/05 §8.2](../design/05-run-log.md)、[design/07 §11](../design/07-runtime-0.7.md)、[design/08 §7](../design/08-state-machine.md) |
+| 代码侧的 kind 白名单 | `src/runlog.js` 的 `EVENT_KINDS` / `INBOX_EVENT_KINDS` / `NODE_STATUS_EVENT_KINDS` / `NODE_TOOLS_EVENT_KINDS` / `MACHINE_EVENT_KINDS` |
 
 ## 怎么用
 
@@ -58,7 +58,7 @@ run 级只有 `run/start`、`run/end`；其余事件必须带 `nodeId + attemptI
 | 组 | kind | 干什么 |
 |---|---|---|
 | run | `run/start`、`run/end` | 一轮运行的开始与收尾（`done` / `aborted` / `failed`） |
-| 节点 | `node/start`、`node/end`、`node/status`（扩展） | 节点 attempt 的开始、结束、主管会话的结构化自审回报 |
+| 节点 | `node/start`、`node/end`、`node/status`（扩展）、`node/tools`（扩展） | 节点 attempt 的开始、结束、主管会话的结构化自审回报、节点会话可用工具快照 |
 | 成员 | `member/start`、`member/end` | team 模式子 agent 的生命周期 |
 | 模型 / 工具 | `model/call`、`tool/call`、`skill/load` | 用量、工具调用、skill 实际加载 |
 | 内容 | `agent/message` | agent 发言（截断 + 脱敏后 ≤2000 字符） |
@@ -69,7 +69,9 @@ run 级只有 `run/start`、`run/end`；其余事件必须带 `nodeId + attemptI
 | 收件箱（扩展） | `message/in`、`message/out` | 外部消息进入 / 回复出去 |
 | 状态机（扩展） | `machine/transition` | 转移观测，只给人看、不参与决策 |
 
-**17 种基础事件**冻结在 [design/05 §2](../design/05-run-log.md)；`message/*`、`node/status`、`machine/transition` 是扩展白名单，单独导出、不污染基础契约。未知 kind 一律拒绝写入，不静默存。
+**17 种基础事件**冻结在 [design/05 §2](../design/05-run-log.md)；`message/*`、`node/status`、`node/tools`、`machine/transition` 是扩展白名单，单独导出、不污染基础契约。
+
+`node/tools` 回答「这个节点会话的注册表里有哪些工具」，**不是**「上一轮实际准入的工具」；字段与校验（`tools` 去重排序 ≤64、`toolsSource ∈ {session, unavailable}`、`count === tools.length`、可选 `truncated`）的临时契约住 `docs/plan/0.10-方案.md` §4.2（design/05 冻结期无法回写，解冻后迁回）。未知 kind 一律拒绝写入，不静默存。
 
 ### 用量四桶
 

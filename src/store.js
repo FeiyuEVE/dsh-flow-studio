@@ -8,7 +8,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -202,6 +202,41 @@ async function seedDefaultFlow(dir) {
 }
 
 /**
+ * 保存前把磁盘上的旧版本另存一份（0.9.1 实证事故的兜底）。
+ *
+ * 起因是一次「客户端手里是一张空图 → PUT 整份替换 → 服务器上的流程被写成 nodes: []」
+ * 的事故：文件确实被覆盖了，但没有任何地方留着事故前的样子。备份放在
+ * `flows/.history/<id>.v<version>.json`，每份流程只留最近 KEEP 份；
+ * 备份失败绝不挡保存（这是兜底，不是主路径）。
+ */
+const HISTORY_DIR = '.history'
+const HISTORY_KEEP = 3
+
+async function stashFlowHistory(dir, id, version) {
+  const from = join(dir, `${id}.json`)
+  const to = join(dir, HISTORY_DIR, `${id}.v${version}.json`)
+  try {
+    await mkdir(join(dir, HISTORY_DIR), { recursive: true, mode: DIR_MODE })
+    await copyFile(from, to)
+  } catch {
+    return
+  }
+  try {
+    const names = await readdir(join(dir, HISTORY_DIR))
+    const mine = names
+      .filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+      .map(name => ({ name, version: Number(name.slice(id.length + 2, -'.json'.length)) }))
+      .filter(item => Number.isFinite(item.version))
+      .sort((a, b) => b.version - a.version)
+    for (const item of mine.slice(HISTORY_KEEP)) {
+      await unlink(join(dir, HISTORY_DIR, item.name)).catch(() => {})
+    }
+  } catch {
+    // 清理失败只是多留几份备份，不影响正确性。
+  }
+}
+
+/**
  * 读一份流程。
  * @returns {Promise<object | null>} 不存在返回 null
  */
@@ -242,6 +277,8 @@ export async function saveFlow(dir, id, body, fallback) {
     if (existing && expected !== undefined && expected !== existing.version) {
       throw new FlowConflictError(existing.version, existing.updatedAt, digestOf(existing))
     }
+    // 覆盖之前先留一份旧版本：任何一次「整份替换」都不该是不可逆的。
+    if (existing) await stashFlowHistory(dir, safe, existing.version)
     const now = new Date().toISOString()
     const flow = normalizeFlow(body, (existing && existing.name) || (fallback && fallback.name) || '未命名流程')
     flow.id = safe

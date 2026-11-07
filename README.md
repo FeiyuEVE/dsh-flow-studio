@@ -20,7 +20,7 @@
 ### 从私源安装（`@feiyueve` scope）
 
 ```sh
-dsh plugin --profile web add @feiyueve/dsh-flow-studio@0.9.0
+dsh plugin --profile web add @feiyueve/dsh-flow-studio@0.9.1
 ```
 
 ### 从源码安装

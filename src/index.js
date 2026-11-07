@@ -898,6 +898,26 @@ function rejectMalformedFlowBody(res, body) {
 }
 
 /**
+ * 0.9.1 实证事故：`PUT /flows/<id>` 是**整份替换**语义。请求体里连 `nodes` / `edges`
+ * 键都没有（典型是把「流程列表摘要」`{id,name,nodeCount,…}` 当流程发过来）时，
+ * `normalizeFlow` 会兜成空数组，服务器上的流程就被静默写成空图。
+ *
+ * 这里只拒绝「键缺失」：键在、但值是空数组或类型古怪，仍然放行 —— 那是 0.7 拍板的
+ * 宽松保存口径（画布自动保存的中间态必然非法，一律 200 + validation，严格口径留给启动 run）。
+ */
+function rejectIncompleteFlowBody(res, body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false
+  const missing = ['nodes', 'edges'].filter(key => !Object.prototype.hasOwnProperty.call(body, key))
+  if (missing.length === 0) return false
+  sendJson(res, 400, {
+    ok: false,
+    code: 'FLOW_BODY_INCOMPLETE',
+    error: '保存流程必须带 ' + missing.join(' / ') + ' 字段：PUT 是整份替换语义，缺字段会把流程写成空图',
+  })
+  return true
+}
+
+/**
  * 原始 URL 的路径段防线。WHATWG URL 会把 `..` / `%2e%2e` 规范化掉，
  * 规范化之后再看就分不清「用户想穿越」还是「本来就没有这个接口」，
  * 所以先在原始 req.url 上挡一道，统一回 400。
@@ -1177,6 +1197,8 @@ async function route(req, res, env) {
         }
         // 保存不因 validation.errors 拒绝（自动保存 + 中间态必然非法）；只有形状垃圾才是 400。
         if (rejectMalformedFlowBody(res, payload)) return
+        // 0.9.1：缺 nodes/edges 键的「整份替换」一律拒绝，否则会把流程写成空图。
+        if (rejectIncompleteFlowBody(res, payload)) return
         // G6-a ②：含 executor:'custom' 的流程，主机开关关着时保存即 400（与启动同口径）。
         const customGate = customExecutorBlockers(payload)
         if (customGate.length > 0) {

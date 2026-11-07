@@ -244,6 +244,45 @@ export function saveBodyFor(flow, options = {}) {
 }
 
 /**
+ * 保存前的形状闸门（0.9.1 实证事故的硬防线）。
+ *
+ * `PUT /flows/<id>` 是**整份替换**语义：请求体里没有 `nodes` / `edges`（或它们不是数组），
+ * 服务器就会把这份流程写成空图 —— 一次「把列表摘要当流程传进来」就能静默清空用户的流程。
+ * 这里在发请求之前就拦住：宁可报错让人重试，不许把服务器上的流程覆盖成空。
+ *
+ * 注意：`nodes: []` / `edges: []` 是**合法**的（用户确实可以删光节点），所以只查类型不查长度。
+ *
+ * @returns {{ ok: boolean, body?: object, reason?: string }}
+ */
+export function flowSavePayload(flow, options = {}) {
+  if (!flow || typeof flow !== 'object') return { ok: false, reason: '没有要保存的流程' }
+  if (!Array.isArray(flow.nodes) || !Array.isArray(flow.edges)) {
+    return { ok: false, reason: '这份流程缺少 nodes / edges（可能是列表摘要或损坏的草稿）' }
+  }
+  return { ok: true, body: saveBodyFor(flow, options) }
+}
+
+/**
+ * 空图写入防线的判定（0.9.1 实证事故）。
+ *
+ * `nodes: []` 本身是合法状态 —— 用户确实可以删光节点再保存。所以只在**三条同时成立**时拦：
+ *   1. 要保存的是空图；
+ *   2. 打开这份流程时服务器上有节点（`guard.nodes > 0`）；
+ *   3. 这次会话没有任何结构编辑（`guard.edited === false`，只有增删节点/边才会置位）。
+ * 三条同时成立只可能是「图上的东西在客户端丢了」，不是用户的意图。
+ *
+ * @param {object|null} flow 要保存的流程
+ * @param {{ nodes?: number, edited?: boolean }|null} guard 打开时的节点数与本次会话是否编辑过结构
+ * @returns {string} 拦截原因（空串 = 允许保存）
+ */
+export function emptyGraphBlockReason(flow, guard) {
+  if (!flow || !Array.isArray(flow.nodes) || flow.nodes.length > 0) return ''
+  if (!guard || !(guard.nodes > 0) || guard.edited === true) return ''
+  return '服务器上这份流程有 ' + guard.nodes + ' 个节点，而当前要保存的是空图，'
+    + '并且这次会话没有删过节点。已取消写入（否则会把流程清空）；重新打开该流程或刷新页面即可恢复。'
+}
+
+/**
  * 保存成功后合并服务器回传的元数据（版本 / 更新时间）。
  *
  * 只并这两个字段、不动内容：保存期间用户可能又改了东西，用服务器快照整体覆盖
@@ -536,6 +575,16 @@ export function FlowStudioPage({
   const editVersion = useRef(0)
   const savedVersion = useRef(0)
   const draftChecked = useRef('')
+  /**
+   * 空图写入防线（0.9.1 实证事故）：`nodes: []` 本身是合法状态（用户可能删光节点），
+   * 但「服务器上有节点、这次会话又没删过节点、却要保存一份空图」只可能是图上东西丢了。
+   * 记录打开时的节点数 + 这次会话有没有做过结构编辑，保存前据此拦一道。
+   */
+  const graphGuard = useRef({ nodes: 0, edited: false })
+  /** 结构编辑（增删节点/增减边/恢复草稿）——只有这些操作能把图变空。 */
+  const markGraphEdited = useCallback(() => {
+    graphGuard.current.edited = true
+  }, [])
   /** M1：运行中锁结构；回调里用 ref 读最新值，避免闭包吃到旧状态。 */
   const lockedRef = useRef(false)
   lockedRef.current = Boolean(runView && runView.activeRun && runIsActive(runView.activeRun))
@@ -571,7 +620,7 @@ export function FlowStudioPage({
     setFlow(previous => (previous
       ? { ...previous, nodes: previous.nodes.map(node => (node.id === id ? { ...node, ...patch } : node)) }
       : previous))
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   const patchEdge = useCallback((id, patch) => {
     if (refuseWhenLocked()) return
@@ -579,7 +628,7 @@ export function FlowStudioPage({
     setFlow(previous => (previous
       ? { ...previous, edges: previous.edges.map(edge => (edge.id === id ? { ...edge, ...patch } : edge)) }
       : previous))
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   /**
    * 拖拽结束后的位置提交（缺陷 7）：画布只在 onNodeDragStop 调一次，
@@ -615,7 +664,21 @@ export function FlowStudioPage({
   const saveNow = useCallback(async (target, options = {}) => {
     const snapshot = target || flowRef.current
     if (!snapshot || !snapshot.id) return false
-    const body = saveBodyFor(snapshot, options)
+    // 形状闸门：整份替换语义下，缺 nodes/edges 的请求体会把服务器上的流程清空。
+    const payload = flowSavePayload(snapshot, options)
+    if (!payload.ok) {
+      setSaveState('error')
+      setError('保存被拦下：' + payload.reason + '，未写入，服务器上的流程保持原样。')
+      return false
+    }
+    const body = payload.body
+    // 空图防线：服务器上有节点、这次会话没删过节点，却要写入空图 —— 停手。
+    const blockReason = emptyGraphBlockReason(snapshot, graphGuard.current)
+    if (blockReason !== '') {
+      setSaveState('error')
+      setError('保存被拦下：' + blockReason)
+      return false
+    }
     const version = editVersion.current
     setSaveState('saving')
     try {
@@ -626,6 +689,8 @@ export function FlowStudioPage({
       setConflict(null)
       savedVersion.current = version
       setSaveState(current => (editVersion.current === version ? 'saved' : current))
+      // 写成功后以「服务器的现状」重新计基线：这次如果真的是用户删光了节点，也算数。
+      graphGuard.current = { nodes: snapshot.nodes.length, edited: false }
       setError('')
       clearDraft(snapshot.id)
       // 没有更新改动时才取消待写草稿；保存期间又敲的字不能被取消掉。
@@ -756,6 +821,14 @@ export function FlowStudioPage({
     if (flow) setIssues(validateFlow(flow))
   }, [flow])
 
+  /**
+   * 只按**流程 id** 重置空图防线：同一份流程被整体换成空图（图上东西丢了）时，
+   * `edited` 必须还是 false，这道防线才拦得住；换到另一份流程才重新计数。
+   */
+  useEffect(() => {
+    graphGuard.current = { nodes: flow ? flow.nodes.length : 0, edited: false }
+  }, [flow && flow.id])
+
   useEffect(() => {
     if (saveState !== 'dirty' || !flow) return undefined
     // 缺陷 8：草稿写盘走去抖（600ms，最长 2s），输入一个字不再同步写整份 JSON。
@@ -826,6 +899,7 @@ export function FlowStudioPage({
     if (!draftNotice) return
     const restored = draftNotice.record.flow
     touch()
+    markGraphEdited()
     setFlow(restored)
     setIssues(validateFlow(restored))
     setSelection(null)
@@ -984,11 +1058,12 @@ export function FlowStudioPage({
     if (refuseWhenLocked()) return null
     const node = blankNode(NODE_KIND.STAGE, Math.round(x), Math.round(y), '新阶段')
     touch()
+    markGraphEdited()
     setFlow(previous => (previous ? { ...previous, nodes: [...previous.nodes, node] } : previous))
     setSelection({ kind: 'node', id: node.id })
     // 画布节点工具条的「新增下游」要立刻拿到 id 建边；双击新增忽略返回值。
     return node
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   const addEdge = useCallback((from, to) => {
     if (refuseWhenLocked()) return null
@@ -1001,10 +1076,11 @@ export function FlowStudioPage({
     const kind = edgeKindBetween(current, from, to)
     const edge = blankEdge(from, to, kind)
     touch()
+    markGraphEdited()
     setFlow(previous => (previous ? { ...previous, edges: [...previous.edges, edge] } : previous))
     setSelection({ kind: 'edge', id: edge.id })
     return edge
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   /** 检查器里的方向微调：单击 4px，按住 Shift 20px。 */
   const nudgeNode = useCallback((id, dx, dy) => {
@@ -1019,6 +1095,7 @@ export function FlowStudioPage({
   const deleteNode = useCallback(id => {
     if (refuseWhenLocked()) return
     touch()
+    markGraphEdited()
     setSelection(null)
     setFlow(previous => (previous
       ? {
@@ -1027,14 +1104,15 @@ export function FlowStudioPage({
         edges: previous.edges.filter(edge => edge.from !== id && edge.to !== id),
       }
       : previous))
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   const deleteEdge = useCallback(id => {
     if (refuseWhenLocked()) return
     touch()
+    markGraphEdited()
     setSelection(null)
     setFlow(previous => (previous ? { ...previous, edges: previous.edges.filter(edge => edge.id !== id) } : previous))
-  }, [refuseWhenLocked, touch])
+  }, [markGraphEdited, refuseWhenLocked, touch])
 
   const addMember = useCallback(() => {
     if (refuseWhenLocked()) return
@@ -1192,8 +1270,11 @@ export function FlowStudioPage({
       progress: runProgress,
     })
     : null
+  // 没打开任何流程时 `flow` 为 null（流程被删光 / 首次进入且库里没有流程），
+  // 但库里可能仍有历史 run —— 顶栏照样要能显示「当前节点」，所以这里不能直接点 `flow.nodes`。
+  const flowNodes = flow ? flow.nodes : []
   const liveLabel = runForFlow
-    ? runLiveLabel(runForFlow, runLive, { nodes: flow.nodes, events: runEvents })
+    ? runLiveLabel(runForFlow, runLive, { nodes: flowNodes, events: runEvents })
     : ''
   const liveHint = runLive
     ? [liveLabel, phaseText(runLive.phase), runLive.since ? '开始于 ' + runLive.since : '']

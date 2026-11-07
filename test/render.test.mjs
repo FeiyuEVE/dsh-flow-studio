@@ -64,8 +64,8 @@ const {
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
   RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, deleteFlowRequest, firstErrorTarget,
-  mergeSavedFlow, progressOf, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
-  startFailurePlan,
+  emptyGraphBlockReason, flowSavePayload, mergeSavedFlow, progressOf, restoreFlowRequest,
+  runEndAnnouncement, runPreflight, saveBodyFor, startFailurePlan,
 } = await import('../src/client/page.js')
 const {
   EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
@@ -873,6 +873,46 @@ check('B2：校验不过不起引擎；本次新建的 run 启动失败要 DELET
     '复用的旧 pending run 启动失败不能删')
 })
 
+check('0.9.1 保存形状闸门：列表摘要 / 缺 nodes 的对象一律不发请求', () => {
+  const flow = { ...model.defaultFlow(), id: 'flow-gate', version: 2 }
+
+  const ok = flowSavePayload(flow)
+  assert.equal(ok.ok, true, '完整流程必须放行')
+  assert.ok(Array.isArray(ok.body.nodes) && ok.body.nodes.length > 0, '请求体要带 nodes')
+
+  // 真事故：把「流程列表摘要」当流程保存 —— 摘要没有 nodes/edges，
+  // PUT 是整份替换语义，发出去就把服务器上的流程写成空图。
+  const summary = model.summarize(flow)
+  assert.equal('nodes' in summary, false, '前提：摘要本来就没有 nodes')
+  const rejected = flowSavePayload(summary)
+  assert.equal(rejected.ok, false, '摘要必须被拦下，不许发请求')
+  assert.ok(rejected.reason.includes('nodes'), '拦下时要说清缺什么，' + rejected.reason)
+
+  // 用户真的删光节点仍然要能保存：空数组是合法的。
+  assert.equal(flowSavePayload({ ...flow, nodes: [], edges: [] }).ok, true, '空图是合法状态')
+  assert.equal(flowSavePayload(null).ok, false, 'null 不能当请求体')
+  assert.equal(flowSavePayload({ id: 'flow-x', name: '只有名字' }).ok, false, '半成品对象必须拦下')
+})
+
+check('0.9.1 空图写入防线：服务器有节点 + 本次没删过节点 → 拒绝保存空图', () => {
+  const filled = { ...model.defaultFlow(), id: 'flow-guard' }
+  const emptied = { ...filled, nodes: [], edges: [] }
+
+  // 真事故形态：打开时有 8 个节点，保存时却成了一张空图，而且用户什么都没删。
+  const blocked = emptyGraphBlockReason(emptied, { nodes: 8, edited: false })
+  assert.ok(blocked.includes('8 个节点'), '拦截原因要给出服务器上的节点数，' + blocked)
+  assert.ok(blocked.includes('没有删过节点'), '拦截原因要说清是「没删过却变空」')
+
+  // 反例一：用户真把节点删光了（结构编辑置位）→ 必须放行，不能把合法操作当事故。
+  assert.equal(emptyGraphBlockReason(emptied, { nodes: 8, edited: true }), '', '用户删光节点后必须能保存')
+  // 反例二：这份流程本来就是空的（新建的空模板）→ 放行。
+  assert.equal(emptyGraphBlockReason(emptied, { nodes: 0, edited: false }), '', '本来就是空图时要能保存')
+  // 反例三：图不空 → 与防线无关。
+  assert.equal(emptyGraphBlockReason(model.defaultFlow(), { nodes: 8, edited: false }), '', '非空图不受影响')
+  // 缺 guard（老调用方 / 首次保存）时不能误拦用户。
+  assert.equal(emptyGraphBlockReason(emptied, null), '', '没有基线时按放行处理')
+})
+
 check('0.4.2 并发保存：请求体带 version、成功后回写新版本、force 才剥版本', () => {
   const flow = { ...model.defaultFlow(), id: 'flow-x', version: 3, updatedAt: '2026-11-06T10:00:00.000Z' }
 
@@ -1098,6 +1138,32 @@ check('页面运行中：顶栏实时节点 + 开始禁用/停止可用 + 抽屉
   assert.ok(html.includes('已通过'), '已通过节点没有状态角标')
   assert.ok(html.includes('class="fs-log open"'), '开始运行后抽屉应自动展开')
   assert.ok(html.includes('标准研发流水线 · 实时'), '抽屉没有切到该 run')
+})
+
+// 回归（0.9.1 实证缺陷）：库里还有 run、但当前没有打开任何流程（流程被删光 /
+// 首次进入且一条都没有）时，`activeRunViewOf` 会把空 flowId 当通配匹配到任意 run，
+// 随后 `{ nodes: flow.nodes }` 在 flow 为 null 时抛
+// `Cannot read properties of null (reading 'nodes')`，整个面板被判成崩溃、画布空白。
+check('没有打开流程但库里有 run：顶栏退回 nodeId，不因 flow 为 null 崩（回归 0.9.1）', () => {
+  const live = { currentNodeId: 'n_dev', attempt: 2, round: 3, phase: 'model' }
+  const orphanView = {
+    run: {
+      id: 'run-orphan', flowId: 'flow-deleted', flowName: '已删掉的流程',
+      name: '已删掉的流程 · 实时', status: 'running', nodeDone: 1, nodeTotal: 6, tokenTotal: 1200, live,
+    },
+    runs: [{
+      id: 'run-orphan', flowId: 'flow-deleted', name: '已删掉的流程 · 实时',
+      status: 'running', nodeDone: 1, nodeTotal: 6, tokenTotal: 1200,
+    }],
+    live,
+    events: [{ kind: 'node/start', nodeId: 'n_dev', attemptId: 2, seq: 1, data: {} }],
+    summary: null,
+    detail: null,
+  }
+  const html = render(React.createElement(FlowStudioPage, { initialSkills: [], initialRunView: orphanView }))
+  assert.ok(html.includes('当前节点 n_dev'), '拿不到节点标题时要退回显示 nodeId，不能崩也不能写「—」')
+  assert.ok(html.includes('第 3 轮'), '没有流程时轮次仍要照常显示')
+  assert.ok(html.includes('fs-empty-card'), '没有流程时画布要给「还没有流程模板」空态，而不是白屏')
 })
 
 check('409 是业务态不是故障：已有 run 在跑 / 不在跑都给可读提示（06 §10）', () => {

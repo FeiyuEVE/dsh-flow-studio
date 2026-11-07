@@ -101,3 +101,16 @@
 - **逃生门**：`FLOW_STUDIO_FLOW_MACHINE=0` 回退 0.8.x 的旧主循环（行为逐字节保留，留一个发布周期）。
 - **测试**：**21 个测试文件 / 759 组**全绿（不含 `test/build.test.mjs` 发布门禁）。
 - **发布前的教训**：一条对 XState 内部对象做 `assert.equal` 的测试，在与预期不符时把宿主打成 22 GB OOM。修复与纪律见 [事故记录](../postmortem/2026-11-07-oom.md) 与 [CONTRIBUTING.md 的测试纪律](../../CONTRIBUTING.md#测试纪律)。
+
+## 0.9.1 — 面板白屏修复 + 保存链兜底
+
+修一个**真实的白屏缺陷**，并把「流程被写成空图」这一类事故从「不可逆」变成「拦得住 / 回得去」。这一版没有新功能。
+
+- **白屏（真 bug）**：`runs` 快照可能比 `boot()` 的 `readFlow` 先到 —— 那时 `flow` 还是 null 而 `runForFlow` 已经非空，顶栏取 `flow.nodes` 直接抛 `Cannot read properties of null (reading 'nodes')`，整个 `main` 槽被判成崩溃、面板全白。改成 `flow ? flow.nodes : []`，并补一条**先红后绿**的 SSR 回归（用 `git worktree` 检出修复前的源码跑同一条用例，能稳定复现同一个 TypeError）。
+- **保存链三道防线**（形状错、空图、缺字段各管一段）：
+  - 客户端 `flowSavePayload()`：请求体必须真的带 `nodes` / `edges` 数组，列表摘要或半成品对象**不发请求**；
+  - 客户端 `emptyGraphBlockReason()`：服务器上有节点 + 这次会话没做过结构编辑 + 却要保存空图 → 拦下并说明原因（用户真删光节点仍然能保存，空数组本身合法）；
+  - Host `rejectIncompleteFlowBody()`：`PUT /flows/<id>` **缺** `nodes` / `edges` 键 → `400 FLOW_BODY_INCOMPLETE`。键在但值是空数组 / 类型古怪仍然 200（0.7 拍板的宽松保存口径不变，严格口径只在启动 run 时）。
+- **可回滚**：Host 每次覆盖前把磁盘上的旧版本另存一份 `flows/.history/<id>.v<version>.json`（每份流程保留最近 3 份，`.history` 不会出现在流程列表里）。写盘失败不备份、备份失败不挡保存。
+- **排查留痕（不是插件 bug，但值得记）**：本地那张「打开面板把标准研发流水线清空成 0 节点」的截图，根因在**我们自己的截图脚本**——`closeModals()` 会点所有可见文案为 `✕` 的按钮，而节点工具栏的删除按钮可见文案就是 `✕`（`aria-label` 才是「删除节点」），于是逐个 `deleteNode()` → `touch()` → 700ms 防抖自动保存把已经空了的图整份 PUT 回服务器。证据是 `touch()` 上的 12 次断点全部来自 `deleteNode`，以及 PUT 的调用栈 `saveNow ← setTimeout(700)` / `flushBeforeLeave ← openFlow ← onOpen`。脚本已改成跳过画布内部的危险按钮；产品侧则用上面三道防线 + 版本备份兜住这一类「图丢了还写回去」的事故。
+- **测试**：**21 个测试文件 / 764 组**全绿（不含发布门禁 `test/build.test.mjs`）。新增 5 组：白屏回归、保存形状闸门、空图防线、缺字段 PUT 400、旧版本备份（含保留 3 份与列表不串味）。

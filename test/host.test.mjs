@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -117,6 +117,35 @@ await check('保存后可读回，且整份替换生效', async () => {
   assert.equal(renamed.createdAt, saved.createdAt, 'createdAt 不该被覆盖')
   const readBack = await store.readFlow(dir, id)
   assert.equal(readBack.name, '改过名')
+})
+
+await check('0.9.1 覆盖前留旧版本备份：.history/<id>.v<version>.json，最多 3 份', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const twoNodes = {
+    name: '备份验证',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' },
+      { id: 'b', kind: 'end', title: '完成', x: 300, y: 0, task: 't' },
+    ],
+    edges: [{ from: 'a', to: 'b', kind: 'next' }],
+  }
+  const v1 = await store.saveFlow(dir, id, twoNodes)
+  assert.equal(v1.version, 1)
+  // 真事故形态：下一条 PUT 是一张空图，整份替换把这 2 个节点覆盖掉。
+  const v2 = await store.saveFlow(dir, id, { name: '备份验证', nodes: [], edges: [] })
+  assert.equal(v2.version, 2)
+  const kept = JSON.parse(readFileSync(join(dir, '.history', `${id}.v1.json`), 'utf8'))
+  assert.equal(kept.version, 1)
+  assert.equal(kept.nodes.length, 2, '覆盖前那一版必须原样留着，事故才能回滚：' + JSON.stringify(kept.nodes))
+
+  for (let i = 0; i < 4; i += 1) {
+    await store.saveFlow(dir, id, { name: '覆盖 ' + i, nodes: [], edges: [] })
+  }
+  const names = readdirSync(join(dir, '.history')).filter(name => name.startsWith(`${id}.v`))
+  assert.equal(names.length, 3, '每份流程只留最近 3 份备份，不能无限增长：' + names.join(','))
+  const listed = await store.listFlows(dir)
+  assert.equal(listed.some(item => item.id.includes('history')), false, '.history 不能出现在流程列表里')
 })
 
 await check('非法 id 一律拒绝', async () => {
@@ -329,6 +358,27 @@ await check('PUT 后 GET 拿到同一份内容', async () => {
   assert.equal(got.json.flow.nodes.length, 2)
   assert.equal(got.json.flow.edges.length, 1)
   assert.equal(validateFlow(got.json.flow).ok, true)
+})
+
+await check('0.9.1 PUT 缺 nodes/edges 键 → 400，流程不被写成空图', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('缺字段'))
+  const id = created.json.flow.id
+  // 真事故形态：把「流程列表摘要」{id,name,nodeCount,edgeCount,…} 当流程 PUT 回来。
+  const list = await call(route, 'GET', '/api/flow-studio/flows')
+  const summary = list.json.flows.find(item => item.id === id)
+  assert.ok(summary && !('nodes' in summary), '前提：摘要本来就没有 nodes')
+  const rejected = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, summary)
+  assert.equal(rejected.status, 400, JSON.stringify(rejected.json))
+  assert.equal(rejected.json.code, 'FLOW_BODY_INCOMPLETE')
+  assert.match(rejected.json.error, /nodes/)
+  const after = await call(route, 'GET', `/api/flow-studio/flows/${id}`)
+  assert.equal(after.json.flow.nodes.length, 2, '被拒绝的 PUT 一个字节都不能写盘')
+  assert.equal(after.json.flow.version, 1, '被拒绝的 PUT 不能推进版本号')
+
+  // 反向：用户真的删光节点（nodes: [] 键在）仍然允许保存，宽松口径不变。
+  const emptied = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, { name: '删光了', nodes: [], edges: [] })
+  assert.equal(emptied.status, 200, '空图仍然要能保存')
+  assert.equal(emptied.json.flow.nodes.length, 0)
 })
 
 await check('POST 新建不校验版本，body.version 不生效，一律从 v1 开始', async () => {

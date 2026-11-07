@@ -1653,6 +1653,12 @@ function leaseHeldBy(lease, meta, options = {}) {
   }
   // 0.11 N2（复核阻断）：持久世代存在时，兼容回退一律关闭——缺 ownerId = 无法证明持权。
   if (execution) return false
+  // N10（复核2 残余）：run.json 的 execution 没了、但 lock.json 仍是 0.11 形状
+  // （带 ownerId / epoch）时，说明世代被抹掉或被旧二进制改过——这种租约不能按
+  // 「0.10 旧租约」对待，否则同 pid@host 又能无凭证续租/删除。真正的 0.10 租约
+  // 两个字段都不存在，仍走下面的兼容路径。
+  if (typeof lease.ownerId === 'string' && lease.ownerId !== '') return false
+  if (Number.isInteger(lease.epoch)) return false
   const pid = Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid
   const host = typeof options.host === 'string' && options.host !== '' ? options.host : hostname()
   if (lease.pid !== pid || lease.host !== host) return false
@@ -2318,6 +2324,9 @@ export async function recordHostExecution(runsRoot, runId, record, options = {})
     reasonCode: typeof record.reasonCode === 'string' ? record.reasonCode.slice(0, 128) : null,
     reportPath: typeof record.reportPath === 'string' ? record.reportPath.slice(0, 512) : null,
     reportSha256: typeof record.reportSha256 === 'string' ? record.reportSha256 : null,
+    // N8（复核2）：二进制/非法 UTF-8 报告的公开副本是按字节脱敏的，不能当文本解析。
+    // 登记里也要留这一位，否则事后审计无法区分「这份副本是可读文本」还是「opaque 字节」。
+    reportOpaque: record.reportOpaque === true,
     startedAt: typeof record.startedAt === 'string' ? record.startedAt : null,
     finishedAt: typeof record.finishedAt === 'string' ? record.finishedAt : null,
     recordedAt: new Date().toISOString(),

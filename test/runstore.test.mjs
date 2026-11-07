@@ -3103,8 +3103,53 @@ if (first) {
     assert.ok(!existsSync(lockPath), '旧 run 的租约必须能被释放')
   })
 
-  // F6-①：同一个 loss key 的两个 finalize 并发。旧实现在锁外查幂等键与终态，两个都能
-  // 走到 append；guard 只比 epoch/owner、不查 execution.state，于是各写一条 run/end。
+  // N10（复核2 残余）：execution 缺失、但 lock.json 仍是 0.11 形状（带 ownerId/epoch）
+  // 时不得按「0.10 旧租约」放行——那说明世代被抹掉或被旧二进制改过，同 pid@host 的
+  // 调用方不该再有无凭证续租/删除的能力。真正的 0.10 租约两个字段都不存在（上一条）。
+  await check('N10（复核2 残余）：execution 缺失但 lock.json 带 ownerId/epoch 时，无 ownerId 的 pid@host 必须 409', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-n10', ttlMs: 60_000, now: t0,
+    })
+    // 只抹掉 run.json 的 execution，保留 lock.json 的 0.11 形状。
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    delete disk.execution
+    writeFileSync(metaPath, `${JSON.stringify(disk, null, 2)}\n`)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const lockBefore = readFileSync(lockPath, 'utf8')
+    assert.equal(JSON.parse(lockBefore).ownerId, 'owner-n10', '夹具前提：lock.json 必须仍是 0.11 形状')
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', now: new Date(t0.getTime() + 1000),
+      }),
+      error => error && error.status === 409,
+      'execution 被抹掉但 lock.json 带世代时，无 ownerId 的续租必须 409',
+    )
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }),
+      error => error && error.status === 409,
+      'execution 被抹掉但 lock.json 带世代时，无 ownerId 的释放必须 409',
+    )
+    assert.equal(readFileSync(lockPath, 'utf8'), lockBefore, '失败调用不得改写 lock.json')
+    // 世代被抹掉后，连「显式 ownerId」也不足以证明持权——这是 N2 有意选的严格口径
+    // （lock.json 与 execution 必须双对账，任一侧缺失都按无法证明持权处理）。
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { ownerId: 'owner-n10' }),
+      error => error && error.status === 409,
+      'execution 缺失时显式 ownerId 也不能释放（双对账口径）',
+    )
+    // 兜底出口是显式 force（运维/灾备语义），以及 TTL 到期后的 reap。
+    assert.equal(await store.releaseLease(runsRoot, meta.id, { ownerId: 'owner-n10', force: true }), true,
+      'force 是这种情况下的唯一释放出口')
+    assert.ok(!existsSync(lockPath), 'force 释放必须删掉租约')
+  })
+
+
   await check('F6（审查 P1）：并发相同 loss key 的 finalize 只落一条 run/end（幂等判定在锁内）', async () => {
     const meta = await makeRun()
     created.push(meta.id)
@@ -3278,6 +3323,50 @@ if (first) {
     assert.equal(verify(checkEvent), false, '报告副本内容被篡改（同长度）后不得继续授信')
     rmSync(abs, { force: true })
     assert.equal(verify(checkEvent), false, '报告副本删除后不得继续授信')
+  })
+
+  // N8（复核2）：reportOpaque 原先只进引擎的嵌套 verification 对象，被 runlog 的
+  // 有界化丢掉；私有登记的显式白名单（bounded）也没收。审计因此无法区分「这份公开
+  // 副本是可读文本」与「opaque 字节」。
+  await check('N8：私有登记保留 reportOpaque（默认 false，二进制报告为 true）', async () => {
+    const meta = await store.createRun(runsRoot, { flowId: 'flow-n8', flowName: 'N8', nodeTotal: 1 })
+    const base = {
+      runId: meta.id,
+      nodeId: 'n_n8',
+      attempt: 1,
+      checkId: 'host:n_n8',
+      commandDigest: 'c'.repeat(64),
+      expectedExitCode: 0,
+      exitCode: 0,
+      state: 'pass',
+      reasonCode: null,
+      reportPath: 'reports/blob.bin',
+      reportSha256: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    }
+
+    const opaqueId = 'hc-n8-opaque'
+    await store.recordHostExecution(runsRoot, meta.id, {
+      ...base, executionId: opaqueId, reportOpaque: true,
+    }, { receipt: store.createHostExecutionReceipt(opaqueId) })
+    const opaqueRecord = JSON.parse(readFileSync(
+      join(runsRoot, meta.id, 'verification', opaqueId, 'record.json'), 'utf8'))
+    assert.equal(opaqueRecord.reportOpaque, true, '二进制报告的登记必须留下 reportOpaque=true')
+
+    const textId = 'hc-n8-text'
+    await store.recordHostExecution(runsRoot, meta.id, {
+      ...base, executionId: textId,
+    }, { receipt: store.createHostExecutionReceipt(textId) })
+    const textRecord = JSON.parse(readFileSync(
+      join(runsRoot, meta.id, 'verification', textId, 'record.json'), 'utf8'))
+    assert.equal(textRecord.reportOpaque, false, '未声明 opaque 时必须落 false（形状稳定，不缺席）')
+
+    // 读回时也要带着这一位，否则审计层拿不到。
+    const execs = await store.readHostExecutions(runsRoot, meta.id)
+    const byId = new Map(execs.map(entry => [entry.executionId, entry]))
+    assert.equal(byId.get(opaqueId)?.reportOpaque, true, 'readHostExecutions 必须透出 reportOpaque')
+    assert.equal(byId.get(textId)?.reportOpaque, false, 'readHostExecutions 的默认值必须是 false')
   })
 
 } finally {

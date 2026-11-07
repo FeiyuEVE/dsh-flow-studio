@@ -6807,6 +6807,9 @@ class FlowEngine {
         verificationKind: 'check',
         ...(verification.reportSha256 ? { reportSha256: verification.reportSha256 } : {}),
         ...(registryPath ? { registryPath } : {}),
+        // N8（复核2）：reportOpaque 也必须是**扁平键**——runlog 的有界化只保留标量，
+        // 嵌套对象会被整个丢掉，事件流与审计就看不到「这份公开副本不是文本」。
+        reportOpaque: verification.reportOpaque === true,
         verification: {
           executionId,
           state: emittedState,

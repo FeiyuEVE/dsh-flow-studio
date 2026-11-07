@@ -173,6 +173,32 @@ await check('redactText：Bearer / sk- / key=value / 超长混合串四类都脱
   A.equal(redactText(relative), relative, '≥32 字符的相对路径必须原样保留')
 })
 
+// N9（复核2）：原先只认 Bearer，`Authorization: Basic <base64>` 会走到 key:value 规则
+// 只把 scheme 抹掉，真正的 base64 凭据原样留下、还把外层字符串改坏。
+await check('N9：Authorization 的 Basic / Token 方案与 Bearer 同口径脱敏，scheme 保留', () => {
+  const cases = [
+    ['Authorization: Basic dXNlcjpwYXNzLXNlY3JldA==', 'dXNlcjpwYXNzLXNlY3JldA==', 'Basic'],
+    ['curl -H "Authorization: Basic dXNlcjpwYXNz" http://x', 'dXNlcjpwYXNz', 'Basic'],
+    ['Authorization: Token canary-token-7f3a', 'canary-token-7f3a', 'Token'],
+    ['Authorization: Bearer sk-live-abcdef1234567890', 'sk-live-abcdef1234567890', 'Bearer'],
+  ]
+  for (const [raw, secret, scheme] of cases) {
+    const out = redactText(raw)
+    A.ok(!out.includes(secret), `凭据必须抹掉（${scheme}）：${out}`)
+    A.match(out, new RegExp(`${scheme} \\[REDACTED\\]`), `scheme 必须保留、值替换成 [REDACTED]：${out}`)
+    // 不许把外层引号或字符串结构改坏（旧实现会产出 `Authorization: "[REDACTED]" <凭据>`）。
+    A.ok(!out.includes('"[REDACTED]"'), `不得产出被改坏的引号形态：${out}`)
+  }
+  // 非凭据文本不受影响（不含认证方案词的普通句子）。
+  A.equal(redactText('normal text without secrets'), 'normal text without secrets',
+    '无凭据的普通句子不得被误改')
+  // 已知误伤（记录在案，不修）：`<方案> <4+ 字符词>` 的松散形态会命中普通英文，
+  // 如 'Basic usage' → 'Basic [REDACTED]'。这是「宁可错杀」的有意取舍——与
+  // host-check.redactSensitiveText / engine.redactArguments 同口径，收窄会在三处
+  // 产生分叉。方向安全（多抹），不影响证据可读性以外的东西。
+  A.equal(redactText('Basic usage'), 'Basic [REDACTED]', '已知误伤：保持三处同口径，不为它收窄规则')
+})
+
 await check('redactDeep：嵌套对象 / 数组 / 非字符串原样 / 循环引用安全', () => {
   const secret = 'Bearer abcdef1234567890'
   const input = {

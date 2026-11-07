@@ -94,8 +94,14 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
 
 export function redactText(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '')
-  // 1) Authorization: Bearer <token>
-  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
+  // 1) Authorization 头的认证方案 + 凭据（Bearer / Basic / Token）。
+  //    N9（复核2）：原先只认 Bearer，`Authorization: Basic <base64>` 会走到下面第 4 条
+  //    的 key:value 规则——那条只把 `Basic` 当值抹掉，真正的 base64 凭据反而原样留下，
+  //    还把外层字符串改坏。现在与 host-check.redactSensitiveText 同口径。
+  text = text.replace(
+    /\b(Bearer|Basic|Token)\s+(?:"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,})/gi,
+    '$1 [REDACTED]',
+  )
   // 2) 敏感标志位：`--token <值>` / `--api-key=<值>` 等空格或等号分隔形态
   //    （N3 接线）。参数名必须完整（名字后只接受空白或 `=`），所以 `--token-file` /
   //    `--tokenize` 的后续正常文件名不会被吞；值只吃一个 shell 词，引号内可含空格。
@@ -108,9 +114,11 @@ export function redactText(raw) {
   text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
   // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
   text = text.replace(
-    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
+    // N7（复核2）：值必须排除 NUL / C0 控制字节 / DEL，否则 `token=<canary>\0tail`
+    // 会把 `\0tail` 一起吞进 [REDACTED]，输出因此丢失非凭据字节。
+    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"\x00-\x1F\x7F]*"|'[^'\x00-\x1F\x7F]*'|[^\s,;&}；，\x00-\x1F\x7F]+)/gi,
     (match, prefix, value) => {
-      if (/^Bearer$/i.test(String(value).replace(/["']/g, ''))) return match
+      if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
       return `${prefix}"[REDACTED]"`
     },
   )

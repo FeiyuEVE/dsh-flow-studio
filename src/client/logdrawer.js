@@ -1352,6 +1352,18 @@ export function runMetrics(run, summary, options = {}) {
   }
 }
 
+/**
+ * R4（0.11 §6）：这条事件是否来自外部来源。
+ * 与 runlog.isExternalEvent 同口径：只认 `extra.source` / `extra.producer`，
+ * 不认 `data.external` 之类的自报标记，也不把没标记的旧事件猜成宿主。
+ * @param {object} event
+ * @returns {boolean}
+ */
+export function eventIsExternal(event) {
+  if (!isObject(event) || !isObject(event.extra)) return false
+  return event.extra.source === 'external' || event.extra.producer === 'external'
+}
+
 /** 事件一行摘要：只读 data 里已知字段，未知 kind 明确写「未识别」。 */
 export function eventSummary(event) {
   if (!isObject(event)) return '未识别事件类型'
@@ -1477,8 +1489,12 @@ export function eventSummary(event) {
       break
     }
     default:
-      return '未识别事件类型' + (event.kind ? '（' + text(event.kind) + '）' : '')
+      parts.push('未识别事件类型' + (event.kind ? '（' + text(event.kind) + '）' : ''))
+      break
   }
+  // R4：外部事件在时间线里仍然显示，但摘要末尾必须带「外部未验证」，
+  // 不能只靠 data.verdict 让读者把它当成一次权威的 pass。
+  if (eventIsExternal(event)) parts.push('外部未验证')
   return parts.filter(Boolean).join(' · ')
 }
 
@@ -1524,6 +1540,26 @@ export function stubBadgeOf(summary) {
   const quality = isObject(summary.quality) ? summary.quality : null
   if (quality && quality.stub === true) return '桩数据，不是真实证据'
   return ''
+}
+
+/**
+ * R6（0.11 §8）：权威通过 vs 模型自报两列。摘要里没有这些字段时显示 unknown，
+ * 不猜数、不崩溃（老 Host / summary 未回也必须能渲染）。
+ * @param {object} summary
+ * @returns {string} 没有 quality 时返回 ''（不占位）
+ */
+export function authorityTextOf(summary) {
+  const quality = isObject(summary) && isObject(summary.quality) ? summary.quality : null
+  if (!quality) return ''
+  const claimed = optionalNum(quality.claimedPassed)
+  const authoritative = optionalNum(quality.authoritativePassed)
+  const total = optionalNum(quality.authoritativeTotal)
+  const coverage = optionalNum(quality.authorityCoverage)
+  const value = number => (number === null ? 'unknown' : String(number))
+  return '权威通过 ' + value(authoritative)
+    + (total === null ? '' : '/' + total)
+    + ' · 自报通过 ' + value(claimed)
+    + ' · 权威覆盖 ' + (coverage === null ? 'unknown' : Math.round(Math.min(1, coverage) * 100) + '%')
 }
 
 /**
@@ -3099,6 +3135,8 @@ export function FsLogDrawer({
   const conclusion = feedRun ? conclusionOf(feedRun, summary) : null
   // 06 §13.8：桩 run 必须能一眼辨认，badge 同时进 40px 收起条与展开后的头行。
   const stubBadge = stubBadgeOf(summary)
+  // R6：权威 / 自报两列（字段缺省显示 unknown）。
+  const authorityText = authorityTextOf(summary)
   const detailEvent = selectedEventKey === ''
     ? null
     : (events.find(event => eventKey(event) === selectedEventKey) || null)
@@ -3569,6 +3607,13 @@ export function FsLogDrawer({
     h('span', { className: 'fs-log-glyph', 'aria-hidden': true }, eventGlyph(event.kind)),
     h('span', { className: 'fs-log-ts', title: text(event.ts, '') }, formatEventTime(event.ts)),
     h('span', { className: 'fs-log-kind' }, text(event.kind, '未识别')),
+    // R4：外部来源事件必须带可见徽标；颜色不能替读者把未验证当成通过。
+    eventIsExternal(event)
+      ? h('span', {
+        className: 'fs-log-pill external',
+        title: '外部来源事件：未经验证，不计入权威通过数 / 质量结论',
+      }, '外部未验证')
+      : null,
     // B4：事件行里的节点名是「打开节点运行详情」的入口（点节点名而不是整行）。
     text(event.nodeId, '') !== ''
       ? h('button', {
@@ -3879,6 +3924,12 @@ export function FsLogDrawer({
       : null,
     feedRun && stubBadge !== ''
       ? h('span', { className: 'fs-log-pill stub', title: '桩引擎产出：不是真实证据，不能用于质量判断' }, stubBadge)
+      : null,
+    feedRun && authorityText !== ''
+      ? h('span', {
+        className: 'fs-log-note fs-log-authority',
+        title: 'authoritativePassed / claimedPassed / authorityCoverage（自报不能补权威分子）',
+      }, authorityText)
       : null,
     !feedRun && runError !== ''
       ? h('span', { className: 'fs-log-note', title: runError }, runError)

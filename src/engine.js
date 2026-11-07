@@ -39,6 +39,8 @@ import { consumeInboxForNode, buildFollowupPayload } from './inbox.js'
 import { createWorktree, decideWorktree, resolveWorkspace, workspaceIdFor } from './worktree.js'
 // 07 §6（R6）：外部 executor（codex / custom）的运行与事件归一化。
 import { normalizeExecutor, runExternalExecutor, toStrictOutputSchema } from './executor.js'
+// 0.11 · R5：宿主独立检查执行器（保存的 check 命令 + 报告采集）。
+import { runHostCheck } from './host-check.js'
 // 07 §11（R8）：节点自审回报解析。用命名空间导入而不是命名导入——v0.8 的
 // `parseNodeStatus` 与引擎改动并行落地，命名导入在对方尚未写完时会让本模块
 // 直接 import 失败；拿不到时下面按「没有自审回报」处理，引擎行为与 v0.7 一致。
@@ -1883,6 +1885,21 @@ class FlowEngine {
     else if (this.activateInjected) this.activate = options.activate
     else this.activate = this._defaultActivate.bind(this)
 
+    // R1/E1（0.11）：续租 409 = 确知本实例已被接管。失权后旧实例必须同步封口、
+    // 停止一切业务写入，收尾只允许走 runstore.finalizeEpoch 的幂等失权 end。
+    // renewLease / leaseRenewMs 可注入（测试用小间隔/假失败，不真等 30s）。
+    this.renewLeaseFn = typeof options.renewLease === 'function' ? options.renewLease : null
+    this.leaseRenewMs = Number.isInteger(options.leaseRenewMs) && options.leaseRenewMs > 0
+      ? options.leaseRenewMs
+      : 30000
+    this.leaseLost = false
+    this.leaseLostInfo = null
+    this.leaseLostEpoch = ''
+    this._leaseRenewal = null
+    // 0.11 · R5：同 (run,node,attempt,checkId) 的宿主检查共享一个 Promise，
+    // 重复 idle/close 回调不重复 spawn；新 attempt 重新执行。
+    this.hostCheckCache = new Map()
+
     this.active = null
     this.live = null
     this.current = null
@@ -3356,6 +3373,8 @@ class FlowEngine {
    */
   async _patchRunBinding(runId, patch = {}) {
     if (typeof runId !== 'string' || runId === '') return null
+    // R1/E1：失权后不能再改写 run.json 绑定（那属于接管者 / 终态投影）。
+    if (this.leaseLost) return null
     const next = this.bindingPatchQueue.then(() => this._applyRunBindingPatch(runId, patch))
     this.bindingPatchQueue = next.catch(() => {})
     return next
@@ -4303,8 +4322,9 @@ class FlowEngine {
       // 06 §13.3：先抢单写者租约；抢不到 409（Host 侧 claimLease 才存在时启用）。
       if (typeof runstoreModule.claimLease === 'function') {
         try {
-          await runstoreModule.claimLease(this.runsRoot, runId)
-          active.lease = true
+          const lease = await runstoreModule.claimLease(this.runsRoot, runId)
+          // R1：保留 lease 对象（acquiredAt 作为本次执行的 epoch 身份），不再只存 true。
+          active.lease = lease && typeof lease === 'object' ? lease : true
         } catch (error) {
           if (error && error.status === 409) {
             throw new EngineError(409, error.message || '该 run 已持有执行租约')
@@ -4469,6 +4489,13 @@ class FlowEngine {
     this.round = 0
     this.artifactBytes = 0
     this.runTimedOut = false
+    // R1/E1：失权状态只属于一次 run；新 run 重新获得续租资格。
+    this.leaseLost = false
+    this.leaseLostInfo = null
+    this.leaseLostEpoch = ''
+    this._leaseRenewal = null
+    // 0.11 · R5：宿主检查去重缓存只属于一次 run。
+    this.hostCheckCache = new Map()
     // G1-a：新 run 重新开封（上一次收尾的封口只属于那一次 run）。
     this.closing = false
     this.sealedSessionEventDrops = 0
@@ -4693,6 +4720,132 @@ class FlowEngine {
     return null
   }
 
+  // -- R1/E1：租约失权（0.11） -------------------------------------------------
+
+  /**
+   * 只有 409 才是「确知本实例已被接管」：runstore 的 renewLease 用 409 表示
+   * 租约缺失 / 损坏 / 已由别的实例持有。其它错误（EIO / ENOENT / 权限）是瞬时 I/O
+   * 故障，不能误判成失权，仍只 warn 并保留下一轮续租机会。
+   */
+  /** 0.11 · R5：宿主检查开关（默认关，仅字符串 '1' 开；与 custom executor 独立）。 */
+  static hostChecksAllowed() {
+    return process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS === '1'
+  }
+
+  _isLeaseConflict(error) {
+    return Boolean(error && (error.status === 409 || error.code === 'LEASE_LOST'))
+  }
+
+  /**
+   * 续租一次（single-flight）：settling 后 / 已失权时不再发起；已在飞的续租共享
+   * 同一个 Promise，避免定时器重入产生多条失权收口。
+   */
+  async _renewLeaseOnce(runId) {
+    if (this.leaseLost || this.closing) return null
+    if (!this.active || this.active.runId !== runId) return null
+    if (this._leaseRenewal) return this._leaseRenewal
+    const renew = this.renewLeaseFn
+      || (typeof runstoreModule.renewLease === 'function' ? runstoreModule.renewLease : null)
+    if (!renew) return null
+    this._leaseRenewal = Promise.resolve()
+      .then(() => renew(this.runsRoot, runId))
+      .then(
+        () => null,
+        error => {
+          if (this._isLeaseConflict(error)) {
+            this._handleLeaseLost(runId, error)
+            return null
+          }
+          this.log('warn', `flow-studio: 续租失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+          return null
+        },
+      )
+      .finally(() => {
+        this._leaseRenewal = null
+      })
+    return this._leaseRenewal
+  }
+
+  /**
+   * 失权处理（在同一 catch 回调里同步完成）：
+   *   ① 置 leaseLost（此后 `_append` 拒绝一切业务写）；
+   *   ② 停续租 timer、封会话观察入口；
+   *   ③ abort 整轮（code=LEASE_LOST），让主循环尽快跳出并进入唯一 finally；
+   *   ④ 不在这里追加 run/end —— 收尾统一由 `_finalizeLeaseLoss` 做，避免与
+   *      接管者的写入竞争。
+   */
+  _handleLeaseLost(runId, error) {
+    if (this.leaseLost) return
+    this.leaseLost = true
+    const active = this.active && this.active.runId === runId ? this.active : null
+    this.leaseLostEpoch = active && active.lease && typeof active.lease.acquiredAt === 'string'
+      ? active.lease.acquiredAt
+      : ''
+    this.leaseLostInfo = {
+      at: isoOf(this.now()),
+      message: error && error.message ? String(error.message) : String(error),
+      epoch: this.leaseLostEpoch,
+    }
+    if (active) {
+      if (active.leaseTimer) {
+        clearInterval(active.leaseTimer)
+        active.leaseTimer = null
+      }
+      this._sealSessionEvents(runId)
+      const reason = new Error('lease-lost：执行租约已被其它实例接管 / 释放，本实例停止写入')
+      reason.name = 'LeaseLostError'
+      reason.code = 'LEASE_LOST'
+      try {
+        active.controller.abort(reason)
+      } catch {
+        // abort 失败不能改变「已失权」的事实。
+      }
+    }
+    this.log('error', `flow-studio: run ${runId} 续租被拒（409），判定租约失权，立即停止旧实例：${this.leaseLostInfo.message}`)
+  }
+
+  /**
+   * 失权后的唯一收口：只允许写一条带 lease-lost 的 run/end（幂等键 = loss:epoch）。
+   * 完全跳过旧的 live:null / 工作区绑定回写 / releaseLease —— 这些都会覆盖接管者的状态。
+   */
+  async _finalizeLeaseLoss(runId) {
+    const reason = 'lease-lost：执行租约已被其它实例接管 / 释放，本实例停止写入'
+    try {
+      if (typeof runstoreModule.finalizeEpoch === 'function') {
+        const result = await runstoreModule.finalizeEpoch(this.runsRoot, runId, {
+          cause: 'lease-lost',
+          reason,
+          expectedEpoch: this.leaseLostEpoch,
+          idempotencyKey: `loss:${this.leaseLostEpoch || 'unknown'}`,
+          now: this.now(),
+        })
+        if (result && result.appended) {
+          this.log('warn', `flow-studio: run ${runId} 已写失权终态（lease-lost）`)
+        }
+        return result
+      }
+    } catch (error) {
+      this.log('error', `flow-studio: 写失权 run/end 失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+    }
+    // 兼容：旧 runstore 没有 finalizeEpoch 时，直接追加一条失权 end（绕过业务写门）。
+    try {
+      await this._append(runId, [{
+        kind: 'run/end',
+        traceId: runTraceId(runId),
+        data: { status: 'failed', reason },
+        extra: {
+          code: 'LEASE_LOST',
+          leaseLost: true,
+          terminalScope: 'run',
+          idempotencyKey: `loss:${this.leaseLostEpoch || 'unknown'}`,
+        },
+      }], { live: false, allowLeaseLostWrite: true })
+    } catch (error) {
+      this.log('error', `flow-studio: 失权 run/end 兜底写入失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+    }
+    return { ok: false, appended: false }
+  }
+
   /** v0.8 旧主循环（逃生门）：while + switch 推进，保留一个发布周期后删除。 */
   async _loopLegacy(runId, flow, stageTotal) {
     const active = this.active
@@ -4716,14 +4869,16 @@ class FlowEngine {
       active.controller.abort(new Error(`run 超过墙钟上限（${runTimeoutMs}ms）`))
     }, runTimeoutMs)
     // 06 §13.3：每 30s 续租；续租失败只告警（租约过期由 Host sweep 收尾）。
-    const leaseTimer = active.lease && typeof runstoreModule.renewLease === 'function'
+    const leaseTimer = active.lease && (this.renewLeaseFn || typeof runstoreModule.renewLease === 'function')
       ? setInterval(() => {
-        runstoreModule.renewLease(this.runsRoot, runId).catch(error => {
-          this.log('warn', `flow-studio: 续租失败（${runId}）：${error.message}`)
-        })
-      }, 30000)
+        // R1/E1：409 → 同步失权收口；I/O 错误只 warn（在 _renewLeaseOnce 里分流）。
+        this._renewLeaseOnce(runId)
+      }, this.leaseRenewMs)
       : null
-    if (leaseTimer && typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    if (leaseTimer) {
+      active.leaseTimer = leaseTimer
+      if (typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    }
     // G1-a：run/end 的载荷先算出来，实际落盘挪到 finally（封口 + dispose + 最终 drain 之后），
     // 保证「run/end 之后不再有任何事件」。
     let endPatch = null
@@ -5057,20 +5212,26 @@ class FlowEngine {
       this._sealSessionEvents(runId)
       await this._disposeRunSessions(runId)
       await this.eventQueue.catch(() => {})
-      if (endPatch) {
-        try {
-          await this._append(runId, endPatch)
-        } catch (writeError) {
-          this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+      if (this.leaseLost) {
+        // R1/E1：失权实例不写 live / 工作区绑定，也不释放接管者的租约；
+        // 只允许追加唯一一条 lease-lost 的 run/end（幂等键 loss:epoch）。
+        await this._finalizeLeaseLoss(runId)
+      } else {
+        if (endPatch) {
+          try {
+            await this._append(runId, endPatch)
+          } catch (writeError) {
+            this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+          }
         }
-      }
-      await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
-      // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
-      await this._patchRunBinding(runId)
-      if (active.lease && typeof runstoreModule.releaseLease === 'function') {
-        await runstoreModule.releaseLease(this.runsRoot, runId).catch(error => {
-          this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
-        })
+        await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
+        // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
+        await this._patchRunBinding(runId)
+        if (active.lease && typeof runstoreModule.releaseLease === 'function') {
+          await runstoreModule.releaseLease(this.runsRoot, runId).catch(error => {
+            this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
+          })
+        }
       }
       // 06 §16：run 结束（done/failed/aborted）或 stop 收口时统一释放会话——已在上面
       // 「封口 → dispose」里做过；这里只剩清运行态（清 eventQueue 前会再等一次）。
@@ -5111,14 +5272,16 @@ class FlowEngine {
       this.runTimedOut = true
       active.controller.abort(new Error(`run 超过墙钟上限（${runTimeoutMs}ms）`))
     }, runTimeoutMs)
-    const leaseTimer = active.lease && typeof runstoreModule.renewLease === 'function'
+    const leaseTimer = active.lease && (this.renewLeaseFn || typeof runstoreModule.renewLease === 'function')
       ? setInterval(() => {
-        runstoreModule.renewLease(this.runsRoot, runId).catch(error => {
-          this.log('warn', `flow-studio: 续租失败（${runId}）：${error.message}`)
-        })
-      }, 30000)
+        // R1/E1：409 → 同步失权收口；I/O 错误只 warn（在 _renewLeaseOnce 里分流）。
+        this._renewLeaseOnce(runId)
+      }, this.leaseRenewMs)
       : null
-    if (leaseTimer && typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    if (leaseTimer) {
+      active.leaseTimer = leaseTimer
+      if (typeof leaseTimer.unref === 'function') leaseTimer.unref()
+    }
     let endPatch = null
     const byId = byIdMap(flow)
     let compiled = null
@@ -5614,20 +5777,26 @@ class FlowEngine {
       this._sealSessionEvents(runId)
       await this._disposeRunSessions(runId)
       await this.eventQueue.catch(() => {})
-      if (endPatch) {
-        try {
-          await this._append(runId, endPatch)
-        } catch (writeError) {
-          this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+      if (this.leaseLost) {
+        // R1/E1：失权实例不写 live / 工作区绑定，也不释放接管者的租约；
+        // 只允许追加唯一一条 lease-lost 的 run/end（幂等键 loss:epoch）。
+        await this._finalizeLeaseLoss(runId)
+      } else {
+        if (endPatch) {
+          try {
+            await this._append(runId, endPatch)
+          } catch (writeError) {
+            this.log('error', `flow-studio: 写 run/end 失败：${writeError.message}`)
+          }
         }
-      }
-      await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
-      // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
-      await this._patchRunBinding(runId)
-      if (active.lease && typeof runstoreModule.releaseLease === 'function') {
-        await runstoreModule.releaseLease(this.runsRoot, runId).catch(error => {
-          this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
-        })
+        await writeRunMeta(this.runsRoot, runId, { live: null }).catch(() => {})
+        // 收尾这次 writeRunMeta 同样会重写 run.json：终态也要保留工作区绑定。
+        await this._patchRunBinding(runId)
+        if (active.lease && typeof runstoreModule.releaseLease === 'function') {
+          await runstoreModule.releaseLease(this.runsRoot, runId).catch(error => {
+            this.log('warn', `flow-studio: 释放租约失败（${runId}）：${error.message}`)
+          })
+        }
       }
       await this._cleanupActive()
       // 收尾后不再接受 INBOX / SELF_CHECK 观测；下次 run 会重建。
@@ -6264,6 +6433,9 @@ class FlowEngine {
       await this.flushEvents()
       const written = await this._writeStructured(runId, node, attempt, traceId, structured, stageTotal)
       await this.flushEvents()
+      // 0.11 · R5：节点收口后、node/end 之前执行宿主检查（结果只影响 quality）。
+      await this._runHostCheckOnce(runId, node, attempt, traceId)
+      await this.flushEvents()
       const membersPartial = await this._closeMembers(runId, node, attempt, traceId)
 
       // readUsage 是可选注入：订阅之外的兜底（同一 traceId+callId 的重复会被聚合替换）。
@@ -6420,6 +6592,170 @@ class FlowEngine {
     return result
   }
 
+  /** 0.11 · R5：宿主检查的工作目录（worktree 优先，其次工作区，最后注入的 cwd）。 */
+  _hostCheckCwd() {
+    if (this.worktreeRecord && this.worktreeRecord.enabled === true
+      && typeof this.worktreeRecord.path === 'string' && this.worktreeRecord.path !== '') {
+      return this.worktreeRecord.path
+    }
+    if (this.workspaceRecord && typeof this.workspaceRecord.path === 'string' && this.workspaceRecord.path !== '') {
+      return this.workspaceRecord.path
+    }
+    if (typeof this.cwd === 'string' && this.cwd !== '') return this.cwd
+    return null
+  }
+
+  /**
+   * 0.11 · R5：节点收口后执行**保存的**检查命令（命令 + 期望退出码 + 报告路径）。
+   *
+   * 时序：正式结构化结果写完后、node/end 之前。去重键 (runId,nodeId,attempt)；
+   * 与节点自报完全解耦：宿主结果只影响 quality，不改变 agent 的 verdict / next/reject。
+   * 失权 / 已封口 / 未开开关时不执行（绝不为了补事件再突破失权门）。
+   *
+   * @returns {Promise<object|null>} 宿主执行结果；未配置 / 未执行返回 null
+   */
+  async _runHostCheckOnce(runId, node, attempt, traceId) {
+    const check = node && node.check && typeof node.check === 'object' ? node.check : null
+    if (!check) return null
+    if (this.leaseLost || this.closing) return null
+    if (!FlowEngine.hostChecksAllowed()) {
+      this.log('warn', `flow-studio: 节点 ${node.id} 配了宿主检查，但 FLOW_STUDIO_ALLOW_HOST_CHECKS 未开启（=1 才执行），已跳过`)
+      return null
+    }
+    const key = [runId, node.id, attempt, String(check.command ?? '')].join('\u0000')
+    if (this.hostCheckCache.has(key)) return this.hostCheckCache.get(key)
+    const promise = this._executeHostCheck(runId, node, attempt, traceId, check).catch(error => {
+      this.log('error', `flow-studio: 宿主检查执行异常（${node.id}#${attempt}）：${error && error.message ? error.message : String(error)}`)
+      return null
+    })
+    this.hostCheckCache.set(key, promise)
+    return promise
+  }
+
+  /** 真正跑一次宿主检查，并把执行记录 / 报告副本写成 producer=host 的产物与 check/form。 */
+  async _executeHostCheck(runId, node, attempt, traceId, check) {
+    let verification
+    try {
+      verification = await runHostCheck({
+        check,
+        cwd: this._hostCheckCwd(),
+        signal: this.active ? this.active.controller.signal : undefined,
+        now: () => this.now().getTime(),
+      })
+    } catch (error) {
+      this.log('error', `flow-studio: 宿主检查启动失败（${node.id}#${attempt}）：${error && error.message ? error.message : String(error)}`)
+      verification = {
+        state: 'skipped',
+        reasonCode: 'HOST_CHECK_UNAVAILABLE',
+        message: error && error.message ? String(error.message) : String(error),
+        exitCode: null,
+        expectedExitCode: Number.isInteger(check.expectExitCode) ? check.expectExitCode : 0,
+        durationMs: 0,
+        truncated: false,
+        outputTail: '',
+        receivedBytes: 0,
+        reportPath: null,
+        reportSha256: null,
+        reportBytes: null,
+        killScope: null,
+        orphanWarning: null,
+        startedAt: isoOf(this.now()),
+        finishedAt: isoOf(this.now()),
+      }
+    }
+    // 失权：不再补任何 check/artifact 事件（只允许 R1 的 lease-lost end）。
+    if (this.leaseLost) return verification
+    const state = verification.state === 'pass'
+      ? 'pass'
+      : (verification.state === 'skipped' ? 'skipped' : 'fail')
+    const executionId = `hc-${randomBytes(8).toString('hex')}`
+    const command = String(check.command ?? '')
+    const record = {
+      v: 1,
+      executionId,
+      runId,
+      nodeId: node.id,
+      attempt,
+      checkId: `host:${node.id}`,
+      commandDigest: createHash('sha256').update(command, 'utf8').digest('hex'),
+      commandSummary: command.length > 200 ? `${command.slice(0, 197)}...` : command,
+      expectedExitCode: verification.expectedExitCode,
+      exitCode: verification.exitCode,
+      startedAt: verification.startedAt,
+      finishedAt: verification.finishedAt,
+      durationMs: verification.durationMs,
+      reportPath: verification.reportPath,
+      reportSha256: verification.reportSha256,
+      reportBytes: verification.reportByteLength,
+      state,
+      reasonCode: verification.reasonCode,
+      killScope: verification.killScope,
+      truncated: verification.truncated,
+      outputTail: verification.outputTail,
+      ...(verification.message ? { message: verification.message } : {}),
+      ...(verification.orphanWarning ? { orphanWarning: verification.orphanWarning } : {}),
+    }
+    let recordPath = null
+    let reportRef = null
+    try {
+      const recordFile = await this._writeArtifactFile(
+        runId, node.id, attempt, `host-check-${executionId}.json`,
+        `${JSON.stringify(record, null, 2)}\n`, traceId,
+        { producer: 'host', authority: 'host', verification: { executionId, reasonCode: verification.reasonCode } },
+      )
+      recordPath = recordFile.path
+      reportRef = recordPath
+      // 报告副本：宿主采集到的字节原样落盘（不再读工作区原文件，避免事后被改）。
+      if (Buffer.isBuffer(verification.reportBytes) && verification.reportBytes.length > 0) {
+        const ext = /\.([A-Za-z0-9]{1,8})$/.exec(verification.reportPath || '')?.[1] || 'json'
+        const copy = await this._writeArtifactFile(
+          runId, node.id, attempt, `host-check-${executionId}-report.${ext}`,
+          verification.reportBytes, traceId,
+          { producer: 'host', authority: 'host', verification: { executionId, kind: 'report-copy' } },
+        )
+        reportRef = copy.path
+      }
+    } catch (error) {
+      this.log('error', `flow-studio: 宿主检查结果落盘失败（${node.id}#${attempt}）：${error && error.message ? error.message : String(error)}`)
+      return verification
+    }
+    if (this.leaseLost) return verification
+    await this._append(runId, [{
+      kind: 'check/form',
+      nodeId: node.id,
+      attemptId: attempt,
+      traceId,
+      extra: {
+        provenance: 'host',
+        producer: 'host',
+        authority: 'host',
+        verification: {
+          executionId,
+          state,
+          reasonCode: verification.reasonCode,
+          recordPath,
+          reportPath: verification.reportPath,
+          reportSha256: verification.reportSha256,
+          killScope: verification.killScope,
+          truncated: verification.truncated,
+        },
+      },
+      data: {
+        ruleSetId: `host:${node.id}`,
+        ruleSetVersion: '0.11',
+        executor: 'host',
+        state,
+        passedChecks: state === 'pass' ? 1 : 0,
+        totalChecks: 1,
+        executedAt: verification.finishedAt,
+        // 报告的宿主副本 / 执行记录（自报报告不能顶掉它）。
+        ...(reportRef ? { reportRef } : {}),
+      },
+    }])
+    this.log('info', `flow-studio: 宿主检查 ${node.id}#${attempt} → ${state}${verification.reasonCode ? `（${verification.reasonCode}）` : ''}`)
+    return verification
+  }
+
   async _writeStructured(runId, node, attempt, traceId, structured, stageTotal) {
     const paths = []
     const usedNames = new Set()
@@ -6483,6 +6819,9 @@ class FlowEngine {
       checks.reportRef = resolved.path
       if (resolved.rejected) checks.reportRefRejected = resolved.rejected
       checks.executedAt = isoOf(this.now())
+      // R6/E4：reportRef 是引擎自己刚生成的报告 = 自报，不是独立证据。
+      // 聚合层据此把 pass 降级为 claimed，不能拿自写报告把 quality 洗绿。
+      const generatedReport = resolved.path === report.path
       await this._append(runId, [{
         kind: 'check/form',
         nodeId: node.id,
@@ -6491,6 +6830,7 @@ class FlowEngine {
         // 06 §13.7：模型自述证据必须自带 provenance，聚合层才会做 artifact 对账。
         extra: {
           provenance: this.stub ? 'stub-synthetic' : 'model-claim',
+          ...(generatedReport ? { generatedReport: true } : {}),
           // runlog 的 data 白名单会丢弃未知字段，拒绝原因放 extra 才留得住。
           ...(resolved.rejected ? { reportRefRejected: resolved.rejected } : {}),
         },
@@ -6527,6 +6867,8 @@ class FlowEngine {
       if (resolved.path) tests.reportRef = resolved.path
       else delete tests.reportRef
       if (resolved.rejected) tests.reportRefRejected = resolved.rejected
+      // R6/E4：tests 报 29/29 但报告是引擎自己写的 = claimed，不是权威通过。
+      const generatedReport = Boolean(report) && resolved.path === report.path
       await this._append(runId, [{
         kind: 'test/report',
         nodeId: node.id,
@@ -6534,6 +6876,7 @@ class FlowEngine {
         traceId,
         extra: {
           provenance: this.stub ? 'stub-synthetic' : 'model-claim',
+          ...(generatedReport ? { generatedReport: true } : {}),
           ...(resolved.rejected ? { reportRefRejected: resolved.rejected } : {}),
         },
         data: tests,
@@ -6591,34 +6934,36 @@ class FlowEngine {
    * 证据独立性（§8.4 v1.3）：这里写的都是**模型结构化输出转写**的产物，属于自证，
    * 不能标 `extra.producer='host'`；宿主自己观测/落盘的产物才打这个标记，本次没有。
    */
-  async _writeArtifactFile(runId, nodeId, attempt, filename, content, traceId) {
+  async _writeArtifactFile(runId, nodeId, attempt, filename, content, traceId, extra = {}) {
     const dir = join(this.runsRoot, runId, nodeId, 'artifacts', String(attempt))
     await mkdir(dir, { recursive: true, mode: 0o700 })
     await chmod(dir, 0o700).catch(() => {})
     const abs = join(dir, filename)
-    const text = typeof content === 'string' ? content : String(content ?? '')
-    const originalBytes = Buffer.byteLength(text, 'utf8')
+    // 0.11 · R5：宿主报告是二进制安全的字节副本；模型产物仍按 UTF-8 文本落盘。
+    const source = Buffer.isBuffer(content) ? content : Buffer.from(String(content ?? ''), 'utf8')
+    const originalBytes = source.length
     const remainingRunBytes = Math.max(0, this.maxRunArtifactBytes - this.artifactBytes)
     const limit = Math.min(this.maxArtifactBytes, remainingRunBytes)
-    let body = text
+    let body = source
     let bytes = originalBytes
     let truncated = false
     if (originalBytes > limit) {
-      const clipped = clipBytes(text, limit)
-      body = clipped.text
-      bytes = clipped.bytes
+      body = source.subarray(0, Math.max(0, limit))
+      bytes = body.length
       truncated = true
     }
     this.artifactBytes += bytes
-    await writeFile(abs, body, { encoding: 'utf8', mode: 0o600 })
+    await writeFile(abs, body, { mode: 0o600 })
     await chmod(abs, 0o600).catch(() => {})
-    const sha256 = createHash('sha256').update(body, 'utf8').digest('hex')
+    const sha256 = createHash('sha256').update(body).digest('hex')
     const rel = `${nodeId}/artifacts/${attempt}/${filename}`
     await this._append(runId, [{
       kind: 'artifact/write',
       nodeId,
       attemptId: attempt,
       traceId,
+      // 只有宿主执行链路能传 extra.producer='host'；模型产物这里恒为空。
+      ...(extra && Object.keys(extra).length > 0 ? { extra } : {}),
       data: {
         path: rel,
         bytes,
@@ -6632,6 +6977,7 @@ class FlowEngine {
     this.artifactIndex.set(rel, { nodeId, attemptId: attempt, sha256 })
     return { path: rel, bytes, sha256, truncated, originalBytes }
   }
+
 
   // -- 会话事件 → 用量 / 工具 / skill -------------------------------------
 
@@ -7023,8 +7369,13 @@ class FlowEngine {
 
   // -- 内部事件 / live -----------------------------------------------------
 
-  async _append(runId, events, { live = true } = {}) {
+  async _append(runId, events, { live = true, allowLeaseLostWrite = false } = {}) {
     if (typeof runId !== 'string' || runId === '') throw new Error('_append：runId 为空')
+    // R1/E1：失权后旧实例不得再写任何业务事件（唯一的例外是失权 run/end 本身）。
+    if (this.leaseLost && !allowLeaseLostWrite) {
+      this.log('warn', `flow-studio: run ${runId} 已失权，丢弃 ${events.length} 条迟到的业务事件`)
+      return { events: [], firstSeq: null, lastSeq: null, dropped: events.length }
+    }
     const normalized = events.map(event => ({
       v: 1,
       ts: isoOf(this.now()),
@@ -7116,6 +7467,8 @@ class FlowEngine {
 
   async _persistLive() {
     if (!this.active || !this.live) return
+    // R1/E1：失权后不再刷新接管者的 live / 绑定。
+    if (this.leaseLost) return
     // C1/§11.2：节点状态的**唯一权威**是 run.json 顶层 `nodeStatus`（由
     // `_patchRunBinding` 收口写）。`runstore.normalizeLive` 会丢弃 live.nodeStatus，
     // 所以这里不再把它塞进 live 载荷（避免看起来 live 里有一份其实落不了盘的状态）。

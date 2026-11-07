@@ -1685,4 +1685,280 @@ check('node/tools 8KB 边界：64×64 名字仍可通过；再塞未知大字段
   bad(nodeTools(['bash'], {}, { blob: 'x'.repeat(MAX_EVENT_BYTES) }), 'event')
 })
 
+console.log('runlog.js · 0.11 R4：外部来源隔离（权威索引之前分区）')
+
+// 追加段单独 import，避免改动文件头既有的 import 列表 / 断言。
+import { EXTERNAL_OBSERVATION_LIMIT, classifyEvidenceAuthority, collectArtifactOwners, isExternalEvent } from '../src/runlog.js'
+
+/** 外部来源事件夹具：只通过 extra.source / producer 标记，不靠 data 自报。 */
+function externalEv(kind, over = {}) {
+  return ev(kind, {
+    ...over,
+    extra: { source: 'external', producer: 'external', authority: 'unverified', ...(over.extra || {}) },
+  })
+}
+
+check('R4 来源判定：只认 extra.source / producer，不猜 host，也不认 data.external 自报标记', () => {
+  assert.equal(isExternalEvent({ kind: 'x', extra: { source: 'external' } }), true)
+  assert.equal(isExternalEvent({ kind: 'x', extra: { producer: 'external' } }), true)
+  assert.equal(isExternalEvent({ kind: 'x', extra: { source: 'host', producer: 'host' } }), false)
+  assert.equal(isExternalEvent({ kind: 'x', data: { external: true } }), false, 'data.external 只是来客自报，不能授信')
+  assert.equal(isExternalEvent({ kind: 'x' }), false, '无 source 的旧事件是 legacy，不猜 host')
+  assert.equal(classifyEvidenceAuthority({ extra: { source: 'external' } }), 'external')
+  assert.equal(classifyEvidenceAuthority({ extra: { producer: 'host' } }), 'host')
+  assert.equal(classifyEvidenceAuthority({ extra: { authority: 'host' } }), 'host')
+  assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'model-claim' } }), 'model-claim')
+  assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'engine' } }), 'engine')
+  assert.equal(classifyEvidenceAuthority({ extra: { provenance: 'stub-synthetic' } }), 'engine')
+  assert.equal(classifyEvidenceAuthority({}), 'legacy')
+  assert.equal(classifyEvidenceAuthority({ extra: { note: 'x' } }), 'legacy')
+})
+
+check('R4 外部假 pass/fail 注入：quality / 权威计数 / 冲突 / 进度 / 状态 / headline 全部不变', () => {
+  const internal = fullEvidence()
+  const internalArtifact = ev('artifact/write', {
+    nodeId: 'n_peer',
+    attemptId: 1,
+    data: { path: 'evidence/shared.json', bytes: 3, kind: 'json', sha256: 'a'.repeat(64) },
+  })
+  const events = [...internal, internalArtifact]
+  const before = summarize(events, { now: NOW })
+  assert.equal(before.quality.state, 'pass', '基线必须是 pass，否则这组测试没有意义')
+
+  const external = [
+    // 假 review 结论（reject）不能压过内部 approve。
+    externalEv('review/verdict', { nodeId: 'n_review', attemptId: 1, data: { verdict: 'reject', findingCount: 0 } }),
+    // 同 suite 假失败不能覆盖内部 test pass。
+    externalEv('test/report', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: { suite: 'unit', executed: 1, passed: 0, failed: 1, skipped: 0, reportRef: 'artifacts/test.md' },
+    }),
+    // 同 ruleSetId 假失败不能覆盖内部 check pass。
+    externalEv('check/form', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: {
+        ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'x', state: 'fail',
+        passedChecks: 0, totalChecks: 5, executedAt: '2026-11-06T10:00:00.000Z',
+      },
+    }),
+    // 同 itemId 假失败不能覆盖内部 acceptance pass。
+    externalEv('acceptance/verdict', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: { itemId: 'acc-1', status: 'fail', decidedBy: 'auto' },
+    }),
+    // 同 path 的假产物不能覆盖内部 artifact 索引 / 归属。
+    externalEv('artifact/write', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: { path: 'evidence/shared.json', bytes: 3, kind: 'json', sha256: 'b'.repeat(64) },
+    }),
+    // 假 node/start（更高 attempt）不能把内部已完成节点打回 pending。
+    externalEv('node/start', { nodeId: 'n_0', attemptId: 3, data: { title: 'A', mode: 'single', skills: [] } }),
+    // 假 reject 不能改变返工轮次 / 使进度失效。
+    externalEv('reject/trigger', {
+      nodeId: 'n_0', attemptId: 3,
+      data: { edgeId: 'e-ext', fromNodeId: 'n_0', toNodeId: 'n_0', reason: '外部伪造' },
+    }),
+    // 假 run/start 不能把引擎改成 stub（否则 quality 会被强制 unknown）。
+    externalEv('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 99, engine: 'stub' } }),
+    // 假 review/finding 不能制造 P0。
+    externalEv('review/finding', {
+      nodeId: 'n_review', attemptId: 1,
+      data: { id: 'ext-f0', severity: 'P0', title: '伪造阻断', status: 'open' },
+    }),
+  ]
+  const all = [...events, ...external]
+  const after = summarize(all, { now: NOW })
+
+  assert.equal(after.quality.state, before.quality.state)
+  assert.equal(after.quality.state, 'pass')
+  assert.equal(after.quality.label, before.quality.label)
+  assert.equal(after.engine, before.engine, '外部 run/start 不能改 engine')
+  assert.deepEqual(after.conflicts, before.conflicts, '外部同标识不能制造内部冲突')
+  assert.deepEqual(after.findings.bySeverity, before.findings.bySeverity)
+  assert.equal(after.findings.unresolvedBySeverity.P0, 0)
+  assert.equal(after.progress.passed, before.progress.passed)
+  assert.equal(after.progress.ratio, before.progress.ratio)
+  assert.equal(after.quality.reworkRounds, 0)
+  for (const key of ['acceptance', 'tests', 'checks']) {
+    assert.equal(after.quality.evidence[key].state, before.quality.evidence[key].state, key)
+    assert.equal(after.quality.evidence[key].passed, before.quality.evidence[key].passed, key)
+  }
+  assert.equal(after.quality.evidence.tests.passedSuites, 1)
+  assert.equal(after.quality.evidence.tests.authoritativePassed, 1)
+  assert.equal(after.quality.evidence.tests.claimedPassed, 0)
+  assert.deepEqual(after.acceptance, before.acceptance)
+
+  // 内部 artifact 索引 / 归属不被同 path 外部写入覆盖。
+  assert.equal(collectArtifactIndex(all).get('evidence/shared.json'), 'a'.repeat(64))
+  const owners = collectArtifactOwners(all)
+  assert.equal(owners.get('evidence/shared.json').nodeId, 'n_peer')
+  assert.equal(owners.get('evidence/shared.json').producer, null)
+
+  // 外部统计仍然可见且有界。
+  assert.equal(after.externalCount, external.length)
+  assert.equal(after.externalObservations.length, external.length)
+  for (const item of after.externalObservations) {
+    assert.equal(typeof item.kind, 'string')
+    assert.equal(Number.isInteger(item.seq), true)
+    assert.equal(typeof item.summary, 'string')
+  }
+
+  // markdown：外部事件有附录并标「外部未验证」；权威通过数不含 external。
+  const markdown = renderRunMarkdown({
+    id: RUN, name: '外部注入', flowId: 'f', flowName: 'F', status: 'done',
+    startedAt: NOW.toISOString(),
+  }, all, after)
+  assert.ok(markdown.includes('- 状态: `done`'), 'run.status 不受外部事件影响')
+  assert.ok(markdown.includes('外部未验证'))
+  assert.ok(markdown.includes('## 外部观察（外部未验证）'))
+  assert.ok(markdown.includes(`- 共 ${external.length} 条外部观察`))
+  assert.ok(markdown.includes('| 测试 | 0 | 1 | 1 | 100.0% |'), '权威表只能数内部权威通过（不含 external）')
+  assert.ok(markdown.includes('通过 1 / 1'), '验收主值只算内部 acceptance')
+})
+
+check('R4 内部 host 产物 + test pass：外部同 path 失败不改结论', () => {
+  const base = fullEvidence()
+  const hostArtifact = ev('artifact/write', {
+    nodeId: 'n_host',
+    attemptId: 1,
+    extra: { producer: 'host' },
+    data: { path: 'artifacts/test.md', bytes: 3, kind: 'md', sha256: 'a'.repeat(64) },
+  })
+  const external = [
+    externalEv('artifact/write', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: { path: 'artifacts/test.md', bytes: 3, kind: 'md', sha256: 'b'.repeat(64) },
+    }),
+    externalEv('test/report', {
+      nodeId: 'n_ext', attemptId: 1,
+      data: { suite: 'unit', executed: 1, passed: 0, failed: 1, skipped: 0, reportRef: 'artifacts/test.md' },
+    }),
+  ]
+  const all = [...base, hostArtifact, ...external]
+  const quality = computeQuality(all)
+  assert.equal(quality.state, 'pass')
+  assert.equal(quality.evidence.tests.state, 'pass')
+  assert.equal(quality.evidence.tests.passedSuites, 1)
+  assert.equal(quality.evidence.tests.authoritativePassed, 1)
+  assert.equal(quality.evidence.tests.claimedPassed, 0)
+  assert.equal(quality.evidence.tests.coverageRatio, 1)
+  assert.deepEqual(computeConflicts(all).tests, [])
+  assert.equal(collectArtifactIndex(all).get('artifacts/test.md'), 'a'.repeat(64))
+  const owners = collectArtifactOwners(all)
+  assert.equal(owners.get('artifacts/test.md').producer, 'host')
+  assert.equal(owners.get('artifacts/test.md').nodeId, 'n_host')
+})
+
+console.log('runlog.js · 0.11 R6：自报证据降级（claimed / authoritative / coverage）')
+
+check('R6 tests 29/29 + generatedReport（无独立报告）：claimed=1、权威=0、coverage=0、quality 不得 pass', () => {
+  const events = fullEvidence()
+  const testEvent = events.find(event => event.kind === 'test/report')
+  testEvent.extra = { provenance: 'model-claim', generatedReport: true }
+  delete testEvent.data.reportRef
+
+  const tests = computeTests(events)
+  assert.equal(tests.state, 'unknown')
+  assert.equal(tests.claimedPassed, 1)
+  assert.equal(tests.authoritativePassed, 0)
+  assert.equal(tests.authoritativeTotal, 1)
+  assert.equal(tests.coverageRatio, 0)
+  assert.match(tests.reason, /自报报告|缺独立证据/)
+
+  const quality = computeQuality(events)
+  assert.notEqual(quality.state, 'pass')
+  assert.equal(quality.state, 'unknown')
+  assert.equal(quality.claimedPassed, 1)
+  assert.equal(quality.authoritativePassed, 2, 'acceptance / checks 仍是内部权威通过')
+})
+
+check('R6 acceptance/checks 自报报告 + 三项全 claimed → quality unknown、authorityCoverage=0', () => {
+  const events = fullEvidence()
+  for (const kind of ['acceptance/verdict', 'test/report', 'check/form']) {
+    const event = events.find(item => item.kind === kind)
+    event.extra = { provenance: 'model-claim', generatedReport: true }
+    if (kind === 'acceptance/verdict') delete event.data.evidenceRef
+    if (kind === 'test/report') delete event.data.reportRef
+    if (kind === 'check/form') delete event.data.executedAt
+  }
+  const quality = computeQuality(events)
+  assert.notEqual(quality.state, 'pass')
+  assert.equal(quality.state, 'unknown')
+  assert.equal(quality.claimedPassed, 3)
+  assert.equal(quality.authoritativePassed, 0)
+  assert.equal(quality.authorityCoverage, 0)
+  for (const key of ['acceptance', 'tests', 'checks']) {
+    assert.equal(quality.evidence[key].claimedPassed, 1, key)
+    assert.equal(quality.evidence[key].authoritativePassed, 0, key)
+    assert.equal(quality.evidence[key].coverageRatio, 0, key)
+    assert.match(quality.evidence[key].reason, /自报报告|缺独立证据/, key)
+  }
+})
+
+check('R6 host check fail 与 model claimed pass 并存：host 优先 → quality fail（更大 seq 洗不白）', () => {
+  const events = fullEvidence()
+  const hostCheck = events.find(event => event.kind === 'check/form')
+  hostCheck.extra = { producer: 'host', authority: 'host' }
+  hostCheck.data.state = 'fail'
+  hostCheck.data.passedChecks = 0
+  // 模型随后声称同一个 ruleSetId pass（无独立报告）——不得解除宿主失败。
+  events.push(ev('check/form', {
+    nodeId: 'n_check',
+    attemptId: 1,
+    extra: { provenance: 'model-claim', generatedReport: true },
+    data: {
+      ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'eslint@9',
+      state: 'pass', passedChecks: 5, totalChecks: 5,
+    },
+  }))
+  const quality = computeQuality(events)
+  assert.equal(quality.state, 'fail')
+  assert.equal(quality.evidence.checks.state, 'fail')
+  assert.ok(quality.evidence.checks.failed >= 1)
+})
+
+check('R6 三项指标都只被 claimed 覆盖（有真产物但均为模型自报）→ quality 至少 unknown，不刷绿', () => {
+  const events = ownershipFixture({ acceptance: 'peer', tests: 'peer', checks: 'peer' })
+  for (const event of events) {
+    if (['acceptance/verdict', 'test/report', 'check/form'].includes(event.kind)) {
+      event.extra = { provenance: 'model-claim' }
+    }
+  }
+  const quality = computeQuality(events)
+  assert.notEqual(quality.state, 'pass', '三项都只有 claimed 覆盖时不能 pass')
+  assert.equal(quality.state, 'unknown')
+  assert.equal(quality.claimedPassed, 3)
+  assert.equal(quality.authoritativePassed, 0)
+  assert.equal(quality.authorityCoverage, 0)
+  assert.match(quality.label, /自报|独立证据/)
+})
+
+check('R4 外部观察有界：externalCount 全量、externalObservations 最多 50 条；外部 acceptance 不进通过率', () => {
+  const events = fullEvidence()
+  const externals = []
+  for (let index = 0; index < 60; index += 1) {
+    externals.push(externalEv('acceptance/verdict', {
+      nodeId: 'n_ext',
+      attemptId: 1,
+      data: { itemId: `ext-${index}`, status: 'pass', decidedBy: 'auto', evidenceRef: 'x' },
+    }))
+  }
+  const summary = summarize([...events, ...externals], { now: NOW })
+  assert.equal(summary.externalCount, 60)
+  assert.equal(summary.externalObservations.length, EXTERNAL_OBSERVATION_LIMIT)
+  assert.equal(summary.quality.state, 'pass')
+  assert.deepEqual(summary.acceptance, { passed: 1, total: 1, rate: 1 }, '外部 acceptance 不进通过率')
+  assert.equal(summary.quality.evidence.acceptance.authoritativePassed, 1)
+  // data.external:true 只是来客自报，不改变来源（也不因此授信 / 降级）。
+  const forged = ev('acceptance/verdict', {
+    nodeId: 'n_ext2',
+    attemptId: 1,
+    data: { itemId: 'ext-forged', status: 'pass', decidedBy: 'auto', evidenceRef: 'x', external: true },
+  })
+  assert.equal(isExternalEvent(forged), false)
+  const forgedSummary = summarize([...events, forged], { now: NOW })
+  assert.equal(forgedSummary.externalCount, 0)
+  assert.equal(forgedSummary.acceptance.total, 2, 'data.external 不改变它作为内部 legacy 事件的归属')
+})
+
 console.log(`\n${checks} 组通过`)

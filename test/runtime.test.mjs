@@ -1721,6 +1721,264 @@ try {
     runtime.dispose()
   })
 
+  // -------------------------------------------------------------------------
+  console.log('runtime · 准入控制（0.11 · R2/S1）')
+
+  // 独立的 runsRoot / flowsRoot：不污染上面既有组的共享目录。
+  const admissionRunsRoot = join(home, 'runs-admission')
+  const admissionFlowsRoot = join(home, 'flows-admission')
+  const admissionModule = await import('../src/admission.js')
+  const { createAdmission: createAdmissionController, AdmissionError } = admissionModule
+
+  async function makeAdmissionRun(flowId) {
+    return store.createRun(admissionRunsRoot, {
+      flowId,
+      flowName: `流程 ${flowId}`,
+      nodeTotal: 1,
+    })
+  }
+
+  await check('准入集成：第 N+1 个 run 排队（不建 Engine、不写 run/start），槽位释放后自动启动', async () => {
+    const flowId = 'flow-adm-queue'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runB = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 4,
+      queueTimeoutMs: 3000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id, { workspace: repoRoot })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      // 不同工作区 key：A 占住唯一槽位，B 才能进入队列（工作区满会立即 429）。
+      const startB = runtime.start(runB.id, { workspace: join(repoRoot, 'src') })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => admission.admissionOf(runB.id)?.state === 'queued', 'runB 没有进入排队')
+
+      // 排队期间：没有 Engine、run.json 仍是 pending、没有 run/start 事件。
+      A.equal(runtime.get(runB.id), null, '排队期间不创建 Engine')
+      A.equal(runtime.admissionOf(runB.id).state, 'queued')
+      A.equal(runtime.admissionOf(runB.id).position, 1)
+      A.equal(runtime.admissionSnapshot().active, 1)
+      A.deepEqual(runtime.admissionSnapshot().queued.map(item => item.runId), [runB.id])
+      A.equal(runtime.admissionLimits.global, 1)
+      A.equal(runtime.admissionLimits.perWorkspace, 1)
+      const metaB = await store.readRunMeta(admissionRunsRoot, runB.id)
+      A.equal(metaB.status, 'pending')
+      A.equal(metaB.started, false)
+      A.deepEqual(
+        (await store.readAllEvents(admissionRunsRoot, runB.id)).events,
+        [],
+        '排队期间不写 run/start',
+      )
+
+      // runA 收尾释放槽位 → runB 自动获得槽位并启动。
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      await until(() => entered.includes(runB.id), 'runB 没有在槽位释放后启动')
+      A.ok(runtime.get(runB.id) instanceof Engine, '拿到槽位后才创建 Engine')
+      await until(() => runtime.admissionOf(runB.id)?.state === 'running', 'runB 没有进入 running')
+      A.equal((await runtime.wait(runB.id)).status, 'done')
+      A.equal(runtime.admissionSnapshot().active, 0, '两个 run 收尾后槽位全部归还')
+      A.deepEqual(runtime.admissionSnapshot().queued, [])
+      A.equal((await startA).ok, true, 'runA start 成功')
+      A.equal((await startB).ok, true, 'runB 拿到槽位后 start 成功')
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  await check('准入集成：stop 排队中的 run → 409（reason=stop）并取消排队，不碰运行中的 run', async () => {
+    const flowId = 'flow-adm-stop'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runB = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 4,
+      queueTimeoutMs: 5000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id, { workspace: repoRoot })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      // 等到 A 真正进入执行（markRunning 早于 run/start 落盘，不能用它当同步点）。
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      const startB = runtime.start(runB.id, { workspace: join(repoRoot, 'src') })
+        .then(() => null, error => error)
+      await until(() => admission.admissionOf(runB.id)?.state === 'queued', 'runB 没有进入排队')
+
+      let stopError = null
+      try {
+        await runtime.stop(runB.id)
+      } catch (error) {
+        stopError = error
+      }
+      A.ok(stopError instanceof EngineError)
+      A.equal(stopError.status, 409)
+      A.equal(stopError.reason, 'stop')
+      A.equal(stopError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.match(stopError.message, /排队/)
+      A.equal(runtime.admissionOf(runB.id), null, '排队票已原子摘除')
+      A.deepEqual(runtime.admissionSnapshot().queued, [])
+      const metaB = await store.readRunMeta(admissionRunsRoot, runB.id)
+      A.equal(metaB.status, 'pending', '排队中的 run 没被写 run/start')
+      A.equal(metaB.started, false)
+
+      // 排队中的 start promise 被取消（不是悬挂的 Promise）。
+      const cancelled = await startB
+      A.ok(cancelled instanceof AdmissionError)
+      A.equal(cancelled.status, 429)
+      A.equal(cancelled.reason, 'cancelled')
+      A.equal(cancelled.cancelReason, 'stop')
+
+      // 运行中的 run 不受影响：照常收尾。
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      A.equal((await startA).ok, true)
+      A.equal(runtime.admissionSnapshot().active, 0)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  await check('准入集成：重复 runId 409 / 限流 429 的 payload 字段完整', async () => {
+    const flowId = 'flow-adm-payload'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runC = await makeAdmissionRun(flowId)
+    const runD = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const wsC = join(home, 'ws-adm-c')
+    const wsD = join(home, 'ws-adm-d')
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 1,
+      queueTimeoutMs: 5000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id)
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      // 不同工作区 key：A 占住唯一全局槽位，C 进队；D 撞队满。
+      const startC = runtime.start(runC.id, { workspace: wsC }).then(() => null, error => error)
+      await until(() => admission.admissionOf(runC.id)?.state === 'queued', 'runC 没有进入排队')
+
+      // 409 payload：排队中的 runId 不能被再次 start（RUN_ALREADY_ACTIVE）。
+      let duplicateQueued = null
+      try {
+        await runtime.start(runC.id, { workspace: wsC })
+      } catch (error) {
+        duplicateQueued = error
+      }
+      A.ok(duplicateQueued instanceof AdmissionError)
+      A.equal(duplicateQueued.status, 409)
+      A.equal(duplicateQueued.code, 'RUN_ALREADY_ACTIVE')
+      A.equal(duplicateQueued.runId, runC.id)
+      A.equal(duplicateQueued.state, 'queued')
+      A.match(duplicateQueued.message, /已在运行/)
+
+      // 409 payload：运行中的 runId 重复 start 仍走 runtime 既有 409（文案含「已在运行」）。
+      let duplicateRunning = null
+      try {
+        await runtime.start(runA.id)
+      } catch (error) {
+        duplicateRunning = error
+      }
+      A.ok(duplicateRunning instanceof EngineError)
+      A.equal(duplicateRunning.status, 409)
+      A.match(duplicateRunning.message, /已在运行/)
+      A.ok(duplicateRunning.message.includes(runA.id))
+
+      // 429 payload：队满（D 用第三个工作区 key，避开 workspace-full 先命中）。
+      let limitError = null
+      try {
+        await runtime.start(runD.id, { workspace: wsD })
+      } catch (error) {
+        limitError = error
+      }
+      A.ok(limitError instanceof AdmissionError)
+      A.equal(limitError.status, 429)
+      A.equal(limitError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.equal(limitError.scope, 'global')
+      A.equal(limitError.reason, 'queue-full')
+      A.equal(limitError.active, 1)
+      A.equal(limitError.max, 1)
+      A.deepEqual(limitError.limits, { global: 1, perWorkspace: 1 })
+      A.equal(limitError.retryAfterMs, 30_000)
+      A.match(limitError.message, /排队已满/)
+      A.equal(runtime.get(runD.id), null, '被限流的 run 不创建 Engine')
+      const metaD = await store.readRunMeta(admissionRunsRoot, runD.id)
+      A.equal(metaD.started, false)
+
+      // 清理排队中的 C，再让 A 正常收尾。
+      let stopC = null
+      try {
+        await runtime.stop(runC.id)
+      } catch (error) {
+        stopC = error
+      }
+      A.ok(stopC instanceof EngineError)
+      A.equal(stopC.status, 409)
+      A.equal(stopC.reason, 'stop')
+      A.equal((await startC).reason, 'cancelled')
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      A.equal((await startA).ok, true)
+      A.equal(runtime.admissionSnapshot().active, 0)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

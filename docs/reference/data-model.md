@@ -88,6 +88,8 @@ $DSH_HOME/flow-studio/runs/
     <nodeId>/
       <attemptId>.jsonl            # 该节点这一次执行的全部事件
       artifacts/                   # 该次执行的产物（需求清单 / 方案 / diff / 报告）
+      # host-check-<executionId>.json：宿主检查执行记录（producer=host）
+      # host-check-<executionId>-report.<ext>：报告副本（字节与 reportSha256 绑定）
       self-check-raw.json          # 节点自审的原始回报（不静默丢弃）
     .index                         # 可选：mtime 快速索引（实现可省，读时扫描兜底）
 ```

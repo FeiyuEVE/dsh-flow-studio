@@ -1077,7 +1077,7 @@ export function computeSkillUsage(events = []) {
 export function computeFindings(events = []) {
   const latest = new Map()
   let reportedCount = 0
-  for (const event of sortEvents(events)) {
+  for (const event of sortEvents(internalEvents(events))) {
     if (!event || event.kind !== 'review/finding' || !event.data) continue
     const id = event.data.id
     if (typeof id !== 'string' || id === '') continue
@@ -1167,7 +1167,7 @@ export function computeRejects(events = []) {
   const byEdge = new Map()
   const byTarget = new Map()
   let total = 0
-  for (const event of events) {
+  for (const event of internalEvents(events)) {
     if (!event || event.kind !== 'reject/trigger' || !event.data) continue
     total += 1
     const edgeId = typeof event.data.edgeId === 'string' ? event.data.edgeId : '(unknown)'
@@ -1205,7 +1205,7 @@ function sortEvents(events) {
  */
 export function currentAttempts(events = []) {
   const map = new Map()
-  for (const event of events) {
+  for (const event of internalEvents(events)) {
     if (!event || typeof event.nodeId !== 'string' || !Number.isInteger(event.attemptId)) continue
     const current = map.get(event.nodeId)
     if (current === undefined || event.attemptId > current) map.set(event.nodeId, event.attemptId)
@@ -1223,8 +1223,9 @@ function isCurrentAttempt(event, attempts) {
 
 /** 过滤出当前 attempt 的事件（用于 quality 证据，不用于 findings 的全局生命周期）。 */
 function currentAttemptEvents(events) {
-  const attempts = currentAttempts(events)
-  return events.filter(event => isCurrentAttempt(event, attempts))
+  const internal = internalEvents(events)
+  const attempts = currentAttempts(internal)
+  return internal.filter(event => isCurrentAttempt(event, attempts))
 }
 
 /**
@@ -1238,7 +1239,7 @@ function currentAttemptEvents(events) {
  * - `ratio` 强制 ≤ 1，旧 attempt 的结论不计。
  */
 export function computeProgress(events = []) {
-  const sorted = sortEvents(events)
+  const sorted = sortEvents(internalEvents(events))
   let nodeTotal = null
   // 按 seq 重放：状态只看「当时」的当前 attempt，和 runstore 的增量计数器同一套规则。
   const nodes = new Map()
@@ -1382,10 +1383,42 @@ const EVIDENCE_LABELS = {
   p0p1: 'P0 缺陷',
 }
 
+/** 外部观察附录的有界上限（§6：外部统计可以增加，但必须有界）。 */
+export const EXTERNAL_OBSERVATION_LIMIT = 50
+
+/**
+ * R4（0.11 §6）：这条事件是否来自外部来源。
+ *
+ * **只认 `extra.source === 'external'` / `extra.producer === 'external'`**：
+ *   - 不猜 host：旧事件没有 source 就是 legacy（来源未知），不能因为「没标记」就当成宿主；
+ *   - 不认 `data.external: true` 之类的自报标记：来客在 data 里写什么都只是未验证观察，
+ *     不能据此授信，也不能据此把内部事件降级。
+ *
+ * @param {object} event 已落盘 / 未落盘的事件
+ * @returns {boolean}
+ */
+export function isExternalEvent(event) {
+  const extra = event && typeof event.extra === 'object' && event.extra !== null ? event.extra : null
+  if (!extra) return false
+  return extra.source === 'external' || extra.producer === 'external'
+}
+
+/**
+ * 在任何权威索引之前分区（§6）：外部事件只进观察，不进证据 / 冲突 / attempt / stale / findings。
+ * 所有聚合函数都在入口调用它，因此对已分区的事件再调用一次也安全（幂等）。
+ *
+ * @param {object[]} events
+ * @returns {object[]}
+ */
+function internalEvents(events = []) {
+  if (!Array.isArray(events)) return []
+  return events.filter(event => !isExternalEvent(event))
+}
+
 /** 06 §13.7 / 05 §8.2：引擎写下的 artifact/write（path + sha256）索引。 */
 export function collectArtifactIndex(events = []) {
   const map = new Map()
-  for (const event of sortEvents(events)) {
+  for (const event of sortEvents(internalEvents(events))) {
     if (!event || event.kind !== 'artifact/write' || !event.data) continue
     const path = event.data.path
     const sha256 = event.data.sha256
@@ -1408,7 +1441,7 @@ export function collectArtifactIndex(events = []) {
  */
 export function collectArtifactOwners(events = []) {
   const map = new Map()
-  for (const event of sortEvents(events)) {
+  for (const event of sortEvents(internalEvents(events))) {
     if (!event || event.kind !== 'artifact/write' || !event.data) continue
     const path = event.data.path
     if (typeof path !== 'string' || !isSafeRelPath(path)) continue
@@ -1443,6 +1476,55 @@ function classifyEvidenceLevel(event, ref, owners) {
 /** 模型自述证据：事件 extra.provenance === 'model-claim'（06 §13.7）。 */
 function isModelClaim(event) {
   return Boolean(event && event.extra && event.extra.provenance === 'model-claim')
+}
+
+/**
+ * R6（0.11 §8）：一条证据事件的权威级别。
+ *
+ * - `external`：`extra.source` / `extra.producer` 为 external（外部观察，永不授信）；
+ * - `host`：`extra.producer === 'host'` 或 `extra.authority === 'host'`（宿主执行 / 登记产物）；
+ * - `model-claim`：`extra.provenance === 'model-claim'`（模型自述，需独立产物对账）；
+ * - `engine`：`extra.provenance` 为 engine / stub-synthetic（引擎自产，非模型声明）；
+ * - `legacy`：没有可识别来源的旧事件（来源未知，不猜测为 host）。
+ *
+ * 注意：`authority` 只是验证结果的投影，不是调用方可声明的权限；本函数只分类，
+ * 不因为字符串写了 'host' 就跳过子产物 / 报告核验（核验仍在各指标内做）。
+ *
+ * @param {object} event
+ * @returns {'host' | 'engine' | 'model-claim' | 'external' | 'legacy'}
+ */
+export function classifyEvidenceAuthority(event) {
+  const extra = event && typeof event.extra === 'object' && event.extra !== null ? event.extra : null
+  if (!extra) return 'legacy'
+  if (extra.source === 'external' || extra.producer === 'external') return 'external'
+  if (extra.producer === 'host' || extra.authority === 'host') return 'host'
+  if (extra.provenance === 'model-claim') return 'model-claim'
+  if (extra.provenance === 'engine' || extra.provenance === 'stub-synthetic') return 'engine'
+  return 'legacy'
+}
+
+/**
+ * R6（0.11 §8）：引擎用自己刚生成的 summary/report 充当 reportRef 的兜底。
+ * 这种「自报报告」没有独立产物可复核，不得算权威通过。
+ * @param {object} event
+ * @returns {boolean}
+ */
+function isGeneratedReportClaim(event) {
+  return Boolean(event && event.extra && event.extra.generatedReport === true)
+}
+
+/**
+ * 指标层的权威计数（§8）：分母是「应验条目数」，缺分母时 coverageRatio 为 null。
+ * @param {{ claimedPassed: number, authoritativePassed: number, denominator: number|null }} values
+ */
+function authorityFields({ claimedPassed, authoritativePassed, denominator }) {
+  const total = Number.isInteger(denominator) && denominator > 0 ? denominator : null
+  return {
+    claimedPassed,
+    authoritativePassed,
+    authoritativeTotal: total,
+    coverageRatio: total === null ? null : authoritativePassed / total,
+  }
 }
 
 /**
@@ -1482,7 +1564,7 @@ export function computeConflicts(events = []) {
   const conflicts = { findings: [], acceptance: [], tests: [], checks: [] }
   for (const [metric, [kind, field]] of Object.entries(groups)) {
     const nodesById = new Map()
-    for (const event of events) {
+    for (const event of internalEvents(events)) {
       if (!event || event.kind !== kind || !event.data) continue
       const id = event.data[field]
       if (typeof id !== 'string' || id === '' || typeof event.nodeId !== 'string') continue
@@ -1519,7 +1601,7 @@ const CONFLICT_LABELS = {
  */
 export function summarizeAcceptance(events = []) {
   const latest = new Map()
-  for (const event of sortEvents(currentAttemptEvents(events))) {
+  for (const event of sortEvents(currentAttemptEvents(internalEvents(events)))) {
     if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
     const itemId = event.data.itemId
     if (typeof itemId !== 'string' || itemId === '') continue
@@ -1542,11 +1624,12 @@ export function summarizeAcceptance(events = []) {
  * 缺证据）；「证据不独立」由 quality 层在五项全过时降为 warn 兜底。
  */
 export function computeAcceptance(events = [], options = {}) {
-  const scoped = currentAttemptEvents(events)
+  const internal = internalEvents(events)
+  const scoped = currentAttemptEvents(internal)
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
   const owners = options.artifactOwners instanceof Map
     ? options.artifactOwners
-    : collectArtifactOwners(events)
+    : collectArtifactOwners(internal)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'acceptance/verdict' || !event.data) continue
@@ -1554,7 +1637,14 @@ export function computeAcceptance(events = [], options = {}) {
     if (typeof itemId !== 'string' || itemId === '') continue
     latest.set(itemId, { data: event.data, event })
   }
-  if (latest.size === 0) return { state: 'unknown', reason: '没有 acceptance/verdict 记录', items: 0 }
+  if (latest.size === 0) {
+    return {
+      state: 'unknown',
+      reason: '没有 acceptance/verdict 记录',
+      items: 0,
+      ...authorityFields({ claimedPassed: 0, authoritativePassed: 0, denominator: null }),
+    }
+  }
 
   let passed = 0
   let failed = 0
@@ -1562,15 +1652,26 @@ export function computeAcceptance(events = [], options = {}) {
   let missingLink = 0
   let unverified = 0
   let selfCertified = 0
+  let claimedPassed = 0
+  let authoritativePassed = 0
+  let generatedReport = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
+  const generatedReportRefs = []
   const countPass = (data, event) => {
     passed += 1
+    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.evidenceRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(data.itemId)
     }
   }
+  const authority = () => authorityFields({
+    claimedPassed,
+    authoritativePassed,
+    denominator: latest.size,
+  })
   for (const { data, event } of latest.values()) {
     if (data.status === 'fail') {
       failed += 1
@@ -1581,6 +1682,13 @@ export function computeAcceptance(events = [], options = {}) {
       continue
     }
     if (isModelClaim(event)) {
+      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      if (isGeneratedReportClaim(event)) {
+        claimedPassed += 1
+        generatedReport += 1
+        generatedReportRefs.push(data.itemId)
+        continue
+      }
       const claim = verifyClaimRef(event, data.evidenceRef, artifacts, options.verifyEvidence)
       if (!claim.ok) {
         unverified += 1
@@ -1607,6 +1715,22 @@ export function computeAcceptance(events = [], options = {}) {
       notApplicable,
       selfCertified,
       selfOnly,
+      ...authority(),
+    }
+  }
+  if (generatedReport > 0) {
+    return {
+      state: 'unknown',
+      reason: `${generatedReport} 个通过的验收条目只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      items: latest.size,
+      passed,
+      failed,
+      notApplicable,
+      generatedReport,
+      generatedReportRefs,
+      selfCertified,
+      selfOnly,
+      ...authority(),
     }
   }
   if (unverified > 0) {
@@ -1621,6 +1745,7 @@ export function computeAcceptance(events = [], options = {}) {
       unverifiedRefs,
       selfCertified,
       selfOnly,
+      ...authority(),
     }
   }
   if (missingLink > 0) {
@@ -1633,10 +1758,19 @@ export function computeAcceptance(events = [], options = {}) {
       notApplicable,
       selfCertified,
       selfOnly,
+      ...authority(),
     }
   }
   if (passed === 0) {
-    return { state: 'unknown', reason: '验收条目全部被跳过 / 不适用', items: latest.size, passed, failed, notApplicable }
+    return {
+      state: 'unknown',
+      reason: '验收条目全部被跳过 / 不适用',
+      items: latest.size,
+      passed,
+      failed,
+      notApplicable,
+      ...authority(),
+    }
   }
   // v1.3：自证不再把指标打成 unknown（unknown = 缺证据 / 自相矛盾）；
   // 「证据不独立」由 quality 层以 warn 兜底，这里如实暴露 selfCertified 条数。
@@ -1649,6 +1783,7 @@ export function computeAcceptance(events = [], options = {}) {
     selfCertified,
     selfOnly,
     selfCertifiedRefs,
+    ...authority(),
   }
 }
 
@@ -1659,11 +1794,12 @@ export function computeAcceptance(events = [], options = {}) {
  * 指标不降级，quality 层在五项全过时按 selfOnly 兜底 warn。
  */
 export function computeTests(events = [], options = {}) {
-  const scoped = currentAttemptEvents(events)
+  const internal = internalEvents(events)
+  const scoped = currentAttemptEvents(internal)
   const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(scoped)
   const owners = options.artifactOwners instanceof Map
     ? options.artifactOwners
-    : collectArtifactOwners(events)
+    : collectArtifactOwners(internal)
   const latest = new Map()
   for (const event of sortEvents(scoped)) {
     if (!event || event.kind !== 'test/report' || !event.data) continue
@@ -1671,7 +1807,14 @@ export function computeTests(events = [], options = {}) {
     if (typeof suite !== 'string' || suite === '') continue
     latest.set(suite, { data: event.data, event })
   }
-  if (latest.size === 0) return { state: 'unknown', reason: '没有 test/report 记录', suites: 0 }
+  if (latest.size === 0) {
+    return {
+      state: 'unknown',
+      reason: '没有 test/report 记录',
+      suites: 0,
+      ...authorityFields({ claimedPassed: 0, authoritativePassed: 0, denominator: null }),
+    }
+  }
 
   let passedSuites = 0
   let failedSuites = 0
@@ -1679,17 +1822,28 @@ export function computeTests(events = [], options = {}) {
   let missingLink = 0
   let unverified = 0
   let selfCertified = 0
+  let claimedPassed = 0
+  let authoritativePassed = 0
+  let generatedReport = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
+  const generatedReportRefs = []
   const suites = []
   const countPass = (suite, data, event) => {
     passedSuites += 1
+    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(suite)
     }
     suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
   }
+  const authority = () => authorityFields({
+    claimedPassed,
+    authoritativePassed,
+    denominator: latest.size,
+  })
   for (const [suite, { data, event }] of latest) {
     const counts = ['executed', 'passed', 'failed', 'skipped']
     if (!counts.every(key => Number.isInteger(data[key]))) {
@@ -1717,6 +1871,13 @@ export function computeTests(events = [], options = {}) {
       continue
     }
     if (isModelClaim(event)) {
+      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      if (isGeneratedReportClaim(event)) {
+        claimedPassed += 1
+        generatedReport += 1
+        generatedReportRefs.push(suite)
+        continue
+      }
       const claim = verifyClaimRef(event, data.reportRef, artifacts, options.verifyEvidence)
       if (!claim.ok) {
         unverified += 1
@@ -1734,10 +1895,25 @@ export function computeTests(events = [], options = {}) {
   }
   const selfOnly = passedSuites > 0 && selfCertified === passedSuites
   if (failedSuites > 0) {
-    return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
+    return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, ...authority() }
+  }
+  if (generatedReport > 0) {
+    return {
+      state: 'unknown',
+      reason: `${generatedReport} 个通过的测试套件只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      suites: latest.size,
+      passedSuites,
+      failedSuites,
+      generatedReport,
+      generatedReportRefs,
+      details: suites,
+      selfCertified,
+      selfOnly,
+      ...authority(),
+    }
   }
   if (missingCounts > 0) {
-    return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
+    return { state: 'unknown', reason: `${missingCounts} 个测试套件计数缺失或执行 0 条`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, ...authority() }
   }
   if (unverified > 0) {
     return {
@@ -1751,16 +1927,25 @@ export function computeTests(events = [], options = {}) {
       details: suites,
       selfCertified,
       selfOnly,
+      ...authority(),
     }
   }
   if (missingLink > 0) {
-    return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly }
+    return { state: 'unknown', reason: `${missingLink} 个测试套件缺报告链接`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, ...authority() }
   }
   if (passedSuites === 0) {
-    return { state: 'unknown', reason: '没有可用的测试执行记录', suites: latest.size, passedSuites, failedSuites, details: suites }
+    return {
+      state: 'unknown',
+      reason: '没有可用的测试执行记录',
+      suites: latest.size,
+      passedSuites,
+      failedSuites,
+      details: suites,
+      ...authority(),
+    }
   }
   // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
-  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, selfCertifiedRefs }
+  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, selfCertifiedRefs, ...authority() }
 }
 
 /**
@@ -1770,19 +1955,24 @@ export function computeTests(events = [], options = {}) {
  * 指标不降级，quality 层在五项全过时按 selfOnly 兜底 warn。
  */
 function checkEvidence(events, options = {}) {
-  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
+  const internal = internalEvents(events)
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(internal)
   const owners = options.artifactOwners instanceof Map
     ? options.artifactOwners
-    : collectArtifactOwners(events)
+    : collectArtifactOwners(internal)
   const latest = new Map()
-  for (const event of sortEvents(currentAttemptEvents(events))) {
+  for (const event of sortEvents(currentAttemptEvents(internal))) {
     if (!event || event.kind !== 'check/form' || !event.data) continue
     const { ruleSetId } = event.data
     if (typeof ruleSetId !== 'string' || ruleSetId === '') continue
     latest.set(ruleSetId, { data: event.data, event })
   }
   if (latest.size === 0) {
-    return { state: 'unknown', reason: '没有 check/form 执行记录' }
+    return {
+      state: 'unknown',
+      reason: '没有 check/form 执行记录',
+      ...authorityFields({ claimedPassed: 0, authoritativePassed: 0, denominator: null }),
+    }
   }
 
   let applicable = 0
@@ -1791,17 +1981,49 @@ function checkEvidence(events, options = {}) {
   let incomplete = 0
   let unverified = 0
   let selfCertified = 0
+  let claimedPassed = 0
+  let authoritativePassed = 0
+  let generatedReport = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
+  const generatedReportRefs = []
   const skipped = []
+  // R6（§8）：宿主检查失败是权威失败，不能被更大 seq / 更高 attempt 的自报或无关
+  // host pass 洗白；只有**更晚的宿主 pass** 才算复验解除。这里记录每个 ruleSetId
+  // 最后一次宿主事件的状态，循环里据此压过 claimed pass。
+  const hostStates = new Map()
+  for (const event of sortEvents(internal)) {
+    if (!event || event.kind !== 'check/form' || !event.data) continue
+    if (classifyEvidenceAuthority(event) !== 'host') continue
+    const id = event.data.ruleSetId
+    if (typeof id !== 'string' || id === '') continue
+    const state = event.data.state
+    if (state !== 'fail' && state !== 'pass') continue
+    const previous = hostStates.get(id)
+    if (previous && seqOf(event) < previous.seq) continue
+    hostStates.set(id, { state, seq: seqOf(event) })
+  }
   const countPass = (ruleSetId, data, event) => {
     passed += 1
+    if (classifyEvidenceAuthority(event) === 'model-claim') claimedPassed += 1
+    else authoritativePassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(ruleSetId)
     }
   }
+  const authority = () => authorityFields({
+    claimedPassed,
+    authoritativePassed,
+    denominator: applicable,
+  })
   for (const [ruleSetId, { data, event }] of latest) {
+    // 宿主权威失败优先：即便本 ruleSetId 的最新事件是模型 claimed pass，也不解除。
+    const hostState = hostStates.get(ruleSetId)
+    if (hostState && hostState.state === 'fail') {
+      failed += 1
+      continue
+    }
     if (data.state === 'fail') {
       failed += 1
       continue
@@ -1822,6 +2044,13 @@ function checkEvidence(events, options = {}) {
       continue
     }
     if (isModelClaim(event)) {
+      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      if (isGeneratedReportClaim(event)) {
+        claimedPassed += 1
+        generatedReport += 1
+        generatedReportRefs.push(ruleSetId)
+        continue
+      }
       // 模型自述的规范检查：executedAt 不算证据，必须给出可复核的 reportRef。
       const claim = verifyClaimRef(event, data.reportRef, artifacts, options.verifyEvidence)
       if (!claim.ok) {
@@ -1842,7 +2071,21 @@ function checkEvidence(events, options = {}) {
   }
   const selfOnly = passed > 0 && selfCertified === passed
   if (failed > 0) {
-    return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed, skipped, selfCertified, selfOnly }
+    return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed, skipped, selfCertified, selfOnly, ...authority() }
+  }
+  if (generatedReport > 0) {
+    return {
+      state: 'unknown',
+      reason: `${generatedReport} 个通过的规范检查只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      applicable,
+      passed,
+      failed,
+      generatedReport,
+      generatedReportRefs,
+      selfCertified,
+      selfOnly,
+      ...authority(),
+    }
   }
   if (unverified > 0) {
     return {
@@ -1855,6 +2098,7 @@ function checkEvidence(events, options = {}) {
       unverifiedRefs,
       selfCertified,
       selfOnly,
+      ...authority(),
     }
   }
   if (incomplete > 0) {
@@ -1866,13 +2110,14 @@ function checkEvidence(events, options = {}) {
       failed,
       selfCertified,
       selfOnly,
+      ...authority(),
     }
   }
   if (applicable === 0) {
-    return { state: 'unknown', reason: '全部规则集被跳过 / 不适用', applicable, passed, failed, skipped }
+    return { state: 'unknown', reason: '全部规则集被跳过 / 不适用', applicable, passed, failed, skipped, ...authority() }
   }
   // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
-  return { state: 'pass', applicable, passed, failed, skipped, selfCertified, selfOnly, selfCertifiedRefs }
+  return { state: 'pass', applicable, passed, failed, skipped, selfCertified, selfOnly, selfCertifiedRefs, ...authority() }
 }
 
 /**
@@ -1883,7 +2128,7 @@ function checkEvidence(events, options = {}) {
  *   大于 `findingCount`，一律 unknown（数据自相矛盾）。
  */
 function reviewEvidence(events, findings) {
-  const verdicts = events
+  const verdicts = internalEvents(events)
     .filter(event => event && event.kind === 'review/verdict' && event.data)
     .sort((a, b) => seqOf(a) - seqOf(b))
   const lastVerdict = verdicts.length > 0 ? verdicts[verdicts.length - 1] : null
@@ -1902,7 +2147,7 @@ function reviewEvidence(events, findings) {
   } else if (lastVerdict.data.verdict === 'approve') {
     const findingCount = lastVerdict.data.findingCount
     const nodeId = lastVerdict.nodeId
-    const nodeFindings = events.filter(event => event && event.kind === 'review/finding'
+    const nodeFindings = internalEvents(events).filter(event => event && event.kind === 'review/finding'
       && event.data && event.nodeId === nodeId && typeof event.data.id === 'string')
     const uniqueIds = new Set(nodeFindings.map(event => event.data.id))
     if (findingCount > 0 && nodeFindings.length === 0) {
@@ -1949,7 +2194,7 @@ function reviewEvidence(events, findings) {
 /** 返工轮次 = `reject/trigger` 事件数（§8.4 的「返工 n 轮」）。 */
 export function countRework(events = []) {
   let total = 0
-  for (const event of events) {
+  for (const event of internalEvents(events)) {
     if (event && event.kind === 'reject/trigger' && event.data) total += 1
   }
   return total
@@ -2009,9 +2254,10 @@ const STALE_METRICS = {
  * @returns {{ acceptance: string[], tests: string[], checks: string[] }}
  */
 export function computeStaleFails(events = []) {
-  const attempts = currentAttempts(events)
+  const internal = internalEvents(events)
+  const attempts = currentAttempts(internal)
   const latest = new Map()
-  for (const event of sortEvents(events)) {
+  for (const event of sortEvents(internal)) {
     if (!event || !event.data) continue
     const metric = STALE_METRICS[event.kind]
     if (!metric) continue
@@ -2059,23 +2305,26 @@ function staleFailReason(label, ids) {
  * - 多项 warn 原因同时成立时全部写进同一个 label（不丢原因）。
  */
 export function computeQuality(events = [], options = {}) {
-  const findings = computeFindings(events)
+  // R4（§6）：外部事件在任何权威索引之前分区，避免同 path / itemId / ruleSetId 的
+  // 外部 pass/fail 覆盖内部证据、制造冲突或清掉宿主失败。
+  const internal = internalEvents(events)
+  const findings = computeFindings(internal)
   const conflicts = options.conflicts && typeof options.conflicts === 'object'
     ? options.conflicts
-    : computeConflicts(events)
-  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(events)
+    : computeConflicts(internal)
+  const artifacts = options.artifacts instanceof Map ? options.artifacts : collectArtifactIndex(internal)
   const artifactOwners = options.artifactOwners instanceof Map
     ? options.artifactOwners
-    : collectArtifactOwners(events)
-  const scoped = currentAttemptEvents(events)
+    : collectArtifactOwners(internal)
+  const scoped = currentAttemptEvents(internal)
   const evidenceOptions = { artifacts, artifactOwners, verifyEvidence: options.verifyEvidence }
   let checks = checkEvidence(scoped, evidenceOptions)
   let acceptance = computeAcceptance(scoped, evidenceOptions)
   let tests = computeTests(scoped, evidenceOptions)
   const review = reviewEvidence(scoped, findings)
   let p0p1 = review.p0p1
-  const progress = computeProgress(events)
-  const reworkRounds = countRework(events)
+  const progress = computeProgress(internal)
+  const reworkRounds = countRework(internal)
 
   // 06 §13.7 双保险：跨节点标识冲突 → 对应指标 unknown，不给绿灯。
   if (conflicts.acceptance && conflicts.acceptance.length > 0) {
@@ -2162,6 +2411,20 @@ export function computeQuality(events = [], options = {}) {
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0), 0)
   const selfOnlyMetrics = ['acceptance', 'tests', 'checks']
     .filter(key => evidence[key].selfOnly === true)
+  // R6（§8）：权威 / 自报汇总。分母是应验条目数之和；分母为 0 时 coverage 为 null（unknown）。
+  const authorityMetrics = ['acceptance', 'tests', 'checks']
+  const claimedPassed = authorityMetrics
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0), 0)
+  const authoritativePassed = authorityMetrics
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].authoritativePassed) ? evidence[key].authoritativePassed : 0), 0)
+  const authoritativeTotal = authorityMetrics
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].authoritativeTotal) ? evidence[key].authoritativeTotal : 0), 0)
+  const authorityCoverage = authoritativeTotal > 0 ? authoritativePassed / authoritativeTotal : null
+  // 三项指标全部只有 claimed 覆盖（如模型自述 + 引擎自写报告）→ 至少 unknown，绝不因自报刷绿。
+  const claimedOnly = authorityMetrics.every(key => (
+    (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0) > 0
+    && (Number.isInteger(evidence[key].authoritativePassed) ? evidence[key].authoritativePassed : 0) === 0
+  ))
   const acceptedRate = findings.acceptedRate
   const goodRework = reworkRounds === 1 && p1Unresolved === 0 && p2Unresolved === 0
     && acceptedRate !== null && acceptedRate >= 0.6
@@ -2207,6 +2470,11 @@ export function computeQuality(events = [], options = {}) {
       label = reworkRounds === 0 ? '优：首轮通过' : '良：返工 1 轮后达标'
     }
   }
+  // R6（§8）：三项指标都只有模型自报时，最多 unknown；report/pass 不能靠自报点亮。
+  if (claimedOnly && state !== 'fail' && state !== 'unknown') {
+    state = 'unknown'
+    label = `证据不足：三项指标只有模型自报（claimed ${claimedPassed} 条），缺独立证据，不能判定为通过`
+  }
 
   const engine = options.engine === 'stub' ? 'stub' : 'real'
   const conflictList = hasConflicts(conflicts) ? conflicts : null
@@ -2224,6 +2492,10 @@ export function computeQuality(events = [], options = {}) {
       p1Unresolved,
       p2Unresolved,
       selfCertified,
+      claimedPassed,
+      authoritativePassed,
+      authoritativeTotal,
+      authorityCoverage,
       engine,
       stub: true,
       conflicts: conflictList,
@@ -2242,6 +2514,10 @@ export function computeQuality(events = [], options = {}) {
     p1Unresolved,
     p2Unresolved,
     selfCertified,
+    claimedPassed,
+    authoritativePassed,
+    authoritativeTotal,
+    authorityCoverage,
     engine,
     conflicts: conflictList,
   }
@@ -2315,11 +2591,12 @@ export function summarize(events = [], options = {}) {
     : new Date()
   const tokens = computeTokens(events)
   // 06 §13.8：引擎标记优先取显式参数（run.json.engine），其次取 run/start.data.engine。
+  // R4（§6）：外部事件不能伪造 run/start.data.engine，因此只在内部事件里探测。
   let engine = 'real'
   if (options.engine === 'stub' || options.engine === 'real') {
     engine = options.engine
   } else {
-    for (const event of events) {
+    for (const event of internalEvents(events)) {
       if (event && event.kind === 'run/start' && event.data
         && (event.data.engine === 'stub' || event.data.engine === 'real')) {
         engine = event.data.engine
@@ -2335,6 +2612,17 @@ export function summarize(events = [], options = {}) {
     findings.reason = conflictReason(CONFLICT_LABELS.findings, conflicts.findings)
     findings.conflicts = conflicts.findings
   }
+  // R4（§6）：外部观察只做展示，有界（最近 EXTERNAL_OBSERVATION_LIMIT 条），不进权威聚合。
+  const externalSources = sortEvents(events.filter(isExternalEvent))
+  const externalObservations = externalSources.slice(-EXTERNAL_OBSERVATION_LIMIT).map(event => {
+    const digest = eventDigest(event)
+    const fallback = isPlainObject(event.data) ? JSON.stringify(event.data) : ''
+    return {
+      kind: typeof event.kind === 'string' ? event.kind : '',
+      seq: Number.isInteger(event.seq) ? event.seq : null,
+      summary: (digest !== '' ? digest : fallback).slice(0, 300),
+    }
+  })
   let lastSeq = Number.isInteger(options.lastSeq) && options.lastSeq >= 0 ? options.lastSeq : 0
   for (const event of events) {
     if (Number.isInteger(event && event.seq) && event.seq > lastSeq) lastSeq = event.seq
@@ -2346,6 +2634,9 @@ export function summarize(events = [], options = {}) {
     truncated: options.truncated === true,
     lastSeq,
     engine,
+    // R4（§6）：外部来源统计；不影响权威 headline / 通过率 / quality.state / run.status。
+    externalCount: externalSources.length,
+    externalObservations,
     // 06 §13.7：40px 主摘要直接取这三项，不用再从 quality.evidence 里翻。
     acceptance: summarizeAcceptance(events),
     conflicts,
@@ -2570,6 +2861,47 @@ export function renderRunMarkdown(meta = {}, events = [], summary = null) {
     lines.push(`| ${EVIDENCE_LABELS[key] || key} | ${value.state} | ${mdCell(value.reason || '')} |`)
   }
   lines.push('')
+  // R6（§8）：权威 vs 自报两列；字段缺省时写 unknown，不编造数字。
+  if (['acceptance', 'tests', 'checks'].some(key => isPlainObject(quality.evidence[key]))) {
+    lines.push('| 证据 | 自报通过(claimed) | 权威通过(authoritative) | 应验条目 | 覆盖率 |')
+    lines.push('| --- | ---: | ---: | ---: | ---: |')
+    for (const key of ['acceptance', 'tests', 'checks']) {
+      const value = isPlainObject(quality.evidence[key]) ? quality.evidence[key] : {}
+      const claimed = Number.isInteger(value.claimedPassed) ? value.claimedPassed : 'unknown'
+      const authoritative = Number.isInteger(value.authoritativePassed) ? value.authoritativePassed : 'unknown'
+      const total = Number.isInteger(value.authoritativeTotal) ? value.authoritativeTotal : 'unknown'
+      const coverage = typeof value.coverageRatio === 'number'
+        ? `${(value.coverageRatio * 100).toFixed(1)}%`
+        : 'unknown'
+      lines.push(`| ${EVIDENCE_LABELS[key] || key} | ${claimed} | ${authoritative} | ${total} | ${coverage} |`)
+    }
+    lines.push('')
+  }
+
+  // R4（§6）：外部观察附录。外部事件仍展示，但明确标注「外部未验证」，
+  // 且它们不在上面的权威通过计数里（summarize 已在权威索引之前分区）。
+  const externalCount = Number.isInteger(s.externalCount)
+    ? s.externalCount
+    : events.filter(isExternalEvent).length
+  if (externalCount > 0) {
+    const observations = Array.isArray(s.externalObservations)
+      ? s.externalObservations
+      : sortEvents(events.filter(isExternalEvent)).slice(-EXTERNAL_OBSERVATION_LIMIT).map(event => ({
+        kind: event.kind,
+        seq: Number.isInteger(event.seq) ? event.seq : null,
+        summary: eventDigest(event),
+      }))
+    lines.push('## 外部观察（外部未验证）')
+    lines.push('')
+    lines.push(`- 共 ${externalCount} 条外部观察；来源未验证，不计入权威通过数 / 质量结论 / run.status。`)
+    lines.push('')
+    lines.push('| seq | kind | 摘要 |')
+    lines.push('| ---: | --- | --- |')
+    for (const item of observations) {
+      lines.push(`| ${item.seq ?? '—'} | \`${item.kind || ''}\` | ${mdCell(item.summary || '')} · 外部未验证 |`)
+    }
+    lines.push('')
+  }
 
   const nodes = indexNodes(events)
   lines.push('## 节点索引')
@@ -2589,7 +2921,9 @@ export function renderRunMarkdown(meta = {}, events = [], summary = null) {
   lines.push('| seq | ts | kind | 节点 | attempt | member | 摘要 |')
   lines.push('| ---: | --- | --- | --- | ---: | --- | --- |')
   for (const event of timeline) {
-    lines.push(`| ${event.seq ?? '—'} | ${event.ts || '—'} | \`${event.kind}\` | ${mdCell(event.nodeId || '—')} | ${event.attemptId ?? '—'} | ${mdCell(event.memberId || '—')} | ${mdCell(eventDigest(event))} |`)
+    // R4（§6）：时间线仍展示外部事件，但必须标「外部未验证」，避免被读成权威通过。
+    const digest = eventDigest(event) + (isExternalEvent(event) ? ' · 外部未验证' : '')
+    lines.push(`| ${event.seq ?? '—'} | ${event.ts || '—'} | \`${event.kind}\` | ${mdCell(event.nodeId || '—')} | ${event.attemptId ?? '—'} | ${mdCell(event.memberId || '—')} | ${mdCell(digest)} |`)
   }
   lines.push('')
 

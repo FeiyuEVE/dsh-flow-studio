@@ -211,6 +211,10 @@ supervision、事件序号都是已经发生过的事实；原地续跑要么改
 要么让 `status` 在 `failed` → `running` → `done` 之间来回跳（前端 / 指标会看到两次
 收尾）。新 run 有独立事件流，`restart.fromRunId` + `restart.attempt` 足以还原世系。
 
+## 并发准入（0.11）
+
+所有生产启动入口（HTTP `start`、`flow_start`、restart、收件箱）都经过 `runtime.start` 的同一份准入账本：全局 + 每工作区两层配额，全局满时进有限 FIFO。排队期间不创建 Engine、不建 worktree、不写 `run/start`；`GET /runs/<id>` 的动态 `admission` 字段只用于展示，不落盘。工作区满立即 429（排队也轮不到它），队列满 / 超时 / 断连同样 429 并给出可读原因。同一 runId 在 resolving / queued / running 任一状态重复启动都是 409。
+
 ## 权限与安全开关
 
 | 环境变量 | 作用 |
@@ -218,6 +222,10 @@ supervision、事件序号都是已经发生过的事实；原地续跑要么改
 | `FLOW_STUDIO_TOKEN` | **全权**令牌（≥16 字符，`Authorization: Bearer`） |
 | `FLOW_STUDIO_READ_TOKEN` | **只读**令牌：只允许 `GET`，任何写请求 → 403（`code:"READ_ONLY_TOKEN"`） |
 | `FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR` | 默认关。关闭时保存 / 启动含 `executor:'custom'` 的流程 → 400（`code:"CUSTOM_EXECUTOR_DISABLED"`）——custom 会在宿主 `sh -c` 执行任意命令，等价宿主 RCE，**只能由运维在主机上打开** |
+| `FLOW_STUDIO_MAX_CONCURRENT_RUNS` / `FLOW_STUDIO_MAX_CONCURRENT_RUNS_PER_WORKSPACE` | 进程级并发上限（默认 4 / 每工作区 2；工作区上限有效值取 `min(值, 全局)`）。启动入口统一经 runtime 准入，超限时排队或 429 |
+| `FLOW_STUDIO_RUN_QUEUE_MAX` / `FLOW_STUDIO_RUN_QUEUE_TIMEOUT_MS` | 有限 FIFO 队列长度（默认 8；`0` = 禁止排队，直接 429）/ 排队等待上限（默认 15000ms，上限 600000ms） |
+| `FLOW_STUDIO_EXECUTOR_MAX_OUTPUT_BYTES` / `FLOW_STUDIO_EXECUTOR_MAX_EVENTS` | 外部 executor 的硬上限（默认 8 MiB / 5000 条事件）；超限杀进程组并返回 `OUTPUT_LIMIT` |
+| `FLOW_STUDIO_ALLOW_HOST_CHECKS` | 默认关；只有字符串 `1` 开启节点 `check` 的宿主执行。关闭时启动含检查的流程 → 400 `HOST_CHECKS_DISABLED` |
 | `FLOW_STUDIO_WORKSPACE_ROOTS` | 可选，冒号分隔的绝对路径；配置后 `workspace` 必须落在其中之一（realpath 比较，防 symlink 绕过），否则 400 |
 | `FLOW_STUDIO_RUN_TIMEOUT_MS` / `FLOW_STUDIO_NODE_TIMEOUT_MS` | 墙钟上限默认 2h / 单节点 20min；`start` 的显式参数优先于它 |
 | `FLOW_STUDIO_NODE_ALARM_MS` | 节点自审闹钟间隔（默认 600000 = 10 分钟） |
@@ -238,6 +246,7 @@ supervision、事件序号都是已经发生过的事实；原地续跑要么改
 | 401 / 403 | 宿主鉴权拒绝；只读令牌写操作 403 `READ_ONLY_TOKEN` |
 | 404 | 流程 / run 不存在 |
 | 409 | 版本冲突 `FLOW_VERSION_CONFLICT`；同一 runId 已在跑；删除租约持有中的 run |
+| 429 | 并发准入拒绝 `RUN_CONCURRENCY_LIMIT`：`scope`（global / workspace）、`reason`（global-full / workspace-full / queue-full / queue-timeout）、`active` / `max` / `limits` / `retryAfterMs`；带 `Retry-After`。排队中的 run 在详情里以派生字段 `admission` 暴露位置，run.json 仍是 pending |
 | 413 | 请求体超限（可读文案，不断连） |
 | 503 | 拿不到宿主 `connection` 服务时 fail-closed |
 

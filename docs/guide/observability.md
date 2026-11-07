@@ -16,6 +16,10 @@
 - **返工账本不缩水**：上一轮报过 10 条验收、这一轮只报 1 条不算「1/1 全过」；上一轮出现过、本轮没有复判为通过的标识一律计入未复判，指标降 `unknown`（测试套件、规则集同样）。改报「跳过」也洗不白。
 - **模型自述的证据不接受**：`provenance=model-claim` 必须对得上 `artifact/write` 的 path + sha256 且文件真实存在，对不上就降级成「未检测」。
 
+- **权威 vs 自报**：模型自报的通过率仍展示，但主结论只认权威来源。引擎自己生成的兜底报告（`extra.generatedReport`）只算 `claimed`；宿主检查（节点 `check`）写出的事件算 `authoritative`。summary 的 `claimedPassed / authoritativePassed / authorityCoverage` 就是两列数字，抽屉顶部并列显示，缺字段显示 unknown。
+- **外部未验证**：外部通道追加的观测事件在时间线与导出里带「外部未验证」，不计入权威通过数、冲突索引与质量结论。
+- **宿主检查**：节点运行详情能看到 `check/form`（`executor=host`）与 `producer=host` 的执行记录 / 报告副本；agent 报 pass 而宿主检查失败时，节点仍 passed，但质量结论为 fail。
+
 `summary` 还会带 `computedAt` 与 `eventCount`，用来判断数据是否过期；长跑或事件窗口被截断时，客户端靠 `progress.nodes`（每节点 `attemptId / status / endSeq / invalidated`）而不是计数恢复画面。
 
 ## 运行日志抽屉

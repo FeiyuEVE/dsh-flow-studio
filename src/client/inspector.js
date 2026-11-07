@@ -371,6 +371,62 @@ function NodeForm({ node, flow, skills, skillsOpen = false, onPatch, onDelete, o
           ],
           onChange: mode => onPatch({ mode }),
         })),
+        // 0.11 · R5：宿主检查命令（可选）。只有保存的流程里显式配置才会执行；
+        // 命令原文随流程保存，运行期由宿主 spawn，不走模型提示词。
+        h(Field, {
+          label: '宿主检查（可选）',
+          hint: '节点收口后宿主真跑一次；结果只影响质量结论，不改 agent verdict',
+        },
+          h('div', { className: 'fs-check-editor' },
+            h('input', {
+              className: 'fs-input',
+              placeholder: '例如：npm test（不填 = 不检查）',
+              value: node.check && typeof node.check.command === 'string' ? node.check.command : '',
+              maxLength: 2000,
+              'aria-label': '宿主检查命令',
+              onChange: event => {
+                const command = event.target.value
+                if (command.trim() === '') onPatch({ check: undefined })
+                else onPatch({ check: { ...(node.check && typeof node.check === 'object' ? node.check : {}), command } })
+              },
+            }),
+            h('div', { className: 'fs-check-row' },
+              h('label', null, '期望退出码',
+                h('input', {
+                  className: 'fs-input sm',
+                  type: 'number',
+                  min: 0,
+                  max: 255,
+                  value: node.check && Number.isInteger(node.check.expectExitCode) ? node.check.expectExitCode : 0,
+                  onChange: event => {
+                    const value = event.target.value === '' ? '' : Number(event.target.value)
+                    onPatch({ check: { ...(node.check || {}), expectExitCode: value } })
+                  },
+                })),
+              h('label', null, '报告路径（可选）',
+                h('input', {
+                  className: 'fs-input sm',
+                  placeholder: 'reports/unit.json',
+                  value: node.check && typeof node.check.reportPath === 'string' ? node.check.reportPath : '',
+                  maxLength: 512,
+                  onChange: event => onPatch({ check: { ...(node.check || {}), reportPath: event.target.value } }),
+                })),
+              h('label', null, '超时 ms',
+                h('input', {
+                  className: 'fs-input sm',
+                  type: 'number',
+                  min: 1000,
+                  max: 1800000,
+                  value: node.check && Number.isInteger(node.check.timeoutMs) ? node.check.timeoutMs : 600000,
+                  onChange: event => onPatch({ check: { ...(node.check || {}), timeoutMs: Number(event.target.value) } }),
+                }))),
+            h('div', { className: 'fs-check-hint' },
+              '需要部署方开启 FLOW_STUDIO_ALLOW_HOST_CHECKS=1；未开启时含检查的流程启动会被拒绝。',
+              h('button', {
+                type: 'button',
+                className: 'fs-btn ghost sm',
+                onClick: () => onPatch({ check: undefined }),
+              }, '清除检查')))),
         h(Field, { label: '角色定位', hint: '它是什么人' },
           h('textarea', {
             className: 'fs-textarea',

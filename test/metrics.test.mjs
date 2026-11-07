@@ -281,8 +281,9 @@ function rawEvent(kind, runId, over = {}) {
  * reject/trigger）只能由引擎 / 运行时内部推进，HTTP `/events` 是观测类白名单。
  * 测试播种改走内部路径 `store.appendEvents` —— 与路由最终调用的实现同一条
  * （同一套归一化 / 进度计数 / run.json 写盘），聚合口径与断言全部不变。
- * 纯观测类事件（acceptance/verdict、artifact/write、review/*、agent/message…）
- * 仍然走 HTTP `/events`，外部通道能力照旧有覆盖。
+ * R4/S3 之后 HTTP `/events` 会强制盖 `external/unverified` 章，所以需要进入权威聚合的
+ * 证据类事件（acceptance/verdict、artifact/write、review/*）也走内部通道；
+ * HTTP 外部通道的能力仍由 E3-b 单独覆盖。
  */
 async function seedEvents(runId, events) {
   return store.appendEvents(runsRoot, runId, events)
@@ -398,7 +399,7 @@ await check('summary 声明 eventCount / truncated，并带 findings.byNode（§
   await seedEvents(meta.id, [
     rawEvent('node/end', meta.id, { nodeId: 'n_a', data: { status: 'passed', durationMs: 1 } }),
   ])
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('review/finding', meta.id, { nodeId: 'n_a', data: { id: 'f1', severity: 'P1', title: '问题', status: 'open' } }),
     rawEvent('review/verdict', meta.id, { nodeId: 'n_a', data: { verdict: 'approve', findingCount: 1 } }),
   ])
@@ -497,7 +498,7 @@ await check('summary 在纯函数层也能独立复算（quality 与 HTTP 同一
 
 await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘要同口径', async () => {
   const meta = await makeRun(2)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('acceptance/verdict', meta.id, {
       nodeId: 'n_a', data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'artifacts/acc.md' },
     }),
@@ -516,7 +517,8 @@ await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘
 
 await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ acceptance unknown', async () => {
   const meta = await makeRun(1)
-  const append = events => call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, events)
+  // 模型自述证据是「内部证据」，走内部 append 通道；外部 /events 现在会盖 external 章。
+  const append = events => seedEvents(meta.id, events)
   // 模型自述：引用了一个根本不存在的文件。
   await append([{
     ...rawEvent('acceptance/verdict', meta.id, {
@@ -600,7 +602,7 @@ await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全�
 
 await check('§13.7 跨节点重复 itemId → acceptance unknown 且返回 conflicts', async () => {
   const meta = await makeRun(2)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('acceptance/verdict', meta.id, {
       nodeId: 'n_a', data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'a.md' },
     }),

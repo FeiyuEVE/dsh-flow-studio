@@ -698,6 +698,17 @@ function failureOf(error, { action, extra = {} }) {
       extra,
     )
   }
+  if (status === 429) {
+    // 0.11 · R2/S1：并发配额拒绝是可重试的排队/限额问题，不能吞成 500 或 409。
+    return failure(message, `${action}失败：并发配额已满（429，${error && error.reason ? error.reason : 'global-full'}），等已有 run 收尾后重试；不要循环重试刷屏。`, true, {
+      ...extra,
+      code: error && error.code ? error.code : 'RUN_CONCURRENCY_LIMIT',
+      scope: error && error.scope ? error.scope : null,
+      reason: error && error.reason ? error.reason : null,
+      retryAfterMs: error && Number.isInteger(error.retryAfterMs) ? error.retryAfterMs : 30000,
+      ...(error && error.limits ? { limits: error.limits } : {}),
+    })
+  }
   if (status === 400) {
     return failure(message, `${action}失败：参数或流程不合法，改正后再试；重发同一份请求不会变。`, false, extra)
   }

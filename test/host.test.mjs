@@ -2017,6 +2017,120 @@ await check('health 报出目录与 schema 版本（已通过 connection 鉴权�
   assert.ok(result.json.runsDir.includes('runs'))
 })
 
+// ---------------------------------------------------------------------------
+// 0.11 · R2/S1：并发配额 429 映射（HTTP payload / Retry-After / 详情 admission）
+// ---------------------------------------------------------------------------
+await check('R2：启动被配额拒绝 → 429 结构化 payload + Retry-After，run 仍 pending，详情带 admission', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  const error = new Error('并发配额已满（global-full）：活动 4 / 上限 4')
+  Object.assign(error, {
+    status: 429,
+    code: 'RUN_CONCURRENCY_LIMIT',
+    scope: 'global',
+    reason: 'global-full',
+    active: 4,
+    max: 4,
+    retryAfterMs: 30000,
+    limits: { global: 4, perWorkspace: 2 },
+  })
+  const fakeEngine = {
+    engineName: 'real',
+    async start() { throw error },
+    async stop() { return {} },
+    admissionOf(id) {
+      return id === run.id
+        ? { state: 'queued', queuedAt: '2026-11-07T00:00:00.000Z', position: 1, timeoutMs: 15000 }
+        : null
+    },
+    supervision: {
+      register() { return { enabled: true } },
+      unregister() { return true },
+      status() { return { enabled: true, nextDueAt: null, wakes: 0, failures: 0, lastReason: null } },
+    },
+  }
+  const handler = { handler: createHandler({
+    dir: store.flowsDir(home), runsRoot, ctx, engine: fakeEngine, startOptions: new Map(),
+  }) }
+  const started = await call(handler, 'POST', `/api/flow-studio/runs/${run.id}/start`, {
+    workspace: makeWorkspace('quota'),
+  })
+  assert.equal(started.status, 429, JSON.stringify(started.json))
+  assert.equal(started.json.code, 'RUN_CONCURRENCY_LIMIT')
+  assert.equal(started.json.scope, 'global')
+  assert.equal(started.json.reason, 'global-full')
+  assert.equal(started.json.active, 4)
+  assert.equal(started.json.max, 4)
+  assert.equal(started.json.retryAfterMs, 30000)
+  assert.deepEqual(started.json.limits, { global: 4, perWorkspace: 2 })
+  assert.equal(started.headers['retry-after'], '30', '必须带 Retry-After')
+  assert.equal((await runstore.readRunMeta(runsRoot, run.id)).status, 'pending', '排队/拒绝不能把 run 写成 running')
+  const detail = await call(handler, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.deepEqual(detail.json.run.admission, {
+    state: 'queued', queuedAt: '2026-11-07T00:00:00.000Z', position: 1, timeoutMs: 15000,
+  }, '详情动态合并 admission，run.json 仍 pending')
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 · R4/S3：外部 POST /events 强制盖 external/unverified，不能伪造质量结论
+// ---------------------------------------------------------------------------
+await check('R4/S3：外部假 pass 被标 external/unverified，质量 headline 不变', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  // 内部证据走 runstore（宿主路径），不经外部通道。
+  await runstore.appendEvents(runsRoot, run.id, [{
+    v: 1,
+    kind: 'test/report',
+    nodeId: 'n_internal',
+    attemptId: 1,
+    traceId: 'tr-internal',
+    data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0 },
+  }])
+  const before = (await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)).json.summary
+  const posted = await call(route, 'POST', `/api/flow-studio/runs/${run.id}/events`, [
+    {
+      v: 1,
+      runId: run.id,
+      kind: 'test/report',
+      nodeId: 'n_evil',
+      attemptId: 1,
+      traceId: 'tr-evil-1',
+      // 来客自带授信元数据：必须被剥离 / 覆盖。
+      extra: { producer: 'host', authority: 'host', source: 'internal', terminalScope: 'run' },
+      data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0 },
+    },
+    { v: 1, runId: run.id, kind: 'review/verdict', nodeId: 'n_evil', attemptId: 1, traceId: 'tr-evil-2', data: { verdict: 'approve', findingCount: 0 } },
+    {
+      v: 1,
+      runId: run.id,
+      kind: 'check/form',
+      nodeId: 'n_evil',
+      attemptId: 1,
+      traceId: 'tr-evil-3',
+      data: { ruleSetId: 'host:n_evil', ruleSetVersion: '0.11', executor: 'host', state: 'pass', passedChecks: 1, totalChecks: 1, executedAt: '2026-11-07T00:00:00.000Z' },
+    },
+  ])
+  assert.equal(posted.status, 200, JSON.stringify(posted.json))
+  for (const event of posted.json.events) {
+    assert.equal(event.extra.source, 'external', `${event.kind} 必须强制 source=external`)
+    assert.equal(event.extra.producer, 'external', `${event.kind} 必须强制 producer=external`)
+    assert.equal(event.extra.authority, 'unverified')
+    assert.equal(event.extra.terminalScope, undefined, '受保护的 terminalScope 必须被剥离')
+  }
+  const after = (await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)).json.summary
+  assert.equal(after.quality.state, before.quality.state, '外部假 pass 不得改变质量 headline')
+  assert.equal(after.quality.evidence.tests.state, before.quality.evidence.tests.state, '外部同 suite 不得覆盖内部证据')
+  assert.equal(after.quality.evidence.checks.state, before.quality.evidence.checks.state, '外部假 host check 不得进入权威检查')
+  assert.ok(after.externalCount >= 3, '外部观察仍保留并有计数')
+  const exported = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exported.status, 200)
+  assert.match(exported.body, /外部观察|外部未验证/, '导出必须保留外部观察附录并标明未验证')
+})
+
 for (const dir of workspaceDirs) rmSync(dir, { recursive: true, force: true })
 rmSync(home, { recursive: true, force: true })
 console.log(`\n${checks} 组通过`)

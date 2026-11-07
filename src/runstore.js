@@ -1975,6 +1975,81 @@ export async function releaseLease(runsRoot, runId, options = {}) {
 }
 
 /**
+ * R1/E1：失权 epoch 的存储专用收口（0.11）。
+ *
+ * 引擎续租拿到 409 = 确知本实例已不是该 run 的执行者。此时旧实例**不能**再走普通的
+ * `appendEvents` 收尾（那会与接管者抢写），只能调用这里：以幂等键确认本 epoch 是否
+ * 已经收口过，未收口才追加**唯一**一条 `run/end failed`（reason 含 `lease-lost`、
+ * `extra.code='LEASE_LOST'`、`extra.terminalScope='run'`）。
+ *
+ * 幂等实现：按 `extra.idempotencyKey` 扫描已落盘事件；JSONL 是追加事实日志，不重写
+ * 历史行。run 已经是终态时直接返回 `idempotent:true`（不重复追加、不覆盖接管者终态）。
+ *
+ * 边界：本函数不负责「接管者仍在跑时只记 instance 事实」的完整跨进程投影（那需要
+ * 持久 epoch + 读端统一投影，见 docs/plan/0.11-方案.md §3.3）；本实现覆盖同一进程
+ * 内的失权收口与幂等重试，跨进程接管检测由租约 409 本身保证。
+ *
+ * @param {string} runsRoot
+ * @param {string} runId
+ * @param {{ cause?: string, reason?: string, expectedEpoch?: string|number, ownerId?: string,
+ *   idempotencyKey?: string, now?: Date }} [options]
+ * @returns {Promise<{ ok: boolean, appended: boolean, idempotent: boolean, event?: object, status?: string }>}
+ */
+export async function finalizeEpoch(runsRoot, runId, options = {}) {
+  const loc = requireLoc(runsRoot, runId)
+  const now = options.now instanceof Date && !Number.isNaN(options.now.getTime()) ? options.now : new Date()
+  const expectedEpoch = typeof options.expectedEpoch === 'string'
+    ? options.expectedEpoch
+    : (Number.isInteger(options.expectedEpoch) ? String(options.expectedEpoch) : '')
+  const ownerId = typeof options.ownerId === 'string' && options.ownerId !== '' ? options.ownerId : ''
+  const idempotencyKey = typeof options.idempotencyKey === 'string' && options.idempotencyKey !== ''
+    ? options.idempotencyKey
+    : `loss:${expectedEpoch || 'unknown'}`
+  const reason = (typeof options.reason === 'string' && options.reason.trim() !== ''
+    ? options.reason
+    : 'lease-lost：执行租约已被其它实例接管 / 释放，本实例停止写入').slice(0, 2000)
+
+  const all = await readAllEvents(runsRoot, runId)
+  if (!all) throw new RunError(404, 'runId', 'run 不存在')
+  const existing = all.events.filter(event => event && event.kind === 'run/end'
+    && event.extra && event.extra.idempotencyKey === idempotencyKey)
+  if (existing.length > 0) {
+    return { ok: true, appended: false, idempotent: true, event: existing[existing.length - 1] }
+  }
+  if (all.meta && TERMINAL_STATUS.has(all.meta.status)) {
+    // 接管者 / 旧路径已经写了终态：不覆盖，只报告幂等。
+    return { ok: true, appended: false, idempotent: true, status: all.meta.status }
+  }
+
+  const event = {
+    v: 1,
+    ts: now.toISOString(),
+    runId: loc.id,
+    memberId: null,
+    kind: 'run/end',
+    traceId: `tr-${String(loc.id).slice(0, 80)}-run`,
+    data: { status: 'failed', reason },
+    extra: {
+      code: 'LEASE_LOST',
+      leaseLost: true,
+      terminalScope: 'run',
+      cause: typeof options.cause === 'string' && options.cause !== '' ? options.cause : 'lease-lost',
+      idempotencyKey,
+      ...(expectedEpoch !== '' ? { leaseEpoch: expectedEpoch } : {}),
+      ...(ownerId !== '' ? { ownerId } : {}),
+    },
+  }
+  const appended = await appendEvents(runsRoot, runId, [event], { now })
+  return {
+    ok: true,
+    appended: true,
+    idempotent: false,
+    event: appended.events[0] || event,
+    status: 'failed',
+  }
+}
+
+/**
  * 启动清理时「多大的 `*.tmp-*` 才算遗留」：默认只删 60 秒之前的。
  *
  * 原子写的临时文件生命周期是**毫秒级**（write → rename），所以 60 秒还没消失的

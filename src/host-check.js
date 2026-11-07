@@ -27,9 +27,9 @@
  *   durationMs: number, truncated: boolean, outputTail: string,
  *   receivedBytes: number,
  *   reportPath: string|null,          // 保存配置里的相对路径（不回显绝对路径）
- *   reportSha256: string|null,        // 绑定下面这份持久化副本字节
- *   reportBytes: Buffer|null,         // 报告字节的**独立副本**（可直接写进私有目录）
- *   reportByteLength: number,         // 副本字节数（方便只想要数字的调用方）
+ *   reportSha256: string|null,        // 绑定下面这份**已脱敏**最终副本字节（F3）
+ *   reportBytes: Buffer|null,         // 报告字节的**已脱敏独立副本**（可直接写进公开目录）
+ *   reportByteLength: number,         // 最终副本字节数（脱敏后长度）
  *   killScope: 'group'|'process'|null, orphanWarning: string|null,
  *   startedAt: string, finishedAt: string, message: string|null,
  * }
@@ -150,6 +150,36 @@ function decodeOutputTail(buffer, redact) {
   let text = buffer.toString('utf8').replace(/^\uFFFD+/, '')
   text = applyRedact(text, redact)
   return tailBytes(text, OUTPUT_TAIL_BYTES)
+}
+
+/**
+ * 0.11 · F3：公开报告副本的脱敏 + 最终副本 hash。
+ *
+ * 报告原文件不可信（可能带 `token=canary`），本函数只在内存里处理独立副本：
+ *   1. 只有能无损 UTF-8 往返的报告才按文本脱敏；二进制/非法 UTF-8 原样保留，
+ *      避免把非文本报告改坏（脱敏规则只针对文本凭据）；
+ *   2. 脱敏后的副本若与原文不同，**先**重新编码成最终副本，**再**对这份最终
+ *      字节算 sha256 / 长度（顺序反了会得到源文件 hash，验证器会判不符）；
+ *   3. 不写回原文件，保留调用方 cwd 里的原始报告。
+ *
+ * @param {Buffer|null} buffer 报告采集到的独立字节副本
+ * @param {(text: string) => string} [redact]
+ * @returns {{ buffer: Buffer|null, sha256: string|null, bytes: number }}
+ */
+function redactReportCopy(buffer, redact) {
+  if (!Buffer.isBuffer(buffer)) return { buffer: null, sha256: null, bytes: 0 }
+  const finalize = (bytes) => ({
+    buffer: bytes,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    bytes: bytes.length,
+  })
+  if (buffer.length === 0) return finalize(buffer)
+  const text = buffer.toString('utf8')
+  // 有损解码（二进制 / 非法 UTF-8）不做文本脱敏，否则会静默改坏报告字节。
+  if (!Buffer.from(text, 'utf8').equals(buffer)) return finalize(buffer)
+  const redacted = applyRedact(text, redact)
+  if (redacted === text) return finalize(buffer)
+  return finalize(Buffer.from(redacted, 'utf8'))
 }
 
 /** 单行消息的兜底长度，避免把整段 stderr / 异常栈塞进结果。 */
@@ -748,11 +778,13 @@ export async function runHostCheck(options = {}) {
         })
         return
       }
+      // F3：公开副本先脱敏，再按最终字节算 hash；哈希与副本必须一一对应。
+      const publicReport = redactReportCopy(postReport.buffer, redact)
       finish(HOST_CHECK_STATE.PASS, null, {
         exitCode,
-        reportSha256: postReport.sha256,
-        reportBytes: postReport.buffer,
-        reportByteLength: postReport.bytes,
+        reportSha256: publicReport.sha256,
+        reportBytes: publicReport.buffer,
+        reportByteLength: publicReport.bytes,
       })
     }
 

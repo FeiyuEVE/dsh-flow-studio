@@ -415,7 +415,13 @@ function clipBytes(value, maxBytes) {
  * @returns {string}
  */
 export function redactArguments(raw) {
-  let text = typeof raw === 'string' ? raw : String(raw ?? '')
+  const text = typeof raw === 'string' ? raw : String(raw ?? '')
+  return redactArgumentsText(text)
+}
+
+/** `redactArguments` 的实现体（拆出来便于宿主检查摘要复用，导出 API 不变）。 */
+function redactArgumentsText(value) {
+  let text = value
   // 1) Authorization: Bearer <token>
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi, 'Bearer [REDACTED]')
   // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
@@ -423,14 +429,25 @@ export function redactArguments(raw) {
   // 3) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
   text = text.replace(
     /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
-    (match, prefix, value) => {
-      if (/^Bearer$/i.test(String(value).replace(/["']/g, ''))) return match
+    (match, prefix, tokenValue) => {
+      if (/^Bearer$/i.test(String(tokenValue).replace(/["']/g, ''))) return match
       return `${prefix}"[REDACTED]"`
     },
   )
   // 4) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
   text = text.replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
   return text
+}
+
+/**
+ * 0.11 · F3：公开执行记录里的命令摘要必须先脱敏再截断，凭据不得随摘要进 JSON。
+ * 命令 digest 仍对**精确命令字节**计算（校验身份），只有可读摘要脱敏。
+ * @param {unknown} command
+ * @returns {string}
+ */
+export function summarizeHostCheckCommand(command) {
+  const safe = redactArguments(command)
+  return safe.length > 200 ? `${safe.slice(0, 197)}...` : safe
 }
 
 /** §8.2：agent/message 文本上限（码点）。 */
@@ -6660,6 +6677,8 @@ class FlowEngine {
         cwd: this._hostCheckCwd(),
         signal: this.active ? this.active.controller.signal : undefined,
         now: () => this.now().getTime(),
+        // F3：公开输出（outputTail / 报告副本）复用同一套凭据脱敏规则。
+        redact: redactArguments,
       })
     } catch (error) {
       this.log('error', `flow-studio: 宿主检查启动失败（${node.id}#${attempt}）：${error && error.message ? error.message : String(error)}`)
@@ -6697,7 +6716,8 @@ class FlowEngine {
       attempt,
       checkId: `host:${node.id}`,
       commandDigest: createHash('sha256').update(command, 'utf8').digest('hex'),
-      commandSummary: command.length > 200 ? `${command.slice(0, 197)}...` : command,
+      // F3：公开 JSON 只放脱敏后的摘要；digest 仍对精确命令字节计算。
+      commandSummary: summarizeHostCheckCommand(command),
       expectedExitCode: verification.expectedExitCode,
       exitCode: verification.exitCode,
       startedAt: verification.startedAt,

@@ -1539,13 +1539,15 @@ function isGeneratedReportClaim(event) {
 
 /**
  * 指标层的权威计数（§8）：分母是「应验条目数」，缺分母时 coverageRatio 为 null。
- * @param {{ claimedPassed: number, authoritativePassed: number, denominator: number|null }} values
+ * @param {{ claimedPassed: number, authoritativePassed: number, legacyPassed?: number, denominator: number|null }} values
  */
-function authorityFields({ claimedPassed, authoritativePassed, denominator }) {
+function authorityFields({ claimedPassed, authoritativePassed, legacyPassed = 0, denominator }) {
   const total = Number.isInteger(denominator) && denominator > 0 ? denominator : null
   return {
     claimedPassed,
     authoritativePassed,
+    // 0.11 F4：旧事件来源未知（legacy），保留「声明通过」计数但绝不计入权威。
+    legacyPassed,
     authoritativeTotal: total,
     coverageRatio: total === null ? null : authoritativePassed / total,
   }
@@ -1678,14 +1680,17 @@ export function computeAcceptance(events = [], options = {}) {
   let selfCertified = 0
   let claimedPassed = 0
   let authoritativePassed = 0
+  let legacyPassed = 0
   let generatedReport = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
   const generatedReportRefs = []
   const countPass = (data, event) => {
     passed += 1
-    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
-    else authoritativePassed += 1
+    const source = classifyEvidenceAuthority(event, options)
+    if (source === 'host') authoritativePassed += 1
+    else if (source === 'legacy') legacyPassed += 1
+    else claimedPassed += 1
     if (classifyEvidenceLevel(event, data.evidenceRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(data.itemId)
@@ -1694,6 +1699,7 @@ export function computeAcceptance(events = [], options = {}) {
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
+    legacyPassed,
     denominator: latest.size,
   })
   for (const { data, event } of latest.values()) {
@@ -1848,6 +1854,7 @@ export function computeTests(events = [], options = {}) {
   let selfCertified = 0
   let claimedPassed = 0
   let authoritativePassed = 0
+  let legacyPassed = 0
   let generatedReport = 0
   const unverifiedRefs = []
   const selfCertifiedRefs = []
@@ -1855,8 +1862,10 @@ export function computeTests(events = [], options = {}) {
   const suites = []
   const countPass = (suite, data, event) => {
     passedSuites += 1
-    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
-    else authoritativePassed += 1
+    const source = classifyEvidenceAuthority(event, options)
+    if (source === 'host') authoritativePassed += 1
+    else if (source === 'legacy') legacyPassed += 1
+    else claimedPassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(suite)
@@ -1866,6 +1875,7 @@ export function computeTests(events = [], options = {}) {
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
+    legacyPassed,
     denominator: latest.size,
   })
   for (const [suite, { data, event }] of latest) {
@@ -2007,6 +2017,7 @@ function checkEvidence(events, options = {}) {
   let selfCertified = 0
   let claimedPassed = 0
   let authoritativePassed = 0
+  let legacyPassed = 0
   let generatedReport = 0
   let unverifiedHost = 0
   const unverifiedRefs = []
@@ -2030,8 +2041,10 @@ function checkEvidence(events, options = {}) {
   }
   const countPass = (ruleSetId, data, event) => {
     passed += 1
-    if (classifyEvidenceAuthority(event, options) === 'model-claim') claimedPassed += 1
-    else authoritativePassed += 1
+    const source = classifyEvidenceAuthority(event, options)
+    if (source === 'host') authoritativePassed += 1
+    else if (source === 'legacy') legacyPassed += 1
+    else claimedPassed += 1
     if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
       selfCertified += 1
       selfCertifiedRefs.push(ruleSetId)
@@ -2040,6 +2053,7 @@ function checkEvidence(events, options = {}) {
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
+    legacyPassed,
     denominator: applicable,
   })
   for (const [ruleSetId, { data, event }] of latest) {
@@ -2480,6 +2494,8 @@ export function computeQuality(events = [], options = {}) {
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0), 0)
   const authoritativePassed = authorityMetrics
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].authoritativePassed) ? evidence[key].authoritativePassed : 0), 0)
+  const legacyPassed = authorityMetrics
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].legacyPassed) ? evidence[key].legacyPassed : 0), 0)
   const authoritativeTotal = authorityMetrics
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].authoritativeTotal) ? evidence[key].authoritativeTotal : 0), 0)
   const authorityCoverage = authoritativeTotal > 0 ? authoritativePassed / authoritativeTotal : null
@@ -2488,6 +2504,11 @@ export function computeQuality(events = [], options = {}) {
     (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0) > 0
     && (Number.isInteger(evidence[key].authoritativePassed) ? evidence[key].authoritativePassed : 0) === 0
   ))
+  // F4（返工）：旧实现只在「三项全 claimed-only」时降权，导致一个真 host check 就能
+  // 让另外两项 claimed pass 免于降权。现在任一条 claimed 通过都不算权威，不论别处
+  // 有没有 host；纯 legacy 旧 run（没有任何新来源）保留旧版 quality 判定以兼容历史，
+  // 但 legacy 权威计数已归零、coverage 反映真实覆盖。
+  const unverifiedMix = claimedPassed > 0
   const acceptedRate = findings.acceptedRate
   const goodRework = reworkRounds === 1 && p1Unresolved === 0 && p2Unresolved === 0
     && acceptedRate !== null && acceptedRate >= 0.6
@@ -2538,6 +2559,11 @@ export function computeQuality(events = [], options = {}) {
     state = 'unknown'
     label = `证据不足：三项指标只有模型自报（claimed ${claimedPassed} 条），缺独立证据，不能判定为通过`
   }
+  // F4（返工）：host 与 claimed 混合时，claimed 项同样不能免于降权。
+  if (unverifiedMix && state !== 'fail' && state !== 'unknown') {
+    state = 'unknown'
+    label = `证据不足：${claimedPassed} 条 claimed 通过未获宿主独立验证，不能判定为通过`
+  }
 
   const engine = options.engine === 'stub' ? 'stub' : 'real'
   const conflictList = hasConflicts(conflicts) ? conflicts : null
@@ -2557,6 +2583,7 @@ export function computeQuality(events = [], options = {}) {
       selfCertified,
       claimedPassed,
       authoritativePassed,
+      legacyPassed,
       authoritativeTotal,
       authorityCoverage,
       engine,
@@ -2579,6 +2606,7 @@ export function computeQuality(events = [], options = {}) {
     selfCertified,
     claimedPassed,
     authoritativePassed,
+    legacyPassed,
     authoritativeTotal,
     authorityCoverage,
     engine,

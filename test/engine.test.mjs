@@ -12,6 +12,7 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -5895,6 +5896,56 @@ try {
       A.equal(startEvent.data.worktreeReason, 'disabled-by-initiator', 'run/start.data 里也能看出是用户主动关闭')
     } finally {
       rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  // 0.11 F3：公开执行记录 / 报告副本先脱敏，再按最终副本算 hash。
+  await check('F3：宿主检查的 commandSummary 与报告副本脱敏，reportSha256 绑定最终副本', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const canary = 'canary-hostcheck-1c9e'
+      const workspace = join(home, 'ws-hostcheck-redact')
+      mkdirSync(workspace, { recursive: true })
+      const rawReport = `{"token":"${canary}"}`
+      const command = `printf '%s' '${rawReport}' > report.json`
+      const flow = flowOf('flow-hostcheck-redact', [
+        startNode(),
+        stage('n_hc_redact', '实现', 300, { check: { command, expectExitCode: 0, reportPath: 'report.json' } }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_hc_redact'),
+        next('e2', 'n_hc_redact', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-hostcheck-redact', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const events = await eventsOf(run.id)
+      const hostWrites = events.filter(event => event.kind === 'artifact/write'
+        && event.extra && event.extra.producer === 'host')
+      const reportWrite = hostWrites.find(event => /-report\./.test(event.data.path))
+      const recordWrite = hostWrites.find(event => /host-check-hc-[0-9a-f]+\.json$/.test(event.data.path)
+        && !/-report\./.test(event.data.path))
+      A.ok(Boolean(reportWrite), '必须落盘报告副本')
+      A.ok(Boolean(recordWrite), '必须落盘执行记录')
+      const readRel = rel => readFileSync(join(runsRoot, run.id, rel), 'utf8')
+      const reportText = readRel(reportWrite.data.path)
+      const recordText = readRel(recordWrite.data.path)
+      A.equal(reportText.includes(canary), false, '报告副本不得含原始 token')
+      A.ok(reportText.includes('[REDACTED]'), '报告副本必须保留 [REDACTED] 标记')
+      A.equal(recordText.includes(canary), false, '执行记录（含 commandSummary）不得含原始 token')
+      A.ok(recordText.includes('[REDACTED]'), '执行记录必须保留 [REDACTED] 标记')
+
+      const record = JSON.parse(recordText)
+      const finalSha = createHash('sha256').update(Buffer.from(reportText, 'utf8')).digest('hex')
+      A.equal(record.reportSha256, finalSha, 'reportSha256 必须绑定脱敏后的最终副本')
+      A.equal(record.reportBytes, Buffer.byteLength(reportText))
+      A.equal(readFileSync(join(workspace, 'report.json'), 'utf8'), rawReport, '不写回源报告')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
   })
 

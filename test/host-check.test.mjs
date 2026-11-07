@@ -121,6 +121,31 @@ await check('reportPath：本次新建报告 → pass，sha256 / 字节副本正
   assert.equal(result.reportSha256, expected)
 })
 
+await check('F3 reportPath：公开报告副本先脱敏、再按最终副本算 hash（token canary 不外泄）', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-report-7f3a'
+  const raw = `{"token":"${canary}","note":"token=${canary}"}`
+  const result = await runHostCheck({
+    check: {
+      command: `mkdir -p reports && printf '%s' '${raw}' > reports/secret.json`,
+      reportPath: 'reports/secret.json',
+    },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes.toString('utf8')
+  assert.doesNotMatch(copy, /canary-report-7f3a/, '公开副本不得包含报告里的原始凭据')
+  assert.match(copy, /\[REDACTED\]/, '命中凭据规则的片段必须替换为 [REDACTED]')
+  assert.equal(result.reportByteLength, Buffer.byteLength(copy), '长度必须对最终副本计算')
+  assert.equal(
+    result.reportSha256,
+    createHash('sha256').update(copy).digest('hex'),
+    'hash 必须绑定脱敏后的最终副本（顺序不能反）',
+  )
+  // 副本语义：只脱敏内存副本，不写回调用方 cwd 的原始报告。
+  assert.equal(readFileSync(join(dir, 'reports/secret.json'), 'utf8'), raw)
+})
+
 await check('reportPath：执行前已存在且未更新 → fail / HOST_CHECK_REPORT_STALE', async () => {
   const dir = freshCwd()
   mkdirSync(join(dir, 'reports'))

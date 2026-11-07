@@ -4055,6 +4055,30 @@ try {
     A.equal(raw.workspace, undefined, 'run.json 不写入伪造的工作区绑定')
   })
 
+  await check('N2（复核阻断）：start 在 claim 之后失败时按同一世代释放租约（不留无法接管的锁）', async () => {
+    const flow = flowOf('flow-n2-release', [startNode(), stage('n_n2rel', '节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_n2rel'),
+      next('e2', 'n_n2rel', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-n2-release', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, activate: async () => passResult('n_n2rel') })
+    // 让 claim 之后的 run/start 写入失败：flowSnapshot 不经过 normalizeFlow，用超长流程名
+    // 把单条事件撑过 8KB 上限。失败点正好在 claimLease 之后、4451 的释放路径之前。
+    const oversized = { ...flow, name: '超长流程名'.repeat(2000) }
+    await assert.rejects(
+      () => engine.start(run.id, { flowSnapshot: oversized }),
+      error => error && error.status === 400,
+      '超长 run/start 事件必须 400',
+    )
+    const lockPath = join(runsRoot, run.id, 'lock.json')
+    A.equal(existsSync(lockPath), false, 'start 失败必须按 claim 的世代释放租约，不能留下锁')
+    const after = await store.readRunMeta(runsRoot, run.id)
+    A.equal(after.status, 'failed', '已迁移到 running 的 run 必须尽量写回 failed')
+    A.ok(after.execution && after.execution.state === 'active', '释放租约不覆盖持久世代（便于事后核对）')
+    A.equal(engine.active, null, '失败的 start 必须释放实例占位')
+  })
+
   await check('C3：stub 引擎不绑定工作区（不建真实会话）→ start 照常跑完，不伪造 workspace', async () => {
     const flow = flowOf('flow-stubws', [startNode(), stage('n_stubws', '节点', 300), endNode()], [
       next('e1', 'n_start', 'n_stubws'),

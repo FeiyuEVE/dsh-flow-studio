@@ -4448,7 +4448,17 @@ class FlowEngine {
         await writeRunMeta(this.runsRoot, runId, { status: 'failed' }).catch(() => {})
       }
       if (active.lease && typeof runstoreModule.releaseLease === 'function') {
-        await runstoreModule.releaseLease(this.runsRoot, runId).catch(() => {})
+        // 0.11 N2（复核阻断）：必须带 claim 产出的同一份世代（ownerId + epoch）释放。
+        // 不带世代的 release 会被 runstore 按「无法证明持权」409 拒绝——失败的 start 就会
+        // 留下一个有 lock.json、但谁也接管不了的 run。
+        const lease = active.lease && typeof active.lease === 'object' ? active.lease : null
+        const fence = lease && typeof lease.ownerId === 'string' && lease.ownerId !== ''
+          ? {
+            ownerId: lease.ownerId,
+            ...(Number.isInteger(lease.epoch) ? { leaseEpoch: lease.epoch } : {}),
+          }
+          : {}
+        await runstoreModule.releaseLease(this.runsRoot, runId, fence).catch(() => {})
       }
       if (this.active === active) await this._cleanupActive()
       throw error

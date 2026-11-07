@@ -643,13 +643,49 @@ await check('§13.7 flow 目录 0700、flow 文件 0600（与 run 日志同口�
 await check('§13.3 DELETE /runs/<id> 在持有租约时 409', async () => {
   const runsRoot = runstore.runsDir(home)
   const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 0 })
-  await runstore.claimLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  const ownerId = 'route-lease-owner'
+  await runstore.claimLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ownerId, ttlMs: 60_000 })
   const blocked = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
   assert.equal(blocked.status, 409)
   assert.match(blocked.json.error, /租约/)
-  await runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host' })
+  await runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ownerId })
   const deleted = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
   assert.equal(deleted.status, 200)
+})
+
+await check('N2（复核阻断）：不带 ownerId 的 renew / release 必须 409，租约与心跳不被改写', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 0 })
+  const ownerId = 'route-owner'
+  const t0 = new Date('2026-11-06T12:00:00.000Z')
+  await runstore.claimLease(runsRoot, run.id, {
+    pid: 4242, host: 'probe-host', ownerId, ttlMs: 60_000, now: t0,
+  })
+  const lockPath = join(runsRoot, run.id, 'lock.json')
+  const locked = readFileSync(lockPath, 'utf8')
+  const before = JSON.parse(locked)
+
+  // 同 pid@host、但不带 claim 的 ownerId：一律按「无法证明持权」409（N2 的语义）。
+  await assert.rejects(
+    () => runstore.renewLease(runsRoot, run.id, {
+      pid: 4242, host: 'probe-host', now: new Date(t0.getTime() + 1000),
+    }),
+    error => error && error.status === 409,
+    '缺 ownerId 的续租必须 409（即使 pid@host 相同）',
+  )
+  await assert.rejects(
+    () => runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host' }),
+    error => error && error.status === 409,
+    '缺 ownerId 的释放必须 409（即使 pid@host 相同）',
+  )
+  assert.ok(existsSync(lockPath), '失败的 release 不得删掉租约')
+  assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).heartbeatAt, before.heartbeatAt,
+    '失败的 renew 不得刷新心跳')
+  assert.equal(readFileSync(lockPath, 'utf8'), locked, '失败的 renew / release 不得改写 lock.json')
+
+  // 带 ownerId 的现任 owner 仍能释放：关掉的只是「无法证明世代」的调用方。
+  assert.equal(await runstore.releaseLease(runsRoot, run.id, { ownerId }), true)
+  assert.ok(!existsSync(lockPath), '带 ownerId 的释放必须删掉租约')
 })
 
 console.log('v0.7 · 保存门禁 / 工作区 / supervision')
@@ -1489,14 +1525,17 @@ await check('G6-b DELETE /runs/<id>/worktree：调 removeWorktree 返回 {ok, re
 
   // 持租约（正在跑）→ 409 + 可读原因，不调 removeWorktree。
   const { run: leased } = await seedWorktreeRun('wt-delete-lease')
-  await runstore.claimLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  const leasedOwnerId = 'wt-lease-owner'
+  await runstore.claimLease(runsRoot, leased.id, {
+    pid: 4242, host: 'probe-host', ownerId: leasedOwnerId, ttlMs: 60_000,
+  })
   try {
     const blocked = await call(injected, 'DELETE', `/api/flow-studio/runs/${leased.id}/worktree`)
     assert.equal(blocked.status, 409)
     assert.match(blocked.json.error, /租约/)
     assert.equal(calls.length, 1, '运行中的 run 不能删 worktree')
   } finally {
-    await runstore.releaseLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host' })
+    await runstore.releaseLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host', ownerId: leasedOwnerId })
   }
 
   // 模块没有 removeWorktree 导出 → 501（不假装删过）。

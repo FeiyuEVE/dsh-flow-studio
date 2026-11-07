@@ -1626,9 +1626,13 @@ function assertFence(meta, options) {
  *
  * - 调用方显式给 ownerId：lock.json 与 run.json.execution 的 ownerId 必须同时相等，epoch
  *   也不能矛盾；任一侧缺失都按「无法证明持权」处理（409），杜绝同 pid@host 的 ABA。
- * - 调用方没给 ownerId（0.10 旧调用方）：退回 pid@host；只要持久 execution 存在，就要求
- *   它与租约的 ownerId / epoch 自洽。claim 先写 execution、再发布 lock.json，两步之间崩溃
- *   会留下「execution 已是新世代、lock.json 还是旧 owner」——旧 owner 不能凭它续租/释放。
+ * - 调用方没给 ownerId（0.10 旧调用方）：**只在 run.json 里还没有 execution 字段的旧 run
+ *   上**退回 pid@host。持久世代一旦存在（0.11 的 claim 一定先写 execution，再发布
+ *   lock.json），pid@host 就不再是身份证明——同进程内新旧 owner 共享 pid@host，独立复核
+ *   实测：接管后不传 ownerId 的 renew 仍能刷新新 owner 心跳、release 能删掉新租约
+ *   （N2）。单独给 leaseEpoch 也不行：没有 ownerId 就无法证明「这个 epoch 是我的」。
+ *   另外，claim 先写 execution、再发布 lock.json，两步之间崩溃会留下「execution 已是
+ *   新世代、lock.json 还是旧 owner」——旧 owner 不能凭它续租/释放。
  */
 function leaseHeldBy(lease, meta, options = {}) {
   const execution = meta && isPlainObject(meta.execution) ? meta.execution : null
@@ -1647,20 +1651,15 @@ function leaseHeldBy(lease, meta, options = {}) {
     }
     return true
   }
+  // 0.11 N2（复核阻断）：持久世代存在时，兼容回退一律关闭——缺 ownerId = 无法证明持权。
+  if (execution) return false
   const pid = Number.isInteger(options.pid) && options.pid > 0 ? options.pid : process.pid
   const host = typeof options.host === 'string' && options.host !== '' ? options.host : hostname()
   if (lease.pid !== pid || lease.host !== host) return false
-  if (execution) {
-    // 持久 execution 存在时，ownerId 不能「丢失」：claim 一定写过它。空值 / 对不上都按
-    // 无法证明持权处理（execution.ownerId 丢失 → 409）。
-    if (typeof execution.ownerId !== 'string' || execution.ownerId === ''
-      || execution.ownerId !== lease.ownerId) {
-      return false
-    }
-    if (Number.isInteger(execution.epoch) && Number.isInteger(lease.epoch)
-      && lease.epoch !== execution.epoch) {
-      return false
-    }
+  // 旧 run 没有 execution 可对账；调用方若显式给了 epoch，至少要求它与 lock.json 自洽。
+  if (Number.isInteger(options.leaseEpoch) && Number.isInteger(lease.epoch)
+    && lease.epoch !== options.leaseEpoch) {
+    return false
   }
   return true
 }

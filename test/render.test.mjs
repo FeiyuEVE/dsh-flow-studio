@@ -70,13 +70,15 @@ const {
 } = await import('../src/client/page.js')
 const {
   EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
-  WATCH_EVENT_KINDS, acceptanceOf, backoffDelay, conclusionOf, deriveNodeStates,
-  drawerActionFor, eventCountText, eventKey, eventSummary, eventWindowNote, eventsSince,
-  filterEvents, findingsLineOf, formatDuration, isStaleLoad, latestSeq, liveOf,
-  mergeEventWindows, mergeRunDetail, needsEventFetch, nextDrawerOpen, nodeFindingsInfo, nodeProgressText, normalizeLive,
-  normalizeProgress, normalizeRun, pageSlice, pickWatchRun, pollDelay, readUsage,
-  runDurationMs, runIsActive, runIsPending, runIsRunning, runLiveLabel, runMetrics,
-  sortEventsDesc, statusText, stubBadgeOf,
+  LOG_ASSUMED_CONTAINER_HEIGHT, LOG_DEFAULT_HEIGHT, LOG_HEIGHT_STORAGE_KEY, LOG_KEEP_CANVAS,
+  LOG_MIN_HEIGHT, WATCH_EVENT_KINDS, acceptanceOf, backoffDelay, clampLogHeight, conclusionOf,
+  deriveNodeStates, drawerActionFor, eventCountText, eventKey, eventSummary, eventWindowNote,
+  eventsSince, filterEvents, findingsLineOf, formatDuration, isStaleLoad, latestSeq, liveOf,
+  logHeightFromKey, logHeightMax, mergeEventWindows, mergeRunDetail, needsEventFetch, nextDrawerOpen,
+  nodeFindingsInfo, nodeProgressText, normalizeLive, normalizeProgress, normalizeRun, pageSlice,
+  pickWatchRun, pollDelay, readStoredLogHeight, readUsage, runDurationMs, runIsActive, runIsPending,
+  runIsRunning, runLiveLabel, runMetrics, sortEventsDesc, statusText, stubBadgeOf,
+  writeStoredLogHeight,
 } = await import('../src/client/logdrawer.js')
 const {
   FS_TOKEN_STORAGE_KEY, LIGHT_POLL_FALLBACK_NOTICE, RUNS_IDLE_POLL_MS, api, authorizationHeader,
@@ -2464,6 +2466,165 @@ check('v0.8 §11.4：节点多于 6 个时区块内部滚动，整块只读不�
     selectedRunId: 'run-few',
   })
   assert.ok(!few.includes('fs-run-nodes-body scroll'), '≤6 个节点不应出现内部滚动')
+})
+
+// ── 0.9.1：抽屉上边缘可拖动拉伸 ───────────────────────────────────────────
+console.log('抽屉高度（可拖拽 / 键盘 / 持久化）')
+
+check('抽屉高度 clamp：正常值原样 / 低于 120 / 超过容器−180 / NaN·null·负数 / 容器过矮', () => {
+  assert.equal(LOG_MIN_HEIGHT, 120)
+  assert.equal(LOG_KEEP_CANVAS, 180)
+  assert.equal(LOG_DEFAULT_HEIGHT, 200)
+  // 正常值原样（整数 px）。
+  assert.equal(clampLogHeight(320, 900), 320)
+  assert.equal(clampLogHeight(420, 900), 420)
+  // 低于下限 → 120。
+  assert.equal(clampLogHeight(100, 900), 120)
+  assert.equal(clampLogHeight(0, 900), 120)
+  // 超过「容器 − 180」→ 收敛到上限（900 − 180 = 720）。
+  assert.equal(clampLogHeight(5000, 900), 720)
+  assert.equal(clampLogHeight(720, 900), 720)
+  assert.equal(logHeightMax(900), 720)
+  // 非数 / 空 / 负数 → 120，不是 NaN。
+  for (const bad of [NaN, Infinity, -Infinity, null, undefined, -30, '-30', 'abc']) {
+    const value = clampLogHeight(bad, 900)
+    assert.equal(value, 120, '坏期望值 ' + String(bad) + ' 应退回 120')
+    assert.equal(Number.isInteger(value), true)
+  }
+  // 容器过矮（250 < 120 + 180）→ 120，不允许出现负数。
+  assert.equal(clampLogHeight(200, 250), 120)
+  assert.equal(clampLogHeight(999, 250), 120)
+  assert.equal(logHeightMax(250), 120)
+  assert.equal(clampLogHeight(500, 290), 120)
+  // 300 − 180 = 120 正好是下限；380 − 180 = 200 正好是默认值。
+  assert.equal(clampLogHeight(200, 300), 120)
+  assert.equal(clampLogHeight(200, 380), 200)
+  // 小数收敛成整数 px。
+  assert.equal(clampLogHeight(420.6, 900), 421)
+  assert.equal(Number.isInteger(clampLogHeight(300, 481.7)), true)
+  // 拿不到容器高度（SSR / 首帧 0）= 假设 900 的确定口径。
+  assert.equal(LOG_ASSUMED_CONTAINER_HEIGHT, 900)
+  assert.equal(clampLogHeight(420, 0), 420)
+  assert.equal(clampLogHeight(420, undefined), 420)
+  assert.equal(clampLogHeight(99999, 0), 720)
+})
+
+check('拖拽条键盘位：↑↓ 24 / PgUp PgDn 96 / Home 最小 / End 最大 / Esc 默认 / 未知键 null', () => {
+  const container = 900
+  assert.equal(logHeightFromKey('ArrowUp', 200, container), 224)
+  assert.equal(logHeightFromKey('ArrowDown', 200, container), 176)
+  assert.equal(logHeightFromKey('PageUp', 200, container), 296)
+  assert.equal(logHeightFromKey('PageDown', 400, container), 304)
+  assert.equal(logHeightFromKey('Home', 400, container), 120)
+  assert.equal(logHeightFromKey('End', 200, container), 720)
+  assert.equal(logHeightFromKey('Escape', 500, container), LOG_DEFAULT_HEIGHT)
+  // 不认识的键必须返回 null（调用方据此决定不 preventDefault）。
+  for (const key of ['Enter', 'c', ' ', 'ArrowLeft', 'F5', '']) {
+    assert.equal(logHeightFromKey(key, 200, container), null, '未知键 ' + JSON.stringify(key) + ' 必须返回 null')
+  }
+  // 步进结果也 clamp：顶到 / 底到边界就不再动。
+  assert.equal(logHeightFromKey('ArrowUp', 720, container), 720)
+  assert.equal(logHeightFromKey('PageUp', 700, container), 720)
+  assert.equal(logHeightFromKey('ArrowDown', 120, container), 120)
+  assert.equal(logHeightFromKey('PageDown', 130, container), 120)
+  // 当前值为 null（没设置过）时从默认 200 起算。
+  assert.equal(logHeightFromKey('ArrowUp', null, container), 224)
+  // 容器过矮：End / Esc / ↑ 都收敛到 120，不会给出负数。
+  assert.equal(logHeightFromKey('End', 200, 250), 120)
+  assert.equal(logHeightFromKey('Escape', 500, 250), 120)
+  assert.equal(logHeightFromKey('ArrowUp', 200, 300), 120)
+})
+
+check('抽屉高度持久化：合法值读回、坏值退回 null、写默认值删键', () => {
+  const makeStorage = () => {
+    const map = new Map()
+    return {
+      getItem: key => (map.has(key) ? map.get(key) : null),
+      setItem: (key, value) => { map.set(key, String(value)) },
+      removeItem: key => { map.delete(key) },
+    }
+  }
+  const storage = makeStorage()
+  // 没设置过 → null（调用方按默认 200 渲染），不是 0 / NaN。
+  assert.equal(readStoredLogHeight(storage), null)
+  writeStoredLogHeight(storage, 420)
+  assert.equal(storage.getItem(LOG_HEIGHT_STORAGE_KEY), '420')
+  assert.equal(readStoredLogHeight(storage), 420)
+  // 坏值一律退回 null：非数、负数、0、空串、非整数 px。
+  for (const bad of ['abc', '-5', '0', '', '420.5']) {
+    storage.setItem(LOG_HEIGHT_STORAGE_KEY, bad)
+    assert.equal(readStoredLogHeight(storage), null, '坏值 ' + JSON.stringify(bad) + ' 必须退回 null')
+  }
+  // 写默认值 / null 都表示「没设置过」→ 删键。
+  storage.setItem(LOG_HEIGHT_STORAGE_KEY, '420')
+  writeStoredLogHeight(storage, LOG_DEFAULT_HEIGHT)
+  assert.equal(storage.getItem(LOG_HEIGHT_STORAGE_KEY), null, '写默认值必须删键')
+  writeStoredLogHeight(storage, 460)
+  assert.equal(storage.getItem(LOG_HEIGHT_STORAGE_KEY), '460')
+  writeStoredLogHeight(storage, null)
+  assert.equal(storage.getItem(LOG_HEIGHT_STORAGE_KEY), null, '写 null 必须删键')
+  // storage 缺失 / 隐私模式下抛错都不崩。
+  assert.equal(readStoredLogHeight(null), null)
+  assert.equal(writeStoredLogHeight(null, 300), false)
+  const broken = {
+    getItem() { throw new Error('blocked') },
+    setItem() { throw new Error('blocked') },
+    removeItem() { throw new Error('blocked') },
+  }
+  assert.equal(readStoredLogHeight(broken), null)
+  assert.equal(writeStoredLogHeight(broken, 300), false)
+})
+
+check('抽屉高度 SSR：initialLogHeight 落到内联 height；拖拽条带完整 a11y 值', () => {
+  const html = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialLogOpen: true,
+    initialLogHeight: 420,
+  }))
+  assert.ok(/class="fs-log open"[^>]*style="height:420px"/.test(html), '展开态应带内联 height:420px')
+  assert.ok(html.includes('role="separator"'), '展开态缺拖拽条')
+  const gripAt = html.indexOf('class="fs-log-grip"')
+  assert.ok(gripAt >= 0, '拖拽条应为 .fs-log-grip')
+  const separator = html.slice(gripAt, gripAt + 600)
+  assert.ok(separator.includes('role="separator"'), '拖拽条缺 role=separator')
+  assert.ok(separator.includes('aria-orientation="horizontal"'), '拖拽条缺 aria-orientation')
+  assert.ok(separator.includes('aria-label="调整执行记录高度"'), '拖拽条缺 aria-label')
+  assert.ok(separator.includes('tabindex="0"'), '拖拽条必须可 Tab 聚焦')
+  assert.ok(separator.includes('title="拖动调整执行记录高度，双击恢复默认"'), '拖拽条缺 title')
+  assert.ok(separator.includes('aria-valuemin="120"'), 'aria-valuemin 应为 120')
+  assert.ok(separator.includes('aria-valuemax="720"'), 'aria-valuemax 应为容器口径上限（SSR 假设 900 → 720）')
+  assert.ok(separator.includes('aria-valuenow="420"'), 'aria-valuenow 应为当前高度 420')
+  // 收起态：40px 折叠条，不出现拖拽条（也就没有 separator）。
+  const closed = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialLogOpen: false,
+    initialLogHeight: 420,
+  }))
+  assert.ok(!closed.includes('role="separator"'), '收起态不能出现拖拽条')
+  assert.ok(!closed.includes('style="height:420px"'), '收起态不能把 420 写到内联高度上')
+})
+
+check('抽屉高度 SSR：initialLogHeight 99999 也按容器口径收敛（SSR 假设容器 900 → 上限 720）', () => {
+  // SSR 拿不到 .fs-root 的真实高度（不跑 effect / 没有 window），统一按 900 假设：
+  // 上限 = 900 − LOG_KEEP_CANVAS(180) = 720，与浏览器量到真实高度后用同一套
+  // clampLogHeight 收敛，所以这里断言「不是 99999，且恰好等于 720」。
+  assert.equal(LOG_ASSUMED_CONTAINER_HEIGHT - LOG_KEEP_CANVAS, 720)
+  const html = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialLogOpen: true,
+    initialLogHeight: 99999,
+  }))
+  assert.ok(!html.includes('height:99999px'), '99999 不能被原样写进内联高度')
+  const match = html.match(/class="fs-log open"[^>]*style="height:(\d+)px"/)
+  assert.ok(match, '展开态应带内联 height')
+  const rendered = Number(match[1])
+  assert.notEqual(rendered, 99999)
+  assert.equal(rendered, 720, 'SSR 口径：假设容器 900 → 上限 720')
+  assert.ok(rendered <= LOG_ASSUMED_CONTAINER_HEIGHT - LOG_KEEP_CANVAS, '渲染高度不能超过假设上限')
+  assert.ok(html.includes('aria-valuenow="' + rendered + '"'), 'aria-valuenow 必须与渲染高度同值')
 })
 
 console.log(`\n${checks} 组通过`)

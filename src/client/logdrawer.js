@@ -32,6 +32,29 @@ export const DRAWER_OPEN_HEIGHT = 200
 export const DRAWER_ZOOM_LEVELS = Object.freeze(['normal', 'tall', 'full'])
 /** 拉高档占视口比例；CSS 里是 70vh，抽成常量供文档 / 测试核对。 */
 export const DRAWER_TALL_VH = 70
+
+// ── 可拖动高度（拖拽条 / 键盘 / 持久化；纯函数，SSR 也能单测）──────────────
+/**
+ * 展开抽屉的高度边界：
+ *  - `LOG_MIN_HEIGHT`：再矮连 40px 折叠条 + 46px 聚合条都挤不下；
+ *  - `LOG_KEEP_CANVAS`：给顶栏 + 画布留出的最小高度（上限 = 容器高度 − 180）；
+ *  - `LOG_DEFAULT_HEIGHT`：没设置过 / 双击 / Esc 时的高度。
+ */
+export const LOG_MIN_HEIGHT = 120
+export const LOG_KEEP_CANVAS = 180
+export const LOG_DEFAULT_HEIGHT = 200
+/**
+ * 拿不到容器高度（SSR、首帧还没量测）时按这个高度算上限：口径确定、可断言，
+ * 浏览器里量到真实高度后再用同一套 clamp 收敛一次。
+ */
+export const LOG_ASSUMED_CONTAINER_HEIGHT = 900
+/** 拖拽条键盘步长：方向键 24px，PageUp / PageDown 96px。 */
+export const LOG_KEY_STEP = 24
+export const LOG_KEY_PAGE_STEP = 96
+/** 持久化键，与 page.js 的 WORKSPACE_STORAGE_KEY 同风格。 */
+export const LOG_HEIGHT_STORAGE_KEY = 'dsh-flow-studio.logHeight'
+export const LOG_GRIP_LABEL = '调整执行记录高度'
+export const LOG_GRIP_TITLE = '拖动调整执行记录高度，双击恢复默认'
 /** 节点「最近在做什么」最多列几条 agent/message（05 §8.3 每节点上限 5）。 */
 export const AGENT_ACTIVITY_LIMIT = 5
 /** 节点详情里最近工具调用 / 产物条数上限。 */
@@ -187,6 +210,99 @@ export function drawerActionFor(event) {
 /** 纯开合函数：给出下一步的 open，便于单测状态机。 */
 export function nextDrawerOpen(open) {
   return !open
+}
+
+// ── 可拖动高度的决策（纯函数：拖动 / 键盘 / 持久化都走这里）────────────────
+
+/**
+ * 容器高度归一化：拿不到 / 非正数（SSR、首帧 0）按 `LOG_ASSUMED_CONTAINER_HEIGHT`
+ * 计，保证上限永远是一个确定的非负整数。
+ */
+export function logContainerHeightOf(containerHeight) {
+  const value = typeof containerHeight === 'number' && Number.isFinite(containerHeight) ? containerHeight : 0
+  return value > 0 ? value : LOG_ASSUMED_CONTAINER_HEIGHT
+}
+
+/**
+ * 当前容器允许的最大抽屉高度 = 容器高度 − 180；容器过矮（连 120 + 180 都不够）
+ * 时退回最小值 120，**绝不出现负数或 NaN**。
+ */
+export function logHeightMax(containerHeight) {
+  const container = logContainerHeightOf(containerHeight)
+  return Math.max(LOG_MIN_HEIGHT, Math.floor(container - LOG_KEEP_CANVAS))
+}
+
+/**
+ * 把任意期望高度收敛到 [120, 容器 − 180] 的整数 px。
+ * `undefined` / `NaN` / `null` / 负数一律按下限 120 处理（不向后兼容坏输入）。
+ */
+export function clampLogHeight(desired, containerHeight) {
+  const max = logHeightMax(containerHeight)
+  const wanted = typeof desired === 'number' && Number.isFinite(desired) ? Math.round(desired) : LOG_MIN_HEIGHT
+  return Math.min(max, Math.max(LOG_MIN_HEIGHT, wanted))
+}
+
+/**
+ * 拖拽条键位 → 新高度（已 clamp）。
+ * ArrowUp +24 / ArrowDown −24 / PageUp +96 / PageDown −96 / Home 最小 / End 最大 /
+ * Escape 默认 200；**不认识的键返回 null**，调用方不要 preventDefault。
+ *
+ * @param {string} key event.key
+ * @param {number|null} current 当前生效高度（null = 还没设置过，按默认 200 起算）
+ * @param {number} containerHeight 容器高度（见 logContainerHeightOf 的口径）
+ * @returns {number|null}
+ */
+export function logHeightFromKey(key, current, containerHeight) {
+  const base = clampLogHeight(
+    typeof current === 'number' && Number.isFinite(current) ? current : LOG_DEFAULT_HEIGHT,
+    containerHeight,
+  )
+  switch (key) {
+    case 'ArrowUp': return clampLogHeight(base + LOG_KEY_STEP, containerHeight)
+    case 'ArrowDown': return clampLogHeight(base - LOG_KEY_STEP, containerHeight)
+    case 'PageUp': return clampLogHeight(base + LOG_KEY_PAGE_STEP, containerHeight)
+    case 'PageDown': return clampLogHeight(base - LOG_KEY_PAGE_STEP, containerHeight)
+    case 'Home': return clampLogHeight(LOG_MIN_HEIGHT, containerHeight)
+    case 'End': return logHeightMax(containerHeight)
+    case 'Escape': return clampLogHeight(LOG_DEFAULT_HEIGHT, containerHeight)
+    default: return null
+  }
+}
+
+/** 从 localStorage 读回上次拖出来的高度；SSR / 隐私模式 / 坏值一律 null。 */
+export function readStoredLogHeight(storage) {
+  try {
+    const store = storage || (typeof localStorage !== 'undefined' ? localStorage : null)
+    if (!store || typeof store.getItem !== 'function') return null
+    const raw = store.getItem(LOG_HEIGHT_STORAGE_KEY)
+    if (typeof raw !== 'string' || raw.trim() === '') return null
+    const value = Number(raw)
+    // 只认正整数：'abc' → NaN、'-5' / '0' 都不是合法高度、'420.5' 不是整数 px。
+    return Number.isInteger(value) && value > 0 ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 记住拖出来的高度；null / 默认 200 表示「没设置过」——删键而不是写 200，
+ * 这样下次读回 null，双击恢复默认后才真的回到初始状态。
+ */
+export function writeStoredLogHeight(storage, value) {
+  try {
+    const store = storage || (typeof localStorage !== 'undefined' ? localStorage : null)
+    if (!store) return false
+    const height = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null
+    if (height === null || height <= 0 || height === LOG_DEFAULT_HEIGHT) {
+      if (typeof store.removeItem === 'function') store.removeItem(LOG_HEIGHT_STORAGE_KEY)
+      return true
+    }
+    if (typeof store.setItem !== 'function') return false
+    store.setItem(LOG_HEIGHT_STORAGE_KEY, String(height))
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ── 高度三档（A：详情可放大；纯函数，SSR 也能单测）──────────────────────────
@@ -2047,6 +2163,17 @@ function clipForLabel(value, max = 60) {
  * @param {{kind: string, id: string}|null} [props.focusNode] 画布当前选中的节点；
  *   抽屉展开时用它打开节点运行详情（点节点即可看该 agent 在干什么）。
  * @param {number} [props.syncToken] 变化时立即强制刷新一次（开始 / 停止后）。
+ * @param {number|null} [props.height] 展开高度（px）；null / 不传 = 默认 200。
+ *   只作用于默认档（normal）：通过拖拽条 / 键盘调整，拖动中由 `onHeightChange` 回传。
+ * @param {number} [props.containerHeight] 外层容器（.fs-root）高度，用来算上限
+ *   「容器 − 180」；0 / 没量测（SSR）按 900 的确定口径（见 LOG_ASSUMED_CONTAINER_HEIGHT）。
+ * @param {(height: number) => void} [props.onHeightChange] 拖动 / 键盘过程中的高度回调，
+ *   调用方只更新 state、不写盘。
+ * @param {(height: number|null) => void} [props.onHeightCommit] 松手 / 键盘确认后的落库回调
+ *   （调用方写 localStorage；null = 清掉设置）。
+ * @param {() => void} [props.onResetHeight] 双击拖拽条：恢复默认并清掉持久化。
+ *
+ * 不传 height / 回调时行为与旧版一致：收起 40px、展开默认 200px（CSS 口径）。
  */
 export function FsLogDrawer({
   open = false,
@@ -2072,6 +2199,12 @@ export function FsLogDrawer({
   focusRun = null,
   focusNode = null,
   syncToken = 0,
+  // 可拖动高度（不传时保持旧行为：展开 200 / 收起 40）。
+  height = null,
+  containerHeight = 0,
+  onHeightChange = null,
+  onHeightCommit = null,
+  onResetHeight = null,
 } = {}) {
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
 
@@ -2104,6 +2237,14 @@ export function FsLogDrawer({
   const [copyState, setCopyState] = useState('')
   /** 高度档（A1）：默认 / 拉高 / 全屏；Esc 逐档往回退。 */
   const [zoom, setZoom] = useState(() => normalizeDrawerZoom(initialZoom))
+  /**
+   * 上边缘拖拽：dragging 只用来关掉 `transition:height` 与标记 `.resizing`；
+   * 起点 / 指针 id / 最后一帧高度放 ref，pointermove 里不依赖 state 重渲染。
+   */
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef(null)
+  /** 上一次拖拽条点击（时间戳 + 是否拖动过）：preventDefault 后 dblclick 可能不来，用它兜底。 */
+  const lastGripTap = useRef({ at: 0, moved: true })
   /** 右侧详情列当前展示的节点（B4）：点节点或事件里的节点名打开。 */
   const [selectedNodeId, setSelectedNodeId] = useState(text(initialSelectedNodeId, ''))
   /** 三个区域各自可独立收起 / 展开（A2）：指标、事件列表、详情（事件或节点）。 */
@@ -2812,6 +2953,125 @@ export function FsLogDrawer({
   // ── 放大 / 弹层 / 节点详情的交互（A1–A2）────────────────────────────────
   const zoomInfo = drawerZoomInfo(zoom)
 
+  // ── 上边缘拖拽（默认档）──────────────────────────────────────────────────
+  // 高度决策全在纯函数里（clampLogHeight / logHeightFromKey）：这里只取指针位置、
+  // 回调给 page。拖动中只 onHeightChange（不写盘），松手 / 键盘才 onHeightCommit。
+  const appliedHeight = clampLogHeight(
+    height === null || height === undefined ? LOG_DEFAULT_HEIGHT : height,
+    containerHeight,
+  )
+  const heightMax = logHeightMax(containerHeight)
+  /** 拖拽条只在展开 + 默认档出现：拉高 / 全屏由既有三档接管，不混两套高度语义。 */
+  const showGrip = open && zoomInfo.key === 'normal'
+
+  /** 指针位置 → 新高度（以按下时的生效高度为基准；向上拖 = 变高）。 */
+  const heightOfDrag = event => {
+    const drag = dragRef.current
+    if (!drag) return null
+    const clientY = event && typeof event.clientY === 'number' && Number.isFinite(event.clientY)
+      ? event.clientY : drag.startY
+    return clampLogHeight(drag.startHeight + (drag.startY - clientY), containerHeight)
+  }
+
+  /** 双击 / Esc 共用的「恢复默认」：有 reset 回调就交给调用方清持久化。 */
+  const resetHeightToDefault = () => {
+    if (typeof onResetHeight === 'function') {
+      onResetHeight()
+      return
+    }
+    // 没给 reset 回调（旧用法）：至少把高度收敛回默认值。
+    if (typeof onHeightCommit === 'function') onHeightCommit(clampLogHeight(LOG_DEFAULT_HEIGHT, containerHeight))
+  }
+
+  const onGripPointerDown = event => {
+    if (!event) return
+    // 只接主键（右键 / 中键不开始拖拽）。
+    if (typeof event.button === 'number' && event.button !== 0) return
+    if (typeof event.preventDefault === 'function') event.preventDefault()
+    // pointerdown 上 preventDefault 会抑制兼容鼠标事件（部分浏览器里 dblclick 不再派发），
+    // 所以双击在这里自己判一次：500ms 内第二次按下、且上一次没有拖动过 = 恢复默认。
+    const now = Date.now()
+    const lastTap = lastGripTap.current
+    if (now - lastTap.at < 500 && lastTap.moved === false) {
+      lastGripTap.current = { at: 0, moved: true }
+      resetHeightToDefault()
+      return
+    }
+    lastGripTap.current = { at: now, moved: true }
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startY: typeof event.clientY === 'number' && Number.isFinite(event.clientY) ? event.clientY : 0,
+      startHeight: appliedHeight,
+      last: appliedHeight,
+    }
+    setDragging(true)
+    const target = event.currentTarget
+    // 拖拽条被 preventDefault 后不会自动获得焦点：手动 focus，让键盘能接着调高度。
+    if (target && typeof target.focus === 'function') target.focus()
+    if (target && typeof target.setPointerCapture === 'function' && typeof event.pointerId === 'number') {
+      try {
+        target.setPointerCapture(event.pointerId)
+      } catch {
+        // 指针已失效（合成事件 / 老浏览器）：仍靠 move 继续拖。
+      }
+    }
+  }
+
+  const onGripPointerMove = event => {
+    const drag = dragRef.current
+    if (!drag || !event) return
+    if (typeof event.pointerId === 'number' && typeof drag.pointerId === 'number'
+      && event.pointerId !== drag.pointerId) return
+    // 拖动中取消 move 的默认动作：配合 .resizing 的 user-select:none 彻底禁掉选中。
+    if (typeof event.preventDefault === 'function') event.preventDefault()
+    const next = heightOfDrag(event)
+    if (next === null || next === drag.last) return
+    drag.last = next
+    if (typeof onHeightChange === 'function') onHeightChange(next)
+  }
+
+  /** 松手 / 取消：恢复过渡，并把最后一帧高度交给调用方落库。 */
+  const endGripDrag = event => {
+    const drag = dragRef.current
+    if (!drag) return
+    dragRef.current = null
+    setDragging(false)
+    // 记录这次是不是「按了没拖」：只有连点两下（都没拖动）才算双击。
+    lastGripTap.current = { at: Date.now(), moved: drag.last !== drag.startHeight }
+    const target = event && event.currentTarget
+    if (target && typeof target.releasePointerCapture === 'function'
+      && typeof drag.pointerId === 'number') {
+      try {
+        target.releasePointerCapture(drag.pointerId)
+      } catch {
+        // 浏览器可能已经自动释放：忽略。
+      }
+    }
+    if (typeof onHeightCommit === 'function') onHeightCommit(drag.last)
+  }
+
+  const onGripDoubleClick = event => {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault()
+    resetHeightToDefault()
+  }
+
+  /** 键盘：认识的键 preventDefault + 收敛后落库；不认识的键放行给外层（含 Esc 之外）。 */
+  const onGripKeyDown = event => {
+    if (!event || typeof event.key !== 'string') return
+    // 以「当前生效高度」为基准，而不是 state 里可能超出容器上限的旧值。
+    const next = logHeightFromKey(event.key, appliedHeight, containerHeight)
+    if (next === null) return
+    if (typeof event.preventDefault === 'function') event.preventDefault()
+    if (typeof event.stopPropagation === 'function') event.stopPropagation()
+    if (event.key === 'Escape') {
+      // Esc = 恢复默认 200 并清持久化（与双击同一口径）。
+      resetHeightToDefault()
+      return
+    }
+    if (typeof onHeightChange === 'function') onHeightChange(next)
+    if (typeof onHeightCommit === 'function') onHeightCommit(next)
+  }
+
   /** 打开完整文本弹层：记住触发元素，关闭时把焦点还回去。 */
   const openOverlay = (title, fullText) => {
     if (typeof document !== 'undefined') overlayReturnRef.current = document.activeElement
@@ -3439,8 +3699,31 @@ export function FsLogDrawer({
     if (typeof event.stopPropagation === 'function') event.stopPropagation()
   }
 
+  // 上边缘 6px 拖拽条：只在展开 + 默认档出现（收起态整条不渲染，CSS 再兜一层
+  // display:none）。role=separator + 动态 min/max/now，键盘也能改高度。
+  const grip = !showGrip ? null : h('div', {
+    className: 'fs-log-grip',
+    role: 'separator',
+    'aria-orientation': 'horizontal',
+    'aria-label': LOG_GRIP_LABEL,
+    title: LOG_GRIP_TITLE,
+    tabIndex: 0,
+    'aria-valuemin': LOG_MIN_HEIGHT,
+    'aria-valuemax': heightMax,
+    'aria-valuenow': appliedHeight,
+    onPointerDown: onGripPointerDown,
+    onPointerMove: onGripPointerMove,
+    onPointerUp: endGripDrag,
+    onPointerCancel: endGripDrag,
+    onDoubleClick: onGripDoubleClick,
+    onKeyDown: onGripKeyDown,
+  })
+
   return h('section', {
-    className: 'fs-log' + (open ? ' open' : '') + zoomInfo.className,
+    className: 'fs-log' + (open ? ' open' : '') + zoomInfo.className + (dragging ? ' resizing' : ''),
+    // 默认档的高度由用户拖出来（已 clamp）；拉高 / 全屏仍交给既有 CSS 档位，
+    // 这里不加内联 height，避免把 70vh / fixed 覆盖掉。
+    style: open && zoomInfo.key === 'normal' ? { height: appliedHeight + 'px' } : undefined,
     'aria-label': '运行日志（' + zoomInfo.label + '）',
     role: 'region',
     'data-zoom': zoom,
@@ -3448,7 +3731,7 @@ export function FsLogDrawer({
     'data-flow-name': flowName || undefined,
     'data-flow-id': flowId || undefined,
     onKeyDown: onDrawerKeyDown,
-  }, bar, body,
+  }, grip, bar, body,
   overlay
     ? h(LogTextOverlay, {
       key: 'text-overlay',

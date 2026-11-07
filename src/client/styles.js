@@ -765,6 +765,24 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   transition:height .18s ease;
 }
 .fs-log.open{height:200px}
+/* 上边缘拖拽条：平时一条 1px 分隔线，hover / focus-visible 变明显 + 2px focus ring。
+   拖动期间根节点加 .resizing 关掉 height 过渡，否则会「拖不动 / 回弹」。 */
+.fs-log-grip{
+  flex:none;display:block;width:100%;height:6px;padding:0;margin:0;border:0;
+  background:transparent;cursor:row-resize;touch-action:none;
+  user-select:none;-webkit-user-select:none;
+}
+.fs-log-grip::before{
+  content:'';display:block;height:1px;margin:2px 0 0;background:var(--dsw-alias-border-l1);
+}
+.fs-log-grip:hover::before,.fs-log-grip:focus-visible::before,.fs-log.resizing .fs-log-grip::before{
+  height:3px;margin-top:1px;background:var(--dsw-alias-brand-primary);
+}
+.fs-log-grip:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.fs-log.resizing{transition:none}
+.fs-log.resizing,.fs-log.resizing *{user-select:none;-webkit-user-select:none}
+/* 收起态（40px 折叠条）不显示拖拽条：既不占高，也不进 Tab 序。 */
+.fs-log:not(.open) .fs-log-grip{display:none}
 .fs-log-bar{flex:none;display:flex;align-items:center;gap:8px;height:40px;padding:0 8px 0 4px;min-width:0}
 
 .fs-log-toggle{

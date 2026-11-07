@@ -22,7 +22,7 @@ import {
 } from './link.js'
 import {
   FsLogDrawer, conclusionOf, deriveNodeStates, drawerActionFor, eventWindowNote, liveOf,
-  runIsActive, runIsPending, runLiveLabel,
+  readStoredLogHeight, runIsActive, runIsPending, runLiveLabel, writeStoredLogHeight,
 } from './logdrawer.js'
 import { h, rt } from './runtime.js'
 import { CSS } from './styles.js'
@@ -586,6 +586,8 @@ export function runControlState(run, {
  * @param {object} [props.initialDraftNotice] 预置草稿横幅（SSR / 测试用；形状同内部
  *   `draftNotice`：`{flowId, record: {savedAt, flow}}`），SSR 不跑 effect 也能验横幅状态。
  * @param {boolean} [props.initialLogOpen] 抽屉初始是否展开。
+ * @param {number|null} [props.initialLogHeight] 抽屉展开高度（SSR / 测试用）；
+ *   省略时读 localStorage（`dsh-flow-studio.logHeight`），再省略用默认 200。
  * @param {string} [props.initialWorkspace] 预置工作区绝对路径（SSR / 测试用）；省略则读 localStorage。
  */
 export function FlowStudioPage({
@@ -594,6 +596,7 @@ export function FlowStudioPage({
   initialRunView = null,
   initialDraftNotice = null,
   initialLogOpen = false,
+  initialLogHeight = null,
   initialError = '',
   initialWorkspace = '',
 } = {}) {
@@ -617,6 +620,21 @@ export function FlowStudioPage({
   /** 0.4.2：保存撞上别人的改动（409）时挂起，等用户选「覆盖」还是「载入服务器版本」。 */
   const [conflict, setConflict] = useState(null)
   const [logOpen, setLogOpen] = useState(Boolean(initialLogOpen))
+  /**
+   * 抽屉展开高度（px）。null = 没设置过 → 抽屉用默认 200。
+   * 初值优先级：测试注入 initialLogHeight → localStorage → null（SSR / 隐私模式）。
+   * 拖动中只 setState（不写盘），松手 / 键盘确认才 writeStoredLogHeight。
+   */
+  const [logHeight, setLogHeight] = useState(() => {
+    const preset = typeof initialLogHeight === 'number' && Number.isFinite(initialLogHeight) && initialLogHeight > 0
+      ? Math.round(initialLogHeight)
+      : null
+    return preset === null ? readStoredLogHeight() : preset
+  })
+  /** `.fs-root` 的实测高度：抽屉上限 = 容器 − 180，窗口变矮时要重新收敛。 */
+  const [logContainerHeight, setLogContainerHeight] = useState(0)
+  /** `.fs-root` 自身：ResizeObserver 观察它，SSR 下不碰。 */
+  const rootRef = useRef(null)
   /** 抽屉回传的实时运行快照：顶栏、画布节点状态、停止按钮都从这里取数。 */
   const [runView, setRunView] = useState(initialRunView)
   const [runBusy, setRunBusy] = useState(false)
@@ -1498,6 +1516,45 @@ export function FlowStudioPage({
   }, [logOpen, runsSource])
 
   /**
+   * 抽屉高度上限跟着容器走：窗口变矮时要把高度重新收敛，不能只认 localStorage
+   * 里的旧值（否则会把画布压成 0）。SSR 安全：getBoundingClientRect /
+   * ResizeObserver 只在 effect 里用；量不到（0）时留 0，由抽屉按 900 的确定口径渲染。
+   */
+  useEffect(() => {
+    const node = rootRef.current
+    if (!node || typeof ResizeObserver === 'undefined') return undefined
+    const measure = () => {
+      if (typeof node.getBoundingClientRect !== 'function') return
+      const rect = node.getBoundingClientRect()
+      const next = rect && Number.isFinite(rect.height) ? Math.round(rect.height) : 0
+      if (next <= 0) return
+      setLogContainerHeight(previous => (previous === next ? previous : next))
+    }
+    measure()
+    const observer = new ResizeObserver(() => measure())
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [])
+
+  /** 拖动中：只更新显示高度，不写 localStorage（松手 / 键盘才落库）。 */
+  const changeLogHeight = useCallback(value => {
+    setLogHeight(typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null)
+  }, [])
+
+  /** 松手 / 键盘确认：把确定值落进 localStorage；null 表示回到「没设置过」。 */
+  const commitLogHeight = useCallback(value => {
+    const height = typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : null
+    setLogHeight(height)
+    writeStoredLogHeight(undefined, height)
+  }, [])
+
+  /** 双击 / Esc 恢复默认：清掉持久化，下次读回的仍是「没设置过」。 */
+  const resetLogHeight = useCallback(() => {
+    setLogHeight(null)
+    writeStoredLogHeight(undefined, null)
+  }, [])
+
+  /**
    * v0.8 §11.4：详情里的节点标题（`nodes: [{id,title}]`）只用于把 nodeId 显示成人话。
    * 没有 nodeStatus 的老 run 不额外发请求；失败静默保留旧数据（下一次列表刷新再试）。
    */
@@ -1728,7 +1785,7 @@ export function FlowStudioPage({
   const issueClass = issues.errors.length > 0 ? 'fs-status-bad'
     : issues.warnings.length > 0 ? 'fs-status-warn' : 'fs-status-ok'
 
-  return h('div', { className: 'fs-root' },
+  return h('div', { className: 'fs-root', ref: rootRef },
     h('style', null, CSS),
 
     h('header', { className: 'fs-head' },
@@ -1981,6 +2038,12 @@ export function FlowStudioPage({
     h(FsLogDrawer, {
       open: logOpen,
       onToggle: () => setLogOpen(value => !value),
+      // 可拖动高度：page 持有值 + 容器高度；拖动中只更新 state，松手 / 键盘才落盘。
+      height: logHeight,
+      containerHeight: logContainerHeight,
+      onHeightChange: changeLogHeight,
+      onHeightCommit: commitLogHeight,
+      onResetHeight: resetLogHeight,
       flowId: flow ? flow.id : '',
       flowName: flow ? flow.name : '',
       onRunSnapshot: handleRunSnapshot,

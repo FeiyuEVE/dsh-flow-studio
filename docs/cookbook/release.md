@@ -10,7 +10,7 @@ node -p "require('./package.json').version"
 git status --short
 ```
 
-1. 改 `package.json` 的 `version`（本仓当前 0.9.3）。
+1. 改 `package.json` 的 `version`（本仓当前 0.9.4）。
 2. 在 [docs/history/releases.md](../history/releases.md) 加对应版本段落，写清新增 / 修复 / 已知边界；不要在 README 里写版本历史。
 3. 确认 `THIRD-PARTY.md` 与 `LICENSE` 不需要更新（新增依赖或 vendored 代码必须更新）。
 

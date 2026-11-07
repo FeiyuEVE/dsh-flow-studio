@@ -128,6 +128,17 @@
 - 关闭：环境变量 `FLOW_STUDIO_WARMUP_FIRST_TURN=0`，或构造参数 `warmUpFirstTurn: false`。
 - 判据（排障用）：`node/start` 之后、正式 attempt 之前，会话里多出一条以「【引擎预热 · 本会话第 1 轮】」开头的 user 消息；引擎日志有「发送预热轮 / 预热轮完成」。
 
+## 团队节点的收口（等成员 + 补要结论）
+
+团队节点（`mode:'team'`）的主管用 `subagent`（spawn 异步）把活派出去后，成员不会阻塞主管的回合——真机实测主管常常在自己的回合里回一句「两名成员仍在执行，继续等待回执」，于是**本轮没有 JSON 结论**，而成员几秒后才把产物写完：节点被判结构不合格、白跑一轮。
+
+现在的收口行为（只在「本轮没有正式结论」且节点是 `team` 时触发，**不放宽判定**）：
+
+1. **等**：轮询已观测到的成员会话是否还 `working`（有界，`FLOW_STUDIO_TEAM_WAIT_MS` 默认 120s，2s 一次）。成员会话已从宿主注册表消失视为结束。
+2. **要**：发一条带同一 attempt/nonce 契约的补充指令（`【引擎补充指令 · 结论必须在本轮给出】`），要求主管用规定格式给出结论；补要失败或仍无结论时按原语义报结构不合格。
+
+排障：引擎日志有「等成员收口 Nms」「本轮没有正式结论（团队节点），补发一次收口指令」。关闭等待（`FLOW_STUDIO_TEAM_WAIT_MS=0`）只会跳过第 1 步，补要结论照旧。
+
 ## 阶段节点的打回工具（`flow_node_reject`）
 
 阶段节点主管在自己的 attempt 进行中可以直接调用模型工具 `flow_node_reject`，
@@ -182,6 +193,7 @@ supervision、事件序号都是已经发生过的事实；原地续跑要么改
 | `FLOW_STUDIO_NODE_ALARM_MS` | 节点自审闹钟间隔（默认 600000 = 10 分钟） |
 | `FLOW_STUDIO_NODE_RETRIES` | 节点重试次数（0–5，默认 1） |
 | `FLOW_STUDIO_WARMUP_FIRST_TURN` | `=0` 关闭新建节点会话的**预热轮**（默认开）。见[节点会话的预热轮](#节点会话的预热轮首轮精简规避) |
+| `FLOW_STUDIO_TEAM_WAIT_MS` | 团队节点「等成员收口」的上限（默认 120000 = 2 分钟，2s 轮询一次） |
 | `FLOW_STUDIO_WAKER_HOURLY_LIMIT` / `FLOW_STUDIO_WAKER_MIN_INTERVAL_MS` | 同一发起会话的 run 级唤醒预算（默认 30 次/小时、最小间隔 120s） |
 | `FLOW_STUDIO_FLOW_MACHINE` | `=0` 回退 0.8.x 的旧主循环（逃生门，留一个发布周期） |
 | `FLOW_STUDIO_STUB_ENGINE` | 桩引擎（容器测试台用；不调模型，只验证编排 / 事件 / 指标 / 打回 / 落盘） |

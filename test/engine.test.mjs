@@ -679,6 +679,125 @@ try {
     A.ok(envelopeOf(bySession.get(aSession)[1]), '正式任务必须带 attempt/nonce 契约')
   })
 
+  await check('团队节点收口：主管派完成员就结束本轮（无结论）→ 等成员收口 + 补要一次结论后通过', async () => {
+    const flow = flowOf('flow-team-collect', [
+      startNode(),
+      stage('n_team', '团队', 300, {
+        mode: 'team',
+        team: [
+          { name: '成员甲', role: '写文件', task: '写 member-a.md' },
+          { name: '成员乙', role: '写文件', task: '写 member-b.md' },
+        ],
+      }),
+      endNode(),
+    ], [
+      next('e1', 'n_start', 'n_team'),
+      next('e2', 'n_team', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-team-collect', 1)
+    const engineRef = { value: null }
+    const leadSessionId = nodeSessionId(run.id, 'n_team', 1)
+    const prompts = []
+    let memberPolls = 0
+    const memberAgent = { status: 'working', session: { id: 'mem-1', header: {} } }
+    const ctx = {
+      on() { return () => {} },
+      get(name) {
+        if (name === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+        }
+        if (name !== 'agents') return undefined
+        return {
+          async create() {
+            return {
+              agent: {
+                session: { id: leadSessionId, header: {} },
+                followup(payload) {
+                  const text = payload.content.map(block => block.text || '').join('\n')
+                  prompts.push(text)
+                  const envelope = envelopeOf(payload)
+                  if (!envelope) return // 预热轮
+                  if (text.includes('引擎补充指令')) {
+                    // 补要结论：这次给正式结论（仍然回显同一 attempt/nonce）。
+                    engineRef.value.handleSessionEvent({ id: leadSessionId }, {
+                      type: 'assistant/message',
+                      data: {
+                        message: {
+                          role: 'assistant',
+                          content: [{
+                            type: 'text',
+                            text: fenced({
+                              attempt: envelope.attempt,
+                              nonce: envelope.nonce,
+                              ...passResult('n_team').structured,
+                              summary: '两名成员回执已收齐，文件均落盘',
+                            }),
+                          }],
+                        },
+                      },
+                    })
+                    return
+                  }
+                  // 主回合：先让引擎「看到」两个成员会话（parentSession === lead），
+                  // 再像真机那样回一句「仍在等待」——没有 JSON 结论。
+                  engineRef.value.handleSessionEvent(
+                    { id: 'mem-1', header: { parentSession: leadSessionId } },
+                    {
+                      type: 'assistant/message',
+                      data: { message: { role: 'assistant', content: [{ type: 'text', text: 'working' }] } },
+                    },
+                  )
+                  engineRef.value.handleSessionEvent({ id: leadSessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: '两名成员仍在执行，继续等待回执。' }],
+                      },
+                    },
+                  })
+                },
+                async whenIdle() {},
+              },
+              async dispose() {},
+            }
+          },
+          get(sessionId) {
+            if (sessionId !== 'mem-1') return null
+            memberPolls += 1
+            // 第一次轮询成员仍在跑，第二次已经结束（真机里成员几秒后才写完文件）。
+            memberAgent.status = memberPolls >= 2 ? 'idle' : 'working'
+            return memberAgent
+          },
+        }
+      },
+    }
+    const engine = createEngine({
+      runsRoot, flowsRoot, ctx, teamWaitMs: 8000, log: () => {},
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    A.equal(final.status, 'done')
+    const nodeEnd = events.find(event => event.kind === 'node/end' && event.nodeId === 'n_team')
+    A.equal(nodeEnd.data.status, 'passed')
+    // 三条消息：预热轮 + 主回合 + 补要结论。
+    A.equal(prompts.length, 3, `实际 ${prompts.length} 条：${prompts.map(item => item.slice(0, 20)).join(' / ')}`)
+    A.ok(prompts[0].includes('引擎预热'))
+    // 补要的那一条必须带同一 attempt/nonce 契约（契约行是 `- nonce: …`，不是 `nonce=`）。
+    A.ok(prompts[2].includes('引擎补充指令'), '第三条必须是收口指令')
+    A.ok(prompts[2].includes('nonce:'), '收口指令必须带 nonce 契约')
+    // 成员确实被观测成节点成员（member/start 落盘）。
+    A.equal(events.filter(event => event.kind === 'member/start').length, 1)
+    // 结论来自补要的那一轮，summary 是主管自己的话。
+    A.equal(nodeEnd.data.verdict === undefined ? undefined : nodeEnd.data.verdict, undefined)
+    const summary = JSON.parse(readFileSync(join(runsRoot, run.id, 'n_team', 'artifacts', '1', 'summary.json'), 'utf8'))
+    A.equal(summary.verdict, 'pass')
+    A.match(summary.summary, /回执已收齐/)
+  })
+
   await check('预热轮可关：warmUpFirstTurn:false → 只有正式任务（1 条），且不再有预热文本', async () => {
     const flow = flowOf('flow-warmup-off', [startNode(), stage('n_only', '单节点', 300), endNode()], [
       next('e1', 'n_start', 'n_only'),

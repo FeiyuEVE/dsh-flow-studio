@@ -118,6 +118,26 @@ export const DEFAULT_WARMUP_TEXT =
   + '可能被首轮精简裁剪过。不要调用任何工具、不要写结论，只回复一行 `ok`。'
   + '下一轮你会收到本阶段的正式任务与输出格式要求。'
 
+/**
+ * 团队节点「等成员收口」的默认上限（v0.9.4）。
+ *
+ * 真机实测：主管用 `subagent`（spawn 异步）把活派给成员后，成员还在跑，主管自己的回合
+ * 就先结束了——它回一句「两名成员仍在执行，继续等待回执」，于是本轮没有 JSON 结论、
+ * 节点被判结构不合格。成员几秒后才把文件写完。
+ *
+ * 所以团队节点在「本轮没有正式结论」时要多做一步：先等成员的会话不再是 working
+ * （有界），再补要一次结论。上限由 `FLOW_STUDIO_TEAM_WAIT_MS` 覆盖。
+ */
+export const DEFAULT_TEAM_WAIT_MS = 120 * 1000
+
+/** 团队节点补要结论时追加的指令（与正式提示词同一 attempt/nonce 契约）。 */
+export const TEAM_CONCLUDE_NUDGE =
+  '【引擎补充指令 · 结论必须在本轮给出】\n'
+  + '你上一轮把任务派给了成员/或还在等回执，但**没有给出本阶段要求的 JSON 结论**。\n'
+  + '现在按顺序做：① 若还有成员在跑，先用 `list_agents` 看状态，能等就等它结束；'
+  + '② 收不到就如实写「成员仍在执行 / 部分失败」；③ 立刻用规定的 ```json 代码块输出结论'
+  + '（verdict=pass 或 reject，回显本次 attempt 与 nonce）。不要再以「继续等待」结束本轮。'
+
 export const MAX_NODE_RETRIES = 5
 
 /**
@@ -1632,6 +1652,10 @@ class FlowEngine {
     this.warmUpText = typeof options.warmUpText === 'string' && options.warmUpText.trim() !== ''
       ? options.warmUpText.trim()
       : DEFAULT_WARMUP_TEXT
+    // v0.9.4：团队节点「等成员收口」的上限（见 DEFAULT_TEAM_WAIT_MS）。
+    this.teamWaitMs = Number.isInteger(options.teamWaitMs) && options.teamWaitMs >= 0
+      ? options.teamWaitMs
+      : envInt('FLOW_STUDIO_TEAM_WAIT_MS', DEFAULT_TEAM_WAIT_MS)
     // 07 §3.1：节点主管会话的 cwd / preset（可注入；没有就交给宿主默认）。
     this.cwd = typeof options.cwd === 'string' && options.cwd !== '' ? options.cwd : null
     this.agentPreset = typeof options.agentPreset === 'string' && options.agentPreset !== ''
@@ -2512,7 +2536,7 @@ class FlowEngine {
       await raceAbort(idlePromise, signal)
       // 让 whenIdle 之后到达的 session/event 先落到订阅处理器（assistant 原文）。
       await new Promise(resolve => setTimeout(resolve, 0))
-      const raw = this.lastAssistantBySession.get(sessionId)
+      let raw = this.lastAssistantBySession.get(sessionId)
       // G1-b：结论取自「本 attempt 最近一条**能解析出正式结论**的 assistant 消息」，
       // 而不是「最后一条消息」。闹钟注入的自审回报一旦成为最后一条（状态块 / 普通
       // JSON / 附带证据），都不能顶掉同一回合里更早的合法 verdict——否则完成节点被
@@ -2524,13 +2548,31 @@ class FlowEngine {
         && (cached.structured.verdict === 'pass' || cached.structured.verdict === 'reject')
         ? cached.structured
         : null
-      const lastParsed = parseAssistantStructured(raw, {
+      let lastParsed = parseAssistantStructured(raw, {
         attempt,
         nonce: envelope.nonce,
         onReject: rejectEnvelope,
       })
-      const lastIsFormal = Boolean(lastParsed)
+      let lastIsFormal = Boolean(lastParsed)
         && (lastParsed.verdict === 'pass' || lastParsed.verdict === 'reject')
+      // v0.9.4：团队节点本轮没给正式结论时，先等成员收口、再补要一次结论。
+      // 真机实测：主管派完 spawn 子 agent 就结束了本轮，成员几秒后才写完文件，于是
+      // 结构不合格、节点被误判失败。这里补的是「等成员 + 要结论」，不是放宽判定。
+      if (!lastIsFormal && node.mode === EXEC_MODE.TEAM) {
+        const nudged = await this._collectTeamConclusion({
+          agent, sessionId, node, attempt, envelope, signal,
+        })
+        if (nudged) {
+          raw = this.lastAssistantBySession.get(sessionId)
+          lastParsed = parseAssistantStructured(raw, {
+            attempt,
+            nonce: envelope.nonce,
+            onReject: rejectEnvelope,
+          })
+          lastIsFormal = Boolean(lastParsed)
+            && (lastParsed.verdict === 'pass' || lastParsed.verdict === 'reject')
+        }
+      }
       let structured = lastIsFormal ? lastParsed : null
       if (!structured && cachedVerdict) {
         // 正式结论 > 自审状态块：最后一条不是正式结论时用缓存里的那一条
@@ -3522,6 +3564,82 @@ class FlowEngine {
       dispose: handle && typeof handle.dispose === 'function'
         ? () => handle.dispose()
         : async () => {},
+    }
+  }
+
+  /**
+   * 团队节点收口（v0.9.4）：本轮没有正式 JSON 结论时，等成员收口再补要一次结论。
+   *
+   * 真机现象（容器测试台实证）：主管用 `subagent`（spawn）把活派给成员后，成员还在跑，
+   * 主管自己的回合先结束，回一句「两名成员仍在执行，继续等待回执」；几秒后成员才把产物
+   * 写完。此时引擎按「没有正式结论」判结构不合格，节点被误判失败——成员白干。
+   *
+   * 这里只做两件事，**不放宽判定**：
+   *   ① 等：轮询成员会话是否还 `working`（有界 `teamWaitMs`，默认 120s，2s 一次）。
+   *      成员会话已经不在注册表里（跑完被释放）视为已完成。
+   *   ② 要：发一条带同一 attempt/nonce 契约的补充指令（{@link TEAM_CONCLUDE_NUDGE}），
+   *      让主管用规定格式把结论给出来。补充指令本身不新增结论、不替模型写 verdict。
+   *
+   * @returns {Promise<boolean>} 是否真的补要了一次（false = 没有成员 / 没有可用会话方法）
+   */
+  async _collectTeamConclusion({ agent, sessionId, node, attempt, envelope, signal }) {
+    if (!agent || typeof agent.followup !== 'function') return false
+    const members = this.current && this.current.members instanceof Map
+      ? [...this.current.members.keys()]
+      : []
+    // ① 等成员收口（有界）。成员的会话 id 就是 current.members 的键。
+    if (members.length > 0 && this.teamWaitMs > 0) {
+      const agents = this._agentsService()
+      const deadline = Date.now() + this.teamWaitMs
+      let waited = 0
+      while (Date.now() < deadline) {
+        if (signal && signal.aborted) return false
+        let busy = 0
+        for (const memberSessionId of members) {
+          if (!agents || typeof agents.get !== 'function') break
+          let memberAgent = null
+          try {
+            memberAgent = agents.get(memberSessionId) || null
+          } catch {
+            memberAgent = null
+          }
+          if (memberAgent && memberAgent.status === 'working') busy += 1
+        }
+        if (busy === 0) break
+        waited += 2000
+        await new Promise(resolve => setTimeout(resolve, 2000))
+      }
+      if (waited > 0) {
+        this.log(
+          'info',
+          `flow-studio: 节点「${node.id}」attempt ${attempt} 等成员收口 ${waited}ms（成员 ${members.length} 个）`,
+        )
+      }
+    }
+    // ② 补要一次结论：同一 attempt/nonce 契约，让主管的结论仍然可解析。
+    this.log(
+      'warn',
+      `flow-studio: 节点「${node.id}」attempt ${attempt} 本轮没有正式结论（团队节点），`
+      + '补发一次收口指令',
+    )
+    try {
+      agent.followup(buildFollowupPayload({
+        text: withAttemptContract(TEAM_CONCLUDE_NUDGE, envelope),
+        runId: this.active && this.active.runId ? this.active.runId : '',
+        nodeId: node.id,
+        from: 'flow-studio',
+      }))
+      const idle = typeof agent.whenIdle === 'function' ? agent.whenIdle() : null
+      if (idle && typeof idle.then === 'function') await raceAbort(Promise.resolve(idle), signal)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      return true
+    } catch (error) {
+      this.log(
+        'warn',
+        `flow-studio: 节点「${node.id}」attempt ${attempt} 补要结论失败`
+        + `（${error && error.message ? error.message : String(error)}），按原语义报结构不合格`,
+      )
+      return false
     }
   }
 

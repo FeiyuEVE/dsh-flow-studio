@@ -1,0 +1,119 @@
+# 数据模型
+
+两类数据：**流程文件**（用户画的图）与 **run 目录**（一次运行的落盘）。两者都在 `$DSH_HOME/flow-studio/` 下，目录 0700、文件 0600；没有另外的覆盖变量。事件字段本身不在这里定义，见 [运行日志](run-log.md) 与契约正文 [design/05](../design/05-run-log.md)。
+
+## 流程文件
+
+一份流程就是一个 JSON：
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "id": "flow-ab12cd34ef",
+  "name": "标准研发流水线",
+  "nodes": [
+    {
+      "id": "n_req", "kind": "stage",        // start | stage | end
+      "title": "需求分析", "x": 300, "y": 220,
+      "mode": "single",                      // single | team
+      "role": "资深需求分析师……",             // 角色定位
+      "task": "把任务卡拆成可验收的需求条目……",  // 负责的事
+      "skills": ["java-service"],            // 引用的 skill 名
+      "outputs": "需求清单 R1..Rn + 风险表",   // 期望产物
+      "maxRounds": 2,                        // 打回上限
+      "model": "",                           // 模型覆盖，空 = 跟随会话
+      "executor": "dsh",                     // dsh（默认）| codex | custom
+      "executorCommand": "",                 // custom 必填；codex 可填可执行文件路径
+      "team": [{ "name": "接口实现", "role": "……", "task": "……" }]
+    }
+  ],
+  "edges": [
+    { "id": "e_1", "from": "n_req", "to": "n_plan", "kind": "next", "label": "" },
+    { "id": "e_2", "from": "n_plan", "to": "n_req", "kind": "reject", "label": "方案被打回" }
+  ]
+}
+```
+
+节点只有三种 `kind`：`start` / `stage` / `end`；只有阶段节点有角色、任务、skill 与主从配置。连线只有两种 `kind`：`next`（正常流转）/ `reject`（打回，目标必须是上游）。
+
+**未识别字段原样收进 `extras`**（有界：键 ≤16、单串 ≤256、总字节 ≤2048、深度 ≤3；坏输入不抛错），后续加字段不会被保存链静默丢掉。
+
+### 校验分两级
+
+- **error（跑不起来）**：没有开始节点、有孤立节点、打回目标不在上游、阶段节点没写任务、`custom` executor 缺命令、外部 executor 配了 team……
+- **warning（能存但作者大概还想改）**：没写角色、主从节点没配子 agent、走不到结束节点……
+
+### 保存宽松、启动严格
+
+v0.7 起：`POST /flows` / `PUT /flows/<id>` 只拒绝「不是 JSON 对象」的请求体，`validation.errors` 非空也照存（画布 600ms 防抖自动保存，半成品必须存得下）；真正拦人的是 `POST /runs/<id>/start` 与 `flow_start` 的 `validateFlowForRun`，非法流程返回 400，不会开跑。运行前校验与引擎同一口径（成环 / 多出边 / 打回指向非阶段节点），在发请求之前就拦住。
+
+### 并发保存
+
+流程文件带 `version`，保存是乐观锁：版本不符返回 **409** 且磁盘零改动；客户端弹出「用我的版本覆盖 / 载入服务器版本」两条出口，不再后写静默覆盖先写。还没有多人实时编辑（看不到对方光标、没有自动合并）。
+
+## Run 落盘布局
+
+```
+$DSH_HOME/flow-studio/runs/
+  <runId>/
+    run.jsonl                      # run 级事件：开始 / 结束 / 状态变更（append-only）
+    run.json                       # run 元数据（可变，原子写；跨进程 meta.lock）
+    sessions.json                  # nodeId → sessionId（一个节点一个会话）
+    messages.jsonl                 # 流程收件箱（append + 分页）
+    lock.json                      # 单写者租约（O_EXCL 创建）
+    meta.lock                      # run.json 写的跨进程锁
+    .error                         # 写盘失败等异常侧车（不静默挂住）
+    <nodeId>/
+      <attemptId>.jsonl            # 该节点这一次执行的全部事件
+      artifacts/                   # 该次执行的产物（需求清单 / 方案 / diff / 报告）
+      self-check-raw.json          # 节点自审的原始回报（不静默丢弃）
+    .index                         # 可选：mtime 快速索引（实现可省，读时扫描兜底）
+```
+
+`runId / nodeId / attemptId` 一律过 `^[A-Za-z0-9._-]{1,64}$` 校验，防路径穿越。单条事件 ≤8KB、单批 ≤200 条、单 run 事件总量 ≤200000，超限 400 并给出当前用量。
+
+### `run.json` 字段
+
+`run.json` 是可变元数据，只有原子重写、没有事件改写。写入有跨进程锁，损坏时先备份并拒绝覆盖（不会被默认值重建，也不会让 `seq` 回退成 1,1）。白名单字段：
+
+| 字段 | 含义 |
+|---|---|
+| `id` / `name` / `flowId` / `flowName` | run 标识与所用流程 |
+| `status` | `pending` / `running` / `done` / `failed` / `aborted` |
+| `started` / `startedAt` / `endedAt` / `createdAt` / `updatedAt` | 生命周期时间 |
+| `workspace` / `sessionMode` / `worktree` | 工作区 `{id, path}`、`sessionMode`、worktree 决策与原因 |
+| `supervision` | run 级自审调度：`enabled` / `wakerSessionId` / `lastWokeAt` / `nextDueAt` / `wakes` / `failures` / `reason` |
+| `nodeStatus` | 节点最新自审状态 `nodeId → {state, progress, summary, verdict, members, blockers, at}`；**256 KiB 字节预算**，超限裁剪并置 `nodeStatusTruncated` |
+| `machine` | 状态机快照 `{version, snapshot?, savedAt?}`；**24 KiB 预算**，超限只丢 `snapshot`、保留 `version` 并置 `machineTruncated` |
+| `limits` | 生效的 `runTimeoutMs` / `nodeTimeoutMs` |
+| `startOptions` | 创建 run 时记下的发起参数（`runtime.patchRunJson` 的唯一写路径） |
+| `progress` / `live` / `input` / `inbox` | 进度、运行时快照、启动输入、收件箱配置 |
+| `nodeDone` / `nodeTotal` / `tokenTotal` / `eventCount` / `lastSeq` / `seq` / `unkeyedCalls` / `tokenTotalApprox` | 计数与用量汇总（列表只读 `run.json`，不读全量事件） |
+| `sessions` | 会话索引（与 `sessions.json` 同源） |
+
+`nodeStatus` 与 `machine` 是两条独立通道，各自量各自的预算；`nodeStatus` 被裁剪不影响 `machine`，反之亦然。
+
+### 状态机快照只是缓存
+
+`run.json.machine` 供恢复加速；**事件流是唯一真相**，任何冲突以 runlog 事件流为准（[design/08 §6](../design/08-state-machine.md)）。生产路径只从初态重放，中途续跑未支持。每次转移额外写一条 `machine/transition` **观测事件**（日志抽屉里的 `⇢`）——只给人看、不参与决策，也不进冻结的 17 种基础事件。`FLOW_STUDIO_FLOW_MACHINE=0` 可回退 0.8.x 的旧主循环（逃生门，留一个发布周期）。
+
+### 写盘失败与崩溃
+
+- 写盘失败把 run 标成 `failed` 并留 `.error` 侧车，不静默挂住；错误文案与实际状态一致，不留 `*.tmp-*`。
+- `appendEvents` 先分配 `seq` 再写事件（崩溃不产生重复 seq）、半行自动断开；启动用 `repairRunCounters` 修计数。
+- 重启后把「`running` 但本进程无实例」的 run 收成 `failed`（跨进程租约保守跳过）；租约过期就地 re-claim，0 字节锁可接管。
+
+## Worktree
+
+`worktree.enabled=true` 时根是 `$DSH_HOME/flow-studio/worktrees/<workspaceId>/<runId>`，分支 `flow/<runId>`（重名依次 `-2`…），base 取工作区 `HEAD`；节点会话与外部 executor 的 `cwd` 都用这份副本。
+
+- **由 `start` 决策**：`run.json.workspace / worktree / sessionMode` 一次写入；工作区是 git 仓库根时 `auto` 才建，建失败如实落 `enabled:false, reason:'create-failed: …'`，绝不假装隔离。`on` 必须开、`off` 不开。
+- **收尾不自动删**：用户可能还要进去看产物、跑测试。`DELETE /runs/<runId>` 只删 run 目录、保留 worktree 并把指针记进孤儿清单。
+- **回收**：`removeWorktree()` 先校验路径必须落在 `<root>/<workspaceId>/` 下，再执行 `git -C <workspace> worktree remove [--force] <path>`；HTTP 入口是 `DELETE /runs/<runId>/worktree` 与 `POST /worktrees {action:'prune', keepRunIds?}`，模型工具是 `flow_worktrees`。prune 会连 `flow/` 前缀的分支一起回收，**绝不碰用户分支**；分支删不掉只记 `skipped` + `branchWarning`，不影响目录清理。
+- **判孤儿**：目录在、对应 run 已删、或 `.git/worktrees` 记录残留，都算孤儿；清理顺序是先 prune（或对仍存在的 run 走 HTTP DELETE），再确认目录消失。
+
+## 延伸阅读
+
+- 事件格式与 kind：[运行日志](run-log.md) → [design/05](../design/05-run-log.md)
+- 校验规则实现：`src/model.js` 的 `validateFlow` / `validateFlowForRun`
+- 运行模型与 worktree 决策：[design/07](../design/07-runtime-0.7.md)

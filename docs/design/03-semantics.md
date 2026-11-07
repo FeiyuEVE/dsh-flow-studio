@@ -390,7 +390,7 @@ T4  若已达该节点打回上限：源节点 → blocked（红虚线描边 + �
 | [GitHub Actions — Using the visualization graph](https://docs.github.com/en/actions/how-tos/monitor-workflows/use-the-visualization-graph) | job 依赖 DAG 的状态表达：状态图标（✓/✗/转圈）+ 颜色双编码、按依赖列位布局——我们状态角标 + 颜色双编码的直接参照（其界面为实际产品观察）。 |
 | [Argo Workflows — 文档与 UI（DAG view）](https://argo-workflows.readthedocs.io/en/release-3.7/) | DAG 视图中「状态色上边框/图标、不大块改填充」的做法——对应我们「运行态只改描边/角标/弱染色 tint，不大块换填充色」的规则。 |
 | ui-ux-pro-max 规则库（本地检索） | `color-not-decorative-only`（功能色必须配图标/文字，反例 5 的依据）、`reduced-motion`、暗色用去饱和浅调变体、字号模块化刻度 12/14/16/18/24、图内数据对比度 ≥3:1。 |
-| [本仓库 README](../../README.md) 与 `src/client/canvas.js` | 出厂模板的 4 条打回拓扑是航道算法的验证用例（§2.2 逐线验证零交叉+1 桥拱）；现版 `rejectPath` 下兜弧线是反例 1 的具体对象；「打回是图的一部分不是例外」是打回线必须有条件文字与轮次刻度的产品立场来源。 |
+| [产品指南：出厂模板与打回拓扑](../guide/overview.md) 与 `src/client/canvas.js` | 出厂模板的 4 条打回拓扑是航道算法的验证用例（§2.2 逐线验证零交叉+1 桥拱）；现版 `rejectPath` 下兜弧线是反例 1 的具体对象；「打回是图的一部分不是例外」是打回线必须有条件文字与轮次刻度的产品立场来源。 |
 
 ---
 

@@ -18,7 +18,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +32,7 @@ const runtimeModule = await import('../src/runtime.js')
 const engineModule = await import('../src/engine.js')
 const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
+const { auditWorkflow } = await import('../src/audit.js')
 const superviseModule = await import('../src/supervise.js')
 
 const { createRuntime: createRuntimeRaw, nodeSelfCheckPrompt } = runtimeModule
@@ -2057,6 +2059,115 @@ try {
     } finally {
       gate.resolve()
       await runtime.dispose().catch(() => {})
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // R5（返工）：runtime 自审走共享验证器；报告副本被替换 / JSON 写坏时结论必须降级
+  // -------------------------------------------------------------------------
+  await check('R5：runtime 自审重读持久化报告副本——副本被替换 / JSON 写坏后 quality 必须降 unknown', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const flowId = 'flow-rt-host-audit'
+      const hostWorkspace = join(home, 'host-audit-ws')
+      mkdirSync(hostWorkspace, { recursive: true })
+      const flow = flowOf(flowId, [
+        startNode(),
+        stage('n_audit', '实现', 300, {
+          check: {
+            command: "mkdir -p reports && printf '{\"suite\":\"unit\",\"passed\":1}' > reports/unit.json",
+            reportPath: 'reports/unit.json',
+          },
+        }),
+        endNode(),
+      ], [next('e1', 'n_start', 'n_audit'), next('e2', 'n_audit', 'n_end')])
+      await saveFlow(flow)
+      const run = await makeRun(flowId)
+      const audits = new Map()
+      const runtime = createRuntime({
+        cwd: hostWorkspace,
+        auditWorkflow: (input) => {
+          const result = auditWorkflow(input)
+          audits.set(input.run && input.run.id, result)
+          return result
+        },
+        activate: async ({ node }) => ({
+          structured: { verdict: 'pass', summary: `${node.id} 通过`, artifacts: [], findings: [] },
+          sessionId: `sess-${node.id}`,
+          dispose: async () => {},
+        }),
+      })
+      // 触发 runtime 自己的 evaluateRun（supervision 到点审计路径），不绕过它直接调 audit。
+      const auditOnce = async () => {
+        runtime.supervision.register(run.id, { wakerSessionId: 'sess-rt-audit' })
+        await runtime.supervision.tick()
+        return audits.get(run.id)
+      }
+      try {
+        await runtime.start(run.id, { workspace: hostWorkspace })
+        await runtime.wait(run.id)
+
+        // 补齐其它证据，让未篡改时的整体 quality 确实是 pass（基线绿，否则本用例没有意义）。
+        // 这些证据也走持久事件流，runtime 自审读到的是同一份磁盘事实。
+        const peerBody = '{"peer":true}'
+        const peerRel = 'evidence/peer.json'
+        mkdirSync(dirname(join(runsRoot, run.id, peerRel)), { recursive: true })
+        writeFileSync(join(runsRoot, run.id, peerRel), peerBody)
+        const peerSha = createHash('sha256').update(peerBody).digest('hex')
+        await store.appendEvents(runsRoot, run.id, [
+          {
+            v: 1, kind: 'artifact/write', nodeId: 'n_peer', attemptId: 1, traceId: 'tr-peer',
+            data: { path: peerRel, bytes: Buffer.byteLength(peerBody), kind: 'json', sha256: peerSha },
+          },
+          {
+            v: 1, kind: 'acceptance/verdict', nodeId: 'n_acc', attemptId: 1, traceId: 'tr-acc',
+            data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+          },
+          {
+            v: 1, kind: 'test/report', nodeId: 'n_test', attemptId: 1, traceId: 'tr-test',
+            data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: peerRel },
+          },
+          {
+            v: 1, kind: 'review/finding', nodeId: 'n_review', attemptId: 1, traceId: 'tr-review',
+            data: { id: 'f1', severity: 'P1', title: '问题', status: 'verified' },
+          },
+          {
+            v: 1, kind: 'review/verdict', nodeId: 'n_review', attemptId: 1, traceId: 'tr-review',
+            data: { verdict: 'approve', findingCount: 1 },
+          },
+        ])
+
+        const baseline = await auditOnce()
+        A.equal(baseline && baseline.quality && baseline.quality.state, 'pass',
+          `未篡改时自审基线必须是 pass：${JSON.stringify(baseline && baseline.quality)}`)
+
+        const events = (await store.readAllEvents(runsRoot, run.id)).events
+        const copy = events.find(event => event.kind === 'artifact/write'
+          && event.extra && event.extra.verificationKind === 'report-copy')
+        A.ok(copy, '宿主检查必须把报告副本落成 artifact/write（verificationKind=report-copy）')
+        const copyAbs = join(runsRoot, run.id, copy.data.path)
+        const original = readFileSync(copyAbs, 'utf8')
+
+        // ① 文件仍在、长度相同，只把 JSON 的 passed 1 换成 0：sha256 必须失配。
+        const replaced = original.replace('"passed":1', '"passed":0')
+        A.equal(replaced.length, original.length, '替换样本必须与原报告等长')
+        writeFileSync(copyAbs, replaced)
+        const tampered = await auditOnce()
+        A.equal(tampered && tampered.quality && tampered.quality.state, 'unknown',
+          `报告副本同长度替换后 quality 必须降 unknown：${JSON.stringify(tampered && tampered.quality)}`)
+        A.ok(tampered.quality.state !== 'pass', '报告副本被替换不能变绿')
+
+        // ② 报告 JSON 直接写坏：同样不能授信。
+        writeFileSync(copyAbs, '{not-json')
+        const broken = await auditOnce()
+        A.equal(broken && broken.quality && broken.quality.state, 'unknown',
+          `报告 JSON 写坏后 quality 必须降 unknown：${JSON.stringify(broken && broken.quality)}`)
+        A.ok(broken.quality.state !== 'pass', '报告 JSON 写坏不能变绿')
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
   })
 

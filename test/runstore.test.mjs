@@ -2575,8 +2575,181 @@ process.stdout.write('OK:' + total)
     assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.some(event => event.nodeId === 'n_inflight'), false)
   })
 
+  // 0.11 R1（本轮·三进程）：租约接管竞态的原子性。
+  // 拓扑刻意做成「3 个真子进程」：三个进程先同时抢初始租约（只有一个赢家 = 旧 owner），
+  // 两个输家在过期后同时抢接管（只有一个赢家 = 新 owner），旧 owner 在接管后先续租拿 409、
+  // 再尝试提交已在飞的业务写。断言：
+  //   ① 任一时点只有一个 owner 能提交业务写（每个 epoch 只有它的 owner 的写落盘）；
+  //   ② 旧 owner 在 409 之后的迟到写即使带着原 fence 也落不了盘（整批 0 条）；
+  //   ③ 落盘事件 seq 连续无重复（两个 owner 的写没有互相覆盖 / 抢同一个 seq）。
+  // 这里断言的是持久化结果（readAllEvents / execution），不信任子进程自己报的 ok。
+  await check('R1（本轮·三进程）：旧 owner + 两个接管者竞态——409 后的迟到写被 fence，单写者', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.startRun(runsRoot, meta.id, { now: new Date() })
+    const startAt = Date.now() + 1500
+    const takeoverAt = startAt + 1500
+    const childScript = join(home, 'lease-race-child.mjs')
+    const runstoreHref = new URL('../src/runstore.js', import.meta.url).href
+    writeFileSync(childScript, `
+const [root, id, role, startAtRaw, takeoverAtRaw] = process.argv.slice(2)
+const store = await import(${JSON.stringify(runstoreHref)})
+const sleep = ms => new Promise(done => setTimeout(done, ms))
+const waitUntil = async at => { const wait = Number(at) - Date.now(); if (wait > 0) await sleep(wait) }
+const ownerId = \`race-\${role}\`
+const pid = process.pid
+const host = \`host-\${role}\`
+const emit = value => process.stdout.write(\`\${JSON.stringify(value)}\\n\`)
+const writeBusiness = async (nodeId, fence) => {
+  try {
+    const result = await store.appendEvents(root, id, [{
+      v: 1,
+      kind: 'node/start',
+      nodeId,
+      attemptId: 1,
+      traceId: \`tr-\${ownerId}-\${nodeId}\`,
+      extra: { writer: ownerId, writerEpoch: fence.leaseEpoch },
+      data: { title: nodeId, mode: 'single', skills: [] },
+    }], fence)
+    emit({ role, step: \`write:\${nodeId}\`, ok: true, seq: result.lastSeq })
+    return true
+  } catch (error) {
+    emit({ role, step: \`write:\${nodeId}\`, ok: false, status: error && error.status, code: error && error.code })
+    return false
+  }
+}
+await waitUntil(startAtRaw)
+let first = null
+try {
+  first = await store.claimLease(root, id, { pid, host, ownerId, ttlMs: 400 })
+  emit({ role, step: 'claim1', ok: true, epoch: first.epoch })
+} catch (error) {
+  emit({ role, step: 'claim1', ok: false, status: error && error.status })
+}
+if (first) {
+  // 旧 owner 在租约还有效时先写一条：这是合法业务写，必须保留。
+  await writeBusiness('n_old_pre', { ownerId, leaseEpoch: first.epoch })
+  await waitUntil(Number(takeoverAtRaw) + 500)
+  try {
+    await store.renewLease(root, id, { pid, host, ownerId })
+    emit({ role, step: 'renew', ok: true })
+  } catch (error) {
+    emit({ role, step: 'renew', ok: false, status: error && error.status })
+  }
+  await waitUntil(Number(takeoverAtRaw) + 1000)
+  // 已确知失权（409）之后才提交的迟到写：必须被持久 fence 拒绝。
+  await writeBusiness('n_old_late', { ownerId, leaseEpoch: first.epoch })
+} else {
+  await waitUntil(takeoverAtRaw)
+  let second = null
+  try {
+    second = await store.claimLease(root, id, { pid, host, ownerId, ttlMs: 60000 })
+    emit({ role, step: 'claim2', ok: true, epoch: second.epoch })
+  } catch (error) {
+    emit({ role, step: 'claim2', ok: false, status: error && error.status })
+  }
+  await waitUntil(Number(takeoverAtRaw) + 1000)
+  if (second) {
+    await writeBusiness('n_winner', { ownerId, leaseEpoch: second.epoch })
+  } else {
+    // 输掉接管的进程拿不到 ownerId 凭证：即使读到当前 epoch，也不能写。
+    const current = await store.readRunMeta(root, id)
+    const epoch = current && current.execution && Number.isInteger(current.execution.epoch)
+      ? current.execution.epoch
+      : 0
+    await writeBusiness('n_loser', { ownerId, leaseEpoch: epoch })
+  }
+}
+`)
+
+    const runChild = role => new Promise((resolveChild, rejectChild) => {
+      const proc = spawn(
+        process.execPath,
+        [childScript, runsRoot, meta.id, role, String(startAt), String(takeoverAt)],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      )
+      let stdout = ''
+      let stderr = ''
+      proc.stdout.on('data', chunk => { stdout += chunk })
+      proc.stderr.on('data', chunk => { stderr += chunk })
+      proc.on('error', rejectChild)
+      proc.on('close', code => {
+        const reports = stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+          try {
+            return JSON.parse(line)
+          } catch {
+            return { parseError: line }
+          }
+        })
+        resolveChild({ role, code, reports, stderr })
+      })
+    })
+
+    const roles = ['alpha', 'beta', 'gamma']
+    const results = await Promise.all(roles.map(runChild))
+    const reports = results.flatMap(item => item.reports)
+    const stepOf = (role, step) => reports.find(item => item.role === role && item.step === step)
+    const claim1 = reports.filter(item => item.step === 'claim1')
+    const claim1Wins = claim1.filter(item => item.ok === true)
+    assert.equal(results.every(item => item.code === 0), true,
+      `三个子进程都必须正常退出：${results.map(item => `${item.role}=${item.code} ${item.stderr.slice(0, 200)}`).join(' | ')}`)
+    assert.equal(claim1.length, 3, '三个进程都必须真的参与初始租约竞争')
+    assert.equal(claim1Wins.length, 1, `初始租约只能有一个赢家：${JSON.stringify(claim1)}`)
+    assert.equal(claim1.filter(item => item.ok === false && item.status === 409).length, 2,
+      `另外两个进程必须拿到 409：${JSON.stringify(claim1)}`)
+
+    const oldRole = claim1Wins[0].role
+    const losers = roles.filter(role => role !== oldRole)
+    const claim2 = reports.filter(item => item.step === 'claim2')
+    const claim2Wins = claim2.filter(item => item.ok === true)
+    assert.equal(claim2.length, 2, '两个初始输家都必须参与接管竞争')
+    assert.equal(claim2Wins.length, 1, `接管只能有一个赢家：${JSON.stringify(claim2)}`)
+    assert.equal(claim2.filter(item => item.ok === false && item.status === 409).length, 1,
+      `另一个接管者必须拿到 409：${JSON.stringify(claim2)}`)
+
+    const renew = stepOf(oldRole, 'renew')
+    assert.equal(renew && renew.ok, false, `旧 owner 续租必须被拒：${JSON.stringify(renew)}`)
+    assert.equal(renew && renew.status, 409, '旧 owner 续租必须是 409')
+
+    // 先断言持久化事实（旧实现下这里会先红）：迟到写 / 失败者写不得出现在事件流里。
+    const persisted = (await store.readAllEvents(runsRoot, meta.id)).events
+    const late = persisted.filter(event => event.nodeId === 'n_old_late')
+    const loserWrite = persisted.filter(event => event.nodeId === 'n_loser')
+    assert.equal(late.length, 0, `旧 owner 在 409 之后的迟到写不得落盘（实际 ${late.length} 条）`)
+    assert.equal(loserWrite.length, 0, `没有 ownerId 凭证的进程不得提交业务写（实际 ${loserWrite.length} 条）`)
+
+    const winnerRole = claim2Wins[0].role
+    const winnerId = `race-${winnerRole}`
+    const pre = persisted.filter(event => event.nodeId === 'n_old_pre')
+    const won = persisted.filter(event => event.nodeId === 'n_winner')
+    assert.equal(pre.length, 1, '旧 owner 失权前的合法写必须保留')
+    assert.equal(won.length, 1, '接管者的业务写必须落盘（且只有一条）')
+    assert.ok(pre[0].seq < won[0].seq, '旧 owner 的合法写必须在接管者写之前')
+
+    assert.equal(stepOf(oldRole, 'write:n_old_pre').ok, true)
+    assert.equal(stepOf(oldRole, 'write:n_old_late').ok, false, '旧 owner 迟到写必须被拒')
+    assert.equal(stepOf(oldRole, 'write:n_old_late').code, 'LEASE_FENCED', '旧 owner 迟到写必须带 LEASE_FENCED')
+    assert.equal(stepOf(winnerRole, 'write:n_winner').ok, true, '接管者写必须成功')
+    const loserRole = losers.find(role => role !== winnerRole)
+    assert.equal(stepOf(loserRole, 'write:n_loser').ok, false, '落败接管者不得提交业务写')
+    assert.equal(stepOf(loserRole, 'write:n_loser').code, 'LEASE_FENCED', '落败接管者必须带 LEASE_FENCED')
+
+    // 单写者 / 世代：run.json.execution 只能指向最终 owner；每个 epoch 只出现一个 writer。
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2, '一次接管后 epoch 必须恰好推进到 2')
+    assert.equal(after.execution.ownerId, winnerId, 'run.json.execution.ownerId 必须是最终 owner')
+    assert.equal(pre[0].extra.writer, `race-${oldRole}`, '旧 owner 的写必须带自己的 writer 标记')
+    assert.equal(String(pre[0].extra.writerEpoch), '1', '旧 owner 的写必须属于 epoch 1')
+    assert.equal(won[0].extra.writer, winnerId, '接管者的写必须带自己的 writer 标记')
+    assert.equal(String(won[0].extra.writerEpoch), '2', '接管者的写必须属于 epoch 2')
+    const seqs = persisted.map(event => event.seq).sort((a, b) => a - b)
+    assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, index) => index + 1),
+      '事件 seq 必须连续、无重复（两个 owner 的写没有抢同一个 seq）')
+    console.log(`  · old=${oldRole} winner=${winnerRole} loser=${loserRole} events=${persisted.length}`)
+  })
+
   // 0.11 R5（本轮）：index / runtime 共用的验证器必须重读报告副本字节
-  await check('R5（本轮）：共享验证器重读报告副本 sha256，副本删除后撤销权威', async () => {
+  await check('R5（本轮）：共享验证器重读报告副本 sha256，副本篡改 / 删除后撤销权威', async () => {
     const meta = await makeRun()
     await store.startRun(runsRoot, meta.id, { now: NOW })
     const rel = 'n_reg/artifacts/1/report.json'
@@ -2623,6 +2796,13 @@ process.stdout.write('OK:' + total)
     const verify = store.buildHostExecutionVerifier(execs, all.events, meta.id, join(runsRoot, meta.id))
     const checkEvent = all.events.find(event => event.kind === 'check/form')
     assert.equal(verify(checkEvent), true, '报告副本字节与登记 sha256 一致时授信')
+    // 关键防伪断言：文件仍在、长度不变，只替换内容（passed 1 → 0）。
+    // 若有人把验证器里的 digest 比较删掉，这条会由 false 变 true → 必红。
+    const tampered = body.replace('"passed":1', '"passed":0')
+    assert.notEqual(tampered, body, '篡改样本必须与原报告等长且内容不同')
+    assert.equal(tampered.length, body.length, '篡改样本必须与原报告等长')
+    writeFileSync(abs, tampered)
+    assert.equal(verify(checkEvent), false, '报告副本内容被篡改（同长度）后不得继续授信')
     rmSync(abs, { force: true })
     assert.equal(verify(checkEvent), false, '报告副本删除后不得继续授信')
   })

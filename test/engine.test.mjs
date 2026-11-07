@@ -12,7 +12,8 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -221,11 +222,35 @@ function makeGitRepo(name) {
 /**
  * 造一个**不在任何 git 仓库里**的空目录。项目 `.tmp/` 本身在插件仓库内
  * （`git rev-parse --show-toplevel` 会返回仓库根），测「非 git 工作区」必须放在仓库外；
- * 按工作区约定用大卷 `~/tmp`（不进 /tmp，也不污染仓库）。
+ * 按工作区约定优先用大卷 `~/tmp`（不进 /tmp，也不污染仓库）。
+ *
+ * 0.11 修：容器/沙箱里 `$HOME` 常常是**不可写**的（dsh 的 bash 沙箱只放开工作区与
+ * /tmp 的 tmpfs），原来直接 `mkdir $HOME/tmp` 会 EACCES，把整条基线测成红的，
+ * 看起来像产品回归。这里改成「按顺序试，谁真能写就用谁」，全部不可写时退回
+ * `os.tmpdir()`（沙箱内即 /tmp，仍然在仓库外，语义不变）。
+ * 可用 `FLOW_STUDIO_TEST_TMP` 显式指定。
  */
+function scratchOutsideRepo() {
+  const candidates = [
+    process.env.FLOW_STUDIO_TEST_TMP,
+    process.env.HOME ? join(process.env.HOME, 'tmp') : null,
+  ].filter(candidate => typeof candidate === 'string' && candidate !== '')
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      accessSync(dir, constants.W_OK)
+      return dir
+    } catch {
+      // 试下一个候选
+    }
+  }
+  const fallback = tmpdir()
+  mkdirSync(fallback, { recursive: true })
+  return fallback
+}
+
 function makePlainDir(name) {
-  const base = join(process.env.HOME || repoRoot, 'tmp')
-  mkdirSync(base, { recursive: true })
+  const base = scratchOutsideRepo()
   return mkdtempSync(join(base, `flow-studio-${name}-`))
 }
 

@@ -148,6 +148,81 @@ await check('0.9.1 覆盖前留旧版本备份：.history/<id>.v<version>.json�
   assert.equal(listed.some(item => item.id.includes('history')), false, '.history 不能出现在流程列表里')
 })
 
+await check('0.9.1 同 version 重复备份不覆盖已有历史（撤销重建按 v1 复现）', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const twoNodes = {
+    name: '事故前',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' },
+      { id: 'b', kind: 'end', title: '完成', x: 300, y: 0, task: 't' },
+    ],
+    edges: [{ from: 'a', to: 'b', kind: 'next' }],
+  }
+  await store.saveFlow(dir, id, twoNodes) // v1
+  await store.saveFlow(dir, id, { name: '覆盖 1', nodes: [], edges: [] }) // v2，旧 v1 进 .history
+  const historyPath = join(dir, '.history', `${id}.v1.json`)
+  const before = JSON.parse(readFileSync(historyPath, 'utf8'))
+  assert.equal(before.version, 1)
+  assert.equal(before.nodes.length, 2, '前提：v1 备份应当留着删除前的两个节点')
+
+  // 撤销 = 服务器上这份文件没了，客户端按手里的图从 v1 重建（绕开 deleteFlow，历史目录还在）。
+  rmSync(join(dir, `${id}.json`))
+  const rebuilt = await store.saveFlow(dir, id, {
+    name: '撤销重建',
+    nodes: [{ id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' }],
+    edges: [],
+  })
+  assert.equal(rebuilt.version, 1)
+  // 再覆盖一次：同 version=1 会再次触发 stash，绝不能把上面那份证据覆盖掉。
+  await store.saveFlow(dir, id, { name: '撤销后再覆盖', nodes: [], edges: [] })
+  const after = JSON.parse(readFileSync(historyPath, 'utf8'))
+  assert.equal(after.name, '事故前', '同 version 的后来者不能覆盖已有备份')
+  assert.equal(after.nodes.length, 2, '已有备份必须原样留着')
+  assert.equal(after.version, 1)
+})
+
+await check('0.9.1 deleteFlow 归档历史备份：活动 .history 不留该 id，历史目录缺失也不抛错', async () => {
+  const dir = store.flowsDir(home)
+  const id = store.newFlowId()
+  const twoNodes = {
+    name: '删除前',
+    nodes: [
+      { id: 'a', kind: 'start', title: '开始', x: 0, y: 0, task: 't' },
+      { id: 'b', kind: 'end', title: '完成', x: 300, y: 0, task: 't' },
+    ],
+    edges: [{ from: 'a', to: 'b', kind: 'next' }],
+  }
+  await store.saveFlow(dir, id, twoNodes) // v1
+  await store.saveFlow(dir, id, { name: '覆盖后', nodes: [], edges: [] }) // v2，v1 进 .history
+  const historyDir = join(dir, '.history')
+  assert.equal(existsSync(join(historyDir, `${id}.v1.json`)), true, '前提：覆盖前应当有 v1 备份')
+
+  assert.equal(await store.deleteFlow(dir, id), true)
+  const stillActive = readdirSync(historyDir)
+    .filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+  assert.deepEqual(stillActive, [], '删除后活动历史不能还留该 id 的备份：' + stillActive.join(','))
+  const archivedDir = join(historyDir, 'deleted')
+  const archived = readdirSync(archivedDir)
+    .filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+  assert.equal(archived.length, 1, '删除前的备份应挪进 .history/deleted/ 归档：' + archived.join(','))
+  const kept = JSON.parse(readFileSync(join(archivedDir, archived[0]), 'utf8'))
+  assert.equal(kept.name, '删除前')
+  assert.equal(kept.nodes.length, 2, '归档里必须是删除前那份证据')
+  assert.equal(await store.deleteFlow(dir, id), false, '文件不存在仍返回 false')
+
+  // 没有任何 .history 目录时删除照样成功，归档失败不能改变返回值 / 不能抛错。
+  const bareDir = join(home, 'flow-studio', `flows-bare-${id}`)
+  mkdirSync(bareDir, { recursive: true })
+  writeFileSync(
+    join(bareDir, 'flow-bare.json'),
+    JSON.stringify({ id: 'flow-bare', name: '无历史', nodes: [], edges: [] }),
+  )
+  assert.equal(await store.deleteFlow(bareDir, 'flow-bare'), true)
+  assert.equal(existsSync(join(bareDir, 'flow-bare.json')), false)
+  assert.equal(existsSync(join(bareDir, '.history')), false, '删除不该凭空造出历史目录')
+})
+
 await check('非法 id 一律拒绝', async () => {
   const dir = store.flowsDir(home)
   assert.equal(store.checkId('../etc/passwd'), null)
@@ -360,25 +435,39 @@ await check('PUT 后 GET 拿到同一份内容', async () => {
   assert.equal(validateFlow(got.json.flow).ok, true)
 })
 
-await check('0.9.1 PUT 缺 nodes/edges 键 → 400，流程不被写成空图', async () => {
+await check('0.9.1 PUT 缺 nodes/edges 键或不是数组 → 400，流程不被写成空图', async () => {
   const created = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('缺字段'))
   const id = created.json.flow.id
+  const flowPath = join(store.flowsDir(home), `${id}.json`)
   // 真事故形态：把「流程列表摘要」{id,name,nodeCount,edgeCount,…} 当流程 PUT 回来。
   const list = await call(route, 'GET', '/api/flow-studio/flows')
   const summary = list.json.flows.find(item => item.id === id)
   assert.ok(summary && !('nodes' in summary), '前提：摘要本来就没有 nodes')
-  const rejected = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, summary)
-  assert.equal(rejected.status, 400, JSON.stringify(rejected.json))
-  assert.equal(rejected.json.code, 'FLOW_BODY_INCOMPLETE')
-  assert.match(rejected.json.error, /nodes/)
-  const after = await call(route, 'GET', `/api/flow-studio/flows/${id}`)
-  assert.equal(after.json.flow.nodes.length, 2, '被拒绝的 PUT 一个字节都不能写盘')
-  assert.equal(after.json.flow.version, 1, '被拒绝的 PUT 不能推进版本号')
+  const badBodies = [
+    ['列表摘要', summary],
+    ['nodes/edges 为 null', { name: 'null 图', nodes: null, edges: null }],
+    ['nodes 不是数组', { name: '类型错', nodes: 'x', edges: [] }],
+    ['只有 name', { name: '只有名字' }],
+  ]
+  for (const [label, body] of badBodies) {
+    const rejected = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, body)
+    assert.equal(rejected.status, 400, label + '：' + JSON.stringify(rejected.json))
+    assert.equal(rejected.json.code, 'FLOW_BODY_INCOMPLETE', label)
+    assert.match(rejected.json.error, /nodes/, label)
+    assert.match(rejected.json.error, /数组/, label)
+    const after = await call(route, 'GET', `/api/flow-studio/flows/${id}`)
+    assert.equal(after.json.flow.nodes.length, 2, label + '：被拒绝的 PUT 一个字节都不能写盘')
+    assert.equal(after.json.flow.version, 1, label + '：被拒绝的 PUT 不能推进版本号')
+    const raw = JSON.parse(readFileSync(flowPath, 'utf8'))
+    assert.equal(raw.version, 1, label + '：磁盘版本号必须不变')
+    assert.equal(raw.nodes.length, 2, label + '：磁盘节点数必须不变')
+  }
 
-  // 反向：用户真的删光节点（nodes: [] 键在）仍然允许保存，宽松口径不变。
+  // 反向：用户真的删光节点（nodes: [] 键在且是数组）仍然允许保存，宽松口径不变。
   const emptied = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, { name: '删光了', nodes: [], edges: [] })
   assert.equal(emptied.status, 200, '空图仍然要能保存')
   assert.equal(emptied.json.flow.nodes.length, 0)
+  assert.equal(emptied.json.flow.version, 2, '整份替换仍然推进版本号')
 })
 
 await check('POST 新建不校验版本，body.version 不生效，一律从 v1 开始', async () => {
@@ -438,6 +527,41 @@ await check('DELETE 后 GET 回归 404', async () => {
   assert.equal(del.status, 200)
   const got = await call(route, 'GET', `/api/flow-studio/flows/${id}`)
   assert.equal(got.status, 404)
+})
+
+await check('0.9.1 删除→撤销→再覆盖：删除前证据进 deleted/，重建流程从干净历史重新开始', async () => {
+  const created = await call(route, 'POST', '/api/flow-studio/flows', validFlowBody('撤销链路'))
+  const id = created.json.flow.id
+  const dir = store.flowsDir(home)
+  // 真事故形态：客户端把图清空后保存 → v2 是空图，v1（两个节点）进 .history。
+  const emptied = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+    name: '撤销链路',
+    nodes: [],
+    edges: [],
+  })
+  assert.equal(emptied.json.flow.version, 2)
+  // 删除：活动历史被归档。
+  const deleted = await call(route, 'DELETE', `/api/flow-studio/flows/${id}`)
+  assert.equal(deleted.status, 200)
+  // 撤销：按删除前手里的内容写回；磁盘上没文件，Host 按整份替换的 upsert 语义从 v1 重建。
+  const restored = await call(route, 'PUT', `/api/flow-studio/flows/${id}`, {
+    name: '撤销链路',
+    nodes: [],
+    edges: [],
+  })
+  assert.equal(restored.status, 200)
+  assert.equal(restored.json.flow.version, 1, '撤销重建必须回到 v1')
+  // 再保存一次：重建后的 v1 要有自己的备份，且不能与删除前的证据互相覆盖。
+  await call(route, 'PUT', `/api/flow-studio/flows/${id}`, { name: '撤销后再覆盖', nodes: [], edges: [] })
+  const historyDir = join(dir, '.history')
+  const active = readdirSync(historyDir).filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+  assert.deepEqual(active, [`${id}.v1.json`], '重建后的 v1 备份应当在活动历史里：' + active.join(','))
+  const archived = readdirSync(join(historyDir, 'deleted'))
+    .filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+  assert.equal(archived.length, 1, '删除前那份证据应当在 deleted/ 归档里：' + archived.join(','))
+  const evidence = JSON.parse(readFileSync(join(historyDir, 'deleted', archived[0]), 'utf8'))
+  assert.equal(evidence.name, '撤销链路')
+  assert.equal(evidence.nodes.length, 2, '归档的必须是删除前的两个节点')
 })
 
 await check('没有 skills 服务时 /skills 返回空表', async () => {

@@ -8,7 +8,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -210,29 +210,81 @@ async function seedDefaultFlow(dir) {
  * 备份失败绝不挡保存（这是兜底，不是主路径）。
  */
 const HISTORY_DIR = '.history'
+/** 删除流程后，活动历史挪进这个子目录，避免与「重建后同名同 version」的备份混在一起。 */
+const HISTORY_DELETED_DIR = 'deleted'
 const HISTORY_KEEP = 3
+
+/** 备份目标是否已存在；除 ENOENT 外一律按「已存在」处理——宁可少备份，也不覆盖已有证据。 */
+async function historyExists(path) {
+  try {
+    await stat(path)
+    return true
+  } catch (error) {
+    return !(error && error.code === 'ENOENT')
+  }
+}
 
 async function stashFlowHistory(dir, id, version) {
   const from = join(dir, `${id}.json`)
-  const to = join(dir, HISTORY_DIR, `${id}.v${version}.json`)
+  const historyDir = join(dir, HISTORY_DIR)
+  const to = join(historyDir, `${id}.v${version}.json`)
   try {
-    await mkdir(join(dir, HISTORY_DIR), { recursive: true, mode: DIR_MODE })
-    await copyFile(from, to)
+    await mkdir(historyDir, { recursive: true, mode: DIR_MODE })
+    // 同一 version 只留第一次备份：删除流程后按新文件从 v1 重建、再保存，会再次走到 v1，
+    // 这里若直接 copyFile 就会把删除前那份事故证据覆盖掉。
+    if (!(await historyExists(to))) await copyFile(from, to)
   } catch {
     return
   }
   try {
-    const names = await readdir(join(dir, HISTORY_DIR))
+    const names = await readdir(historyDir)
     const mine = names
       .filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
       .map(name => ({ name, version: Number(name.slice(id.length + 2, -'.json'.length)) }))
       .filter(item => Number.isFinite(item.version))
       .sort((a, b) => b.version - a.version)
     for (const item of mine.slice(HISTORY_KEEP)) {
-      await unlink(join(dir, HISTORY_DIR, item.name)).catch(() => {})
+      await unlink(join(historyDir, item.name)).catch(() => {})
     }
   } catch {
     // 清理失败只是多留几份备份，不影响正确性。
+  }
+}
+
+/**
+ * 删除流程成功后，把它在 `.history` 下的活动备份挪进 `.history/deleted/`。
+ *
+ * 选择「挪走」而不是「直接删」：0.9.1 这套备份的存在意义就是留着事故前的样子，
+ * 删除流程本身也是一次不可逆操作（客户端可能只是误删、随后撤销重建）。挪进归档
+ * 子目录既保住了证据，又让重建后的流程从干净的活动历史重新开始——否则同 version
+ * 的旧备份会让「不覆盖」规则把新流程的 v1 证据挡掉。
+ *
+ * 历史目录不存在 / 挪动失败一律静默：这是兜底，不改变 deleteFlow 的返回值语义。
+ */
+async function retireFlowHistory(dir, id) {
+  const historyDir = join(dir, HISTORY_DIR)
+  let names
+  try {
+    names = await readdir(historyDir)
+  } catch {
+    return
+  }
+  const mine = names.filter(name => name.startsWith(`${id}.v`) && name.endsWith('.json'))
+  if (mine.length === 0) return
+  const deletedDir = join(historyDir, HISTORY_DELETED_DIR)
+  try {
+    await mkdir(deletedDir, { recursive: true, mode: DIR_MODE })
+  } catch {
+    return
+  }
+  for (const name of mine) {
+    const from = join(historyDir, name)
+    const to = join(deletedDir, name)
+    // 同一个 id 被反复建 / 删时归档名可能重名：加时间戳后缀，绝不覆盖已归档的证据。
+    const target = (await historyExists(to))
+      ? join(deletedDir, `${name.slice(0, -'.json'.length)}-${Date.now()}.json`)
+      : to
+    await rename(from, target).catch(() => {})
   }
 }
 
@@ -292,6 +344,9 @@ export async function saveFlow(dir, id, body, fallback) {
 
 /**
  * 删除一份流程。
+ *
+ * 文件真的删掉（返回 true）之后，才把它在 `.history` 下的活动备份归档进
+ * `.history/deleted/`；归档只是兜底，读写历史失败都不影响「文件在不在」这个返回值。
  * @returns {Promise<boolean>} 原本是否存在
  */
 export async function deleteFlow(dir, id) {
@@ -299,9 +354,10 @@ export async function deleteFlow(dir, id) {
   if (!safe) return false
   try {
     await unlink(join(dir, `${safe}.json`))
-    return true
   } catch (error) {
     if (error && error.code === 'ENOENT') return false
     throw error
   }
+  await retireFlowHistory(dir, safe).catch(() => {})
+  return true
 }

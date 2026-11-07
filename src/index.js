@@ -899,20 +899,23 @@ function rejectMalformedFlowBody(res, body) {
 
 /**
  * 0.9.1 实证事故：`PUT /flows/<id>` 是**整份替换**语义。请求体里连 `nodes` / `edges`
- * 键都没有（典型是把「流程列表摘要」`{id,name,nodeCount,…}` 当流程发过来）时，
- * `normalizeFlow` 会兜成空数组，服务器上的流程就被静默写成空图。
+ * 键都没有（典型是把「流程列表摘要」`{id,name,nodeCount,…}` 当流程发过来），或键在但值
+ * 不是数组（`nodes: null` / `nodes: 'nope'`）时，`normalizeFlow` 会兜成空数组，
+ * 服务器上的流程就被静默写成空图。
  *
- * 这里只拒绝「键缺失」：键在、但值是空数组或类型古怪，仍然放行 —— 那是 0.7 拍板的
- * 宽松保存口径（画布自动保存的中间态必然非法，一律 200 + validation，严格口径留给启动 run）。
+ * 因此这里要求两个键**存在且都是数组**。空数组仍然放行 —— 那是 0.7 拍板的宽松保存口径
+ * （画布自动保存的中间态必然非法，一律 200 + validation，严格口径留给启动 run）。
+ * 只用于 PUT：POST 新建的宽松口径有既有契约，不在此列。
  */
 function rejectIncompleteFlowBody(res, body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false
-  const missing = ['nodes', 'edges'].filter(key => !Object.prototype.hasOwnProperty.call(body, key))
-  if (missing.length === 0) return false
+  const invalid = ['nodes', 'edges'].filter(key => !Array.isArray(body[key]))
+  if (invalid.length === 0) return false
   sendJson(res, 400, {
     ok: false,
     code: 'FLOW_BODY_INCOMPLETE',
-    error: '保存流程必须带 ' + missing.join(' / ') + ' 字段：PUT 是整份替换语义，缺字段会把流程写成空图',
+    error: '保存流程必须带 nodes / edges 数组：PUT 是整份替换语义，缺字段或类型不对会把流程写成空图（不合格：'
+      + invalid.join(' / ') + '）',
   })
   return true
 }
@@ -1197,7 +1200,7 @@ async function route(req, res, env) {
         }
         // 保存不因 validation.errors 拒绝（自动保存 + 中间态必然非法）；只有形状垃圾才是 400。
         if (rejectMalformedFlowBody(res, payload)) return
-        // 0.9.1：缺 nodes/edges 键的「整份替换」一律拒绝，否则会把流程写成空图。
+        // 0.9.1：缺 nodes/edges 键或值不是数组的「整份替换」一律拒绝，否则会把流程写成空图。
         if (rejectIncompleteFlowBody(res, payload)) return
         // G6-a ②：含 executor:'custom' 的流程，主机开关关着时保存即 400（与启动同口径）。
         const customGate = customExecutorBlockers(payload)

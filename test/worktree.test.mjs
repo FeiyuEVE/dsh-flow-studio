@@ -152,6 +152,37 @@ function branchesOf(repo) {
 }
 
 /** 模拟 git 非 0 退出：error.status 是数字退出码。 */
+/**
+ * 当前 git 是否支持 `git worktree add --orphan`（git 2.42+）。
+ *
+ * 真跑一次探测而不是解析版本号（发行版可能回移开关）。缓存结果，避免每条用例 fork。
+ * 不支持时相关用例**明示跳过**：旧 git 上「空仓库也能开隔离副本」不可能成立，
+ * 产品会走 `WORKTREE_CREATE_FAILED(empty-repo)` + 降级，那是另一条已覆盖的路径。
+ */
+let orphanSupport = null
+function supportsOrphanWorktree() {
+  if (orphanSupport !== null) return orphanSupport
+  const probe = mkdtempSync(join(repoRoot, '.tmp', 'orphan-probe-'))
+  try {
+    const gitHome = mkdtempSync(join(repoRoot, '.tmp', 'orphan-probe-home-'))
+    const run = args => execFileSync('git', args, {
+      cwd: probe,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: gitHome, GIT_CONFIG_NOSYSTEM: '1' },
+    })
+    run(['init', '-q'])
+    run(['worktree', 'add', '--orphan', join(probe, 'wt')])
+    orphanSupport = true
+    rmSync(gitHome, { recursive: true, force: true })
+  } catch {
+    orphanSupport = false
+  } finally {
+    rmSync(probe, { recursive: true, force: true })
+  }
+  return orphanSupport
+}
+
 function gitFailure(stderr, status = 1) {
   const error = new Error(stderr || `git exit ${status}`)
   error.code = status
@@ -983,6 +1014,10 @@ try {
   console.log('worktree · 空仓库（真 git）')
 
   await check('没有 commit 的空仓库：用 --orphan 建出 worktree，baseCommit 为 null', async () => {
+    if (!supportsOrphanWorktree()) {
+      console.log('  · 当前 git 不支持 `worktree add --orphan`（需 ≥2.42），明示跳过该用例')
+      return
+    }
     const emptyRepo = join(home, 'repo-empty')
     mkdirSync(emptyRepo, { recursive: true })
     git(['init'], emptyRepo)

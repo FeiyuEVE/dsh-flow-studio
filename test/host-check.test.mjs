@@ -264,6 +264,139 @@ await check('F3 reportPath：二进制里的空格形态凭据也按字节脱敏
   assert.equal(copy.includes(Buffer.from('http://127.0.0.1/x')), true, '后面的 URL 不能被吞掉')
 })
 
+// 0.11 N6（复核2）：标志位的「前导分隔符」是文本假设。二进制记录里标志位前往往是
+// NUL / 长度前缀 / protobuf tag 等任意字节，旧规则的字符类 `[\s"'`;|&(=,\[]` 不命中，
+// `--api-key <值>` / `--password <值>` 会原样进公开副本。
+await check('N6：二进制报告里标志位前是 NUL / 控制字节时也必须按字节脱敏', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-n6-bin-5c2a'
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from([0x1c, 0x00]),
+    Buffer.from(`--api-key ${canary}`),
+    Buffer.from([0x12]),
+    Buffer.from(`--password ${canary}-pw`),
+    Buffer.from([0x80, 0x81]),
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/flags.bin', reportPath: 'reports/flags.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes
+  assert.equal(copy.includes(Buffer.from(canary)), false, 'NUL 前面的 --api-key 值不得泄漏')
+  assert.equal(copy.includes(Buffer.from(`${canary}-pw`)), false, '控制字节前面的 --password 值不得泄漏')
+  assert.equal(copy.includes(Buffer.from('--api-key [REDACTED]')), true, '标志位与 [REDACTED] 标记必须保留')
+  assert.equal(copy.includes(Buffer.from('--password [REDACTED]')), true, '标志位与 [REDACTED] 标记必须保留')
+  // 非命中字节逐字节保留：0xFF/0xFE 头、前导控制字节、尾部高位字节都不许被改写。
+  assert.equal(copy[0], 0xff)
+  assert.equal(copy[1], 0xfe)
+  assert.equal(copy.includes(Buffer.from([0x1c, 0x00])), true, '未被命中的前导字节必须原样保留')
+  assert.equal(copy.includes(Buffer.from([0x12])), true)
+  assert.deepEqual(Array.from(copy.subarray(copy.length - 2)), [0x80, 0x81])
+  assert.equal(result.reportOpaque, true)
+})
+
+// 同一缺陷在文本路径同样存在：`\u0000--api-key <值>` 是合法 UTF-8，会走文本脱敏。
+await check('N6：文本报告里标志位前是 NUL / 控制字节时也脱敏（合法 UTF-8 路径）', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-n6-text-7b3d'
+  mkdirSync(join(dir, 'reports'))
+  const raw = `\u0000--api-key ${canary}\u0001 tail`
+  writeFileSync(join(dir, 'seed.txt'), Buffer.from(raw, 'utf8'))
+  const result = await runHostCheck({
+    check: { command: 'cp seed.txt reports/flags.txt', reportPath: 'reports/flags.txt' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes.toString('utf8')
+  assert.equal(copy.includes(canary), false, 'NUL 前面的 --api-key 值不得泄漏（文本路径）')
+  assert.equal(copy, `\u0000--api-key [REDACTED]\u0001 tail`,
+    '只替换凭据值，前导 NUL / 后续控制字节与普通文本必须原样保留')
+  assert.equal(result.reportOpaque, false, '合法 UTF-8 报告仍走文本路径')
+})
+
+// 0.11 N7（复核2）：`token=<值>` 的值字符类原本包含 NUL，会把其后的 `\0tail` 一起吞掉，
+// 公开副本因此变短、丢失非凭据字节。二进制路径与文本路径都必须只替换凭据段。
+await check('N7：二进制报告 token=<canary>\\0tail 只替换凭据段，尾部 NUL+tail 逐字节保留', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-n7-bin-2f61'
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from(`token=${canary}`),
+    Buffer.from([0x00]),
+    Buffer.from('tail'),
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/nul.bin', reportPath: 'reports/nul.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes
+  const expected = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('token="[REDACTED]"'),
+    Buffer.from([0x00]),
+    Buffer.from('tail'),
+  ])
+  assert.equal(copy.equals(expected), true,
+    `脱敏副本必须精确等于「原字节里只把凭据值换成 [REDACTED]」：实际 ${copy.toString('hex')} / 预期 ${expected.toString('hex')}`)
+  assert.equal(copy.includes(Buffer.from(canary)), false, '凭据不得泄漏')
+  assert.deepEqual(Array.from(copy.subarray(copy.length - 5)), [0x00, 0x74, 0x61, 0x69, 0x6c],
+    '尾部 NUL+tail 五个字节必须原样保留（不得被值规则吞掉）')
+  assert.equal(copy.length, seed.length - canary.length + '"[REDACTED]"'.length,
+    '长度差必须恰好是「凭据值 → "[REDACTED]"」的差值')
+  assert.equal(result.reportOpaque, true)
+  assert.equal(result.reportSha256, createHash('sha256').update(copy).digest('hex'))
+})
+
+await check('N7：文本报告 token=<canary>\\0tail 只替换凭据段，尾部 NUL+tail 逐字节保留', async () => {
+  const dir = freshCwd()
+  const canary = 'canary-n7-text-9a04'
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.from(`token=${canary}\u0000tail`, 'utf8')
+  writeFileSync(join(dir, 'seed.txt'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.txt reports/nul.txt', reportPath: 'reports/nul.txt' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  const copy = result.reportBytes
+  const expected = Buffer.from(`token="[REDACTED]"\u0000tail`, 'utf8')
+  assert.equal(copy.equals(expected), true,
+    `文本路径脱敏副本必须精确等于预期：实际 ${copy.toString('hex')} / 预期 ${expected.toString('hex')}`)
+  assert.equal(copy.includes(Buffer.from(canary)), false, '凭据不得泄漏')
+  assert.deepEqual(Array.from(copy.subarray(copy.length - 5)), [0x00, 0x74, 0x61, 0x69, 0x6c],
+    '尾部 NUL+tail 五个字节必须原样保留')
+  assert.equal(result.reportOpaque, false, '合法 UTF-8 报告仍走文本路径')
+})
+
+// 反向锁：新规则把「前一个字节不是 [A-Za-z0-9_-]」当分隔判据，不能因此把
+// `--token-file` / `--tokenize` 这类更长参数名当成 `--token` 并吞掉后面的文件名。
+await check('N7 反向锁：二进制里的 --token-file / --tokenize 后正常文件名不被吞', async () => {
+  const dir = freshCwd()
+  mkdirSync(join(dir, 'reports'))
+  const seed = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('\u0000cat --token-file reports/unit.json --tokenize reports/x --token-file=reports/y\u0001'),
+    Buffer.from([0x80]),
+  ])
+  writeFileSync(join(dir, 'seed.bin'), seed)
+  const result = await runHostCheck({
+    check: { command: 'cp seed.bin reports/tokenfile.bin', reportPath: 'reports/tokenfile.bin' },
+    cwd: dir,
+  })
+  assert.equal(result.state, 'pass')
+  assert.equal(result.reportBytes.equals(seed), true,
+    '不含独立 --token 参数的二进制报告必须逐字节不变（--token-file / --tokenize 不是凭据标志位）')
+  assert.equal(result.reportSha256, createHash('sha256').update(seed).digest('hex'))
+  assert.equal(result.reportOpaque, true)
+})
+
 await check('reportPath：执行前已存在且未更新 → fail / HOST_CHECK_REPORT_STALE', async () => {
   const dir = freshCwd()
   mkdirSync(join(dir, 'reports'))

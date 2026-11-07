@@ -6008,10 +6008,26 @@ try {
 
       // 公开副本按字节读：源报告是非 UTF-8，用 latin1 回读才能逐字节判断。
       const copyBytes = readFileSync(join(runsRoot, run.id, reportWrite.data.path))
+      // N7（复核2）：逐段精确校验，而不是只查「不含 canary / 含 [REDACTED]」——
+      // 后者放过了「值规则把 canary 后面的 \0tail 一起吞掉」的缺陷。脱敏副本必须
+      // 精确等于「原字节里只把凭据值替换成 "[REDACTED]"」的结果。
+      const expectedCopy = Buffer.concat([
+        Buffer.from([0xff, 0xfe]),
+        Buffer.from('token="[REDACTED]"', 'utf8'),
+        Buffer.from([0x00]),
+        Buffer.from('tail', 'utf8'),
+      ])
+      A.equal(copyBytes.equals(expectedCopy), true,
+        `脱敏副本必须逐字节等于预期：实际 ${copyBytes.toString('hex')}（${copyBytes.length} 字节）/ 预期 ${expectedCopy.toString('hex')}（${expectedCopy.length} 字节）`)
       A.equal(copyBytes.includes(Buffer.from(canary, 'utf8')), false, '二进制公开副本不得含原始凭据字节')
       A.ok(copyBytes.includes(Buffer.from('[REDACTED]', 'utf8')), '二进制公开副本必须保留 [REDACTED] 标记')
       A.equal(copyBytes[0], 0xFF, '非凭据字节必须逐字节保留（首字节）')
       A.equal(copyBytes[1], 0xFE, '非凭据字节必须逐字节保留（次字节）')
+      A.deepEqual(Array.from(copyBytes.subarray(copyBytes.length - 5)), [0x00, 0x74, 0x61, 0x69, 0x6c],
+        '尾部 NUL+tail 五个字节必须原样保留（N7：值规则不得吞掉后续非凭据字节）')
+      const seedBytes = readFileSync(join(workspace, 'report.json'))
+      A.equal(copyBytes.length, seedBytes.length - canary.length + Buffer.byteLength('"[REDACTED]"'),
+        '长度差必须恰好是「凭据值 → "[REDACTED]"」的差值')
 
       const record = JSON.parse(readFileSync(join(runsRoot, run.id, recordWrite.data.path), 'utf8'))
       A.equal(record.reportOpaque, true, '二进制报告必须 reportOpaque=true')

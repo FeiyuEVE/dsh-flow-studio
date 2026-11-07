@@ -112,16 +112,55 @@ function hostCheckInvalid(field, message) {
  * 命令行里「带值」的敏感参数名（`--token <value>` / `--api-key=<value>` 等）。
  *
  * 参数名必须是**完整**的：名字后面只接受空白或 `=`，因此 `--token-file`、`--tokenize`、
- * `--tokens` 不会被当成 `--token`，它们后面的普通文件名/参数也不会被吞掉。值只吃
- * 一个 shell 词（引号内可含空格），后面的正常参数（URL、report.json 等）原样保留。
+ * `--tokens` 不会被当成 `--token`，它们后面的普通文件名/参数也不会被吞掉。
+ *
+ * 0.11 N6/N7（复核2）之后的两条硬约束：
+ *   - **前导判据不依赖文本分隔符**：判据是「前一个字符不是 `[A-Za-z0-9_-]`」，而不是
+ *     固定的空白/标点字符类。二进制记录里标志位前往往是 NUL、长度前缀、protobuf tag
+ *     或高位字节，固定字符类会整条漏判（N6）。
+ *   - **值不吃 NUL / 控制字节**：值只吃一段「非空白 + 非控制」字符，遇到 NUL / 控制
+ *     字节 / 空白即停；否则 `token=<canary>\0tail` 会把 `\0tail` 一起吞进
+ *     `[REDACTED]`，公开副本因此丢失非凭据字节（N7）。
  *
  * 导出 pattern 字符串（而不是带 `g` 的 RegExp 实例）供同源规则复用：带 `g` 的对象
  * 在 `test`/`exec` 之间共享 `lastIndex`，跨模块复用会埋并发/顺序 bug。
+ * 捕获组顺序固定为 `(前导)(标志)(分隔)(双引号值)(单引号值)(裸值)`，下游
+ * `process-output.js` 依赖这个顺序。
  */
-export const SECRET_FLAG_PATTERN = `(^|[\\s"'\`;|&(=,\\[])(--?(?:token|password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|auth[_-]?token|secret[_-]?key|private[_-]?key|credentials?|authorization|cookie|session[_-]?key|ssh[_-]?key))(\\s*=\\s*|\\s+)(?:"([^"]*)"|'([^']*)'|([^\\s"'\`;|&)]+))`
+const FLAG_NAME = `--?(?:token|password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|auth[_-]?token|secret[_-]?key|private[_-]?key|credentials?|authorization|cookie|session[_-]?key|ssh[_-]?key)`
+
+/**
+ * 构造标志位规则。
+ *
+ * `valueExclude` 是「不算值字符」的字符类片段：
+ *   - 文本路径 `\x00-\x1F\x7F`：NUL / C0 控制字节 / DEL 终止值，高位字节留给 Unicode；
+ *   - 二进制路径 `\x00-\x1F\x7F-\xFF`：latin1 下 1 字节 = 1 字符，值只吃可打印 ASCII
+ *     （含空格，成对引号内），NUL / 控制字节 / 高位字节一律终止值。
+ */
+function buildSecretFlagPattern(valueExclude) {
+  return `(^|[^A-Za-z0-9_-])(${FLAG_NAME})(\\s*=\\s*|\\s+)(?:"([^"${valueExclude}]*)"|'([^'${valueExclude}]*)'|([^\\s,;&}；，${valueExclude}]+))`
+}
+
+/** 文本路径使用的标志位规则（高位字节仍算值，避免把非 ASCII 凭据截成半段）。 */
+export const SECRET_FLAG_PATTERN = buildSecretFlagPattern('\\x00-\\x1F\\x7F')
+
+/** 二进制路径使用的标志位规则：值只吃可打印 ASCII（0x20–0x7E，引号内可含空格）。 */
+const SECRET_FLAG_PATTERN_BYTES = buildSecretFlagPattern('\\x00-\\x1F\\x7F-\\xFF')
 
 /** 本模块内部使用的敏感参数规则（`replace` 会重置 `lastIndex`，模块内单线程安全）。 */
 const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
+const SECRET_FLAG_BYTES = new RegExp(SECRET_FLAG_PATTERN_BYTES, 'gi')
+
+/**
+ * `key:value` / `key=value` 规则（同上，文本 / 二进制两套值字符类）。
+ * 值同样排除 NUL / 控制字节：`token=<canary>\0tail` 只替换凭据段。
+ */
+function buildKeyValuePattern(valueExclude) {
+  return `(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\\s*[:=]\\s*)("[^"${valueExclude}]*"|'[^'${valueExclude}]*'|[^\\s,;&}；，${valueExclude}]+)`
+}
+
+const KEY_VALUE = new RegExp(buildKeyValuePattern('\\x00-\\x1F\\x7F'), 'gi')
+const KEY_VALUE_BYTES = new RegExp(buildKeyValuePattern('\\x00-\\x1F\\x7F-\\xFF'), 'gi')
 
 /**
  * 高置信凭据规则（1–4）：Bearer / Basic / Token + sk- + 敏感命令行参数 + key:value。
@@ -130,9 +169,10 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
  * 二进制字节上（按 latin1 逐字节映射后只替换命中的 ASCII 段，其余字节不变）。
  *
  * @param {string} text
+ * @param {boolean} [binary] true = 按字节口径（值只吃可打印 ASCII，遇高位字节即停）
  * @returns {string}
  */
-function redactHighConfidence(text) {
+function redactHighConfidence(text, binary = false) {
   let out = text
   // 1) Authorization 头里的认证方案 + 凭据（凭据两侧的引号必须成对，不能吞掉外层引号）
   out = out.replace(
@@ -142,20 +182,17 @@ function redactHighConfidence(text) {
   // 2) sk- 开头的 API key（保留前缀给排查看，值抹掉）
   out = out.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
   // 3) 空格/等号分隔的命令行参数：--token <value> / --api-key=<value> / -H ... 等。
-  //    参数名后必须是空白或 =，所以 --token-file 不会被误判；值只吃一个 shell 词。
-  out = out.replace(SECRET_FLAG, (match, lead, flag, separator, doubleQuoted, singleQuoted) => {
+  //    参数名后必须是空白或 =，所以 --token-file 不会被误判；前导判据见 buildSecretFlagPattern。
+  out = out.replace(binary ? SECRET_FLAG_BYTES : SECRET_FLAG, (match, lead, flag, separator, doubleQuoted, singleQuoted) => {
     if (doubleQuoted !== undefined) return `${lead}${flag}${separator}"[REDACTED]"`
     if (singleQuoted !== undefined) return `${lead}${flag}${separator}'[REDACTED]'`
     return `${lead}${flag}${separator}[REDACTED]`
   })
   // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
-  out = out.replace(
-    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&}；，]+)/gi,
-    (match, prefix, value) => {
-      if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
-      return `${prefix}"[REDACTED]"`
-    },
-  )
+  out = out.replace(binary ? KEY_VALUE_BYTES : KEY_VALUE, (match, prefix, value) => {
+    if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
+    return `${prefix}"[REDACTED]"`
+  })
   return out
 }
 
@@ -254,8 +291,10 @@ function redactReportCopy(buffer, redact) {
   }
   // 二进制 / 非法 UTF-8：latin1 1:1 映射保证除凭据段外的字节完全不变。
   // 只用高置信规则：任何长度启发式都会在真实二进制上误伤非凭据字节。
+  // `binary=true` 让值只吃可打印 ASCII（0x20–0x7E），遇 NUL / 控制 / 高位字节即停，
+  // 避免把凭据后面的非凭据字节一起吞掉（N7）。
   const latin1 = buffer.toString('latin1')
-  const redacted = redactHighConfidence(latin1)
+  const redacted = redactHighConfidence(latin1, true)
   if (redacted === latin1) return finalize(buffer, true)
   return finalize(Buffer.from(redacted, 'latin1'), true)
 }

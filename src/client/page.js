@@ -297,6 +297,94 @@ export function mergeSavedFlow(flow, saved) {
 }
 
 /**
+ * 保存成功后的保存态（0.9.1：修复「停在 saving 导致自动保存永久停摆」）。
+ *
+ * 自动保存 effect 的前置条件是 `saveState === 'dirty'`。如果保存期间用户又改过
+ * （editVersion 变了），成功分支必须回到 `dirty` 让下一轮自动保存排上；沿用旧的
+ * `current` 会一直停在 `saving`，自动保存就再也不会触发。
+ *
+ * @param {number} savedEditVersion 发这次请求时的 editVersion
+ * @param {number} currentEditVersion 响应回来时的 editVersion
+ * @returns {'saved'|'dirty'}
+ */
+export function saveStateAfterSuccess(savedEditVersion, currentEditVersion) {
+  return savedEditVersion === currentEditVersion ? 'saved' : 'dirty'
+}
+
+/**
+ * 保存串行化（0.9.1：修复「插件自己撞自己 409」）。
+ *
+ * `PUT /flows/<id>` 是整份替换 + 乐观锁。第一次响应回来之前 `mergeSavedFlow` 还没把
+ * 新 version 写回本地，而自动保存去抖窗只有 700ms —— 只要一次 PUT 慢于这个窗口，
+ * 用户继续编辑就会带着旧 version 再发一次，Host 只能判成 409，可实际根本没有第三方。
+ * 更糟的是点「运行」前的 flushBeforeLeave 也会撞上，POST /runs 直接发不出去。
+ *
+ * 队列保证「同一时刻最多一个 PUT 在飞」，并且**出队时才决定版本号**：排队期间前一次
+ * 保存可能已经回写了新版本，用它覆盖快照里的 version，第二次请求才不会再撞。
+ *
+ * `save(snapshot, options)` 是真正发请求的函数（组件里包一层 `api.saveFlow`），返回
+ * 形状同 Host：`{ flow: { id, version, ... } }`。失败直接 throw 即可：调用方拿到的
+ * run 会 reject，但链尾吞掉结果继续放行后面的保存，一次失败不会把整条链卡死。
+ *
+ * @param {{ save?: (snapshot: object, options?: object) => Promise<any> }} [options]
+ * @returns {{ save: (snapshot: object, options?: object) => Promise<any>, pending: () => number }}
+ */
+export function createSaveQueue({ save } = {}) {
+  /** 每份流程最近一次保存成功后服务器给的版本；按 id 记，切流程时不串号。 */
+  const versions = new Map()
+  let chain = Promise.resolve()
+  let pending = 0
+  const enqueue = (snapshot, options = {}) => {
+    if (typeof save !== 'function') return Promise.reject(new Error('保存队列缺少 save 实现'))
+    if (!isObject(snapshot) || typeof snapshot.id !== 'string' || snapshot.id === '') {
+      return Promise.reject(new Error('没有要保存的流程'))
+    }
+    const id = snapshot.id
+    pending += 1
+    const run = chain.then(async () => {
+      try {
+        // 关键：出队时才取版本。入队时带的可能还是前一次响应回来之前的旧值。
+        const version = versions.has(id) ? versions.get(id) : snapshot.version
+        const request = version === snapshot.version ? snapshot : { ...snapshot, version }
+        const result = await save(request, options)
+        const saved = result && isObject(result.flow) ? result.flow : null
+        if (saved && saved.id === id && typeof saved.version === 'number') versions.set(id, saved.version)
+        return result
+      } finally {
+        pending -= 1
+      }
+    })
+    // 链尾只吞结果、不吞异常：调用方手上的 run 仍然会 reject，后面的保存照常排队。
+    chain = run.then(() => {}, () => {})
+    return run
+  }
+  return { save: enqueue, pending: () => pending }
+}
+
+/**
+ * 冲突处置的落点判定（0.9.1：冲突状态必须按 flowId 隔离）。
+ *
+ * 409 横幅可能停在界面上，而用户已经切到另一份流程；这时若按「当前打开的流程」
+ * 去发无条件写，就会把**另一份流程**上别人刚写的版本静默回退成自己手里的旧内容。
+ * 所以「用我的版本覆盖」只允许打到冲突发生时的快照，且当前打开的必须仍是同一份流程。
+ *
+ * @param {{ flowId?: string, snapshot?: object }|null} conflict
+ * @param {object|null} currentFlow
+ * @returns {{ ok: boolean, flow: object|null, reason: string }}
+ */
+export function conflictTarget(conflict, currentFlow) {
+  const snapshot = isObject(conflict) && isObject(conflict.snapshot) ? conflict.snapshot : null
+  if (!snapshot || typeof snapshot.id !== 'string' || snapshot.id === '') {
+    return { ok: false, flow: null, reason: '没有冲突发生时的流程快照，已放弃这次覆盖' }
+  }
+  const currentId = currentFlow && typeof currentFlow.id === 'string' ? currentFlow.id : ''
+  if (currentId === '' || currentId !== conflict.flowId || currentId !== snapshot.id) {
+    return { ok: false, flow: null, reason: '冲突属于另一份流程，已放弃这次覆盖' }
+  }
+  return { ok: true, flow: snapshot, reason: '' }
+}
+
+/**
  * start 失败后的收口计划（B2）：只有「本次刚新建的 run」才 DELETE，
  * 避免 400 / 409 之后在运行记录里留一条幽灵 pending run；复用的旧 run 不能删。
  */
@@ -447,6 +535,8 @@ export function activeRunViewOf(snapshot, flow) {
  * - 第一次点停止只 arm；真正的停止走**独立的「确认停止」按钮**，且要等
  *   `STOP_CONFIRM_DELAY_MS` 才可点（M6：同一按钮双击不再能击穿确认）；
  * - busy 期间两个按钮都禁用，避免连点发出重复 start/stop；
+ * - 停止只看 run 本身：只要当前流程对应的 run 在跑，即使流程已被删掉（flow 为空）
+ *   也要能停，否则这个 run 在 UI 上就失去唯一入口；
  * - 首次运行列表没回来前禁用「运行」并写清 title（m7）；
  * - F2：没有选工作区时禁用「运行」并在 title 里写明原因（不允许发一个不带 workspace 的运行）。
  */
@@ -467,7 +557,9 @@ export function runControlState(run, {
     confirmLabel: '确认停止',
     startDisabled: !hasFlow || busy || running || !listReady || !hasWorkspace,
     // M6：确认态下主按钮锁死，防止「第一击 arm、第二击 stop」被双击击穿。
-    stopDisabled: !hasFlow || !running || busy || confirming,
+    // 停止只看「当前流程的 run 在不在跑」：流程被删掉之后 flow 为 null，但那个 run
+    // 还在跑 —— 抽屉里没有第二个停止入口，这里再禁掉就再也停不掉了。
+    stopDisabled: !run || !running || busy || confirming,
     confirmDisabled: !confirming || busy || !confirmReady,
     startTitle: workspaceTitle !== '' && listTitle !== ''
       ? `${workspaceTitle}（${listTitle}）`
@@ -491,6 +583,8 @@ export function runControlState(run, {
  * @param {Array} [props.initialSkills] 预置的 skill 目录，省一次往返。
  * @param {object} [props.initialRunView] 预置运行快照（SSR / 测试用；形状同抽屉
  *   `onRunSnapshot` 的回调参数：`{run, runs, events, summary, live, detail}`）。
+ * @param {object} [props.initialDraftNotice] 预置草稿横幅（SSR / 测试用；形状同内部
+ *   `draftNotice`：`{flowId, record: {savedAt, flow}}`），SSR 不跑 effect 也能验横幅状态。
  * @param {boolean} [props.initialLogOpen] 抽屉初始是否展开。
  * @param {string} [props.initialWorkspace] 预置工作区绝对路径（SSR / 测试用）；省略则读 localStorage。
  */
@@ -498,6 +592,7 @@ export function FlowStudioPage({
   initialFlow = null,
   initialSkills = [],
   initialRunView = null,
+  initialDraftNotice = null,
   initialLogOpen = false,
   initialError = '',
   initialWorkspace = '',
@@ -518,7 +613,7 @@ export function FlowStudioPage({
   const [railCollapsed, setRailCollapsed] = useState(false)
   const [keyboardLink, setKeyboardLink] = useState(null)
   const [announce, setAnnounce] = useState('')
-  const [draftNotice, setDraftNotice] = useState(null)
+  const [draftNotice, setDraftNotice] = useState(initialDraftNotice)
   /** 0.4.2：保存撞上别人的改动（409）时挂起，等用户选「覆盖」还是「载入服务器版本」。 */
   const [conflict, setConflict] = useState(null)
   const [logOpen, setLogOpen] = useState(Boolean(initialLogOpen))
@@ -584,6 +679,21 @@ export function FlowStudioPage({
   /** 结构编辑（增删节点/增减边/恢复草稿）——只有这些操作能把图变空。 */
   const markGraphEdited = useCallback(() => {
     graphGuard.current.edited = true
+  }, [])
+  /**
+   * 把「从服务器读回来的那份 flow」装进界面，并重算空图防线基线。
+   *
+   * 基线只能跟着服务器的现状走：同一份流程被别处清空后，本端重新读到的是空图（id 没变，
+   * 只按 id 触发的那条 effect 不会重算），基线若还停在旧的 8，之后任何非结构编辑
+   *（例如改流程名）都会被 emptyGraphBlockReason 拦下，而且提示「重新打开该流程即可恢复」
+   * 也是错的 —— 重新打开并不会重算基线。草稿 / 编辑路径绝不能走这里：它们不是服务器的
+   * 现状，重置基线会放过真正的「图上东西丢了」。
+   */
+  const applyServerFlow = useCallback(next => {
+    setFlow(next)
+    setIssues(next ? validateFlow(next) : { ok: true, errors: [], warnings: [] })
+    graphGuard.current = { nodes: next && Array.isArray(next.nodes) ? next.nodes.length : 0, edited: false }
+    return next
   }, [])
   /** M1：运行中锁结构；回调里用 ref 读最新值，避免闭包吃到旧状态。 */
   const lockedRef = useRef(false)
@@ -655,6 +765,19 @@ export function FlowStudioPage({
   const draftScheduler = useMemo(() => createDraftScheduler({ write: persistDraft }), [persistDraft])
 
   /**
+   * 保存队列（0.9.1）：同一时刻最多一个 PUT 在飞，后续保存排队等在飞请求完成后再发。
+   * 请求体在出队时才生成，所以排队期间前一次保存回写的新 version 会被带上，
+   * 不会再出现「自己撞自己」的假 409。队列是组件级单例（切换流程也复用同一份版本表）。
+   */
+  const saveQueue = useMemo(() => createSaveQueue({
+    save: (snapshot, options) => {
+      // 入队前已经过形状闸门，这里再取一次 body 只是为了把（可能被队列刷新过的）version 带上。
+      const payload = flowSavePayload(snapshot, options)
+      return api.saveFlow(snapshot.id, payload.body)
+    },
+  }), [])
+
+  /**
    * 保存当前流程（0.4.2 乐观锁）。
    *
    * 请求体照常带 `version`；成功后把服务器回传的新 version 收回本地，
@@ -671,7 +794,6 @@ export function FlowStudioPage({
       setError('保存被拦下：' + payload.reason + '，未写入，服务器上的流程保持原样。')
       return false
     }
-    const body = payload.body
     // 空图防线：服务器上有节点、这次会话没删过节点，却要写入空图 —— 停手。
     const blockReason = emptyGraphBlockReason(snapshot, graphGuard.current)
     if (blockReason !== '') {
@@ -682,13 +804,17 @@ export function FlowStudioPage({
     const version = editVersion.current
     setSaveState('saving')
     try {
-      const result = await api.saveFlow(snapshot.id, body)
+      // 串行队列：上一次 PUT 还没回来时，这次会排在它后面；出队时会用上一次回写的
+      // 新 version 覆盖快照里的旧值，所以不会拿旧版本撞出一个假的 409。
+      const result = await saveQueue.save(snapshot, options)
       const summary = summarize(result.flow)
       setFlows(previous => previous.map(item => (item.id === summary.id ? summary : item)))
       setFlow(previous => mergeSavedFlow(previous, result.flow))
       setConflict(null)
       savedVersion.current = version
-      setSaveState(current => (editVersion.current === version ? 'saved' : current))
+      // 保存期间又编辑过：必须回到 dirty 让自动保存重新排上；停在 saving 会让
+      // 前置条件 `saveState === 'dirty'` 永远不成立，自动保存就此永久停摆。
+      setSaveState(saveStateAfterSuccess(version, editVersion.current))
       // 写成功后以「服务器的现状」重新计基线：这次如果真的是用户删光了节点，也算数。
       graphGuard.current = { nodes: snapshot.nodes.length, edited: false }
       setError('')
@@ -709,6 +835,9 @@ export function FlowStudioPage({
           : null
         setConflict({
           flowId: snapshot.id,
+          // 存下当时要写的那份快照：「用我的版本覆盖」只对这份生效，
+          // 绝不能退化成「覆盖当前打开的流程」（那会打到别人的改动上）。
+          snapshot,
           currentVersion,
           updatedAt: failure.data && failure.data.updatedAt ? failure.data.updatedAt : '',
         })
@@ -721,16 +850,22 @@ export function FlowStudioPage({
         + '。改动已存为本地草稿，重试或重新打开该流程可恢复。')
       return false
     }
-  }, [draftScheduler, persistDraft])
+  }, [draftScheduler, persistDraft, saveQueue])
 
-  /** 冲突处置一：用户确认用本地版本覆盖服务器（显式选择，不算静默覆盖）。 */
+  /** 冲突处置一：用户确认用本地版本覆盖服务器（只针对冲突发生时的快照）。 */
   const overwriteConflict = useCallback(async () => {
-    const current = flowRef.current
-    if (!current) return
+    const target = conflictTarget(conflict, flowRef.current)
     setConflict(null)
-    const ok = await saveNow(current, { force: true })
+    if (!target.ok) {
+      // 用户已经切到别的流程：绝不能拿当前流程去发无条件写 —— 那会把别人刚写的新版本
+      // 静默回退成自己手里的旧内容。提示后放弃这次覆盖，冲突横幅也一并清掉。
+      setError(target.reason)
+      setAnnounce(target.reason)
+      return
+    }
+    const ok = await saveNow(target.flow, { force: true })
     setAnnounce(ok ? '已用你的版本覆盖服务器上的改动' : '覆盖失败，改动仍在本地草稿里')
-  }, [saveNow])
+  }, [conflict, saveNow])
 
   /** 冲突处置二：放弃本地改动，载入服务器上的最新版本。 */
   const reloadServerFlow = useCallback(async () => {
@@ -740,8 +875,8 @@ export function FlowStudioPage({
     try {
       const result = await api.readFlow(target)
       draftChecked.current = ''
-      setFlow(result.flow)
-      setIssues(result.validation)
+      // 服务器读回来的 flow 统一走 applyServerFlow：空图防线基线跟着服务器的现状重算。
+      applyServerFlow(result.flow)
       setSelection(null)
       setConflict(null)
       savedVersion.current = editVersion.current
@@ -754,7 +889,7 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [conflict])
+  }, [applyServerFlow, conflict])
 
   /** 离开当前流程前：先把改动落草稿，再尝试保存；失败也绝不静默丢弃。 */
   const flushBeforeLeave = useCallback(async () => {
@@ -769,13 +904,14 @@ export function FlowStudioPage({
 
   const openFlow = useCallback(async id => {
     const warning = await flushBeforeLeave()
+    // 切流程必须清掉上一份流程留下的 409 横幅，否则它会被当成当前流程的冲突。
+    setConflict(null)
     setBusy(true)
     try {
       const result = await api.readFlow(id)
       // 重新打开时要重新检查草稿：saveNow 失败后刚落的草稿不能因为「这个 id 查过了」被跳过。
       draftChecked.current = ''
-      setFlow(result.flow)
-      setIssues(result.validation)
+      applyServerFlow(result.flow)
       setSelection(null)
       setKeyboardLink(null)
       setSaveState('idle')
@@ -786,7 +922,7 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [flushBeforeLeave])
+  }, [applyServerFlow, flushBeforeLeave])
 
   useEffect(() => {
     let alive = true
@@ -802,8 +938,7 @@ export function FlowStudioPage({
         if (!pinned.current && list.flows.length > 0) {
           const first = await api.readFlow(list.flows[0].id)
           if (!alive) return
-          setFlow(first.flow)
-          setIssues(first.validation)
+          applyServerFlow(first.flow)
           setSaveState('idle')
         }
         setBooted(true)
@@ -815,7 +950,7 @@ export function FlowStudioPage({
     }
     void boot()
     return () => { alive = false }
-  }, [])
+  }, [applyServerFlow])
 
   useEffect(() => {
     if (flow) setIssues(validateFlow(flow))
@@ -897,6 +1032,9 @@ export function FlowStudioPage({
 
   const restoreDraft = () => {
     if (!draftNotice) return
+    // 运行中锁结构：草稿是另一份图（节点数可能完全不同），换上去会违反「运行中锁结构」
+    // 不变式（引擎按节点重读流程）。与 patchNode / addNodeAt / deleteNode 同口径。
+    if (refuseWhenLocked()) return
     const restored = draftNotice.record.flow
     touch()
     markGraphEdited()
@@ -933,8 +1071,9 @@ export function FlowStudioPage({
       ]
       const created = await api.createFlow(starter)
       setFlows(previous => [summarize(created.flow), ...previous])
-      setFlow(created.flow)
-      setIssues(created.validation)
+      // 新建也会切走当前流程：清掉上一份留下的冲突横幅，并用服务器返回的图重算基线。
+      setConflict(null)
+      applyServerFlow(created.flow)
       setSelection({ kind: 'node', id: starter.nodes[1].id })
       setKeyboardLink(null)
       setSaveState('idle')
@@ -944,7 +1083,7 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [busy, flushBeforeLeave])
+  }, [applyServerFlow, busy, flushBeforeLeave])
 
   /**
    * G5-b：删除流程。确认由 FlowList 的二次确认负责；这里保证「先备份（草稿 + 内存快照）
@@ -989,21 +1128,20 @@ export function FlowStudioPage({
       const remaining = flows.filter(item => item.id !== id)
       setFlows(remaining)
       if (flowRef.current && flowRef.current.id === id) {
+        // 删除后必然离开这份流程：它留下的冲突横幅不能再挂到下一份流程上。
+        setConflict(null)
         if (remaining.length > 0) {
           // 服务器删除已经成功；打开下一条失败不能误报成「删除失败」。
           try {
             const next = await api.readFlow(remaining[0].id)
-            setFlow(next.flow)
-            setIssues(next.validation)
+            applyServerFlow(next.flow)
           } catch (failure) {
-            setFlow(null)
-            setIssues({ ok: true, errors: [], warnings: [] })
+            applyServerFlow(null)
             setError('流程已删除，但打开下一条流程失败：'
               + (failure && failure.message ? failure.message : '未知原因') + '。可用「撤销」恢复刚删的流程。')
           }
         } else {
-          setFlow(null)
-          setIssues({ ok: true, errors: [], warnings: [] })
+          applyServerFlow(null)
         }
         setSelection(null)
         setKeyboardLink(null)
@@ -1017,7 +1155,7 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [busy, draftScheduler, flows, persistDraft])
+  }, [applyServerFlow, busy, draftScheduler, flows, persistDraft])
 
   /** G5-b：撤销删除——把删除前的内存快照按原 id 写回服务器。 */
   const undoDeleteFlow = useCallback(async () => {
@@ -1037,8 +1175,10 @@ export function FlowStudioPage({
         const without = previous.filter(item => item.id !== restored.id)
         return [summarize(restored), ...without]
       })
-      setFlow(restored)
-      setIssues(validateFlow(restored))
+      // 撤销删除会切回这份流程（服务器写回了它）：走 applyServerFlow 重算空图防线基线，
+      // 同时清掉删除前遗留的冲突横幅。
+      setConflict(null)
+      applyServerFlow(restored)
       setSelection(null)
       setKeyboardLink(null)
       setSaveState('idle')
@@ -1052,7 +1192,7 @@ export function FlowStudioPage({
     } finally {
       setBusy(false)
     }
-  }, [busy, deletedFlow])
+  }, [applyServerFlow, busy, deletedFlow])
 
   const addNodeAt = useCallback((x, y) => {
     if (refuseWhenLocked()) return null
@@ -1728,7 +1868,14 @@ export function FlowStudioPage({
           '发现未保存的本地草稿（' + formatSavedAt(draftNotice.record.savedAt) + '）·「'
           + ((draftNotice.record.flow && draftNotice.record.flow.name) || '未命名流程') + '」'),
         h('span', { className: 'fs-status-spacer' }),
-        h('button', { type: 'button', className: 'fs-btn sm', onClick: restoreDraft }, '恢复'),
+        h('button', {
+          type: 'button',
+          className: 'fs-btn sm',
+          // 运行中锁结构：草稿是另一份图，恢复会破坏运行中的图；按钮直接禁用而不是点了没反应。
+          disabled: locked,
+          title: locked ? RUN_LOCK_REASON : '用本地草稿替换当前图（保存后才会覆盖服务器版本）',
+          onClick: restoreDraft,
+        }, '恢复'),
         h('button', { type: 'button', className: 'fs-btn ghost sm', onClick: discardDraft }, '丢弃'))
       : null,
 

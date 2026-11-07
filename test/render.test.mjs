@@ -63,9 +63,10 @@ const {
 } = await import('../src/client/flowlist.js')
 const { FlowStudioPage, runControlState } = await import('../src/client/page.js')
 const {
-  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, deleteFlowRequest, firstErrorTarget,
-  emptyGraphBlockReason, flowSavePayload, mergeSavedFlow, progressOf, restoreFlowRequest,
-  runEndAnnouncement, runPreflight, saveBodyFor, startFailurePlan,
+  RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, conflictTarget, createSaveQueue,
+  deleteFlowRequest, firstErrorTarget, emptyGraphBlockReason, flowSavePayload, mergeSavedFlow,
+  progressOf, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
+  saveStateAfterSuccess, startFailurePlan,
 } = await import('../src/client/page.js')
 const {
   EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
@@ -913,6 +914,38 @@ check('0.9.1 空图写入防线：服务器有节点 + 本次没删过节点 →
   assert.equal(emptyGraphBlockReason(emptied, null), '', '没有基线时按放行处理')
 })
 
+check('0.9.1 从服务器读回的 flow 统一走 applyServerFlow：空图防线基线只跟着服务器重算', () => {
+  const source = readFileSync(join(repoRoot, 'src/client/page.js'), 'utf8')
+  const slice = (startMarker, endMarker, who) => {
+    const from = source.indexOf(startMarker)
+    assert.ok(from >= 0, '源码里找不到 ' + who + ' 的起点：' + startMarker)
+    const to = source.indexOf(endMarker, from + startMarker.length)
+    assert.ok(to > from, '源码里找不到 ' + who + ' 的终点：' + endMarker)
+    return source.slice(from, to)
+  }
+  // 这些路径都是「服务器读回来的 flow」：同 id 被别处清空后必须重算基线（改成 0），
+  // 否则之后改流程名之类的非结构编辑会被 emptyGraphBlockReason 用旧基线误拦，
+  // 而且文案里的「重新打开该流程即可恢复」并不成立（只有这里会重算）。
+  const sites = {
+    'boot effect': slice('const boot = async () => {', 'void boot()', 'boot effect'),
+    openFlow: slice('const openFlow = useCallback(', '}, [applyServerFlow, flushBeforeLeave])', 'openFlow'),
+    reloadServerFlow: slice('const reloadServerFlow = useCallback(', '}, [applyServerFlow, conflict])', 'reloadServerFlow'),
+  }
+  for (const [name, body] of Object.entries(sites)) {
+    assert.ok(body.includes('applyServerFlow('), name + ' 没有走 applyServerFlow：同 id 重新载入后空图基线不会重算，'
+      + '之后改流程名会被 emptyGraphBlockReason 误拦且「重新打开即可恢复」失效')
+  }
+  // 反向：草稿不是服务器的现状，恢复草稿不能重置基线（会放过真正的「图上东西丢了」）。
+  const restore = slice('const restoreDraft = () => {', 'const discardDraft', 'restoreDraft')
+  assert.ok(!restore.includes('applyServerFlow('), 'restoreDraft 必须用草稿 setFlow，不能重置服务器基线')
+  // 纯函数语义对照：旧基线 8 + 空图 = 拦；服务器读回空图后基线 0 = 放行。
+  const empty = { ...model.defaultFlow(), id: 'flow-guard', nodes: [], edges: [] }
+  assert.ok(emptyGraphBlockReason(empty, { nodes: 8, edited: false }).includes('8 个节点'),
+    '同 id 被整体换成空图、基线还是旧值时仍必须拦')
+  assert.equal(emptyGraphBlockReason(empty, { nodes: 0, edited: false }), '',
+    '从服务器读回空图后基线是 0，必须允许后续保存')
+})
+
 check('0.4.2 并发保存：请求体带 version、成功后回写新版本、force 才剥版本', () => {
   const flow = { ...model.defaultFlow(), id: 'flow-x', version: 3, updatedAt: '2026-11-06T10:00:00.000Z' }
 
@@ -936,6 +969,77 @@ check('0.4.2 并发保存：请求体带 version、成功后回写新版本、fo
   assert.equal(mergeSavedFlow(flow, otherSaved).version, 3, 'id 不同时不许并版本')
   assert.equal(mergeSavedFlow(null, saved), null)
   assert.equal(mergeSavedFlow(flow, null), flow)
+})
+
+await checkAsync('0.9.1 保存队列：并发保存串行化，第二次带第一次回写的新版本（不再自发 409）', async () => {
+  const calls = []
+  let releaseFirst = () => {}
+  const firstGate = new Promise(resolve => { releaseFirst = resolve })
+  const queue = createSaveQueue({
+    save: async (snapshot, options) => {
+      calls.push({ version: snapshot.version, name: snapshot.name, options })
+      if (calls.length === 1) await firstGate
+      return { flow: { id: snapshot.id, version: snapshot.version + 1, name: snapshot.name } }
+    },
+  })
+  const stale = { id: 'flow-q', name: '第一次改', version: 1, nodes: [], edges: [] }
+  const first = queue.save(stale)
+  // 去抖窗内又改了：自动保存会拿**同一份旧 version** 再发一次，这就是假 409 的成因。
+  const second = queue.save({ ...stale, name: '第二次改' })
+  await Promise.resolve()
+  assert.equal(calls.length, 1, '第一个 PUT 未完成前不允许发第二个，' + JSON.stringify(calls))
+  assert.equal(queue.pending(), 2, '两个保存都要在队列里等着')
+  releaseFirst()
+  const [firstResult, secondResult] = await Promise.all([first, second])
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].version, 1)
+  assert.equal(calls[1].version, 2, '第二次必须带第一次响应回写的新版本，否则就是自发 409：' + JSON.stringify(calls))
+  assert.equal(calls[1].name, '第二次改', '排队不能吞掉后一次的内容')
+  assert.equal(firstResult.flow.version, 2)
+  assert.equal(secondResult.flow.version, 3)
+  assert.equal(queue.pending(), 0, '队列跑完必须清空，不能影响下一次保存')
+
+  // 一次失败不能把整条链卡死：后续保存照常执行（真冲突仍然要能浮到界面上）。
+  let attempts = 0
+  const failing = createSaveQueue({
+    save: async snapshot => {
+      attempts += 1
+      if (attempts === 1) throw new Error('409 Conflict')
+      return { flow: { id: snapshot.id, version: 2 } }
+    },
+  })
+  await assert.rejects(failing.save({ id: 'flow-r', version: 1 }), /409 Conflict/)
+  const recovered = await failing.save({ id: 'flow-r', version: 1 })
+  assert.equal(recovered.flow.version, 2, '前一次失败后，后续保存仍必须能发出')
+  assert.equal(failing.pending(), 0)
+
+  // 同源小 bug：保存期间又编辑过，成功后必须回到 dirty（自动保存的前置条件），
+  // 停在 saving 会让 `saveState === 'dirty'` 永远不成立，自动保存永久停摆。
+  assert.equal(saveStateAfterSuccess(3, 3), 'saved', '保存期间没再改：正常进入已保存')
+  assert.equal(saveStateAfterSuccess(3, 4), 'dirty', '保存期间又改过：必须回到 dirty 让自动保存重新排上')
+})
+
+check('0.9.1 冲突按 flowId 隔离：覆盖只对冲突发生时的快照生效，切流程后拒绝', () => {
+  const snapshot = { id: 'flow-x', name: 'X 的本地版本', version: 1, nodes: [], edges: [] }
+  const conflict = { flowId: 'flow-x', snapshot, currentVersion: 2, updatedAt: '2026-11-07T10:00:00.000Z' }
+
+  const same = conflictTarget(conflict, { ...snapshot, version: 1 })
+  assert.equal(same.ok, true)
+  assert.equal(same.flow, snapshot, '覆盖必须用冲突发生时的快照，而不是当前 flow')
+
+  // 真事故形态：X 撞 409 → 切到 Y → 横幅还在 → 点「用我的版本覆盖」不能打到 Y 上。
+  const other = conflictTarget(conflict, { id: 'flow-y', name: 'Y', version: 2, nodes: [], edges: [] })
+  assert.equal(other.ok, false, '切到别的流程后必须拒绝覆盖')
+  assert.ok(other.reason.includes('另一份流程'), '拒绝原因要说清是另一份流程：' + other.reason)
+  assert.equal(other.flow, null, '拒绝时不能给出任何可写目标')
+
+  // 当前没有打开流程同样拒绝。
+  assert.equal(conflictTarget(conflict, null).ok, false)
+  // 没有 conflict / 没有快照都拒绝（不能悄悄退回「当前 flow」）。
+  assert.equal(conflictTarget(null, { id: 'flow-x' }).ok, false)
+  assert.equal(conflictTarget({ flowId: 'flow-x' }, { id: 'flow-x' }).ok, false)
+  // flowId 与快照 id 不一致（损坏的冲突态）也拒绝。
+  assert.equal(conflictTarget({ flowId: 'flow-y', snapshot }, { id: 'flow-x' }).ok, false)
 })
 
 check('m6/m7：运行收口播报、错误 role=alert、首次列表未回前禁用运行', () => {
@@ -1016,6 +1120,38 @@ check('顶栏运行控制态：运行 / 运行中 / 停止 / 独立确认停止 
   assert.equal(shellControl.startDisabled, false)
   assert.equal(shellControl.stopDisabled, true)
   assert.equal(runIsActive({ id: 'r3', status: 'running', eventCount: 4 }), true)
+})
+
+check('顶栏停止：没打开流程但 runForFlow 在跑时也能停（流程被删后不能失去停止入口）', () => {
+  // 流程被删光 / 首次进入且一条都没有：flow 为 null，但库里那条 run 还在跑。
+  const orphan = { id: 'run-orphan', flowId: 'flow-deleted', status: 'running', started: true, eventCount: 2 }
+  assert.equal(runIsActive(orphan), true, '前提：这是一条真正在跑的 run')
+  const control = runControlState(orphan, { hasFlow: false })
+  assert.equal(control.running, true)
+  assert.equal(control.stopDisabled, false, '只要 runForFlow 在跑就必须允许停止（抽屉里没有第二个入口）')
+  assert.equal(control.startDisabled, true, '没有流程时不允许开始')
+
+  // 其余禁用条件不变。
+  assert.equal(runControlState(null, { hasFlow: false }).stopDisabled, true, '没有 run 时不能停')
+  assert.equal(runControlState({ id: 'r', status: 'done' }, { hasFlow: false }).stopDisabled, true)
+  assert.equal(runControlState(orphan, { hasFlow: false, busy: true }).stopDisabled, true, '请求在飞时不能连点')
+  assert.equal(runControlState(orphan, { hasFlow: false, armed: true }).stopDisabled, true, '确认态主按钮锁死')
+  assert.equal(runControlState(orphan, { hasFlow: true }).stopDisabled, false, '有流程时行为不变')
+
+  // SSR 也验一次：顶栏的停止按钮真的是可点的，而不是只有纯函数算对了。
+  const html = render(React.createElement(FlowStudioPage, {
+    initialSkills: [],
+    initialRunView: {
+      run: { id: 'run-orphan', flowId: 'flow-deleted', name: '已删掉的流程 · 实时', status: 'running', started: true, eventCount: 2 },
+      runs: [{ id: 'run-orphan', flowId: 'flow-deleted', name: '已删掉的流程 · 实时', status: 'running' }],
+      live: { currentNodeId: 'n_dev', attempt: 1, round: 1, phase: 'model' },
+      events: [{ kind: 'node/start', nodeId: 'n_dev', attemptId: 1, seq: 1, data: {} }],
+      summary: null,
+      detail: null,
+    },
+  }))
+  assert.ok(!/class="fs-btn danger run-stop"[^>]*disabled/.test(html),
+    'SSR：没有打开流程时停止按钮也必须可用，否则那条 run 在 UI 上停不掉')
 })
 
 check('运行文案：当前节点 · 第 N 轮 · attempt M；live 缺失从事件回退', () => {
@@ -1140,6 +1276,53 @@ check('页面运行中：顶栏实时节点 + 开始禁用/停止可用 + 抽屉
   assert.ok(html.includes('标准研发流水线 · 实时'), '抽屉没有切到该 run')
 })
 
+// 运行中锁结构（M1）：草稿是另一份图（节点数可能完全不同），恢复它会换掉运行中的图。
+// 这里验 UI 层：锁定态下草稿横幅的「恢复」按钮必须 disabled（SSR 不跑 effect，
+// 所以用 initialDraftNotice 预置横幅）。
+check('运行中锁结构：草稿横幅的「恢复」按钮 disabled，未运行时可用', () => {
+  const runningView = {
+    run: {
+      id: 'run-lock', flowId: 'flow-test', name: '锁定中的运行', status: 'running',
+      started: true, eventCount: 3, nodeDone: 0, nodeTotal: 6,
+    },
+    runs: [{ id: 'run-lock', flowId: 'flow-test', name: '锁定中的运行', status: 'running' }],
+    live: { currentNodeId: 'n_dev', attempt: 1, round: 1, phase: 'model' },
+    events: [{ kind: 'node/start', nodeId: 'n_dev', attemptId: 1, seq: 1, data: {} }],
+    summary: null,
+    detail: null,
+  }
+  const draftRecord = {
+    savedAt: '2026-11-07T10:00:00+08:00',
+    flow: { ...flow, nodes: [flow.nodes[0]], edges: [] },
+  }
+  const buttonTagAt = html => {
+    const restoreAt = html.indexOf('>恢复<')
+    assert.ok(restoreAt > 0, '草稿横幅没渲染出「恢复」按钮')
+    const start = html.lastIndexOf('<button', restoreAt)
+    assert.ok(start > 0, '「恢复」不在 button 里')
+    return html.slice(start, restoreAt)
+  }
+
+  const lockedHtml = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialRunView: runningView,
+    initialDraftNotice: { flowId: 'flow-test', record: draftRecord },
+  }))
+  const lockedTag = buttonTagAt(lockedHtml)
+  assert.ok(lockedTag.includes('disabled'), '运行中必须禁用「恢复」按钮（否则草稿会换掉运行中的图）：' + lockedTag)
+  assert.ok(lockedTag.includes('运行中已锁定结构'), '禁用原因要写进 title：' + lockedTag)
+
+  const idleHtml = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialDraftNotice: { flowId: 'flow-test', record: draftRecord },
+  }))
+  const idleTag = buttonTagAt(idleHtml)
+  assert.ok(!idleTag.includes('disabled'), '没在运行时「恢复」必须可用：' + idleTag)
+  assert.ok(idleTag.includes('本地草稿'), '可用状态的 title 要说明恢复的含义：' + idleTag)
+})
+
 // 回归（0.9.1 实证缺陷）：库里还有 run、但当前没有打开任何流程（流程被删光 /
 // 首次进入且一条都没有）时，`activeRunViewOf` 会把空 flowId 当通配匹配到任意 run，
 // 随后 `{ nodes: flow.nodes }` 在 flow 为 null 时抛
@@ -1163,7 +1346,7 @@ check('没有打开流程但库里有 run：顶栏退回 nodeId，不因 flow �
   const html = render(React.createElement(FlowStudioPage, { initialSkills: [], initialRunView: orphanView }))
   assert.ok(html.includes('当前节点 n_dev'), '拿不到节点标题时要退回显示 nodeId，不能崩也不能写「—」')
   assert.ok(html.includes('第 3 轮'), '没有流程时轮次仍要照常显示')
-  assert.ok(html.includes('fs-empty-card'), '没有流程时画布要给「还没有流程模板」空态，而不是白屏')
+  assert.ok(html.includes('class="fs-empty-card"'), '没有流程时画布要给「还没有流程模板」空态，而不是白屏')
 })
 
 check('409 是业务态不是故障：已有 run 在跑 / 不在跑都给可读提示（06 §10）', () => {

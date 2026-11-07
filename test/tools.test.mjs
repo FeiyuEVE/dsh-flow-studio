@@ -2412,7 +2412,25 @@ try {
     // 引擎 C3 起 workspace 必填：显式给临时目录，worktree off 避免测试里建 worktree。
     await engine.start(run1.id, { parent: overrideParent, workspace: home, worktree: 'off' })
     const final1 = await engine.wait(run1.id)
-    A.equal(final1.status, 'done')
+    // 诊断（只在失败时可见）：这条用例在整仓 `npm test` 里偶发红过，断言里带上
+    // run/end 的失败原因与 node/end 状态，避免「failed !== done」这种没有上下文的报错。
+    const events1 = (await runstore.readAllEvents(runsRoot, run1.id)).events
+    const reasons1 = events1
+      .filter(event => event.kind === 'run/end' || event.kind === 'node/end')
+      .map(event => `${event.kind}:${JSON.stringify(event.data && (event.data.status || event.data.reason))}`
+        + `${event.extra && event.extra.validationError ? `/${String(event.extra.validationError).slice(0, 200)}` : ''}`)
+      .join(' | ')
+    let debug1 = ''
+    if (final1.status !== 'done') {
+      const errorSidecar = (() => {
+        try { return readFileSync(join(runsRoot, run1.id, '.error'), 'utf8').slice(0, 400) } catch { return null }
+      })()
+      debug1 = `; meta=${JSON.stringify(final1)}`
+        + `; kinds=${events1.map(event => `${event.seq}:${event.kind}:${event.nodeId || ''}`).join(',')}`
+        + `; sidecar=${JSON.stringify(errorSidecar)}`
+        + `; runJson=${readFileSync(join(runsRoot, run1.id, 'run.json'), 'utf8').slice(0, 1000)}`
+    }
+    A.equal(final1.status, 'done', `run1 应该 done，实际 ${final1.status}；事件：${reasons1}${debug1}`)
     A.equal(activations.length, 1)
     A.equal(activations[0].parent, overrideParent)
     A.equal(activations[0].parent.session.id, 'override-session')

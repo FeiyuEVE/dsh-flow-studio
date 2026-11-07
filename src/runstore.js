@@ -1116,17 +1116,31 @@ async function writeFileWith(path, data, options) {
  * `*.tmp-*` 永久留在 run 目录里，下一次再写再留一份。
  */
 async function writeTempAtomic(path, text) {
-  const tmp = `${path}.tmp-${process.pid}-${tmpCounter++}`
-  let renamed = false
-  try {
-    await writeFileWith(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
-    await rename(tmp, path)
-    renamed = true
-  } finally {
-    if (!renamed) await unlink(tmp).catch(() => {})
+  // 为什么带一次重试：`cleanupTempFiles`（插件挂载时的启动恢复，见 index.js 的
+  // repairRunStates / sweepExpiredLeases）会清掉 run 目录里的 `*.tmp-*`。它和
+  // 「另一个引擎正在写 run.json」并发时，可能在 write 与 rename 之间把临时文件删掉，
+  // rename 于是 ENOENT；旧实现把这个 ENOENT 当存储故障，`appendEvents` 的 catch
+  // 会把 run 直接标成 failed——事件流里明明是 run/end done，run.json 却是 failed。
+  // 临时文件的名字每次都是新的，所以「换个名字重写一次」就能自愈；除 ENOENT 之外
+  // （满盘 ENOSPC、权限 EACCES、目标目录被删）重试没有意义，直接抛出。
+  let lastError = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const tmp = `${path}.tmp-${process.pid}-${tmpCounter++}`
+    let renamed = false
+    try {
+      await writeFileWith(tmp, text, { encoding: 'utf8', mode: FILE_MODE })
+      await rename(tmp, path)
+      renamed = true
+      await chmod(path, FILE_MODE).catch(() => {})
+      return path
+    } catch (error) {
+      lastError = error
+      if (!error || error.code !== 'ENOENT') break
+    } finally {
+      if (!renamed) await unlink(tmp).catch(() => {})
+    }
   }
-  await chmod(path, FILE_MODE).catch(() => {})
-  return path
+  throw lastError
 }
 
 /**
@@ -1959,17 +1973,35 @@ export async function releaseLease(runsRoot, runId, options = {}) {
 }
 
 /**
+ * 启动清理时「多大的 `*.tmp-*` 才算遗留」：默认只删 60 秒之前的。
+ *
+ * 原子写的临时文件生命周期是**毫秒级**（write → rename），所以 60 秒还没消失的
+ * 一定是崩溃 / 满盘留下的。反过来，如果无条件全删，就会把**正在写**的临时文件
+ * 一起删掉：插件挂载时的启动恢复（`repairRunStates` / `sweepExpiredLeases`，
+ * 见 index.js）是 fire-and-forget，可能与另一个引擎的 `appendEvents` 并发——
+ * 那条路径上的 rename 会 ENOENT，`appendEvents` 的 catch 就把一个**已经跑完**的
+ * run 标成 failed（事件流里是 run/end done）。年龄闸门是这个 bug 的根因修复。
+ */
+export const TMP_SWEEP_MIN_AGE_MS = 60_000
+
+/**
  * G2-c：清理 run 目录下遗留的 `*.tmp-*`（崩溃 / 满盘留下的 0600 临时文件）。
  *
- * 只扫 run 根目录与一层节点目录；临时文件的生命周期是毫秒级，清理只在启动恢复阶段
- * 调用（sweep / repairRunStates），不会和正常写入抢同一个文件。
+ * 只扫 run 根目录与一层节点目录；默认只删 {@link TMP_SWEEP_MIN_AGE_MS} 之前的
+ * （按 mtime），正在写的临时文件不动。清理只在启动恢复阶段调用
+ * （sweep / repairRunStates）。
  *
  * @param {string} runsRoot
  * @param {string} [runId] 省略时清理 runsRoot 下所有 run
+ * @param {{ minAgeMs?: number, now?: Date }} [options] `minAgeMs: 0` = 不做年龄闸门（测试用）
  * @returns {Promise<string[]>} 被删掉的相对路径（`<runId>/<name>`）
  */
-export async function cleanupTempFiles(runsRoot, runId) {
+export async function cleanupTempFiles(runsRoot, runId, options = {}) {
   const root = resolve(runsRoot)
+  const minAgeMs = Number.isFinite(options.minAgeMs) && options.minAgeMs >= 0
+    ? options.minAgeMs
+    : TMP_SWEEP_MIN_AGE_MS
+  const now = options.now instanceof Date && Number.isFinite(options.now.getTime()) ? options.now : new Date()
   const targets = []
   if (runId !== undefined && runId !== null) {
     const loc = locate(root, runId)
@@ -2002,8 +2034,18 @@ export async function cleanupTempFiles(runsRoot, runId) {
     }
     for (const name of names) {
       if (!TMP_FILE_RE.test(name)) continue
+      const path = join(dir, name)
+      // 年龄闸门：正在写的临时文件（mtime 就在刚才）不动，否则会把别人的原子写删掉。
+      let info
       try {
-        await unlink(join(dir, name))
+        info = await stat(path)
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue
+        throw error
+      }
+      if (now.getTime() - info.mtimeMs < minAgeMs) continue
+      try {
+        await unlink(path)
         removed.push(`${prefix}${name}`)
       } catch (error) {
         if (!error || error.code !== 'ENOENT') throw error

@@ -1678,7 +1678,7 @@ process.stdout.write('OK:' + total)
     console.log(`  · 变体 B 文案=${failureB.reason} / 实际 status=${afterB.status}`)
   })
 
-  await check('G2-c 启动清理：遗留的 *.tmp-* 被 cleanupTempFiles 清掉，正常文件不动', async () => {
+  await check('G2-c 启动清理：只删「久到不可能是正在写」的 *.tmp-*，正常文件不动', async () => {
     const meta = await makeRun()
     created.push(meta.id)
     const dir = join(runsRoot, meta.id)
@@ -1689,18 +1689,68 @@ process.stdout.write('OK:' + total)
       join(dir, 'n_1', '1.jsonl.tmp-1234-2'),
     ]
     for (const path of stale) writeFileSync(path, 'partial')
+    // 关键回归：**刚写出来的临时文件不能被删**。插件挂载时的启动恢复是
+    // fire-and-forget，会与另一个引擎的原子写并发；无条件全删会让那条 rename
+    // 拿到 ENOENT，`appendEvents` 的 catch 于是把一个跑完的 run 标成 failed
+    //（事件流里是 run/end done）——这正是本仓 `npm test` 偶发红的原因。
+    const fresh = await store.cleanupTempFiles(runsRoot, meta.id)
+    assert.deepEqual(fresh, [], `刚写的临时文件不该被删：${fresh.join(',')}`)
+    for (const path of stale) assert.ok(existsSync(path), `${path} 生命周期只有毫秒级，刚写完不算遗留`)
+
+    // 按 mtime 变老（10 分钟前）→ 默认阈值（60s）就会认定是崩溃残留。
+    const old = new Date(Date.now() - 10 * 60 * 1000)
+    for (const path of stale) utimesSync(path, old, old)
     const removed = await store.cleanupTempFiles(runsRoot, meta.id)
-    assert.equal(removed.length, 3, `应清掉 3 个临时文件：${removed.join(',')}`)
+    assert.equal(removed.length, 3, `应清掉 3 个遗留临时文件：${removed.join(',')}`)
     for (const path of stale) assert.ok(!existsSync(path), `${path} 应被清掉`)
     assert.ok(existsSync(join(dir, 'run.json')), '正常文件不能被误删')
 
-    // 不带 runId 的整目录清理也能命中。
+    // 不带 runId 的整目录清理同样带年龄闸门；显式 minAgeMs: 0 才无条件清。
     const allTmp = join(dir, '.usage.json.tmp-99-0')
     writeFileSync(allTmp, 'x')
-    const allRemoved = await store.cleanupTempFiles(runsRoot)
-    assert.ok(allRemoved.some(name => name.includes('.usage.json.tmp-')), '整目录清理应命中最新的临时文件')
+    const keptByDefault = await store.cleanupTempFiles(runsRoot)
+    assert.deepEqual(keptByDefault, [], '整目录清理也必须放过刚写的临时文件')
+    assert.ok(existsSync(allTmp))
+    const allRemoved = await store.cleanupTempFiles(runsRoot, undefined, { minAgeMs: 0 })
+    assert.ok(allRemoved.some(name => name.includes('.usage.json.tmp-')), 'minAgeMs:0 应命中最新的临时文件')
     assert.ok(!existsSync(allTmp))
-    console.log(`  · 清理 ${removed.length} 个 + 整目录扫描命中；run.json 未受影响`)
+    console.log(`  · 默认放过 ${stale.length} 个新文件、清掉同名的老文件；minAgeMs:0 才无条件清`)
+  })
+
+  await check('G2-c 原子写在临时文件被外部删掉时重试一次（不再把跑完的 run 标成 failed）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const dir = join(runsRoot, meta.id)
+    const runJson = join(dir, 'run.json')
+    const before = readFileSync(runJson, 'utf8')
+    // 模拟「启动清理 / 杀毒 / watcher 在 write 与 rename 之间删掉临时文件」：
+    // 钩子照常落盘，然后立刻把临时文件删掉，让随后的 rename 拿到 ENOENT。
+    let deleted = 0
+    store.__setWriteFileHook(async (path, data, options) => {
+      await writeFileAsync(path, data, options)
+      // 只删第一次：外层是「一次性的外部清理」，重试用的是新文件名，不该再被删。
+      if (path.includes('.tmp-') && deleted === 0) {
+        rmSync(path, { force: true })
+        deleted += 1
+      }
+    })
+    try {
+      // 第一次尝试被删 → 第二次成功；最终 run.json 必须被更新，且不残留临时文件。
+      const written = await store.writeRunMeta(runsRoot, meta.id, { name: '重试后写入' })
+      assert.equal(written.name, '重试后写入')
+      assert.equal(deleted, 1, `第一次尝试应被删掉一次，实际 ${deleted}`)
+      const text = readFileSync(runJson, 'utf8')
+      assert.notEqual(text, before, 'run.json 必须被更新')
+      assert.equal(JSON.parse(text).name, '重试后写入')
+      const residue = readdirSync(dir).filter(name => /\.tmp-\d+-\d+$/.test(name))
+      assert.deepEqual(residue, [], `失败尝试不能留下临时文件：${residue.join(',')}`)
+    } finally {
+      store.__setWriteFileHook(null)
+    }
+    // 钩子撤掉后普通写入照常工作。
+    const after = await store.writeRunMeta(runsRoot, meta.id, { name: '钩子已撤' })
+    assert.equal(after.name, '钩子已撤')
+    console.log(`  · 第一次 attempt 被删 ${deleted} 次 → 重试成功；钩子撤销后写入正常`)
   })
 
   console.log('runstore.js · G2-d 租约自愈')

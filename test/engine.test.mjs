@@ -245,6 +245,34 @@ function envelopeOf(payload) {
   return { attempt: Number(attempt[1]), nonce: nonce[1].trim() }
 }
 
+/**
+ * 当前 git 是否支持 `git worktree add --orphan`（git 2.42+）。
+ *
+ * 用一次性的临时仓库真跑一遍，而不是解析 `git --version`：发行版补丁可能回移开关。
+ * 结果缓存，避免每条用例都 fork 一次 git。
+ */
+let orphanWorktreeSupport = null
+function supportsOrphanWorktree() {
+  if (orphanWorktreeSupport !== null) return orphanWorktreeSupport
+  const probe = mkdtempSync(join(repoRoot, '.tmp', 'orphan-probe-'))
+  try {
+    const git = args => execFileSync('git', args, {
+      cwd: probe,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
+    })
+    git(['init', '-q'])
+    git(['worktree', 'add', '--orphan', join(probe, 'wt')])
+    orphanWorktreeSupport = true
+  } catch {
+    orphanWorktreeSupport = false
+  } finally {
+    rmSync(probe, { recursive: true, force: true })
+  }
+  return orphanWorktreeSupport
+}
+
 /** 把对象包成 assistant 回复里的 ```json 围栏。 */
 function fenced(value) {
   return `\`\`\`json\n${JSON.stringify(value)}\n\`\`\``
@@ -5073,6 +5101,13 @@ try {
   })
 
   await check('G2：空仓库（没有任何提交）→ run 能开跑，baseCommit === null（--orphan 合法值）', async () => {
+    // 环境能力闸门：`git worktree add --orphan` 是 git 2.42 才有的开关。旧 git 上这一档
+    // 不可能成功（产品会降级成「不开隔离副本 + warning」，那是另一条已覆盖的路径），
+    // 所以这里探测一次、不支持就**明示跳过**，而不是改产品去迁就旧 git。
+    if (!supportsOrphanWorktree()) {
+      console.log('  · 当前 git 不支持 `worktree add --orphan`（需 ≥2.42），明示跳过该用例')
+      return
+    }
     const repo = mkdtempSync(join(repoRoot, '.tmp', 'repo-empty-'))
     try {
       const gitHome = join(home, 'git-home-empty')

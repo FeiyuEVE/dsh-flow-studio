@@ -511,9 +511,13 @@ try {
     writeFileSync(join(runsRoot, denied, 'run.json'), '{}')
     chmodSync(join(runsRoot, denied, 'run.json'), 0o000)
 
+    // root 绕过文件权限位，`chmod 000` 在容器里仍然读得出来——这一档在 root 下不可能成立。
+    // 不静默放过：明确打印「跳过该子项」，其余两档（目录 / 坏 JSON）照常断言。
+    const asRoot = typeof process.getuid === 'function' && process.getuid() === 0
     const { runs, skipped } = await store.listRuns(runsRoot, { limit: 100 })
     assert.ok(runs.some(run => run.id === good.id), '好 run 仍然要列出来')
-    for (const id of [asDir, badJson, denied]) {
+    const expectedIds = asRoot ? [asDir, badJson] : [asDir, badJson, denied]
+    for (const id of expectedIds) {
       const entry = skipped.find(item => item.id === id)
       assert.ok(entry, `${id} 应出现在 skipped`)
       assert.ok(typeof entry.reason === 'string' && entry.reason.length > 0)
@@ -521,6 +525,12 @@ try {
     }
     assert.match(skipped.find(item => item.id === asDir).reason, /目录/)
     assert.match(skipped.find(item => item.id === badJson).reason, /JSON/)
+    if (asRoot) {
+      console.log('  · 以 root 运行：跳过「run.json 权限拒绝」子项（root 绕过权限位，该档无法构造）')
+      assert.ok(!skipped.some(item => item.id === denied), 'root 下该 run 读得出来，不应出现在 skipped')
+    } else {
+      assert.match(skipped.find(item => item.id === denied).reason, /权限/)
+    }
     chmodSync(join(runsRoot, denied, 'run.json'), 0o600)
   })
 

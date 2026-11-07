@@ -1902,6 +1902,58 @@ try {
   // -------------------------------------------------------------------------
   console.log('engine v1.1 · 模型覆盖 M5（§13.11）')
 
+  /**
+   * 0.2.2-rc.1 假宿主：`agents.create` 校验 `agentOptions.provider` 是非空字符串，
+   * 缺失直接 throw（复现新宿主的硬要求）。`selection === null` 表示宿主没有
+   * `agentDefaultModel` 服务（拿不到默认模型路由）。
+   */
+  function strictProviderHost(engineRef, { selection = { provider: 'deepseek', model: 'deepseek-chat' } } = {}) {
+    const created = []
+    const ctx = {
+      on() { return () => {} },
+      get(name) {
+        if (name === 'agentDefaultModel' && selection) {
+          return { currentSelection: () => selection }
+        }
+        if (name !== 'agents') return undefined
+        return {
+          async create(options) {
+            const agentOptions = options.agentOptions
+            if (!agentOptions || typeof agentOptions.provider !== 'string' || agentOptions.provider === '') {
+              throw new TypeError('agentOptions.provider 必须是非空字符串（0.2.1-rc.5+ 宿主硬要求）')
+            }
+            created.push(options)
+            const sessionId = options.sessionId
+            return {
+              agent: {
+                session: { id: sessionId, header: {} },
+                followup(payload) {
+                  const envelope = envelopeOf(payload)
+                  const base = structuredPass('n_model')
+                  const structured = envelope
+                    ? { attempt: envelope.attempt, nonce: envelope.nonce, ...base }
+                    : base
+                  engineRef.value.handleSessionEvent({ id: sessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: {
+                        role: 'assistant',
+                        content: [{ type: 'text', text: `\`\`\`json\n${JSON.stringify(structured)}\n\`\`\`` }],
+                      },
+                    },
+                  })
+                },
+                async whenIdle() {},
+              },
+              async dispose() {},
+            }
+          },
+        }
+      },
+    }
+    return { ctx, created }
+  }
+
   await check('node.model：注入 activate 收到 agentOptions={model}，node/start 记录 model', async () => {
     const flow = flowOf('flow-model', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-chat' }), endNode()], [
       next('e1', 'n_start', 'n_model'),
@@ -1925,49 +1977,108 @@ try {
     A.equal(events.find(event => event.kind === 'node/start').data.model, 'deepseek-chat')
   })
 
-  await check('node.model：默认 agents.create 把 model 放进 agentOptions', async () => {
+  await check('node.model：默认 agents.create 补齐 provider，节点 model 优先且不带宿主 reasoningEffort', async () => {
     const flow = flowOf('flow-model-spawn', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-reasoner' }), endNode()], [
       next('e1', 'n_start', 'n_model'),
       next('e2', 'n_model', 'n_end'),
     ])
     await saveFlow(flow)
     const run = await makeRun('flow-model-spawn', 1)
-    let engine = null
-    let captured = null
-    const ctx = {
-      on() { return () => {} },
-      get(name) {
-        if (name !== 'agents') return undefined
-        return {
-          async create(createOptions) {
-            captured = createOptions
-            const sessionId = createOptions.sessionId
-            return {
-              agent: {
-                session: { id: sessionId, header: {} },
-                followup() {
-                  engine.handleSessionEvent({ id: sessionId }, {
-                    type: 'assistant/message',
-                    data: {
-                      message: {
-                        role: 'assistant',
-                        content: [{ type: 'text', text: JSON.stringify(structuredPass('n_model')) }],
-                      },
-                    },
-                  })
-                },
-                async whenIdle() {},
-              },
-              dispose: async () => {},
-            }
-          },
-        }
-      },
-    }
-    engine = createEngine({ runsRoot, flowsRoot, ctx })
+    const engineRef = { value: null }
+    const { ctx, created } = strictProviderHost(engineRef)
+    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engineRef.value = engine
     await engine.start(run.id)
-    await engine.wait(run.id)
-    A.deepEqual(captured.agentOptions, { model: 'deepseek-reasoner' })
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    A.equal(created.length, 1)
+    A.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'deepseek-reasoner' })
+    A.equal('reasoningEffort' in created[0].agentOptions, false, '节点自定 model 时不得带宿主 reasoningEffort')
+
+    // 宿主默认 selection 里带 reasoningEffort 时同样不得移植给节点自定 model；
+    // 节点自己给了 reasoningEffort 才传。
+    const effortEngine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx: {
+        on() { return () => {} },
+        get: name => (name === 'agentDefaultModel'
+          ? { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }) }
+          : undefined),
+      },
+    })
+    A.deepEqual(
+      effortEngine._resolveCreateAgentOptions({ model: 'deepseek-reasoner' }),
+      { provider: 'deepseek', model: 'deepseek-reasoner' },
+    )
+    A.deepEqual(
+      effortEngine._resolveCreateAgentOptions({ model: 'deepseek-reasoner', reasoningEffort: 'low' }),
+      { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'low' },
+    )
+  })
+
+  await check('node.model：节点没设 model 时显式固定宿主默认模型路由（provider + model）', async () => {
+    const flow = flowOf('flow-model-default', [startNode(), stage('n_model', '业务', 300), endNode()], [
+      next('e1', 'n_start', 'n_model'),
+      next('e2', 'n_model', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-model-default', 1)
+    const engineRef = { value: null }
+    const { ctx, created } = strictProviderHost(engineRef)
+    const engine = createEngine({ runsRoot, flowsRoot, ctx })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    A.equal(created.length, 1)
+    A.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
+  })
+
+  await check('宿主没有 agentDefaultModel：保持旧行为（不因本改动崩），并 warn 缺 provider', async () => {
+    const flow = flowOf('flow-model-nohost', [startNode(), stage('n_model', '业务', 300, { model: 'deepseek-reasoner' }), endNode()], [
+      next('e1', 'n_start', 'n_model'),
+      next('e2', 'n_model', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-model-nohost', 1)
+    const logs = []
+    const engineRef = { value: null }
+    const { ctx, created } = strictProviderHost(engineRef, { selection: null })
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx,
+      nodeRetries: 0,
+      log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    engineRef.value = engine
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    // 旧行为原样透传 {model}，新宿主会拒绝创建 → run 失败，但引擎不崩、有可诊断 warn。
+    A.equal(final.status, 'failed')
+    A.equal(created.length, 0, '拿不到 selection 时不得凭空造 provider')
+    A.ok(
+      logs.some(line => line.startsWith('warn:') && /宿主未提供默认模型/.test(line) && /provider/.test(line)),
+      `必须留下「宿主未提供默认模型，节点模型缺 provider」的 warn，实际日志：${JSON.stringify(logs)}`,
+    )
+  })
+
+  await check('节点侧显式 provider 优先：不被宿主默认模型覆盖', async () => {
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      ctx: {
+        on() { return () => {} },
+        get: name => (name === 'agentDefaultModel'
+          ? { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) }
+          : undefined),
+      },
+    })
+    A.deepEqual(
+      engine._resolveCreateAgentOptions({ provider: 'openai', model: 'gpt-5' }),
+      { provider: 'openai', model: 'gpt-5' },
+    )
   })
 
   // -------------------------------------------------------------------------

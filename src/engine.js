@@ -1980,6 +1980,46 @@ class FlowEngine {
   }
 
   /**
+   * 创建节点会话用的 `agentOptions`：新版 dsh 的节点会话**必须**能解析出模型路由，
+   * 即 `agentOptions` 里 provider 与 model 成对（只给 model 时，0.2.2-rc.1 的
+   * `agents.create` 本身不抛错，但首轮 preStep 会抛 `agent "…" has no provider/model`；
+   * 更早的 rc5 直接在创建期拒绝）。规则：
+   *   - 节点侧显式给了非空 provider：原样返回（节点配置优先，不被宿主默认覆盖）；
+   *   - 没给 agentOptions：返回完整的宿主默认 selection（把默认模型路由固定下来）；
+   *   - 只给了 model：用宿主默认 provider 补齐，model 保持节点配置；
+   *   - 宿主没有 `agentDefaultModel` 服务：原样返回保持旧行为，并在「有 model 没 provider」
+   *     时记一条 warn（可诊断，不要让会话创建静默失败）。
+   * 节点自定了 model 时**不**把宿主的 `reasoningEffort` 带过去：不同模型的 effort
+   * 档位不可移植，只有 agentOptions 自己给了才传。
+   */
+  _resolveCreateAgentOptions(agentOptions) {
+    const selection = this._defaultAgentSelection()
+    const hasProvider = Boolean(agentOptions)
+      && typeof agentOptions.provider === 'string' && agentOptions.provider !== ''
+    const hasModel = Boolean(agentOptions)
+      && typeof agentOptions.model === 'string' && agentOptions.model !== ''
+    if (!selection) {
+      if (hasModel && !hasProvider) {
+        this.log(
+          'warn',
+          'flow-studio: 宿主未提供默认模型（agentDefaultModel 不可用），节点模型缺 provider；'
+          + '新宿主（0.2.1-rc.5+）可能拒绝创建该节点会话',
+        )
+      }
+      return agentOptions
+    }
+    if (!agentOptions || Object.keys(agentOptions).length === 0) return selection
+    if (hasProvider) return agentOptions
+    return {
+      provider: selection.provider,
+      model: hasModel ? agentOptions.model : selection.model,
+      ...(typeof agentOptions.reasoningEffort === 'string' && agentOptions.reasoningEffort !== ''
+        ? { reasoningEffort: agentOptions.reasoningEffort }
+        : {}),
+    }
+  }
+
+  /**
    * 07 §11（R8）：解析节点自审回报。`parseNodeStatus` 是纯函数且承诺不抛错，
    * 这里再兜一层：并行落地期间拿不到导出 / 意外异常一律按「没有回报」处理。
    */
@@ -2953,7 +2993,11 @@ class FlowEngine {
     throw new EngineError(503, 'agents.create 不可用：宿主 agents 服务无法创建节点主管会话')
   }
 
-  /** 07 §3.1：用 `agents.create` 新建一个顶层节点主管会话。 */
+  /**
+   * 07 §3.1：用 `agents.create` 新建一个顶层节点主管会话。
+   * `agentOptions` 必须带 provider（0.2.1-rc.5+ 宿主硬要求），由
+   * `_resolveCreateAgentOptions` 用宿主默认模型兜底。
+   */
   async _createNodeSession({ prompt, signal, onSession, agentOptions, node, attempt, runId, traceId }) {
     const agents = this._agentsService()
     const sessionId = nodeSessionId(runId, node.id, attempt)
@@ -2963,11 +3007,15 @@ class FlowEngine {
     if (cwd) meta.cwd = cwd
     const preset = this._sessionPreset()
     if (preset) meta.agentPreset = preset
+    // 宿主硬要求 agentOptions.provider：节点 model 只给了 model，这里补齐路由。
+    const resolvedAgentOptions = this._resolveCreateAgentOptions(agentOptions)
     const createOptions = {
       sessionId,
       ...(Object.keys(meta).length > 0 ? { meta } : {}),
       // 06 §13.11 M5：node.model 必须真正传给会话创建（不只是界面上填）。
-      ...(agentOptions && Object.keys(agentOptions).length > 0 ? { agentOptions } : {}),
+      ...(resolvedAgentOptions && Object.keys(resolvedAgentOptions).length > 0
+        ? { agentOptions: resolvedAgentOptions }
+        : {}),
     }
     if (signal && signal.aborted) throw abortError(signal)
 
@@ -3045,6 +3093,8 @@ class FlowEngine {
     }
     const parent = await this._resolveParent()
     if (!parent) throw new EngineError(503, '没有可用的父会话：无法启动子 agent')
+    // 与 `_createNodeSession` 同一口径：agentOptions 缺 provider 时用宿主默认模型补齐。
+    const resolvedAgentOptions = this._resolveCreateAgentOptions(agentOptions)
     let started
     try {
       started = await subagents.startActivation({
@@ -3057,7 +3107,9 @@ class FlowEngine {
           parent,
           ...(outputSchema === undefined ? {} : { outputSchema }),
           // 06 §13.11 M5：node.model 必须真正传给 spawn provider，不能只在界面上填。
-          ...(agentOptions && Object.keys(agentOptions).length > 0 ? { agentOptions } : {}),
+          ...(resolvedAgentOptions && Object.keys(resolvedAgentOptions).length > 0
+            ? { agentOptions: resolvedAgentOptions }
+            : {}),
         },
       })
     } catch (error) {

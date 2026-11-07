@@ -1773,6 +1773,41 @@ check('结论 pill 按 04 §3.9.3 映射：warn 是「可」不是「需返工�
   assert.equal(failed.text, '失败')
 })
 
+check('N1 客户端兜底：Host 仍报 pass 但权威覆盖<100% 时不得渲染绿色（旧 Host 兼容）', () => {
+  const legacyPass = conclusionOf(logRun, {
+    quality: {
+      state: 'pass', label: '优：首轮通过',
+      authoritativePassed: 0, claimedPassed: 0, legacyPassed: 3,
+      authoritativeTotal: 3, authorityCoverage: 0,
+    },
+  })
+  assert.notEqual(legacyPass.tone, 'success', 'coverage=0 的 pass 不得是绿 pill')
+  assert.equal(legacyPass.tone, 'warn')
+  assert.match(legacyPass.text, /证据不足|权威覆盖/)
+  assert.ok(!legacyPass.text.includes('优：'), '不能把「优」原样贴在黄 pill 上')
+
+  const partial = conclusionOf(logRun, {
+    quality: {
+      state: 'pass', label: '优：首轮通过',
+      authoritativePassed: 1, authoritativeTotal: 3, authorityCoverage: 1 / 3,
+    },
+  })
+  assert.equal(partial.tone, 'warn', '1/3 覆盖与 legacy 一样不能绿')
+  assert.match(partial.text, /33%/)
+
+  const full = conclusionOf(logRun, {
+    quality: {
+      state: 'pass', label: '优：首轮通过',
+      authoritativePassed: 3, authoritativeTotal: 3, authorityCoverage: 1, claimedPassed: 0,
+    },
+  })
+  assert.equal(full.tone, 'success', '覆盖 100% 且无 claimed 残留仍必须是绿 pill')
+  assert.equal(full.text, '优：首轮通过')
+
+  const oldHost = conclusionOf(logRun, { quality: { state: 'pass', label: '优：首轮通过' } })
+  assert.equal(oldHost.tone, 'success', '没有 coverage 字段的老 Host 摘要保持兼容，不误伤真通过')
+})
+
 check('findings 按 seq 升序取最后状态：先 open 后 verified 算已复验（审核 M4）', () => {
   const events = sortEventsDesc([
     {

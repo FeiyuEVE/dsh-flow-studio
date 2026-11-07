@@ -62,6 +62,9 @@ import { ChildProcess, spawn as spawnProcess } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
+
+import { createBoundedOutput, redactDeep, redactText } from './process-output.js'
 
 /** 允许的 executor 种类；顺序即文档与下拉框的展示顺序。 */
 export const EXECUTORS = Object.freeze(['dsh', 'codex', 'custom'])
@@ -75,8 +78,81 @@ const CODEX_SANDBOXES = Object.freeze(['read-only', 'workspace-write', 'danger-f
 /** stderr 只保留尾部，避免一条刷屏日志把事件数组撑爆（07 §8 要求 2000 字符）。 */
 const STDERR_TAIL_MAX = 2000
 
+/**
+ * stderr 在脱敏之前的原始保留上限（**字节**）。
+ *
+ * 为什么不是直接保留 2000 字符：脱敏必须看到完整凭据才能替换（例如 `token=...` 的值跨
+ * chunk，或 Bearer 前缀在更早的数据里）。先保留一段有界原文，整体脱敏后再裁到
+ * `STDERR_TAIL_MAX`，避免「先裁出 token 前缀再脱敏」把后缀漏出去。
+ * 65536 字节本身有界，且与 stdout 共享 maxBytes 预算（见 appendStderr），不会随输出
+ * 无限增长，也不会让结果里的 retainedBytes 超过配置上限。
+ */
+const STDERR_RETAIN_BYTES = 64 * 1024
+
+/** 诊断 tail 上限（结果里的 `tail` 字段），同时也是 createBoundedOutput 的 maxTail 默认。 */
+const OUTPUT_TAIL_MAX = 16 * 1024
+
+/** 输出字节上限默认值：stdout + stderr 原始输入字节（0.11 R3）。 */
+const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
+/** 规范化事件条数默认上限（0.11 R3）。 */
+const DEFAULT_MAX_EVENTS = 5000
+
+/** 部署侧覆盖输出字节上限的环境变量名。 */
+const MAX_OUTPUT_BYTES_ENV = 'FLOW_STUDIO_EXECUTOR_MAX_OUTPUT_BYTES'
+
+/** 部署侧覆盖事件条数上限的环境变量名。 */
+const MAX_EVENTS_ENV = 'FLOW_STUDIO_EXECUTOR_MAX_EVENTS'
+
 /** 超时 / abort 后先 SIGTERM，再给 250ms 宽限 SIGKILL。 */
 const KILL_GRACE_MS = 250
+
+/**
+ * 完整字符串校验的正整数上限：`/^\d+$/` 且 > 0。
+ *
+ * 刻意不用 `parseInt`：`parseInt('2x') === 2` 会让拼错的部署配置静默生效，比回默认更危险。
+ * 数字选项同样要求安全正整数；`0` / 负数 / 小数 / NaN 都不合法。
+ */
+function positiveLimit(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null
+  }
+  if (typeof value === 'string') {
+    if (!/^\d+$/.test(value)) return null
+    const parsed = Number(value)
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+  }
+  return null
+}
+
+/** 非法配置回默认并留一条 warning；返回值永远是可用的正整数。 */
+function resolveOutputLimit(optionValue, envKey, fallback, label) {
+  if (optionValue !== undefined && optionValue !== null) {
+    const parsed = positiveLimit(optionValue)
+    if (parsed !== null) return parsed
+    warnInvalidLimit(label, optionValue, fallback)
+    return fallback
+  }
+  const envValue = process.env[envKey]
+  if (envValue !== undefined) {
+    const parsed = positiveLimit(envValue)
+    if (parsed !== null) return parsed
+    warnInvalidLimit(label, envValue, fallback)
+    return fallback
+  }
+  return fallback
+}
+
+/** 非法上限的 warn：不抛错，也不让一次配置笔误改变执行语义（回默认继续跑）。 */
+function warnInvalidLimit(label, value, fallback) {
+  const message = `${label}「${String(value)}」不是 >0 的正整数（要求完整匹配 /^\\d+$/），已回落到默认值 ${fallback}。`
+  if (typeof process.emitWarning === 'function') {
+    process.emitWarning(message, 'ExecutorOutputLimitWarning')
+    return
+  }
+  console.warn(message)
+}
+
 
 /**
  * 是否用 `detached: true` 让子进程成为新进程组的组长。
@@ -542,9 +618,18 @@ function tailOf(value, max) {
  * 命令模板里只有读文件的命令替换 `"$(cat -- "$FLOW_STUDIO_PROMPT_FILE")"`，
  * 绝无 prompt 文本参与 shell 解析。临时文件在本次执行收口时删除。
  * 返回 `{ ok, text, structured, exitCode, usage, events, killScope, orphanWarning }`；
- * 失败时追加 `reason`（timeout / aborted / exit / spawn），非 0 退出再带 `tail`。
+ * 失败时追加 `reason`（timeout / aborted / exit / spawn / OUTPUT_LIMIT），非 0 退出再带 `tail`。
+ * 输出越界时统一返回：
+ *   `{ ok:false, reason:'OUTPUT_LIMIT', code:'OUTPUT_LIMIT', truncated:true,
+ *      receivedBytes, retainedBytes, eventCount, tail, ... }`，并已终止进程组。
  * `killScope`：`'group'` = 按进程组终止（孙进程一起），`'process'` = 只终止了直接子进程，
  * `null` = 本次没有发生终止；`orphanWarning`：非 null 时说明进程组不可用、孙进程可能残留。
+ *
+ * 输出上限（0.11 R3）：`maxOutputBytes` / `maxEvents` 选项优先，其次环境变量
+ * `FLOW_STUDIO_EXECUTOR_MAX_OUTPUT_BYTES` / `FLOW_STUDIO_EXECUTOR_MAX_EVENTS`，最后默认
+ * 8 MiB / 5000。非法值（非 `/^\d+$/` 或 ≤0）回默认并 warn，绝不用 parseInt 接受 "2x"。
+ * stdout + stderr 的原始字节在 decode / 保留之前累计；事件、text、tail、message 在对外
+ * 可见之前都会先脱敏（`process-output.redactText` / `redactDeep`）。
  *
  * @param {{
  *   spec: {kind:string, command?:string, model?:string, schemaPath?:string, sandbox?:string},
@@ -554,10 +639,14 @@ function tailOf(value, max) {
  *   signal?: AbortSignal,
  *   spawn?: Function,
  *   onEvent?: (event: object) => void,
+ *   maxOutputBytes?: number|string,
+ *   maxEvents?: number|string,
  * }} options
  * @returns {Promise<{ok:boolean, text:string, structured:object|null, exitCode:number|null,
  *   usage:{input:number,output:number,total:number}|null, events:object[], reason?:string,
- *   tail?:string, message?:string, killScope:'group'|'process'|null, orphanWarning:string|null}>}
+ *   code?:string, truncated?:boolean, receivedBytes?:number, retainedBytes?:number,
+ *   eventCount?:number, tail?:string, message?:string,
+ *   killScope:'group'|'process'|null, orphanWarning:string|null}>}
  */
 export async function runExternalExecutor({
   spec,
@@ -567,6 +656,8 @@ export async function runExternalExecutor({
   signal,
   spawn = spawnProcess,
   onEvent,
+  maxOutputBytes,
+  maxEvents,
 } = {}) {
   if (!spec || typeof spec !== 'object') {
     throw executorInvalid('缺少 executor spec：先用 normalizeExecutor(node) 归一化。')
@@ -581,17 +672,148 @@ export async function runExternalExecutor({
     throw executorInvalid('runExternalExecutor 需要可注入的 spawn 函数。')
   }
 
-  const events = []
-  let stdoutAll = ''
+  // 上限解析放在起进程之前：配置笔误只影响保留额度，不影响 spawn 参数。
+  const outputByteLimit = resolveOutputLimit(
+    maxOutputBytes,
+    MAX_OUTPUT_BYTES_ENV,
+    DEFAULT_MAX_OUTPUT_BYTES,
+    '外部 executor 输出字节上限',
+  )
+  const outputEventLimit = resolveOutputLimit(
+    maxEvents,
+    MAX_EVENTS_ENV,
+    DEFAULT_MAX_EVENTS,
+    '外部 executor 事件条数上限',
+  )
+
+  /**
+   * 全路径共享的有界保留器：stdout 文本、事件队列都在这里。
+   *
+   * 不再保留 `stdoutAll` / 无界 `events` 第二份副本；stdout 的半行缓冲
+   * （`stdoutBuffer`）只会累积「已接受进保留额度」的文本，因此同样 ≤ maxBytes。
+   */
+  const output = createBoundedOutput({
+    maxBytes: outputByteLimit,
+    maxEvents: outputEventLimit,
+    maxTail: Math.min(OUTPUT_TAIL_MAX, outputByteLimit),
+  })
+  /** stdout 未闭合的半行（有界：只接收 output 接受了的前缀）。 */
   let stdoutBuffer = ''
+  /**
+   * stderr 的原始保留尾部（脱敏前）。它本身有界，且与 stdout 共享 maxBytes 预算：
+   * 上限按「剩余字节 / 3」折算成 UTF-16 码元数（每个码元最多编码 3 个 UTF-8 字节），
+   * 因此 `Buffer.byteLength(stderrTail)` 不会超过剩余预算。
+   */
   let stderrTail = ''
+  /** stderr 累计接收的原始字节（与 stdout 一起计入 maxBytes）。 */
+  let stderrReceivedBytes = 0
   let stderrEmitted = false
   let finalText = ''
   let usage = null
   let settled = false
+  /**
+   * 输出越界 / 收口后置 true：此后不再处理 data、不再 emit，迟到的 close/error
+   * 也不能改写结论（与 settled 一起构成唯一收口闸门）。
+   */
+  let writeClosed = false
   let interruptReason = null
   let child = null
   let timer = null
+  /**
+   * 输出越界时由 Promise 内部的 `interrupt('OUTPUT_LIMIT')` 接手；emit 在越界后
+   * 可能仍被 killChild 的告警路径调用，所以用回调而不是直接引用内部闭包。
+   */
+  let onOutputLimit = null
+
+  const emit = (event) => {
+    if (settled || writeClosed || !event || typeof event !== 'object') return false
+    // 事件对象先递归脱敏（数组 / 嵌套字符串都覆盖），再进有界队列与 onEvent。
+    const safe = redactDeep(event)
+    if (!output.pushEvent(safe)) {
+      // 事件条数越界：交给统一 OUTPUT_LIMIT 收口（先置原因再杀进程组）。
+      if (typeof onOutputLimit === 'function') onOutputLimit()
+      return false
+    }
+    if (typeof onEvent === 'function') {
+      try {
+        onEvent(safe)
+      } catch {
+        // 消费方自己的异常不能带崩执行器。
+      }
+    }
+    return true
+  }
+
+  const emitStderr = () => {
+    if (stderrEmitted || stderrTail === '' || writeClosed) return
+    stderrEmitted = true
+    // 先对整段 stderr 脱敏，再裁到事件上限：避免先裁出 token 前缀导致后缀漏网。
+    emit({ kind: 'stderr', text: tailOf(redactText(stderrTail), STDERR_TAIL_MAX) })
+  }
+
+  const currentText = () => {
+    if (finalText !== '') return finalText
+    if (spec.kind !== 'custom') return ''
+    // custom 的最终文本仍受 maxBytes 约束（output.text() 就是有界前缀）。
+    return redactText(output.text().trim())
+  }
+
+  const snapshot = () => {
+    const text = currentText()
+    return {
+      text,
+      structured: parseStructured(text),
+      usage,
+      events: output.eventList(),
+    }
+  }
+
+  /** stdout + stderr 的原始接收字节（用于 OUTPUT_LIMIT 结果的自证）。 */
+  const totalReceivedBytes = () => output.receivedBytes + stderrReceivedBytes
+
+  /**
+   * stderr 还能保留多少 UTF-16 码元：按剩余字节预算折算（每码元最多 3 字节）。
+   * stdout 每接受一段，剩余预算就变小，stderr 会跟着从头部收缩（见 trimStderr）。
+   */
+  const stderrRetainedCharLimit = () => {
+    const remaining = Math.max(0, outputByteLimit - output.retainedBytes)
+    return Math.floor(Math.min(STDERR_RETAIN_BYTES, remaining) / 3)
+  }
+
+  /** 按当前共享预算裁掉 stderr 多出来的头部（保留尾部，尾部才是诊断与脱敏需要的）。 */
+  const trimStderr = () => {
+    const limit = stderrRetainedCharLimit()
+    if (limit === 0) {
+      stderrTail = ''
+      return
+    }
+    if (stderrTail.length > limit) stderrTail = tailOf(stderrTail, limit)
+  }
+
+  /** 追加 stderr 文本：先按预算粗切 chunk，再保留整体尾部，避免大 chunk 全量拼接。 */
+  const appendStderr = (text) => {
+    if (text === '') return
+    const limit = stderrRetainedCharLimit()
+    if (limit === 0) {
+      stderrTail = ''
+      return
+    }
+    const piece = text.length > limit ? text.slice(-limit) : text
+    stderrTail = tailOf(stderrTail + piece, limit)
+  }
+
+  /** 保留文本 + stderr 保留字节；两侧共享预算，合计不超过 maxBytes。 */
+  const totalRetainedBytes = () => output.retainedBytes + Buffer.byteLength(stderrTail, 'utf8')
+
+  /**
+   * 诊断 tail：优先 stderr（失败原因通常在那里），否则取 stdout 尾部。
+   * 全部先脱敏再裁剪；上限 min(OUTPUT_TAIL_MAX / STDERR_TAIL_MAX, maxBytes)。
+   */
+  const outputTail = () => {
+    if (stderrTail !== '') return tailOf(redactText(stderrTail), STDERR_TAIL_MAX)
+    return tailOf(redactText(output.tail()), Math.min(STDERR_TAIL_MAX, outputByteLimit))
+  }
+
   /**
    * 本次终止的范围：`'group'` = 杀了整组（含孙进程），`'process'` = 只杀了直接子进程，
    * `null` = 没有发生终止（成功 / 非 0 退出等自然收口）。结果对象里原样透出。
@@ -604,35 +826,6 @@ export async function runExternalExecutor({
   let orphanWarning = CAN_DETACH
     ? null
     : '当前平台（Windows）不支持 POSIX 进程组：abort / 超时只能终止直接子进程，孙进程可能残留。'
-
-  const emit = (event) => {
-    events.push(event)
-    if (typeof onEvent === 'function') {
-      try {
-        onEvent(event)
-      } catch {
-        // 消费方自己的异常不能带崩执行器。
-      }
-    }
-  }
-
-  const emitStderr = () => {
-    if (stderrEmitted || stderrTail === '') return
-    stderrEmitted = true
-    emit({ kind: 'stderr', text: stderrTail })
-  }
-
-  const currentText = () => finalText || (spec.kind === 'custom' ? stdoutAll.trim() : '')
-
-  const snapshot = () => {
-    const text = currentText()
-    return {
-      text,
-      structured: parseStructured(text),
-      usage,
-      events,
-    }
-  }
 
   /**
    * 本次子进程能否按「整组」终止。
@@ -759,14 +952,16 @@ export async function runExternalExecutor({
   const consumeLine = (line) => {
     const parsed = parseCodexLine(line)
     if (parsed.kind === 'ignore') return
-    emit(parsed)
-    if (parsed.kind === 'final') finalText = parsed.text
+    // emit 会做事件对象递归脱敏；事件条数越界时 emit 返回 false 并触发统一收口。
+    if (!emit(parsed)) return
+    // finalText 是后续 text / structured / message 的来源，进入前先脱敏。
+    if (parsed.kind === 'final') finalText = redactText(parsed.text)
     if (parsed.kind === 'usage') usage = parsed.usage
   }
 
   const flushCompleteLines = () => {
     let index = stdoutBuffer.indexOf('\n')
-    while (index >= 0) {
+    while (index >= 0 && !settled && !writeClosed) {
       const line = stdoutBuffer.slice(0, index)
       stdoutBuffer = stdoutBuffer.slice(index + 1)
       consumeLine(line)
@@ -778,11 +973,12 @@ export async function runExternalExecutor({
     const finish = (result) => {
       if (settled) return
       settled = true
+      writeClosed = true
       if (timer) clearTimeout(timer)
       if (signal && typeof signal.removeEventListener === 'function') {
         signal.removeEventListener('abort', onAbort)
       }
-      // 所有收口路径都经过这里：成功 / 非 0 退出 / 超时 / abort / spawn 失败。
+      // 所有收口路径都经过这里：成功 / 非 0 退出 / 超时 / abort / spawn 失败 / 输出越界。
       // 先断开 stdout / stderr 管道，再删 prompt 临时文件，最后 resolve：
       // 任何路径都不把子进程的 fd 留给宿主事件循环（见 destroyStdio 注释）。
       destroyStdio()
@@ -793,28 +989,68 @@ export async function runExternalExecutor({
       resolve({ ...result, killScope, orphanWarning })
     }
 
+    /** 输出越界的唯一结果形状：reason / code 同值、truncated=true，并自证累计/保留量。 */
+    const outputLimitResult = () => ({
+      ok: false,
+      reason: 'OUTPUT_LIMIT',
+      code: 'OUTPUT_LIMIT',
+      truncated: true,
+      exitCode: null,
+      ...snapshot(),
+      tail: outputTail(),
+      receivedBytes: totalReceivedBytes(),
+      retainedBytes: totalRetainedBytes(),
+      eventCount: output.eventCount,
+    })
+
+    /**
+     * 唯一 OUTPUT_LIMIT 收口：先原子固定原因 + 关写闸门，再杀进程组，最后 settle。
+     * 顺序不能反——某些桩 spawn 的 kill 会同步 emit close，close 分支只能看到
+     * OUTPUT_LIMIT，不能把这次收口改判成 exit / 成功。
+     */
+    const settleOutputLimit = () => {
+      if (settled) return
+      interruptReason = 'OUTPUT_LIMIT'
+      writeClosed = true
+      killChild()
+      finish(outputLimitResult())
+    }
+
+    // emit 发现事件条数越界时回调到这里（emit 定义在 Promise 外，无法直接读闭包）。
+    onOutputLimit = settleOutputLimit
+
     const failWith = (reason, extra = {}) => {
+      if (settled) return
       emitStderr()
+      // message / tail 同样可能在错误链里带出凭据（例如命令回显），对外前先脱敏。
+      const safeExtra = { ...extra }
+      if (typeof safeExtra.message === 'string') safeExtra.message = redactText(safeExtra.message)
+      if (typeof safeExtra.tail === 'string') safeExtra.tail = redactText(safeExtra.tail)
       finish({
         ok: false,
         reason,
-        exitCode: Object.prototype.hasOwnProperty.call(extra, 'exitCode') ? extra.exitCode : null,
+        exitCode: Object.prototype.hasOwnProperty.call(safeExtra, 'exitCode') ? safeExtra.exitCode : null,
         ...snapshot(),
-        ...extra,
+        ...safeExtra,
       })
     }
 
     const succeed = (exitCode) => {
+      if (settled) return
       emitStderr()
       finish({ ok: true, exitCode, ...snapshot() })
     }
 
     /**
-     * 超时 / abort / spawn 失败：先记下终止原因再 kill。某些桩 spawn 的 kill 会同步
-     * emit close，若不先记原因，close 会把 timeout/abort 误记成 exit。
+     * 超时 / abort / spawn 失败 / 输出越界：先记下终止原因再 kill。某些桩 spawn 的 kill
+     * 会同步 emit close，若不先记原因，close 会把 timeout/abort 误记成 exit。
      */
     const interrupt = (reason) => {
       if (settled) return
+      if (reason === 'OUTPUT_LIMIT') {
+        settleOutputLimit()
+        return
+      }
       interruptReason = reason
       killChild()
       failWith(reason)
@@ -873,47 +1109,84 @@ export async function runExternalExecutor({
     }
     if (spec.kind === 'custom') feedPromptToStdin(child, customPrompt)
 
-    if (typeof child.stdout.setEncoding === 'function') child.stdout.setEncoding('utf8')
-    if (typeof child.stderr.setEncoding === 'function') child.stderr.setEncoding('utf8')
+    // 不用 stream.setEncoding：解码交给 StringDecoder，这样 data 拿到的是原始 Buffer，
+    // 可以在 decode / 复制之前按原始字节计量（跨 chunk 的多字节字符也不会被拆坏）。
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
+    const decodeChunk = (chunk, decoder) => {
+      if (typeof chunk === 'string') return chunk
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      return decoder.write(buffer)
+    }
+    const rawChunkBytes = (chunk) => {
+      if (typeof chunk === 'string') return Buffer.byteLength(chunk, 'utf8')
+      if (Buffer.isBuffer(chunk)) return chunk.length
+      if (ArrayBuffer.isView(chunk)) return chunk.byteLength
+      return Buffer.byteLength(String(chunk), 'utf8')
+    }
 
     child.stdout.on('data', (chunk) => {
-      const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-      stdoutAll += text
+      if (settled || writeClosed) return
+      // 先按原始字节计量并保留前缀；越过 maxBytes 立刻进入唯一 OUTPUT_LIMIT 收口。
+      const accepted = output.addRaw(chunk)
+      // stdout 占用了共享预算，stderr 的保留上限随之收缩（只影响尾部长度，不影响已收字节）。
+      trimStderr()
+      if (!accepted || output.limit === 'bytes') {
+        interrupt('OUTPUT_LIMIT')
+        return
+      }
+      const text = decodeChunk(chunk, stdoutDecoder)
+      if (text === '') return
       stdoutBuffer += text
       flushCompleteLines()
     })
     child.stderr.on('data', (chunk) => {
-      const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-      stderrTail = tailOf(stderrTail + text, STDERR_TAIL_MAX)
+      if (settled || writeClosed) return
+      const text = decodeChunk(chunk, stderrDecoder)
+      stderrReceivedBytes += rawChunkBytes(chunk)
+      // stderr 是诊断流：先保留有界原文（供整体脱敏），结果里只出尾部 2000 字符。
+      appendStderr(text)
+      // stdout 与 stderr 共享总接收预算：任一维度越界都进入同一个 OUTPUT_LIMIT 通道。
+      if (totalReceivedBytes() > outputByteLimit) interrupt('OUTPUT_LIMIT')
     })
     child.on('error', (error) => {
-      if (settled) return
+      if (settled || writeClosed || interruptReason) return
       interruptReason = 'spawn'
       killChild()
       failWith('spawn', { message: error && error.message ? error.message : String(error) })
     })
     child.on('close', (code) => {
       if (settled) return
+      if (interruptReason === 'OUTPUT_LIMIT') {
+        finish(outputLimitResult())
+        return
+      }
       if (interruptReason) {
         failWith(interruptReason)
         return
       }
-      // 半行在 EOF 处也算一行（某些桩命令不补换行）。
+      if (writeClosed) return
+      // 冲刷解码器里可能残留的半个多字节序列，再处理 EOF 处没有换行的半行。
+      const stdoutRest = stdoutDecoder.end()
+      if (stdoutRest !== '') stdoutBuffer += stdoutRest
+      const stderrRest = stderrDecoder.end()
+      if (stderrRest !== '') appendStderr(stderrRest)
       if (stdoutBuffer.trim() !== '') consumeLine(stdoutBuffer)
       stdoutBuffer = ''
+      // 事件条数可能在 EOF 半行这里越界（consumeLine 会触发收口），不能再走成功分支。
+      if (settled || writeClosed) return
       const exitCode = Number.isInteger(code) ? code : null
       if (exitCode === 0) {
         succeed(0)
         return
       }
       emitStderr()
-      const tail = stderrTail !== '' ? stderrTail : tailOf(stdoutAll, STDERR_TAIL_MAX)
       finish({
         ok: false,
         reason: 'exit',
         exitCode,
         ...snapshot(),
-        tail,
+        tail: outputTail(),
       })
     })
 

@@ -74,14 +74,18 @@ function fixture({ rework = 0, half = false, p1 = 'verified', p2 = null, p0 = nu
   }
   events.push(ev('acceptance/verdict', {
     nodeId: 'n_acc', attemptId: 1,
+    // 0.11 N1：pass 档要求权威覆盖 100%；这三条证据按「宿主已核对」的输入形状构造。
+    extra: { producer: 'host', authority: 'host' },
     data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: 'artifacts/acc.md' },
   }))
   events.push(ev('test/report', {
     nodeId: 'n_test', attemptId: 1,
+    extra: { producer: 'host', authority: 'host' },
     data: { suite: 'unit', executed: 10, passed: 10, failed: 0, skipped: 0, reportRef: 'artifacts/test.md' },
   }))
   events.push(ev('check/form', {
     nodeId: 'n_check', attemptId: 1,
+    extra: { producer: 'host', authority: 'host' },
     data: {
       ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
       passedChecks: 5, totalChecks: 5, executedAt: '2026-11-06T10:00:00.000Z',
@@ -113,12 +117,15 @@ function fixture({ rework = 0, half = false, p1 = 'verified', p2 = null, p0 = nu
   return events
 }
 
+/** 0.11 N1：夹具里的宿主来源证据需要显式验证器才会被算作权威通过。 */
+const HOST_VERIFY = { verifyHostExecution: () => true }
+
 console.log('metrics · quality 判定表探针（05 §8.4）')
 
 const probeRows = []
 await check('quality 能出 pass：返工 0 → 优；返工 1 + P1=0 + 采纳率 1 → 良', () => {
-  const first = computeQuality(fixture({ rework: 0 }))
-  const good = computeQuality(fixture({ rework: 1, p1: 'verified' }))
+  const first = computeQuality(fixture({ rework: 0 }), HOST_VERIFY)
+  const good = computeQuality(fixture({ rework: 1, p1: 'verified' }), HOST_VERIFY)
   probeRows.push(['返工 0', first.state, first.label])
   probeRows.push(['返工 1 + P1=0 + 采纳率 100%', good.state, good.label])
   assert.equal(first.state, 'pass')
@@ -128,10 +135,26 @@ await check('quality 能出 pass：返工 0 → 优；返工 1 + P1=0 + 采纳�
   assert.equal(good.acceptedRate, 1)
 })
 
+// N1 反向锁：把夹具改回旧 run 的 legacy 形状（证据无 extra）后不得再 pass，
+// 否则将来有人改回无 extra 的夹具，N1 会静默回退且本文件无测试发现。
+await check('N1：legacy 形状（证据无 extra）的同一份 fixture 不得 pass，标签写明来源未知', () => {
+  const legacy = fixture({ rework: 0 }).map(event => {
+    if (['acceptance/verdict', 'test/report', 'check/form'].includes(event.kind)) event.extra = undefined
+    return event
+  })
+  const quality = computeQuality(legacy)
+  probeRows.push(['legacy 形状（无 extra）', quality.state, quality.label])
+  assert.equal(quality.authorityCoverage, 0)
+  assert.equal(quality.claimedPassed, 0)
+  assert.ok(quality.legacyPassed >= 3, `legacyPassed=${quality.legacyPassed}`)
+  assert.equal(quality.state, 'unknown', `legacy 形状不得 pass：${quality.label}`)
+  assert.match(quality.label, /legacy|来源未知/)
+})
+
 await check('缺证据 → unknown（列出缺项）；半成品 → warn；P1 未解决不给良', () => {
   const unknown = computeQuality([])
-  const half = computeQuality(fixture({ half: true }))
-  const p1Open = computeQuality(fixture({ rework: 1, p1: 'open' }))
+  const half = computeQuality(fixture({ half: true }), HOST_VERIFY)
+  const p1Open = computeQuality(fixture({ rework: 1, p1: 'open' }), HOST_VERIFY)
   probeRows.push(['无事件', unknown.state, unknown.label])
   probeRows.push(['证据全过但进度 1/2', half.state, half.label])
   probeRows.push(['返工 1 + P1 未解决', p1Open.state, p1Open.label])
@@ -144,9 +167,9 @@ await check('缺证据 → unknown（列出缺项）；半成品 → warn；P1 �
 })
 
 await check('v1.3 首轮通过 + P1/P2 未解决 → warn；P0 未解决 → fail', () => {
-  const p1Only = computeQuality(fixture({ rework: 0, p1: 'open' }))
-  const p2Only = computeQuality(fixture({ rework: 0, p2: 'fixed' }))
-  const p0Block = computeQuality(fixture({ rework: 0, p0: 'open', p1: 'open', p2: 'open' }))
+  const p1Only = computeQuality(fixture({ rework: 0, p1: 'open' }), HOST_VERIFY)
+  const p2Only = computeQuality(fixture({ rework: 0, p2: 'fixed' }), HOST_VERIFY)
+  const p0Block = computeQuality(fixture({ rework: 0, p0: 'open', p1: 'open', p2: 'open' }), HOST_VERIFY)
   probeRows.push(['首轮 + P1 未解决', p1Only.state, p1Only.label])
   probeRows.push(['首轮 + P2 未解决', p2Only.state, p2Only.label])
   probeRows.push(['首轮 + P0/P1/P2 未解决', p0Block.state, p0Block.label])
@@ -281,8 +304,9 @@ function rawEvent(kind, runId, over = {}) {
  * reject/trigger）只能由引擎 / 运行时内部推进，HTTP `/events` 是观测类白名单。
  * 测试播种改走内部路径 `store.appendEvents` —— 与路由最终调用的实现同一条
  * （同一套归一化 / 进度计数 / run.json 写盘），聚合口径与断言全部不变。
- * 纯观测类事件（acceptance/verdict、artifact/write、review/*、agent/message…）
- * 仍然走 HTTP `/events`，外部通道能力照旧有覆盖。
+ * R4/S3 之后 HTTP `/events` 会强制盖 `external/unverified` 章，所以需要进入权威聚合的
+ * 证据类事件（acceptance/verdict、artifact/write、review/*）也走内部通道；
+ * HTTP 外部通道的能力仍由 E3-b 单独覆盖。
  */
 async function seedEvents(runId, events) {
   return store.appendEvents(runsRoot, runId, events)
@@ -398,7 +422,7 @@ await check('summary 声明 eventCount / truncated，并带 findings.byNode（§
   await seedEvents(meta.id, [
     rawEvent('node/end', meta.id, { nodeId: 'n_a', data: { status: 'passed', durationMs: 1 } }),
   ])
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('review/finding', meta.id, { nodeId: 'n_a', data: { id: 'f1', severity: 'P1', title: '问题', status: 'open' } }),
     rawEvent('review/verdict', meta.id, { nodeId: 'n_a', data: { verdict: 'approve', findingCount: 1 } }),
   ])
@@ -484,7 +508,7 @@ await check('可选 token 两档：未设置同源放行；设置后缺/错 toke
 
 await check('summary 在纯函数层也能独立复算（quality 与 HTTP 同一口径）', () => {
   const events = fixture({ rework: 1 })
-  const summary = summarize(events)
+  const summary = summarize(events, HOST_VERIFY)
   assert.equal(summary.quality.state, 'pass')
   assert.equal(summary.quality.label, '良：返工 1 轮后达标')
   assert.equal(summary.progress.ratio, 1)
@@ -497,7 +521,7 @@ await check('summary 在纯函数层也能独立复算（quality 与 HTTP 同一
 
 await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘要同口径', async () => {
   const meta = await makeRun(2)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('acceptance/verdict', meta.id, {
       nodeId: 'n_a', data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'artifacts/acc.md' },
     }),
@@ -516,7 +540,8 @@ await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘
 
 await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ acceptance unknown', async () => {
   const meta = await makeRun(1)
-  const append = events => call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, events)
+  // 模型自述证据是「内部证据」，走内部 append 通道；外部 /events 现在会盖 external 章。
+  const append = events => seedEvents(meta.id, events)
   // 模型自述：引用了一个根本不存在的文件。
   await append([{
     ...rawEvent('acceptance/verdict', meta.id, {
@@ -600,7 +625,7 @@ await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全�
 
 await check('§13.7 跨节点重复 itemId → acceptance unknown 且返回 conflicts', async () => {
   const meta = await makeRun(2)
-  await call(route, 'POST', `/api/flow-studio/runs/${meta.id}/events`, [
+  await seedEvents(meta.id, [
     rawEvent('acceptance/verdict', meta.id, {
       nodeId: 'n_a', data: { itemId: 'R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'a.md' },
     }),

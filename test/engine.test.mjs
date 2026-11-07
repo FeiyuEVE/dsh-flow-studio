@@ -12,7 +12,9 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -221,11 +223,35 @@ function makeGitRepo(name) {
 /**
  * 造一个**不在任何 git 仓库里**的空目录。项目 `.tmp/` 本身在插件仓库内
  * （`git rev-parse --show-toplevel` 会返回仓库根），测「非 git 工作区」必须放在仓库外；
- * 按工作区约定用大卷 `~/tmp`（不进 /tmp，也不污染仓库）。
+ * 按工作区约定优先用大卷 `~/tmp`（不进 /tmp，也不污染仓库）。
+ *
+ * 0.11 修：容器/沙箱里 `$HOME` 常常是**不可写**的（dsh 的 bash 沙箱只放开工作区与
+ * /tmp 的 tmpfs），原来直接 `mkdir $HOME/tmp` 会 EACCES，把整条基线测成红的，
+ * 看起来像产品回归。这里改成「按顺序试，谁真能写就用谁」，全部不可写时退回
+ * `os.tmpdir()`（沙箱内即 /tmp，仍然在仓库外，语义不变）。
+ * 可用 `FLOW_STUDIO_TEST_TMP` 显式指定。
  */
+function scratchOutsideRepo() {
+  const candidates = [
+    process.env.FLOW_STUDIO_TEST_TMP,
+    process.env.HOME ? join(process.env.HOME, 'tmp') : null,
+  ].filter(candidate => typeof candidate === 'string' && candidate !== '')
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      accessSync(dir, constants.W_OK)
+      return dir
+    } catch {
+      // 试下一个候选
+    }
+  }
+  const fallback = tmpdir()
+  mkdirSync(fallback, { recursive: true })
+  return fallback
+}
+
 function makePlainDir(name) {
-  const base = join(process.env.HOME || repoRoot, 'tmp')
-  mkdirSync(base, { recursive: true })
+  const base = scratchOutsideRepo()
   return mkdtempSync(join(base, `flow-studio-${name}-`))
 }
 
@@ -4029,6 +4055,30 @@ try {
     A.equal(raw.workspace, undefined, 'run.json 不写入伪造的工作区绑定')
   })
 
+  await check('N2（复核阻断）：start 在 claim 之后失败时按同一世代释放租约（不留无法接管的锁）', async () => {
+    const flow = flowOf('flow-n2-release', [startNode(), stage('n_n2rel', '节点', 300), endNode()], [
+      next('e1', 'n_start', 'n_n2rel'),
+      next('e2', 'n_n2rel', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-n2-release', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, activate: async () => passResult('n_n2rel') })
+    // 让 claim 之后的 run/start 写入失败：flowSnapshot 不经过 normalizeFlow，用超长流程名
+    // 把单条事件撑过 8KB 上限。失败点正好在 claimLease 之后、4451 的释放路径之前。
+    const oversized = { ...flow, name: '超长流程名'.repeat(2000) }
+    await assert.rejects(
+      () => engine.start(run.id, { flowSnapshot: oversized }),
+      error => error && error.status === 400,
+      '超长 run/start 事件必须 400',
+    )
+    const lockPath = join(runsRoot, run.id, 'lock.json')
+    A.equal(existsSync(lockPath), false, 'start 失败必须按 claim 的世代释放租约，不能留下锁')
+    const after = await store.readRunMeta(runsRoot, run.id)
+    A.equal(after.status, 'failed', '已迁移到 running 的 run 必须尽量写回 failed')
+    A.ok(after.execution && after.execution.state === 'active', '释放租约不覆盖持久世代（便于事后核对）')
+    A.equal(engine.active, null, '失败的 start 必须释放实例占位')
+  })
+
   await check('C3：stub 引擎不绑定工作区（不建真实会话）→ start 照常跑完，不伪造 workspace', async () => {
     const flow = flowOf('flow-stubws', [startNode(), stage('n_stubws', '节点', 300), endNode()], [
       next('e1', 'n_start', 'n_stubws'),
@@ -5561,7 +5611,10 @@ try {
     A.deepEqual(a2Findings.map(event => event.data.id), ['n_a:BF1'], '打回方的 finding 复报后归属目标节点，不成 n_a:n_b:BF1')
     A.equal(allIds.some(id => /^n_a:n_a:/.test(id)), false, '不许出现双前缀 id')
     A.equal(allIds.some(id => /^n_a:n_b:/.test(id)), false, '不许出现跨节点双前缀 id')
-    A.equal(summary.quality.evidence.acceptance.state, 'pass', '复报后旧 fail 能判成 pass')
+    // 0.11 R6（F5）：无独立 evidenceRef 的 acceptance 退到引擎自写报告 = claimed，不再判 pass。
+    A.equal(summary.quality.evidence.acceptance.state, 'unknown', '自报报告只能 unknown')
+    A.match(String(summary.quality.evidence.acceptance.reason), /自报报告/, '必须说明缺独立证据')
+    A.ok(summary.quality.evidence.acceptance.claimedPassed >= 1, '至少一条验收通过被降级为 claimed')
     A.equal(summary.quality.evidence.acceptance.staleFails, undefined, '旧 n_a:R1 复判为通过，staleFails 必须为空')
   })
 
@@ -5867,6 +5920,125 @@ try {
       A.equal(startEvent.data.worktreeReason, 'disabled-by-initiator', 'run/start.data 里也能看出是用户主动关闭')
     } finally {
       rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  // 0.11 F3：公开执行记录 / 报告副本先脱敏，再按最终副本算 hash。
+  await check('F3：宿主检查的 commandSummary 与报告副本脱敏，reportSha256 绑定最终副本', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const canary = 'canary-hostcheck-1c9e'
+      const workspace = join(home, 'ws-hostcheck-redact')
+      mkdirSync(workspace, { recursive: true })
+      const rawReport = `{"token":"${canary}"}`
+      const command = `printf '%s' '${rawReport}' > report.json`
+      const flow = flowOf('flow-hostcheck-redact', [
+        startNode(),
+        stage('n_hc_redact', '实现', 300, { check: { command, expectExitCode: 0, reportPath: 'report.json' } }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_hc_redact'),
+        next('e2', 'n_hc_redact', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-hostcheck-redact', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const events = await eventsOf(run.id)
+      const hostWrites = events.filter(event => event.kind === 'artifact/write'
+        && event.extra && event.extra.producer === 'host')
+      const reportWrite = hostWrites.find(event => /-report\./.test(event.data.path))
+      const recordWrite = hostWrites.find(event => /host-check-hc-[0-9a-f]+\.json$/.test(event.data.path)
+        && !/-report\./.test(event.data.path))
+      A.ok(Boolean(reportWrite), '必须落盘报告副本')
+      A.ok(Boolean(recordWrite), '必须落盘执行记录')
+      const readRel = rel => readFileSync(join(runsRoot, run.id, rel), 'utf8')
+      const reportText = readRel(reportWrite.data.path)
+      const recordText = readRel(recordWrite.data.path)
+      A.equal(reportText.includes(canary), false, '报告副本不得含原始 token')
+      A.ok(reportText.includes('[REDACTED]'), '报告副本必须保留 [REDACTED] 标记')
+      A.equal(recordText.includes(canary), false, '执行记录（含 commandSummary）不得含原始 token')
+      A.ok(recordText.includes('[REDACTED]'), '执行记录必须保留 [REDACTED] 标记')
+
+      const record = JSON.parse(recordText)
+      const finalSha = createHash('sha256').update(Buffer.from(reportText, 'utf8')).digest('hex')
+      A.equal(record.reportSha256, finalSha, 'reportSha256 必须绑定脱敏后的最终副本')
+      A.equal(record.reportBytes, Buffer.byteLength(reportText))
+      A.equal(record.reportOpaque, false, '可解析的文本报告必须 reportOpaque=false')
+      A.equal(readFileSync(join(workspace, 'report.json'), 'utf8'), rawReport, '不写回源报告')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
+  })
+
+  await check('F3（0.11 N3）：二进制报告副本按字节脱敏且记录 reportOpaque=true，源文件不被写回', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const canary = 'canary-bin-9f21'
+      const workspace = join(home, 'ws-hostcheck-bincopy')
+      mkdirSync(workspace, { recursive: true })
+      // 非 UTF-8 报告：0xFF 0xFE 开头 + 一条 key:value 形态凭据。printf 解释 \377 等转义。
+      const command = `printf '\\377\\376token=${canary}\\000tail' > report.json`
+      const flow = flowOf('flow-hostcheck-bincopy', [
+        startNode(),
+        stage('n_hc_bin', '实现', 300, { check: { command, expectExitCode: 0, reportPath: 'report.json' } }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_hc_bin'),
+        next('e2', 'n_hc_bin', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-hostcheck-bincopy', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, activate: async ({ node }) => passOf(node.id) })
+      await engine.start(run.id, { workspace })
+      const final = await engine.wait(run.id)
+      A.equal(final.status, 'done')
+
+      const events = await eventsOf(run.id)
+      const hostWrites = events.filter(event => event.kind === 'artifact/write'
+        && event.extra && event.extra.producer === 'host')
+      const reportWrite = hostWrites.find(event => /-report\./.test(event.data.path))
+      const recordWrite = hostWrites.find(event => /host-check-hc-[0-9a-f]+\.json$/.test(event.data.path)
+        && !/-report\./.test(event.data.path))
+      A.ok(Boolean(reportWrite), '必须落盘报告副本')
+      A.ok(Boolean(recordWrite), '必须落盘执行记录')
+
+      // 公开副本按字节读：源报告是非 UTF-8，用 latin1 回读才能逐字节判断。
+      const copyBytes = readFileSync(join(runsRoot, run.id, reportWrite.data.path))
+      // N7（复核2）：逐段精确校验，而不是只查「不含 canary / 含 [REDACTED]」——
+      // 后者放过了「值规则把 canary 后面的 \0tail 一起吞掉」的缺陷。脱敏副本必须
+      // 精确等于「原字节里只把凭据值替换成 "[REDACTED]"」的结果。
+      const expectedCopy = Buffer.concat([
+        Buffer.from([0xff, 0xfe]),
+        Buffer.from('token="[REDACTED]"', 'utf8'),
+        Buffer.from([0x00]),
+        Buffer.from('tail', 'utf8'),
+      ])
+      A.equal(copyBytes.equals(expectedCopy), true,
+        `脱敏副本必须逐字节等于预期：实际 ${copyBytes.toString('hex')}（${copyBytes.length} 字节）/ 预期 ${expectedCopy.toString('hex')}（${expectedCopy.length} 字节）`)
+      A.equal(copyBytes.includes(Buffer.from(canary, 'utf8')), false, '二进制公开副本不得含原始凭据字节')
+      A.ok(copyBytes.includes(Buffer.from('[REDACTED]', 'utf8')), '二进制公开副本必须保留 [REDACTED] 标记')
+      A.equal(copyBytes[0], 0xFF, '非凭据字节必须逐字节保留（首字节）')
+      A.equal(copyBytes[1], 0xFE, '非凭据字节必须逐字节保留（次字节）')
+      A.deepEqual(Array.from(copyBytes.subarray(copyBytes.length - 5)), [0x00, 0x74, 0x61, 0x69, 0x6c],
+        '尾部 NUL+tail 五个字节必须原样保留（N7：值规则不得吞掉后续非凭据字节）')
+      const seedBytes = readFileSync(join(workspace, 'report.json'))
+      A.equal(copyBytes.length, seedBytes.length - canary.length + Buffer.byteLength('"[REDACTED]"'),
+        '长度差必须恰好是「凭据值 → "[REDACTED]"」的差值')
+
+      const record = JSON.parse(readFileSync(join(runsRoot, run.id, recordWrite.data.path), 'utf8'))
+      A.equal(record.reportOpaque, true, '二进制报告必须 reportOpaque=true')
+      A.equal(record.reportSha256, createHash('sha256').update(copyBytes).digest('hex'),
+        'reportSha256 必须绑定按字节脱敏后的最终副本')
+      A.equal(record.reportBytes, copyBytes.length)
+      // 源报告保留原样（不写回），canary 仍在私有目录里，这是设计允许的。
+      A.ok(readFileSync(join(workspace, 'report.json')).includes(Buffer.from(canary, 'utf8')),
+        '不写回源报告：源文件应仍含原始内容')
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
   })
 

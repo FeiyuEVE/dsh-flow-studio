@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
@@ -642,13 +643,49 @@ await check('§13.7 flow 目录 0700、flow 文件 0600（与 run 日志同口�
 await check('§13.3 DELETE /runs/<id> 在持有租约时 409', async () => {
   const runsRoot = runstore.runsDir(home)
   const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 0 })
-  await runstore.claimLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  const ownerId = 'route-lease-owner'
+  await runstore.claimLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ownerId, ttlMs: 60_000 })
   const blocked = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
   assert.equal(blocked.status, 409)
   assert.match(blocked.json.error, /租约/)
-  await runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host' })
+  await runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host', ownerId })
   const deleted = await call(route, 'DELETE', `/api/flow-studio/runs/${run.id}`)
   assert.equal(deleted.status, 200)
+})
+
+await check('N2（复核阻断）：不带 ownerId 的 renew / release 必须 409，租约与心跳不被改写', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const run = await runstore.createRun(runsRoot, { flowId: 'flow-a', flowName: 'A', nodeTotal: 0 })
+  const ownerId = 'route-owner'
+  const t0 = new Date('2026-11-06T12:00:00.000Z')
+  await runstore.claimLease(runsRoot, run.id, {
+    pid: 4242, host: 'probe-host', ownerId, ttlMs: 60_000, now: t0,
+  })
+  const lockPath = join(runsRoot, run.id, 'lock.json')
+  const locked = readFileSync(lockPath, 'utf8')
+  const before = JSON.parse(locked)
+
+  // 同 pid@host、但不带 claim 的 ownerId：一律按「无法证明持权」409（N2 的语义）。
+  await assert.rejects(
+    () => runstore.renewLease(runsRoot, run.id, {
+      pid: 4242, host: 'probe-host', now: new Date(t0.getTime() + 1000),
+    }),
+    error => error && error.status === 409,
+    '缺 ownerId 的续租必须 409（即使 pid@host 相同）',
+  )
+  await assert.rejects(
+    () => runstore.releaseLease(runsRoot, run.id, { pid: 4242, host: 'probe-host' }),
+    error => error && error.status === 409,
+    '缺 ownerId 的释放必须 409（即使 pid@host 相同）',
+  )
+  assert.ok(existsSync(lockPath), '失败的 release 不得删掉租约')
+  assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).heartbeatAt, before.heartbeatAt,
+    '失败的 renew 不得刷新心跳')
+  assert.equal(readFileSync(lockPath, 'utf8'), locked, '失败的 renew / release 不得改写 lock.json')
+
+  // 带 ownerId 的现任 owner 仍能释放：关掉的只是「无法证明世代」的调用方。
+  assert.equal(await runstore.releaseLease(runsRoot, run.id, { ownerId }), true)
+  assert.ok(!existsSync(lockPath), '带 ownerId 的释放必须删掉租约')
 })
 
 console.log('v0.7 · 保存门禁 / 工作区 / supervision')
@@ -1488,14 +1525,17 @@ await check('G6-b DELETE /runs/<id>/worktree：调 removeWorktree 返回 {ok, re
 
   // 持租约（正在跑）→ 409 + 可读原因，不调 removeWorktree。
   const { run: leased } = await seedWorktreeRun('wt-delete-lease')
-  await runstore.claimLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host', ttlMs: 60_000 })
+  const leasedOwnerId = 'wt-lease-owner'
+  await runstore.claimLease(runsRoot, leased.id, {
+    pid: 4242, host: 'probe-host', ownerId: leasedOwnerId, ttlMs: 60_000,
+  })
   try {
     const blocked = await call(injected, 'DELETE', `/api/flow-studio/runs/${leased.id}/worktree`)
     assert.equal(blocked.status, 409)
     assert.match(blocked.json.error, /租约/)
     assert.equal(calls.length, 1, '运行中的 run 不能删 worktree')
   } finally {
-    await runstore.releaseLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host' })
+    await runstore.releaseLease(runsRoot, leased.id, { pid: 4242, host: 'probe-host', ownerId: leasedOwnerId })
   }
 
   // 模块没有 removeWorktree 导出 → 501（不假装删过）。
@@ -2015,6 +2055,212 @@ await check('health 报出目录与 schema 版本（已通过 connection 鉴权�
   assert.equal(result.json.auth, 'connection')
   assert.ok(result.json.dir.includes('flow-studio'))
   assert.ok(result.json.runsDir.includes('runs'))
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 · R2/S1：并发配额 429 映射（HTTP payload / Retry-After / 详情 admission）
+// ---------------------------------------------------------------------------
+await check('R2：启动被配额拒绝 → 429 结构化 payload + Retry-After，run 仍 pending，详情带 admission', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  const error = new Error('并发配额已满（global-full）：活动 4 / 上限 4')
+  Object.assign(error, {
+    status: 429,
+    code: 'RUN_CONCURRENCY_LIMIT',
+    scope: 'global',
+    reason: 'global-full',
+    active: 4,
+    max: 4,
+    retryAfterMs: 30000,
+    limits: { global: 4, perWorkspace: 2 },
+  })
+  const fakeEngine = {
+    engineName: 'real',
+    async start() { throw error },
+    async stop() { return {} },
+    admissionOf(id) {
+      return id === run.id
+        ? { state: 'queued', queuedAt: '2026-11-07T00:00:00.000Z', position: 1, timeoutMs: 15000 }
+        : null
+    },
+    supervision: {
+      register() { return { enabled: true } },
+      unregister() { return true },
+      status() { return { enabled: true, nextDueAt: null, wakes: 0, failures: 0, lastReason: null } },
+    },
+  }
+  const handler = { handler: createHandler({
+    dir: store.flowsDir(home), runsRoot, ctx, engine: fakeEngine, startOptions: new Map(),
+  }) }
+  const started = await call(handler, 'POST', `/api/flow-studio/runs/${run.id}/start`, {
+    workspace: makeWorkspace('quota'),
+  })
+  assert.equal(started.status, 429, JSON.stringify(started.json))
+  assert.equal(started.json.code, 'RUN_CONCURRENCY_LIMIT')
+  assert.equal(started.json.scope, 'global')
+  assert.equal(started.json.reason, 'global-full')
+  assert.equal(started.json.active, 4)
+  assert.equal(started.json.max, 4)
+  assert.equal(started.json.retryAfterMs, 30000)
+  assert.deepEqual(started.json.limits, { global: 4, perWorkspace: 2 })
+  assert.equal(started.headers['retry-after'], '30', '必须带 Retry-After')
+  assert.equal((await runstore.readRunMeta(runsRoot, run.id)).status, 'pending', '排队/拒绝不能把 run 写成 running')
+  const detail = await call(handler, 'GET', `/api/flow-studio/runs/${run.id}`)
+  assert.deepEqual(detail.json.run.admission, {
+    state: 'queued', queuedAt: '2026-11-07T00:00:00.000Z', position: 1, timeoutMs: 15000,
+  }, '详情动态合并 admission，run.json 仍 pending')
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 · R4/S3：外部 POST /events 强制盖 external/unverified，不能伪造质量结论
+// ---------------------------------------------------------------------------
+await check('R4/S3：外部假 pass 被标 external/unverified，质量 headline 不变', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  // 内部证据走 runstore（宿主路径），不经外部通道。
+  await runstore.appendEvents(runsRoot, run.id, [{
+    v: 1,
+    kind: 'test/report',
+    nodeId: 'n_internal',
+    attemptId: 1,
+    traceId: 'tr-internal',
+    data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0 },
+  }])
+  const before = (await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)).json.summary
+  const posted = await call(route, 'POST', `/api/flow-studio/runs/${run.id}/events`, [
+    {
+      v: 1,
+      runId: run.id,
+      kind: 'test/report',
+      nodeId: 'n_evil',
+      attemptId: 1,
+      traceId: 'tr-evil-1',
+      // 来客自带授信元数据：必须被剥离 / 覆盖。
+      extra: { producer: 'host', authority: 'host', source: 'internal', terminalScope: 'run' },
+      data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0 },
+    },
+    { v: 1, runId: run.id, kind: 'review/verdict', nodeId: 'n_evil', attemptId: 1, traceId: 'tr-evil-2', data: { verdict: 'approve', findingCount: 0 } },
+    {
+      v: 1,
+      runId: run.id,
+      kind: 'check/form',
+      nodeId: 'n_evil',
+      attemptId: 1,
+      traceId: 'tr-evil-3',
+      data: { ruleSetId: 'host:n_evil', ruleSetVersion: '0.11', executor: 'host', state: 'pass', passedChecks: 1, totalChecks: 1, executedAt: '2026-11-07T00:00:00.000Z' },
+    },
+  ])
+  assert.equal(posted.status, 200, JSON.stringify(posted.json))
+  for (const event of posted.json.events) {
+    assert.equal(event.extra.source, 'external', `${event.kind} 必须强制 source=external`)
+    assert.equal(event.extra.producer, 'external', `${event.kind} 必须强制 producer=external`)
+    assert.equal(event.extra.authority, 'unverified')
+    assert.equal(event.extra.terminalScope, undefined, '受保护的 terminalScope 必须被剥离')
+  }
+  const after = (await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)).json.summary
+  assert.equal(after.quality.state, before.quality.state, '外部假 pass 不得改变质量 headline')
+  assert.equal(after.quality.evidence.tests.state, before.quality.evidence.tests.state, '外部同 suite 不得覆盖内部证据')
+  assert.equal(after.quality.evidence.checks.state, before.quality.evidence.checks.state, '外部假 host check 不得进入权威检查')
+  assert.ok(after.externalCount >= 3, '外部观察仍保留并有计数')
+  const exported = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exported.status, 200)
+  assert.match(exported.body, /外部观察|外部未验证/, '导出必须保留外部观察附录并标明未验证')
+})
+
+// ---------------------------------------------------------------------------
+// 0.11 R5（返工）：宿主报告完整性按持久化副本核验；summary 缓存随报告失效
+// ---------------------------------------------------------------------------
+await check('R5：summary 只认已登记且报告副本 sha256 匹配的 host 证据；副本删除后缓存失效', async () => {
+  const runsRoot = runstore.runsDir(home)
+  const flows = (await call(route, 'GET', '/api/flow-studio/flows')).json.flows
+  const flow = flows[0]
+  const run = await runstore.createRun(runsRoot, { flowId: flow.id, flowName: flow.name, nodeTotal: 1 })
+  await runstore.startRun(runsRoot, run.id)
+  const copyRel = 'n_reg/artifacts/1/host-check-report.json'
+  const copyAbs = join(runsRoot, run.id, copyRel)
+  mkdirSync(dirname(copyAbs), { recursive: true })
+  const reportBody = '{"suite":"unit","passed":1}'
+  writeFileSync(copyAbs, reportBody)
+  const reportSha = createHash('sha256').update(reportBody).digest('hex')
+  await runstore.appendEvents(runsRoot, run.id, [
+    {
+      v: 1, kind: 'artifact/write', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-reg',
+      extra: { producer: 'host', authority: 'host', verificationId: 'hc-reg-1', verificationKind: 'report-copy' },
+      data: { path: copyRel, bytes: Buffer.byteLength(reportBody), kind: 'json', sha256: reportSha },
+    },
+    {
+      v: 1, kind: 'check/form', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-reg',
+      extra: { producer: 'host', authority: 'host', verificationId: 'hc-reg-1' },
+      data: {
+        ruleSetId: 'host:n_reg', ruleSetVersion: '0.11', executor: 'host', state: 'pass',
+        passedChecks: 1, totalChecks: 1, executedAt: new Date().toISOString(),
+      },
+    },
+  ])
+  // 持凭证登记一条真实宿主执行（普通事件 / HTTP 无法构造这个 receipt）。
+  const receipt = runstore.createHostExecutionReceipt('hc-reg-1')
+  await runstore.recordHostExecution(runsRoot, run.id, {
+    executionId: 'hc-reg-1',
+    runId: run.id,
+    nodeId: 'n_reg',
+    attempt: 1,
+    checkId: 'host:n_reg',
+    commandDigest: 'a'.repeat(64),
+    expectedExitCode: 0,
+    exitCode: 0,
+    state: 'pass',
+    reasonCode: null,
+    reportPath: 'reports/unit.json',
+    reportSha256: reportSha,
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+  }, { receipt })
+
+  const first = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(first.status, 200)
+  assert.equal(first.json.summary.quality.evidence.checks.state, 'pass')
+  assert.equal(first.json.summary.quality.evidence.checks.authoritativePassed, 1)
+  assert.equal(first.json.cached, false)
+
+  const cached = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(cached.json.cached, true, '报告未变时缓存可命中')
+  assert.equal(cached.json.summary.quality.evidence.checks.authoritativePassed, 1)
+
+  // 跨读端一致性：export 必须与 summary 用同一验证器，不能把同一权威通过误降 unknown。
+  const exportBefore = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportBefore.status, 200)
+  assert.match(exportBefore.body, /\| 规范 \| pass \|/, 'export 必须保留已登记的宿主权威通过')
+
+  // 报告内容篡改（长度相同）也必须撤销权威并让缓存失效；取消哈希比较时这条必红。
+  writeFileSync(copyAbs, '{"suite":"unit","passed":0}')
+  const afterTamper = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(afterTamper.json.cached, false, '报告内容篡改后缓存必须失效')
+  assert.equal(afterTamper.json.summary.quality.evidence.checks.authoritativePassed, 0,
+    '报告内容与登记 sha256 不符时不得授信')
+  assert.notEqual(afterTamper.json.summary.quality.evidence.checks.state, 'pass')
+  const exportTamper = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportTamper.status, 200)
+  assert.match(exportTamper.body, /\| 规范 \| unknown \|/, '报告篡改后 export 也必须降 unknown')
+
+  // 恢复原始报告：验证器与缓存都应回到权威通过。
+  writeFileSync(copyAbs, reportBody)
+  const restored = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(restored.json.summary.quality.evidence.checks.authoritativePassed, 1,
+    '恢复原始报告后重新授信')
+
+  rmSync(copyAbs, { force: true })
+  const afterDelete = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/summary`)
+  assert.equal(afterDelete.json.cached, false, '报告副本删除后缓存必须失效')
+  assert.equal(afterDelete.json.summary.quality.evidence.checks.authoritativePassed, 0,
+    '报告副本缺失时不得继续给权威通过')
+  assert.notEqual(afterDelete.json.summary.quality.evidence.checks.state, 'pass')
+  const exportAfter = await call(route, 'GET', `/api/flow-studio/runs/${run.id}/export`)
+  assert.equal(exportAfter.status, 200)
+  assert.match(exportAfter.body, /\| 规范 \| unknown \|/, '报告副本删除后 export 也必须降 unknown')
 })
 
 for (const dir of workspaceDirs) rmSync(dir, { recursive: true, force: true })

@@ -29,7 +29,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
-import { NODE_KIND, validateFlow } from './model.js'
+import { NODE_KIND, normalizeNodeCheck, validateFlow, validateNodeCheck } from './model.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import { createRuntime, patchRunJson, readStartOptions, saveSupervision } from './runtime.js'
 import * as worktreeModule from './worktree.js'
@@ -41,7 +41,8 @@ import {
 } from './tools.js'
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
-  readLease, readRunDetail, readRunMessages, readRunMeta, repairRunStates, runsDir,
+  buildHostExecutionVerifier, readHostExecutions, readLease, readRunDetail, readRunMessages, readRunMeta,
+  repairRunStates, runsDir,
   sweepExpiredLeases, writeRunInbox, writeRunMeta,
 } from './runstore.js'
 import { workspaceIdFor } from './worktree.js'
@@ -85,7 +86,7 @@ const BASE = '/api/flow-studio'
 /** 06 §13.7：`/summary` 按 lastSeq 的增量缓存（runId → 上次聚合结果）。 */
 const summaryCache = new Map()
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, extraHeaders = null) {
   if (res.headersSent) {
     res.end()
     return
@@ -95,6 +96,7 @@ function sendJson(res, status, payload) {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'content-length': Buffer.byteLength(body),
+    ...(extraHeaders && typeof extraHeaders === 'object' ? extraHeaders : {}),
   })
   res.end(body)
 }
@@ -321,6 +323,57 @@ function makeEvidenceVerifier(runDir) {
       return false
     }
   }
+}
+
+/**
+ * 0.11 R5（F4）：宿主检查的权威验证器。只有 runstore 私有 verification 登记过的
+ * executionId + 同节点/attempt + 报告 hash 对得上，才承认 producer='host'。
+ * 普通 artifact/write、外部 HTTP 或手写 extra.producer 都过不了这一关。
+ */
+function hostVerificationOf(event) {
+  const extra = event && event.extra && typeof event.extra === 'object' ? event.extra : {}
+  const nested = extra.verification && typeof extra.verification === 'object' ? extra.verification : {}
+  return {
+    executionId: typeof extra.verificationId === 'string' ? extra.verificationId
+      : (typeof nested.executionId === 'string' ? nested.executionId : ''),
+    kind: typeof extra.verificationKind === 'string' ? extra.verificationKind
+      : (typeof nested.kind === 'string' ? nested.kind : ''),
+    reportSha256: typeof extra.reportSha256 === 'string' ? extra.reportSha256
+      : (typeof nested.reportSha256 === 'string' ? nested.reportSha256 : ''),
+  }
+}
+
+function makeHostExecutionVerifier(runId, records, events = [], runDir = '') {
+  // 与 runtime 自审共用 runstore 的同一实现（报告副本 sha256 必核）。
+  return buildHostExecutionVerifier(records, events, runId, runDir)
+}
+
+/**
+ * 0.11 R5（返工）：宿主证据指纹。记录或任一报告副本的字节变化都会改变指纹，
+ * summary 缓存据此失效，避免删除 / 损坏报告后仍复用旧的权威结论。
+ */
+function hostEvidenceDigest(runId, records, events = [], runDir = '') {
+  const hash = createHash('sha256')
+  hash.update(String(runId))
+  const sorted = [...(records || [])].sort((a, b) => String(a.executionId).localeCompare(String(b.executionId)))
+  for (const record of sorted) {
+    hash.update(JSON.stringify(record))
+    if (typeof record.reportSha256 === 'string' && record.reportSha256 !== '') {
+      const copy = (events || []).find(event => event && event.kind === 'artifact/write'
+        && hostVerificationOf(event).executionId === record.executionId
+        && hostVerificationOf(event).kind === 'report-copy')
+      if (!copy) {
+        hash.update('report-missing')
+        continue
+      }
+      try {
+        hash.update(createHash('sha256').update(readFileSync(join(runDir, copy.data.path))).digest('hex'))
+      } catch {
+        hash.update('report-unreadable')
+      }
+    }
+  }
+  return hash.digest('hex')
 }
 
 function newTraceId() {
@@ -761,6 +814,52 @@ function assertExternalEvents(rawEvents) {
   }
 }
 
+/**
+ * R4/S3（0.11）：外部通道的事件**来源不可伪造**。
+ *
+ * `extra` 里这些字段是宿主 / 引擎的授信元数据，来客一个都不许自带：来源、生产者、
+ * 权威级别、可信执行登记、epoch / 终态作用域、幂等键、引擎自写报告标记。服务端
+ * 一律先剥离、再覆盖成 external/unverified；data 原文保留为「未验证观察」。
+ */
+const PROTECTED_EXTERNAL_EXTRA = new Set([
+  'source',
+  'producer',
+  'authority',
+  'verification',
+  'executionId',
+  'trustedExecution',
+  'terminalScope',
+  'leaseEpoch',
+  'leaseLost',
+  'epoch',
+  'idempotencyKey',
+  'generatedReport',
+])
+
+/**
+ * R4/S3：给外部事件整批盖来源章。返回新数组（不改调用方对象）。
+ * @param {unknown} rawEvents 单条或数组
+ */
+function stampExternalEvents(rawEvents) {
+  const list = Array.isArray(rawEvents) ? rawEvents : [rawEvents]
+  return list.map(event => {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return event
+    const extra = event.extra && typeof event.extra === 'object' && !Array.isArray(event.extra)
+      ? { ...event.extra }
+      : {}
+    for (const key of PROTECTED_EXTERNAL_EXTRA) delete extra[key]
+    return {
+      ...event,
+      extra: {
+        ...extra,
+        source: 'external',
+        producer: 'external',
+        authority: 'unverified',
+      },
+    }
+  })
+}
+
 /** run 的终态：到了这里就不再有「定时唤醒」的意义（supervise.planWake 也直接停）。 */
 const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'aborted'])
 
@@ -800,6 +899,44 @@ function runNodeStatusOf(meta) {
  *
  * @returns {Array<{ nodeId: string, message: string }>}
  */
+/** 0.11 · R5：宿主检查默认关，只有显式 `FLOW_STUDIO_ALLOW_HOST_CHECKS=1` 才允许执行。 */
+function hostChecksAllowed() {
+  return process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS === '1'
+}
+
+/**
+ * 0.11 · R5：启动前拦截「配了检查但开关没开 / 配置非法」的流程。
+ * 不等到节点收口才失败——那会让 run 白跑一轮且留下半套证据。
+ * @returns {Array<{ nodeId: string, code: string, message: string }>}
+ */
+function hostCheckBlockers(flow) {
+  const blockers = []
+  const allowed = hostChecksAllowed()
+  const nodes = flow && Array.isArray(flow.nodes) ? flow.nodes : []
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index]
+    if (!node || node.kind !== NODE_KIND.STAGE) continue
+    if (node.check === undefined || node.check === null) continue
+    if (!allowed) {
+      blockers.push({
+        nodeId: node.id,
+        code: 'HOST_CHECKS_DISABLED',
+        message: `nodes[${index}]（${node.id}）配置了宿主检查命令，但 FLOW_STUDIO_ALLOW_HOST_CHECKS 未开启（只有字符串 1 才执行）；请移除检查配置，或由部署方显式开启后再启动。`,
+      })
+      continue
+    }
+    const verdict = validateNodeCheck(normalizeNodeCheck(node.check))
+    if (!verdict.ok) {
+      blockers.push({
+        nodeId: node.id,
+        code: 'HOST_CHECK_INVALID',
+        message: `nodes[${index}].check.${verdict.field}：${verdict.message}`,
+      })
+    }
+  }
+  return blockers
+}
+
 function executorBlockers(flow) {
   const blockers = []
   for (const node of (flow && flow.nodes) || []) {
@@ -993,6 +1130,27 @@ async function handle(req, res, env) {
       // 业务码（例如 workspace）在这里补出去，调用方可按 code 分流。
       if (typeof error.code === 'string' && error.code !== '') payload.code = error.code
       sendJson(res, error.status, payload)
+      return
+    }
+    // 0.11 · R2/S1：并发配额拒绝要保留结构化原因（scope / reason / limits /
+    // retryAfterMs），并带 Retry-After；不能退化成一句笼统的 429 文案。
+    if (error && error.status === 429 && error.code === 'RUN_CONCURRENCY_LIMIT') {
+      const payload = {
+        ok: false,
+        code: error.code,
+        error: error.message,
+        scope: error.scope,
+        reason: error.reason,
+        active: error.active,
+        max: error.max,
+        retryAfterMs: error.retryAfterMs,
+        ...(error.limits ? { limits: error.limits } : {}),
+        ...(error.runId ? { runId: error.runId } : {}),
+        ...(error.childRunId ? { childRunId: error.childRunId } : {}),
+      }
+      sendJson(res, 429, payload, {
+        'retry-after': String(Math.max(1, Math.ceil((error.retryAfterMs || 30000) / 1000))),
+      })
       return
     }
     if (error && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
@@ -1618,6 +1776,10 @@ async function handleRuns(req, res, env, url, parts) {
         ...detail.run,
         ...runBindingFields(detail.run),
         startOptions: await readStartOptions(root, runId),
+        // 0.11 · R2/S1：排队是内存派生状态，不写进 run.json；详情动态合并。
+        ...(typeof env.engine.admissionOf === 'function' && env.engine.admissionOf(runId)
+          ? { admission: env.engine.admissionOf(runId) }
+          : {}),
       }
       // G6-b ①：详情带 worktreeStatus（exists / dirty / head）；拿不到就 {unknown:true, reason}。
       const worktreeStatus = await worktreeStatusOf(env, detail.run)
@@ -1729,7 +1891,10 @@ async function handleRuns(req, res, env, url, parts) {
         // E3-b：外部写入通道只允许纯观测类事件；生命周期事件整批拒绝、一个字都不写，
         // 保证 run 状态机不会被 HTTP 调用方推动（例如追加 run/start 后永久 409）。
         assertExternalEvents(body)
-        const appended = await appendEvents(root, runId, body)
+        // R4/S3：生命周期白名单之后，强制盖 external/unverified 章再落盘。
+        // 外部 review/verdict、test/report 等只能作为「未验证观察」，不能进入权威聚合。
+        const stamped = stampExternalEvents(body)
+        const appended = await appendEvents(root, runId, stamped)
         sendJson(res, 200, {
           ok: true,
           accepted: appended.events.length,
@@ -1908,6 +2073,11 @@ async function handleRuns(req, res, env, url, parts) {
         if (blockers.length > 0) {
           throw new RunError(400, 'executor', `流程里有非法的 executor 配置：${blockers[0].message}`)
         }
+        // 0.11 · R5：宿主检查默认关；配置非法 / 开关关闭在资源创建前拒绝。
+        const checkBlockers = hostCheckBlockers(flow)
+        if (checkBlockers.length > 0) {
+          throw new RunError(400, 'check', checkBlockers[0].message, { code: checkBlockers[0].code })
+        }
         // G6-a ②：custom executor 需要主机级开关；关着时启动一律 400（与保存同口径）。
         const customGate = customExecutorBlockers(flow)
         if (customGate.length > 0) {
@@ -2018,10 +2188,16 @@ async function handleRuns(req, res, env, url, parts) {
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
       // 07 §4 / §7：summary 也要能读到 workspace / worktree / supervision（与列表 / 详情同口径）。
       const extrasPayload = { ...runWorkspaceFields(meta), ...runBindingFields(meta) }
-      // 06 §13.7 增量缓存：lastSeq / eventCount / engine 都没变就复用上一次聚合结果。
+      // 06 §13.7 增量缓存 + 0.11 R5（返工）宿主证据指纹：报告副本被删除 / 损坏后
+      // 事件 seq 不会变，缓存必须失效，不能继续返回旧的权威结论。
+      const all = await readAllEvents(root, runId)
+      const events = all ? all.events : []
+      const hostExecutions = await readHostExecutions(root, runId)
+      const hostDigest = hostEvidenceDigest(runId, hostExecutions, events, join(root, runId))
       const cached = summaryCache.get(runId)
       if (cached && cached.lastSeq === meta.lastSeq
-        && cached.eventCount === meta.eventCount && cached.engine === meta.engine) {
+        && cached.eventCount === meta.eventCount && cached.engine === meta.engine
+        && cached.hostDigest === hostDigest) {
         sendJson(res, 200, {
           ok: true,
           cached: true,
@@ -2030,17 +2206,17 @@ async function handleRuns(req, res, env, url, parts) {
         })
         return
       }
-      const all = await readAllEvents(root, runId)
-      const events = all ? all.events : []
       const summary = summarize(events, {
         engine: meta.engine === 'stub' ? 'stub' : undefined,
         lastSeq: meta.lastSeq,
         verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+        verifyHostExecution: makeHostExecutionVerifier(runId, hostExecutions, events, join(root, runId)),
       })
       summaryCache.set(runId, {
         lastSeq: meta.lastSeq,
         eventCount: meta.eventCount,
         engine: meta.engine,
+        hostDigest,
         summary,
       })
       sendJson(res, 200, { ok: true, cached: false, summary, ...extrasPayload })
@@ -2056,10 +2232,12 @@ async function handleRuns(req, res, env, url, parts) {
       if (!meta) throw new RunError(404, 'runId', 'run 不存在')
       const all = await readAllEvents(root, runId)
       const events = all ? all.events : []
+      const hostExecutions = await readHostExecutions(root, runId)
       const summary = summarize(events, {
         engine: meta.engine === 'stub' ? 'stub' : undefined,
         lastSeq: meta.lastSeq,
         verifyEvidence: makeEvidenceVerifier(join(root, runId)),
+        verifyHostExecution: makeHostExecutionVerifier(runId, hostExecutions, events, join(root, runId)),
       })
       const markdown = renderRunMarkdown(meta, events, summary)
       const body = Buffer.from(markdown, 'utf8')
@@ -2167,6 +2345,10 @@ export function apply(ctx) {
     // 显式传 stub 判定，避免引擎侧自己只看 FLOW_STUDIO_STUB_ENGINE 就启用桩。
     stub: stubInfo.stub,
     log,
+    // 0.11 · R2/S1：生产启动入口统一走 runtime 准入（全局 + 每工作区配额 + 有限 FIFO）。
+    // 上限来自 FLOW_STUDIO_MAX_CONCURRENT_RUNS / _PER_WORKSPACE / RUN_QUEUE_MAX /
+    // RUN_QUEUE_TIMEOUT_MS；不传空对象以外的值，避免这里成为第二份配额定义。
+    admissionLimits: {},
   })
   // 07 §4.1：建 run → start 之间的发起参数交接（见 rememberStartOptions 的说明）。
   const startOptions = new Map()

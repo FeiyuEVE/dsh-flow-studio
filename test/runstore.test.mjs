@@ -6,6 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync,
@@ -29,6 +30,19 @@ async function check(name, fn) {
   await fn()
   checks += 1
   console.log(`  ✓ ${name}`)
+}
+
+/** 跑一个一次性 Node 子进程，收集 exit code / stdout / stderr（跨进程锁与租约竞态用）。 */
+function runNodeScript(scriptPath, args) {
+  return new Promise((resolveChild, rejectChild) => {
+    const proc = spawn(process.execPath, [scriptPath, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', chunk => { stdout += chunk })
+    proc.stderr.on('data', chunk => { stderr += chunk })
+    proc.on('error', rejectChild)
+    proc.on('close', code => resolveChild({ code, stdout, stderr }))
+  })
 }
 
 /** 一条能通过 normalizeEvent 的事件；具体 kind 的 data 在这里补齐。 */
@@ -662,9 +676,12 @@ try {
     const meta = await makeRun()
     created.push(meta.id)
     const now = new Date('2026-11-06T12:00:00.000Z')
-    const lease = await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ttlMs: 60_000, now })
+    // N2 起 renew / release 必须带 claim 的同一份 ownerId；pid@host 不再单独构成身份证明。
+    const ownerId = 'owner-13-3'
+    const lease = await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ownerId, ttlMs: 60_000, now })
     assert.equal(lease.pid, 111)
     assert.equal(lease.host, 'h1')
+    assert.equal(lease.ownerId, ownerId)
     assert.equal((await store.readLease(runsRoot, meta.id, { now })).pid, 111)
     assert.equal(statSync(join(runsRoot, meta.id, 'lock.json')).mode & 0o777, 0o600)
 
@@ -677,7 +694,7 @@ try {
       error => error.status === 409,
     )
     const renewed = await store.renewLease(runsRoot, meta.id, {
-      pid: 111, host: 'h1', ttlMs: 120_000, now: new Date(now.getTime() + 30_000),
+      pid: 111, host: 'h1', ownerId, ttlMs: 120_000, now: new Date(now.getTime() + 30_000),
     })
     assert.equal(renewed.ttlMs, 120_000)
     assert.equal(renewed.heartbeatAt, new Date(now.getTime() + 30_000).toISOString())
@@ -686,7 +703,7 @@ try {
       () => store.releaseLease(runsRoot, meta.id, { pid: 222, host: 'h2' }),
       error => error.status === 409,
     )
-    assert.equal(await store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }), true)
+    assert.equal(await store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1', ownerId }), true)
     assert.equal(await store.readLease(runsRoot, meta.id, { now }), null)
   })
 
@@ -1770,7 +1787,9 @@ process.stdout.write('OK:' + total)
     created.push(meta.id)
     const t0 = new Date('2026-11-06T12:00:00.000Z')
     await store.startRun(runsRoot, meta.id, { now: t0 })
-    await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ttlMs: 1_000, now: t0 })
+    // N2 起 renew 必须带 claim 的同一份 ownerId。
+    const ownerId = 'owner-g2d'
+    await store.claimLease(runsRoot, meta.id, { pid: 111, host: 'h1', ownerId, ttlMs: 1_000, now: t0 })
     const later = new Date(t0.getTime() + 5_000)
     const lockPath = join(runsRoot, meta.id, 'lock.json')
 
@@ -1783,7 +1802,7 @@ process.stdout.write('OK:' + total)
 
     // 持有者自己：就地 re-claim（心跳刷新、acquiredAt 保留、文件始终在）。
     const renewed = await store.renewLease(runsRoot, meta.id, {
-      pid: 111, host: 'h1', ttlMs: 60_000, now: later,
+      pid: 111, host: 'h1', ownerId, ttlMs: 60_000, now: later,
     })
     assert.equal(renewed.pid, 111)
     assert.equal(renewed.heartbeatAt, later.toISOString())
@@ -2446,6 +2465,910 @@ process.stdout.write('OK:' + total)
     assert.equal(Object.hasOwn(read.n_old, 'agentOptions'), false)
     assert.equal(Object.hasOwn(read.n_other, 'agentOptions'), false)
   })
+  // 0.11 R1：失权收口必须按持久 epoch/owner 条件写
+  await check('R1（0.11）：finalizeEpoch 按持久 epoch/owner 条件写，接管后旧实例只记 instance 事实', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const now = new Date()
+    // 第一个 owner：租约一创建就过期（ttl=1ms 且心跳在过去），随即可被接管。
+    const first = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 1, now: new Date(now.getTime() - 5000),
+    })
+    assert.equal(first.epoch, 1, '每次 claim 的持久 epoch 从 1 开始')
+    const second = await store.claimLease(runsRoot, meta.id, { pid: 222, host: 'h2', ttlMs: 60_000, now })
+    assert.equal(second.epoch, 2, '接管者拿到下一个 epoch')
+
+    // 持久 fence：旧 owner/epoch 的业务写必须被存储层拒绝（一条都不落盘）。
+    const before = (await store.readAllEvents(runsRoot, meta.id)).events.length
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_stale', attemptId: 1, traceId: 'tr-stale',
+        data: { title: 'stale', mode: 'single', skills: [] },
+      }], { ownerId: first.ownerId, leaseEpoch: 1 }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.length, before,
+      'fenced 写被拒绝后事件数不变')
+    const accepted = await store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_new', attemptId: 1, traceId: 'tr-new',
+      data: { title: 'new', mode: 'single', skills: [] },
+    }], { ownerId: second.ownerId, leaseEpoch: 2 })
+    assert.equal(accepted.events.length, 1, '现任 owner/epoch 的写允许')
+
+    const stale = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 1, ownerId: first.ownerId, idempotencyKey: 'loss:1', now,
+    })
+    assert.equal(stale.terminalScope, 'instance', '旧 epoch 只能记 instance 范围事实')
+    let after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'running', '接管者仍在跑时，旧实例不得把 run 改成 failed')
+    assert.equal(after.execution.epoch, 2, '接管者的 execution 不被旧实例覆盖')
+    assert.equal(after.execution.ownerId, second.ownerId)
+
+    const again = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 1, ownerId: first.ownerId, idempotencyKey: 'loss:1', now,
+    })
+    assert.equal(again.idempotent, true, '同一失权 epoch 的重复收口必须幂等')
+
+    const current = await store.finalizeEpoch(runsRoot, meta.id, {
+      expectedEpoch: 2, ownerId: second.ownerId, idempotencyKey: 'loss:2', now,
+    })
+    assert.equal(current.terminalScope, 'run', '现任 owner 收口才是 run 范围 failed')
+    after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.equal(after.execution.state, 'settled')
+  })
+
+  // 0.11 R1（本轮）：claimLease 的 execution 更新与 appendEvents fence 共用跨进程 meta.lock
+  await check('R1（本轮）：claim 更新 execution 与 append fence 共用跨进程 meta.lock（可控交错）', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const first = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ttlMs: 1, now: new Date(Date.now() - 5000),
+    })
+    assert.equal(first.epoch, 1)
+
+    // 父进程先持 meta.lock（appendEvents 的 guard 在锁内挂起）。
+    let enteredResolve
+    let releaseResolve
+    const entered = new Promise(resolve => { enteredResolve = resolve })
+    const release = new Promise(resolve => { releaseResolve = resolve })
+    const appendPromise = store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_hold', attemptId: 1, traceId: 'tr-hold',
+      data: { title: 'hold', mode: 'single', skills: [] },
+    }], {
+      guard: async () => {
+        enteredResolve()
+        await release
+      },
+    })
+    await entered
+
+    const childScript = join(home, 'claim-child.mjs')
+    writeFileSync(childScript, [
+      `import * as store from ${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)}`,
+      'try {',
+      '  const lease = await store.claimLease(process.argv[2], process.argv[3], {',
+      '    pid: 222, host: "h2", ttlMs: 60000, now: new Date(),',
+      '  })',
+      '  console.log("claimed", lease.epoch)',
+      '} catch (error) {',
+      '  console.error("claim-failed", error && error.code, error && error.message)',
+      '  process.exit(2)',
+      '}',
+    ].join('\n'))
+    const child = spawn(process.execPath, [childScript, runsRoot, meta.id], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let childOut = ''
+    let childErr = ''
+    child.stdout.on('data', chunk => { childOut += chunk })
+    child.stderr.on('data', chunk => { childErr += chunk })
+    const childExit = new Promise(resolve => child.once('exit', resolve))
+
+    // 子进程跨进程 claim 必须停在 meta.lock 上：期间 execution 仍是旧 epoch。
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const during = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(during.execution.epoch, 1,
+      `另一进程的 claim 必须被 meta.lock 挡住（child stderr: ${childErr.slice(0, 200)}）`)
+    // 新租约在 epoch 更新完成之前不得对外可见（原子可见性）。
+    const leaseDuring = JSON.parse(readFileSync(join(runsRoot, meta.id, 'lock.json'), 'utf8'))
+    assert.equal(leaseDuring.ownerId, first.ownerId,
+      'epoch 未更新前 lock.json 仍是旧 owner（新租约不可见）')
+
+    releaseResolve()
+    await appendPromise
+    const code = await childExit
+    assert.equal(code, 0, `子进程 claim 失败：${childErr.slice(0, 300)}`)
+    assert.match(childOut, /claimed 2/, '锁释放后子进程拿到 epoch 2')
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2)
+    // 新 epoch 生效后，旧 owner 的在飞写即使此刻才提交也必须被 fence 拒绝。
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_inflight', attemptId: 1, traceId: 'tr-inflight',
+        data: { title: 'inflight', mode: 'single', skills: [] },
+      }], { ownerId: first.ownerId, leaseEpoch: 1 }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.some(event => event.nodeId === 'n_inflight'), false)
+  })
+
+  // 0.11 R1（本轮·三进程）：租约接管竞态的原子性。
+  // 拓扑刻意做成「3 个真子进程」：三个进程先同时抢初始租约（只有一个赢家 = 旧 owner），
+  // 两个输家在过期后同时抢接管（只有一个赢家 = 新 owner），旧 owner 在接管后先续租拿 409、
+  // 再尝试提交已在飞的业务写。断言：
+  //   ① 任一时点只有一个 owner 能提交业务写（每个 epoch 只有它的 owner 的写落盘）；
+  //   ② 旧 owner 在 409 之后的迟到写即使带着原 fence 也落不了盘（整批 0 条）；
+  //   ③ 落盘事件 seq 连续无重复（两个 owner 的写没有互相覆盖 / 抢同一个 seq）。
+  // 这里断言的是持久化结果（readAllEvents / execution），不信任子进程自己报的 ok。
+  await check('R1（本轮·三进程）：旧 owner + 两个接管者竞态——409 后的迟到写被 fence，单写者', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    await store.startRun(runsRoot, meta.id, { now: new Date() })
+    const startAt = Date.now() + 1500
+    const takeoverAt = startAt + 1500
+    const childScript = join(home, 'lease-race-child.mjs')
+    const runstoreHref = new URL('../src/runstore.js', import.meta.url).href
+    writeFileSync(childScript, `
+const [root, id, role, startAtRaw, takeoverAtRaw] = process.argv.slice(2)
+const store = await import(${JSON.stringify(runstoreHref)})
+const sleep = ms => new Promise(done => setTimeout(done, ms))
+const waitUntil = async at => { const wait = Number(at) - Date.now(); if (wait > 0) await sleep(wait) }
+const ownerId = \`race-\${role}\`
+const pid = process.pid
+const host = \`host-\${role}\`
+const emit = value => process.stdout.write(\`\${JSON.stringify(value)}\\n\`)
+const writeBusiness = async (nodeId, fence) => {
+  try {
+    const result = await store.appendEvents(root, id, [{
+      v: 1,
+      kind: 'node/start',
+      nodeId,
+      attemptId: 1,
+      traceId: \`tr-\${ownerId}-\${nodeId}\`,
+      extra: { writer: ownerId, writerEpoch: fence.leaseEpoch },
+      data: { title: nodeId, mode: 'single', skills: [] },
+    }], fence)
+    emit({ role, step: \`write:\${nodeId}\`, ok: true, seq: result.lastSeq })
+    return true
+  } catch (error) {
+    emit({ role, step: \`write:\${nodeId}\`, ok: false, status: error && error.status, code: error && error.code })
+    return false
+  }
+}
+await waitUntil(startAtRaw)
+let first = null
+try {
+  first = await store.claimLease(root, id, { pid, host, ownerId, ttlMs: 400 })
+  emit({ role, step: 'claim1', ok: true, epoch: first.epoch })
+} catch (error) {
+  emit({ role, step: 'claim1', ok: false, status: error && error.status })
+}
+if (first) {
+  // 旧 owner 在租约还有效时先写一条：这是合法业务写，必须保留。
+  await writeBusiness('n_old_pre', { ownerId, leaseEpoch: first.epoch })
+  await waitUntil(Number(takeoverAtRaw) + 500)
+  try {
+    await store.renewLease(root, id, { pid, host, ownerId })
+    emit({ role, step: 'renew', ok: true })
+  } catch (error) {
+    emit({ role, step: 'renew', ok: false, status: error && error.status })
+  }
+  await waitUntil(Number(takeoverAtRaw) + 1000)
+  // 已确知失权（409）之后才提交的迟到写：必须被持久 fence 拒绝。
+  await writeBusiness('n_old_late', { ownerId, leaseEpoch: first.epoch })
+} else {
+  await waitUntil(takeoverAtRaw)
+  let second = null
+  try {
+    second = await store.claimLease(root, id, { pid, host, ownerId, ttlMs: 60000 })
+    emit({ role, step: 'claim2', ok: true, epoch: second.epoch })
+  } catch (error) {
+    emit({ role, step: 'claim2', ok: false, status: error && error.status })
+  }
+  await waitUntil(Number(takeoverAtRaw) + 1000)
+  if (second) {
+    await writeBusiness('n_winner', { ownerId, leaseEpoch: second.epoch })
+  } else {
+    // 输掉接管的进程拿不到 ownerId 凭证：即使读到当前 epoch，也不能写。
+    const current = await store.readRunMeta(root, id)
+    const epoch = current && current.execution && Number.isInteger(current.execution.epoch)
+      ? current.execution.epoch
+      : 0
+    await writeBusiness('n_loser', { ownerId, leaseEpoch: epoch })
+  }
+}
+`)
+
+    const runChild = role => new Promise((resolveChild, rejectChild) => {
+      const proc = spawn(
+        process.execPath,
+        [childScript, runsRoot, meta.id, role, String(startAt), String(takeoverAt)],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      )
+      let stdout = ''
+      let stderr = ''
+      proc.stdout.on('data', chunk => { stdout += chunk })
+      proc.stderr.on('data', chunk => { stderr += chunk })
+      proc.on('error', rejectChild)
+      proc.on('close', code => {
+        const reports = stdout.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+          try {
+            return JSON.parse(line)
+          } catch {
+            return { parseError: line }
+          }
+        })
+        resolveChild({ role, code, reports, stderr })
+      })
+    })
+
+    const roles = ['alpha', 'beta', 'gamma']
+    const results = await Promise.all(roles.map(runChild))
+    const reports = results.flatMap(item => item.reports)
+    const stepOf = (role, step) => reports.find(item => item.role === role && item.step === step)
+    const claim1 = reports.filter(item => item.step === 'claim1')
+    const claim1Wins = claim1.filter(item => item.ok === true)
+    assert.equal(results.every(item => item.code === 0), true,
+      `三个子进程都必须正常退出：${results.map(item => `${item.role}=${item.code} ${item.stderr.slice(0, 200)}`).join(' | ')}`)
+    assert.equal(claim1.length, 3, '三个进程都必须真的参与初始租约竞争')
+    assert.equal(claim1Wins.length, 1, `初始租约只能有一个赢家：${JSON.stringify(claim1)}`)
+    assert.equal(claim1.filter(item => item.ok === false && item.status === 409).length, 2,
+      `另外两个进程必须拿到 409：${JSON.stringify(claim1)}`)
+
+    const oldRole = claim1Wins[0].role
+    const losers = roles.filter(role => role !== oldRole)
+    const claim2 = reports.filter(item => item.step === 'claim2')
+    const claim2Wins = claim2.filter(item => item.ok === true)
+    assert.equal(claim2.length, 2, '两个初始输家都必须参与接管竞争')
+    assert.equal(claim2Wins.length, 1, `接管只能有一个赢家：${JSON.stringify(claim2)}`)
+    assert.equal(claim2.filter(item => item.ok === false && item.status === 409).length, 1,
+      `另一个接管者必须拿到 409：${JSON.stringify(claim2)}`)
+
+    const renew = stepOf(oldRole, 'renew')
+    assert.equal(renew && renew.ok, false, `旧 owner 续租必须被拒：${JSON.stringify(renew)}`)
+    assert.equal(renew && renew.status, 409, '旧 owner 续租必须是 409')
+
+    // 先断言持久化事实（旧实现下这里会先红）：迟到写 / 失败者写不得出现在事件流里。
+    const persisted = (await store.readAllEvents(runsRoot, meta.id)).events
+    const late = persisted.filter(event => event.nodeId === 'n_old_late')
+    const loserWrite = persisted.filter(event => event.nodeId === 'n_loser')
+    assert.equal(late.length, 0, `旧 owner 在 409 之后的迟到写不得落盘（实际 ${late.length} 条）`)
+    assert.equal(loserWrite.length, 0, `没有 ownerId 凭证的进程不得提交业务写（实际 ${loserWrite.length} 条）`)
+
+    const winnerRole = claim2Wins[0].role
+    const winnerId = `race-${winnerRole}`
+    const pre = persisted.filter(event => event.nodeId === 'n_old_pre')
+    const won = persisted.filter(event => event.nodeId === 'n_winner')
+    assert.equal(pre.length, 1, '旧 owner 失权前的合法写必须保留')
+    assert.equal(won.length, 1, '接管者的业务写必须落盘（且只有一条）')
+    assert.ok(pre[0].seq < won[0].seq, '旧 owner 的合法写必须在接管者写之前')
+
+    assert.equal(stepOf(oldRole, 'write:n_old_pre').ok, true)
+    assert.equal(stepOf(oldRole, 'write:n_old_late').ok, false, '旧 owner 迟到写必须被拒')
+    assert.equal(stepOf(oldRole, 'write:n_old_late').code, 'LEASE_FENCED', '旧 owner 迟到写必须带 LEASE_FENCED')
+    assert.equal(stepOf(winnerRole, 'write:n_winner').ok, true, '接管者写必须成功')
+    const loserRole = losers.find(role => role !== winnerRole)
+    assert.equal(stepOf(loserRole, 'write:n_loser').ok, false, '落败接管者不得提交业务写')
+    assert.equal(stepOf(loserRole, 'write:n_loser').code, 'LEASE_FENCED', '落败接管者必须带 LEASE_FENCED')
+
+    // 单写者 / 世代：run.json.execution 只能指向最终 owner；每个 epoch 只出现一个 writer。
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2, '一次接管后 epoch 必须恰好推进到 2')
+    assert.equal(after.execution.ownerId, winnerId, 'run.json.execution.ownerId 必须是最终 owner')
+    assert.equal(pre[0].extra.writer, `race-${oldRole}`, '旧 owner 的写必须带自己的 writer 标记')
+    assert.equal(String(pre[0].extra.writerEpoch), '1', '旧 owner 的写必须属于 epoch 1')
+    assert.equal(won[0].extra.writer, winnerId, '接管者的写必须带自己的 writer 标记')
+    assert.equal(String(won[0].extra.writerEpoch), '2', '接管者的写必须属于 epoch 2')
+    const seqs = persisted.map(event => event.seq).sort((a, b) => a - b)
+    assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, index) => index + 1),
+      '事件 seq 必须连续、无重复（两个 owner 的写没有抢同一个 seq）')
+    console.log(`  · old=${oldRole} winner=${winnerRole} loser=${loserRole} events=${persisted.length}`)
+  })
+
+  // ───────────────────────────────────────────────────────────────────────
+  // 0.11 独立审查报告 F1（P0）/ F6（P1）：租约并发安全
+  // ───────────────────────────────────────────────────────────────────────
+
+  // F1-①：同 pid@host、不同 ownerId。旧实现的 renew 只把 {pid,host} 交给核对，
+  // 于是「新 owner 已接管」后旧 owner 仍能续租成功（同进程不同 owner 也能）。
+  await check('F1（审查 P0）：同 pid@host 不同 ownerId —— 旧 owner 续租/释放必须 409，新租约不被覆盖', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    const old = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 1, now: t0,
+    })
+    assert.equal(old.epoch, 1)
+    // 旧租约过期后，同一个 pid@host 被新 owner 接管（ABA 身份碰撞）。
+    const fresh = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new', ttlMs: 60_000, now: new Date(t0.getTime() + 10_000),
+    })
+    assert.equal(fresh.epoch, 2)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const before = JSON.parse(readFileSync(lockPath, 'utf8'))
+    assert.equal(before.ownerId, 'owner-new')
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', ownerId: 'owner-old', now: new Date(t0.getTime() + 20_000),
+      }),
+      error => error && error.status === 409,
+      '旧 owner（ownerId 不符）不得续租新 owner 的租约',
+    )
+    const afterRenew = JSON.parse(readFileSync(lockPath, 'utf8'))
+    assert.equal(afterRenew.ownerId, 'owner-new', '失败续租不得覆盖新 owner 的 ownerId')
+    assert.equal(afterRenew.heartbeatAt, before.heartbeatAt, '失败续租不得刷新心跳')
+
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1', ownerId: 'owner-old' }),
+      error => error && error.status === 409,
+      '旧 owner（ownerId 不符）不得释放新 owner 的租约',
+    )
+    assert.ok(existsSync(lockPath), '失败释放不得删掉新 owner 的租约')
+
+    // 旧实例的业务写：一条都不能落盘。
+    const beforeEvents = (await store.readAllEvents(runsRoot, meta.id)).events.length
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_old_aba', attemptId: 1, traceId: 'tr-old-aba',
+        data: { title: 'old', mode: 'single', skills: [] },
+      }], { ownerId: old.ownerId, leaseEpoch: old.epoch }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    assert.equal((await store.readAllEvents(runsRoot, meta.id)).events.length, beforeEvents,
+      '旧实例的业务写必须 0 条落盘')
+
+    const renewed = await store.renewLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new', now: new Date(t0.getTime() + 30_000),
+    })
+    assert.equal(renewed.ownerId, 'owner-new', '现任 owner 仍能续租')
+  })
+
+  // F1-②：claim 先写 run.json.execution、再发布 lock.json；这两步之间崩溃时，
+  // lock.json 还是旧 owner。旧实现 renew/release 只看 lock.json，旧 owner 能续租/删掉它。
+  await check('F1（审查 P0）：execution.ownerId 已推进而 lock.json 仍是旧 owner（claim 半途崩溃）→ 续租/释放 409', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 60_000, now: t0,
+    })
+    // 模拟 claim 写完 run.json.execution 后、发布新 lock.json 前进程崩溃。
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    disk.execution = { epoch: 2, ownerId: 'owner-new', state: 'active' }
+    writeFileSync(metaPath, `${JSON.stringify(disk, null, 2)}\n`)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const lockBefore = readFileSync(lockPath, 'utf8')
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', ownerId: 'owner-old', now: new Date(t0.getTime() + 1000),
+      }),
+      error => error && error.status === 409,
+      '租约身份与持久 execution 不一致时，旧 owner 不得续租',
+    )
+    // 不带 ownerId 的旧调用方同样不能续租：租约与 execution 自相矛盾。
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, { pid: 111, host: 'h1', now: new Date(t0.getTime() + 2000) }),
+      error => error && error.status === 409,
+    )
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1', ownerId: 'owner-old' }),
+      error => error && error.status === 409,
+      '旧 owner 不得释放已被新 epoch 取代的租约',
+    )
+    assert.equal(readFileSync(lockPath, 'utf8'), lockBefore, '失败续租/释放不得改写租约文件')
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2)
+    assert.equal(after.execution.ownerId, 'owner-new')
+  })
+
+  // F1-③：renew/release 必须与 claim 共用跨进程 meta.lock。父进程用 appendEvents 的 guard
+  // 占住 meta.lock，子进程的续租/释放必须停在锁外；旧实现不持这把锁，会当场改/删租约。
+  await check('F1（审查 P0）：续租/释放与 claim 共用跨进程 meta.lock（持锁期间旧 owner 不能改/删租约）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    const owner = 'owner-lock'
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: owner, ttlMs: 60_000, now: t0,
+    })
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const heartbeatBefore = JSON.parse(readFileSync(lockPath, 'utf8')).heartbeatAt
+
+    const childScript = join(home, 'lease-renew-release-child.mjs')
+    writeFileSync(childScript, [
+      `const store = await import(${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)})`,
+      'const [root, id, ownerId] = process.argv.slice(2)',
+      "const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')",
+      'try {',
+      "  const renewed = await store.renewLease(root, id, { pid: 111, host: 'h1', ownerId, now: new Date() })",
+      "  emit({ step: 'renew', ok: true, heartbeatAt: renewed.heartbeatAt })",
+      '} catch (error) {',
+      "  emit({ step: 'renew', ok: false, status: error && error.status })",
+      '}',
+      'try {',
+      "  const released = await store.releaseLease(root, id, { pid: 111, host: 'h1', ownerId })",
+      "  emit({ step: 'release', ok: released })",
+      '} catch (error) {',
+      "  emit({ step: 'release', ok: false, status: error && error.status })",
+      '}',
+    ].join('\n'))
+
+    // 父进程占住跨进程 meta.lock。
+    let enteredResolve
+    let releaseResolve
+    const entered = new Promise(resolve => { enteredResolve = resolve })
+    const release = new Promise(resolve => { releaseResolve = resolve })
+    const hold = store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_hold_meta', attemptId: 1, traceId: 'tr-hold-meta',
+      data: { title: 'hold', mode: 'single', skills: [] },
+    }], {
+      guard: async () => {
+        enteredResolve()
+        await release
+      },
+    })
+    await entered
+
+    const child = spawn(process.execPath, [childScript, runsRoot, meta.id, owner], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let childOut = ''
+    let childErr = ''
+    child.stdout.on('data', chunk => { childOut += chunk })
+    child.stderr.on('data', chunk => { childErr += chunk })
+    const childExit = new Promise(resolve => child.once('exit', resolve))
+    try {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      assert.equal(childOut, '',
+        `续租/释放必须等 meta.lock（旧实现会在持锁期间改租约）：${childErr.slice(0, 200)}`)
+      const during = JSON.parse(readFileSync(lockPath, 'utf8'))
+      assert.equal(during.heartbeatAt, heartbeatBefore, '持锁期间心跳不得被续租刷新')
+      assert.ok(existsSync(lockPath), '持锁期间任一方都不得删租约')
+    } finally {
+      releaseResolve()
+    }
+    await hold
+    const code = await childExit
+    assert.equal(code, 0, `子进程失败：${childErr.slice(0, 300)}`)
+    const reports = childOut.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    assert.equal(reports.find(item => item.step === 'renew').ok, true, '锁释放后续租成功')
+    assert.equal(reports.find(item => item.step === 'release').ok, true, '锁释放后释放成功')
+    assert.ok(!existsSync(lockPath), '释放后租约文件必须删除')
+  })
+
+  // F1-④：真子进程 claim 接管后，旧 owner 的续租必须 409；旧业务写 0 条；锁与 epoch 归新 owner。
+  await check('F1（审查 P0·子进程）：claim 接管后旧 owner 续租 409，新锁/epoch 归新 owner，旧业务写 0 条', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    const old = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 1, now: t0,
+    })
+    assert.equal(old.epoch, 1)
+
+    // 子进程用**同一个 pid@host**、不同 ownerId 接管：旧实现的 renew 只看 pid@host。
+    const childScript = join(home, 'lease-claim-f1-child.mjs')
+    writeFileSync(childScript, [
+      `const store = await import(${JSON.stringify(new URL('../src/runstore.js', import.meta.url).href)})`,
+      'const [root, id] = process.argv.slice(2)',
+      'try {',
+      "  const lease = await store.claimLease(root, id, { pid: 111, host: 'h1', ownerId: 'owner-new', ttlMs: 60000, now: new Date() })",
+      "  process.stdout.write(JSON.stringify({ ok: true, epoch: lease.epoch, ownerId: lease.ownerId }) + '\\n')",
+      '} catch (error) {',
+      "  process.stdout.write(JSON.stringify({ ok: false, status: error && error.status }) + '\\n')",
+      '  process.exit(2)',
+      '}',
+    ].join('\n'))
+    const claimed = await runNodeScript(childScript, [runsRoot, meta.id])
+    assert.equal(claimed.code, 0, `子进程 claim 失败：${claimed.stderr.slice(0, 300)}`)
+    const claimReport = JSON.parse(claimed.stdout.trim())
+    assert.equal(claimReport.ok, true)
+    assert.equal(claimReport.epoch, 2, '子进程接管必须拿到 epoch 2')
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', ownerId: 'owner-old', now: new Date(),
+      }),
+      error => error && error.status === 409,
+      '旧 owner 续租必须 409',
+    )
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.execution.epoch, 2, '新 epoch 不得被旧 owner 覆盖')
+    assert.equal(after.execution.ownerId, 'owner-new', 'execution.ownerId 必须是新 owner')
+    const lock = JSON.parse(readFileSync(join(runsRoot, meta.id, 'lock.json'), 'utf8'))
+    assert.equal(lock.epoch, 2, 'lock.json.epoch 必须是新 epoch')
+    assert.equal(lock.ownerId, 'owner-new', 'lock.json.ownerId 必须是新 owner')
+
+    await assert.rejects(
+      () => store.appendEvents(runsRoot, meta.id, [{
+        v: 1, kind: 'node/start', nodeId: 'n_old_cross', attemptId: 1, traceId: 'tr-old-cross',
+        data: { title: 'old', mode: 'single', skills: [] },
+      }], { ownerId: old.ownerId, leaseEpoch: old.epoch }),
+      error => error && error.status === 409 && error.code === 'LEASE_FENCED',
+    )
+    const events = (await store.readAllEvents(runsRoot, meta.id)).events
+    assert.equal(events.some(item => item.nodeId === 'n_old_cross'), false, '旧业务写必须 0 条落盘')
+  })
+
+  // N2（独立复核·阻断）：leaseHeldBy 的兼容回退只剩「run.json 里还没有 execution」这一种
+  // 合法场景。一旦持久世代存在，缺少 ownerId 的调用方（旧插件 / 裸调 releaseLease）就
+  // 无法证明自己是这一代——同进程内新旧 owner 共享 pid@host，pid@host 比对等于放行。
+  await check('N2（复核阻断）：接管后不带 ownerId 的 renew 必须 409，且不得刷新新 owner 心跳', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 1, now: t0,
+    })
+    // 旧租约过期后，同一个 pid@host 被新 owner 接管（同进程 ABA：pid/host 完全一样）。
+    const fresh = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new', ttlMs: 60_000,
+      now: new Date(t0.getTime() + 10_000),
+    })
+    assert.equal(fresh.epoch, 2)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const locked = readFileSync(lockPath, 'utf8')
+    const before = JSON.parse(locked)
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', now: new Date(t0.getTime() + 20_000),
+      }),
+      error => error && error.status === 409,
+      '不带 ownerId 的续租不能写已被接管的租约',
+    )
+    const after = JSON.parse(readFileSync(lockPath, 'utf8'))
+    assert.equal(after.heartbeatAt, before.heartbeatAt, '失败续租不得刷新新 owner 的心跳')
+    assert.equal(after.ownerId, 'owner-new', '失败续租不得改写 ownerId')
+    assert.equal(after.epoch, 2, '失败续租不得改写 epoch')
+    assert.equal(readFileSync(lockPath, 'utf8'), locked, '失败续租不得改写 lock.json 一个字节')
+
+    // 现任 owner 带 ownerId 仍能续租：关掉的只是「无法证明世代」的调用方。
+    const renewed = await store.renewLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new', now: new Date(t0.getTime() + 30_000),
+    })
+    assert.equal(renewed.ownerId, 'owner-new')
+  })
+
+  await check('N2（复核阻断）：接管后不带 ownerId 的 release 必须 409，且新租约仍在', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 1, now: t0,
+    })
+    const fresh = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new', ttlMs: 60_000,
+      now: new Date(t0.getTime() + 10_000),
+    })
+    assert.equal(fresh.epoch, 2)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const locked = readFileSync(lockPath, 'utf8')
+    const before = JSON.parse(locked)
+
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }),
+      error => error && error.status === 409,
+      '不带 ownerId 的释放不能删已被接管的租约',
+    )
+    assert.ok(existsSync(lockPath), '失败释放不得删掉新 owner 的租约')
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).heartbeatAt, before.heartbeatAt)
+    assert.equal(readFileSync(lockPath, 'utf8'), locked, '失败释放不得改写 lock.json 一个字节')
+
+    // 现任 owner 带 ownerId 仍能释放。
+    assert.equal(await store.releaseLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-new',
+    }), true, '现任 owner 带 ownerId 必须能释放')
+    assert.ok(!existsSync(lockPath), '带正确 ownerId 的释放必须删掉租约')
+  })
+
+  // N2（兼容边界）：只有「run.json 还没有 execution 字段」的旧 run 才允许 pid@host 回退。
+  // 这是 0.10 旧二进制留下的形态（claim 不写 execution，lock.json 也没有 ownerId/epoch）。
+  await check('N2（兼容）：run.json 无 execution 的旧 run 仍允许 pid@host 的 renew/release', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-legacy', ttlMs: 60_000, now: t0,
+    })
+    // 抹回 0.10 形态：run.json 无 execution，lock.json 无 ownerId / epoch。
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    delete disk.execution
+    writeFileSync(metaPath, `${JSON.stringify(disk, null, 2)}\n`)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'))
+    delete lock.ownerId
+    delete lock.epoch
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`)
+
+    const renewed = await store.renewLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', now: new Date(t0.getTime() + 1000),
+    })
+    assert.equal(renewed.pid, 111, '旧调用方的续租仍生效')
+    assert.equal(Date.parse(renewed.heartbeatAt), t0.getTime() + 1000, '旧调用方的续租必须刷新心跳')
+    assert.equal(await store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }), true,
+      '旧调用方的释放仍生效')
+    assert.ok(!existsSync(lockPath), '旧 run 的租约必须能被释放')
+  })
+
+  // N10（复核2 残余）：execution 缺失、但 lock.json 仍是 0.11 形状（带 ownerId/epoch）
+  // 时不得按「0.10 旧租约」放行——那说明世代被抹掉或被旧二进制改过，同 pid@host 的
+  // 调用方不该再有无凭证续租/删除的能力。真正的 0.10 租约两个字段都不存在（上一条）。
+  await check('N10（复核2 残余）：execution 缺失但 lock.json 带 ownerId/epoch 时，无 ownerId 的 pid@host 必须 409', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-n10', ttlMs: 60_000, now: t0,
+    })
+    // 只抹掉 run.json 的 execution，保留 lock.json 的 0.11 形状。
+    const metaPath = join(runsRoot, meta.id, 'run.json')
+    const disk = JSON.parse(readFileSync(metaPath, 'utf8'))
+    delete disk.execution
+    writeFileSync(metaPath, `${JSON.stringify(disk, null, 2)}\n`)
+    const lockPath = join(runsRoot, meta.id, 'lock.json')
+    const lockBefore = readFileSync(lockPath, 'utf8')
+    assert.equal(JSON.parse(lockBefore).ownerId, 'owner-n10', '夹具前提：lock.json 必须仍是 0.11 形状')
+
+    await assert.rejects(
+      () => store.renewLease(runsRoot, meta.id, {
+        pid: 111, host: 'h1', now: new Date(t0.getTime() + 1000),
+      }),
+      error => error && error.status === 409,
+      'execution 被抹掉但 lock.json 带世代时，无 ownerId 的续租必须 409',
+    )
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { pid: 111, host: 'h1' }),
+      error => error && error.status === 409,
+      'execution 被抹掉但 lock.json 带世代时，无 ownerId 的释放必须 409',
+    )
+    assert.equal(readFileSync(lockPath, 'utf8'), lockBefore, '失败调用不得改写 lock.json')
+    // 世代被抹掉后，连「显式 ownerId」也不足以证明持权——这是 N2 有意选的严格口径
+    // （lock.json 与 execution 必须双对账，任一侧缺失都按无法证明持权处理）。
+    await assert.rejects(
+      () => store.releaseLease(runsRoot, meta.id, { ownerId: 'owner-n10' }),
+      error => error && error.status === 409,
+      'execution 缺失时显式 ownerId 也不能释放（双对账口径）',
+    )
+    // 兜底出口是显式 force（运维/灾备语义），以及 TTL 到期后的 reap。
+    assert.equal(await store.releaseLease(runsRoot, meta.id, { ownerId: 'owner-n10', force: true }), true,
+      'force 是这种情况下的唯一释放出口')
+    assert.ok(!existsSync(lockPath), 'force 释放必须删掉租约')
+  })
+
+
+  await check('F6（审查 P1）：并发相同 loss key 的 finalize 只落一条 run/end（幂等判定在锁内）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    const lease = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-f6', ttlMs: 60_000, now: t0,
+    })
+
+    // 占住 meta.lock：让两个 finalize 都完成「锁外读」后停在写入前（旧实现的双写窗口）。
+    let enteredResolve
+    let releaseResolve
+    const entered = new Promise(resolve => { enteredResolve = resolve })
+    const release = new Promise(resolve => { releaseResolve = resolve })
+    const hold = store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_f6_hold', attemptId: 1, traceId: 'tr-f6-hold',
+      data: { title: 'hold', mode: 'single', skills: [] },
+    }], {
+      guard: async () => {
+        enteredResolve()
+        await release
+      },
+    })
+    await entered
+
+    const options = {
+      expectedEpoch: lease.epoch,
+      ownerId: lease.ownerId,
+      idempotencyKey: 'loss:1',
+      now: new Date(),
+    }
+    const first = store.finalizeEpoch(runsRoot, meta.id, options)
+    const second = store.finalizeEpoch(runsRoot, meta.id, options)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    releaseResolve()
+    await hold
+    const settled = await Promise.all([first, second])
+
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const ends = all.events.filter(item => item.kind === 'run/end'
+      && item.extra && item.extra.idempotencyKey === 'loss:1')
+    assert.equal(ends.length, 1, `同一 loss key 只能有一条 end（实际 ${ends.length} 条）`)
+    assert.equal(settled.filter(item => item.appended === true).length, 1, '只有一次真正追加')
+    assert.equal(settled.filter(item => item.idempotent === true).length, 1, '另一次必须幂等返回')
+    assert.equal(settled.find(item => item.appended === true).terminalScope, 'run')
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'failed')
+    assert.equal(after.execution.state, 'settled')
+    assert.equal(after.execution.epoch, lease.epoch)
+  })
+
+  // F6-②：接管后旧 epoch 的 finalize 只能记 instance 事实；并发的两个 finalize 也不得双写，
+  // 更不得改动新 owner 的 status / execution。
+  await check('F6（审查 P1）：接管后并发失权收口只写一条 instance 事实，且不改新 owner 状态', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    const t0 = new Date('2026-11-06T12:00:00.000Z')
+    await store.startRun(runsRoot, meta.id, { now: t0 })
+    const old = await store.claimLease(runsRoot, meta.id, {
+      pid: 111, host: 'h1', ownerId: 'owner-old', ttlMs: 1, now: t0,
+    })
+    const fresh = await store.claimLease(runsRoot, meta.id, {
+      pid: 222, host: 'h2', ownerId: 'owner-new', ttlMs: 60_000, now: new Date(t0.getTime() + 10_000),
+    })
+    assert.equal(fresh.epoch, 2)
+
+    let enteredResolve
+    let releaseResolve
+    const entered = new Promise(resolve => { enteredResolve = resolve })
+    const release = new Promise(resolve => { releaseResolve = resolve })
+    const hold = store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_f6_hold2', attemptId: 1, traceId: 'tr-f6-hold2',
+      data: { title: 'hold', mode: 'single', skills: [] },
+    }], {
+      guard: async () => {
+        enteredResolve()
+        await release
+      },
+    })
+    await entered
+
+    const options = {
+      expectedEpoch: old.epoch,
+      ownerId: old.ownerId,
+      idempotencyKey: 'loss:1',
+      now: new Date(),
+    }
+    const first = store.finalizeEpoch(runsRoot, meta.id, options)
+    const second = store.finalizeEpoch(runsRoot, meta.id, options)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    releaseResolve()
+    await hold
+    const settled = await Promise.all([first, second])
+
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const ends = all.events.filter(item => item.kind === 'run/end'
+      && item.extra && item.extra.idempotencyKey === 'loss:1')
+    assert.equal(ends.length, 1, `旧 epoch 的 loss key 只能有一条 end（实际 ${ends.length} 条）`)
+    assert.equal(ends[0].extra.terminalScope, 'instance', '旧 epoch 只能记 instance 范围事实')
+    assert.equal(settled.filter(item => item.appended === true).length, 1)
+    assert.equal(settled.filter(item => item.idempotent === true).length, 1)
+
+    const after = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(after.status, 'running', '不得改动新 owner 的 status')
+    assert.equal(after.execution.epoch, fresh.epoch, '不得改动新 owner 的 epoch')
+    assert.equal(after.execution.ownerId, 'owner-new', '不得改动新 owner 的 ownerId')
+    assert.equal(after.execution.state, 'active', '不得改动新 owner 的 execution.state')
+
+    // 新 owner 仍能写业务事件（旧实例的收口没有把它 fence 掉）。
+    const accepted = await store.appendEvents(runsRoot, meta.id, [{
+      v: 1, kind: 'node/start', nodeId: 'n_new_owner', attemptId: 1, traceId: 'tr-new-owner',
+      data: { title: 'new', mode: 'single', skills: [] },
+    }], { ownerId: fresh.ownerId, leaseEpoch: fresh.epoch })
+    assert.equal(accepted.events.length, 1, '新 owner 的业务写必须仍被接受')
+  })
+
+  // 0.11 R5（本轮）：index / runtime 共用的验证器必须重读报告副本字节
+  await check('R5（本轮）：共享验证器重读报告副本 sha256，副本篡改 / 删除后撤销权威', async () => {
+    const meta = await makeRun()
+    await store.startRun(runsRoot, meta.id, { now: NOW })
+    const rel = 'n_reg/artifacts/1/report.json'
+    const abs = join(runsRoot, meta.id, rel)
+    mkdirSync(dirname(abs), { recursive: true })
+    const body = '{"suite":"unit","passed":1}'
+    writeFileSync(abs, body)
+    const sha = createHash('sha256').update(body).digest('hex')
+    await store.appendEvents(runsRoot, meta.id, [
+      {
+        v: 1, kind: 'artifact/write', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-v',
+        extra: { producer: 'host', authority: 'host', verificationId: 'hc-v1', verificationKind: 'report-copy' },
+        data: { path: rel, bytes: Buffer.byteLength(body), kind: 'json', sha256: sha },
+      },
+      {
+        v: 1, kind: 'check/form', nodeId: 'n_reg', attemptId: 1, traceId: 'tr-v',
+        extra: { producer: 'host', authority: 'host', verificationId: 'hc-v1' },
+        data: {
+          ruleSetId: 'host:n_reg', ruleSetVersion: '0.11', executor: 'host', state: 'pass',
+          passedChecks: 1, totalChecks: 1, executedAt: new Date().toISOString(),
+        },
+      },
+    ])
+    const receipt = store.createHostExecutionReceipt('hc-v1')
+    await store.recordHostExecution(runsRoot, meta.id, {
+      executionId: 'hc-v1',
+      runId: meta.id,
+      nodeId: 'n_reg',
+      attempt: 1,
+      checkId: 'host:n_reg',
+      commandDigest: 'b'.repeat(64),
+      expectedExitCode: 0,
+      exitCode: 0,
+      state: 'pass',
+      reasonCode: null,
+      reportPath: 'reports/unit.json',
+      reportSha256: sha,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    }, { receipt })
+
+    const all = await store.readAllEvents(runsRoot, meta.id)
+    const execs = await store.readHostExecutions(runsRoot, meta.id)
+    const verify = store.buildHostExecutionVerifier(execs, all.events, meta.id, join(runsRoot, meta.id))
+    const checkEvent = all.events.find(event => event.kind === 'check/form')
+    assert.equal(verify(checkEvent), true, '报告副本字节与登记 sha256 一致时授信')
+    // 关键防伪断言：文件仍在、长度不变，只替换内容（passed 1 → 0）。
+    // 若有人把验证器里的 digest 比较删掉，这条会由 false 变 true → 必红。
+    const tampered = body.replace('"passed":1', '"passed":0')
+    assert.notEqual(tampered, body, '篡改样本必须与原报告等长且内容不同')
+    assert.equal(tampered.length, body.length, '篡改样本必须与原报告等长')
+    writeFileSync(abs, tampered)
+    assert.equal(verify(checkEvent), false, '报告副本内容被篡改（同长度）后不得继续授信')
+    rmSync(abs, { force: true })
+    assert.equal(verify(checkEvent), false, '报告副本删除后不得继续授信')
+  })
+
+  // N8（复核2）：reportOpaque 原先只进引擎的嵌套 verification 对象，被 runlog 的
+  // 有界化丢掉；私有登记的显式白名单（bounded）也没收。审计因此无法区分「这份公开
+  // 副本是可读文本」与「opaque 字节」。
+  await check('N8：私有登记保留 reportOpaque（默认 false，二进制报告为 true）', async () => {
+    const meta = await store.createRun(runsRoot, { flowId: 'flow-n8', flowName: 'N8', nodeTotal: 1 })
+    const base = {
+      runId: meta.id,
+      nodeId: 'n_n8',
+      attempt: 1,
+      checkId: 'host:n_n8',
+      commandDigest: 'c'.repeat(64),
+      expectedExitCode: 0,
+      exitCode: 0,
+      state: 'pass',
+      reasonCode: null,
+      reportPath: 'reports/blob.bin',
+      reportSha256: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    }
+
+    const opaqueId = 'hc-n8-opaque'
+    await store.recordHostExecution(runsRoot, meta.id, {
+      ...base, executionId: opaqueId, reportOpaque: true,
+    }, { receipt: store.createHostExecutionReceipt(opaqueId) })
+    const opaqueRecord = JSON.parse(readFileSync(
+      join(runsRoot, meta.id, 'verification', opaqueId, 'record.json'), 'utf8'))
+    assert.equal(opaqueRecord.reportOpaque, true, '二进制报告的登记必须留下 reportOpaque=true')
+
+    const textId = 'hc-n8-text'
+    await store.recordHostExecution(runsRoot, meta.id, {
+      ...base, executionId: textId,
+    }, { receipt: store.createHostExecutionReceipt(textId) })
+    const textRecord = JSON.parse(readFileSync(
+      join(runsRoot, meta.id, 'verification', textId, 'record.json'), 'utf8'))
+    assert.equal(textRecord.reportOpaque, false, '未声明 opaque 时必须落 false（形状稳定，不缺席）')
+
+    // 读回时也要带着这一位，否则审计层拿不到。
+    const execs = await store.readHostExecutions(runsRoot, meta.id)
+    const byId = new Map(execs.map(entry => [entry.executionId, entry]))
+    assert.equal(byId.get(opaqueId)?.reportOpaque, true, 'readHostExecutions 必须透出 reportOpaque')
+    assert.equal(byId.get(textId)?.reportOpaque, false, 'readHostExecutions 的默认值必须是 false')
+  })
+
 } finally {
   rmSync(home, { recursive: true, force: true })
 }

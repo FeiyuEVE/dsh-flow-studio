@@ -77,6 +77,17 @@ run 级只有 `run/start`、`run/end`；其余事件必须带 `nodeId + attemptI
 
 `model/call.data.usage` 只认四个**互斥**桶：`input` / `cacheRead` / `cacheWrite` / `output`；`reasoning` 可选且是 `output` 的子集，不另计。`total = input + cacheRead + cacheWrite + output`。同一 `traceId + data.callId` 的重试按**替换**处理（`callId` 必填）。
 
+## 0.11 可信扩展（版本限定）
+
+[design/05](../design/05-run-log.md) 冻结期间，0.11「可信」六条的事件级扩展先记在这里；解冻后按迁移纪律迁回 05。
+
+- **外部来源**：`POST /runs/<runId>/events` 追加的每条事件都由服务端强制写 `extra.source='external'`、`extra.producer='external'`、`extra.authority='unverified'`，并剥离来客自带的 `source/producer/authority/verification/terminalScope/leaseEpoch/idempotencyKey/generatedReport` 等授信字段。聚合层在任何索引之前把 external 分区：外部同 path / 同 itemId / 同 ruleSetId 的 pass/fail 不覆盖内部证据、不制造冲突、不清掉宿主失败；时间线与导出仍可看到它们，但标「外部未验证」。
+- **证据权威**：模型自述（`extra.provenance='model-claim'`）仍保留计数；当报告是引擎自己刚生成的兜底（`extra.generatedReport=true`）时只能算 `claimed`，对应指标降 `unknown`。只有宿主执行链路写出的事件（`extra.producer='host'`，例如节点 `check` 的 `check/form`）计 `authoritative`。
+- **summary 缓存**：缓存键包含宿主证据指纹（登记记录 + 报告副本摘要）；删除 / 损坏报告副本后事件 seq 不变，但缓存会失效并重算为 unknown。
+- **summary 新增字段**：三项证据指标各带 `claimedPassed / authoritativePassed / authoritativeTotal / coverageRatio`；`quality` 汇总带 `claimedPassed / authoritativePassed / authoritativeTotal / authorityCoverage`。主通过率与绿 pill 用权威分子 / 应验分母，不用 claimed 补分子。
+- **宿主检查**：节点 `check.command` 由宿主在节点收口后真实执行，结果写成 `check/form`（`ruleSetId='host:<nodeId>'`、`executor='host'`、`state ∈ pass/fail/skipped`）与 `producer=host` 的执行记录 / 报告副本产物；agent 的 verdict 与 next/reject 不受影响，宿主失败只压质量结论。开关 `FLOW_STUDIO_ALLOW_HOST_CHECKS=1`。
+- **宿主执行登记（防伪）**：每次真实执行由引擎持一次性凭证写入 `verification/<executionId>/record.json`（runId / nodeId / attempt / commandDigest / exitCode / reportSha256）。事件侧的可信元数据写成扁平键 `extra.verificationId / verificationKind / reportSha256`（`extra` 有界化只保留标量，嵌套对象会被丢弃）。聚合层只有在传入 `verifyHostExecution` 且记录对得上时才承认 `producer=host`：验证器（summary、export、runtime 自审共用同一实现）会重读持久化报告副本字节核对 `reportSha256`；**没有验证器时 producer=host 一律按 claimed**，伪造 / 跨节点 / 旧 attempt 引用均不授信。
+
 ## 改契约的纪律
 
 事件格式一改全链路跟着改：先改 [design/05](../design/05-run-log.md)（新增 kind 追加在 §8 补充裁决并说明为何不污染 17 种基础事件），再改 `src/runlog.js` 白名单与校验、聚合、客户端，最后补测试并跑 [容器测试台](../cookbook/run-container-testbed.md)。不要在 reference 或 README 里另写一份字段表。

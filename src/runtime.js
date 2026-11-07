@@ -7,7 +7,13 @@
  *   - **按 run 一实例**：`class Engine` 继续持有全部 per-run 字段，但一个实例只服务
  *     一个 run；不同 runId（同工作区 / 跨工作区）各自一个实例并行跑。
  *   - **唯一 409**：同一个 runId 已在跑 → `EngineError(409, '同一 run 已在运行（<runId>）')`。
- *     没有 `MAX_CONCURRENT`、没有 per-workspace 上限、没有排队。
+ *     默认没有 `MAX_CONCURRENT`、没有 per-workspace 上限、没有排队（0.10 旧行为）。
+ *   - **可选准入（0.11 · R2/S1）**：显式传 `options.admission`（controller）或
+ *     `options.admissionLimits` 时才启用 `admission` 模块：start 先按
+ *     `global` / `perWorkspace` 申请槽位（全局满严格 FIFO 排队，工作区满立即 429），
+ *     grant 之后才 `newEngine` + `engine.start`；排队期间不建 Engine、不写 run/start。
+ *     收尾 / 启动失败 / dispose 各释放一次。不传这两个选项时，本文件的行为与 0.10
+ *     逐字一致。
  *   - **收尾摘除**：Engine 在 run 收尾（done/failed/aborted）时回调 `onSettled(runId)`，
  *     runtime 立刻把实例从表里摘掉并释放它的事件订阅；不轮询。run.json 仍然可读。
  *   - **跨 run 共享**：`sessionIndex`（flow_reply / 消息反查）、`startedBy`、logger、now
@@ -52,15 +58,18 @@
  * @module @feiyueve/dsh-flow-studio/runtime
  */
 
-import { readdir } from 'node:fs/promises'
+import { readdir, realpath } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { hostname } from 'node:os'
 
 import { auditWorkflow as defaultAuditWorkflow } from './audit.js'
+import { createAdmission } from './admission.js'
 import { Engine, EngineError, createEngine, validateFlowForRun } from './engine.js'
 import { buildFollowupPayload } from './inbox.js'
 import { checkRunId } from './runlog.js'
 import {
-  appendEvents, claimLease, createRun, listRuns, readAllEvents, readLease, readNodeSessions,
+  appendEvents, buildHostExecutionVerifier, claimLease, createRun, listRuns, readAllEvents, readHostExecutions,
+  readLease, readNodeSessions,
   readRunMeta, releaseLease, runsDir, writeNodeSessions, writeRunMeta,
 } from './runstore.js'
 import { RESTARTABLE_STATUSES, prepareRestart } from './restart.js'
@@ -77,6 +86,8 @@ const RUNTIME_ONLY_KEYS = new Set([
   'setInterval', 'clearInterval',
   // E2-a / E2-b / E2-c：运行时自己消费的收口 / 卸载 / 事件缓冲旋钮。
   'disposeTimeoutMs', 'sessionEventByteLimit', 'sessionEventLimit',
+  // 0.11 · R2/S1：准入控制器 / 内建控制器旋钮（不让 Engine 收到）。
+  'admission', 'admissionLimits',
 ])
 
 // ---------------------------------------------------------------------------
@@ -156,6 +167,61 @@ export const RUN_EXTRA_KEYS = Object.freeze([
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+// ---------------------------------------------------------------------------
+// 0.11 F2：执行世代（ownerId + epoch）
+// ---------------------------------------------------------------------------
+//
+// Engine 在 `start()` 里用 `runstore.claimLease()` 抢到本次执行的租约（含随机 `ownerId`
+// 与单调 `epoch`），并把它挂在 `engine.active.lease` 上。runtime 在 `engine.start()`
+// 返回后把这份世代记下来；收尾时只有「持久 `run.json.execution` 仍是这份世代」才允许
+// 摘掉本 run 的调度登记 / 落盘 supervision.enabled=false。否则说明接管者已经拿到新
+// 世代，旧实例的迟到收尾只许摘自己的资源（Engine 实例 / 配额 / 事件订阅）。
+
+/** 从 Engine 实例读出本次执行的世代；没有（旧 Engine / 桩）返回 null。 */
+function engineLeaseGeneration(engine) {
+  const lease = engine && engine.active && engine.active.lease
+  if (!isPlainObject(lease)) return null
+  const generation = {}
+  if (typeof lease.ownerId === 'string' && lease.ownerId !== '') generation.ownerId = lease.ownerId
+  if (Number.isInteger(lease.epoch)) generation.epoch = lease.epoch
+  return generation.ownerId === undefined && generation.epoch === undefined ? null : generation
+}
+
+/**
+ * 持久 execution 与「本实例世代」是否一致。
+ * 只比较双方都带了的字段：老 run 可能没有 ownerId / epoch，不因此误判被接管。
+ */
+function executionMatchesGeneration(execution, generation) {
+  if (!isPlainObject(execution) || !generation) return true
+  if (generation.ownerId !== undefined
+    && typeof execution.ownerId === 'string' && execution.ownerId !== ''
+    && execution.ownerId !== generation.ownerId) {
+    return false
+  }
+  if (generation.epoch !== undefined && Number.isInteger(execution.epoch)
+    && execution.epoch !== generation.epoch) {
+    return false
+  }
+  return true
+}
+
+/** runstore 的写入门闩：meta.execution 必须仍是这份世代。 */
+function generationFence(generation) {
+  if (!generation) return {}
+  return {
+    ...(generation.ownerId === undefined ? {} : { ownerId: generation.ownerId }),
+    ...(generation.epoch === undefined ? {} : { leaseEpoch: generation.epoch }),
+  }
+}
+
+/** 世代的可读标签（日志用）。 */
+function generationLabel(generation) {
+  if (!generation) return 'unknown'
+  const owner = generation.ownerId === undefined ? '?' : generation.ownerId.slice(0, 8)
+  const epoch = generation.epoch === undefined ? '?' : String(generation.epoch)
+  return `epoch=${epoch}, owner=${owner}`
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +694,48 @@ export function nodeSelfCheckPrompt(entry = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// 0.11 · R2/S1：准入控制（可选启用；不传 admission / admissionLimits 时保持 0.10 旧行为）
+// ---------------------------------------------------------------------------
+
+/** 是否是 `createAdmission()` 返回的准入 API（而不是裸 controller 状态对象）。 */
+function isAdmissionLike(value) {
+  return Boolean(value && typeof value === 'object'
+    && typeof value.acquire === 'function'
+    && typeof value.release === 'function'
+    && typeof value.cancel === 'function'
+    && typeof value.markRunning === 'function'
+    && typeof value.admissionOf === 'function'
+    && typeof value.snapshot === 'function')
+}
+
+/**
+ * 解析 runtime 的准入配置。
+ *
+ *   - `options.admission`：显式控制器——既接受 `createAdmission()` 的返回值，
+ *     也接受裸 controller 对象（内部再包一层 createAdmission）。
+ *   - `options.admissionLimits`：启用内建 controller（进程共享单例）。
+ *   - 两者都不给 → 返回 null，runtime 保持 0.10 的「并发不设上限」。
+ */
+function resolveRuntimeAdmission(options) {
+  if (options.admission !== undefined && options.admission !== null) {
+    if (isAdmissionLike(options.admission)) return options.admission
+    if (!isPlainObject(options.admission)) {
+      throw new TypeError('createRuntime 的 admission 必须是 createAdmission() 返回值或 controller 对象')
+    }
+    return createAdmission({ controller: options.admission })
+  }
+  if (options.admissionLimits !== undefined && options.admissionLimits !== null) {
+    const limits = isPlainObject(options.admissionLimits) ? options.admissionLimits : {}
+    return createAdmission({
+      limits,
+      queueMax: limits.queueMax,
+      queueTimeoutMs: limits.queueTimeoutMs,
+    })
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
 // createRuntime
 // ---------------------------------------------------------------------------
 
@@ -701,6 +809,47 @@ export function createRuntime(options = {}) {
   const sessionEventLimit = Number.isInteger(options.sessionEventLimit) && options.sessionEventLimit > 0
     ? options.sessionEventLimit
     : DEFAULT_SESSION_EVENT_LIMIT
+
+  // 0.11 · R2/S1：准入控制器。**只有显式提供才启用**——不提供时下面的代码路径
+  // 与 0.10 逐字一致（并发不设上限、没有排队）。
+  const admission = resolveRuntimeAdmission(options)
+  /**
+   * 0.11 F5：从「发起 start」到「拿到槽位 / 建好 Engine」之间同步占住的 runId。
+   * 读快照 / realpath 都是 await，不先占就是 await 穿透：两个并发 start 会一起通过
+   * `runs.has()` 预检（第一个收尾很快时第二个甚至能再建一个 Engine）。
+   */
+  const starting = new Set()
+  /** 0.11 F2：Engine 实例 → 本次执行世代（ownerId + epoch）；收尾时用来核对是否仍是持有者。 */
+  const engineGenerations = new WeakMap()
+  /** 本 runtime 正在排队等槽位的 runId（dispose 只取消自己的队，不碰共享 controller 里别人的）。 */
+  const pendingStarts = new Set()
+  /** runId → 一次性 release 包装（settleInstance 与 start 抛错共用，保证只还一次）。 */
+  const admissionReleases = new Map()
+
+  function trackAdmissionRelease(runId, release) {
+    if (!admission) return null
+    let called = false
+    const once = () => {
+      if (called) return
+      called = true
+      admissionReleases.delete(runId)
+      try {
+        release()
+      } catch (error) {
+        log('warn', `flow-studio: 释放执行槽位失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+      }
+    }
+    admissionReleases.set(runId, once)
+    return once
+  }
+
+  /** 收尾 / 启动失败 / dispose 都走这里：同一个 run 的槽位只释放一次。 */
+  function releaseAdmissionSlot(runId) {
+    const once = admissionReleases.get(runId)
+    if (!once) return false
+    once()
+    return true
+  }
 
   // engineDeps：除 runtime 自己消费的键之外，全部透传（activate / stub / 超时 / ...）。
   const engineDeps = {}
@@ -785,9 +934,15 @@ export function createRuntime(options = {}) {
         flow = null
       }
     }
+    const hostExecutions = await readHostExecutions(runsRoot, runId).catch(() => [])
+    const hostById = new Map(hostExecutions
+      .filter(record => record && typeof record.executionId === 'string')
+      .map(record => [record.executionId, record]))
+    // 0.11 R5（返工）：自审 summary 与 HTTP 同口径（同一 runstore 验证器，含副本 sha256）。
+    const verifyHostExecution = buildHostExecutionVerifier(hostExecutions, events, runId, join(runsRoot, runId))
     let audited = null
     try {
-      audited = auditFn({ flow, events, run: meta, now: now() })
+      audited = auditFn({ flow, events, run: meta, now: now(), verifyHostExecution })
     } catch (error) {
       log('warn', `supervision: 审计 run ${runId} 失败：${error && error.message ? error.message : String(error)}`)
       audited = null
@@ -1160,6 +1315,8 @@ export function createRuntime(options = {}) {
     if (runId !== null) {
       runs.delete(runId)
       LIVE_RUN_IDS.delete(runId)
+      // 0.11 · R2/S1：run 收尾即还槽位（幂等；start 抛错路径也调同一个包装）。
+      releaseAdmissionSlot(runId)
     }
     // 收尾后不再需要 session/event 订阅；不释放会让每个结束的 run 继续缓冲全局会话事件。
     try {
@@ -1168,23 +1325,59 @@ export function createRuntime(options = {}) {
       // 释放失败不该影响收尾。
     }
     if (runId !== null) {
-      // 07 §7：终态立刻停调度并落盘 enabled=false（重启后也不会再唤醒已结束的 run）。
-      try {
-        supervision.unregister(runId)
-      } catch {
-        // 调度器状态清理失败不该影响收尾。
-      }
-      // v0.8 §11.1：run 收尾后不再叫醒这个 run 的任何节点会话。
-      try {
-        nodeSupervision.unregisterRun(runId)
-      } catch {
-        // 调度器状态清理失败不该影响收尾。
-      }
-      saveSupervision(runsRoot, runId, { enabled: false, reason: 'terminal' }).then(() => {
+      // 0.11 F2：本实例的世代。失权（lease-lost）后的迟到收尾必须拿它核对当前持有者，
+      // 不能无条件摘掉接管者刚登记的 supervision / 落盘 enabled=false。
+      const generation = engineGenerations.get(engine) || null
+      engineGenerations.delete(engine)
+      const cleanup = async () => {
+        let meta = null
+        try {
+          meta = await readRunMeta(runsRoot, runId)
+        } catch {
+          meta = null
+        }
+        // 落盘前核对：run.json.execution 仍是本实例 claim 到的世代吗？
+        if (meta && !executionMatchesGeneration(meta.execution, generation)) {
+          log('info', `flow-studio: run ${runId} 的持久世代已属于接管者（${generationLabel(generation)} 已失效），`
+            + '旧实例只摘自己的资源，跳过 supervision / 节点闹钟清理')
+          return
+        }
+        // 落盘用持久 fence 再原子核对一次：检查与写入之间若发生接管，runstore 会 409
+        // LEASE_FENCED，绝不覆盖接管者的 supervision。
+        const supervisionPatch = {
+          ...(meta && isPlainObject(meta.supervision) ? meta.supervision : {}),
+          enabled: false,
+          reason: 'terminal',
+        }
+        const fence = meta && isPlainObject(meta.execution) ? generationFence(generation) : {}
+        try {
+          if (meta) await writeRunMeta(runsRoot, runId, { supervision: supervisionPatch }, fence)
+        } catch (error) {
+          if (error && (error.status === 409 || error.code === 'LEASE_FENCED')) {
+            log('info', `flow-studio: run ${runId} 收尾写 supervision 被 fence 拒绝（世代已属于接管者），`
+              + '保留接管者的调度登记')
+            return
+          }
+          log('warn', `flow-studio: runtime 收尾写 supervision 失败（${runId}）：${error.message}`)
+          return
+        }
+        // 只有「仍持有 + 落盘成功」才摘掉本 run 的两个调度登记。
+        try {
+          supervision.unregister(runId)
+        } catch {
+          // 调度器状态清理失败不该影响收尾。
+        }
+        try {
+          nodeSupervision.unregisterRun(runId)
+        } catch {
+          // 调度器状态清理失败不该影响收尾。
+        }
         // 终态 run 不再需要 waker 缓存（避免进程内 Map 随历史 run 累积）。
         RUN_WAKERS.delete(runWakerKey(runsRoot, runId))
-      }).catch(error => {
-        log('warn', `flow-studio: runtime 收尾写 supervision 失败（${runId}）：${error.message}`)
+      }
+      // settleInstance 由 Engine 的同步回调调用：本地资源同步摘，持久清理异步完成。
+      void cleanup().catch(error => {
+        log('warn', `flow-studio: runtime 收尾清理失败（${runId}）：${error && error.message ? error.message : String(error)}`)
       })
     }
     if (runId !== null && settledHook) {
@@ -1222,28 +1415,141 @@ export function createRuntime(options = {}) {
     return engine
   }
 
+  /**
+   * 0.11 F5：每工作区配额键。
+   *
+   * 必须用**来源工作区**（startOptions.workspace，其次 cwd，其次 run.json 绑定）的
+   * realpath——两个软链别名指向同一目录时归一到同一个键，不能各占一份额度。
+   * 路径不存在 / realpath 失败时退回绝对化后的原值（仍然比 raw 相对路径稳定）。
+   */
+  async function workspaceQuotaKey(startOptions, meta) {
+    const candidates = []
+    if (typeof startOptions.workspace === 'string' && startOptions.workspace !== '') {
+      candidates.push(startOptions.workspace)
+    } else if (typeof startOptions.cwd === 'string' && startOptions.cwd !== '') {
+      candidates.push(startOptions.cwd)
+    } else if (meta && isPlainObject(meta.workspace)) {
+      if (typeof meta.workspace.realpath === 'string' && meta.workspace.realpath !== '') {
+        candidates.push(meta.workspace.realpath)
+      } else if (typeof meta.workspace.path === 'string' && meta.workspace.path !== '') {
+        candidates.push(meta.workspace.path)
+      }
+    }
+    if (candidates.length === 0) return 'default'
+    const absolute = resolve(candidates[0])
+    try {
+      return await realpath(absolute)
+    } catch {
+      return absolute
+    }
+  }
+
   async function start(runId, startOptions = {}) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
     // 07 §5：唯一 409 就是「同一个 runId 已在跑」。
     if (runs.has(runId)) throw new EngineError(409, `同一 run 已在运行（${runId}）`)
+    // 已有准入票（queued / reserved / running）：保持既有 409 payload（AdmissionError），
+    // 不能因为新增的同步占位就把它降级成一条普通 EngineError。
+    if (admission && admission.admissionOf(runId)) {
+      return admission.acquire({ runId })
+    }
+    // 0.11 F5：读快照 / realpath 之前先同步占住 runId，堵住 await 穿透：
+    // 两个并发 start 同一 runId 时，第二个在预检处直接 409，不会重复读快照、
+    // 更不会在第一个刚收尾后另建一个 Engine。
+    if (starting.has(runId)) throw new EngineError(409, `同一 run 已在运行（${runId}）`)
+    if (!admission) return startReserved(runId, startOptions, null)
+
+    starting.add(runId)
+    try {
+      // 0.11 R2：入队前冻结流程快照（含 node.check）；排队期间保存流程不改变实际执行命令。
+      let meta = null
+      try {
+        meta = await readRunMeta(runsRoot, runId)
+      } catch {
+        meta = null
+      }
+      let effectiveOptions = startOptions
+      if (!effectiveOptions.flowSnapshot && meta && typeof meta.flowId === 'string' && meta.flowId !== '') {
+        let snapshot
+        try {
+          snapshot = await readFlow(flowsRoot, meta.flowId)
+        } catch (error) {
+          // F5：快照读失败显式报错（不能退化成出队时读「最新流程」）。
+          throw new EngineError(500, `读取流程快照失败（${meta.flowId}），不能启动：${error && error.message ? error.message : String(error)}`)
+        }
+        if (!snapshot) {
+          throw new EngineError(404, `流程快照不存在（${meta.flowId}），不能启动`)
+        }
+        effectiveOptions = { ...effectiveOptions, flowSnapshot: snapshot }
+      }
+      // F5：配额键用来源工作区 realpath 规范化，软链别名不能绕过每工作区额度。
+      const workspaceKey = await workspaceQuotaKey(startOptions, meta)
+      // 0.11 · R2/S1：`acquire` 在返回 Promise 之前就同步登记了 queued / reserved，
+      // 所以两个并发 start 同一 runId 时，第二个会在 acquire 的重复检查处直接 409，
+      // 不会穿透到 newEngine（不会出现两个 Engine 实例）。
+      pendingStarts.add(runId)
+      let slotRelease = null
+      try {
+        slotRelease = await admission.acquire({
+          runId,
+          workspaceKey,
+          signal: effectiveOptions ? effectiveOptions.signal : undefined,
+        })
+      } catch (error) {
+        pendingStarts.delete(runId)
+        throw error
+      }
+      pendingStarts.delete(runId)
+      return startReserved(runId, effectiveOptions, slotRelease)
+    } finally {
+      starting.delete(runId)
+    }
+  }
+
+  /**
+   * 拿到槽位之后的启动路径：这里才创建 Engine / 写 run/start。
+   * 排队期间（acquire 未 resolve）不碰 Engine，也不写 run.json。
+   */
+  async function startReserved(runId, startOptions, slotRelease) {
     // v0.8 §11：节点闹钟随 runtime 起（幂等；engine 在 create 成功后自行 register）。
     nodeSupervision.start()
-    const engine = newEngine(runId)
-    runs.set(runId, engine)
-    LIVE_RUN_IDS.add(runId)
+    if (admission) trackAdmissionRelease(runId, slotRelease)
+    let engine = null
     try {
-      return await engine.start(runId, startOptions)
+      engine = newEngine(runId)
+      runs.set(runId, engine)
+      LIVE_RUN_IDS.add(runId)
+      // 槽位从 reserved 变 running（只影响 admissionOf 的可观测状态，不额外计数）。
+      if (admission) {
+        try {
+          admission.markRunning(runId)
+        } catch (error) {
+          log('warn', `flow-studio: 标记 run 执行态失败（${runId}）：${error && error.message ? error.message : String(error)}`)
+        }
+      }
+      const started = await engine.start(runId, startOptions)
+      // 0.11 F2：记下本次执行世代（claimLease 产出的 ownerId + epoch）。
+      // Engine 在收尾时先 releaseLease 再 onSettled，所以必须在这里（active 还在时）抓。
+      if (runs.get(runId) === engine) {
+        const generation = engineLeaseGeneration(engine)
+        if (generation) engineGenerations.set(engine, generation)
+      }
+      return started
     } catch (error) {
       // 启动失败：把实例从表里摘掉（调用方拿到的错误照原样抛）。
-      if (runs.get(runId) === engine) {
+      if (engine && runs.get(runId) === engine) {
         runs.delete(runId)
         LIVE_RUN_IDS.delete(runId)
       }
-      try {
-        engine.dispose()
-      } catch {
-        // 忽略释放失败。
+      if (engine) {
+        try {
+          engine.dispose()
+        } catch {
+          // 忽略释放失败。
+        }
       }
+      // 槽位必须还回去（若 Engine 已经自己收尾过，这里的包装是幂等的 no-op）。
+      releaseAdmissionSlot(runId)
       throw error
     }
   }
@@ -1256,6 +1562,26 @@ export function createRuntime(options = {}) {
   }
 
   async function stop(runId) {
+    if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
+    // 0.11 · R2/S1：还在排队的 run 没有 Engine 可 stop——原子摘票并 409。
+    if (admission) {
+      const queued = admission.admissionOf(runId)
+      if (queued && queued.state === 'queued') {
+        admission.cancel(runId, 'stop')
+        const limits = admission.limits
+        const current = admission.snapshot()
+        throw new EngineError(409, `run 正在排队（${runId}），已取消执行请求`, {
+          code: 'RUN_CONCURRENCY_LIMIT',
+          reason: 'stop',
+          scope: 'global',
+          runId,
+          active: current.active,
+          max: limits.global,
+          limits: { global: limits.global, perWorkspace: limits.perWorkspace },
+          retryAfterMs: 30000,
+        })
+      }
+    }
     const engine = requireRunning(runId)
     return engine.stop(runId)
   }
@@ -1319,14 +1645,20 @@ export function createRuntime(options = {}) {
     if (!oldMeta) throw new EngineError(404, `run 不存在（${oldRunId}）`)
     // 持久化互斥：已经有一个续跑自该 run 的子 run 时，再重启会重复复制会话。
     // 让用户继续/停止那个子 run（续跑失败就重启子 run），而不是并排两个。
+    let retryChild = null
     try {
       const listed = await listRuns(runsRoot, { limit: 100 })
       for (const item of listed.runs || []) {
         if (!item || item.id === oldRunId) continue
         const meta = await readRunMeta(runsRoot, item.id)
-        if (meta && meta.restart && meta.restart.fromRunId === oldRunId) {
-          throw new EngineError(400, `该 run 已经有续跑 run（${item.id}）；请继续或停止它，不要重复重启`)
+        if (!meta || !meta.restart || meta.restart.fromRunId !== oldRunId) continue
+        // 0.11 R2：上次 restart 在准入处被 429 拒绝、run/start 从未写出 → 同一个子 run
+        // 可重试（复用 childRunId / resumePlan），不能被「存在任意 child」永久挡住。
+        if (meta.restart.startRejected && meta.status === 'pending' && meta.started !== true) {
+          retryChild = meta
+          continue
         }
+        throw new EngineError(400, `该 run 已经有续跑 run（${item.id}）；请继续或停止它，不要重复重启`)
       }
     } catch (error) {
       if (error instanceof EngineError) throw error
@@ -1377,16 +1709,18 @@ export function createRuntime(options = {}) {
       ? restartOptions.note.trim().slice(0, 500)
       : undefined
     const name = `${oldMeta.name || oldMeta.flowName || oldMeta.flowId}（续跑 ${attempt}）`
-    const created = await createRun(runsRoot, {
-      flowId: oldMeta.flowId,
-      flowName: oldMeta.flowName || oldMeta.flowId,
-      name,
-      nodeTotal: stages.length,
-      engine: oldMeta.engine === 'stub' ? 'stub' : 'real',
-    })
+    const created = retryChild
+      ? { id: retryChild.id }
+      : await createRun(runsRoot, {
+        flowId: oldMeta.flowId,
+        flowName: oldMeta.flowName || oldMeta.flowId,
+        name,
+        nodeTotal: stages.length,
+        engine: oldMeta.engine === 'stub' ? 'stub' : 'real',
+      })
     // 继承旧 run 的节点会话：新 run 的 engine.start → _loadNodeSessions 会读这份表；
     // 每个节点仍用同一个 sessionId，冷会话由 _followupNodeSession → agents.resume 续上。
-    if (Object.keys(inherited).length > 0) {
+    if (!retryChild && Object.keys(inherited).length > 0) {
       await writeNodeSessions(runsRoot, created.id, inherited)
     }
     const restartInfo = {
@@ -1421,15 +1755,41 @@ export function createRuntime(options = {}) {
         supervision: { enabled: false, wakerSessionId, reason: 'restarted' },
       }).catch(() => {})
     }
-    const started = await start(created.id, {
-      ...(workspacePath === null ? {} : { workspace: workspacePath, worktree: 'off' }),
-      resumePlan: {
-        fromRunId: oldRunId,
-        startNodeId: plan.startNodeId,
-        skipped: plan.skipped,
-        oldFailure: plan.oldFailure,
-      },
-    })
+    let started
+    try {
+      started = await start(created.id, {
+        ...(workspacePath === null ? {} : { workspace: workspacePath, worktree: 'off' }),
+        resumePlan: {
+          fromRunId: oldRunId,
+          startNodeId: plan.startNodeId,
+          skipped: plan.skipped,
+          oldFailure: plan.oldFailure,
+        },
+      })
+    } catch (error) {
+      // 0.11 R2：准入拒绝（429）不删除子 run；记 startRejected 供下一次 restart 复用。
+      if (error && error.status === 429) {
+        await writeRunMeta(runsRoot, created.id, {
+          restart: {
+            ...restartInfo,
+            startRejected: {
+              code: error.code || 'RUN_CONCURRENCY_LIMIT',
+              reason: error.reason || 'queue-full',
+              at: now().toISOString(),
+              retryable: true,
+            },
+          },
+        }).catch(() => {})
+        if (error && typeof error === 'object') {
+          error.childRunId = created.id
+          error.retryable = true
+        }
+      } else {
+        // 其它启动失败：同样保留目录与 childRunId，避免调用方失去线索。
+        if (error && typeof error === 'object' && !error.childRunId) error.childRunId = created.id
+      }
+      throw error
+    }
     log(
       'info',
       `flow-studio: run ${created.id} 从 ${oldRunId} 续跑（第 ${attempt} 次，起点 ${plan.startNodeId}，`
@@ -1570,7 +1930,9 @@ export function createRuntime(options = {}) {
    *   2. 清空注册表 / 摘掉调度登记 / 从跨 runtime 的活跃集合里移除；
    *   3. 对每个活跃 Engine 调用现有 abort 能力（`abort` → `stop` → `active.controller.abort`），
    *      并立刻 `engine.dispose()` 摘掉 session/event 订阅（卸载后不再写新事件）；
-   *   4. 在 `disposeTimeoutMs` 内等待其收尾，超时只告警（不阻塞卸载）。
+   *   4. 在 `disposeTimeoutMs` 内等待其收尾，超时只告警（不阻塞卸载）；
+   *   5. **0.11 F7**：配额槽只在 Engine 真实终止后归还。超时仍占着——Engine / 外部进程
+   *      还没退出时把槽还回去，会让新 run 突破全局限额；迟到终止由终止 promise 归还。
    *
    * @returns {Promise<{ aborted: number, timedOut: boolean }>} 永不 reject
    */
@@ -1586,10 +1948,25 @@ export function createRuntime(options = {}) {
     } catch {
       // 停止节点闹钟失败不该影响卸载。
     }
+    // 0.11 · R2/S1：先取消本 runtime 正在排队的 run（原子摘票），只取消自己登记的
+    // runId——共享 controller 里别的 runtime 的队不动。
+    if (admission) {
+      for (const queuedRunId of [...pendingStarts]) {
+        try {
+          admission.cancel(queuedRunId, 'dispose')
+        } catch (error) {
+          log('warn', `flow-studio: 卸载取消排队 ${queuedRunId} 失败：${error && error.message ? error.message : String(error)}`)
+        }
+      }
+      pendingStarts.clear()
+    }
     const snapshot = [...runs.entries()]
     runs.clear()
     const waits = []
     for (const [runId, engine] of snapshot) {
+      // F7：槽位释放包装按「本次启动」捕获，不在迟到终止时按 runId 重新查表——
+      // 否则 dispose 之后同 runId 若被重新 start，旧 Engine 的迟到终止会误还新 run 的槽。
+      const releaseSlot = admissionReleases.get(runId) || null
       LIVE_RUN_IDS.delete(runId)
       RUN_WAKERS.delete(runWakerKey(runsRoot, runId))
       try {
@@ -1626,17 +2003,32 @@ export function createRuntime(options = {}) {
           // 释放失败不该影响卸载。
         }
       }
+      let termination = null
       if (pending && typeof pending.then === 'function') {
-        waits.push(Promise.resolve(pending).then(() => undefined, () => undefined))
+        termination = Promise.resolve(pending).then(() => undefined, () => undefined)
       } else if (engine && typeof engine.wait === 'function') {
         try {
-          waits.push(Promise.resolve(engine.wait(runId)).then(() => undefined, () => undefined))
+          termination = Promise.resolve(engine.wait(runId)).then(() => undefined, () => undefined)
         } catch {
-          // 等待失败不该影响卸载。
+          termination = null
         }
       }
+      if (termination) {
+        waits.push(termination)
+        // 0.11 F7：待真实终止才还槽。dispose 的有界等待超时后槽位仍然占着，直到
+        // Engine（含外部进程组）真正退出；正常终止在这里立刻归还（与 settleInstance 的
+        // 一次性包装共享同一个 release，重复调用是 no-op）。
+        void termination.then(() => {
+          if (releaseSlot) releaseSlot()
+        })
+      } else if (releaseSlot) {
+        // 没有可等待的终止信号（同步 abort 的桩 / 已收尾实例）：按已终止处理。
+        releaseSlot()
+      }
     }
-    if (waits.length === 0) return Promise.resolve({ aborted: snapshot.length, timedOut: false })
+    if (waits.length === 0) {
+      return Promise.resolve({ aborted: snapshot.length, timedOut: false })
+    }
     return waitBounded(
       Promise.all(waits),
       disposeTimeoutMs,
@@ -1892,6 +2284,19 @@ export function createRuntime(options = {}) {
     /** E2-a：显式再跑一次重启收口（初始化扫描同一实现；幂等，返回本次收口的 runId）。 */
     reclaimOrphans: reclaimOrphanRuns,
     dispose,
+    // ── 0.11 · R2/S1：准入（未启用时全部为 null，旧调用方拿不到也不受影响） ──
+    /** 某个 run 的准入状态：queued / reserved / running / null（未启用准入时为 null）。 */
+    admissionOf(runId) {
+      return admission ? admission.admissionOf(runId) : null
+    },
+    /** 当前生效的并发限制（含 env 非法值的 warnings）；未启用准入时为 null。 */
+    get admissionLimits() {
+      return admission ? admission.limits : null
+    },
+    /** 准入快照：{ active, global, workspaces, queued }；未启用准入时为 null。 */
+    admissionSnapshot() {
+      return admission ? admission.snapshot() : null
+    },
     // ── Engine 门面：`env.engine = runtime` 后旧调用照跑 ──────────────────
     /** 供 /health 使用：'stub' / 'real'（与 Engine 同一口径）。 */
     get engineName() {

@@ -165,10 +165,18 @@ try {
     )
   })
 
-  await check('只把当前工作树的 build.mjs / verify-build.mjs / package.json 覆盖进干净检出', async () => {
+  await check('把当前工作树的 build 脚本 / package.json 与 src 模块覆盖进干净检出', async () => {
     for (const rel of ['scripts/build.mjs', 'scripts/verify-build.mjs', 'package.json']) {
       copyFileSync(join(repo, rel), join(checkout, rel))
       A.ok(existsSync(join(checkout, rel)), `已复制 ${rel}`)
+    }
+    // 0.11：开发阶段的模块改动 / 新增模块还没进 HEAD（本阶段不 commit），
+    // 干净检出必须补上「当前交付的 src」才能证明 npm pack 打包的是眼前这份代码。
+    // supervise.js 这类本阶段未改的文件仍是 HEAD 内容（上一组的断言继续成立）。
+    for (const file of HOST_MODULES) {
+      const source = join(repo, 'src', file)
+      if (!existsSync(source)) continue
+      copyFileSync(source, join(checkout, 'src', file))
     }
     // esbuild 从工作树的 node_modules 解析（符号链接过去，避免干净检出里再装一遍）。
     const repoModules = join(repo, 'node_modules')

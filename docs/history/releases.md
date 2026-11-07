@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.9）
+# 版本历史（0.1 → 0.11）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -183,3 +183,21 @@
 - **真实浏览器证据**（测试节点在容器内解包 Chromium + puppeteer-core 量测，夹具不入库）：R2 三键 22×22 可命中；R3 指标条 67px 外框 / 58 内容盒、7 个 stat 三行齐、事件区 151px/3 行；R4 两个入口点击各调用一次、参数精确；R5 节点详情 `preset：ptc（来源：节点配置）`；R7 收起/展开/键盘/上限。
 - **已知边界（不阻塞，记录在案）**：① skills 搜索框在已有 active 时仍把 Space 当选择键（设计锁定，若要空格当搜索词需改契约）；② `page.js` 里有两处 340/200 的旧注释与结构文档不一致；③ `openSession` 不做归属校验、restart 错误横幅跨 run 残留等 F13–F17 观察项按 P2 accepted；④ 「start 失败留下 pending 子 run，会挡住旧 run 的 restart」是新暴露的 E13，发布补丁或 0.11 处理。
 - **怎么产出的**：这一版由 flow-studio 自己的六阶段流水线在容器里跑出来（`r-mw67vqpf-okns` 死在 `n_dev` → 修引擎发 0.9.5 → `restart` 续跑成 `r-mw6aiqyp-25z6` → done）。中途那次死在 `n_dev` 不是流程问题，而是 0.9.5 修的那个「状态块 + 结论合并」解析缺口——同一份代码先把自己踩的坑修掉，再跑完剩下的阶段。
+
+## 0.11.0 — 加固：租约世代、runtime 竞态、证据授信与脱敏（三轮开发 + 两轮独立复核）
+
+这一版不改用户可见功能面（九条 UI 改进在 0.10.0 已经交付），修的是**跑起来才暴露的信任问题**：并发接管会不会双写、报告副本会不会把凭据带进公开目录、质量结论会不会拿模型自报刷绿。做法是三条平行的加固线，落完后由独立复核做对抗性验收——第一轮判 **REJECT**（修复自身带出三个新阻断项），修完再做第二轮。
+
+- **R1 租约原子性（`src/runstore.js`）**：`renewLease` / `releaseLease` 与 `claimLease` 共用同一把 `meta.lock`，`ownerId` + `epoch` 对账，`finalizeEpoch` 的幂等收口也进同一锁事务。任一环节不在锁内，两个进程就能同时认为自己是写者。
+- **R2 runtime 竞态（`src/runtime.js`）**：失权清理先核对世代再落盘；工作区配额键改 `realpath`（软链能绕配额）；`start()` 同步预占 runId（避免两个 start 同时通过预检）；`dispose()` 等进程**真的**终止再还槽。
+- **R3 证据授信与脱敏（`src/host-check.js` / `src/runlog.js` / `src/engine.js`）**：公开报告副本**先脱敏再算 hash**（顺序反了会得到源文件 hash，验证器判不符）；legacy 事件不计权威；混合证据（host + 模型自报）不再免于降权。
+- **N1 修「越没证据越绿」**：原先 legacy-only 事件集（权威覆盖 0%）仍给「优：首轮通过」并渲绿，而同等覆盖度带 `provenance:'model-claim'` 的新 run 反被降 `unknown`。现在 pass 档要求**权威覆盖 100%**（`QUALITY_PASS_MIN_AUTHORITY_COVERAGE = 1`）：只要还有应验条目未被宿主权威覆盖，就不能借别的条目点亮整条 run；客户端 `conclusionOf` 同口径兜底，不再渲绿。
+- **N2 修租约兼容分支的 ABA**：新 owner 接管后，旧调用方只要不传 `ownerId`（同一进程内 pid@host 相同）就能续租、甚至删掉新 owner 的租约。现在兼容回退**只在 `run.json` 还没有 `execution` 字段的 0.10 旧 run 上**生效；持久世代一旦存在，缺 `ownerId` 一律 409。start 失败收尾也改成带 claim 的同一份 `{ownerId, leaseEpoch}` 释放——否则会留下一个谁也接管不了的 `lock.json`。
+- **N3 修脱敏面的两个漏**：① 非 UTF-8 / 二进制报告的公开副本原先**原样复制**（canary 实存）；现在按 latin1 1:1 映射后只跑**高置信**规则（Bearer/Basic/Token、`sk-`、`--secret 标志位`、`key:value`），命中段替换、未命中字节逐字节保留，因此不含凭据的二进制报告 sha256 与长度不变、验证器照常通过；**不**在不可判读字节上跑 ≥32 长度启发式（PDF/图片/长 hex 头会假阳性，正好破坏「非命中字节不变」这个证据前提）。结果新增 `reportOpaque`。② `--token <值>` 这类**空格 / 引号分隔**的凭据原先任何规则都不认，会原样进 `commandSummary`；现在 engine 的摘要规则改为委托 `host-check.redactSensitiveText`（同一份规则，不再各自维护副本），`process-output.redactText` 复用同一模式常量。
+- **第二轮复核追加修复（N6~N10）**：第一轮修完后再做一次对抗性复核，又查出五处——① `--api-key` / `--password` / `--secret` 的标志位规则要求前导是文本分隔符，二进制记录里前面是 NUL 或长度前缀时**原样泄漏**（N6）；② 值字符类没排除 NUL，`token=<canary>\0tail` 会把 `\0tail` 一起吞掉、公开副本丢字节（N7，这条是靠把断言从「首两字节」改成**逐字节精确相等**才暴露的）；③ `reportOpaque` 只进了嵌套对象，被 `boundExtra` 丢掉、私有登记白名单也没收（N8）；④ `process-output` 只认 Bearer，`Authorization: Basic <base64>` 抹掉 scheme 却留下凭据（N9）；⑤ `execution` 被抹掉但 `lock.json` 仍是 0.11 形状时，无 ownerId 的 pid@host 仍可续租（N10）。五处全部修掉并各自做了红→绿：标志位前导判据改成「前一字符不是 `[A-Za-z0-9_-]`」、值按文本/二进制两套字符类分别排除 NUL/控制字节（二进制再排高位字节，值只吃可打印 ASCII）；`reportOpaque` 同时进事件扁平键与私有登记；`Bearer|Basic|Token` 三方案同口径；兼容回退要求 `lock.json` 也没有 ownerId/epoch。
+- **行为变化（升级前请读）**：
+  1. **没有 `ownerId` 的 `renewLease` / `releaseLease` 调用会 409**——仅当目标 run 已有 `execution`（即 0.11 写过世代）。0.10 旧 run 仍可用 pid@host 兼容释放。仓库内生产调用点已全部合规。
+  2. **质量结论的「优 / 良」在真实 run 上不可达**（见下方 G-E）：引擎对 `acceptance/verdict`、`test/report` 一律写 `provenance:'model-claim'`，只有宿主检查的 `check/form` 会写 `producer/authority:'host'`。所以即使给节点配了宿主检查，三项里仍有两项是自报 ⇒ `claimedPassed ≥ 2` ⇒ `state=unknown`，文案是「证据不足：N 条 claimed 通过未获宿主独立验证」。这不是坏了，是**不再拿模型自报刷绿**；要让 run 能绿需要 0.12 落「authoritative peer」（产物存在性 + sha256 绑定计入权威）。
+- **验证**：`npm test` **EXIT 0**，**27 个 `.test.mjs` / 991 组**（发布门禁 8 组 / 62 条断言 + 26 个功能套件 983 组；12 个套件显式计数，合计 4434 条断言）；`npm run build` **EXIT 0**（`src ↔ lib` 20 个 Host 模块逐字节一致、37 个打包输入、`lib/client.js` 481,892 B < 上限 524,288）；`node scripts/verify-build.mjs` **EXIT 0**。十处修复全部做了红→绿双向验证（把产品代码改回旧行为，新用例必须红；含一条「二进制报告含 64 位 hex 串不得被误伤」的反向锁）。
+- **已知残留（记录在案，不阻塞）**：① `finalizeEpoch` 在持锁期间要扫全量事件，而 `META_LOCK_TTL_MS` 只有 10s——超大 run + 慢盘上可能被别的进程按「陈旧锁」接管；② 没有世代信息的旧 Engine 走到迟到清理时，fence 会退化成 `{}`，`supervision.enabled=false` 可能无 fence 落盘；③ `appendEvents` 完全不传 fence 的写法仍被接受（与直接改 `run.json` 同信任域）；④ 二进制副本按设计不跑调用方自定义 redact，只覆盖内置高置信形态；无 recognized 形态的裸随机秘密仍不可检测（与方案 §5 的承诺一致）；⑤ **不覆盖 UTF-16 编码的凭据**（含 PowerShell 默认输出形态）——有 BOM 时走二进制路径、无 BOM 时因 NUL 合法走文本路径，两种都不识别 `--api-key` 这类标志位，第三轮复核实测副本与源逐字节相同；⑥ 标志位前紧邻 `[A-Za-z0-9_-]`（如 `deadbeef--api-key <值>`）有意不命中，避免把词中片段误当参数（`=` 形态仍由 key:value 规则兜住）；⑦ 认证方案的值只吃 token-safe ASCII，`Authorization: Basic 中文密码` 这类非 ASCII 凭据三处都不认（既有缺口，非本轮引入）。
+- **12 条缺口评估里未纳入本版的**：G-A（无人值守节点卡审批无超时）/ G-C（打回上限触发即判 run failed，无「再给一轮」）/ G-D（结论派生数字不自洽判死整条 run）/ G-E（质量结论不可达）— 均记在 [0.11 功能缺口评估](../plan/0.11-功能缺口评估.md)，列为 0.12 候选。

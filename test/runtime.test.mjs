@@ -18,7 +18,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +32,7 @@ const runtimeModule = await import('../src/runtime.js')
 const engineModule = await import('../src/engine.js')
 const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
+const { auditWorkflow } = await import('../src/audit.js')
 const superviseModule = await import('../src/supervise.js')
 
 const { createRuntime: createRuntimeRaw, nodeSelfCheckPrompt } = runtimeModule
@@ -1719,6 +1721,835 @@ try {
     A.equal(summary.restored, 0)
     A.equal(runtime.nodeSupervision.list().length, 0, '没有 Engine 实例的 run 不登记任何节点闹钟')
     runtime.dispose()
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runtime · 准入控制（0.11 · R2/S1）')
+
+  // 独立的 runsRoot / flowsRoot：不污染上面既有组的共享目录。
+  const admissionRunsRoot = join(home, 'runs-admission')
+  const admissionFlowsRoot = join(home, 'flows-admission')
+  const admissionModule = await import('../src/admission.js')
+  const { createAdmission: createAdmissionController, AdmissionError } = admissionModule
+
+  async function makeAdmissionRun(flowId) {
+    return store.createRun(admissionRunsRoot, {
+      flowId,
+      flowName: `流程 ${flowId}`,
+      nodeTotal: 1,
+    })
+  }
+
+  await check('准入集成：第 N+1 个 run 排队（不建 Engine、不写 run/start），槽位释放后自动启动', async () => {
+    const flowId = 'flow-adm-queue'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runB = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 4,
+      queueTimeoutMs: 3000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id, { workspace: repoRoot })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      // 不同工作区 key：A 占住唯一槽位，B 才能进入队列（工作区满会立即 429）。
+      const startB = runtime.start(runB.id, { workspace: join(repoRoot, 'src') })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => admission.admissionOf(runB.id)?.state === 'queued', 'runB 没有进入排队')
+
+      // 排队期间：没有 Engine、run.json 仍是 pending、没有 run/start 事件。
+      A.equal(runtime.get(runB.id), null, '排队期间不创建 Engine')
+      A.equal(runtime.admissionOf(runB.id).state, 'queued')
+      A.equal(runtime.admissionOf(runB.id).position, 1)
+      A.equal(runtime.admissionSnapshot().active, 1)
+      A.deepEqual(runtime.admissionSnapshot().queued.map(item => item.runId), [runB.id])
+      A.equal(runtime.admissionLimits.global, 1)
+      A.equal(runtime.admissionLimits.perWorkspace, 1)
+      const metaB = await store.readRunMeta(admissionRunsRoot, runB.id)
+      A.equal(metaB.status, 'pending')
+      A.equal(metaB.started, false)
+      A.deepEqual(
+        (await store.readAllEvents(admissionRunsRoot, runB.id)).events,
+        [],
+        '排队期间不写 run/start',
+      )
+
+      // runA 收尾释放槽位 → runB 自动获得槽位并启动。
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      await until(() => entered.includes(runB.id), 'runB 没有在槽位释放后启动')
+      A.ok(runtime.get(runB.id) instanceof Engine, '拿到槽位后才创建 Engine')
+      await until(() => runtime.admissionOf(runB.id)?.state === 'running', 'runB 没有进入 running')
+      A.equal((await runtime.wait(runB.id)).status, 'done')
+      A.equal(runtime.admissionSnapshot().active, 0, '两个 run 收尾后槽位全部归还')
+      A.deepEqual(runtime.admissionSnapshot().queued, [])
+      A.equal((await startA).ok, true, 'runA start 成功')
+      A.equal((await startB).ok, true, 'runB 拿到槽位后 start 成功')
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  await check('准入集成：stop 排队中的 run → 409（reason=stop）并取消排队，不碰运行中的 run', async () => {
+    const flowId = 'flow-adm-stop'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runB = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 4,
+      queueTimeoutMs: 5000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id, { workspace: repoRoot })
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      // 等到 A 真正进入执行（markRunning 早于 run/start 落盘，不能用它当同步点）。
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      const startB = runtime.start(runB.id, { workspace: join(repoRoot, 'src') })
+        .then(() => null, error => error)
+      await until(() => admission.admissionOf(runB.id)?.state === 'queued', 'runB 没有进入排队')
+
+      let stopError = null
+      try {
+        await runtime.stop(runB.id)
+      } catch (error) {
+        stopError = error
+      }
+      A.ok(stopError instanceof EngineError)
+      A.equal(stopError.status, 409)
+      A.equal(stopError.reason, 'stop')
+      A.equal(stopError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.match(stopError.message, /排队/)
+      A.equal(runtime.admissionOf(runB.id), null, '排队票已原子摘除')
+      A.deepEqual(runtime.admissionSnapshot().queued, [])
+      const metaB = await store.readRunMeta(admissionRunsRoot, runB.id)
+      A.equal(metaB.status, 'pending', '排队中的 run 没被写 run/start')
+      A.equal(metaB.started, false)
+
+      // 排队中的 start promise 被取消（不是悬挂的 Promise）。
+      const cancelled = await startB
+      A.ok(cancelled instanceof AdmissionError)
+      A.equal(cancelled.status, 429)
+      A.equal(cancelled.reason, 'cancelled')
+      A.equal(cancelled.cancelReason, 'stop')
+
+      // 运行中的 run 不受影响：照常收尾。
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      A.equal((await startA).ok, true)
+      A.equal(runtime.admissionSnapshot().active, 0)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  await check('准入集成：重复 runId 409 / 限流 429 的 payload 字段完整', async () => {
+    const flowId = 'flow-adm-payload'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runC = await makeAdmissionRun(flowId)
+    const runD = await makeAdmissionRun(flowId)
+    const gate = deferred()
+    const wsC = join(home, 'ws-adm-c')
+    const wsD = join(home, 'ws-adm-d')
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 1,
+      queueTimeoutMs: 5000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      const startA = runtime.start(runA.id)
+        .then(meta => ({ ok: true, meta }), error => ({ ok: false, error }))
+      await until(() => entered.includes(runA.id), 'runA 没有进入执行')
+      // 不同工作区 key：A 占住唯一全局槽位，C 进队；D 撞队满。
+      const startC = runtime.start(runC.id, { workspace: wsC }).then(() => null, error => error)
+      await until(() => admission.admissionOf(runC.id)?.state === 'queued', 'runC 没有进入排队')
+
+      // 409 payload：排队中的 runId 不能被再次 start（RUN_ALREADY_ACTIVE）。
+      let duplicateQueued = null
+      try {
+        await runtime.start(runC.id, { workspace: wsC })
+      } catch (error) {
+        duplicateQueued = error
+      }
+      A.ok(duplicateQueued instanceof AdmissionError)
+      A.equal(duplicateQueued.status, 409)
+      A.equal(duplicateQueued.code, 'RUN_ALREADY_ACTIVE')
+      A.equal(duplicateQueued.runId, runC.id)
+      A.equal(duplicateQueued.state, 'queued')
+      A.match(duplicateQueued.message, /已在运行/)
+
+      // 409 payload：运行中的 runId 重复 start 仍走 runtime 既有 409（文案含「已在运行」）。
+      let duplicateRunning = null
+      try {
+        await runtime.start(runA.id)
+      } catch (error) {
+        duplicateRunning = error
+      }
+      A.ok(duplicateRunning instanceof EngineError)
+      A.equal(duplicateRunning.status, 409)
+      A.match(duplicateRunning.message, /已在运行/)
+      A.ok(duplicateRunning.message.includes(runA.id))
+
+      // 429 payload：队满（D 用第三个工作区 key，避开 workspace-full 先命中）。
+      let limitError = null
+      try {
+        await runtime.start(runD.id, { workspace: wsD })
+      } catch (error) {
+        limitError = error
+      }
+      A.ok(limitError instanceof AdmissionError)
+      A.equal(limitError.status, 429)
+      A.equal(limitError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.equal(limitError.scope, 'global')
+      A.equal(limitError.reason, 'queue-full')
+      A.equal(limitError.active, 1)
+      A.equal(limitError.max, 1)
+      A.deepEqual(limitError.limits, { global: 1, perWorkspace: 1 })
+      A.equal(limitError.retryAfterMs, 30_000)
+      A.match(limitError.message, /排队已满/)
+      A.equal(runtime.get(runD.id), null, '被限流的 run 不创建 Engine')
+      const metaD = await store.readRunMeta(admissionRunsRoot, runD.id)
+      A.equal(metaD.started, false)
+
+      // 清理排队中的 C，再让 A 正常收尾。
+      let stopC = null
+      try {
+        await runtime.stop(runC.id)
+      } catch (error) {
+        stopC = error
+      }
+      A.ok(stopC instanceof EngineError)
+      A.equal(stopC.status, 409)
+      A.equal(stopC.reason, 'stop')
+      A.equal((await startC).reason, 'cancelled')
+      gate.resolve()
+      A.equal((await runtime.wait(runA.id)).status, 'done')
+      A.equal((await startA).ok, true)
+      A.equal(runtime.admissionSnapshot().active, 0)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  // 0.11 R2：restart 在准入处被 429 时保留可重试 childRunId，释放后复用同一 child
+  await check('准入集成：restart 429 保留可重试 childRunId，释放后复用同一 child 启动', async () => {
+    const flowId = 'flow-adm-restart'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const gate = deferred()
+    const entered = []
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 0,
+      queueTimeoutMs: 1000,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node, runId }) => {
+        entered.push(runId)
+        await gate.promise
+        return passResult(node.id)
+      },
+    })
+    try {
+      // 占满唯一槽位。
+      const occupant = await makeAdmissionRun(flowId)
+      const startOccupant = runtime.start(occupant.id, { workspace: repoRoot })
+      await until(() => entered.includes(occupant.id), '占位 run 没有进入执行')
+
+      // 造一个已失败的旧 run（带 workspace 绑定 + 一条失败节点事件，便于推导续跑起点）。
+      const oldRun = await makeAdmissionRun(flowId)
+      await store.appendEvents(admissionRunsRoot, oldRun.id, [
+        {
+          v: 1, kind: 'run/start', traceId: 'tr-old', data: { flowId, flowName: flowId, nodeTotal: 1 },
+        },
+        {
+          v: 1, kind: 'node/start', nodeId: 'n_a', attemptId: 1, traceId: 'tr-old-node',
+          data: { title: '实现', mode: 'single', skills: [] },
+        },
+        {
+          v: 1, kind: 'node/end', nodeId: 'n_a', attemptId: 1, traceId: 'tr-old-node',
+          data: { status: 'failed', durationMs: 1 },
+        },
+      ])
+      await store.writeRunMeta(admissionRunsRoot, oldRun.id, {
+        status: 'failed',
+        started: true,
+        endedAt: new Date().toISOString(),
+        workspace: { path: repoRoot },
+      })
+
+      let firstError = null
+      try {
+        await runtime.restart(oldRun.id)
+      } catch (error) {
+        firstError = error
+      }
+      A.ok(firstError, '槽位被占时 restart 必须失败')
+      A.equal(firstError.status, 429)
+      A.ok(typeof firstError.childRunId === 'string' && firstError.childRunId !== '',
+        '429 必须带可重试的 childRunId')
+      const childId = firstError.childRunId
+      const childMeta = await store.readRunMeta(admissionRunsRoot, childId)
+      A.equal(childMeta.status, 'pending')
+      A.equal(childMeta.started, false, '未写出 run/start 的 child 仍是未开始')
+      A.ok(childMeta.restart && childMeta.restart.startRejected, '必须记 startRejected 供重试')
+
+      // 释放槽位后重试：同一个 child 被复用并真正启动。
+      gate.resolve()
+      A.equal((await startOccupant).status, 'running')
+      A.equal((await runtime.wait(occupant.id)).status, 'done')
+      const retried = await runtime.restart(oldRun.id)
+      A.equal(retried.run.id, childId, '重试必须复用同一个 childRunId')
+      A.equal((await runtime.wait(childId)).status, 'done')
+    } finally {
+      gate.resolve()
+      await runtime.dispose().catch(() => {})
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  console.log('runtime · 0.11 F2/F5/F7：世代收口 / 配额键与同步占位 / dispose 还槽')
+  // -------------------------------------------------------------------------
+
+  await check('F5：每工作区配额键走 realpath——软链别名不能绕过额度', async () => {
+    const flowId = 'flow-f5-symlink'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const runA = await makeAdmissionRun(flowId)
+    const runB = await makeAdmissionRun(flowId)
+    const runC = await makeAdmissionRun(flowId)
+    const realWs = join(home, 'ws-f5-real')
+    const aliasWs = join(home, 'ws-f5-alias')
+    const otherWs = join(home, 'ws-f5-other')
+    mkdirSync(realWs, { recursive: true })
+    mkdirSync(otherWs, { recursive: true })
+    rmSync(aliasWs, { recursive: true, force: true })
+    symlinkSync(realWs, aliasWs)
+    const gate = deferred()
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 4, perWorkspace: 1 },
+      queueMax: 0,
+    })
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      activate: async ({ node }) => {
+        await gate.promise
+        return passResult(node.id)
+      },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    try {
+      const startA = runtime.start(runA.id, { workspace: realWs })
+        .then(() => true, () => false)
+      await until(() => runtime.get(runA.id) !== null, 'runA 没有拿到槽位')
+
+      // 同一目录的软链别名：旧实现用 raw 路径当键，两个 key 各占 1 份 → B 能启动。
+      const aliasError = await runtime.start(runB.id, { workspace: aliasWs }).then(() => null, error => error)
+      A.ok(aliasError, '软链别名必须被每工作区额度挡住（不能被当成另一个工作区）')
+      A.equal(aliasError.status, 429)
+      A.equal(aliasError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.equal(aliasError.scope, 'workspace')
+      A.equal(aliasError.reason, 'workspace-full')
+      A.equal(aliasError.workspaceKey, realpathSync(realWs), '配额键必须是 realpath')
+      A.equal(runtime.get(runB.id), null)
+
+      // 真的另一个工作区不受影响：额度按 realpath 分桶，不是被一刀切。
+      const otherOk = await runtime.start(runC.id, { workspace: otherWs }).then(() => true, () => false)
+      A.equal(otherOk, true, '另一个真实工作区仍应能启动')
+
+      gate.resolve()
+      A.equal(await startA, true, 'runA 正常收尾')
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  await check('F5：读快照前同步占 runId——并发重复 start 只能有一个成功', async () => {
+    const flowId = 'flow-f5-duplicate-start'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const run = await makeAdmissionRun(flowId)
+    const snapshot = await flowStore.readFlow(admissionFlowsRoot, flowId)
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 2, perWorkspace: 2 },
+      queueMax: 2,
+    })
+    let engines = 0
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      createEngine: options => {
+        const index = ++engines
+        return {
+          index,
+          async start(id) {
+            // 模拟「第一个 start 在第二个读快照的 await 结束前就收尾」：
+            // 旧实现没有同步占位，第二个会在此之后重新拿到空槽位再建一个 Engine。
+            options.onSettled(id)
+            return { id, status: 'done' }
+          },
+          dispose() {},
+          async wait() { return { status: 'done' } },
+          async sweepStaleRuns() { return [] },
+        }
+      },
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    try {
+      // 第一个带 flowSnapshot（同步路径），第二个必须自己去读快照（走 await）。
+      const results = await Promise.allSettled([
+        runtime.start(run.id, { workspace: repoRoot, flowSnapshot: snapshot }),
+        runtime.start(run.id, { workspace: repoRoot }),
+      ])
+      A.equal(results[0].status, 'fulfilled', '第一个 start 成功')
+      A.equal(results[1].status, 'rejected', '并发重复 start 必须在预检处 409（不许同时通过预检）')
+      A.equal(results[1].reason.status, 409)
+      A.match(results[1].reason.message, /已在运行/)
+      A.equal(engines, 1, '同一个 runId 只能创建一个 Engine（旧实现会建两个）')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('F5：流程快照读失败必须显式报错，不能退化为出队时最新流程', async () => {
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 2, perWorkspace: 2 },
+      queueMax: 2,
+    })
+    let engines = 0
+    const createEngine = () => {
+      engines += 1
+      return {
+        async start(id) { return { id, status: 'running' } },
+        dispose() {},
+        async wait() { return { status: 'done' } },
+        async sweepStaleRuns() { return [] },
+      }
+    }
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      createEngine,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    })
+    try {
+      // ① run.json 指向一个不存在的流程：readFlow 返回 null（旧实现静默跳过快照）。
+      const missing = await makeAdmissionRun('flow-f5-snapshot-missing')
+      const missingError = await runtime.start(missing.id, { workspace: join(home, 'ws-f5-snap-missing') })
+        .then(() => null, error => error)
+      A.ok(missingError instanceof EngineError, '流程不存在必须显式报错')
+      A.equal(missingError.status, 404)
+      A.match(missingError.message, /快照/)
+      A.equal(runtime.get(missing.id), null)
+      A.equal(engines, 0, '快照失败不创建 Engine')
+
+      // ② 流程文件坏 JSON：readFlow 抛错（旧实现 catch 后继续）。
+      const corruptId = 'flow-f5-snapshot-corrupt'
+      await flowStore.saveFlow(admissionFlowsRoot, corruptId, oneStageFlow(corruptId))
+      writeFileSync(join(admissionFlowsRoot, `${corruptId}.json`), '{not-json')
+      const corrupt = await makeAdmissionRun(corruptId)
+      const corruptError = await runtime.start(corrupt.id, { workspace: join(home, 'ws-f5-snap-corrupt') })
+        .then(() => null, error => error)
+      A.ok(corruptError instanceof EngineError, '流程文件损坏必须显式报错')
+      A.equal(corruptError.status, 500)
+      A.match(corruptError.message, /快照/)
+      A.equal(runtime.get(corrupt.id), null)
+      A.equal(engines, 0, '读快照抛错也不创建 Engine')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('F2：旧实例失权后 settle 不能关掉接管者的 supervision', async () => {
+    const flowId = 'flow-f2-takeover'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const run = await makeAdmissionRun(flowId)
+    const logs = []
+    const sent = []
+    const fakeAgent = { status: 'idle', followup(payload) { sent.push(payload) } }
+    let oldLease = null
+    let settleOld = null
+    const runtime = createRuntimeRaw({
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      ctx: { get: () => ({ get: () => fakeAgent }) },
+      logger: (level, message) => logs.push(`${level}:${message}`),
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      createEngine: options => {
+        const engine = {
+          active: null,
+          async start(id) {
+            // 真正的 Engine 在 start 里 claimLease（epoch+1 / 随机 ownerId）。
+            const lease = await store.claimLease(admissionRunsRoot, id)
+            oldLease = lease
+            engine.active = { lease }
+            return { id, status: 'running' }
+          },
+          wait() { return new Promise(() => {}) },
+          dispose() {},
+        }
+        settleOld = () => options.onSettled(run.id)
+        return engine
+      },
+    })
+    try {
+      await runtime.start(run.id, { workspace: repoRoot })
+      A.ok(oldLease && Number.isInteger(oldLease.epoch), '旧实例必须 claim 到带 epoch 的租约（世代来源）')
+      A.ok(typeof oldLease.ownerId === 'string' && oldLease.ownerId !== '')
+
+      // 接管者：旧 owner 释放后新 claim → 新 epoch + 新 ownerId。
+      await store.releaseLease(admissionRunsRoot, run.id, { ownerId: oldLease.ownerId })
+      const newLease = await store.claimLease(admissionRunsRoot, run.id)
+      A.ok(newLease.epoch > oldLease.epoch, `新 owner 必须拿到更高 epoch（${oldLease.epoch} → ${newLease.epoch}）`)
+      A.ok(newLease.ownerId !== oldLease.ownerId, '新 owner 必须是不同 ownerId')
+
+      // 新 owner 开启 supervision（接管者刚启用的监督不能被旧实例关掉）。
+      const enabled = await runtime.enableSupervision(run.id, {
+        enabled: true,
+        wakerSessionId: 'sess-f2-new-owner',
+      })
+      A.equal(enabled.enabled, true)
+      A.equal(runtime.supervision.status(run.id).enabled, true)
+
+      // 旧实例失权收口后仍通知 runtime（Engine 的行为不变），这里模拟这次迟到 settle。
+      settleOld()
+      // 直接断言：清理至少不能同步摘掉接管者的调度登记（旧实现这里立刻变 false）。
+      A.equal(runtime.supervision.status(run.id).enabled, true,
+        '旧实例 settle 不能同步摘掉接管者的调度登记')
+      await until(
+        () => logs.some(line => line.includes('跳过 supervision')),
+        '旧实例没有按世代跳过 supervision 清理',
+        1500,
+      )
+      A.equal(runtime.supervision.status(run.id).enabled, true, '接管者的调度登记必须保留')
+      const meta = await store.readRunMeta(admissionRunsRoot, run.id)
+      A.equal(meta.supervision.enabled, true, '接管者的 enabled=true 不能被旧实例覆盖成 false')
+      A.equal(meta.supervision.wakerSessionId, 'sess-f2-new-owner', '接管者的唤醒目标必须保留')
+
+      // 唤醒保留：把 run.startedAt 挪到过去，下一轮 tick 必须真的唤醒接管者会话。
+      await store.writeRunMeta(admissionRunsRoot, run.id, { startedAt: '2020-01-01T00:00:00.000Z' })
+      const tick = await runtime.supervision.tick()
+      A.equal(tick.woken, 1, '接管者的 supervision 仍能唤醒')
+      A.equal(sent.length, 1, '接管者会话应收到一条 followup')
+      A.match(sent[0].content[0].text, new RegExp(run.id))
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('F7：dispose 超时不能提前还槽——未终止 Engine 仍占全局限额', async () => {
+    const flowId = 'flow-f7-dispose-slot'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 0,
+    })
+    const never = () => ({
+      async start(id) { return { id, status: 'running' } },
+      // 不响应 abort：永远不会 settle。外部进程也还没退出。
+      abort() { return new Promise(() => {}) },
+      wait() { return new Promise(() => {}) },
+      dispose() {},
+      async sweepStaleRuns() { return [] },
+    })
+    const baseOptions = {
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      createEngine: never,
+      disposeTimeoutMs: 30,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    }
+    const runtime = createRuntimeRaw(baseOptions)
+    const runA = await makeAdmissionRun(flowId)
+    await runtime.start(runA.id, { workspace: join(home, 'ws-f7-a') })
+    A.equal(admission.snapshot().active, 1)
+
+    const disposed = await runtime.dispose()
+    A.equal(disposed.timedOut, true, '不响应 abort 的 Engine 必须触发有界超时')
+    A.equal(admission.snapshot().active, 1, 'Engine 尚未终止，槽位不能被提前归还')
+
+    // 另一个 runtime 用同一份共享账本：第 N+1 个 run 必须仍被限住。
+    const runtime2 = createRuntimeRaw(baseOptions)
+    try {
+      const runB = await makeAdmissionRun(flowId)
+      const limitError = await runtime2.start(runB.id, { workspace: join(home, 'ws-f7-b') })
+        .then(() => null, error => error)
+      A.ok(limitError, '第 N+1 个 run 不能被启动（旧实现 dispose 超时后提前还槽会放行）')
+      A.equal(limitError.status, 429)
+      A.equal(limitError.code, 'RUN_CONCURRENCY_LIMIT')
+      A.equal(limitError.reason, 'queue-full')
+      A.equal(runtime2.get(runB.id), null)
+      A.equal(admission.snapshot().active, 1)
+    } finally {
+      await runtime2.dispose()
+    }
+  })
+
+  await check('F7：Engine 真实终止后才归还槽位（迟到终止释放）', async () => {
+    const flowId = 'flow-f7-late-release'
+    await flowStore.saveFlow(admissionFlowsRoot, flowId, oneStageFlow(flowId))
+    const admission = createAdmissionController({
+      controller: {},
+      limits: { global: 1, perWorkspace: 1 },
+      queueMax: 0,
+    })
+    const gate = deferred()
+    const slow = () => ({
+      async start(id) { return { id, status: 'running' } },
+      // abort 有响应，但比 disposeTimeoutMs 慢：dispose 先超时，Engine 稍后才真正退出。
+      abort() { return gate.promise },
+      wait() { return gate.promise },
+      dispose() {},
+      async sweepStaleRuns() { return [] },
+    })
+    const options = {
+      runsRoot: admissionRunsRoot,
+      flowsRoot: admissionFlowsRoot,
+      cwd: repoRoot,
+      worktree: 'off',
+      admission,
+      createEngine: slow,
+      disposeTimeoutMs: 20,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+    }
+    const runtime = createRuntimeRaw(options)
+    const runA = await makeAdmissionRun(flowId)
+    await runtime.start(runA.id, { workspace: join(home, 'ws-f7-late-a') })
+    const disposed = await runtime.dispose()
+    A.equal(disposed.timedOut, true)
+    A.equal(admission.snapshot().active, 1, 'dispose 超时后仍占着槽位')
+
+    gate.resolve()
+    await until(() => admission.snapshot().active === 0, 'Engine 真实终止后槽位没有归还', 1500)
+
+    // 槽位归还后，第 N+1 个 run 可以启动。
+    const runtime2 = createRuntimeRaw({ ...options, createEngine: () => ({
+      async start(id) { return { id, status: 'done' } },
+      async wait() { return { status: 'done' } },
+      dispose() {},
+      async sweepStaleRuns() { return [] },
+    }) })
+    try {
+      const runB = await makeAdmissionRun(flowId)
+      const started = await runtime2.start(runB.id, { workspace: join(home, 'ws-f7-late-b') })
+        .then(() => true, () => false)
+      A.equal(started, true, '真实终止后新 run 必须能拿到槽位')
+    } finally {
+      await runtime2.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // R5（返工）：runtime 自审走共享验证器；报告副本被替换 / JSON 写坏时结论必须降级
+  // -------------------------------------------------------------------------
+  await check('R5：runtime 自审重读持久化报告副本——副本被替换 / JSON 写坏后 quality 必须降 unknown', async () => {
+    process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
+    try {
+      const flowId = 'flow-rt-host-audit'
+      const hostWorkspace = join(home, 'host-audit-ws')
+      mkdirSync(hostWorkspace, { recursive: true })
+      const flow = flowOf(flowId, [
+        startNode(),
+        stage('n_audit', '实现', 300, {
+          check: {
+            command: "mkdir -p reports && printf '{\"suite\":\"unit\",\"passed\":1}' > reports/unit.json",
+            reportPath: 'reports/unit.json',
+          },
+        }),
+        endNode(),
+      ], [next('e1', 'n_start', 'n_audit'), next('e2', 'n_audit', 'n_end')])
+      await saveFlow(flow)
+      const run = await makeRun(flowId)
+      const audits = new Map()
+      const runtime = createRuntime({
+        cwd: hostWorkspace,
+        auditWorkflow: (input) => {
+          const result = auditWorkflow(input)
+          audits.set(input.run && input.run.id, result)
+          return result
+        },
+        activate: async ({ node }) => ({
+          structured: { verdict: 'pass', summary: `${node.id} 通过`, artifacts: [], findings: [] },
+          sessionId: `sess-${node.id}`,
+          dispose: async () => {},
+        }),
+      })
+      // 触发 runtime 自己的 evaluateRun（supervision 到点审计路径），不绕过它直接调 audit。
+      const auditOnce = async () => {
+        runtime.supervision.register(run.id, { wakerSessionId: 'sess-rt-audit' })
+        await runtime.supervision.tick()
+        return audits.get(run.id)
+      }
+      try {
+        await runtime.start(run.id, { workspace: hostWorkspace })
+        await runtime.wait(run.id)
+
+        // 补齐其它证据，让未篡改时的整体 quality 确实是 pass（基线绿，否则本用例没有意义）。
+        // 这些证据也走持久事件流，runtime 自审读到的是同一份磁盘事实。
+        // 0.11 N1：pass 档要求权威覆盖 100%，因此 acceptance / tests 也按「宿主已核对」
+        // 的输入形状写：绑定同一份真实宿主执行凭证（verificationId），让共享验证器核对。
+        const seeded = (await store.readAllEvents(runsRoot, run.id)).events
+        const hostCheck = seeded.find(event => event.kind === 'check/form'
+          && event.extra && event.extra.producer === 'host')
+        A.ok(hostCheck && typeof hostCheck.extra.verificationId === 'string',
+          '宿主检查必须带 verificationId（本用例把它作为证据来源凭证）')
+        const hostExtra = {
+          producer: 'host',
+          authority: 'host',
+          verificationId: hostCheck.extra.verificationId,
+        }
+        const peerBody = '{"peer":true}'
+        const peerRel = 'evidence/peer.json'
+        mkdirSync(dirname(join(runsRoot, run.id, peerRel)), { recursive: true })
+        writeFileSync(join(runsRoot, run.id, peerRel), peerBody)
+        const peerSha = createHash('sha256').update(peerBody).digest('hex')
+        await store.appendEvents(runsRoot, run.id, [
+          {
+            v: 1, kind: 'artifact/write', nodeId: 'n_peer', attemptId: 1, traceId: 'tr-peer',
+            data: { path: peerRel, bytes: Buffer.byteLength(peerBody), kind: 'json', sha256: peerSha },
+          },
+          {
+            v: 1, kind: 'acceptance/verdict', nodeId: hostCheck.nodeId, attemptId: hostCheck.attemptId,
+            traceId: 'tr-acc', extra: hostExtra,
+            data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+          },
+          {
+            v: 1, kind: 'test/report', nodeId: hostCheck.nodeId, attemptId: hostCheck.attemptId,
+            traceId: 'tr-test', extra: hostExtra,
+            data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: peerRel },
+          },
+          {
+            v: 1, kind: 'review/finding', nodeId: 'n_review', attemptId: 1, traceId: 'tr-review',
+            data: { id: 'f1', severity: 'P1', title: '问题', status: 'verified' },
+          },
+          {
+            v: 1, kind: 'review/verdict', nodeId: 'n_review', attemptId: 1, traceId: 'tr-review',
+            data: { verdict: 'approve', findingCount: 1 },
+          },
+        ])
+
+        const baseline = await auditOnce()
+        A.equal(baseline && baseline.quality && baseline.quality.state, 'pass',
+          `未篡改时自审基线必须是 pass：${JSON.stringify(baseline && baseline.quality)}`)
+
+        // N1 反向锁：把证据改回旧 run 的 legacy 形状（无 extra 来源）追加一条，
+        // 权威覆盖不再是 100% → 必须降 unknown，不得继续 pass（否则夹具改回旧形状会静默回退）。
+        await store.appendEvents(runsRoot, run.id, [{
+          v: 1, kind: 'acceptance/verdict', nodeId: 'n_legacy_acc', attemptId: 1, traceId: 'tr-legacy-acc',
+          data: { itemId: 'acc-legacy', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+        }])
+        const legacyShape = await auditOnce()
+        A.equal(legacyShape && legacyShape.quality && legacyShape.quality.state, 'unknown',
+          `legacy 形状（无 extra）不得再 pass：${JSON.stringify(legacyShape && legacyShape.quality)}`)
+        A.match(legacyShape.quality.label, /legacy|来源未知/)
+
+        const events = (await store.readAllEvents(runsRoot, run.id)).events
+        const copy = events.find(event => event.kind === 'artifact/write'
+          && event.extra && event.extra.verificationKind === 'report-copy')
+        A.ok(copy, '宿主检查必须把报告副本落成 artifact/write（verificationKind=report-copy）')
+        const copyAbs = join(runsRoot, run.id, copy.data.path)
+        const original = readFileSync(copyAbs, 'utf8')
+
+        // ① 文件仍在、长度相同，只把 JSON 的 passed 1 换成 0：sha256 必须失配。
+        const replaced = original.replace('"passed":1', '"passed":0')
+        A.equal(replaced.length, original.length, '替换样本必须与原报告等长')
+        writeFileSync(copyAbs, replaced)
+        const tampered = await auditOnce()
+        A.equal(tampered && tampered.quality && tampered.quality.state, 'unknown',
+          `报告副本同长度替换后 quality 必须降 unknown：${JSON.stringify(tampered && tampered.quality)}`)
+        A.ok(tampered.quality.state !== 'pass', '报告副本被替换不能变绿')
+
+        // ② 报告 JSON 直接写坏：同样不能授信。
+        writeFileSync(copyAbs, '{not-json')
+        const broken = await auditOnce()
+        A.equal(broken && broken.quality && broken.quality.state, 'unknown',
+          `报告 JSON 写坏后 quality 必须降 unknown：${JSON.stringify(broken && broken.quality)}`)
+        A.ok(broken.quality.state !== 'pass', '报告 JSON 写坏不能变绿')
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
+    }
   })
 
 } finally {

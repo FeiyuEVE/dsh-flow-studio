@@ -29,7 +29,7 @@ bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩
 npm test
 ```
 
-**22 个自检文件**：`test/build.test.mjs`（发布门禁）+ 21 个功能套件共 **772 组**（其中 9 个套件显式计数，合计 3869 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
+**23 个自检文件**：`test/build.test.mjs`（发布门禁）+ 22 个功能套件共 **794 组**（其中 10 个套件显式计数，合计 3998 条断言；发布门禁另有 56 条）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
 
 ### 测试套件地图
 
@@ -39,10 +39,11 @@ npm test
 - `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。
 - `test/host.test.mjs` —— 存储增删改查 + 真实 HTTP 语义（伪造最小 ctx，把 `apply()` 注册的路由取出来直接喂 req/res）；v0.7 组覆盖保存宽松（空流程 / executor 非法也 200 + validation）、`?workspaceId=` 过滤、`POST /runs/<id>/supervision` 的 400/404/enable/disable 与已收尾 run 拒绝开启；v0.8 组覆盖 `GET /runs` 列表行 / 详情 / summary 三处 `nodeStatus`（缺省 `{}`）。
 - `test/runlog.test.mjs` —— 事件校验与归一化（白名单、有界 `extra`、四桶用量、run/节点级字段规则、`callId` 必填）；v0.8 组覆盖 `node/status` 通过校验、可选字段收敛、成员 / 阻塞项有界与坏输入拒绝。
-- `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器；D 组覆盖 `nodeStatus` 的 256 KiB 字节预算与裁剪顺序、`nodeStatusTruncated`、损坏 `run.json` 备份且拒绝覆盖、并发 append 的 seq 单调、`startOptions` 白名单。
+- `test/runstore.test.mjs` —— run 目录读写、分页过滤、删除、路径穿越拒绝、超限拒绝、坏 run 隔离、计数器（含「刚写的 `*.tmp-*` 不能被启动清理删掉」与「临时文件被外部删掉时原子写重试」两条回归）；D 组覆盖 `nodeStatus` 的 256 KiB 字节预算与裁剪顺序、`nodeStatusTruncated`、损坏 `run.json` 备份且拒绝覆盖、并发 append 的 seq 单调、`startOptions` 白名单。
 - `test/metrics.test.mjs` —— 指标口径：token 四桶与重放替换、skill 唯一覆盖率、findings 三态、打回失效、质量判定表（含不明证据不给绿灯）。
 - `test/flowmachine.test.mjs` —— 状态机编译纯函数：版本哈希只含影响转移的字段、状态/边集与 flow 一致、pass 链 / 显式与兜底打回 / 打回上限 / 未知 verdict / 超时与取消、持久化往返、事件流重放等价、非法 flow 矩阵（12 组 / 251 断言）。
 - `test/engine-machine.test.mjs` —— 引擎 × 状态机：同一组行为用例分别跑 actor 驱动与 `FLOW_STUDIO_FLOW_MACHINE=0` 旧循环；机器专属覆盖 `run.json.machine` 落盘、`machine/transition`、快照恢复 / 版本不匹配重放 / 恢复失败收口（25 组 / 136 断言）。
+- `test/engine-restart.test.mjs` —— v0.9.2 前置：`flow_node_reject` 按「阶段节点 + 有出向 reject 边」门控（无边不注册）、工具打回真的走 `reject/trigger` 与目标 attempt+1、失败后 `restart` 建新 run 并继承旧会话 / 跳过已完成节点 / 按当前结构重挂工具 / 旧 run 终态不改写 / 错误可诊断。
 - `test/engine.test.mjs` —— 执行引擎：结构不合格拒跑（含 reject 边两端必须是阶段节点的启动校验）、单写者租约与同 runId 二次 start 409、打回按 attempt 重跑、预算中断、写盘失败终态、证据对账、上游产物正文进提示词、证据引用透传与回退、节点失败重试与失败隔离、桩模式双闸门；v0.7 组另覆盖工作区 / worktree、sessionMode 降级可见、外部 executor（custom 成功 / 非 0 退出 / stop / 缺命令 / 重试）；v0.8 组覆盖节点闹钟：建会话即登记、attempt 结束注销先于 run 收尾、打回重跑重新登记、`node/status` 三处可见、`done+verdict` 提前完成（`completedBy:'self-check'`）、非法 verdict 不提前完成、未注入调度器时退回 v0.7、外部 executor 不登记。
 - `test/worktree.test.mjs` —— 工作区与 worktree：`workspaceIdFor` 稳定、真 git 仓库根 / 子目录 / 非 git 的区分、`git` 不可用与「不是仓库」分开、`auto/on/off` 决策、分支冲突 `-2`、真 worktree 落盘、脏 worktree 删除校验与路径越界拒绝。
 - `test/executor.test.mjs` —— 外部 executor：三档归一化与 `EXECUTOR_INVALID`、codex argv 顺序、strict schema 转换、JSONL 的 final / usage / 过程 / 未知事件、custom 占位符与 shell 转义、超时 / abort / 非 0 退出 / spawn 失败、跨 chunk 半行、真 node 子进程端到端；**不依赖真 codex、不联网**。

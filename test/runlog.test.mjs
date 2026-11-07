@@ -707,8 +707,24 @@ function fullEvidence(over = {}) {
   return events
 }
 
-check('quality：五项证据齐全 + 进度 100% + P0=0（返工 0）→ pass「优：首轮通过」', () => {
-  const quality = computeQuality(fullEvidence())
+/**
+ * 0.11 N1：三项证据都带宿主权威来源的「正常 run」夹具（coverage=1，可 pass）。
+ * 与 fullEvidence()（全 legacy、无来源）刻意区分：legacy 不得再借旧口径点亮 pass。
+ */
+function hostEvidence(over = {}) {
+  const events = fullEvidence(over)
+  for (const kind of ['acceptance/verdict', 'test/report', 'check/form']) {
+    const event = events.find(item => item.kind === kind)
+    if (event) event.extra = { ...(event.extra || {}), producer: 'host', authority: 'host' }
+  }
+  return events
+}
+
+/** 宿主权威验证器：只在这些纯函数夹具里表示「已由 Host 登记核对」。 */
+const HOST_VERIFY = { verifyHostExecution: () => true }
+
+check('quality：五项证据齐全 + 宿主权威覆盖 100% + 进度 100% + P0=0（返工 0）→ pass「优：首轮通过」', () => {
+  const quality = computeQuality(hostEvidence(), HOST_VERIFY)
   assert.equal(quality.state, 'pass')
   assert.equal(quality.label, '优：首轮通过')
   assert.deepEqual(quality.missing, [])
@@ -723,7 +739,7 @@ check('quality：五项证据齐全 + 进度 100% + P0=0（返工 0）→ pass�
 })
 
 check('quality：返工 1 轮 + P1=0 + 采纳率≥0.6 → pass「良：返工 1 轮后达标」', () => {
-  const quality = computeQuality(fullEvidence({ rework: 1, p1Status: 'verified' }))
+  const quality = computeQuality(hostEvidence({ rework: 1, p1Status: 'verified' }), HOST_VERIFY)
   assert.equal(quality.state, 'pass')
   assert.equal(quality.label, '良：返工 1 轮后达标')
   assert.equal(quality.reworkRounds, 1)
@@ -1387,16 +1403,20 @@ function ownershipEvents(metric, mode) {
     if (metric === 'acceptance') {
       events.push(ev('acceptance/verdict', {
         nodeId: claimNode, attemptId: 1,
+        // 0.11 N1：结论层 pass 需要全量权威覆盖；证据归属（self/peer/host）仍由产物决定。
+        extra: { producer: 'host', authority: 'host' },
         data: { itemId: id, status: 'pass', decidedBy: 'auto', evidenceRef: ref },
       }))
     } else if (metric === 'tests') {
       events.push(ev('test/report', {
         nodeId: claimNode, attemptId: 1,
+        extra: { producer: 'host', authority: 'host' },
         data: { suite: id, executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: ref },
       }))
     } else {
       events.push(ev('check/form', {
         nodeId: claimNode, attemptId: 1,
+        extra: { producer: 'host', authority: 'host' },
         data: {
           ruleSetId: id, ruleSetVersion: '1', executor: 'eslint',
           state: 'pass', passedChecks: 1, totalChecks: 1, reportRef: ref,
@@ -1419,7 +1439,7 @@ function ownershipFixture(spec = {}, p1Status = 'verified') {
 }
 
 check('v1.3 结论层：三项指标全部自证 → warn（label 提到自证）', () => {
-  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'self', checks: 'self' }))
+  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'self', checks: 'self' }), HOST_VERIFY)
   assert.equal(quality.state, 'warn')
   assert.match(quality.label, /验收条目、测试、规范 全部为自证证据（3 条），缺独立复核/)
   assert.equal(quality.selfCertified, 3)
@@ -1429,7 +1449,7 @@ check('v1.3 结论层：三项指标全部自证 → warn（label 提到自证�
 })
 
 check('v1.3 结论层：acceptance 全自证 + tests 混 peer → 因 acceptance selfOnly 仍 warn', () => {
-  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'mixed', checks: 'mixed' }))
+  const quality = computeQuality(ownershipFixture({ acceptance: 'self', tests: 'mixed', checks: 'mixed' }), HOST_VERIFY)
   assert.equal(quality.evidence.acceptance.selfOnly, true)
   assert.equal(quality.evidence.tests.selfOnly, false)
   assert.equal(quality.evidence.checks.selfOnly, false)
@@ -1438,7 +1458,7 @@ check('v1.3 结论层：acceptance 全自证 + tests 混 peer → 因 acceptance
 })
 
 check('v1.3 结论层：三项指标各含至少一条 peer/host → 可以 pass，selfCertified 计数正确', () => {
-  const quality = computeQuality(ownershipFixture({ acceptance: 'mixed', tests: 'mixed', checks: 'host' }))
+  const quality = computeQuality(ownershipFixture({ acceptance: 'mixed', tests: 'mixed', checks: 'host' }), HOST_VERIFY)
   assert.equal(quality.evidence.acceptance.selfOnly, false)
   assert.equal(quality.evidence.tests.selfOnly, false)
   assert.equal(quality.evidence.checks.selfOnly, false)
@@ -1451,7 +1471,7 @@ check('v1.3 结论层：全自证 warn 与 P1 遗留 warn 汇合，两个原因�
   const quality = computeQuality(ownershipFixture(
     { acceptance: 'self', tests: 'self', checks: 'self' },
     'open',
-  ))
+  ), HOST_VERIFY)
   assert.equal(quality.state, 'warn')
   assert.match(quality.label, /遗留 1 个 P1 未解决/)
   assert.match(quality.label, /全部为自证证据（3 条），缺独立复核/)
@@ -1718,14 +1738,14 @@ check('R4 来源判定：只认 extra.source / producer，不猜 host，也不�
 })
 
 check('R4 外部假 pass/fail 注入：quality / 权威计数 / 冲突 / 进度 / 状态 / headline 全部不变', () => {
-  const internal = fullEvidence()
+  const internal = hostEvidence()
   const internalArtifact = ev('artifact/write', {
     nodeId: 'n_peer',
     attemptId: 1,
     data: { path: 'evidence/shared.json', bytes: 3, kind: 'json', sha256: 'a'.repeat(64) },
   })
   const events = [...internal, internalArtifact]
-  const before = summarize(events, { now: NOW })
+  const before = summarize(events, { now: NOW, ...HOST_VERIFY })
   assert.equal(before.quality.state, 'pass', '基线必须是 pass，否则这组测试没有意义')
 
   const external = [
@@ -1770,7 +1790,7 @@ check('R4 外部假 pass/fail 注入：quality / 权威计数 / 冲突 / 进度 
     }),
   ]
   const all = [...events, ...external]
-  const after = summarize(all, { now: NOW })
+  const after = summarize(all, { now: NOW, ...HOST_VERIFY })
 
   assert.equal(after.quality.state, before.quality.state)
   assert.equal(after.quality.state, 'pass')
@@ -1787,8 +1807,8 @@ check('R4 外部假 pass/fail 注入：quality / 权威计数 / 冲突 / 进度 
     assert.equal(after.quality.evidence[key].passed, before.quality.evidence[key].passed, key)
   }
   assert.equal(after.quality.evidence.tests.passedSuites, 1)
-  assert.equal(after.quality.evidence.tests.authoritativePassed, 0, 'legacy 无来源不计权威')
-  assert.equal(after.quality.evidence.tests.legacyPassed, 1)
+  assert.equal(after.quality.evidence.tests.authoritativePassed, 1, '宿主来源计入权威')
+  assert.equal(after.quality.evidence.tests.legacyPassed, 0)
   assert.equal(after.quality.evidence.tests.claimedPassed, 0)
   assert.deepEqual(after.acceptance, before.acceptance)
 
@@ -1816,12 +1836,12 @@ check('R4 外部假 pass/fail 注入：quality / 权威计数 / 冲突 / 进度 
   assert.ok(markdown.includes('外部未验证'))
   assert.ok(markdown.includes('## 外部观察（外部未验证）'))
   assert.ok(markdown.includes(`- 共 ${external.length} 条外部观察`))
-  assert.ok(markdown.includes('| 测试 | 0 | 0 | 1 | 0.0% |'), '权威表只数 host 权威通过（legacy / external 都不算）')
+  assert.ok(markdown.includes('| 测试 | 0 | 1 | 1 | 100.0% |'), '权威表只数 host 权威通过（legacy / external 都不算）')
   assert.ok(markdown.includes('通过 1 / 1'), '验收主值只算内部 acceptance')
 })
 
 check('R4 内部 host 产物 + test pass：外部同 path 失败不改结论', () => {
-  const base = fullEvidence()
+  const base = hostEvidence()
   const hostArtifact = ev('artifact/write', {
     nodeId: 'n_host',
     attemptId: 1,
@@ -1839,14 +1859,14 @@ check('R4 内部 host 产物 + test pass：外部同 path 失败不改结论', (
     }),
   ]
   const all = [...base, hostArtifact, ...external]
-  const quality = computeQuality(all)
+  const quality = computeQuality(all, HOST_VERIFY)
   assert.equal(quality.state, 'pass')
   assert.equal(quality.evidence.tests.state, 'pass')
   assert.equal(quality.evidence.tests.passedSuites, 1)
-  assert.equal(quality.evidence.tests.authoritativePassed, 0, 'host 产物不能把 legacy 声明抬成权威')
-  assert.equal(quality.evidence.tests.legacyPassed, 1)
+  assert.equal(quality.evidence.tests.authoritativePassed, 1, '宿主来源的 test pass 计入权威')
+  assert.equal(quality.evidence.tests.legacyPassed, 0)
   assert.equal(quality.evidence.tests.claimedPassed, 0)
-  assert.equal(quality.evidence.tests.coverageRatio, 0)
+  assert.equal(quality.evidence.tests.coverageRatio, 1)
   assert.deepEqual(computeConflicts(all).tests, [])
   assert.equal(collectArtifactIndex(all).get('artifacts/test.md'), 'a'.repeat(64))
   const owners = collectArtifactOwners(all)
@@ -2015,7 +2035,7 @@ check('R6 三项指标都只被 claimed 覆盖（有真产物但均为模型自�
 })
 
 check('R4 外部观察有界：externalCount 全量、externalObservations 最多 50 条；外部 acceptance 不进通过率', () => {
-  const events = fullEvidence()
+  const events = hostEvidence()
   const externals = []
   for (let index = 0; index < 60; index += 1) {
     externals.push(externalEv('acceptance/verdict', {
@@ -2024,13 +2044,13 @@ check('R4 外部观察有界：externalCount 全量、externalObservations 最�
       data: { itemId: `ext-${index}`, status: 'pass', decidedBy: 'auto', evidenceRef: 'x' },
     }))
   }
-  const summary = summarize([...events, ...externals], { now: NOW })
+  const summary = summarize([...events, ...externals], { now: NOW, ...HOST_VERIFY })
   assert.equal(summary.externalCount, 60)
   assert.equal(summary.externalObservations.length, EXTERNAL_OBSERVATION_LIMIT)
   assert.equal(summary.quality.state, 'pass')
   assert.deepEqual(summary.acceptance, { passed: 1, total: 1, rate: 1 }, '外部 acceptance 不进通过率')
-  assert.equal(summary.quality.evidence.acceptance.authoritativePassed, 0)
-  assert.equal(summary.quality.evidence.acceptance.legacyPassed, 1)
+  assert.equal(summary.quality.evidence.acceptance.authoritativePassed, 1)
+  assert.equal(summary.quality.evidence.acceptance.legacyPassed, 0)
   // data.external:true 只是来客自报，不改变来源（也不因此授信 / 降级）。
   const forged = ev('acceptance/verdict', {
     nodeId: 'n_ext2',
@@ -2038,9 +2058,80 @@ check('R4 外部观察有界：externalCount 全量、externalObservations 最�
     data: { itemId: 'ext-forged', status: 'pass', decidedBy: 'auto', evidenceRef: 'x', external: true },
   })
   assert.equal(isExternalEvent(forged), false)
-  const forgedSummary = summarize([...events, forged], { now: NOW })
+  const forgedSummary = summarize([...events, forged], { now: NOW, ...HOST_VERIFY })
   assert.equal(forgedSummary.externalCount, 0)
   assert.equal(forgedSummary.acceptance.total, 2, 'data.external 不改变它作为内部 legacy 事件的归属')
+})
+
+console.log('runlog.js · 0.11 N1：pass 档必须与权威覆盖一致')
+
+/**
+ * 两条「无来源通过」+ 一条宿主检查 → 权威覆盖 1/3。
+ * 同一份内容把两条无来源换成带 provenance 的 model-claim：覆盖仍是 1/3，
+ * 但 claimedPassed>0（旧实现给前者 pass、后者 unknown，方向倒挂）。
+ */
+function thirdCoverageProbe(claimed) {
+  const events = fullEvidence()
+  events.find(item => item.kind === 'check/form').extra = { producer: 'host', authority: 'host' }
+  if (!claimed) return events
+  const acceptance = events.find(item => item.kind === 'acceptance/verdict')
+  acceptance.extra = { provenance: 'model-claim' }
+  acceptance.data.evidenceRef = 'ev/n1-claimed.json'
+  const tests = events.find(item => item.kind === 'test/report')
+  tests.extra = { provenance: 'model-claim' }
+  tests.data.reportRef = 'ev/n1-claimed.json'
+  events.push(ev('artifact/write', {
+    nodeId: 'n_peer', attemptId: 1,
+    data: { path: 'ev/n1-claimed.json', bytes: 1, kind: 'json', sha256: 'a'.repeat(64) },
+  }))
+  return events
+}
+
+check('N1 legacy-only 探针（全无来源）：不得 pass、不得显示「优」，权威覆盖如实为 0', () => {
+  const quality = computeQuality(fullEvidence())
+  assert.equal(quality.authorityCoverage, 0)
+  assert.equal(quality.authoritativePassed, 0)
+  assert.ok(quality.legacyPassed >= 3, `legacyPassed=${quality.legacyPassed}`)
+  assert.equal(quality.state, 'unknown', `legacy-only 不得通过：state=${quality.state} label=${quality.label}`)
+  assert.equal(quality.label.includes('优'), false, quality.label)
+  assert.match(quality.label, /证据不足/)
+})
+
+check('N1 方向一致：同样 1/3 权威覆盖，legacy run 不得比 model-claim run 更绿', () => {
+  const legacyQuality = computeQuality(thirdCoverageProbe(false), HOST_VERIFY)
+  const claimedQuality = computeQuality(thirdCoverageProbe(true), { ...HOST_VERIFY, verifyEvidence: () => true })
+
+  assert.equal(legacyQuality.authorityCoverage, 1 / 3)
+  assert.equal(claimedQuality.authorityCoverage, 1 / 3)
+  assert.equal(legacyQuality.claimedPassed, 0, 'legacy 不计 claimed')
+  assert.equal(legacyQuality.legacyPassed, 2)
+  assert.equal(claimedQuality.claimedPassed, 2)
+  assert.notEqual(legacyQuality.state, 'pass', 'legacy 1/3 覆盖不得 pass')
+  assert.equal(claimedQuality.state, 'unknown')
+  assert.equal(legacyQuality.state, claimedQuality.state,
+    `方向倒挂：legacy=${legacyQuality.state} / model-claim=${claimedQuality.state}`)
+})
+
+check('N1 反向：真宿主证据齐全（coverage=1、无 claimed/legacy 残留）仍 pass「优」', () => {
+  const quality = computeQuality(hostEvidence(), HOST_VERIFY)
+  assert.equal(quality.authorityCoverage, 1)
+  assert.equal(quality.authoritativeTotal, 3)
+  assert.equal(quality.authoritativePassed, 3)
+  assert.equal(quality.claimedPassed, 0)
+  assert.equal(quality.legacyPassed, 0)
+  assert.equal(quality.state, 'pass', quality.label)
+  assert.equal(quality.label, '优：首轮通过')
+})
+
+check('N1 阈值边界：权威覆盖 2/3 仍不足以 pass（只有 100% 才给优/良）', () => {
+  const events = hostEvidence()
+  // 3 个应验条目里只把 1 个降级为无来源：覆盖 2/3，claimed 仍为 0。
+  events.find(item => item.kind === 'test/report').extra = undefined
+  const quality = computeQuality(events, HOST_VERIFY)
+  assert.equal(quality.authorityCoverage, 2 / 3)
+  assert.equal(quality.claimedPassed, 0)
+  assert.equal(quality.legacyPassed, 1)
+  assert.equal(quality.state, 'unknown', quality.label)
 })
 
 console.log(`\n${checks} 组通过`)

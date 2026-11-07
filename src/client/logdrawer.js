@@ -1567,6 +1567,8 @@ export function authorityTextOf(summary) {
  * 任意文本里猜绿色：
  *   pass → 绿（优 / 良），warn → 黄（可），fail → 红（需返工），
  *   unknown → 黄（未检测 / 证据不足，不是绿灯）。
+ * 0.11 N1：`quality.state=pass` 但同一份 summary 的权威覆盖不足 100% 时降为黄
+ * （旧 Host 仍可能给出 legacy-only 的 pass，客户端不能再把它画成绿色）。
  * 没拿到 `quality` 证据（summary 未回 / 请求失败）时一律中性，绝不显示绿色「完成」。
  * 运行层失败 / 中止优先于质量结论。
  */
@@ -1596,6 +1598,22 @@ export function conclusionOf(run, summary) {
   }
 
   if (qualityState === 'pass') {
+    // 0.11 N1 客户端兜底：旧 Host 可能仍把 legacy-only（权威覆盖 0）算成 pass。
+    // 同一份 summary 已给出权威覆盖时，覆盖不足 100% 就不许渲染绿色；没有 coverage
+    // 字段的老摘要保持兼容（无法判定，不误伤真通过）。
+    const coverage = optionalNum(quality.authorityCoverage)
+    const authoritative = optionalNum(quality.authoritativePassed)
+    const total = optionalNum(quality.authoritativeTotal)
+    const shortfall = (coverage !== null && coverage < 1)
+      || (coverage === null && authoritative !== null && total !== null && authoritative < total)
+    if (shortfall) {
+      const percent = coverage === null ? '' : Math.round(Math.min(1, coverage) * 100) + '%'
+      const fraction = authoritative !== null && total !== null ? `（${authoritative}/${total}）` : ''
+      return {
+        text: `证据不足：权威覆盖${percent ? ' ' + percent : ''}${fraction}，不能判定为通过`,
+        tone: 'warn',
+      }
+    }
     return { text: qualityLabel || '良：必要质量证据齐全且通过', tone: 'success' }
   }
   if (qualityState === 'warn') {

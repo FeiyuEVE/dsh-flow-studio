@@ -2465,6 +2465,18 @@ try {
 
         // 补齐其它证据，让未篡改时的整体 quality 确实是 pass（基线绿，否则本用例没有意义）。
         // 这些证据也走持久事件流，runtime 自审读到的是同一份磁盘事实。
+        // 0.11 N1：pass 档要求权威覆盖 100%，因此 acceptance / tests 也按「宿主已核对」
+        // 的输入形状写：绑定同一份真实宿主执行凭证（verificationId），让共享验证器核对。
+        const seeded = (await store.readAllEvents(runsRoot, run.id)).events
+        const hostCheck = seeded.find(event => event.kind === 'check/form'
+          && event.extra && event.extra.producer === 'host')
+        A.ok(hostCheck && typeof hostCheck.extra.verificationId === 'string',
+          '宿主检查必须带 verificationId（本用例把它作为证据来源凭证）')
+        const hostExtra = {
+          producer: 'host',
+          authority: 'host',
+          verificationId: hostCheck.extra.verificationId,
+        }
         const peerBody = '{"peer":true}'
         const peerRel = 'evidence/peer.json'
         mkdirSync(dirname(join(runsRoot, run.id, peerRel)), { recursive: true })
@@ -2476,11 +2488,13 @@ try {
             data: { path: peerRel, bytes: Buffer.byteLength(peerBody), kind: 'json', sha256: peerSha },
           },
           {
-            v: 1, kind: 'acceptance/verdict', nodeId: 'n_acc', attemptId: 1, traceId: 'tr-acc',
+            v: 1, kind: 'acceptance/verdict', nodeId: hostCheck.nodeId, attemptId: hostCheck.attemptId,
+            traceId: 'tr-acc', extra: hostExtra,
             data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
           },
           {
-            v: 1, kind: 'test/report', nodeId: 'n_test', attemptId: 1, traceId: 'tr-test',
+            v: 1, kind: 'test/report', nodeId: hostCheck.nodeId, attemptId: hostCheck.attemptId,
+            traceId: 'tr-test', extra: hostExtra,
             data: { suite: 'unit', executed: 1, passed: 1, failed: 0, skipped: 0, reportRef: peerRel },
           },
           {
@@ -2496,6 +2510,17 @@ try {
         const baseline = await auditOnce()
         A.equal(baseline && baseline.quality && baseline.quality.state, 'pass',
           `未篡改时自审基线必须是 pass：${JSON.stringify(baseline && baseline.quality)}`)
+
+        // N1 反向锁：把证据改回旧 run 的 legacy 形状（无 extra 来源）追加一条，
+        // 权威覆盖不再是 100% → 必须降 unknown，不得继续 pass（否则夹具改回旧形状会静默回退）。
+        await store.appendEvents(runsRoot, run.id, [{
+          v: 1, kind: 'acceptance/verdict', nodeId: 'n_legacy_acc', attemptId: 1, traceId: 'tr-legacy-acc',
+          data: { itemId: 'acc-legacy', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+        }])
+        const legacyShape = await auditOnce()
+        A.equal(legacyShape && legacyShape.quality && legacyShape.quality.state, 'unknown',
+          `legacy 形状（无 extra）不得再 pass：${JSON.stringify(legacyShape && legacyShape.quality)}`)
+        A.match(legacyShape.quality.label, /legacy|来源未知/)
 
         const events = (await store.readAllEvents(runsRoot, run.id)).events
         const copy = events.find(event => event.kind === 'artifact/write'

@@ -2362,6 +2362,17 @@ function staleFailReason(label, ids) {
 }
 
 /**
+ * 0.11 N1：pass 档要求的最小权威覆盖率。
+ *
+ * 取 1（100%）而不是某个比例：`authorityCoverage` 的分子只来自 host 权威通过，
+ * 分母是应验条目数。pass（优/良）是「必要证据齐全且通过」的肯定结论，只要还有
+ * 应验条目只有 legacy（来源未知）/ claimed（未经宿主验证）覆盖，就不能借别的
+ * 条目的权威点亮整条 run —— 任何比例阈值都会让「大部分够权威」继续绿，正是 N1
+ * 要修的方向倒挂。coverage 为 null（分母为 0、不可判定）同样视为不足。
+ */
+export const QUALITY_PASS_MIN_AUTHORITY_COVERAGE = 1
+
+/**
  * 质量结论（§8.4，按 04 §3.9.3 落地）。
  *
  * 必要证据五项：acceptance / tests / checks / review / p0p1。
@@ -2371,6 +2382,8 @@ function staleFailReason(label, ids) {
  *   - 有未解决 P1/P2 → warn，label 写「遗留 N 个 P1 / M 个 P2 未解决」；
  *   - 任一证据指标「全部为自证」（selfOnly）→ warn，label 写「<指标名> 全部为自证证据（N 条），缺独立复核」；
  *     每个有通过条目的指标都至少有 1 条 peer/host 级证据时才允许 pass（自证总数见 quality.selfCertified）；
+ *   - 权威覆盖 < 100%（`QUALITY_PASS_MIN_AUTHORITY_COVERAGE`，例如 legacy-only 或 claimed 残留）
+ *     → unknown，不给「优 / 良」；
  *   - 返工 0 → pass「优：首轮通过」；返工 1 + P1=P2=0 + acceptedRate≥0.6 → pass「良」；
  *   - 其余返工情形 → warn「可：返工 n 轮」。
  * - progress.ratio < 1 → 至少 warn。
@@ -2563,6 +2576,20 @@ export function computeQuality(events = [], options = {}) {
   if (unverifiedMix && state !== 'fail' && state !== 'unknown') {
     state = 'unknown'
     label = `证据不足：${claimedPassed} 条 claimed 通过未获宿主独立验证，不能判定为通过`
+  }
+  // 0.11 N1：pass 档必须与权威覆盖一致。旧实现在这里只看五项齐全，于是 legacy-only
+  // （coverage=0、claimed=0）仍给「优：首轮通过」，而同样 1/3 覆盖的 model-claim run 被
+  // 上面的 unverifiedMix 降成 unknown —— 越没证据越绿。现在覆盖不足 100% 一律 unknown；
+  // 带 claimed 的情形已由上面两个分支给出更具体的文案，这里只兜住 legacy / 分母留空。
+  if (state === 'pass'
+    && (authorityCoverage === null || authorityCoverage < QUALITY_PASS_MIN_AUTHORITY_COVERAGE)) {
+    state = 'unknown'
+    const coverageText = authorityCoverage === null
+      ? 'unknown'
+      : `${(authorityCoverage * 100).toFixed(0)}%`
+    label = legacyPassed > 0 && claimedPassed === 0
+      ? `证据不足：${legacyPassed} 条通过来自历史无来源事件（legacy），权威覆盖 ${authoritativePassed}/${authoritativeTotal}（${coverageText}），不能判定为通过`
+      : `证据不足：权威覆盖 ${authoritativePassed}/${authoritativeTotal}（${coverageText}），未达 100%，不能判定为通过`
   }
 
   const engine = options.engine === 'stub' ? 'stub' : 'real'

@@ -17,7 +17,7 @@ npm install
 ```sh
 npm run build                    # src/client/entry.js → lib/client.js（esbuild 单文件，≈440 KB，含 React Flow 12）+ 复制 Host 模块
 node scripts/verify-build.mjs    # 只读校验：lib/ 的 .js 集合与清单一致、src↔lib 逐字节相同、main 入口存在
-node test/render.test.mjs        # SSR + 构建产物加载，99 组
+node test/render.test.mjs        # SSR + 构建产物加载，102 组
 bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩引擎）
 ```
 
@@ -29,7 +29,7 @@ bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩
 npm test
 ```
 
-**28 个自检文件**：`test/build.test.mjs`（发布门禁 8 组 / 62 条断言）+ 27 个功能套件共 **990 组**（其中 12 个套件显式计数，合计 4437 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
+**28 个自检文件**：`test/build.test.mjs`（发布门禁 8 组 / 62 条断言）+ 27 个功能套件共 **992 组**（其中 12 个套件显式计数，合计 4593 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
 
 ### 测试套件地图
 

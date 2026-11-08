@@ -228,3 +228,24 @@
   3. 带会话的节点工具条从 3 键变 4 键（外框 76×28 → 100×28），仍从右边贴齐向左展开。
 - **验证**：`npm test` **EXIT 0**，**28 个 `.test.mjs` / 1000 组**（发布门禁 8 组 / 62 条断言 + 27 个功能套件 992 组；13 个文件显式计数，合计 4655 条断言）；`npm run build` **EXIT 0**（`src ↔ lib` 20 个 Host 模块逐字节一致、37 个打包输入、`lib/client.js` 483,652 B < 上限 524,288）；`node scripts/verify-build.mjs` **EXIT 0**。`geometry.test.mjs` 7 组、`render.test.mjs` 102 组随新常量同步，未删除任何断言、未把数值断言放宽成 `assert.ok()`；新增会话入口的 4 类断言（有会话出现 / 无会话不出现 / 回调收到正确的节点与会话 id / `aria-label`）与页面级 `openSessionForNode` 的过期 id、缺回调降级。
 - **已知残留**：① 本次无浏览器 E2E 重测热区——点击、键盘 Enter/空格、拖拽与双击隔离由 SSR 结构断言 + 纯函数断言证明，真实 `getBoundingClientRect` 未复测（三键仍是 22×22、`top:-14px` 未动，0.10 的浏览器结论继续参考）；② `canvas.js` 聚焦缩放的下限仍为 60%，高于新 near 边界 56%，所以聚焦一定落在完整档——但它不属于 LOD 阈值，日后若再调字号需一并复核；③ 测试计数的口径修正：`executor.test.mjs` 用「32 组通过，218 条断言」的全角逗号格式，此前只匹配全角括号的汇总一直漏计这 218 条，本版起合计口径含它（旧版本记录的 4437 条是漏计后的数字，不是断言的增减）。
+
+## 0.12.0 — 流程产物从「一份大 JSON」改成「一个目录」
+
+这一版改的是**流程怎么被写出来**，不是流程怎么跑。
+
+- **问题（实测）**：让模型一次手写整份流程 JSON 会崩在三处。元流程自身 9 节点 / 13 边的 flow JSON 是 **44,947 字节**（UTF-8，其中 `task` 正文合计 13,633 字）；设计 run 的节点⑦还要求模型在已经写了 **63,568 字节**规格正文之后，再把这一万多字**重新编码**进 JSON。结果是 ① 评审节点审的是 Markdown、交付的是 JSON，**同一模型无机械校验的重述必然漂移**（id 改名、措辞压缩、成员合并）；② 结构错误只在**导入时**才暴露，跑了两小时、`maxRounds` 用尽，最后一个逗号就让交付物作废；③ 4.5 万字节单文件不可 diff，改一个节点要整份重抄。那次 run 实际产出的 `flow-*.json` 是 **0 个**。
+- **改成目录化**（`src/flowdir.js`）：一份流程 = 一个目录，
+  ```
+  <dir>/flow.json                 # name / description / nodeOrder / edges
+  <dir>/nodes/<id>.json           # 单节点结构，不含 task
+  <dir>/nodes/<id>.task.md        # task 正文（Markdown，唯一的大块）
+  ```
+  最大的单文件从 4.5 万字节降到**每节点一两千字节**；`task` 不再是转义后的 JSON 字符串，而是能直接读、直接 diff 的 Markdown。9 节点流程反编译后是 **19 个文件 / 43,542 字节**——总体积几乎不变，变的是**形状**：可逐文件审、可只改一个节点、可只重跑一段。
+- **校验仍然只有一份**：`compileFlowFiles` 组装后直接走 `normalizeFlow` + `validateFlow`，**不另写结构校验**；错误带 `{code, path, field?, message}`，按**文件与字段**定位（`missing-manifest` / `bad-manifest-json` / `bad-node-json` / `missing-node` / `unlisted-node` / `missing-task` / `task-duplicated` / `unknown-file` / `unsafe-path` / `invalid-flow`）。这是刻意不做「自定义 Markdown 方言」的原因：本仓零运行时依赖，自写解析器等于造第二套判据，与 `validateFlow` 必然漂移。
+- **宿主入口**：`POST /flows/import-dir`（目录 → **新流程**，不覆盖已有）、`POST /flows/<id>/export-dir`（流程 → 目录，拒绝覆盖别人的目录 → 409 `FLOW_DIR_REFUSED`）；模型工具 `flow_compile`（编译，`save:true` 才入库）与 `flow_decompile`（导出）。`dir` 一律要求绝对路径；显式 `name` 覆盖目录里的流程名。目录是**编辑期真源**，`flows/<id>.json` 仍是**运行期真源**，两者不做自动双向同步——靠「导入生成新 id」避免两个真相源互相覆盖。
+- **往返是硬门禁**：`compile(decompile(flow))` 与原 flow 深等；`defaultFlow()` 与含 team / skills / check / 中文 task 的流程都要过；另加逐字节确定性与「不 mutate 输入」。实测 5 个真实存量流程（含 9 节点元流程）往返**全部深等**。
+- **元流程已同步**：⑦「落地规格」从「手写 `flow-<slug>.json`」改成「写目录 + 调 `flow_compile` 把 `errors[]` 清零再交付」，④ 的硬约束块同步改为目录布局（`flow-8c7a00530c` version 2→3，`validateFlow` 无 error / 无 warning，旧文案零残留）。
+- **验证**：`npm test` **EXIT 0**，**29 个 `.test.mjs` / 1,035 组**（发布门禁 8 组 / 64 条断言 + 28 个功能套件 1,027 组；12 个套件显式计数，合计 4,647 条断言；另有 `executor.test.mjs` 用全角逗号格式的 218 条）；`npm run build` **EXIT 0**（`src ↔ lib` 21 个 Host 模块逐字节一致、37 个打包输入、`lib/client.js` 483,652 B < 上限 524,288）；`node scripts/verify-build.mjs` **EXIT 0**。新增 `test/flowdir.test.mjs` 20 组（1,223 行实现 / 561 行测试）。
+- **兼容性（升级前请读）**：存量 `flows/*.json` **一个字节不动**；`POST/PUT /flows` 的语义与校验**完全不变**，目录化是**附加路径**。要迁一份老流程：`flow_decompile` 导出目录 → 改 → `flow_compile` 存成**新流程**（会产生新 id，旧流程不受影响）。
+- **已知边界**：① `compileFlowFiles` 返回「文件里写了什么就是什么」的组装结果、不补默认值，入库前必须再走 `normalizeFlow`（宿主两处入口已做）——直接拿它当已归一对象用会缺 `executor` / `maxRounds` 这类默认字段；② 只报「节点 / 连线被 `normalizeFlow` 丢弃」这类结构损失，**不报值级收敛**（标题超长被截断、非法 `edge.kind` 被改成 `next`、`x/y` 非有限数被改 80）；③ 非 JSON 类型经往返会变形（`undefined` 丢失、`NaN`→`null`、`Date`→字符串），往返契约只覆盖 JSON 模型内的流程；④ 覆盖已有产物目录是「旧目录改名 → 新目录 rename → 删备份」两步，两步之间崩溃会在父目录留下 `.flow.old-*` / `.flow.tmp-*`（正常路径会删净）。
+- **没做**（0.12 第二批）：git hook 驱动设计期门禁（`pre-commit` 跑同一个 `flow_compile`）与设计 run 默认开 worktree。**不会**拿 git hook 驱动 run 生命周期——run 事件有自己的 JSONL 契约，hook 是同步阻塞且在无仓库 / `custom` executor 场景直接失效。

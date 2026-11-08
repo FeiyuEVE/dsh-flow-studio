@@ -17,6 +17,8 @@
 | GET | `/flows/<id>` | 读整份（含 `version`）+ 校验结果 |
 | PUT | `/flows/<id>` | 整份覆盖保存；`validation.errors` 只报告不拦保存（仍会 400 的只有：body 不是 JSON 对象 / 缺 body / `version` 不是正整数 / `nodes`、`edges` 键缺失或不是数组（`FLOW_BODY_INCOMPLETE`）/ 主机未开 `FLOW_STUDIO_ALLOW_CUSTOM_EXECUTOR` 却含 `executor:'custom'`（`CUSTOM_EXECUTOR_DISABLED`））；`nodes: []` / `edges: []` 仍然 200（0.7 宽松口径，空图是合法的整份替换）；版本冲突回 409（`FLOW_VERSION_CONFLICT`），成功回传新 `version` |
 | DELETE | `/flows/<id>` | 删除 |
+| POST | `/flows/import-dir` | **目录 → 新建流程**（0.12）：body `{dir, name?}`；编译失败 400 `FLOW_COMPILE_FAILED` + `errors[]`（每项 `{code, path, field?, message}`），缺 `dir` 400 `FLOW_DIR_REQUIRED`，含 `custom` executor 且主机开关关着 400 `CUSTOM_EXECUTOR_DISABLED`；成功 200 并生成**新 id**（不覆盖已有流程） |
+| POST | `/flows/<id>/export-dir` | **流程 → 目录**（0.12）：body `{dir}`；目标是非空且不是目录化产物的目录 → 409 `FLOW_DIR_REFUSED`（防误删），流程不存在 404。布局见 [数据模型 · 流程目录](data-model.md#流程目录012) |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
 | GET | `/health` | schema 版本、skills 服务是否在位、`auth` 档位（`connection` = 只走宿主登录门；`token` = 另配了 `FLOW_STUDIO_TOKEN`）、`engine`（`real` / `stub`）、`version`；未鉴权时不返回目录 |
 | GET/POST | `/runs` | run 列表（`limit`；`workspaceId` 过滤）/ 新建 run（`pending`，不自动开跑）。列表行与详情都带 `workspaceId` / `workspacePath` / `worktreeEnabled` / `workspace` / `worktree` / `sessionMode` / `supervision` / `nodeStatus` |
@@ -58,6 +60,8 @@
 | `flow_send_message` | 往收件箱发消息 | `runId?`、`nodeId?`、`text`、`reply?` |
 | `flow_reply` | 节点内 agent 回复来源 | `text`、`inReplyTo?` |
 | `flow_worktrees` | 列 / 回收 worktree | `action`、`keepRunIds?` |
+| `flow_compile` | 把流程**目录**编译成流程（0.12）；`save:true` 时存成新流程 | `dir`（绝对路径）、`save?`、`name?` |
+| `flow_decompile` | 把流程导出成**目录**（0.12），不覆盖别人的目录 | `flowId`、`dir`（绝对路径） |
 
 用法闭环见 [在会话里开流程](../guide/session-driven.md)。
 

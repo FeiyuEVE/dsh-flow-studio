@@ -73,6 +73,25 @@ $DSH_HOME/flow-studio/flows/
 - 保留策略只作用于活动备份：每次写入后按 `version` 倒序只留最近 3 份；`deleted/` 是归档，不参与轮转（需要清理由运维手动处理）。
 - `DELETE /flows/<id>` 成功删掉文件后，才把该 id 的活动历史挪进 `.history/deleted/`（归档重名时加时间戳后缀）；历史目录不存在时静默跳过，不影响删除的返回语义（文件本来就不存在仍是 `false`）。
 
+## 流程目录（0.12）
+
+一份流程还可以用**目录**保存，用于编辑期阅读、diff 与局部改写。目录是编辑期真源，`flows/<id>.json` 仍是运行期真源；两者**不做自动双向同步**，靠「导入生成新 id」避免两个真源互相覆盖。
+
+```
+<dir>/flow.json                 # { schemaVersion, name, description, nodeOrder: [id...], edges: [...] }
+<dir>/nodes/<id>.json           # 该节点除 task 外的全部字段
+<dir>/nodes/<id>.task.md        # 该节点的 task 正文（Markdown 原文）
+```
+
+- `nodeOrder` 决定节点顺序，不靠文件名排序。
+- `nodes/<id>.json` **不得**含 `task`（正文在 `.task.md`，两个真相源会被判 `task-duplicated`）。
+- 布局之外的任何文件 → `unknown-file`，不静默忽略（避免目录里躺着没人读的内容）。
+- 编译走 `src/flowdir.js`：组装后过 `normalizeFlow` + `validateFlow`，**不另写一套结构校验**；错误带 `{code, path, field?, message}`，按文件与字段定位。
+- 路径安全：`..` / 绝对路径 / 反斜杠 / symlink 越界一律拒；单文件上限 64 KiB。
+- 导出目标必须不存在、为空，或本来就是目录化产物——不覆盖别人的目录。
+
+命令行入口：`POST /flows/import-dir`、`POST /flows/<id>/export-dir`；模型工具 `flow_compile`、`flow_decompile`。决策与推导见 [0.12 流程产物目录化](../plan/0.12-流程产物目录化.md)。
+
 ## Run 落盘布局
 
 ```

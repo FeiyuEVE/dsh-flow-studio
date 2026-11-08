@@ -29,11 +29,12 @@ bash scripts/e2e-docker.sh       # 容器测试台端到端（真装真跑，桩
 npm test
 ```
 
-**28 个自检文件**：`test/build.test.mjs`（发布门禁 8 组 / 62 条断言）+ 27 个功能套件共 **992 组**（其中 12 个套件显式计数，合计 4593 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
+**29 个自检文件**：`test/build.test.mjs`（发布门禁 8 组 / 64 条断言）+ 28 个功能套件共 **1027 组**（其中 12 个套件显式计数，合计 4647 条断言）。测试不联网、不依赖真 codex：外部 executor 用注入的假 `spawn`，容器测试台用桩引擎。
 
 ### 测试套件地图
 
 - `test/model.test.mjs` —— 出厂模板合法（六个阶段默认「主管 + 3 个子 agent」，往返保存不丢成员）、坏数据收敛、四类结构错误能被抓出来、未知字段进 `extras` 不丢。
+- `test/flowdir.test.mjs` —— 流程目录化（0.12）：`compile(decompile(flow))` 往返深等（`defaultFlow` 与含 team / skills / check / 中文 task 的流程各一条）、逐字节确定性、不 mutate 输入、10 类错误码各一条（`missing-manifest` / `bad-*-json` / `missing-node` / `unlisted-node` / `missing-task` / `task-duplicated` / `unknown-file` / `unsafe-path` / `invalid-flow`）、symlink 越界与 64 KiB 上限、`writeFlowDir` 的 0700/0600 与幂等重写、拒绝覆盖别人的非空目录（20 组）。
 - `test/geometry.test.mjs` —— 世界边界唯一来源、fit 公式与 15% 地板、6 槽与第 7 条降级、tie-break 与输入顺序无关。
 - `test/link.test.mjs` —— 键盘连线状态机：候选顺序、循环移动、Enter 确认、方向规则、可读播报。
 - `test/draft.test.mjs` —— 草稿键名、写入读回、无 localStorage 时的内存退化、坏 JSON、内容指纹与恢复判定。

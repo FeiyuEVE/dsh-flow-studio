@@ -490,12 +490,14 @@ try {
     const tools = createFlowTools({
       flowsRoot, runsRoot, engine, ctx: makeCtxWithAgents(agents),
     })
-    // 断言完整工具集合（比数字更强）：v0.7 加 flow_supervise、v0.8.2 加 flow_worktrees。
+    // 断言完整工具集合（比数字更强）：v0.7 加 flow_supervise、v0.8.2 加 flow_worktrees、
+    // 0.12 目录化加 flow_compile / flow_decompile。
     // 用集合比对，以后新增工具不会因为一条计数断言就红。
     A.deepEqual(
       tools.map(tool => tool.name).sort(),
-      ['flow_list', 'flow_reply', 'flow_restart', 'flow_send_message', 'flow_start',
-        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+      ['flow_compile', 'flow_decompile', 'flow_list', 'flow_reply', 'flow_restart',
+        'flow_send_message', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch',
+        'flow_worktrees'],
     )
     const reply = tools.find(tool => tool.name === 'flow_reply')
     const send = tools.find(tool => tool.name === 'flow_send_message')

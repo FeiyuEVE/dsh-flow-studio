@@ -36,14 +36,15 @@ import {
   redactSecrets, validateReplyTargetStrict,
 } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
-import { NODE_KIND } from './model.js'
+import { NODE_KIND, normalizeFlow } from './model.js'
+import { compileFlowFiles, readFlowDir, writeFlowDir } from './flowdir.js'
 import { checkRunId } from './runlog.js'
 import { saveSupervision } from './runtime.js'
 import {
   createRun, listRuns, normalizeReplyTarget, readAllEvents, readNodeSessions, readRunDetail,
   readRunMessages, readRunMeta,
 } from './runstore.js'
-import { checkId, listFlows, readFlow } from './store.js'
+import { checkId, listFlows, newFlowId, readFlow, saveFlow } from './store.js'
 
 /** 默认审查间隔（秒）：给模型挂 `proactive_set` 的 `after_seconds`。 */
 export const DEFAULT_WATCH_SECONDS = 180
@@ -1289,6 +1290,164 @@ export function createFlowTools(deps) {
         } catch (error) {
           if (error instanceof ParamError) return failure(error.message, error.hint)
           return failure(`读取流程列表失败：${messageOf(error)}`, '稍后重试；持续失败说明 Host 侧存储不可读，先告诉主人。', true)
+        }
+      },
+    },
+
+    // ── flow_compile / flow_decompile（0.12：流程产物目录化） ──────────────
+    //
+    // 为什么有这两个工具：让模型一次手写整份大 JSON 会漂移（实测一个 9 节点流程
+    // 44,947 字节，其中 task 正文 13,633 字），且评审对象（Markdown）与交付物（JSON）
+    // 不是同一份。目录化以后模型写的是多个小文件，结构校验仍然只有 flow-studio 这一套。
+    {
+      name: 'flow_compile',
+      description:
+        '把一个**流程目录**编译成流程（0.12 目录化产物）。目录布局固定：`flow.json`'
+        + '（name / description / nodeOrder / edges）+ `nodes/<id>.json`（节点结构，**不含 task**）'
+        + '+ `nodes/<id>.task.md`（该节点的 task 正文）。'
+        + '编译走与保存同一套结构校验（每个节点恰好一条出向 next 边、打回只回上游、'
+        + '无出向打回边的节点必须在 task 里写「不得返回 reject」、节点数 ≤12、team 成员 2–6…），'
+        + '每处错误都带**文件路径与字段路径**，可以逐条改而不是整份重抄。'
+        + '`save=true` 时编译成功会存成**新流程（新 id）**，不会覆盖任何已有流程。',
+      parameters: {
+        type: 'object',
+        properties: {
+          dir: { type: 'string', description: '流程目录的绝对路径（必填）' },
+          save: { type: 'boolean', description: 'true = 编译成功并存成新流程；省略 = 只编译不入库' },
+          name: { type: 'string', description: '入库时的流程名；给了就以它为准，省略则用目录里 flow.json 的 name' },
+        },
+        required: ['dir'],
+      },
+      output: outputFor({
+        ok: { type: 'boolean', description: '是否编译成功' },
+        dir: { type: 'string', description: '被编译的目录' },
+        saved: { type: 'boolean', description: '是否已存成流程' },
+        flowId: nullable({ type: 'string' }, 'saved=true 时新流程的 id；只编译时为 null'),
+        nodeCount: { type: 'integer', description: '节点数' },
+        edgeCount: { type: 'integer', description: '连线数' },
+        files: { type: 'array', description: '目录里识别到的文件（相对路径，升序）', items: { type: 'string' } },
+        errors: {
+          type: 'array',
+          description: '编译失败时的错误列表（成功时不出现）',
+          items: {
+            type: 'object',
+            properties: {
+              code: { type: 'string', description: '错误码，如 missing-node / task-duplicated / invalid-flow' },
+              path: { type: 'string', description: '出问题的文件相对路径' },
+              field: nullable({ type: 'string' }, '字段路径（如 nodes[3].edges[1]）'),
+              message: { type: 'string', description: '中文说明，含怎么改' },
+            },
+            required: ['code', 'path', 'message'],
+            additionalProperties: true,
+          },
+        },
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        const head = `${value.saved ? '已存入' : '编译通过'}` + `：${value.nodeCount} 节点 / ${value.edgeCount} 连线`
+          + (value.saved ? `，新流程 id ${value.flowId}` : '（未入库）')
+        return [{ type: 'text', text: head + `\n目录：${value.dir}` }]
+      }),
+      timeoutMs: TIMEOUT_LIST_MS,
+      isConcurrencySafe: () => false,
+      async execute(args) {
+        try {
+          const a = argsOf(args)
+          const dir = typeof a.dir === 'string' ? a.dir.trim() : ''
+          if (dir === '') {
+            throw new ParamError('参数 dir 必须是流程目录的绝对路径', '先写好目录结构（或用 flow_decompile 导出），再传绝对路径。')
+          }
+          if (!isAbsolute(dir)) {
+            throw new ParamError('dir 必须是绝对路径', '相对路径在不同会话的工作目录下含义不同，请传绝对路径。')
+          }
+          const read = await readFlowDir(dir)
+          const compiled = compileFlowFiles(read.files)
+          const errors = [...read.errors, ...compiled.errors]
+          const files = [...read.files.keys()].sort()
+          if (errors.length > 0) {
+            return failure(
+              `流程目录编译失败：${errors.length} 处问题（第一处：${errors[0].message}）`,
+              '按 errors[] 里的 path + field 逐条改目录里的文件，改完再编译一次；不要整份重抄。',
+              false,
+              { dir, files, errors },
+            )
+          }
+          const flow = compiled.flow
+          const base = { dir, files, nodeCount: flow.nodes.length, edgeCount: flow.edges.length }
+          if (a.save !== true) {
+            return jsonSafe({ ok: true, saved: false, flowId: null, flow, ...base })
+          }
+          // compileFlowFiles 返回「文件里写了什么就是什么」的组装结果，不补默认值；
+          // 入库前必须 normalizeFlow，否则 executor / maxRounds / extras 这些默认字段是空的。
+          const wantedName = typeof a.name === 'string' && a.name.trim() !== '' ? a.name.trim() : ''
+          const normalized = normalizeFlow(flow, wantedName || undefined)
+          // 显式给了 name 就以它为准（normalizeFlow 的第二个参数只是 fallback，目录里有 name 时会被它盖住）。
+          if (wantedName !== '') normalized.name = wantedName
+          // 与画布保存同口径：custom executor 是宿主 RCE 面，主机开关关着时不许入库。
+          const gate = customExecutorBlockers(normalized)
+          if (gate.length > 0) {
+            return failure(gate[0].message, '把该节点的 executor 改回 dsh，或请主人在配置里打开自定义执行器。', false, {
+              dir, files, errors: gate,
+            })
+          }
+          const flowId = newFlowId()
+          const saved = await saveFlow(deps.flowsRoot, flowId, normalized, { name: '新流程' })
+          return jsonSafe({ ok: true, saved: true, flowId: saved.id, flow: saved, ...base })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          return failureOf(error, { action: '编译流程目录' })
+        }
+      },
+    },
+    {
+      name: 'flow_decompile',
+      description:
+        '把一个已有流程导出成**目录**（0.12 目录化产物），用于把它拆成可读、可 diff、可局部修改的小文件。'
+        + '产出 `flow.json` + `nodes/<id>.json` + `nodes/<id>.task.md`。'
+        + '目标目录必须不存在或为空（或本来就是 flow_decompile 的产物）——不覆盖别人的目录，防误删。'
+        + '导出只读原流程，不改动它；改完目录后用 flow_compile 存成**新流程**。',
+      parameters: {
+        type: 'object',
+        properties: {
+          flowId: { type: 'string', description: '要导出的流程 id（必填）' },
+          dir: { type: 'string', description: '目标目录的绝对路径（必填）' },
+        },
+        required: ['flowId', 'dir'],
+      },
+      output: outputFor({
+        ok: { type: 'boolean', description: '是否导出成功' },
+        flowId: { type: 'string', description: '被导出的流程 id' },
+        dir: { type: 'string', description: '导出到的目录' },
+        files: { type: 'array', description: '写出的文件（相对路径，升序）', items: { type: 'string' } },
+        bytes: { type: 'integer', description: '写出的 UTF-8 总字节数' },
+      }, (args, value) => {
+        if (!value || value.ok !== true) return renderJson(value)
+        return [{ type: 'text', text: `已导出流程 ${value.flowId} 到 ${value.dir}：${value.files.length} 个文件 / ${value.bytes} 字节` }]
+      }),
+      timeoutMs: TIMEOUT_LIST_MS,
+      isConcurrencySafe: () => false,
+      async execute(args) {
+        try {
+          const a = argsOf(args)
+          const flowId = typeof a.flowId === 'string' ? a.flowId.trim() : ''
+          const dir = typeof a.dir === 'string' ? a.dir.trim() : ''
+          if (flowId === '') throw new ParamError('参数 flowId 必填', '先用 flow_list 拿到流程 id。')
+          if (dir === '') throw new ParamError('参数 dir 必填', '传目标目录的绝对路径。')
+          if (!isAbsolute(dir)) throw new ParamError('dir 必须是绝对路径', '相对路径含义不明确，请传绝对路径。')
+          if (!checkId(flowId)) throw new ParamError(`流程 id 不合法：${flowId}`, '用 flow_list 里的 id。')
+          const flow = await readFlow(deps.flowsRoot, flowId)
+          if (!flow) return failure(`流程不存在：${flowId}`, '用 flow_list 确认 id；被删掉的流程导不出来。')
+          const written = await writeFlowDir(dir, flow)
+          return jsonSafe({ ok: true, flowId, dir: written.dir, files: written.files, bytes: written.bytes })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          const code = error && typeof error.code === 'string' ? error.code : ''
+          if (code === 'flowdir-not-ours' || code === 'flowdir-not-a-directory') {
+            return failure(
+              error.message,
+              '换一个不存在的目录，或先清空目标目录；这个检查是为了不覆盖别人的文件。',
+            )
+          }
+          return failureOf(error, { action: '导出流程目录' })
         }
       },
     },

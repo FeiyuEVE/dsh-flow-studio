@@ -12,7 +12,8 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -33,6 +34,8 @@ const {
 const { deliverInboundMessage } = await import('../src/inbox.js')
 const { createEngine } = await import('../src/engine.js')
 const { apply } = await import('../src/index.js')
+const { defaultFlow } = await import('../src/model.js')
+const { readFlowDir, writeFlowDir } = await import('../src/flowdir.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
 // F2：前端的纯逻辑（工作区门禁 / 建 run 与 start 的请求体）在这里一起断言。
@@ -185,6 +188,21 @@ function byName(tools, name) {
 function makeExec(sessionId = 'session-a') {
   const agent = { session: { id: sessionId, header: { cwd: '/workspace/inherited' } } }
   return { agent, signal: undefined }
+}
+
+/**
+ * 0.12 目录化 fixture：按用户约定建在 `process.env.TMPDIR || os.tmpdir()` 下
+ * （本机 TMPDIR 指向大卷），每个用例在 finally 里删干净。
+ */
+const flowFixtureRoot = process.env.TMPDIR || tmpdir()
+mkdirSync(flowFixtureRoot, { recursive: true })
+async function withFlowFixture(label, fn) {
+  const dir = mkdtempSync(join(flowFixtureRoot, `tools-flowdir-${label}-`))
+  try {
+    return await fn(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 /** 极简 ctx：只实现 apply 用到的成员。 */
@@ -2329,30 +2347,37 @@ try {
     A.equal(ctx.routes.length, 1)
   })
 
-  await check('有 tools 服务时注册七个工具，卸载时逆序撤销', () => {
+  await check('有 tools 服务时注册九个工具，卸载时逆序撤销', () => {
     const { ctx, registered, disposed, disposeFns } = makeCtx({ toolsService: true })
     apply(ctx)
     // v0.7 新增 flow_supervise；G6-b 新增 flow_worktrees；v0.9.2 新增 flow_restart
-    //（失败后重启并在原会话续跑），所以固定数量从 4 → 5 → 6 → 7。
-    A.equal(registered.length, 7)
+    //（失败后重启并在原会话续跑）；0.12 目录化新增 flow_compile / flow_decompile，
+    // 所以固定数量从 4 → 5 → 6 → 7 → 9。
+    A.equal(registered.length, 9)
     A.deepEqual(
       registered.map(tool => tool.name).sort(),
-      ['flow_list', 'flow_restart', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+      [
+        'flow_compile', 'flow_decompile', 'flow_list', 'flow_restart', 'flow_start',
+        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees',
+      ],
     )
     A.equal(ctx.routes.length, 1)
     A.ok(disposeFns.length >= 1)
-    // 最后一个 effect 就是工具注册；调用它的 disposer 应把六个工具都撤掉。
+    // 最后一个 effect 就是工具注册；调用它的 disposer 应把九个工具都撤掉。
     disposeFns[disposeFns.length - 1]()
     A.deepEqual(
       disposed.slice().sort(),
-      ['flow_list', 'flow_restart', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees'],
+      [
+        'flow_compile', 'flow_decompile', 'flow_list', 'flow_restart', 'flow_start',
+        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees',
+      ],
     )
   })
 
   await check('ctx.tools 属性（不走 ctx.get）也能注册', () => {
     const { ctx, registered } = makeCtx({ toolsService: true, useCtxProperty: true })
     apply(ctx)
-    A.equal(registered.length, 7)
+    A.equal(registered.length, 9)
   })
 
   // ── 11.5 engine.start 的 per-start parent（06 §15） ──────────────────
@@ -2467,7 +2492,133 @@ try {
     A.equal(meta.status, 'pending')
   })
 
-  // ── 12. 参数 schema ────────────────────────────────────────────────────
+  // ── 12. 0.12 流程产物目录化：flow_compile / flow_decompile ─────────────
+  await check('flow_compile 省略 save：只编译不入库（saved:false / flowId:null / listFlows 数量不变）', async () => {
+    await withFlowFixture('compile-dry', async dir => {
+      const source = join(dir, 'src')
+      const original = defaultFlow()
+      await writeFlowDir(source, original)
+      const compile = byName(makeTools(), 'flow_compile')
+      const before = await store.listFlows(flowsRoot)
+
+      const result = await compile.execute({ dir: source }, makeExec())
+
+      A.equal(result.ok, true)
+      A.equal(result.saved, false)
+      A.equal(result.flowId, null)
+      A.equal(result.dir, source)
+      A.equal(result.nodeCount, original.nodes.length)
+      A.equal(result.edgeCount, original.edges.length)
+      A.deepEqual(result.files, [
+        'flow.json',
+        ...original.nodes.flatMap(node => [`nodes/${node.id}.json`, `nodes/${node.id}.task.md`]),
+      ].sort())
+      const after = await store.listFlows(flowsRoot)
+      A.equal(after.length, before.length, 'save 省略时不能入库')
+      A.deepEqual(result.flow, original, '只编译也应返回与目录深等的流程')
+    })
+  })
+
+  await check('flow_compile（save:true）：存成新流程，flowId 能在 listFlows 里查到，节点数与目录一致', async () => {
+    await withFlowFixture('compile-save', async dir => {
+      const source = join(dir, 'src')
+      const original = defaultFlow()
+      await writeFlowDir(source, original)
+      const compile = byName(makeTools(), 'flow_compile')
+      const beforeIds = new Set((await store.listFlows(flowsRoot)).map(flow => flow.id))
+
+      const result = await compile.execute({ dir: source, save: true }, makeExec())
+
+      A.equal(result.ok, true)
+      A.equal(result.saved, true)
+      A.equal(typeof result.flowId, 'string')
+      A.equal(beforeIds.has(result.flowId), false, '必须存成新 id')
+      A.equal(result.flow.id, result.flowId)
+      const listed = await store.listFlows(flowsRoot)
+      A.equal(listed.some(flow => flow.id === result.flowId), true, '新流程必须出现在 listFlows 里')
+      A.equal(listed.find(flow => flow.id === result.flowId).nodeCount, original.nodes.length)
+      const saved = await store.readFlow(flowsRoot, result.flowId)
+      A.equal(saved.nodes.length, original.nodes.length, '入库后节点数必须与目录一致')
+      A.equal(result.flow.nodes.length, original.nodes.length)
+      A.equal(result.flow.name, original.name, '未传 name 时应保留目录里的流程名')
+
+      const named = await compile.execute({ dir: source, save: true, name: '工具覆盖名' }, makeExec())
+      A.equal(named.ok, true)
+      A.equal(named.flow.name, '工具覆盖名', '显式传 name 时必须覆盖目录里的流程名')
+    })
+  })
+
+  await check('flow_compile 编译失败：ok:false、errors 非空且带 path（缺 task 文件）', async () => {
+    await withFlowFixture('compile-bad', async dir => {
+      const source = join(dir, 'src')
+      const original = defaultFlow()
+      await writeFlowDir(source, original)
+      const missingId = original.nodes[1].id
+      rmSync(join(source, 'nodes', `${missingId}.task.md`))
+      const compile = byName(makeTools(), 'flow_compile')
+
+      const result = await compile.execute({ dir: source }, makeExec())
+
+      A.equal(result.ok, false)
+      A.equal(Array.isArray(result.errors), true)
+      A.equal(result.errors.length > 0, true)
+      A.equal(result.errors[0].code, 'missing-task')
+      A.equal(result.errors[0].path, `nodes/${missingId}.task.md`)
+      A.equal(typeof result.error, 'string')
+      A.equal(result.error.length > 0, true)
+      A.equal(typeof result.hint, 'string')
+      A.equal(result.hint.length > 0, true)
+    })
+  })
+
+  await check('flow_compile 的 dir 传相对路径：ok:false，error 说明必须是绝对路径', async () => {
+    const compile = byName(makeTools(), 'flow_compile')
+    const result = await compile.execute({ dir: 'relative/flow-dir' }, makeExec())
+    A.equal(result.ok, false)
+    A.match(result.error, /绝对路径/)
+    A.match(result.hint, /绝对路径/)
+  })
+
+  await check('flow_decompile 未知 flowId：ok:false 且 hint 非空', async () => {
+    await withFlowFixture('decompile-404', async dir => {
+      const decompile = byName(makeTools(), 'flow_decompile')
+      const result = await decompile.execute({
+        flowId: 'flow-does-not-exist',
+        dir: join(dir, 'out'),
+      }, makeExec())
+      A.equal(result.ok, false)
+      A.match(result.error, /流程不存在/)
+      A.equal(typeof result.hint, 'string')
+      A.equal(result.hint.length > 0, true)
+      A.equal(existsSync(join(dir, 'out')), false, '未知流程不应写目标目录')
+    })
+  })
+
+  await check('flow_decompile 成功：文件列表与磁盘一致，再 flow_compile 回来与原流程 deepEqual', async () => {
+    await withFlowFixture('decompile-roundtrip', async dir => {
+      const original = await store.saveFlow(flowsRoot, 'flow-dir-roundtrip', defaultFlow(), { name: '目录往返' })
+      const target = join(dir, 'exported')
+      const decompile = byName(makeTools(), 'flow_decompile')
+
+      const result = await decompile.execute({ flowId: original.id, dir: target }, makeExec())
+      A.equal(result.ok, true)
+      A.equal(result.flowId, original.id)
+      A.equal(result.dir, target)
+      A.equal(Number.isInteger(result.bytes) && result.bytes > 0, true)
+      A.deepEqual(result.files, [...result.files].sort(), 'files 必须升序')
+      const onDisk = await readFlowDir(target)
+      A.deepEqual([...onDisk.files.keys()].sort(), result.files, '返回的文件列表必须与磁盘一致')
+
+      const compile = byName(makeTools(), 'flow_compile')
+      const roundtrip = await compile.execute({ dir: target }, makeExec())
+      A.equal(roundtrip.ok, true)
+      A.equal(roundtrip.nodeCount, original.nodes.length)
+      A.equal(roundtrip.edgeCount, original.edges.length)
+      A.deepEqual(roundtrip.flow, original, 'decompile → compile 必须回到原流程')
+    })
+  })
+
+
   await check('参数 schema：flow_start 的 flowId / flowName 都非必填，flow_stop 的 runId 必填', () => {
     const tools = makeTools()
     for (const tool of tools) {

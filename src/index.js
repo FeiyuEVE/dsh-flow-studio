@@ -29,7 +29,8 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
-import { NODE_KIND, normalizeNodeCheck, validateFlow, validateNodeCheck } from './model.js'
+import { NODE_KIND, normalizeFlow, normalizeNodeCheck, validateFlow, validateNodeCheck } from './model.js'
+import { compileFlowFiles, readFlowDir, writeFlowDir } from './flowdir.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import { createRuntime, patchRunJson, readStartOptions, saveSupervision } from './runtime.js'
 import * as worktreeModule from './worktree.js'
@@ -1285,6 +1286,123 @@ async function route(req, res, env) {
   // /api/flow-studio/flows[/<id>]
   if (parts[0] === 'flows') {
     const id = parts[1]
+
+    // 0.12 目录化（附加路径，不动既有 POST/PUT 语义）：
+    //   POST /flows/import-dir          { dir, name? }  目录 → 编译 → 存成**新流程**（新 id）
+    //   POST /flows/<id>/export-dir     { dir }         已有流程 → 写成一个目录
+    //
+    // 「导入生成新 id」是刻意的：目录是编辑期真源、JSON 是运行期真源，两者不做双向同步，
+    // 靠新 id 避免出现两个真源互相覆盖。
+    if (parts.length === 2 && id === 'import-dir') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 POST' })
+        return
+      }
+      const body = await readBody(req)
+      if (!body || typeof body !== 'object' || typeof body.dir !== 'string' || body.dir.trim() === '') {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'FLOW_DIR_REQUIRED',
+          error: '需要 dir：流程目录的绝对路径',
+        })
+        return
+      }
+      // 相对路径在 host 进程的 cwd 下解析，含义随启动方式变化；与 flow_compile 工具同口径，一律要求绝对路径。
+      if (!isAbsolute(body.dir.trim())) {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'FLOW_DIR_NOT_ABSOLUTE',
+          error: 'dir 必须是绝对路径：相对路径在不同工作目录下含义不同',
+        })
+        return
+      }
+      const read = await readFlowDir(body.dir)
+      const compiled = compileFlowFiles(read.files)
+      // IO 层错误（路径穿越 / 超限）与语义错误（缺文件 / 布局外文件 / 结构非法）必须合并报，
+      // 只报其中一半会让调用方以为「只是某个文件读失败」。
+      const errors = [...read.errors, ...compiled.errors]
+      if (errors.length > 0) {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'FLOW_COMPILE_FAILED',
+          error: errors[0].message,
+          errors,
+        })
+        return
+      }
+      // compileFlowFiles 返回的是「文件里写了什么就是什么」的组装结果，不补默认值；
+      // 入库前必须走 normalizeFlow，否则默认字段（executor/maxRounds/extras…）会是空的。
+      const wantedName = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim() : ''
+      const normalized = normalizeFlow(compiled.flow, wantedName || '新流程')
+      // 显式给了 name 就以它为准（normalizeFlow 的第二个参数只是 fallback，目录里有 name 时会被它盖住）。
+      if (wantedName !== '') normalized.name = wantedName
+      const customGate = customExecutorBlockers(normalized)
+      if (customGate.length > 0) {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'CUSTOM_EXECUTOR_DISABLED',
+          field: 'nodes',
+          error: customGate[0].message,
+          errors: customGate,
+        })
+        return
+      }
+      const flowId = newFlowId()
+      const saved = await saveFlow(env.dir, flowId, normalized, { name: '新流程' })
+      sendJson(res, 200, {
+        ok: true,
+        flow: saved,
+        validation: validateFlow(saved),
+        files: [...read.files.keys()].sort(),
+      })
+      return
+    }
+
+    if (parts.length === 3 && checkId(id) && parts[2] === 'export-dir') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: '只支持 POST' })
+        return
+      }
+      const body = await readBody(req)
+      if (!body || typeof body !== 'object' || typeof body.dir !== 'string' || body.dir.trim() === '') {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'FLOW_DIR_REQUIRED',
+          error: '需要 dir：导出目录的绝对路径',
+        })
+        return
+      }
+      if (!isAbsolute(body.dir.trim())) {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'FLOW_DIR_NOT_ABSOLUTE',
+          error: 'dir 必须是绝对路径：相对路径在不同工作目录下含义不同',
+        })
+        return
+      }
+      const flow = await readFlow(env.dir, id)
+      if (!flow) {
+        sendJson(res, 404, { ok: false, error: '流程不存在' })
+        return
+      }
+      try {
+        const written = await writeFlowDir(body.dir, flow)
+        sendJson(res, 200, { ok: true, dir: written.dir, files: written.files, bytes: written.bytes })
+      } catch (error) {
+        // 拒绝覆盖「不是本模块产物」的非空目录：这是防误删，不是存储故障，回 409 更准确。
+        const code = error && typeof error.code === 'string' ? error.code : ''
+        if (code.startsWith('flowdir-')) {
+          sendJson(res, 409, {
+            ok: false,
+            code: 'FLOW_DIR_REFUSED',
+            error: error && error.message ? error.message : String(error),
+          })
+          return
+        }
+        throw error
+      }
+      return
+    }
 
     if (parts.length === 1) {
       if (req.method === 'GET') {

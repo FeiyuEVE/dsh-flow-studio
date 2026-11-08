@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -26,7 +27,8 @@ const {
 const { MAX_TIMEOUT_MS } = await import('../src/tools.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
-const { validateFlow } = await import('../src/model.js')
+const { defaultFlow, validateFlow } = await import('../src/model.js')
+const { compileFlowFiles, readFlowDir, writeFlowDir } = await import('../src/flowdir.js')
 
 let checks = 0
 function check(name, fn) {
@@ -359,6 +361,21 @@ function makeWorkspace(label) {
 }
 
 /**
+ * 0.12 目录化的 fixture 目录：按用户约定建在 `process.env.TMPDIR || os.tmpdir()` 下
+ * （本机 TMPDIR 指向大卷），每个用例自己在 finally 里删干净。
+ */
+const flowFixtureRoot = process.env.TMPDIR || tmpdir()
+mkdirSync(flowFixtureRoot, { recursive: true })
+async function withFlowFixture(label, fn) {
+  const dir = mkdtempSync(join(flowFixtureRoot, `host-flowdir-${label}-`))
+  try {
+    return await fn(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
  * 合法的最小流程（开始 → 完成）：v0.7 起 POST /flows 也过保存门禁，
  * 「先建一个壳、再 PUT 真内容」的旧造数方式会拿到 400，所以统一用这份合法流程造数。
  */
@@ -563,6 +580,182 @@ await check('0.9.1 删除→撤销→再覆盖：删除前证据进 deleted/，�
   const evidence = JSON.parse(readFileSync(join(historyDir, 'deleted', archived[0]), 'utf8'))
   assert.equal(evidence.name, '撤销链路')
   assert.equal(evidence.nodes.length, 2, '归档的必须是删除前的两个节点')
+})
+
+await check('0.12 POST /flows/import-dir：成功导入为新流程（新 id），files 升序且与原流程节点数一致', async () => {
+  await withFlowFixture('import-ok', async dir => {
+    const source = join(dir, 'src')
+    const original = defaultFlow()
+    await writeFlowDir(source, original)
+    const flows = store.flowsDir(home)
+    const before = await store.listFlows(flows)
+    const beforeIds = new Set(before.map(flow => flow.id))
+
+    const result = await call(route, 'POST', '/api/flow-studio/flows/import-dir', { dir: source })
+    assert.equal(result.status, 200)
+    assert.equal(result.json.ok, true)
+    const flow = result.json.flow
+    assert.equal(typeof flow.id, 'string')
+    assert.equal(beforeIds.has(flow.id), false, `导入必须生成新 id，不能复用既有 id：${flow.id}`)
+    assert.equal(flow.name, original.name, '未传 name 时应保留目录里的流程名')
+
+    assert.equal(flow.nodes.length, original.nodes.length, '返回的 flow.nodes 数必须与原流程一致')
+    assert.equal(flow.edges.length, original.edges.length)
+
+    const files = result.json.files
+    assert.deepEqual(files, [...files].sort(), 'files 必须升序')
+    assert.equal(files.includes('flow.json'), true)
+    const expectedTasks = original.nodes.map(node => `nodes/${node.id}.task.md`).sort()
+    assert.deepEqual(
+      files.filter(path => path.startsWith('nodes/') && path.endsWith('.task.md')),
+      expectedTasks,
+      '每个节点都要有一条 nodes/<id>.task.md',
+    )
+    assert.deepEqual(
+      files.filter(path => path.startsWith('nodes/') && path.endsWith('.json')),
+      original.nodes.map(node => `nodes/${node.id}.json`).sort(),
+    )
+
+    const after = await store.listFlows(flows)
+    assert.equal(after.length, before.length + 1, '导入应当只新增一条流程')
+    assert.deepEqual(await store.readFlow(flows, flow.id), flow, '导入结果必须真的落盘且可读回')
+
+    // name 覆盖语义：显式传 name 时以它为准（normalizeFlow 的 fallback 会被目录里的 name 盖住）。
+    const named = await call(route, 'POST', '/api/flow-studio/flows/import-dir', { dir: source, name: '导入覆盖名' })
+    assert.equal(named.status, 200)
+    assert.equal(named.json.flow.name, '导入覆盖名', '显式传 name 时必须覆盖目录里的流程名')
+    assert.notEqual(named.json.flow.id, flow.id, '每次导入都必须是新 id')
+  })
+})
+
+await check('0.12 POST /flows/import-dir：缺 task 文件 → 400 FLOW_COMPILE_FAILED，errors[0] 指回那个文件', async () => {
+  await withFlowFixture('import-missing-task', async dir => {
+    const source = join(dir, 'src')
+    const original = defaultFlow()
+    await writeFlowDir(source, original)
+    const missingId = original.nodes[1].id
+    const missingPath = `nodes/${missingId}.task.md`
+    rmSync(join(source, 'nodes', `${missingId}.task.md`))
+    const beforeCount = (await store.listFlows(store.flowsDir(home))).length
+
+    const result = await call(route, 'POST', '/api/flow-studio/flows/import-dir', { dir: source })
+    assert.equal(result.status, 400)
+    assert.equal(result.json.ok, false)
+    assert.equal(result.json.code, 'FLOW_COMPILE_FAILED')
+    assert.equal(result.json.errors[0].code, 'missing-task')
+    assert.equal(result.json.errors[0].path, missingPath)
+    assert.equal(result.json.error, result.json.errors[0].message, 'error 取第一条错误的可读说明')
+    assert.equal((await store.listFlows(store.flowsDir(home))).length, beforeCount, '编译失败不应入库')
+  })
+})
+
+await check('0.12 POST /flows/import-dir：缺 dir / 空串 / 非字符串 → 400 FLOW_DIR_REQUIRED', async () => {
+  for (const body of [{}, { dir: '' }, { dir: '   ' }, { dir: 42 }, { name: '只有名字' }]) {
+    const result = await call(route, 'POST', '/api/flow-studio/flows/import-dir', body)
+    assert.equal(result.status, 400, JSON.stringify(body))
+    assert.equal(result.json.ok, false, JSON.stringify(body))
+    assert.equal(result.json.code, 'FLOW_DIR_REQUIRED', JSON.stringify(body))
+  }
+})
+
+await check('0.12 POST /flows/import-dir：相对路径 → 400 FLOW_DIR_NOT_ABSOLUTE（与 flow_compile 工具同口径）', async () => {
+  for (const target of ['relative/dir', './here', 'flows']) {
+    const result = await call(route, 'POST', '/api/flow-studio/flows/import-dir', { dir: target })
+    assert.equal(result.status, 400, target)
+    assert.equal(result.json.code, 'FLOW_DIR_NOT_ABSOLUTE', target)
+  }
+})
+
+await check('0.12 POST /flows/<id>/export-dir：相对路径 → 400 FLOW_DIR_NOT_ABSOLUTE', async () => {
+  const flows = store.flowsDir(home)
+  const original = await store.saveFlow(flows, 'flow-dir-rel', defaultFlow(), { name: '相对路径源' })
+  const result = await call(route, 'POST', `/api/flow-studio/flows/${original.id}/export-dir`, { dir: 'relative/out' })
+  assert.equal(result.status, 400)
+  assert.equal(result.json.code, 'FLOW_DIR_NOT_ABSOLUTE')
+})
+
+await check('0.12 POST /flows/<id>/export-dir：成功落盘，readFlowDir + compileFlowFiles 与原流程 deepEqual', async () => {
+  await withFlowFixture('export-ok', async dir => {
+    const flows = store.flowsDir(home)
+    const original = await store.saveFlow(flows, 'flow-dir-export', defaultFlow(), { name: '目录导出源' })
+    const target = join(dir, 'exported')
+
+    const result = await call(route, 'POST', `/api/flow-studio/flows/${original.id}/export-dir`, { dir: target })
+    assert.equal(result.status, 200)
+    assert.equal(result.json.ok, true)
+    assert.equal(result.json.dir, target)
+    const files = result.json.files
+    assert.deepEqual(files, [...files].sort(), '导出文件列表必须升序')
+    assert.deepEqual(files, [
+      'flow.json',
+      ...original.nodes.flatMap(node => [`nodes/${node.id}.json`, `nodes/${node.id}.task.md`]),
+    ].sort())
+    assert.equal(Number.isInteger(result.json.bytes) && result.json.bytes > 0, true, 'bytes 必须是正整数字节数')
+    for (const relPath of files) {
+      assert.equal(existsSync(join(target, relPath)), true, `磁盘缺少 ${relPath}`)
+      assert.equal(statSync(join(target, relPath)).isFile(), true, `${relPath} 必须是普通文件`)
+    }
+
+    const readBack = await readFlowDir(target)
+    assert.deepEqual([...readBack.files.keys()].sort(), files)
+    const compiled = compileFlowFiles(readBack.files)
+    assert.deepEqual(compiled.errors, [])
+    assert.deepEqual(compiled.flow, original, '导出目录编译回来必须与原流程深等')
+  })
+})
+
+await check('0.12 POST /flows/<id>/export-dir：目标是非本模块产物的非空目录 → 409 FLOW_DIR_REFUSED，且不碰别人的文件', async () => {
+  await withFlowFixture('export-refuse', async dir => {
+    const flows = store.flowsDir(home)
+    const original = await store.saveFlow(flows, 'flow-dir-refuse', defaultFlow(), { name: '拒绝覆盖' })
+    const target = join(dir, 'foreign')
+    mkdirSync(target)
+    const foreignPath = join(target, 'README.md')
+    writeFileSync(foreignPath, '这个目录不属于 flow-studio，不能被覆盖。\n')
+
+    const result = await call(route, 'POST', `/api/flow-studio/flows/${original.id}/export-dir`, { dir: target })
+    assert.equal(result.status, 409)
+    assert.equal(result.json.ok, false)
+    assert.equal(result.json.code, 'FLOW_DIR_REFUSED')
+    assert.equal(readFileSync(foreignPath, 'utf8'), '这个目录不属于 flow-studio，不能被覆盖。\n')
+    assert.deepEqual(readdirSync(target), ['README.md'], '拒绝后目录里不能多出 flow.json / nodes')
+    assert.equal(existsSync(join(target, 'flow.json')), false)
+  })
+})
+
+await check('0.12 POST /flows/<id>/export-dir：未知流程 id → 404', async () => {
+  await withFlowFixture('export-404', async dir => {
+    const result = await call(route, 'POST', '/api/flow-studio/flows/flow-does-not-exist/export-dir', {
+      dir: join(dir, 'out'),
+    })
+    assert.equal(result.status, 404)
+    assert.equal(result.json.ok, false)
+    assert.equal(existsSync(join(dir, 'out')), false, '404 不应创建目标目录')
+  })
+})
+
+await check('0.12 路由优先级：/flows/import-dir 始终走导入分支，即使存在同名流程 id', async () => {
+  await withFlowFixture('import-priority', async dir => {
+    const flows = store.flowsDir(home)
+    const pinned = await store.saveFlow(flows, 'import-dir', validFlowBody('恰好叫 import-dir'), { name: '占位' })
+    const pinnedPath = join(flows, 'import-dir.json')
+    const pinnedBefore = readFileSync(pinnedPath, 'utf8')
+
+    // 方法不对时是 405（说明命中了导入分支），不是「按 id 读流程」的 404。
+    const getResult = await call(route, 'GET', '/api/flow-studio/flows/import-dir')
+    assert.equal(getResult.status, 405, 'GET /flows/import-dir 应由导入端点回 405，而不是流程详情')
+    const missing = await call(route, 'POST', '/api/flow-studio/flows/import-dir', {})
+    assert.equal(missing.status, 400)
+    assert.equal(missing.json.code, 'FLOW_DIR_REQUIRED')
+
+    const source = join(dir, 'src')
+    await writeFlowDir(source, defaultFlow())
+    const imported = await call(route, 'POST', '/api/flow-studio/flows/import-dir', { dir: source })
+    assert.equal(imported.status, 200)
+    assert.equal(imported.json.flow.id === 'import-dir', false, '导入不能命中/覆盖既有同名流程')
+    assert.equal(readFileSync(pinnedPath, 'utf8'), pinnedBefore, '既有 import-dir 流程文件不能被改动')
+    assert.equal((await store.readFlow(flows, 'import-dir')).name, pinned.name)
+  })
 })
 
 await check('没有 skills 服务时 /skills 返回空表', async () => {

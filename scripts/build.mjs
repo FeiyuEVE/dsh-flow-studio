@@ -45,6 +45,7 @@ export const HOST_MODULES = [
   'xstate-vendor.js',
   'index.js',
   'model.js',
+  'flowdir.js',
   'store.js',
   'runlog.js',
   'runstore.js',

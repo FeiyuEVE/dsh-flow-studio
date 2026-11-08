@@ -1465,6 +1465,14 @@ export function eventSummary(event) {
       parts.push('来自 ' + text(data.from, '外部'))
       if (data.targetNodeId) parts.push('→ ' + text(data.targetNodeId))
       if (data.text) parts.push(text(data.text))
+      // 0.11.1：长正文只展示头部时，UI 必须明说「全文多大、在哪个文件」，
+      // 否则看起来就像消息本身只有这么长。
+      if (typeof data.bodyPath === 'string' && data.bodyPath !== '') {
+        const chars = Number.isInteger(data.bodyChars) && data.bodyChars > 0
+          ? '全文 ' + num(data.bodyChars) + ' 字'
+          : '全文已落盘'
+        parts.push(chars + ' · 见 ' + text(data.bodyPath))
+      }
       break
     case 'message/out':
       parts.push('回复')

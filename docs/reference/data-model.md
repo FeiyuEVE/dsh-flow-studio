@@ -81,7 +81,8 @@ $DSH_HOME/flow-studio/runs/
     run.jsonl                      # run 级事件：开始 / 结束 / 状态变更（append-only）
     run.json                       # run 元数据（可变，原子写；跨进程 meta.lock）
     sessions.json                  # nodeId → { sessionId, createdAt, lastUsedAt, agentOptions? }（一个节点一个会话）
-    messages.jsonl                 # 流程收件箱（append + 分页）
+    messages.jsonl                 # 流程收件箱（append + 分页；长正文只存头部 + bodyPath/bodyChars）
+    inbox/                         # 收件箱长正文全文（<messageId>.md；目录 0700 / 文件 0600）
     lock.json                      # 单写者租约（O_EXCL 创建；含 ownerId，租约握手用）
     verification/                  # 宿主检查私有登记（<executionId>/record.json；只有引擎持凭证可写；
                                    #   record 含 commandDigest / exitCode / reportSha256 / 节点 / attempt）
@@ -97,6 +98,8 @@ $DSH_HOME/flow-studio/runs/
 ```
 
 `runId / nodeId / attemptId` 一律过 `^[A-Za-z0-9._-]{1,64}$` 校验，防路径穿越。单条事件 ≤8KB、单批 ≤200 条、单 run 事件总量 ≤200000，超限 400 并给出当前用量。
+
+`messages.jsonl` 的入站记录在正文 >1200 字时只存 1200 字头部，并带 `bodyPath`（`inbox/<messageId>.md`，run 目录内安全相对路径）与 `bodyChars`（全文字数，1..200000）；`run.json.input.messages` 用同一对字段，保证重启 / 续跑后提示词仍能指回全文。入站正文硬上限 200000 字（超过返回可读 400）。
 
 ### `run.json` 字段
 

@@ -175,6 +175,21 @@ export const AGENT_ACTIVITY_TOTAL = 200
 export const MESSAGE_TEXT_MAX_CHARS = 2000
 /** 06 §16：消息来源标识（from）的上限。 */
 export const MESSAGE_FROM_MAX_CHARS = 200
+/**
+ * 06 §16（0.11.1）：收件箱长正文落盘目录（run 目录内的固定子目录）。
+ *
+ * 正文超过内联阈值时全文写到 `inbox/<messageId>.md`；事件 / messages.jsonl 只放
+ * 头部，靠 `bodyPath` + `bodyChars` 指回全文。目录 0700、文件 0600。
+ */
+export const MESSAGE_BODY_DIR = 'inbox'
+/**
+ * 06 §16（0.11.1）：长正文落盘的硬上限（字符，按码点）。
+ *
+ * 与 `src/inbox.js` 的 `MESSAGE_BODY_HARD_MAX_CHARS` 同源（那边是 import 本常量
+ * 再导出的别名）：runlog 不能 import inbox（inbox → runlog 已存在，会成环）。
+ * 超限由入口返回可读 400，绝不静默截断。
+ */
+export const MESSAGE_BODY_CHARS_MAX = 200000
 /** 06 §16：消息级回复目标的 kind 白名单。 */
 const MESSAGE_REPLY_KIND = new Set(['session', 'http', 'none'])
 /** 06 §16：message/out.delivery 白名单。 */
@@ -241,6 +256,24 @@ export function isSafeRelPath(value) {
   if (value.startsWith('/') || value.startsWith('\\')) return false
   if (value.includes('\0') || value.includes('\\')) return false
   return value.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..')
+}
+
+/**
+ * 06 §16（0.11.1）：消息全文指针 `bodyPath` 的严格形状。
+ *
+ * 比 `isSafeRelPath` 再收一层：必须恰好是 `inbox/<文件名>.md`（单层、无子目录）。
+ * 收件箱正文是引擎自己写的固定布局，不猜、不放开任意 run 内路径——消息里的
+ * `bodyPath` 来自外部请求 / 旧数据，宽一点就是一条读文件原语。
+ *
+ * @param {unknown} value
+ */
+export function isSafeInboxBodyPath(value) {
+  if (!isSafeRelPath(value)) return false
+  const prefix = `${MESSAGE_BODY_DIR}/`
+  if (!value.startsWith(prefix)) return false
+  const name = value.slice(prefix.length)
+  if (name === '' || name.includes('/')) return false
+  return name.endsWith('.md')
 }
 
 function checkTraceId(value) {
@@ -378,6 +411,24 @@ function messageTextField(value) {
   if (typeof value !== 'string') return { ok: false, reason: '必须是字符串' }
   if (value.trim() === '') return { ok: false, reason: '不能为空字符串' }
   return { ok: true, value: clipCodePoints(value, MESSAGE_TEXT_MAX_CHARS) }
+}
+
+/** 06 §16（0.11.1）：可选 `bodyPath`（收件箱全文指针）。 */
+function bodyPathField(value) {
+  if (value === undefined || value === null) return { ok: true, present: false }
+  if (!isSafeInboxBodyPath(value)) {
+    return { ok: false, reason: `必须是 ${MESSAGE_BODY_DIR}/<文件名>.md 的安全相对路径（禁止绝对路径与 .. 段）` }
+  }
+  return { ok: true, value, present: true }
+}
+
+/** 06 §16（0.11.1）：可选 `bodyChars`（全文字数，正整数）。 */
+function bodyCharsField(value) {
+  if (value === undefined || value === null) return { ok: true, present: false }
+  if (!Number.isInteger(value) || value < 1 || value > MESSAGE_BODY_CHARS_MAX) {
+    return { ok: false, reason: `必须是 1..${MESSAGE_BODY_CHARS_MAX} 的整数` }
+  }
+  return { ok: true, value, present: true }
 }
 
 function strArrayField(data, key, { required = true, maxItems = 12, maxLen = 64 } = {}) {
@@ -690,6 +741,13 @@ function validateData(kind, data) {
         }
         out2.replyKind = data.replyKind
       }
+      // 0.11.1：长正文落盘后只放头部，全文字数与指针必须一起放行。
+      const bodyPath = bodyPathField(data.bodyPath)
+      if (!bodyPath.ok) return err('bodyPath', bodyPath.reason)
+      if (bodyPath.present) out2.bodyPath = bodyPath.value
+      const bodyChars = bodyCharsField(data.bodyChars)
+      if (!bodyChars.ok) return err('bodyChars', bodyChars.reason)
+      if (bodyChars.present) out2.bodyChars = bodyChars.value
       for (const key of Object.keys(out)) delete out[key]
       Object.assign(out, out2)
       break
@@ -718,6 +776,13 @@ function validateData(kind, data) {
         return err('delivery', `取值必须是 ${[...MESSAGE_DELIVERY].join(' / ')}`)
       }
       out2.delivery = delivery
+      // 0.11.1：回复同样允许带全文指针（当前由 inbox 只对入站落盘，但 schema 不再丢字段）。
+      const bodyPath = bodyPathField(data.bodyPath)
+      if (!bodyPath.ok) return err('bodyPath', bodyPath.reason)
+      if (bodyPath.present) out2.bodyPath = bodyPath.value
+      const bodyChars = bodyCharsField(data.bodyChars)
+      if (!bodyChars.ok) return err('bodyChars', bodyChars.reason)
+      if (bodyChars.present) out2.bodyChars = bodyChars.value
       for (const key of Object.keys(out)) delete out[key]
       Object.assign(out, out2)
       break

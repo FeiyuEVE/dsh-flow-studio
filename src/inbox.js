@@ -10,7 +10,10 @@
  * 本模块只做**纯函数 + 投递编排**：落盘全部委托给 `runstore.js`，
  * 流程模板读取委托给 `store.js`，不 import engine（避免 engine ↔ inbox 循环依赖）。
  *
- * 安全边界：外部文本一律按码点截断（正文 4000 / 事件 2000 / 提示词 1200）；
+ * 安全边界：外部正文**不再静默截断**——≤1200 字全文进提示词；超过就全文落盘
+ * （`inbox/<messageId>.md`），事件 / messages.jsonl 只放 ≤2000 字的头部 + `bodyPath`
+ * / `bodyChars` 指针；超过硬上限（200000 字）返回可读 400。落盘失败时降级为
+ * 「保留可读头部 + warn + 返回体标明未落盘」，绝不吞消息。
  * 回复通道（`reply`）的白名单校验**只在本模块实现一份**，所有入口共用：
  *   - `tokenEnv` 只接受专用前缀 `FLOW_STUDIO_REPLY_TOKEN_*`（大小写敏感，后缀只用
  *     大写字母 / 数字 / 下划线），其它变量名（`DSH_*` / `FLOW_STUDIO_TOKEN` / `PATH`…）
@@ -23,18 +26,30 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { resolve, sep } from 'node:path'
 
 import { EDGE_KIND, NODE_KIND } from './model.js'
-import { checkRunId } from './runlog.js'
+import { MESSAGE_BODY_CHARS_MAX, checkRunId, isSafeInboxBodyPath } from './runlog.js'
 import {
   MESSAGE_REPLY_KINDS, RunError, appendEvents, appendRunInputMessages, appendRunMessages,
   normalizeReplyTarget, readNodeSessions, readRunMessages, readRunMeta, updateRunMessageStatus,
-  upsertNodeSession,
+  upsertNodeSession, writeRunInboxBody,
 } from './runstore.js'
 import { readFlow } from './store.js'
 
-/** 外部消息正文上限（HTTP 请求体 / flow_send_message / flow_reply 共用）。 */
+/**
+ * 回复正文上限（`deliverOutboundReply` 仍按 4000 收口）。
+ *
+ * 0.11.1 起**不再是入站正文上限**：入站正文改用 {@link MESSAGE_BODY_HARD_MAX_CHARS}
+ * （超过阈值落盘）。保留这个导出名只为旧调用方 / 文档兼容。
+ */
 export const MESSAGE_BODY_MAX_CHARS = 4000
+/**
+ * 入站正文硬上限（字符，按码点）。超过返回可读 400，绝不静默截断。
+ *
+ * 与 `runlog.MESSAGE_BODY_CHARS_MAX` 同源（runlog 不能 import inbox，会成环）。
+ */
+export const MESSAGE_BODY_HARD_MAX_CHARS = MESSAGE_BODY_CHARS_MAX
 /** 消息来源标识上限。 */
 export const MESSAGE_FROM_MAX_CHARS = 200
 /** 写事件时的正文上限（与 runlog.MESSAGE_TEXT_MAX_CHARS 一致）。 */
@@ -42,6 +57,13 @@ export const MESSAGE_EVENT_TEXT_MAX_CHARS = 2000
 /** 提示词里「外部消息」段的条数 / 单条长度上限（06 §16）。 */
 export const PROMPT_INBOX_MAX_MESSAGES = 5
 export const PROMPT_INBOX_MESSAGE_MAX_CHARS = 1200
+/**
+ * 正文超过它就落盘（= 进提示词的 inline 上限，语义统一）。
+ *
+ * 正好等于 `PROMPT_INBOX_MESSAGE_MAX_CHARS`：≤1200 字的正文全文进提示词，
+ * >1200 字落的盘、提示词只放 1200 字头部 + 指针。
+ */
+export const INBOX_SPILL_THRESHOLD_CHARS = PROMPT_INBOX_MESSAGE_MAX_CHARS
 /** 认为「已经投递过」的状态。 */
 export const DELIVERED_STATUSES = Object.freeze(['injected', 'resumed', 'delivered'])
 /** 回复 HTTP 请求超时（毫秒）。 */
@@ -241,7 +263,17 @@ export function validateInboundBody(raw) {
   if (typeof raw.text !== 'string' || raw.text.trim() === '') {
     return { ok: false, error: '缺少 text（消息正文，必填）' }
   }
-  const text = clipCodePoints(raw.text, MESSAGE_BODY_MAX_CHARS)
+  // 0.11.1：正文不再在这里截断（旧实现按 4000 静默截）。超硬上限给可读错误，
+  // 阈值以上的正文交给 deliverInboundMessage 落盘，提示词靠 bodyPath 指回全文。
+  const textChars = Array.from(raw.text).length
+  if (textChars > MESSAGE_BODY_HARD_MAX_CHARS) {
+    return {
+      ok: false,
+      error: `正文 ${textChars} 字超过上限 ${MESSAGE_BODY_HARD_MAX_CHARS} 字，`
+        + '请拆成多条或改用文件（把长内容写成文件后只发摘要 / 路径）',
+    }
+  }
+  const text = raw.text
   let nodeId
   if (raw.nodeId !== undefined && raw.nodeId !== null && raw.nodeId !== '') {
     if (typeof raw.nodeId !== 'string' || !checkRunId(raw.nodeId)) {
@@ -359,31 +391,76 @@ export function resolveTargetNode({ flow, meta, explicitNodeId }) {
 // 纯函数：提示词段 / 事件 / followup
 // ---------------------------------------------------------------------------
 
-/** 「外部消息」段的一条：带 from / 时间 / 正文，正文有界。 */
-export function formatInboxMessageLine(message, note) {
+/**
+ * 0.11.1：长正文的显式指针（提示词 / 活会话注入共用）。
+ *
+ * 为什么还带绝对路径：节点会话的 cwd 是工作区，不是 run 目录；只给
+ * `inbox/m-xxx.md` 模型无从解析。相对路径是落盘事实（事件 / messages.jsonl /
+ * run.json.input），绝对路径是「现在就能 read」的可执行指针——两者都由
+ * `runsRoot + runId + 校验过的 bodyPath` 拼出，不拼外部输入。
+ *
+ * @param {{ bodyPath: string, bodyChars?: number, runDir?: string, indent?: string }} input
+ */
+export function formatInboxBodyPointer({ bodyPath, bodyChars, runDir, indent = '  ' } = {}) {
+  const chars = Number.isInteger(bodyChars) && bodyChars > 0 ? bodyChars : null
+  const countText = chars === null ? '正文超过内联上限' : `正文共 ${chars} 字`
+  let absText = ''
+  if (typeof runDir === 'string' && runDir !== '' && isSafeInboxBodyPath(bodyPath)) {
+    try {
+      const root = resolve(runDir)
+      const abs = resolve(root, bodyPath)
+      if (abs !== root && abs.startsWith(`${root}${sep}`)) absText = `（绝对路径 ${abs}）`
+    } catch {
+      // 绝对路径只是便利信息，拼不出来就不给；相对路径与指针仍然生效。
+    }
+  }
+  return `${indent}⚠ ${countText}，此处只放头部；**全文在 ${bodyPath}${absText}，`
+    + '必须先用 read 工具读完再作答**'
+}
+
+/**
+ * 「外部消息」段的一条：带 from / 时间 / 正文。
+ *
+ * 有 `bodyPath` 时正文只是头部，下一行给「必须读全文」的指针；没有 `bodyPath`
+ * 时正文本来就是全文（≤阈值），保持旧格式。`options.runDir` 用来补绝对路径。
+ */
+export function formatInboxMessageLine(message, note, options = {}) {
   const at = typeof message.ts === 'string' ? message.ts : ''
   const from = typeof message.from === 'string' && message.from !== '' ? message.from : 'unknown'
   const text = clipCodePoints(message.text, PROMPT_INBOX_MESSAGE_MAX_CHARS)
-  return `- [${at} · ${from}]（${note}）${text}`
+  const head = `- [${at} · ${from}]（${note}）${text}`
+  if (typeof message.bodyPath !== 'string' || !isSafeInboxBodyPath(message.bodyPath)) return head
+  return `${head}\n${formatInboxBodyPointer({
+    bodyPath: message.bodyPath,
+    bodyChars: message.bodyChars,
+    runDir: options.runDir,
+  })}`
 }
 
 /**
  * 把「新到的」与「之前已投递、向下游流转的」消息拼成提示词段。
- * 最多 5 条、每条 ≤1200 字；没有消息时返回空串（不占提示词预算）。
+ * 最多 5 条、每条 ≤1200 字头部；没有消息时返回空串（不占提示词预算）。
+ *
+ * @param {{ fresh?: object[], prior?: object[], runDir?: string }} [input]
  */
-export function buildPromptInboxSection({ fresh = [], prior = [] } = {}) {
+export function buildPromptInboxSection({ fresh = [], prior = [], runDir } = {}) {
+  const freshShown = Array.isArray(fresh) ? fresh.slice(0, PROMPT_INBOX_MAX_MESSAGES) : []
+  const priorShown = Array.isArray(prior) ? prior.slice(-PROMPT_INBOX_MAX_MESSAGES) : []
   const lines = []
-  for (const message of Array.isArray(fresh) ? fresh.slice(0, PROMPT_INBOX_MAX_MESSAGES) : []) {
-    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 新到，本节点处理'))
+  for (const message of freshShown) {
+    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 新到，本节点处理', { runDir }))
   }
-  for (const message of Array.isArray(prior) ? prior.slice(-PROMPT_INBOX_MAX_MESSAGES) : []) {
-    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 上游节点已收到'))
+  for (const message of priorShown) {
+    lines.push(formatInboxMessageLine(message, '来自流程收件箱 · 上游节点已收到', { runDir }))
   }
   if (lines.length === 0) return ''
-  return [
-    '以下消息由外部发进本流程的收件箱（按到达时间排序；单条已按上限截断）。',
-    ...lines,
-  ].join('\n')
+  const hasPointer = [...freshShown, ...priorShown]
+    .some(message => message && typeof message.bodyPath === 'string' && isSafeInboxBodyPath(message.bodyPath))
+  const intro = hasPointer
+    ? '以下消息由外部发进本流程的收件箱（按到达时间排序；带「全文在 …」的消息只放了头部，'
+      + '必须先用 read 工具读完全文再作答）。'
+    : '以下消息由外部发进本流程的收件箱（按到达时间排序；单条正文即全文）。'
+  return [intro, ...lines].join('\n')
 }
 
 /**
@@ -418,9 +495,17 @@ export function buildFollowupPayload({ text, runId, nodeId, from = 'flow-studio'
   }
 }
 
-/** 外部消息投进会话时的正文（带来源标记，避免模型误以为是用户当前轮输入）。 */
-export function inboundSessionText({ from, text }) {
-  return `[流程收件箱 · 来自 ${clipCodePoints(from, MESSAGE_FROM_MAX_CHARS)}]\n${clipCodePoints(text, MESSAGE_BODY_MAX_CHARS)}`
+/**
+ * 外部消息投进会话时的正文（带来源标记，避免模型误以为是用户当前轮输入）。
+ *
+ * 0.11.1：长正文已落盘时，注入文本同样给「必须读全文」的指针——否则活会话里的
+ * 节点也会把头部当成全文（这正是设计 run 误判「原文不完整」的原因）。
+ */
+export function inboundSessionText({ from, text, bodyPath, bodyChars, runDir } = {}) {
+  const head = `[流程收件箱 · 来自 ${clipCodePoints(from, MESSAGE_FROM_MAX_CHARS)}]`
+  const body = clipCodePoints(text, MESSAGE_BODY_HARD_MAX_CHARS)
+  if (typeof bodyPath !== 'string' || !isSafeInboxBodyPath(bodyPath)) return `${head}\n${body}`
+  return `${head}\n${body}\n${formatInboxBodyPointer({ bodyPath, bodyChars, runDir })}`
 }
 
 /** 回复正文的前缀：告诉接收方这条消息来自哪个流程 / 哪个节点。 */
@@ -431,7 +516,10 @@ export function replyMarker({ flowName, nodeTitle }) {
 }
 
 /** 构造 run 级 `message/in` 事件（字段与 runlog 白名单一致）。 */
-export function buildMessageInEvent({ id, from, text, targetNodeId, replyKind }, { traceId } = {}) {
+export function buildMessageInEvent({
+  id, from, text, targetNodeId, replyKind, bodyPath, bodyChars,
+}, { traceId } = {}) {
+  const safeBodyPath = typeof bodyPath === 'string' && isSafeInboxBodyPath(bodyPath) ? bodyPath : null
   return {
     v: 1,
     kind: 'message/in',
@@ -442,6 +530,8 @@ export function buildMessageInEvent({ id, from, text, targetNodeId, replyKind },
       text: clipCodePoints(text, MESSAGE_EVENT_TEXT_MAX_CHARS),
       ...(targetNodeId ? { targetNodeId } : {}),
       ...(replyKind ? { replyKind } : {}),
+      ...(safeBodyPath ? { bodyPath: safeBodyPath } : {}),
+      ...(safeBodyPath && Number.isInteger(bodyChars) && bodyChars > 0 ? { bodyChars } : {}),
     },
   }
 }
@@ -581,6 +671,8 @@ async function recordInbound(deps, runId, record) {
     text: record.text,
     targetNodeId: record.targetNodeId,
     replyKind,
+    bodyPath: record.bodyPath,
+    bodyChars: record.bodyChars,
   }, { traceId: messageTraceId(runId) }))
 }
 
@@ -623,15 +715,41 @@ export async function deliverInboundMessage(deps, runId, body) {
 
   const messageId = `m-${randomUUID()}`
   const createdAt = isoOf(new Date())
+  const runDir = resolve(deps.runsRoot, runId)
+  const bodyChars = Array.from(input.text).length
+
+  // 0.11.1：长正文全文落盘，事件 / messages.jsonl / run.json.input 只放头部。
+  // 落盘失败**不丢消息**：降级为「保留可读头部 + warn」，返回体带 bodySpillError。
+  let bodyPath
+  let bodySpillError
+  let storedText = input.text
+  if (bodyChars > INBOX_SPILL_THRESHOLD_CHARS) {
+    try {
+      const written = await writeRunInboxBody(deps.runsRoot, runId, messageId, input.text)
+      bodyPath = written.path
+      storedText = clipCodePoints(input.text, INBOX_SPILL_THRESHOLD_CHARS)
+    } catch (error) {
+      const reason = error && error.message ? error.message : '写入失败'
+      bodySpillError = `正文 ${bodyChars} 字未落盘（${reason}）；本次只保留前 ${MESSAGE_EVENT_TEXT_MAX_CHARS} 字`
+      logWarn(deps, `flow-studio: ${bodySpillError}（${runId}/${messageId}）`)
+      storedText = clipCodePoints(input.text, MESSAGE_EVENT_TEXT_MAX_CHARS)
+    }
+  }
+  const spillFields = {
+    ...(bodyPath ? { bodyPath, bodyChars } : {}),
+    ...(bodySpillError ? { bodySpillError } : {}),
+  }
+
   const record = {
     v: 1,
     id: messageId,
     direction: 'in',
     ts: createdAt,
     from: input.from,
-    text: input.text,
+    text: storedText,
     targetNodeId: target.nodeId,
     status: 'pending',
+    ...(bodyPath ? { bodyPath, bodyChars } : {}),
     ...(input.reply ? { reply: input.reply, replyKind: input.reply.kind } : {}),
   }
 
@@ -643,7 +761,14 @@ export async function deliverInboundMessage(deps, runId, body) {
       // pending 的 run 走启动输入。显式记 warn，避免静默丢消息。
       logWarn(deps, 'flow-studio: 没有可用的 agents 服务，收件箱消息改为入队 / 启动输入')
     } else {
-      const delivered = await deliverToAgentSession(agents, sessionId, inboundSessionText(input), {
+      const sessionText = inboundSessionText({
+        from: input.from,
+        text: storedText,
+        bodyPath,
+        bodyChars,
+        runDir,
+      })
+      const delivered = await deliverToAgentSession(agents, sessionId, sessionText, {
         runId,
         nodeId: target.nodeId,
         from: input.from,
@@ -667,6 +792,7 @@ export async function deliverInboundMessage(deps, runId, body) {
         targetNodeId: target.nodeId,
         mode: delivered.mode,
         sessionId,
+        ...spillFields,
       }
     }
   }
@@ -678,7 +804,7 @@ export async function deliverInboundMessage(deps, runId, body) {
   if (meta.status === 'running' || meta.started === true) {
     record.status = 'pending'
     await recordInbound(deps, runId, record)
-    return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'queued' }
+    return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'queued', ...spillFields }
   }
 
   record.status = 'pending'
@@ -686,11 +812,12 @@ export async function deliverInboundMessage(deps, runId, body) {
   await appendRunInputMessages(deps.runsRoot, runId, [{
     id: messageId,
     from: input.from,
-    text: input.text,
+    text: storedText,
     at: createdAt,
     targetNodeId: target.nodeId,
+    ...(bodyPath ? { bodyPath, bodyChars } : {}),
   }])
-  return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'started' }
+  return { ok: true, messageId, targetNodeId: target.nodeId, mode: 'started', ...spillFields }
 }
 
 /**
@@ -725,10 +852,20 @@ export async function consumeInboxForNode(deps, runId, nodeId, options = {}) {
       text: typeof item.text === 'string' ? item.text : '',
       targetNodeId: typeof item.targetNodeId === 'string' ? item.targetNodeId : nodeId,
       status: 'pending',
+      // 0.11.1：启动输入里的全文指针要透传，否则重启 / 续跑后节点只看得到头部。
+      ...(typeof item.bodyPath === 'string' && isSafeInboxBodyPath(item.bodyPath)
+        ? {
+          bodyPath: item.bodyPath,
+          ...(Number.isInteger(item.bodyChars) && item.bodyChars > 0 ? { bodyChars: item.bodyChars } : {}),
+        }
+        : {}),
     })
   }
   const selected = selectPromptMessages(messages, nodeId)
-  const section = buildPromptInboxSection(selected)
+  const section = buildPromptInboxSection({
+    ...selected,
+    runDir: resolve(deps.runsRoot, runId),
+  })
   // 本节点要处理的消息全部标记 delivered（提示词里只展示前 5 条，其余也已消费）。
   for (const message of messages.filter(item => item.direction === 'in'
     && item.status === 'pending' && item.targetNodeId === nodeId)) {
@@ -791,7 +928,14 @@ export async function deliverOutboundReply(deps, input) {
   const meta = await readRunMeta(deps.runsRoot, runId)
   if (!meta) throw new RunError(404, 'runId', 'run 不存在')
 
-  const text = clipCodePoints(typeof input.text === 'string' ? input.text : '', MESSAGE_BODY_MAX_CHARS)
+  // 0.11.1：出站回复同样不再静默截断到 4000——超硬上限直接报可读错误。
+  const rawText = typeof input.text === 'string' ? input.text : ''
+  const rawChars = Array.from(rawText).length
+  if (rawChars > MESSAGE_BODY_HARD_MAX_CHARS) {
+    throw new RunError(400, 'text', `回复正文 ${rawChars} 字超过上限 ${MESSAGE_BODY_HARD_MAX_CHARS} 字，请拆成多条`)
+  }
+  // 不再按 4000 截断：投递用全文（事件侧 message/out 仍按 2000 字留审计，那是展示上限）。
+  const text = rawText
   if (text.trim() === '') throw new RunError(400, 'text', '回复正文不能为空')
 
   let inReplyTo = typeof input.inReplyTo === 'string' && input.inReplyTo !== '' ? input.inReplyTo : undefined

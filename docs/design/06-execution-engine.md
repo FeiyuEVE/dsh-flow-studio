@@ -657,16 +657,20 @@ v0.7 的推荐路径是**内建 supervision**：runtime 的唯一调度器轮询
 
 | kind | data 字段（白名单） | 上限 / 归一化 |
 |---|---|---|
-| `message/in` | `id`、`from`、`text`、`targetNodeId?`、`replyKind?` | `from` ≤200 字符；`text` 按码点截断到 2000；`targetNodeId` 必须是合法节点 id；`replyKind` ∈ session / http / none |
-| `message/out` | `id`、`inReplyTo?`、`text`、`nodeId?`、`delivery` | `text` 按码点截断到 2000；`delivery` ∈ session / http / local |
+| `message/in` | `id`、`from`、`text`、`targetNodeId?`、`replyKind?`、`bodyPath?`、`bodyChars?` | `from` ≤200 字符；`text` 按码点截断到 2000（长正文时只是头部）；`bodyPath` 必须是 `inbox/<文件名>.md` 的安全相对路径；`bodyChars` 是 1..200000 的整数；`targetNodeId` 必须是合法节点 id；`replyKind` ∈ session / http / none |
+| `message/out` | `id`、`inReplyTo?`、`text`、`nodeId?`、`delivery`、`bodyPath?`、`bodyChars?` | `text` 按码点截断到 2000；`delivery` ∈ session / http / local；`bodyPath` / `bodyChars` 与 `message/in` 同一判据 |
 
 `EVENT_KINDS`（05 §2 的 17 种基础契约）保持冻结；扩展事件各自独立导出、谁也不追加进 `EVENT_KINDS`：
 收件箱是 `INBOX_EVENT_KINDS`（§16.3）、节点自审是 `NODE_STATUS_EVENT_KINDS`（§19）、状态机转移观测是
-`MACHINE_EVENT_KINDS`（08 §7），校验器接受这几个数组的并集。HTTP 入口的正文上限是 4000 字符，落事件时再截到 2000。
+`MACHINE_EVENT_KINDS`（08 §7），校验器接受这几个数组的并集。HTTP 入口的正文硬上限是 200000 字符（超过返回可读 400）；
+事件里仍只放 ≤2000 字的头部，全文在 `inbox/<messageId>.md`，靠 `bodyPath` / `bodyChars` 指回。
 
 ### 16.4 消息路由表（`POST /api/flow-studio/runs/<runId>/messages`）
 
-请求体：`{ from, text, nodeId?, reply? }`（`from` ≤200、`text` ≤4000 必填）。
+请求体：`{ from, text, nodeId?, reply? }`（`from` ≤200；`text` 必填、≤200000 字符）。
+正文 ≤1200 字符时全文进提示词；>1200 字符时全文落盘 `runs/<runId>/inbox/<messageId>.md`
+（目录 0700、文件 0600），事件 / `messages.jsonl` / `run.json.input` 只保留 1200 字头部 +
+`bodyPath` / `bodyChars`；>200000 字符返回 400（「正文 N 字超过上限 200000 字，请拆成多条或改用文件」），不静默截断。
 
 目标节点解析顺序：
 
@@ -695,7 +699,16 @@ v0.7 的推荐路径是**内建 supervision**：runtime 的唯一调度器轮询
 - **prior**：之前已投递过（`injected` / `resumed` / `delivered`）的消息，**入口节点收到的消息会继续出现
   在后续每个阶段节点里**（最多 5 条）。
 
-有界口径：最多 5 条、每条 ≤1200 字，行格式 `- [ts · from]（来自流程收件箱 · …）正文`。
+有界口径：最多 5 条、每条 ≤1200 字头部，行格式 `- [ts · from]（来自流程收件箱 · …）正文`。
+带 `bodyPath` 的消息在下一行追加显式指针：
+
+```
+  ⚠ 正文共 5000 字，此处只放头部；**全文在 inbox/m-xxx.md（绝对路径 …/inbox/m-xxx.md），必须先用 read 工具读完再作答**
+```
+
+相对路径是落盘事实（事件 / `messages.jsonl` / `run.json.input` 都只存它），绝对路径由
+`runsRoot + runId + 校验过的 bodyPath` 拼出，供节点会话（cwd 是工作区、不是 run 目录）直接 `read`。
+没有 `bodyPath` 的消息正文本来就是全文（≤1200 字），不出现指针。
 本节点要处理的 fresh 消息在拼完提示词后**全部标记 `delivered`**（即使只展示了前 5 条，其余也算已消费）；
 提示词总预算仍是 8000 字，超限时「输出格式」段硬保留。
 
@@ -737,8 +750,10 @@ v0.7 的推荐路径是**内建 supervision**：runtime 的唯一调度器轮询
 
 ### 16.8 安全与兼容
 
-- 外部文本一律按码点截断：请求体 4000、事件 2000、提示词单条 1200、来源 200；消息文件 8 MiB、
-  sessions.json 512 KiB 为最后闸门。
+- 外部正文不再静默截断：≤1200 字全文进提示词；>1200 字全文落 `inbox/<messageId>.md`（目录 0700、
+  文件 0600），事件 / messages.jsonl 只放 ≤2000 字头部 + `bodyPath` / `bodyChars`；>200000 字返回可读 400。
+  落盘失败时消息仍然入库（保留 ≤2000 字头部），记 `warn` 并在投递返回体里带 `bodySpillError`。
+  来源标识 ≤200 字符；消息文件 8 MiB、sessions.json 512 KiB 为最后闸门。
 - URL 只允许 `http:` / `https:`；`tokenEnv` 只接受合法环境变量名，值只从 `process.env` 读取。
 - 所有路径都是 run 目录内的固定相对文件名（`messages.jsonl`、`sessions.json`），
   不拼外部输入；runId 继续走 `checkRunId()`。

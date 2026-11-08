@@ -32,8 +32,8 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import * as worktreeModule from './worktree.js'
 import { validateFlowForRun } from './engine.js'
 import {
-  REPLY_TOKEN_ENV_PREFIX, deliverInboundMessage, deliverOutboundReply, redactSecrets,
-  validateReplyTargetStrict,
+  MESSAGE_BODY_HARD_MAX_CHARS, REPLY_TOKEN_ENV_PREFIX, deliverInboundMessage, deliverOutboundReply,
+  redactSecrets, validateReplyTargetStrict,
 } from './inbox.js'
 import { normalizeExecutor } from './executor.js'
 import { NODE_KIND } from './model.js'
@@ -2398,7 +2398,7 @@ export function createFlowTools(deps) {
         properties: {
           runId: { type: 'string', description: '目标 run id；省略 = 当前会话启动的最新 run，再退回最近一次 run' },
           nodeId: { type: 'string', description: '目标阶段节点 id（可选；不传则按「当前节点 → 入口节点」推断）' },
-          text: { type: 'string', description: '消息正文（必填，≤4000 字符，超过按码点截断）' },
+          text: { type: 'string', description: `消息正文（必填）。无实际长度限制：≤1200 字直接进节点提示词；更长的正文会落盘（inbox/<messageId>.md），提示词里给出全文路径，节点会自己读完。硬上限 ${MESSAGE_BODY_HARD_MAX_CHARS} 字，超过直接报错而不是截断。` },
           reply: {
             type: 'object',
             description: '节点回复消息时要投递到的目标（可选）',
@@ -2445,7 +2445,7 @@ export function createFlowTools(deps) {
         let nodeId
         let reply
         try {
-          text = optionalString(args, 'text', { max: 4000 })
+          text = optionalString(args, 'text', { max: MESSAGE_BODY_HARD_MAX_CHARS })
           if (text === undefined) {
             throw new ParamError('缺少必填参数 text', '传要发进流程的消息正文（≤4000 字符）。')
           }
@@ -2554,9 +2554,9 @@ export function createFlowTools(deps) {
         let text
         let inReplyTo
         try {
-          text = optionalString(args, 'text', { max: 4000 })
+          text = optionalString(args, 'text', { max: MESSAGE_BODY_HARD_MAX_CHARS })
           if (text === undefined) {
-            throw new ParamError('缺少必填参数 text', '传要回复的正文（≤4000 字符）。')
+            throw new ParamError('缺少必填参数 text', `传要回复的正文（硬上限 ${MESSAGE_BODY_HARD_MAX_CHARS} 字）。`)
           }
           inReplyTo = optionalString(args, 'inReplyTo', { max: 128 })
         } catch (error) {

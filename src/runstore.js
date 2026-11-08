@@ -24,8 +24,8 @@ import { hostname } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
-  MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, checkMemberId, checkRunId, computeProgress,
-  isInstanceScopedEnd,
+  MAX_BATCH_EVENTS, MAX_EVENT_BYTES, MAX_RUN_EVENTS, MESSAGE_BODY_CHARS_MAX, MESSAGE_BODY_DIR,
+  checkMemberId, checkRunId, computeProgress, isInstanceScopedEnd, isSafeInboxBodyPath,
   normalizeEvent, progressFromNodeStates,
   // 08 §7：事件 kind 白名单与 runlog **同源**（基础 17 种 + 各扩展白名单），
   // 这里不再手写第二份字符串——手抄那份曾经漏掉 `node/status`，过滤直接 400。
@@ -343,6 +343,13 @@ function normalizeRunInput(source) {
     }
     if (typeof item.targetNodeId === 'string' && checkRunId(item.targetNodeId)) {
       entry.targetNodeId = item.targetNodeId
+    }
+    // 0.11.1：启动输入也要带全文指针，否则重启 / 续跑后节点只看得到头部。
+    if (typeof item.bodyPath === 'string' && isSafeInboxBodyPath(item.bodyPath)) {
+      entry.bodyPath = item.bodyPath
+      if (Number.isInteger(item.bodyChars) && item.bodyChars > 0 && item.bodyChars <= MESSAGE_BODY_CHARS_MAX) {
+        entry.bodyChars = item.bodyChars
+      }
     }
     messages.push(entry)
   }
@@ -2857,12 +2864,25 @@ function normalizeMessageRecord(raw) {
     if (typeof raw.replyKind === 'string' && MESSAGE_REPLY_KIND_SET.has(raw.replyKind)) {
       record.replyKind = raw.replyKind
     }
+    // 0.11.1：长正文落盘后 text 只是头部；指针与全文字数必须穿过读写往返。
+    if (typeof raw.bodyPath === 'string' && isSafeInboxBodyPath(raw.bodyPath)) {
+      record.bodyPath = raw.bodyPath
+      if (Number.isInteger(raw.bodyChars) && raw.bodyChars > 0 && raw.bodyChars <= MESSAGE_BODY_CHARS_MAX) {
+        record.bodyChars = raw.bodyChars
+      }
+    }
   } else {
     record.text = clipText(typeof raw.text === 'string' ? raw.text : '', RUN_MESSAGE_TEXT_MAX_CHARS)
     const replyTo = optionalText(raw.inReplyTo, 128)
     if (replyTo) record.inReplyTo = replyTo
     if (typeof raw.nodeId === 'string' && checkRunId(raw.nodeId)) record.nodeId = raw.nodeId
     if (typeof raw.delivery === 'string' && raw.delivery.length <= 32) record.delivery = raw.delivery
+    if (typeof raw.bodyPath === 'string' && isSafeInboxBodyPath(raw.bodyPath)) {
+      record.bodyPath = raw.bodyPath
+      if (Number.isInteger(raw.bodyChars) && raw.bodyChars > 0 && raw.bodyChars <= MESSAGE_BODY_CHARS_MAX) {
+        record.bodyChars = raw.bodyChars
+      }
+    }
   }
   if (typeof raw.status === 'string' && MESSAGE_STATUS_SET.has(raw.status)) record.status = raw.status
   else record.status = direction === 'in' ? 'pending' : 'delivered'
@@ -2984,6 +3004,41 @@ export async function readRunMessages(runsRoot, runId, options = {}) {
   const total = merged.messages.length
   const messages = total > limit ? merged.messages.slice(total - limit) : merged.messages
   return { messages, total, truncated: total > messages.length, skipped: merged.skipped }
+}
+
+/**
+ * 06 §16（0.11.1）：把一条入站消息的**全文**写到 `runs/<runId>/inbox/<messageId>.md`。
+ *
+ * 为什么单独一个函数：目录 0700 / 文件 0600 与原子写（临时文件 + rename）的纪律
+ * 只应该有一份实现（`ensureDirMode` / `writeTempAtomic` 都在本模块）。inbox.js
+ * 只负责「要不要落盘」的策略，落盘细节不自己拼 fs。
+ *
+ * messageId 只参与文件名、仍走 `checkRunId`（`m-<uuid>` 天然满足字符集）。
+ *
+ * @returns {Promise<{ path: string, chars: number, bytes: number }>} path 为 run 目录内相对路径
+ */
+export async function writeRunInboxBody(runsRoot, runId, messageId, text) {
+  const loc = requireLoc(runsRoot, runId)
+  const id = checkRunId(messageId)
+  if (!id) throw new RunError(400, 'messageId', 'messageId 不合法（不能用作落盘文件名）')
+  const body = typeof text === 'string' ? text : String(text ?? '')
+  const chars = Array.from(body).length
+  if (chars === 0) throw new RunError(400, 'text', '正文不能为空')
+  if (chars > MESSAGE_BODY_CHARS_MAX) {
+    throw new RunError(
+      400, 'text',
+      `正文 ${chars} 字超过上限 ${MESSAGE_BODY_CHARS_MAX} 字，请拆成多条或改用文件`,
+    )
+  }
+  const dir = join(loc.dir, MESSAGE_BODY_DIR)
+  await ensureDirMode(dir)
+  const file = join(dir, `${id}.md`)
+  await writeTempAtomic(file, body)
+  return {
+    path: `${MESSAGE_BODY_DIR}/${id}.md`,
+    chars,
+    bytes: Buffer.byteLength(body, 'utf8'),
+  }
 }
 
 /**

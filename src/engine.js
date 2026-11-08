@@ -2049,6 +2049,9 @@ class FlowEngine {
         text: typeof item.text === 'string' ? item.text : '',
         at: typeof item.at === 'string' ? item.at : isoOf(this.now()),
         ...(typeof item.targetNodeId === 'string' ? { targetNodeId: item.targetNodeId } : {}),
+        // 0.11.1：启动输入的全文指针要带进提示词（inbox.consumeInboxForNode 会消费）。
+        ...(typeof item.bodyPath === 'string' ? { bodyPath: item.bodyPath } : {}),
+        ...(Number.isInteger(item.bodyChars) ? { bodyChars: item.bodyChars } : {}),
       }))
   }
 
@@ -3851,6 +3854,40 @@ class FlowEngine {
   }
 
   /**
+   * 0.11.1：给节点会话设置一个可见标题（`流程名 · 节点标题`）。
+   *
+   * 为什么必须显式设置：DSH 的 `sessionTitle` 只把**人类 `user/message`** 当标题来源
+   * （内置回退与 provider 都如此），而流程节点的提示词是 `source.kind='flow-studio'`
+   * 的注入消息，永远不符合条件 —— 结果画布/会话列表里全是「未命名」。
+   *
+   * 用 `sessionTitle.rename(session, title)` 写一条 `user` 来源标题：它会 pin 住该会话，
+   * 后续不再被自动修订（对流程会话正是想要的语义）。
+   * 标题是展示层：服务不可用、会话不活、字段超限一律只 warn，绝不影响节点执行。
+   */
+  async _applyNodeSessionTitle(sessionId, node, flow) {
+    try {
+      if (!this.ctx || typeof this.ctx.get !== 'function') return
+      const service = this.ctx.get('sessionTitle')
+      if (!service || typeof service.rename !== 'function') return
+      const store = this.ctx.get('sessions')
+      if (!store || typeof store.get !== 'function') return
+      const session = store.get(sessionId)
+      if (!session) return
+      const flowName = flow && typeof flow.name === 'string' ? flow.name.trim() : ''
+      const nodeTitle = node && typeof node.title === 'string' && node.title.trim() !== ''
+        ? node.title.trim()
+        : (node && typeof node.id === 'string' ? node.id : 'flow-studio 节点')
+      let title = flowName === '' ? nodeTitle : `${flowName} · ${nodeTitle}`
+      // 标题上限按码点收口，避免超长流程名把整条标题吃掉。
+      const chars = Array.from(title)
+      if (chars.length > 40) title = `${chars.slice(0, 39).join('')}…`
+      service.rename(session, title)
+    } catch (error) {
+      this.log('warn', `flow-studio: 给节点会话设置标题失败（${sessionId}，不影响执行）：${error && error.message ? error.message : String(error)}`)
+    }
+  }
+
+  /**
    * 07 §3.1：用 `agents.create` 新建一个顶层节点主管会话。
    * `agentOptions` 现在**必须**是成对的 provider + model（v0.9.2）：解析不出来就
    * 在创建之前抛 503（`_resolveCreateAgentOptions`），不创建注定首轮失败的会话。
@@ -3919,6 +3956,10 @@ class FlowEngine {
         // 记录会话 id 失败不该阻断执行。
       }
     }
+    // 0.11.1：给节点会话一个可见标题。DSH 的会话标题只从「人类 user/message」派生
+    // （fallback 与 provider 都不认非人类来源），而流程节点的提示词是
+    // `source.kind='flow-studio'` 的注入消息 —— 不显式命名，会话列表里全是「未命名」。
+    await this._applyNodeSessionTitle(sessionId, node, flow)
     // 07 §11.1：agents.create 成功后立刻登记节点闹钟（attempt 结束 / run 收尾再注销）。
     this._registerNodeSupervision(runId, node, attempt, sessionId)
     // v0.9.2（任务 3）：会话一建好就落 sessions.json —— 即使本轮 prompt 失败（节点

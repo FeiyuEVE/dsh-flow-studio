@@ -2301,6 +2301,7 @@ try {
     composition = null,
   } = {}) {
     const created = []
+    const renamed = []
     const composed = []
     const presetResolved = []
     const presetMounted = []
@@ -2373,6 +2374,13 @@ try {
             },
           }
         }
+        // 0.11.1：会话标题服务与会话存储（引擎创建会话后会给节点会话显式命名）。
+        if (name === 'sessionTitle') {
+          return { rename: (session, title) => { renamed.push({ sessionId: session && session.id, title }) } }
+        }
+        if (name === 'sessions') {
+          return { get: id => ({ id }) }
+        }
         if (name !== 'agents') return undefined
         return {
           async create(options) {
@@ -2400,7 +2408,7 @@ try {
       },
     }
     return {
-      ctx, created, composed, presetResolved, presetMounted, resumed, failPresets,
+      ctx, created, renamed, composed, presetResolved, presetMounted, resumed, failPresets,
       get setupCalls() { return setupCalls },
       setupSpy,
     }
@@ -2508,7 +2516,7 @@ try {
     await saveFlow(flow)
     const run = await makeRun('flow-model-default', 1)
     const engineRef = { value: null }
-    const { ctx, created } = strictProviderHost(engineRef)
+    const { ctx, created, renamed } = strictProviderHost(engineRef)
     const engine = createEngine({ runsRoot, flowsRoot, ctx })
     engineRef.value = engine
     await engine.start(run.id)
@@ -2516,6 +2524,10 @@ try {
     A.equal(final.status, 'done')
     A.equal(created.length, 1)
     A.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
+    // 0.11.1：会话建好后必须显式命名（DSH 只从「人类消息」派生标题，流程注入的不算）。
+    A.equal(renamed.length, 1, '每个节点会话都要命名一次')
+    A.equal(renamed[0].sessionId, created[0].sessionId, '命名必须落在刚创建的会话上')
+    A.match(renamed[0].title, /业务$/, `标题应包含节点标题：${renamed[0].title}`)
   })
 
   await check('宿主没有 agentDefaultModel 且节点只有 model：503 可诊断失败，不创建注定失败的会话', async () => {

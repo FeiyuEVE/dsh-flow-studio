@@ -13,11 +13,11 @@
 
 import { EDGE_KIND, NODE_H, NODE_W } from '../model.js'
 
-/** 列距：节点宽 208 + 间隙 52。间隙是贝塞尔与打回端口的共用呼吸区。 */
+/** 列距：节点宽 232 + 间隙 52。间隙是贝塞尔与打回端口的共用呼吸区。 */
 export const COL_GAP = 52
-/** 一列的步进：208 + 52 = 260（DESIGN.md §6 的列距）。 */
+/** 一列的步进：232 + 52 = 284（0.11.2 放大后的列距，决策记录见 docs/plan/0.11.2-节点卡放大-需求.md）。 */
 export const COL_STEP = NODE_W + COL_GAP
-/** 8 列主干（开始 + 6 阶段 + 结束）的世界宽：7×260 + 208 = 2028。 */
+/** 8 列主干（开始 + 6 阶段 + 结束）的世界宽：7×284 + 232 = 2220。 */
 export const EIGHT_COL_WORLD_W = 7 * COL_STEP + NODE_W
 /** 适配全览的屏幕边距（px）。这是屏幕 px，不参与世界坐标换算。 */
 export const PAD = 48
@@ -344,9 +344,15 @@ export function hiddenColumnsOf(nodes, width, viewX, zoom) {
   return hidden
 }
 
-/** 缩放等级：只影响显示什么，不影响位置。低于 45% 就是「精简」档。 */
+/**
+ * 缩放等级：只影响显示什么，不影响位置。
+ *
+ * 0.11.2 解冻后标题 15px，阈值按「渲染后文字实际大小不变」重算：
+ * 旧 far/mid 边界 0.45/0.6 × 14px = 6.3px / 8.4px；
+ * 解 15z = 6.3 → z = 0.42、15z = 8.4 → z = 0.56。
+ */
 export function lodOf(zoom) {
-  if (zoom < 0.45) return 'far'
-  if (zoom < 0.6) return 'mid'
+  if (zoom < 0.42) return 'far'
+  if (zoom < 0.56) return 'mid'
   return 'near'
 }

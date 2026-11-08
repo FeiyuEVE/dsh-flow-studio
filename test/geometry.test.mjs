@@ -30,22 +30,22 @@ function reject(id, from, to) {
 
 console.log('geometry.js')
 
-check('节点尺寸是 208×96，主从节点 116', () => {
-  assert.equal(NODE_W, 208)
-  assert.equal(NODE_H, 96)
-  assert.equal(nodeHeight(makeNode('a', 0)), 96)
-  assert.equal(nodeHeight({ ...makeNode('a', 0), mode: 'team', team: [{ name: 'x' }] }), 116)
-  assert.equal(COL_STEP, 260)
+check('节点尺寸是 232×108，主从节点 128', () => {
+  assert.equal(NODE_W, 232)
+  assert.equal(NODE_H, 108)
+  assert.equal(nodeHeight(makeNode('a', 0)), 108)
+  assert.equal(nodeHeight({ ...makeNode('a', 0), mode: 'team', team: [{ name: 'x' }] }), 128)
+  assert.equal(COL_STEP, 284)
 })
 
-check('worldBounds 是唯一世界边界来源：8 列主干宽 2028', () => {
+check('worldBounds 是唯一世界边界来源：8 列主干宽 2220', () => {
   const bounds = worldBounds(defaultFlow().nodes)
-  assert.equal(bounds.w, 2028, '开始到结束的真实包围盒应为 2028')
-  assert.equal(EIGHT_COL_WORLD_W, 2028, '导出的 8 列常量也必须等于 2028')
+  assert.equal(bounds.w, 2220, '开始到结束的真实包围盒应为 2220')
+  assert.equal(EIGHT_COL_WORLD_W, 2220, '导出的 8 列常量也必须等于 2220')
   assert.equal(bounds.minX, 40)
-  assert.equal(bounds.maxX, 2068)
-  // 出厂模板的阶段节点是 team 模式（主管 + 3 名成员），卡高 116；start/end 仍是 96。
-  assert.equal(bounds.h, 116)
+  assert.equal(bounds.maxX, 2260)
+  // 出厂模板的阶段节点是 team 模式（主管 + 3 名成员），卡高 128；start/end 仍是 108。
+  assert.equal(bounds.h, 128)
 })
 
 check('fitView 用屏幕 px 边距与 15% 地板，不再有第二套数学', () => {
@@ -61,7 +61,7 @@ check('fitView 用屏幕 px 边距与 15% 地板，不再有第二套数学', ()
   assert.equal(fit.hiddenColumns, 0)
 })
 
-check('30 节点串行链：16.78% 装得下，600px 视口触发 15% 地板并报隐藏列', () => {
+check('30 节点串行链：15.35% 装得下，600px 视口触发 15% 地板并报隐藏列', () => {
   const chain = Array.from({ length: 30 }, (_, index) => makeNode('n' + index, index * COL_STEP))
   assert.equal(worldBounds(chain).w, 29 * COL_STEP + NODE_W)
   const wide = fitView(chain, 1396, 824)
@@ -73,7 +73,7 @@ check('30 节点串行链：16.78% 装得下，600px 视口触发 15% 地板并�
   assert.equal(narrow.z, FIT_MIN)
   assert.equal(narrow.clamped, true)
   assert.ok(narrow.hiddenColumns > 0, '低于地板时必须给出「还有 N 列在视野外」')
-  assert.equal(narrow.hiddenColumns, 16)
+  assert.equal(narrow.hiddenColumns, 17)
 })
 
 check('航道槽位 6 个，入槽位与出槽位镜像', () => {

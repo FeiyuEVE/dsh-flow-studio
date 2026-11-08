@@ -50,7 +50,8 @@ bindReact(React)
 const model = await import('../src/model.js')
 const {
   FlowCanvas, canConnectNodes, createDragHandlers, edgeAriaLabel, edgeListText, guardStructureEdit,
-  interactionState, isEdgeActive, lodText, nodeAriaLabel, snapToGridEnabled, stateShape, wheelPanDelta,
+  interactionState, isEdgeActive, lodText, nodeAriaLabel, openNodeSession, sessionIdOf,
+  snapToGridEnabled, stateShape, wheelPanDelta,
 } = await import('../src/client/canvas.js')
 const { SNAP_GRID, lodOf, rejectPathRects, snapPosition } = await import('../src/client/geometry.js')
 const { Inspector, nextActiveSkill } = await import('../src/client/inspector.js')
@@ -65,8 +66,8 @@ const { FlowStudioPage, runControlState } = await import('../src/client/page.js'
 const {
   RUN_LOCK_REASON, STOP_CONFIRM_DELAY_MS, activeRunViewOf, conflictTarget, createSaveQueue,
   deleteFlowRequest, firstErrorTarget, emptyGraphBlockReason, flowSavePayload, mergeSavedFlow,
-  progressOf, restartRunSequence, restoreFlowRequest, runEndAnnouncement, runPreflight, saveBodyFor,
-  saveStateAfterSuccess, startFailurePlan,
+  openSessionForNode, progressOf, restartRunSequence, restoreFlowRequest, runEndAnnouncement,
+  runPreflight, saveBodyFor, saveStateAfterSuccess, startFailurePlan,
 } = await import('../src/client/page.js')
 const {
   DRAWER_OPEN_HEIGHT, EVENT_FETCH_LIMIT, FsLogDrawer, HIDDEN_POLL_MS, LIVE_POLL_MS, MAX_POLL_MS,
@@ -164,6 +165,8 @@ check('0.10 R2 三键 aria-label 数量（7/8/8，END 只有两键）与 CSS 不
   assert.ok(/gap:2px/.test(toolsBlock), '.fs-node-tools gap 应为 2px')
   assert.ok(/padding:2px/.test(toolsBlock), '.fs-node-tools padding 应为 2px')
   assert.ok(/border:1px/.test(toolsBlock), '.fs-node-tools border 应为 1px')
+  // 0.11.2：卡放大不改工具条的浮出偏移；配合 .fs-node overflow:visible，三键仍完整露出。
+  assert.ok(/top:-14px/.test(toolsBlock), '.fs-node-tools 仍应从卡片顶边浮出（top:-14px）')
   const toolAt = CSS.indexOf('.fs-node-tool{')
   const toolBlock = CSS.slice(toolAt, CSS.indexOf('}', toolAt) + 1)
   assert.ok(/width:22px;height:22px/.test(toolBlock), '.fs-node-tool 应为 22×22 热区')
@@ -175,6 +178,85 @@ check('0.10 R2 三键 aria-label 数量（7/8/8，END 只有两键）与 CSS 不
   // :focus-within 与 focus-visible ring 保留（overflow:visible 后不再被裁）。
   assert.ok(CSS.includes('.fs-node:focus-within .fs-node-tools'), '缺少 focus-within 浮出规则')
   assert.ok(CSS.includes('.fs-node-tool:focus-visible'), '缺少工具按钮 focus ring')
+})
+
+// ── 0.11.2：节点卡「打开会话」入口 ─────────────────────────────────────────
+check('0.11.2：节点卡「打开会话」只在 run.sessions 有该节点时出现，回调收到 nodeId/sessionId', () => {
+  const nodeBlock = (html, id) => {
+    const at = html.indexOf('data-node-id="' + id + '"')
+    assert.ok(at >= 0, '找不到节点 ' + id)
+    const nextAt = html.indexOf('data-node-id="', at + 1)
+    return html.slice(at, nextAt > at ? nextAt : html.length)
+  }
+  const html = render(React.createElement(FlowCanvas, {
+    flow,
+    selection: null,
+    runSessions: { n_req: 'sess-n-req', n_dev: 'sess-n-dev' },
+    onOpenSession() {},
+    onSelect() {},
+    onMoveNode() {},
+    onAddEdge() {},
+    onAddNodeAt() {},
+  }))
+  // ① 有 session：按钮出现（只有两个节点有会话）。
+  assert.equal((html.match(/data-action="open-session"/g) || []).length, 2, '有会话的节点各一个入口')
+  assert.ok(html.includes('data-session-id="sess-n-req"'), '会话 id 要写进 data-*（可测的渲染标记）')
+  assert.ok(nodeBlock(html, 'n_req').includes('fs-node-tool-session'), '入口缺少稳定的 class 标记')
+  // ④ 无障碍：aria-label / title。
+  assert.ok(html.includes('aria-label="打开节点会话 sess-n-req"'), '按钮缺少 aria-label')
+  assert.ok(html.includes('title="在宿主里打开该节点的会话 sess-n-req"'), '按钮缺少 title')
+  // ② 无 session：完全不渲染按钮（不是渲染一个点了没反应的）。
+  assert.ok(!nodeBlock(html, 'n_start').includes('open-session'), '没有会话的节点不能出现空按钮')
+  assert.ok(!nodeBlock(html, 'n_plan').includes('open-session'), '不在 run.sessions 的节点不能出现按钮')
+
+  // ③ 点击回调收到的 nodeId / sessionId 正确（按钮 onClick 用的就是这个纯函数）。
+  const got = []
+  assert.equal(openNodeSession({
+    openSession: (nodeId, sessionId) => { got.push([nodeId, sessionId]); return true },
+  }, { id: 'n_req' }, 'sess-n-req'), true)
+  assert.deepEqual(got, [['n_req', 'sess-n-req']], '回调必须拿到节点 id 与会话 id')
+  assert.equal(openNodeSession({
+    openSession: () => { throw new Error('没有会话时不该调用宿主跳转') },
+  }, { id: 'n_req' }, ''), false, '空会话 id 不能触发跳转')
+
+  // run.sessions 的解析口径：缺失 / 非字符串都算「没有会话」。
+  assert.equal(sessionIdOf({ n_req: 'sess-n-req' }, 'n_req'), 'sess-n-req')
+  assert.equal(sessionIdOf({ n_req: 42 }, 'n_req'), '')
+  assert.equal(sessionIdOf(null, 'n_req'), '')
+})
+
+check('0.11.2：页面把 activity run 的 sessions 透传给画布，并复用宿主的 openSession', () => {
+  const pageHtml = render(React.createElement(FlowStudioPage, {
+    initialFlow: flow,
+    initialSkills: [],
+    initialRunView: {
+      run: {
+        id: 'run-sess', flowId: 'flow-test', name: '带会话的运行', status: 'running',
+        sessions: { n_dev: 'sess-page-dev' },
+      },
+      runs: [{
+        id: 'run-sess', flowId: 'flow-test', name: '带会话的运行', status: 'running',
+        sessions: { n_dev: 'sess-page-dev' },
+      }],
+      live: null,
+      events: [],
+      summary: null,
+      detail: null,
+    },
+  }))
+  assert.ok(pageHtml.includes('data-session-id="sess-page-dev"'), '页面必须把 run.sessions 透传到画布')
+  assert.ok(pageHtml.includes('aria-label="打开节点会话 sess-page-dev"'), '页面上的入口缺少 aria-label')
+
+  // 页面回调：只认当前 run.sessions 里的会话，并把解析后的 id 交给宿主 openSession。
+  const calls = []
+  assert.equal(openSessionForNode({ n_dev: 'sess-page-dev' }, 'n_dev', 'sess-page-dev',
+    id => { calls.push(id); return true }), true)
+  assert.deepEqual(calls, ['sess-page-dev'], 'openSession 必须收到解析后的会话 id')
+  assert.equal(openSessionForNode({ n_dev: 'sess-page-dev' }, 'n_dev', 'stale-session',
+    () => { throw new Error('过期会话 id 不能跳转') }), false, '卡片持有的旧 id 不能盖过 run.sessions')
+  assert.equal(openSessionForNode({ n_dev: 'sess-page-dev' }, 'n_req', '',
+    () => { throw new Error('没有会话的节点不能跳转') }), false)
+  assert.equal(openSessionForNode({ n_dev: 'sess-page-dev' }, 'n_dev', '', null), false, '宿主没有 openSession 时返回 false')
 })
 
 check('打回线超过 6 条：画 +N 汇总角标并提示已并入最外航道', () => {
@@ -233,7 +315,7 @@ check('检查器（节点）渲染出执行方式与 skills 选择器', () => {
   assert.ok(html.includes('连接到…'), '单指针连线入口没渲染')
   assert.ok(html.includes('到 方案设计'), '连线目标没有可读名字')
   assert.ok(html.includes('位置'), '可点按移动入口没渲染')
-  assert.ok(html.includes('X 300 · Y 220'), '当前坐标没显示')
+  assert.ok(html.includes('X 324 · Y 220'), '当前坐标没显示')
   assert.ok(html.includes('按住 Shift 步长 20px'), '微调步长提示没渲染')
   assert.ok(html.includes('>上<') && html.includes('>下<') && html.includes('>左<') && html.includes('>右<'), '四个方向按钮不齐')
 })
@@ -795,10 +877,10 @@ check('SSR 回退：静态画布带 data-* / aria / 连线列表，不是空 div
 })
 
 check('LOD 三档：阈值、文案与 CSS 挂钩', () => {
-  assert.equal(lodOf(0.449), 'far')
-  assert.equal(lodOf(0.45), 'mid')
-  assert.equal(lodOf(0.599), 'mid')
-  assert.equal(lodOf(0.6), 'near')
+  assert.equal(lodOf(0.419), 'far')
+  assert.equal(lodOf(0.42), 'mid')
+  assert.equal(lodOf(0.559), 'mid')
+  assert.equal(lodOf(0.56), 'near')
   assert.equal(lodText('near'), '完整视图')
   assert.equal(lodText('mid'), '紧凑视图')
   assert.equal(lodText('far'), '精简视图')
@@ -872,15 +954,15 @@ check('拖线端点规则：结束节点没有出边、开始节点不接受入�
 
 check('打回线仍走 6 槽位航道：端点 = 节点底缘 + 槽位，标签在水平段 24%', () => {
   const view = { x: 0, y: 220, z: 1 }
-  const fromRect = { x: 300, y: 0, w: 208, h: 96 }
-  const toRect = { x: 560, y: 0, w: 208, h: 116 }
+  const fromRect = { x: 300, y: 0, w: 232, h: 108 }
+  const toRect = { x: 560, y: 0, w: 232, h: 128 }
   const path = rejectPathRects(fromRect, toRect, 240, 24, -72)
-  assert.equal(path.from.x, 300 + 104 + 24, '出端口应落在节点底缘 + 出槽位')
-  assert.equal(path.from.y, 96, '出端口在源节点底缘')
-  assert.equal(path.to.x, 560 + 104 - 72, '入槽位应落在节点底缘 + 入槽位')
-  assert.equal(path.to.y, 116, '入端口在目标节点底缘（主从节点更高）')
+  assert.equal(path.from.x, 300 + 116 + 24, '出端口应落在节点底缘 + 出槽位')
+  assert.equal(path.from.y, 108, '出端口在源节点底缘')
+  assert.equal(path.to.x, 560 + 116 - 72, '入槽位应落在节点底缘 + 入槽位')
+  assert.equal(path.to.y, 128, '入端口在目标节点底缘（主从节点更高）')
   assert.equal(path.laneY, 240)
-  assert.ok(path.d.includes('L 582 240'), '水平段应落在给定航道（目标端 - 折角半径）')
+  assert.ok(path.d.includes('L 594 240'), '水平段应落在给定航道（目标端 - 折角半径）')
   assert.equal(path.label.y, 236)
   assert.equal(view.y, 220)
 })

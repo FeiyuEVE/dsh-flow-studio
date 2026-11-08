@@ -17,7 +17,7 @@ import {
   applyNodeChanges, getSmoothStepPath, useInternalNode, useReactFlow,
 } from '@xyflow/react'
 
-import { EDGE_KIND, EXEC_MODE, NODE_KIND, NODE_W } from '../model.js'
+import { EDGE_KIND, EXEC_MODE, NODE_H, NODE_KIND, NODE_W } from '../model.js'
 import {
   COL_STEP, FIT_MAX, FIT_MIN, SNAP_GRID, assignRejectLanes, hiddenColumnsOf, lodOf,
   nextPath, nodeHeight, rejectPath, rejectPathRects, snapPosition,
@@ -101,7 +101,7 @@ function summaryOf(node) {
 
 /** 成员角色短名：卡片一行只放得下几个字，完整内容在 title / aria-label 里。 */
 function roleShort(role) {
-  // 208px 卡片一行放得下「主 + 3 个成员」，角色取 2 个字；完整角色在 title / aria-label 里。
+  // 232px 卡片一行放得下「主 + 3 个成员」，角色取 2 个字；完整角色在 title / aria-label 里。
   return String(role || '').split(/[。，,·\s]/)[0].slice(0, 2)
 }
 
@@ -214,12 +214,38 @@ function makeNodeActions(props, lockedRef) {
       if (createdId && props.onAddEdge) props.onAddEdge(node.id, createdId)
       if (createdId && props.onSelect) props.onSelect({ kind: 'node', id: createdId })
     },
+    openSession: (nodeId, sessionId) => {
+      if (props.onOpenSession) props.onOpenSession(nodeId, sessionId)
+    },
   }
+}
+
+/**
+ * 节点卡「打开会话」按钮的点击动作（静态回退 / React Flow / 测试共用同一口径）。
+ * 没有会话 id 或没有回调时返回 false —— 不渲染按钮由调用方按 sessionId 先判。
+ */
+export function openNodeSession(actions, node, sessionId) {
+  const id = sessionId === undefined || sessionId === null ? '' : String(sessionId)
+  if (id === '') return false
+  if (!actions || typeof actions.openSession !== 'function') return false
+  const nodeId = node && typeof node === 'object' ? String(node.id || '') : String(node || '')
+  if (nodeId === '') return false
+  actions.openSession(nodeId, id)
+  return true
+}
+
+/** 从 `run.sessions`（nodeId → sessionId）解析本节点的会话；类型不对 / 空串都算「没有会话」。 */
+export function sessionIdOf(runSessions, nodeId) {
+  if (!runSessions || typeof runSessions !== 'object') return ''
+  const id = nodeId === undefined || nodeId === null ? '' : String(nodeId)
+  if (id === '') return ''
+  const value = runSessions[id]
+  return typeof value === 'string' && value !== '' ? value : ''
 }
 
 /** 自定义节点：卡片信息沿用旧版，分区、工具条与运行角标在视觉上升级。 */
 function StudioNodeCard({ data }) {
-  const { node, runtime, locked, selected, candidate, activeCandidate, actions, staticMode } = data
+  const { node, runtime, locked, selected, candidate, activeCandidate, actions, staticMode, sessionId = '' } = data
   const isStage = node.kind === NODE_KIND.STAGE
   const hasIn = node.kind !== NODE_KIND.START
   const hasOut = node.kind !== NODE_KIND.END
@@ -292,7 +318,28 @@ function StudioNodeCard({ data }) {
   }
 
   const canAddDownstream = node.kind !== NODE_KIND.END
+  // 会话入口只在该节点确实有节点会话时渲染：没有就完全不出现，避免「点了没反应」的按钮。
+  const sessionEntry = sessionId
+    ? h('button', {
+      type: 'button',
+      className: 'fs-node-tool fs-node-tool-session nodrag nopan',
+      title: '在宿主里打开该节点的会话 ' + sessionId,
+      'aria-label': '打开节点会话 ' + sessionId,
+      'data-action': 'open-session',
+      'data-session-id': sessionId,
+      // 拖动 / 双击进抽屉都由卡片与画布接管：三者都在按钮上截断，只保留「打开会话」。
+      onPointerDown: event => event.stopPropagation(),
+      onDoubleClick: event => event.stopPropagation(),
+      onClick: event => {
+        event.stopPropagation()
+        openNodeSession(actions, node, sessionId)
+      },
+      // Enter / 空格交给原生 button 的 click；这里只阻止画布的键盘快捷键跟着触发。
+      onKeyDown: event => event.stopPropagation(),
+    }, '↗')
+    : null
   const toolbar = h('div', { className: 'fs-node-tools', role: 'group', 'aria-label': '节点操作' },
+    sessionEntry,
     canAddDownstream
       ? h('button', {
         type: 'button',
@@ -478,8 +525,8 @@ function StudioRejectEdgeCard({
 }) {
   const sourceNode = useInternalNode(source)
   const targetNode = useInternalNode(target)
-  const fallbackFrom = (data && data.fromRect) || { x: sourceX - NODE_W / 2, y: sourceY - 96, w: NODE_W, h: 96 }
-  const fallbackTo = (data && data.toRect) || { x: targetX - NODE_W / 2, y: targetY - 96, w: NODE_W, h: 96 }
+  const fallbackFrom = (data && data.fromRect) || { x: sourceX - NODE_W / 2, y: sourceY - NODE_H, w: NODE_W, h: NODE_H }
+  const fallbackTo = (data && data.toRect) || { x: targetX - NODE_W / 2, y: targetY - NODE_H, w: NODE_W, h: NODE_H }
   const fromRect = sourceNode
     ? {
       x: sourceNode.internals.positionAbsolute.x,
@@ -558,6 +605,7 @@ function StaticCanvas({
   flow, selection, apiRef, linkState, nodeStates = null,
   onSelect, onMoveNode, onAddEdge, onAddNodeAt, onPickCandidate, onDeleteNode,
   locked = false, lockReason = '', eventWindowNote = '',
+  runSessions = null, onOpenSession = null,
 }) {
   const nodes = flow.nodes
   const edges = flow.edges
@@ -569,7 +617,7 @@ function StaticCanvas({
   const candidateSet = new Set(candidateIds)
   const activeCandidateId = linkState ? candidateIds[linkState.index] || '' : ''
   const actions = makeNodeActions({
-    onSelect, onAddNodeAt, onAddEdge, onDeleteNode,
+    onSelect, onAddNodeAt, onAddEdge, onDeleteNode, onOpenSession,
   }, { current: locked })
 
   const edgeItems = []
@@ -637,6 +685,7 @@ function StaticCanvas({
     data: {
       node,
       runtime: nodeStates ? nodeStates[node.id] || null : null,
+      sessionId: sessionIdOf(runSessions, node.id),
       locked,
       selected: Boolean(selection && selection.kind === 'node' && selection.id === node.id),
       linkActive: Boolean(linkState),
@@ -748,6 +797,7 @@ export function createNodeDecorator(options = {}) {
   const decorate = node => {
     const state = readState()
     const runtime = state.nodeStates ? state.nodeStates[node.id] || null : null
+    const sessionId = sessionIdOf(state.runSessions, node.id)
     const selected = Boolean(state.selection && state.selection.kind === 'node' && state.selection.id === node.id)
     const locked = Boolean(state.locked)
     const linkActive = Boolean(state.linkState)
@@ -760,6 +810,7 @@ export function createNodeDecorator(options = {}) {
     if (cached
       && cached.node === node
       && cached.runtime === runtime
+      && cached.sessionId === sessionId
       && cached.selected === selected
       && cached.locked === locked
       && cached.linkActive === linkActive
@@ -782,6 +833,7 @@ export function createNodeDecorator(options = {}) {
       data: {
         node,
         runtime,
+        sessionId,
         locked,
         selected,
         linkActive,
@@ -793,6 +845,7 @@ export function createNodeDecorator(options = {}) {
     cache.set(node.id, {
       node,
       runtime,
+      sessionId,
       selected,
       locked,
       linkActive,
@@ -870,6 +923,7 @@ function FlowCanvasInner(props) {
     flow, selection, apiRef, linkState, nodeStates = null,
     onSelect, onMoveNode, onAddEdge, onAddNodeAt, onPickCandidate, onDeleteNode,
     locked = false, lockReason = '', eventWindowNote = '',
+    runSessions = null, onOpenSession = null,
   } = props
   const { useState, useEffect, useRef, useCallback, useMemo } = rt.React
   const rf = useReactFlow()
@@ -890,6 +944,7 @@ function FlowCanvasInner(props) {
   const latest = useRef({})
   latest.current = {
     flow, selection, nodeStates, locked, linkState,
+    runSessions, onOpenSession,
     onSelect, onMoveNode, onAddEdge, onAddNodeAt, onDeleteNode,
   }
 
@@ -911,6 +966,9 @@ function FlowCanvasInner(props) {
         const createdId = created && created.id ? created.id : created
         if (createdId && latest.current.onAddEdge) latest.current.onAddEdge(node.id, createdId)
         if (createdId && latest.current.onSelect) latest.current.onSelect({ kind: 'node', id: createdId })
+      },
+      openSession: (nodeId, sessionId) => {
+        if (latest.current.onOpenSession) latest.current.onOpenSession(nodeId, sessionId)
       },
     }
   }
@@ -937,7 +995,7 @@ function FlowCanvasInner(props) {
       // 缓存命中时保持同一个对象身份（含拖拽中的实时位置），memo 才有意义。
       return next === node ? node : { ...next, position: node.position, dragging: node.dragging }
     }))
-  }, [decorate, nodeStates, selection, locked, linkState])
+  }, [decorate, nodeStates, selection, locked, linkState, runSessions])
 
   const onNodesChange = useCallback(changes => {
     setRfNodes(previous => applyNodeChanges(changes, previous))

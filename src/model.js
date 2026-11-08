@@ -12,10 +12,12 @@ export const SCHEMA_VERSION = 1
 
 /**
  * 画布上节点的固定尺寸（px，逻辑坐标）。固定宽高让连线锚点与命中测试都能纯算。
- * 208×96 是 DESIGN.md §6 的裁决值；主从节点加 20px（116）放成员点行。
+ * 232×108 是 0.11.2 解冻后的值（决策记录：docs/plan/0.11.2-节点卡放大-需求.md）；
+ * 0.10 的「208×96（主从 116）」冻结条款已于 2026-11-08 由用户授权解除。
+ * 主从节点仍加 20px（128）放成员点行，表达式在 geometry.js 里。
  */
-export const NODE_W = 208
-export const NODE_H = 96
+export const NODE_W = 232
+export const NODE_H = 108
 
 /** 节点类型：开始 / 阶段 / 结束。 */
 export const NODE_KIND = { START: 'start', STAGE: 'stage', END: 'end' }
@@ -418,12 +420,13 @@ export function defaultFlow() {
     ...extra,
   })
 
+  // 8 列主干的 x 步进 = COL_STEP（232 + 52 = 284）。model.js 不能反向 import geometry，故写展开值。
   const nodes = [
     node('n_start', NODE_KIND.START, '任务输入', 40, {
       task: '接收用户任务原文，确认目标、约束与完成判据，产出任务卡（不含方案）。',
       outputs: '任务卡：一句话目标 / 范围 / 非目标 / 完成判据',
     }),
-    node('n_req', NODE_KIND.STAGE, '需求分析', 300, {
+    node('n_req', NODE_KIND.STAGE, '需求分析', 324, {
       mode: EXEC_MODE.TEAM,
       role: '需求阶段主管（资深需求分析师）。负责拆活、分派与收口，不代替成员写需求条目。',
       task: '主持需求分析：把任务卡拆成三块分给成员，逐条核实验收标准是否可判定，汇总成需求清单与风险表；信息不足的条目列为待确认项并说明影响。',
@@ -434,7 +437,7 @@ export function defaultFlow() {
         member('风险与边界', '风险评审。专门找会让方案返工的前提。', '列出假设、非目标、外部依赖与边界条件，逐条写「不成立时会怎样」与建议的应对；标注需要用户确认的开放问题。'),
       ],
     }),
-    node('n_plan', NODE_KIND.STAGE, '方案设计', 560, {
+    node('n_plan', NODE_KIND.STAGE, '方案设计', 608, {
       mode: EXEC_MODE.TEAM,
       role: '方案阶段主管。负责把需求裁决成可实施的方案，不写实现细节。',
       task: '主持方案设计：给成员定清选型 / 契约 / 数据三条线，驳回没有理由的选型与无法验证的契约，收口成一份可实施、可回滚的方案。',
@@ -445,7 +448,7 @@ export function defaultFlow() {
         member('数据与存储', '数据设计者。先想数据怎么坏，再想怎么存。', '设计数据模型与存储选型，说明索引、容量估算与一致性要求；给出迁移、备份与回滚步骤，标注不可逆操作。'),
       ],
     }),
-    node('n_shape', NODE_KIND.STAGE, '结构设计', 820, {
+    node('n_shape', NODE_KIND.STAGE, '结构设计', 892, {
       mode: EXEC_MODE.TEAM,
       role: '结构设计主管。负责把方案落成可落手的代码结构，判断方案是否可落地。',
       task: '主持结构设计：分派模块划分、依赖构建、目录命名三块，检查结构是否与方案一一对应、改动文件清单是否完整；方案无法落地时打回方案设计。',
@@ -456,7 +459,7 @@ export function defaultFlow() {
         member('目录与命名', '规范负责人。让改动落在正确的文件里。', '按现有约定给出目录、文件、类型与函数命名方案，产出一份逐文件的改动清单（新增 / 修改 / 删除），标出需要同步更新的文档与配置。'),
       ],
     }),
-    node('n_dev', NODE_KIND.STAGE, '开发', 1080, {
+    node('n_dev', NODE_KIND.STAGE, '开发', 1176, {
       mode: EXEC_MODE.TEAM,
       role: '开发主管。负责拆实现任务、控改动面与核对自测，不替成员写全部代码。',
       task: '主持开发：按结构设计把后端 / 前端 / 自测拆给成员，盯住改动面与编码规范，汇总代码改动与自测结论；与结构设计不一致的地方在自测结论里单列。',
@@ -467,7 +470,7 @@ export function defaultFlow() {
         member('自测与用例', '开发自测负责人。先跑通再交付。', '为本次改动补充或更新测试，跑一遍关键路径并记录命令与结果；列出未覆盖的分支与需要测试阶段重点验证的地方。'),
       ],
     }),
-    node('n_test', NODE_KIND.STAGE, '测试', 1340, {
+    node('n_test', NODE_KIND.STAGE, '测试', 1460, {
       mode: EXEC_MODE.TEAM,
       role: '测试阶段主管。负责定测试策略、分派执行与判定是否放行。',
       task: '主持测试：把验收标准分配给用例设计 / 自动化执行 / 回归与缺陷三条线，核对失败用例的复现步骤，汇总测试结论；不达标时打回开发。',
@@ -478,7 +481,7 @@ export function defaultFlow() {
         member('回归与缺陷', '缺陷管理员。缺陷必须能被别人复现。', '跑回归用例确认既有功能未被破坏；把失败整理成缺陷清单（编号 / 级别 / 复现步骤 / 期望与实际），并判断哪些必须打回开发。'),
       ],
     }),
-    node('n_review', NODE_KIND.STAGE, '代码审查', 1600, {
+    node('n_review', NODE_KIND.STAGE, '代码审查', 1744, {
       mode: EXEC_MODE.TEAM,
       role: '代码审查主管。负责分派审查角度、裁定级别、汇总 finding，不做风格偏好之争。',
       task: '主持代码审查：分派规范 / 安全 / 可维护性三路审查，核对每条 finding 的位置与理由，汇总成可执行的 finding 清单；必须返工的按打回线退回开发。',
@@ -489,7 +492,7 @@ export function defaultFlow() {
         member('可维护性', '可维护性审查者。为下一个改这段代码的人说话。', '检查重复逻辑、耦合、命名可读性与注释缺失，评估改动的测试可维护性；指出可以在本次顺手收敛、但不该扩大改动面的地方。'),
       ],
     }),
-    node('n_end', NODE_KIND.END, '完成', 1860, {
+    node('n_end', NODE_KIND.END, '完成', 2028, {
       task: '汇总产物、结论与遗留问题，给出可交付的最终答复。',
       outputs: '交付说明',
     }),

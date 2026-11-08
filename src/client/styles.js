@@ -359,7 +359,7 @@ export const CSS = `
 .fs-node-head{display:flex;align-items:center;gap:6px;min-width:0;padding-bottom:3px;
   border-bottom:1px solid var(--dsw-alias-border-l1)}
 .fs-node-title{
-  flex:1;min-width:0;font-size:14px;line-height:22px;font-weight:500;color:var(--dsw-alias-label-primary);
+  flex:1;min-width:0;font-size:15px;line-height:24px;font-weight:500;color:var(--dsw-alias-label-primary);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .fs-mode-badge{
@@ -459,7 +459,7 @@ export const CSS = `
 .fs-node-tool:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .fs-node-tool.danger:hover{color:var(--fs-r2-error)}
 .fs-node-tool:disabled{opacity:.4;cursor:not-allowed}
-.fs-node-tool:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.fs-node-tool:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 
 /* 端口 */
 .fs-port{

@@ -12,7 +12,7 @@ import {
   EDGE_KIND, EXEC_MODE, NODE_KIND, blankEdge, blankFlow, blankNode, runBlockers, summarize, validateFlow,
 } from '../model.js'
 import { api, createRunsSource, restartFailureText, runActionFailureText } from './api.js'
-import { FlowCanvas } from './canvas.js'
+import { FlowCanvas, sessionIdOf } from './canvas.js'
 import { IssuesDialog, PreviewDialog } from './dialogs.js'
 import { clearDraft, createDraftScheduler, draftDiffers, readDraft, writeDraft } from './drafts.js'
 import { FlowList, extractRunRows, hasNodeStatus, workspacePathOf } from './flowlist.js'
@@ -55,6 +55,31 @@ function isObject(value) {
 
 /** M1：运行中锁结构的统一原因文案（画布 / 检查器 / 播报共用同一句）。 */
 export const RUN_LOCK_REASON = '运行中已锁定结构：拖拽 / 双击新建 / 连线 / 检查器编辑暂不可用，停止运行后恢复'
+
+/**
+ * 0.11.2：画布节点卡「打开会话」的解析口径（纯函数，SSR 可直接单测）。
+ *
+ * 会话 id 以当前活动 run 的 `run.sessions[nodeId]` 为准；卡片传来的 id 只做一致性校验，
+ * 过期 / 不一致一律不跳。跳转仍走宿主注入的 `openSession`（plugin.js 的
+ * `workspace.openSession`），与抽屉的「打开节点会话」同一条链路。
+ *
+ * @param {object|null} runSessions `run.sessions`（nodeId → sessionId）
+ * @param {string} nodeId
+ * @param {string} [sessionId] 卡片上记录的会话 id（可省略）
+ * @param {(sessionId: string) => boolean|void} [openSession] 宿主注入的跳转回调
+ * @returns {boolean} 是否真的调用了 openSession 且没有被宿主拒绝
+ */
+export function openSessionForNode(runSessions, nodeId, sessionId, openSession) {
+  const target = sessionIdOf(runSessions, nodeId)
+  if (target === '') return false
+  if (sessionId && sessionId !== target) return false
+  if (typeof openSession !== 'function') return false
+  try {
+    return openSession(target) !== false
+  } catch {
+    return false
+  }
+}
 
 /** M6：确认停止按钮在第一次点击后至少等 400ms 才可用（防双击击穿）。 */
 export const STOP_CONFIRM_DELAY_MS = 400
@@ -1463,6 +1488,8 @@ export function FlowStudioPage({
     runForFlow && runForFlow.progress,
     active && active.detail && active.detail.run && active.detail.run.progress,
   )
+  // 0.11.2：画布节点卡的「打开会话」只认当前活动 run 的 sessions（与节点状态同源）。
+  const runSessions = runForFlow && isObject(runForFlow.sessions) ? runForFlow.sessions : null
   const nodeStates = runForFlow
     ? deriveNodeStates({
       nodes: stageNodes,
@@ -1506,6 +1533,16 @@ export function FlowStudioPage({
     : ''
 
   const handleRunSnapshot = useCallback(snapshot => { setRunView(snapshot) }, [])
+
+  /**
+   * 0.11.2：画布节点卡的「打开会话」。会话 id 以当前活动 run 的 `run.sessions[nodeId]`
+   * 为准（卡片传来的 id 只做一致性校验），再走 plugin.js 注入的 openSession ——
+   * 与抽屉的「打开节点会话」复用同一条宿主跳转链路，不另写一套。
+   */
+  const handleOpenSession = useCallback(
+    (nodeId, sessionId) => openSessionForNode(runSessions, nodeId, sessionId, openSession),
+    [runSessions, openSession],
+  )
 
   /** G5-d：抽屉刷新列表时走同一个共享数据源，返回 Host 原始 payload（不是第二份轮询）。 */
   const refreshRunRows = useCallback(async options => {
@@ -2053,9 +2090,11 @@ export function FlowStudioPage({
           apiRef: canvasApi,
           linkState: keyboardLink,
           nodeStates,
+          runSessions,
           locked,
           lockReason: RUN_LOCK_REASON,
           eventWindowNote: windowNote,
+          onOpenSession: handleOpenSession,
           onSelect: setSelection,
           onMoveNode: moveNode,
           onAddEdge: addEdge,

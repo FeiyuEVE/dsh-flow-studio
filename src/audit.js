@@ -34,7 +34,31 @@ export const AUDIT_VERDICTS = Object.freeze([
 
 const DEFAULT_STALL_MS = 10 * 60 * 1000
 const DEFAULT_NODE_TIMEOUT_MS = 20 * 60 * 1000
+/** run 级墙钟上限的默认值（与 engine.js 的 DEFAULT_RUN_TIMEOUT_MS 同口径，2 小时）。 */
+const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000
 const DEFAULT_MAX_REJECTS_PER_EDGE = 3
+
+/** 显式阈值：只有正整数才算「传了」，其余一律当没传（宁可退回默认，也不拿 0 / NaN 当上限）。 */
+function explicitTimeout(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
+}
+
+/**
+ * restart 续跑跳过节点：`run.json.restart.skippedNodeIds`（上次已完成、本次不执行的阶段）。
+ * 读路径宽松：非数组 / 坏元素 / 重复一律丢弃，不抛错。
+ */
+function skippedNodeIdsOf(run) {
+  const restart = isObject(run && run.restart) ? run.restart : null
+  const out = []
+  const seen = new Set()
+  for (const raw of asArray(restart && restart.skippedNodeIds)) {
+    const nodeId = idOf(raw)
+    if (!nodeId || seen.has(nodeId)) continue
+    seen.add(nodeId)
+    out.push(nodeId)
+  }
+  return out
+}
 
 /** 一次审计的输出有界：事件可以到 20 万条，报告不能跟着涨。 */
 const MAX_DEVIATIONS = 50
@@ -327,7 +351,14 @@ function findFailure(run, sorted) {
  * @param {object|null} input.run run.json（status/startedAt/endedAt/failedNodeId…）
  * @param {number|Date} [input.now=Date.now()]
  * @param {number} [input.stallMs=600000] 多久没新事件算卡死
- * @param {number} [input.nodeTimeoutMs=1200000] 单节点超过多久算「有时限风险」
+ * @param {number} [input.nodeTimeoutMs] 单节点超过多久算「有时限风险」。
+ *   取值链：显式参数 > `input.run.limits.nodeTimeoutMs` > 默认 1200000（20 分钟）。
+ *   下沉到审计内部是为了覆盖所有调用方：flow_watch 与引擎侧 supervision 都不会因为
+ *   忘记传阈值而把一个配了 30 分钟的节点按 20 分钟判超时。
+ * @param {number} [input.runTimeoutMs] 整轮 run 的墙钟上限，只用于报告/判定依据；
+ *   取值链同上（`input.run.limits.runTimeoutMs` > 默认 7200000）。
+ * @param {'run'|'default'} [input.thresholdSource] 阈值来源（run.json.limits / 默认值），
+ *   省略时按「显式传了 / run.limits 里有」推断
  * @param {number} [input.maxRejectsPerEdge=3] 同一条打回边触发几次算死循环
  * @returns {object} 字段契约见 06 §14（verdict/status/headline/progress/plan/…）
  */
@@ -352,7 +383,7 @@ function emptyResult({ verdict, status, headline }) {
     verdict,
     status: status ?? null,
     headline: clipHeadline(headline),
-    progress: { passed: 0, total: 0, ratio: null, nodes: [] },
+    progress: { passed: 0, total: 0, ratio: null, skipped: [], skippedCount: 0, nodes: [] },
     plan: { expected: [], actual: [], deviations: [] },
     currentNode: null,
     rejects: { total: 0, byNode: [], looped: [] },
@@ -360,20 +391,56 @@ function emptyResult({ verdict, status, headline }) {
     quality: null,
     tokens: null,
     idleMs: 0,
+    thresholds: {
+      stallMs: DEFAULT_STALL_MS,
+      nodeTimeoutMs: DEFAULT_NODE_TIMEOUT_MS,
+      runTimeoutMs: DEFAULT_RUN_TIMEOUT_MS,
+      source: 'default',
+    },
     recommended: RECOMMENDED[verdict] || 'inspect',
     nextCheckSeconds: NEXT_CHECK_SECONDS[verdict] ?? null,
   }
 }
 
+/** run.json.limits 的宽松读数：只认正整数（读路径不猜、不补 0）。 */
+function runLimitTimeout(run, key) {
+  const limits = isObject(run && run.limits) ? run.limits : null
+  return explicitTimeout(limits && limits[key])
+}
+
 function inspect(options) {
   const nowMs = normalizeNow(options.now)
   const stallMs = finitePositive(options.stallMs, DEFAULT_STALL_MS)
-  const nodeTimeoutMs = finitePositive(options.nodeTimeoutMs, DEFAULT_NODE_TIMEOUT_MS)
-  const maxRejectsPerEdge = finitePositive(options.maxRejectsPerEdge, DEFAULT_MAX_REJECTS_PER_EDGE)
-
+  // 阈值来源链：显式 options > run.json.limits > 默认。
+  // 下沉到这里的理由：引擎侧 supervision（runtime 的 evaluate）也调 auditWorkflow，
+  // 它只传 run，不传阈值；来源留在调用方就会让「30 分钟的节点被 20 分钟默认值判超时」
+  // 在另一条路径上原样存活。
   const run = isObject(options.run) ? options.run : null
+  const explicitNodeTimeoutMs = explicitTimeout(options.nodeTimeoutMs)
+  const explicitRunTimeoutMs = explicitTimeout(options.runTimeoutMs)
+  const limitNodeTimeoutMs = runLimitTimeout(run, 'nodeTimeoutMs')
+  const limitRunTimeoutMs = runLimitTimeout(run, 'runTimeoutMs')
+  const nodeTimeoutMs = explicitNodeTimeoutMs ?? limitNodeTimeoutMs ?? DEFAULT_NODE_TIMEOUT_MS
+  const runTimeoutMs = explicitRunTimeoutMs ?? limitRunTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS
+  const maxRejectsPerEdge = finitePositive(options.maxRejectsPerEdge, DEFAULT_MAX_REJECTS_PER_EDGE)
+  // 阈值来源：调用方显式声明优先；否则「显式传了 / run.json.limits 里有」都算 run 来源。
+  const fromRunLimits = limitNodeTimeoutMs !== null || limitRunTimeoutMs !== null
+  const thresholdSource = options.thresholdSource === 'run' || options.thresholdSource === 'default'
+    ? options.thresholdSource
+    : (explicitNodeTimeoutMs !== null || explicitRunTimeoutMs !== null || fromRunLimits ? 'run' : 'default')
+  const thresholds = {
+    stallMs,
+    nodeTimeoutMs,
+    runTimeoutMs,
+    source: thresholdSource,
+  }
+
   const flow = isObject(options.flow) ? options.flow : null
   const sorted = sortEvents(asArray(options.events).filter(event => isObject(event)))
+
+  // restart 续跑：上次已完成、本次跳过的阶段 —— 既不算未执行，也不算偏航。
+  const skipped = skippedNodeIdsOf(run)
+  const skippedSet = new Set(skipped)
 
   const template = buildTemplate(flow)
   const titleOf = makeTitleLookup(template, sorted)
@@ -420,12 +487,24 @@ function inspect(options) {
   const observedTotal = rawProgress && Number.isInteger(rawProgress.total) ? rawProgress.total : 0
   const total = observedTotal > 0 ? observedTotal : progressIds.length
   const passed = rawProgress && Number.isInteger(rawProgress.passed) ? rawProgress.passed : 0
+  const skippedCount = skipped.length
+  // 分母 = 节点总数 − restart 跳过数（跳过节点本次不执行，不能拉低进度）；
+  // 没有 restart 时 denominator === total，与既有口径完全一致。
+  const baseDenominator = rawProgress && Number.isInteger(rawProgress.denominator)
+    ? rawProgress.denominator
+    : total
+  const denominator = Math.max(0, baseDenominator - skippedCount)
   let ratio = rawProgress && typeof rawProgress.ratio === 'number' ? rawProgress.ratio : null
-  if (ratio === null && observedTotal > 0) ratio = Math.min(1, passed / total)
+  if (skippedCount > 0) {
+    ratio = denominator === 0 ? null : Math.min(1, passed / denominator)
+  } else if (ratio === null && observedTotal > 0) {
+    ratio = Math.min(1, passed / denominator)
+  }
 
   const progressNodes = progressIds.map(nodeId => {
     const entry = progressMap[nodeId]
-    let state = 'pending'
+    // restart 跳过的阶段：本次不会执行，标 skipped（不是 pending / 未执行）。
+    let state = skippedSet.has(nodeId) ? 'skipped' : 'pending'
     let attempt = 0
     if (entry) {
       attempt = Number.isInteger(entry.attemptId) ? entry.attemptId : 0
@@ -440,6 +519,14 @@ function inspect(options) {
     }
     return { id: nodeId, title: titleOf(nodeId), state, attempt }
   })
+  const progressResult = {
+    passed,
+    total,
+    ratio,
+    skipped: skipped.slice(),
+    skippedCount,
+    nodes: progressNodes,
+  }
 
   // -- 打开中的节点：并发判定 + 当前节点 + 节点空闲 ------------------------
   const open = new Map()
@@ -535,9 +622,26 @@ function inspect(options) {
     .sort((left, right) => (right.count - left.count) || left.nodeId.localeCompare(right.nodeId))
 
   // -- 偏航：node/start 序列对照模板 next 链；打回后从 to 重新开始 ---------
-  const expected = template.chain.slice()
+  //
+  // restart 续跑的 run 不是从流程第一个阶段起跑：`restart.skippedNodeIds` 里的阶段
+  // 上次已经完成、本次不执行。所以「预期链」要扣掉它们，否则「从第 4 阶段续跑」会被
+  // 判成「跳过前 3 个阶段」（误报 deviating + recommended=stop）。
+  const expected = template.chain.filter(nodeId => !skippedSet.has(nodeId))
   const chainKnown = expected.length > 0
   let expectedNext = chainKnown ? expected[0] : null
+  // next 边可能指向被跳过的阶段：继续沿链前进到下一个本次真正要跑的阶段。
+  const nextExpectedAfter = fromId => {
+    let cursor = fromId
+    const walked = new Set([fromId])
+    for (let guard = 0; guard < 200; guard += 1) {
+      const next = template.nextStageId(cursor)
+      if (!next || walked.has(next)) return null
+      walked.add(next)
+      if (!skippedSet.has(next)) return next
+      cursor = next
+    }
+    return null
+  }
   const actual = []
   const deviations = []
   const seenStarts = new Set()
@@ -546,7 +650,8 @@ function inspect(options) {
     if (event.kind === 'reject/trigger') {
       const toNodeId = isObject(event.data) ? idOf(event.data.toNodeId) : null
       // 打回目标是合法「重新开始」：下一条 node/start 落到 to 上不算偏航。
-      if (chainKnown && toNodeId) expectedNext = toNodeId
+      // 打回落到「本次跳过」的节点时忽略（它不会在本 run 里重新执行）。
+      if (chainKnown && toNodeId && !skippedSet.has(toNodeId)) expectedNext = toNodeId
       continue
     }
     if (event.kind !== 'node/start') continue
@@ -557,6 +662,8 @@ function inspect(options) {
     // 同一 attempt 的重试会再写一条 node/start（06 §9），不能算两阶段、也不能算偏航。
     if (seenStarts.has(startKey)) continue
     seenStarts.add(startKey)
+    // restart 跳过节点不是「未执行」：不推进 actual、不生成 deviation。
+    if (skippedSet.has(nodeId)) continue
     if (chainKnown && template.byId.has(nodeId)) {
       const kind = template.kindOf(nodeId)
       if (kind !== 'stage') continue
@@ -573,7 +680,7 @@ function inspect(options) {
           reason: `阶段链已走完，仍开始了「${titleOf(nodeId)}」`,
         })
       }
-      expectedNext = template.nextStageId(nodeId)
+      expectedNext = nextExpectedAfter(nodeId)
       continue
     }
 
@@ -594,10 +701,10 @@ function inspect(options) {
         deviations.push({ index: actual.length - 1, nodeId, expected: expectedNext, reason })
       }
       // 偏航时以实际节点重新对齐，避免一次跳过把后面整条链都算成偏航。
-      expectedNext = template.nextStageId(nodeId)
+      expectedNext = nextExpectedAfter(nodeId)
       continue
     }
-    expectedNext = template.nextStageId(nodeId)
+    expectedNext = nextExpectedAfter(nodeId)
   }
 
   // -- 质量 / token：有事件才复用 summarize（终态与运行中都可算） -----------
@@ -627,11 +734,12 @@ function inspect(options) {
       nowMs,
       run,
       titleOf,
-      progress: { passed, total, ratio, nodes: progressNodes },
+      progress: progressResult,
       plan: { expected, actual: actual.slice(0, MAX_ACTUAL), deviations },
       rejects: { total: rejectsTotal, byNode, looped },
       currentNode,
       idleMs,
+      thresholds,
     })
     return terminal
   }
@@ -670,16 +778,26 @@ function inspect(options) {
     })
   }
   if (timeoutRisk && currentNode) {
+    // 阈值必须写「这次实际用的值」：run.json.limits 与默认值可能差很多（例如 30 分钟 vs 20 分钟）。
+    const sourceText = thresholdSource === 'run' ? 'run.json.limits' : '默认值'
     addAnomaly({
       kind: 'timeout-risk',
       nodeId: currentNode.id,
-      detail: `节点「${currentNode.title}」已运行 ${durationText(currentNode.elapsedMs)}（阈值 ${durationText(nodeTimeoutMs)}）`,
+      detail: `节点「${currentNode.title}」已运行 ${durationText(currentNode.elapsedMs)}`
+        + `（阈值 ${durationText(nodeTimeoutMs)}，来源 ${sourceText}）`,
     })
   }
   if (noProgress) {
+    // 只说明「还没跑完一个阶段」，同时把已观测事实写清楚：事件还在流时不是「卡住了」。
+    const idleText = idleMs < stallMs
+      ? (idleMs === 0
+        ? '事件仍在流（idle=0）'
+        : `事件仍在流（idle=${Math.round(idleMs / 1000)} 秒，最近仍有新事件）`)
+      : `最近 ${durationText(idleMs)} 无新事件`
     addAnomaly({
       kind: 'no-progress',
-      detail: `已运行 ${durationText(elapsedRunMs)}，完成 ${passed}/${total} 阶段（ratio=0）`,
+      detail: `已运行 ${durationText(elapsedRunMs)}，完成 ${passed}/${total} 阶段（ratio=0；`
+        + `无进展判定阈值 ${durationText(stallMs)}）；${idleText}`,
     })
   }
 
@@ -703,6 +821,7 @@ function inspect(options) {
     idleMs,
     stallMs,
     nodeTimeoutMs,
+    thresholdSource,
     elapsedRunMs,
     passed,
     total,
@@ -713,7 +832,7 @@ function inspect(options) {
     verdict,
     status,
     headline: clipHeadline(headline),
-    progress: { passed, total, ratio, nodes: progressNodes },
+    progress: progressResult,
     plan: {
       expected,
       actual: actual.slice(0, MAX_ACTUAL),
@@ -725,6 +844,7 @@ function inspect(options) {
     quality,
     tokens,
     idleMs,
+    thresholds,
     recommended: RECOMMENDED[verdict],
     nextCheckSeconds: NEXT_CHECK_SECONDS[verdict],
   }
@@ -734,7 +854,7 @@ function inspect(options) {
 function terminalResult(context) {
   const {
     effective, status, quality, tokens, sorted, nowMs, run, titleOf,
-    progress, plan, rejects, currentNode, idleMs,
+    progress, plan, rejects, currentNode, idleMs, thresholds,
   } = context
   const anomalies = []
   let headline = ''
@@ -786,6 +906,7 @@ function terminalResult(context) {
     quality,
     tokens,
     idleMs,
+    thresholds,
     recommended: RECOMMENDED[effective],
     nextCheckSeconds: NEXT_CHECK_SECONDS[effective],
   }
@@ -795,7 +916,7 @@ function terminalResult(context) {
 function runningHeadline(context) {
   const {
     verdict, concurrency, deviations, looped, stalled, timeoutRisk, noProgress,
-    currentNode, idleMs, stallMs, nodeTimeoutMs, elapsedRunMs, passed, total, titleOf,
+    currentNode, idleMs, stallMs, nodeTimeoutMs, thresholdSource, elapsedRunMs, passed, total, titleOf,
   } = context
 
   if (verdict === 'deviating') {
@@ -825,13 +946,16 @@ function runningHeadline(context) {
       parts.push(`${where} ${durationText(idleMs)} 无新事件（阈值 ${durationText(stallMs)}）`)
     }
     if (timeoutRisk && currentNode) {
-      parts.push(`节点「${currentNode.title}」已运行 ${durationText(currentNode.elapsedMs)}（超时阈值 ${durationText(nodeTimeoutMs)}）`)
+      const sourceText = thresholdSource === 'run' ? 'run.json.limits' : '默认值'
+      parts.push(`节点「${currentNode.title}」已运行 ${durationText(currentNode.elapsedMs)}`
+        + `（超时阈值 ${durationText(nodeTimeoutMs)}，来源 ${sourceText}）`)
     }
     return `疑似卡死：${parts.join('；')}`
   }
 
   if (verdict === 'no-progress') {
-    return `无进展：已运行 ${durationText(elapsedRunMs)}，完成 ${passed}/${total} 阶段（还没跑完一个节点）`
+    const idleText = idleMs < stallMs ? '，事件仍在流' : ''
+    return `无进展：已运行 ${durationText(elapsedRunMs)}，完成 ${passed}/${total} 阶段（还没跑完一个节点${idleText}）`
   }
 
   if (currentNode) {

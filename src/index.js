@@ -43,6 +43,7 @@ import {
 import {
   RunError, appendEvents, createRun, deleteRun, listRuns, readAllEvents, readEvents,
   buildHostExecutionVerifier, readHostExecutions, readLease, readRunDetail, readRunMessages, readRunMeta,
+  normalizeCoverageBuckets,
   repairRunStates, runsDir,
   sweepExpiredLeases, writeRunInbox, writeRunMeta,
 } from './runstore.js'
@@ -963,6 +964,42 @@ function runBindingFields(meta) {
 }
 
 /**
+ * B：把 run.json.tokenCoverage 收敛成对外形状。
+ *
+ * - 老 run 没有这个字段（或形状坏掉）→ 按 `{ complete: true, missing: [] }` 处理，
+ *   不报错、不把「没记录」误报成「有缺口」；
+ * - `full=false` 只回 `{ complete }`（列表 / light 投影够用，省字节）；
+ * - `full=true` 回完整 `{ complete, missing: [{ nodeId, attemptId }], buckets }`（详情用）。
+ *   `buckets = { seen, missing }` 是四桶覆盖（`input|cacheRead|cacheWrite|output`），
+ *   纯信息、不参与 `complete`；老 run 没有这个字段时收敛成空数组对。
+ *
+ * runstore 的 `normalizeMeta` 已经做过有界收敛（missing ≤50、每条只留 nodeId/attemptId），
+ * 这里只做「缺省 + 投影」，不重新发明口径。
+ *
+ * @param {object|null|undefined} meta
+ * @param {{ full?: boolean }} [options]
+ * @returns {{ complete: boolean, missing?: {nodeId: string, attemptId: number}[], buckets?: {seen: string[], missing: string[]} }}
+ */
+function tokenCoverageOf(meta, options = {}) {
+  const source = meta && typeof meta === 'object' && meta.tokenCoverage && typeof meta.tokenCoverage === 'object'
+    ? meta.tokenCoverage
+    : null
+  const complete = source ? source.complete === true : true
+  if (options.full !== true) return { complete }
+  const missing = []
+  if (source && Array.isArray(source.missing)) {
+    for (const item of source.missing) {
+      if (missing.length >= 50) break
+      if (!item || typeof item !== 'object') continue
+      if (typeof item.nodeId !== 'string' || item.nodeId === '') continue
+      if (!Number.isInteger(item.attemptId) || item.attemptId < 1) continue
+      missing.push({ nodeId: item.nodeId, attemptId: item.attemptId })
+    }
+  }
+  return { complete, missing, buckets: normalizeCoverageBuckets(source && source.buckets) }
+}
+
+/**
  * G7：`GET /runs/<runId>?light=1` 的轻量投影（前端契约，字段集固定）。
  *
  * **只读 run.json 元数据**（`readRunMeta`），绝不调用 `readRunDetail()`：
@@ -987,6 +1024,8 @@ function lightRunOf(meta) {
     nodeDone: meta.nodeDone,
     nodeTotal: meta.nodeTotal,
     tokenTotal: meta.tokenTotal,
+    // B：light 投影只放 { complete }（缺口明细在详情里）。
+    tokenCoverage: tokenCoverageOf(meta),
     // progress? 可选：run.json 里有什么给什么（不重算）。
     ...(meta.progress && typeof meta.progress === 'object' ? { progress: meta.progress } : {}),
     // eventCount? 可选：直接取 run.json 计数器；拿不到就省略，绝不为此解析事件。
@@ -1797,7 +1836,13 @@ async function handleRuns(req, res, env, url, parts) {
         const meta = await readRunMeta(root, row.id).catch(() => null)
         const fields = runWorkspaceFields(meta)
         if (typeof workspaceId === 'string' && workspaceId !== '' && fields.workspaceId !== workspaceId) continue
-        rows.push({ ...row, ...fields, ...runBindingFields(meta) })
+        rows.push({
+          ...row,
+          ...fields,
+          ...runBindingFields(meta),
+          // B：列表只放 { complete }；listRuns 行本身也已带一份，这里以 run.json 为准。
+          tokenCoverage: tokenCoverageOf(meta),
+        })
         if (rows.length >= limit) break
       }
       sendJson(res, 200, { ok: true, runs: rows, skipped: result.skipped })
@@ -1893,6 +1938,8 @@ async function handleRuns(req, res, env, url, parts) {
       const run = {
         ...detail.run,
         ...runBindingFields(detail.run),
+        // B：详情放全量（complete + 至多 50 条缺口）；老 run 缺失按 complete=true。
+        tokenCoverage: tokenCoverageOf(detail.run, { full: true }),
         startOptions: await readStartOptions(root, runId),
         // 0.11 · R2/S1：排队是内存派生状态，不写进 run.json；详情动态合并。
         ...(typeof env.engine.admissionOf === 'function' && env.engine.admissionOf(runId)

@@ -2511,16 +2511,30 @@ try {
         A.equal(baseline && baseline.quality && baseline.quality.state, 'pass',
           `未篡改时自审基线必须是 pass：${JSON.stringify(baseline && baseline.quality)}`)
 
-        // N1 反向锁：把证据改回旧 run 的 legacy 形状（无 extra 来源）追加一条，
-        // 权威覆盖不再是 100% → 必须降 unknown，不得继续 pass（否则夹具改回旧形状会静默回退）。
+        // N1 反向锁（v1.3）：追加一条旧 run 形状的 legacy 通过条目（无 extra），且
+        // evidenceRef 指向解析不到的路径 → 找不到产物归属 → 必须 warn（缺独立复核），
+        // 不得继续 pass。这样「造一条无来源通过就能刷绿」的反回归仍然成立。
         await store.appendEvents(runsRoot, run.id, [{
           v: 1, kind: 'acceptance/verdict', nodeId: 'n_legacy_acc', attemptId: 1, traceId: 'tr-legacy-acc',
-          data: { itemId: 'acc-legacy', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+          data: {
+            itemId: 'acc-legacy', status: 'pass', decidedBy: 'human',
+            evidenceRef: 'evidence/does-not-exist.json',
+          },
         }])
         const legacyShape = await auditOnce()
-        A.equal(legacyShape && legacyShape.quality && legacyShape.quality.state, 'unknown',
-          `legacy 形状（无 extra）不得再 pass：${JSON.stringify(legacyShape && legacyShape.quality)}`)
-        A.match(legacyShape.quality.label, /legacy|来源未知/)
+        A.equal(legacyShape && legacyShape.quality && legacyShape.quality.state, 'warn',
+          `legacy 形状（无 extra、找不到产物归属）不得再 pass：${JSON.stringify(legacyShape && legacyShape.quality)}`)
+        A.match(legacyShape.quality.label, /找不到产物归属|缺独立复核/)
+
+        // v1.3 子用例：同一 itemId 复判为引用真 peer 产物（别的节点写的 artifact/write）
+        // → 合法独立证据，仍可 pass（不能把 peer 独立复核也误杀）。
+        await store.appendEvents(runsRoot, run.id, [{
+          v: 1, kind: 'acceptance/verdict', nodeId: 'n_legacy_acc', attemptId: 1, traceId: 'tr-legacy-peer',
+          data: { itemId: 'acc-legacy', status: 'pass', decidedBy: 'human', evidenceRef: peerRel },
+        }])
+        const peerLegacy = await auditOnce()
+        A.equal(peerLegacy && peerLegacy.quality && peerLegacy.quality.state, 'pass',
+          `legacy 条目引用真 peer 产物时仍应 pass：${JSON.stringify(peerLegacy && peerLegacy.quality)}`)
 
         const events = (await store.readAllEvents(runsRoot, run.id)).events
         const copy = events.find(event => event.kind === 'artifact/write'

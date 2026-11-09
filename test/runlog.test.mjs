@@ -1236,7 +1236,10 @@ check('§8.4 B4 本轮真 fail 不被 stale 降级成 unknown（MAJOR-3 回归�
 check('quality v1.3：首轮通过 + 遗留 1 个 P1 → warn「遗留 1 个 P1 未解决」', () => {
   const quality = computeQuality(fullEvidence({ rework: 0, p1Status: 'open' }))
   assert.equal(quality.state, 'warn')
-  assert.equal(quality.label, '可：遗留 1 个 P1 未解决')
+  assert.match(quality.label, /遗留 1 个 P1 未解决/)
+  // v1.3：fullEvidence 的通过条目没有 artifact/write 归属，label 还会带一条
+  // 「找不到产物归属」原因；§8.4 要求多条 warn 原因全部写进同一个 label。
+  assert.match(quality.label, /找不到产物归属|缺独立复核/)
   assert.equal(quality.p1Unresolved, 1)
   assert.equal(quality.evidence.p0p1.state, 'warn')
   assert.equal(quality.evidence.acceptance.state, 'pass', '首轮证据本身仍是通过')
@@ -1245,7 +1248,8 @@ check('quality v1.3：首轮通过 + 遗留 1 个 P1 → warn「遗留 1 个 P1 
 check('quality v1.3：首轮通过 + 遗留 1 个 P2 → warn（P2 也压住绿灯）', () => {
   const quality = computeQuality(fullEvidence({ rework: 0, p2Status: 'fixed' }))
   assert.equal(quality.state, 'warn')
-  assert.equal(quality.label, '可：遗留 1 个 P2 未解决')
+  assert.match(quality.label, /遗留 1 个 P2 未解决/)
+  assert.match(quality.label, /找不到产物归属|缺独立复核/)
   assert.equal(quality.p2Unresolved, 1)
 })
 
@@ -1957,21 +1961,29 @@ check('F4 legacy 无来源 pass：test/report / acceptance 不得算 authoritati
   assert.equal(quality.authorityCoverage, 0)
 })
 
-check('F4 host + claimed 混合：claimed 项不得因存在 host 项而免于降权', () => {
-  // 真 host check + 两个模型自报（有可复核产物的 pass）→ 不能再是 pass。
+check('F4 host + claimed 混合：claimed 项只有自证时不得因存在 host 项而免于降权', () => {
+  // v1.3：独立性由被引用产物的归属决定。这里两个 claimed 条目各自引用**本节点自写**
+  // 的产物（self），只有 check 是 host —— claimed 项不能靠 host check 搭便车变绿。
   const claimedEvents = fullEvidence()
   const claimedAcceptance = claimedEvents.find(event => event.kind === 'acceptance/verdict')
   claimedAcceptance.extra = { provenance: 'model-claim' }
-  claimedAcceptance.data.evidenceRef = 'ev/f4-claimed.json'
+  claimedAcceptance.data.evidenceRef = 'ev/f4-acc-self.json'
   const claimedTest = claimedEvents.find(event => event.kind === 'test/report')
   claimedTest.extra = { provenance: 'model-claim' }
-  claimedTest.data.reportRef = 'ev/f4-claimed.json'
+  claimedTest.data.reportRef = 'ev/f4-test-self.json'
   claimedEvents.find(event => event.kind === 'check/form').extra = { producer: 'host', authority: 'host' }
-  claimedEvents.push(ev('artifact/write', {
-    nodeId: 'n_peer',
-    attemptId: 1,
-    data: { path: 'ev/f4-claimed.json', bytes: 1, kind: 'json', sha256: 'a'.repeat(64) },
-  }))
+  claimedEvents.push(
+    ev('artifact/write', {
+      nodeId: claimedAcceptance.nodeId,
+      attemptId: 1,
+      data: { path: 'ev/f4-acc-self.json', bytes: 1, kind: 'json', sha256: 'a'.repeat(64) },
+    }),
+    ev('artifact/write', {
+      nodeId: claimedTest.nodeId,
+      attemptId: 1,
+      data: { path: 'ev/f4-test-self.json', bytes: 1, kind: 'json', sha256: 'b'.repeat(64) },
+    }),
+  )
   const mixed = computeQuality(claimedEvents, {
     verifyHostExecution: () => true,
     verifyEvidence: () => true,
@@ -1980,10 +1992,11 @@ check('F4 host + claimed 混合：claimed 项不得因存在 host 项而免于�
   assert.equal(mixed.evidence.acceptance.claimedPassed, 1)
   assert.equal(mixed.evidence.tests.claimedPassed, 1)
   assert.equal(mixed.authoritativePassed, 1)
-  assert.notEqual(mixed.state, 'pass', 'host + claimed 混合时不能让 claimed 项搭便车')
-  assert.equal(mixed.state, 'unknown')
-  assert.match(mixed.label, /未获宿主独立验证|独立证据/)
-
+  assert.equal(mixed.evidence.acceptance.selfOnly, true, 'acceptance 只有自证')
+  assert.equal(mixed.evidence.tests.selfOnly, true, 'tests 只有自证')
+  assert.notEqual(mixed.state, 'pass', '自证 claimed + host 混合仍不能让 claimed 项搭便车')
+  assert.equal(mixed.state, 'warn')
+  assert.match(mixed.label, /全部为自证证据|缺独立复核/)
 })
 
 check('R6 acceptance/checks 自报报告 + 三项全 claimed → quality unknown、authorityCoverage=0', () => {
@@ -2047,20 +2060,23 @@ check('R6（返工）：没有 verifyHostExecution 时 producer=host 只能算 c
   assert.equal(verified.evidence.checks.state, 'pass')
 })
 
-check('R6 三项指标都只被 claimed 覆盖（有真产物但均为模型自报）→ quality 至少 unknown，不刷绿', () => {
-  const events = ownershipFixture({ acceptance: 'peer', tests: 'peer', checks: 'peer' })
+check('R6 三项指标 claimed 覆盖但只有自证 → warn，不刷绿（v1.3：peer 产物才算独立）', () => {
+  // v1.3：claimed 条目引用的产物若由**别的节点**写（peer），就是独立复核、可以 pass；
+  // 这里全部改成引用本节点自写产物（self），锁住「自证不能把 claimed 洗成绿」。
+  const events = ownershipFixture({ acceptance: 'self', tests: 'self', checks: 'self' })
   for (const event of events) {
     if (['acceptance/verdict', 'test/report', 'check/form'].includes(event.kind)) {
       event.extra = { provenance: 'model-claim' }
     }
   }
   const quality = computeQuality(events)
-  assert.notEqual(quality.state, 'pass', '三项都只有 claimed 覆盖时不能 pass')
-  assert.equal(quality.state, 'unknown')
+  assert.notEqual(quality.state, 'pass', '三项都只有自证覆盖时不能 pass')
+  assert.equal(quality.state, 'warn')
   assert.equal(quality.claimedPassed, 3)
+  assert.equal(quality.selfCertified, 3)
   assert.equal(quality.authoritativePassed, 0)
   assert.equal(quality.authorityCoverage, 0)
-  assert.match(quality.label, /自报|独立证据/)
+  assert.match(quality.label, /全部为自证证据|缺独立复核/)
 })
 
 check('R4 外部观察有界：externalCount 全量、externalObservations 最多 50 条；外部 acceptance 不进通过率', () => {
@@ -2116,17 +2132,19 @@ function thirdCoverageProbe(claimed) {
   return events
 }
 
-check('N1 legacy-only 探针（全无来源）：不得 pass、不得显示「优」，权威覆盖如实为 0', () => {
+check('N1 legacy-only 探针（全无来源、找不到产物归属）：不得 pass、不得显示「优」，按缺独立复核降 warn', () => {
+  // v1.3：独立性不足是 warn 的语义（unknown 只留给缺证据 / 数据矛盾）。
   const quality = computeQuality(fullEvidence())
   assert.equal(quality.authorityCoverage, 0)
   assert.equal(quality.authoritativePassed, 0)
+  assert.equal(quality.independentPassed, 0)
   assert.ok(quality.legacyPassed >= 3, `legacyPassed=${quality.legacyPassed}`)
-  assert.equal(quality.state, 'unknown', `legacy-only 不得通过：state=${quality.state} label=${quality.label}`)
+  assert.equal(quality.state, 'warn', `legacy-only 不得通过：state=${quality.state} label=${quality.label}`)
   assert.equal(quality.label.includes('优'), false, quality.label)
-  assert.match(quality.label, /证据不足/)
+  assert.match(quality.label, /找不到产物归属|缺独立复核/)
 })
 
-check('N1 方向一致：同样 1/3 权威覆盖，legacy run 不得比 model-claim run 更绿', () => {
+check('N1 方向一致（v1.3）：legacy 无归属 → warn；claimed 引用 peer 产物 → 可 pass（peer 是独立复核）', () => {
   const legacyQuality = computeQuality(thirdCoverageProbe(false), HOST_VERIFY)
   const claimedQuality = computeQuality(thirdCoverageProbe(true), { ...HOST_VERIFY, verifyEvidence: () => true })
 
@@ -2135,10 +2153,13 @@ check('N1 方向一致：同样 1/3 权威覆盖，legacy run 不得比 model-cl
   assert.equal(legacyQuality.claimedPassed, 0, 'legacy 不计 claimed')
   assert.equal(legacyQuality.legacyPassed, 2)
   assert.equal(claimedQuality.claimedPassed, 2)
-  assert.notEqual(legacyQuality.state, 'pass', 'legacy 1/3 覆盖不得 pass')
-  assert.equal(claimedQuality.state, 'unknown')
-  assert.equal(legacyQuality.state, claimedQuality.state,
-    `方向倒挂：legacy=${legacyQuality.state} / model-claim=${claimedQuality.state}`)
+  // 旧版「同样覆盖 → 同样 unknown」的方向锁在 v1.3 失效：claimed 条目的证据引用
+  // 能对上**别的节点**写的产物（peer），按 §8.3 就是独立复核，可以 pass。
+  assert.equal(legacyQuality.state, 'warn', `legacy 无归属不得 pass：${legacyQuality.label}`)
+  assert.match(legacyQuality.label, /找不到产物归属|缺独立复核/)
+  assert.equal(claimedQuality.state, 'pass', claimedQuality.label)
+  assert.equal(claimedQuality.independentPassed, 3, 'acceptance / tests 各 1 条 peer + checks host')
+  assert.notEqual(legacyQuality.state, 'pass', 'legacy 1/3 覆盖且找不到归属不得 pass')
 })
 
 check('N1 反向：真宿主证据齐全（coverage=1、无 claimed/legacy 残留）仍 pass「优」', () => {
@@ -2152,15 +2173,16 @@ check('N1 反向：真宿主证据齐全（coverage=1、无 claimed/legacy 残�
   assert.equal(quality.label, '优：首轮通过')
 })
 
-check('N1 阈值边界：权威覆盖 2/3 仍不足以 pass（只有 100% 才给优/良）', () => {
+check('N1 阈值边界（v1.3）：权威覆盖 2/3 且有一条找不到产物归属 → warn，不给「优/良」', () => {
   const events = hostEvidence()
-  // 3 个应验条目里只把 1 个降级为无来源：覆盖 2/3，claimed 仍为 0。
+  // 3 个应验条目里把 test/report 降回无来源、且没有 artifact/write 归属：覆盖 2/3。
   events.find(item => item.kind === 'test/report').extra = undefined
   const quality = computeQuality(events, HOST_VERIFY)
   assert.equal(quality.authorityCoverage, 2 / 3)
   assert.equal(quality.claimedPassed, 0)
   assert.equal(quality.legacyPassed, 1)
-  assert.equal(quality.state, 'unknown', quality.label)
+  assert.equal(quality.state, 'warn', quality.label)
+  assert.match(quality.label, /找不到产物归属|缺独立复核/)
 })
 
 console.log(`\n${checks} 组通过`)

@@ -1989,7 +1989,7 @@ export function createRuntime(options = {}) {
             pending = engine.abort(runId)
           } else if (typeof engine.stop === 'function') {
             // Engine.stop(runId)：abort 在飞请求 + 等循环收尾，返回 run 元数据。
-            pending = engine.stop(runId)
+            pending = engine.stop(runId, { source: 'engine' })
           } else {
             const controller = engine.active && engine.active.controller
             if (controller && typeof controller.abort === 'function') {

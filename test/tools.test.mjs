@@ -145,9 +145,13 @@ function makeEngine({
   return engine
 }
 
-function makeTools({ engine = makeEngine(), auditWorkflow, watchSeconds, now, worktree, worktreeRunner } = {}) {
+function makeTools({
+  engine = makeEngine(), auditWorkflow, watchSeconds, now, worktree, worktreeRunner,
+  stallMs, nodeTimeoutMs, runTimeoutMs, maxRejectsPerEdge,
+} = {}) {
   return createFlowTools({
     flowsRoot, runsRoot, engine, auditWorkflow, watchSeconds, now, worktree, worktreeRunner,
+    stallMs, nodeTimeoutMs, runTimeoutMs, maxRejectsPerEdge,
   })
 }
 
@@ -831,6 +835,291 @@ try {
     A.match(result.supervision.alarmPrompt, /proactive_reclaim/)
     A.match(result.supervision.alarmPrompt, /flow_watch/)
     A.ok(result.supervision.alarmPrompt.includes(started.runId))
+  })
+
+  // ── 7.5 flow_watch · 判定阈值读 run.json.limits（改动 A） ────────────────
+  const NOW_FIXED = new Date('2026-11-06T12:00:00.000Z')
+  const isoBefore = ms => new Date(NOW_FIXED.getTime() - ms).toISOString()
+  const healthyAuditStub = seen => async input => {
+    if (Array.isArray(seen)) seen.push(input)
+    return {
+      verdict: 'healthy',
+      status: 'running',
+      headline: '推进中',
+      progress: { passed: 0, total: 1, ratio: 0, nodes: [] },
+      plan: { expected: [], actual: [], deviations: [] },
+      anomalies: [],
+      recommended: ['继续等待'],
+      nextCheckSeconds: 120,
+    }
+  }
+
+  await check('flow_watch：阈值取 run.json.limits（节点 30 分钟），thresholds 标 source=run', async () => {
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '阈值来源', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'running',
+      started: true,
+      startedAt: isoBefore(30 * 60 * 1000),
+      limits: { nodeTimeoutMs: 30 * 60 * 1000, runTimeoutMs: 45 * 60 * 1000 },
+    })
+    const seen = []
+    const tools = makeTools({
+      engine: makeEngine(),
+      auditWorkflow: healthyAuditStub(seen),
+      stallMs: 5 * 60 * 1000,
+      now: () => NOW_FIXED,
+    })
+    const watch = byName(tools, 'flow_watch')
+    const result = record(await watch.execute({ runId: run.id }, makeExec()))
+
+    A.equal(result.ok, true)
+    A.equal(seen.length, 1, '审计只调一次')
+    // 透传给审计的是 run 自己的上限，不是 deps / 默认值。
+    A.equal(seen[0].nodeTimeoutMs, 30 * 60 * 1000)
+    A.equal(seen[0].runTimeoutMs, 45 * 60 * 1000)
+    A.equal(seen[0].thresholdSource, 'run')
+    // stallMs 没有 run 级来源：deps 配置 > 默认值。
+    A.equal(seen[0].stallMs, 5 * 60 * 1000)
+
+    // 返回值显式暴露「本次判定用的阈值」，主人能看出 stalled 是按哪个阈值算的。
+    A.deepEqual(result.thresholds, {
+      stallMs: 5 * 60 * 1000,
+      nodeTimeoutMs: 30 * 60 * 1000,
+      runTimeoutMs: 45 * 60 * 1000,
+      source: 'run',
+    })
+    const text = watch.output.render({}, result).map(part => part.text).join('\n')
+    A.match(text, /判定阈值/)
+    A.match(text, /30 分钟/)
+    A.match(text, /run\.json\.limits/)
+  })
+
+  await check('flow_watch：run 没配 limits → 用 deps / 默认阈值，source=default', async () => {
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '默认阈值', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'running', started: true, startedAt: isoBefore(60 * 1000),
+    })
+    const seen = []
+    const tools = makeTools({
+      engine: makeEngine(),
+      auditWorkflow: healthyAuditStub(seen),
+      stallMs: 5 * 60 * 1000,
+      nodeTimeoutMs: 25 * 60 * 1000,
+      runTimeoutMs: 90 * 60 * 1000,
+      now: () => NOW_FIXED,
+    })
+    const result = record(await byName(tools, 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.equal(result.ok, true)
+    A.equal(seen[0].nodeTimeoutMs, 25 * 60 * 1000)
+    A.equal(seen[0].runTimeoutMs, 90 * 60 * 1000)
+    A.equal(seen[0].thresholdSource, 'default')
+    A.deepEqual(result.thresholds, {
+      stallMs: 5 * 60 * 1000,
+      nodeTimeoutMs: 25 * 60 * 1000,
+      runTimeoutMs: 90 * 60 * 1000,
+      source: 'default',
+    })
+
+    // 连 deps 都没配：退回默认（节点 20 分钟 / 整轮 2 小时 / 无事件 10 分钟）。
+    const plain = record(await byName(makeTools({
+      engine: makeEngine(), auditWorkflow: healthyAuditStub(), now: () => NOW_FIXED,
+    }), 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.deepEqual(plain.thresholds, {
+      stallMs: 10 * 60 * 1000,
+      nodeTimeoutMs: 20 * 60 * 1000,
+      runTimeoutMs: 2 * 60 * 60 * 1000,
+      source: 'default',
+    })
+  })
+
+  await check('flow_watch：run 配了 30 分钟节点上限 → 26 分钟的节点不再误报 stalled（默认值会报）', async () => {
+    async function seed(limits) {
+      const run = await runstore.createRun(runsRoot, {
+        flowId: 'flow-main', flowName: '主流程', name: '误报对照', nodeTotal: 1, engine: 'real',
+      })
+      await runstore.writeRunMeta(runsRoot, run.id, {
+        status: 'running',
+        started: true,
+        startedAt: isoBefore(30 * 60 * 1000),
+        ...(limits ? { limits } : {}),
+      })
+      await runstore.appendEvents(runsRoot, run.id, [
+        {
+          v: 1,
+          ts: isoBefore(30 * 60 * 1000),
+          kind: 'run/start',
+          traceId: `run:${run.id}`,
+          data: { flowId: 'flow-main', flowName: '主流程', nodeTotal: 1, engine: 'real' },
+        },
+        {
+          v: 1,
+          ts: isoBefore(26 * 60 * 1000),
+          kind: 'node/start',
+          nodeId: 'n_a',
+          attemptId: 1,
+          traceId: `run:${run.id}`,
+          data: { title: '阶段 A', mode: 'single', skills: [] },
+        },
+        // 事件仍在流（idle=1 分钟）：所以只有「超过节点上限」这一种可能触发 stalled。
+        {
+          v: 1,
+          ts: isoBefore(60 * 1000),
+          kind: 'agent/message',
+          nodeId: 'n_a',
+          attemptId: 1,
+          traceId: `run:${run.id}`,
+          data: { role: 'assistant', text: '还在干活', truncated: false },
+        },
+      ])
+      return run
+    }
+
+    const withLimits = await seed({ nodeTimeoutMs: 30 * 60 * 1000, runTimeoutMs: 2 * 60 * 60 * 1000 })
+    const ok = record(await byName(makeTools({
+      engine: makeEngine(), now: () => NOW_FIXED,
+    }), 'flow_watch').execute({ runId: withLimits.id }, makeExec()))
+    A.equal(ok.ok, true)
+    A.equal(ok.thresholds.source, 'run')
+    A.equal(ok.thresholds.nodeTimeoutMs, 30 * 60 * 1000)
+    A.equal(ok.anomalies.some(item => item.kind === 'timeout-risk'), false, '26 分钟 < 30 分钟，不该报超时风险')
+    A.equal(ok.anomalies.some(item => item.kind === 'stall'), false, '事件仍在流，不该报无事件卡死')
+    A.ok(ok.verdict !== 'stalled')
+
+    // 对照：同一个 26 分钟节点，run 没配 limits → 默认 20 分钟就会误报 timeout-risk。
+    const withoutLimits = await seed(null)
+    const strict = record(await byName(makeTools({
+      engine: makeEngine(), now: () => NOW_FIXED,
+    }), 'flow_watch').execute({ runId: withoutLimits.id }, makeExec()))
+    A.equal(strict.thresholds.source, 'default')
+    A.equal(strict.thresholds.nodeTimeoutMs, 20 * 60 * 1000)
+    A.equal(strict.verdict, 'stalled')
+    const timeout = strict.anomalies.find(item => item.kind === 'timeout-risk')
+    A.ok(timeout, '默认阈值下必须报 timeout-risk（对照）')
+    A.match(timeout.detail, /阈值 20 分钟/)
+    A.match(timeout.detail, /默认值/)
+  })
+
+  // ── 7.6 flow_watch · restart 续跑跳过节点（改动 B） ─────────────────────
+  await check('flow_watch：restart 续跑的 run 不算偏航，progress.skipped / skippedCount 单列', async () => {
+    await store.saveFlow(flowsRoot, 'flow-chain', makeFlow('flow-chain', '链流程', [
+      { id: 'n_req', title: '需求分析' },
+      { id: 'n_shape', title: '结构设计' },
+      { id: 'n_dev', title: '开发' },
+      { id: 'n_test', title: '测试' },
+    ]))
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-chain', flowName: '链流程', name: '续跑', nodeTotal: 4, engine: 'real',
+    })
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'running',
+      started: true,
+      startedAt: isoBefore(10 * 60 * 1000),
+      restart: {
+        fromRunId: 'r-previous',
+        attempt: 1,
+        oldStatus: 'aborted',
+        startNodeId: 'n_dev',
+        skippedNodeIds: ['n_req', 'n_shape'],
+        inheritedNodeIds: ['n_req', 'n_shape', 'n_dev'],
+      },
+    })
+    await runstore.appendEvents(runsRoot, run.id, [
+      {
+        v: 1,
+        ts: isoBefore(10 * 60 * 1000),
+        kind: 'run/start',
+        traceId: `run:${run.id}`,
+        data: { flowId: 'flow-chain', flowName: '链流程', nodeTotal: 4, engine: 'real' },
+      },
+      // 从第 3 阶段起跑：上次前两阶段已完成（skippedNodeIds）。
+      {
+        v: 1,
+        ts: isoBefore(8 * 60 * 1000),
+        kind: 'node/start',
+        nodeId: 'n_dev',
+        attemptId: 1,
+        traceId: `run:${run.id}`,
+        data: { title: '开发', mode: 'single', skills: [] },
+      },
+      {
+        v: 1,
+        ts: isoBefore(6 * 60 * 1000),
+        kind: 'node/end',
+        nodeId: 'n_dev',
+        attemptId: 1,
+        traceId: `run:${run.id}`,
+        data: { status: 'passed', durationMs: 120000 },
+      },
+      {
+        v: 1,
+        ts: isoBefore(5 * 60 * 1000),
+        kind: 'node/start',
+        nodeId: 'n_test',
+        attemptId: 1,
+        traceId: `run:${run.id}`,
+        data: { title: '测试', mode: 'single', skills: [] },
+      },
+    ])
+
+    const tools = makeTools({ engine: makeEngine(), now: () => NOW_FIXED })
+    const watch = byName(tools, 'flow_watch')
+    const result = record(await watch.execute({ runId: run.id }, makeExec()))
+
+    A.equal(result.ok, true)
+    A.ok(result.verdict !== 'deviating', `续跑不该判偏航（实际 ${result.verdict}）`)
+    A.ok(result.recommended !== 'stop', '续跑不该建议 stop')
+    A.deepEqual(result.plan.deviations, [])
+    A.deepEqual(result.plan.expected, ['n_dev', 'n_test'], '预期链扣掉本次跳过的阶段')
+    A.deepEqual(result.plan.actual, ['n_dev', 'n_test'])
+    A.deepEqual(result.progress.skipped, ['n_req', 'n_shape'])
+    A.equal(result.progress.skippedCount, 2)
+    A.equal(result.progress.passed, 1)
+    A.equal(result.progress.total, 4)
+    A.equal(result.progress.ratio, 1 / 2, 'ratio = passed / (total - skipped)')
+    const states = Object.fromEntries(result.progress.nodes.map(node => [node.id, node.state]))
+    A.equal(states.n_req, 'skipped')
+    A.equal(states.n_shape, 'skipped')
+    const text = watch.output.render({}, result).map(part => part.text).join('\n')
+    A.match(text, /restart 续跑跳过 2 个阶段/)
+  })
+
+  await check('flow_watch：没有 restart 的 run，progress 不带跳过节点（行为不变）', async () => {
+    const run = await runstore.createRun(runsRoot, {
+      flowId: 'flow-main', flowName: '主流程', name: '无续跑', nodeTotal: 1, engine: 'real',
+    })
+    await runstore.writeRunMeta(runsRoot, run.id, {
+      status: 'running', started: true, startedAt: isoBefore(5 * 60 * 1000),
+    })
+    await runstore.appendEvents(runsRoot, run.id, [
+      {
+        v: 1,
+        ts: isoBefore(5 * 60 * 1000),
+        kind: 'run/start',
+        traceId: `run:${run.id}`,
+        data: { flowId: 'flow-main', flowName: '主流程', nodeTotal: 1, engine: 'real' },
+      },
+      {
+        v: 1,
+        ts: isoBefore(4 * 60 * 1000),
+        kind: 'node/start',
+        nodeId: 'n_a',
+        attemptId: 1,
+        traceId: `run:${run.id}`,
+        data: { title: '阶段 A', mode: 'single', skills: [] },
+      },
+    ])
+    const result = record(await byName(makeTools({
+      engine: makeEngine(), now: () => NOW_FIXED,
+    }), 'flow_watch').execute({ runId: run.id }, makeExec()))
+    A.equal(result.ok, true)
+    A.deepEqual(result.progress.skipped, [])
+    A.equal(result.progress.skippedCount, 0)
+    A.equal(result.progress.ratio, 0)
+    A.deepEqual(result.plan.deviations, [])
   })
 
   // ── 8. flow_watch · 节点自审状态（v0.8 §11.4） ──────────────────────────

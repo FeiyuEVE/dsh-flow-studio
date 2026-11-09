@@ -331,8 +331,11 @@ try {
     A.equal(final.status, 'done')
     A.ok(Boolean(testEvent), 'test/report 必须落盘（自报事实保留）')
     A.equal(testEvent.extra && testEvent.extra.generatedReport, true, '引擎自写报告必须打 generatedReport 标记')
-    A.equal(summary.quality.evidence.tests.state, 'unknown', '自写报告的 pass 只能算 claimed，指标不得为 pass')
-    A.match(String(summary.quality.evidence.tests.reason), /自报报告/, 'reason 必须说明缺独立证据')
+    // v1.3：自证是指标级证据（state=pass + selfOnly），结论层再降 warn；
+    // 「引擎自写报告不能把 quality 洗绿」由最后一条断言守住。
+    A.equal(summary.quality.evidence.tests.state, 'pass', '自证仍是证据，指标层不降级')
+    A.equal(summary.quality.evidence.tests.selfOnly, true, '自写报告只能算自证')
+    A.match(String(summary.quality.evidence.tests.reason), /自报|自证/, 'reason 必须写清自报 / 独立条数')
     A.equal(summary.quality.evidence.tests.claimedPassed, 1)
     A.equal(summary.quality.evidence.tests.authoritativePassed, 0)
     A.ok(summary.quality.state !== 'pass', '自报 29/29 不能把 quality 洗绿')
@@ -366,8 +369,10 @@ try {
     const summary = summarize(events)
     A.equal(final.status, 'done')
     A.equal(verdict.extra && verdict.extra.generatedReport, true, '引擎自写 acceptance.json 必须打标记')
-    A.equal(summary.quality.evidence.acceptance.state, 'unknown')
-    A.match(String(summary.quality.evidence.acceptance.reason), /自报报告/)
+    // v1.3：自证是指标级证据；quality 层的降权由 selfOnly 负责。
+    A.equal(summary.quality.evidence.acceptance.state, 'pass', '自证仍是证据，指标层不降级')
+    A.equal(summary.quality.evidence.acceptance.selfOnly, true, '引擎自写 acceptance.json 只能算自证')
+    A.match(String(summary.quality.evidence.acceptance.reason), /自报|自证/)
     A.equal(summary.quality.evidence.acceptance.claimedPassed, 1)
     A.equal(summary.quality.evidence.acceptance.authoritativePassed, 0)
   })

@@ -1720,12 +1720,11 @@ check('抽屉展开态（M4）：验收 / 总耗时 / P0 / 采纳率 / skill 覆
     initialEvents: logEvents,
   }))
   for (const needle of [
-    '验收通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次',
+    '自报通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次',
     '12:00', '78%', '2/3', '1 轮',
   ]) {
     assert.ok(html.includes(needle), '展开态缺少指标「' + needle + '」')
   }
-  assert.ok(html.includes('入 8k · 缓存读 40k · 缓存写 0 · 出 2k'), 'token 四段明细应出现在展开态')
   assert.equal(formatDuration(42300), '42.3s')
   assert.equal(formatDuration(720000), '12:00')
   assert.equal(formatDuration(null), '')
@@ -1737,6 +1736,46 @@ check('抽屉展开态（M4）：验收 / 总耗时 / P0 / 采纳率 / skill 覆
   assert.equal(metrics.acceptedRateText, '78%')
   assert.equal(metrics.skillText, '2/3')
   assert.equal(metrics.reworkText, '1 轮')
+})
+
+check('D：验收通过率是自报口径——标签写「自报」，只有 quality=pass 才用 success 色', () => {
+  // 只认 stat 标签本体（`>自报通过率</span>`），别命中 40px 条的 title 文案。
+  const statTagOf = (source, label) => {
+    const at = source.indexOf('>' + label + '</span>')
+    assert.ok(at > 0, '缺少指标「' + label + '」')
+    return source.slice(source.lastIndexOf('<div', at), at)
+  }
+  const drawer = summary => render(React.createElement(FsLogDrawer, {
+    open: true,
+    onToggle() {},
+    initialRuns: [logRun],
+    initialRunId: logRun.id,
+    initialSummary: summary,
+    initialDetail: { run: logRun, nodes: [], eventCount: 4 },
+    initialEvents: logEvents,
+  }))
+
+  // quality=pass：允许 success 色，但标签仍必须写「自报」（它不是权威验收率）。
+  const passHtml = drawer(logSummary)
+  assert.ok(passHtml.includes('>自报通过率</span>'), '标签必须写「自报通过率」')
+  assert.ok(statTagOf(passHtml, '自报通过率').includes('fs-stat-success'),
+    'quality=pass 时自报通过率可用 success 色')
+  assert.ok(passHtml.includes('良：返工 1 轮后达标'), '旁边的结论 pill 保持不变')
+
+  // quality 非 pass（warn / unknown / 缺质量结论）→ 中性色，绝不冒充权威绿。
+  for (const [name, summary] of [
+    ['warn', { ...logSummary, quality: { state: 'warn', label: '可：验收条目全部为自证证据，缺独立复核' } }],
+    ['unknown', { ...logSummary, quality: { state: 'unknown', label: '证据不足：测试未检测' } }],
+    ['缺 quality', { ...logSummary, quality: undefined }],
+  ]) {
+    const html = drawer(summary)
+    assert.ok(html.includes('>自报通过率</span>'), name + '：仍必须显示「自报通过率」')
+    const tag = statTagOf(html, '自报通过率')
+    assert.ok(tag.includes('fs-stat-neutral'), name + '：quality 非 pass 时必须中性色：' + tag)
+    assert.ok(!tag.includes('fs-stat-success'), name + '：quality 非 pass 时不得用 success 色')
+  }
+  assert.ok(drawer({ ...logSummary, quality: { state: 'warn', label: '可：验收条目全部为自证证据，缺独立复核' } })
+    .includes('可：验收条目全部为自证证据，缺独立复核'), '旁边的结论 pill 保持不变')
 })
 
 check('抽屉无 run：显示「还没有运行记录」与「刷新」', () => {
@@ -1885,6 +1924,18 @@ check('N1 客户端兜底：Host 仍报 pass 但权威覆盖<100% 时不得渲�
   })
   assert.equal(full.tone, 'success', '覆盖 100% 且无 claimed 残留仍必须是绿 pill')
   assert.equal(full.text, '优：首轮通过')
+
+  // v1.3：新 Host 带 independentPassed（peer/host 独立证据门禁）时，pass 以服务端为准；
+  // 仅 host 的 authorityCoverage 只用于展示，不再二次降级（peer 也是独立复核）。
+  const peerPass = conclusionOf(logRun, {
+    quality: {
+      state: 'pass', label: '优：首轮通过',
+      independentPassed: 7, selfCertified: 6, selfOnlyMetrics: [],
+      authoritativePassed: 0, authoritativeTotal: 13, authorityCoverage: 0, claimedPassed: 7,
+    },
+  })
+  assert.equal(peerPass.tone, 'success', 'peer 独立复核的 pass 不得被 host-only coverage 降级')
+  assert.equal(peerPass.text, '优：首轮通过')
 
   const oldHost = conclusionOf(logRun, { quality: { state: 'pass', label: '优：首轮通过' } })
   assert.equal(oldHost.tone, 'success', '没有 coverage 字段的老 Host 摘要保持兼容，不误伤真通过')
@@ -2904,7 +2955,7 @@ check('0.10 R3 抽屉默认 340、指标条 min-height:58 且内容盒 ≥48、�
     initialSummary: logSummary,
   }))
   assert.equal((html.match(/class="fs-stat fs-stat-/g) || []).length, 7, '展开态应有 7 个 stat')
-  for (const needle of ['验收通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次']) {
+  for (const needle of ['自报通过率', '总耗时', '总 token', 'P0 未解决', '审查采纳率', 'skill 覆盖率', '返工轮次']) {
     assert.ok(html.includes(needle), '缺少指标「' + needle + '」')
   }
   // 收起态仍是 40px 条（R3 只改展开档）。

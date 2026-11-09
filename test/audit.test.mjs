@@ -89,6 +89,15 @@ function assertContract(audit, expectedVerdict) {
   assert.ok(Number.isInteger(audit.progress.total) && audit.progress.total >= 0)
   assert.ok(audit.progress.ratio === null || (audit.progress.ratio >= 0 && audit.progress.ratio <= 1))
   assert.ok(Array.isArray(audit.progress.nodes))
+  // restart 续跑：跳过节点单列返回（没有 restart 时是空数组 / 0，字段恒定存在）。
+  assert.ok(Array.isArray(audit.progress.skipped))
+  assert.equal(audit.progress.skippedCount, audit.progress.skipped.length)
+  // 判定依据：本次实际用的阈值 + 来源（run.json.limits / 默认值）。
+  assert.ok(audit.thresholds && typeof audit.thresholds === 'object')
+  assert.ok(Number.isInteger(audit.thresholds.stallMs) && audit.thresholds.stallMs > 0)
+  assert.ok(Number.isInteger(audit.thresholds.nodeTimeoutMs) && audit.thresholds.nodeTimeoutMs > 0)
+  assert.ok(Number.isInteger(audit.thresholds.runTimeoutMs) && audit.thresholds.runTimeoutMs > 0)
+  assert.ok(['run', 'default'].includes(audit.thresholds.source))
   assert.ok(Array.isArray(audit.plan.expected))
   assert.ok(Array.isArray(audit.plan.actual))
   assert.ok(Array.isArray(audit.plan.deviations))
@@ -509,10 +518,17 @@ check('N1：legacy 形状（证据无 extra）的 done run 不得 pass，headlin
   })
   assertContract(audit, 'done')
   assert.ok(audit.quality, 'done 必须有质量结论')
-  assert.equal(audit.quality.state, 'unknown', `legacy 形状不得 pass：${audit.quality.label}`)
-  assert.match(audit.quality.label, /legacy|来源未知/)
-  assert.match(audit.headline, /unknown/)
-  assert.match(audit.headline, /legacy|来源未知/)
+  // 质量分类归 runlog 的质量层：v1.3 起 legacy（无产物归属）从 unknown 细分成 warn，
+  // 但「legacy 形状不得算通过」这条不能松——只断言不是 pass。
+  assert.ok(
+    audit.quality.state !== 'pass',
+    `legacy 形状不得 pass（实际 ${audit.quality.state}：${audit.quality.label}）`,
+  )
+  // 措辞同样归 runlog（可能说「来源未知 / 找不到产物归属 / 缺独立复核 / 证据不足」）；
+  // 审计这边只要求可读文案指明了「证据不足」这一类原因。
+  assert.match(audit.quality.label, /legacy|来源未知|找不到产物归属|缺独立复核|证据不足|无法判定/)
+  assert.match(audit.headline, /unknown|warn/)
+  assert.match(audit.headline, /legacy|来源未知|找不到产物归属|缺独立复核|证据不足|无法判定/)
 })
 
 // ---------------------------------------------------------------------------
@@ -652,6 +668,299 @@ check('done 但无证据：quality unknown，headline 明说未检测', () => {
   assert.ok(audit.quality)
   assert.equal(audit.quality.state, 'unknown')
   assert.match(audit.headline, /未检测/)
+})
+
+// ---------------------------------------------------------------------------
+// 15. 阈值来源：run.json.limits 优先，默认值兜底
+// ---------------------------------------------------------------------------
+check('阈值：显式 nodeTimeoutMs=30 分钟 → 26 分钟的节点不报超时风险（默认 20 分钟会报）', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
+  ]
+  // 节点已跑 26 分钟，但期间事件一直在流（不是「无事件卡死」）。
+  const mid = [
+    ev('agent/message', { ts: isoAt(20), data: { role: 'assistant', text: '仍在推进' } }),
+    ev('agent/message', { ts: isoAt(25), data: { role: 'assistant', text: '快好了' } }),
+  ]
+  const base = {
+    flow: FLOW,
+    events: [...events, ...mid],
+    now: msAt(26),
+    run: { status: 'running', startedAt: isoAt(0) },
+  }
+
+  // 默认阈值（20 分钟）→ 误报 timeout-risk。
+  const withDefault = auditWorkflow(base)
+  assertContract(withDefault, 'stalled')
+  assert.ok(withDefault.anomalies.some(anomaly => anomaly.kind === 'timeout-risk'))
+  assert.equal(withDefault.thresholds.source, 'default')
+  assert.equal(withDefault.thresholds.nodeTimeoutMs, 20 * 60 * 1000)
+
+  // run 配置 30 分钟 → 同一份事件不该再报超时风险。
+  const withRunLimit = auditWorkflow({ ...base, nodeTimeoutMs: 30 * 60 * 1000, thresholdSource: 'run' })
+  assertContract(withRunLimit, 'healthy')
+  assert.equal(withRunLimit.anomalies.length, 0)
+  assert.equal(withRunLimit.thresholds.nodeTimeoutMs, 30 * 60 * 1000)
+  assert.equal(withRunLimit.thresholds.source, 'run')
+
+  // 显式传了但 thresholdSource 没传：按「有显式值」推断成 run。
+  const inferred = auditWorkflow({ ...base, nodeTimeoutMs: 30 * 60 * 1000 })
+  assert.equal(inferred.thresholds.source, 'run')
+
+  // 整轮上限也接受透传（只进判定依据；不改变 verdict）。
+  const withRunLimitBoth = auditWorkflow({
+    ...base,
+    nodeTimeoutMs: 30 * 60 * 1000,
+    runTimeoutMs: 45 * 60 * 1000,
+    thresholdSource: 'run',
+  })
+  assert.equal(withRunLimitBoth.thresholds.runTimeoutMs, 45 * 60 * 1000)
+})
+
+check('阈值：不传 options、只给 run.limits.nodeTimeoutMs → 也用 run 值（引擎 supervision 的调用形状）', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
+    ev('agent/message', { ts: isoAt(25), data: { role: 'assistant', text: '仍在推进' } }),
+  ]
+  // runtime.js 的 evaluate 就是这么调的：只有 run 元数据，一个阈值参数都不传。
+  const runWithLimits = {
+    status: 'running',
+    startedAt: isoAt(0),
+    limits: { nodeTimeoutMs: 30 * 60 * 1000, runTimeoutMs: 45 * 60 * 1000 },
+  }
+  const viaRunLimits = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(26),
+    run: runWithLimits,
+  })
+  assertContract(viaRunLimits, 'healthy')
+  assert.equal(viaRunLimits.anomalies.some(anomaly => anomaly.kind === 'timeout-risk'), false,
+    '26 分钟 < run 配的 30 分钟，不得报超时风险')
+  assert.equal(viaRunLimits.anomalies.some(anomaly => anomaly.kind === 'stall'), false)
+  assert.equal(viaRunLimits.thresholds.nodeTimeoutMs, 30 * 60 * 1000)
+  assert.equal(viaRunLimits.thresholds.runTimeoutMs, 45 * 60 * 1000)
+  assert.equal(viaRunLimits.thresholds.source, 'run')
+
+  // 对照：同一个 run 不配 limits（runtime 里的老 run）→ 仍按默认 20 分钟报超时。
+  const withoutLimits = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(26),
+    run: { status: 'running', startedAt: isoAt(0) },
+  })
+  assertContract(withoutLimits, 'stalled')
+  assert.ok(withoutLimits.anomalies.some(anomaly => anomaly.kind === 'timeout-risk'))
+  assert.equal(withoutLimits.thresholds.source, 'default')
+
+  // 显式参数仍最优先：调用方明确给 10 分钟时，run.json.limits 的 30 分钟不能盖掉它。
+  const explicitWins = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(26),
+    run: runWithLimits,
+    nodeTimeoutMs: 10 * 60 * 1000,
+  })
+  assert.equal(explicitWins.thresholds.nodeTimeoutMs, 10 * 60 * 1000)
+  assert.ok(explicitWins.anomalies.some(anomaly => anomaly.kind === 'timeout-risk'))
+
+  // limits 里的坏值（0 / 字符串）当没配，退回默认，不抛错。
+  const brokenLimits = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(26),
+    run: { status: 'running', startedAt: isoAt(0), limits: { nodeTimeoutMs: 0, runTimeoutMs: 'soon' } },
+  })
+  assert.equal(brokenLimits.thresholds.nodeTimeoutMs, 20 * 60 * 1000)
+  assert.equal(brokenLimits.thresholds.source, 'default')
+})
+
+check('阈值：超时风险 detail / headline 写的是实际用的阈值，不是默认值', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
+    ev('agent/message', { ts: isoAt(8), data: { role: 'assistant', text: '仍在推进' } }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(21),
+    run: { status: 'running', startedAt: isoAt(0) },
+    nodeTimeoutMs: 15 * 60 * 1000,
+    thresholdSource: 'run',
+  })
+  assertContract(audit, 'stalled')
+  const timeout = audit.anomalies.find(anomaly => anomaly.kind === 'timeout-risk')
+  assert.ok(timeout)
+  assert.match(timeout.detail, /阈值 15 分钟/)
+  assert.match(timeout.detail, /run\.json\.limits/)
+  assert.doesNotMatch(timeout.detail, /20 分钟/)
+  assert.match(audit.headline, /15 分钟/)
+})
+
+// ---------------------------------------------------------------------------
+// 16. no-progress：detail 补上已观测事实（事件仍在流 / idle）
+// ---------------------------------------------------------------------------
+check('no-progress：detail 写清「事件仍在流（idle=…）」，阈值文字与实际一致', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(15) }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(16),
+    run: { status: 'running', startedAt: isoAt(0) },
+  })
+  assertContract(audit, 'no-progress')
+  const anomaly = audit.anomalies.find(item => item.kind === 'no-progress')
+  assert.ok(anomaly)
+  assert.match(anomaly.detail, /事件仍在流/)
+  assert.match(anomaly.detail, /idle=/)
+  assert.match(anomaly.detail, /无进展判定阈值 10 分钟/)
+  assert.match(audit.headline, /事件仍在流/)
+
+  // 事件确实停了超过阈值：detail 不再说「仍在流」，而是说「最近 X 无新事件」。
+  const stopped = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(40),
+    run: { status: 'running', startedAt: isoAt(0) },
+  })
+  // 事件停了 25 分钟，同时触发 stall → verdict 仍是 stalled，但 no-progress 条目仍要如实描述。
+  const stoppedAnomaly = stopped.anomalies.find(item => item.kind === 'no-progress')
+  assert.ok(stoppedAnomaly)
+  assert.match(stoppedAnomaly.detail, /无新事件/)
+  assert.doesNotMatch(stoppedAnomaly.detail, /事件仍在流/)
+})
+
+// ---------------------------------------------------------------------------
+// 17. restart 续跑：跳过节点不算未执行、不算偏航
+// ---------------------------------------------------------------------------
+check('restart 续跑：从第 3 阶段起跑不算偏航，跳过节点单列、分母扣减', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    // 上次已完成 n_req / n_shape，本次直接跑 n_dev。
+    nodeStart(ev, 'n_dev', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_dev', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_test', 1, { ts: isoAt(0, 3) }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(0, 30),
+    run: {
+      status: 'running',
+      startedAt: isoAt(0),
+      restart: { fromRunId: 'r-old', attempt: 1, startNodeId: 'n_dev', skippedNodeIds: ['n_req', 'n_shape'] },
+    },
+  })
+  assertContract(audit, 'healthy')
+  assert.deepEqual(audit.plan.deviations, [])
+  assert.deepEqual(audit.plan.expected, ['n_dev', 'n_test'])
+  assert.deepEqual(audit.plan.actual, ['n_dev', 'n_test'])
+  assert.deepEqual(audit.progress.skipped, ['n_req', 'n_shape'])
+  assert.equal(audit.progress.skippedCount, 2)
+  assert.equal(audit.progress.passed, 1)
+  assert.equal(audit.progress.total, 4)
+  assert.equal(audit.progress.ratio, 1 / 2, 'ratio = passed / (total - skipped)')
+  const states = Object.fromEntries(audit.progress.nodes.map(node => [node.id, node.state]))
+  assert.equal(states.n_req, 'skipped')
+  assert.equal(states.n_shape, 'skipped')
+  assert.equal(states.n_dev, 'passed')
+  assert.equal(states.n_test, 'running')
+  assert.equal(audit.anomalies.length, 0)
+  assert.equal(audit.recommended, 'wait')
+})
+
+check('restart 续跑（全部跑完）：done + ratio=1，不再有偏航条目', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_dev', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_dev', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_test', 1, { ts: isoAt(0, 3) }),
+    nodeEnd(ev, 'n_test', 'passed', 1, { ts: isoAt(0, 4) }),
+    ev('run/end', { ts: isoAt(0, 5), data: { status: 'done' } }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(1),
+    run: {
+      status: 'done',
+      startedAt: isoAt(0),
+      endedAt: isoAt(0, 5),
+      restart: { fromRunId: 'r-old', attempt: 2, startNodeId: 'n_dev', skippedNodeIds: ['n_req', 'n_shape'] },
+    },
+  })
+  assertContract(audit, 'done')
+  assert.equal(audit.progress.passed, 2)
+  assert.equal(audit.progress.total, 4)
+  assert.equal(audit.progress.ratio, 1)
+  assert.deepEqual(audit.plan.deviations, [])
+  assert.deepEqual(audit.progress.skipped, ['n_req', 'n_shape'])
+})
+
+check('没有 restart 的 run：行为完全不变（skipped 为空、ratio 仍是 passed/total）', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
+    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
+    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
+    nodeEnd(ev, 'n_shape', 'passed', 1, { ts: isoAt(0, 4) }),
+    nodeStart(ev, 'n_dev', 1, { ts: isoAt(0, 5) }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(0, 40),
+    run: { status: 'running', startedAt: isoAt(0) },
+  })
+  assertContract(audit, 'healthy')
+  assert.deepEqual(audit.plan.expected, ['n_req', 'n_shape', 'n_dev', 'n_test'])
+  assert.deepEqual(audit.progress.skipped, [])
+  assert.equal(audit.progress.skippedCount, 0)
+  assert.equal(audit.progress.ratio, 0.5)
+  assert.ok(audit.progress.nodes.every(node => node.state !== 'skipped'))
+})
+
+check('restart 跳过节点若被引擎重新执行（异常数据）：不生成偏航条目', () => {
+  const ev = eventLog()
+  const events = [
+    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 4 } }),
+    nodeStart(ev, 'n_dev', 1, { ts: isoAt(0, 1) }),
+    // 理论上不该出现：被跳过的阶段又被 node/start（比如续跑计划被手改）。
+    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 2) }),
+    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 3) }),
+  ]
+  const audit = auditWorkflow({
+    flow: FLOW,
+    events,
+    now: msAt(0, 30),
+    run: {
+      status: 'running',
+      startedAt: isoAt(0),
+      restart: { fromRunId: 'r-old', attempt: 1, startNodeId: 'n_dev', skippedNodeIds: ['n_req', 'n_shape'] },
+    },
+  })
+  assert.deepEqual(audit.plan.deviations, [])
+  assert.deepEqual(audit.plan.actual, ['n_dev'])
+  assert.equal(audit.anomalies.some(anomaly => anomaly.kind === 'deviation'), false)
 })
 
 console.log(`\n${checks} 组通过`)

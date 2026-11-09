@@ -304,17 +304,44 @@ export function buildCodexArgs({ cwd, schemaPath, model, sandbox = DEFAULT_CODEX
   return args
 }
 
-/** 把 codex 的 usage 对象归一化成 `{ input, output, total }`；认不出返回 null。 */
+/**
+ * 把 codex 的 usage 对象归一化成四桶 `{ input, cacheRead, cacheWrite, output, total }`；
+ * 认不出返回 null。
+ *
+ * **口径（05 §3）**：codex 的 `input_tokens` 是「命中缓存 + 未命中」的总和，
+ * `cached_input_tokens` / `cache_write_input_tokens` 是其中的子集，不是额外增量。
+ * 所以必须**从 input 里扣掉**再独立成桶：
+ *   - `cacheRead  = cached_input_tokens`（或 cachedInputTokens / cache_read_input_tokens）
+ *   - `cacheWrite = cache_write_input_tokens`（或 cacheWriteInputTokens）
+ *   - `input      = max(0, input_tokens − cacheRead − cacheWrite)`
+ *   - `total      = input_tokens + output_tokens`（显式给了 total_tokens 就用它）
+ * 这样四桶之和恒等于旧口径的 total（`input_tokens + output`），`tokenTotal` 不变；
+ * 缓存桶只是把原来记进 input 的那部分挪到正确的桶里。
+ *
+ * 防御：上游若给出 cached > input 这类矛盾数据，两个缓存桶按 raw input 上限截断
+ * （先读后写），保证「四桶之和 === total」这条不变量不被坏数据破坏。
+ *
+ * @param {object} raw
+ * @returns {{input:number, cacheRead:number, cacheWrite:number, output:number, total:number}|null}
+ */
 function normalizeUsage(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const input = nonNegativeInt(raw.input_tokens ?? raw.inputTokens ?? raw.input)
+  const rawInput = nonNegativeInt(raw.input_tokens ?? raw.inputTokens ?? raw.input)
   const output = nonNegativeInt(raw.output_tokens ?? raw.outputTokens ?? raw.output)
   const explicitTotal = raw.total_tokens ?? raw.totalTokens ?? raw.total
   const hasTokens = ['input_tokens', 'inputTokens', 'output_tokens', 'outputTokens', 'input', 'output']
     .some(key => Number.isFinite(raw[key]))
   if (!hasTokens) return null
-  const total = Number.isFinite(explicitTotal) ? nonNegativeInt(explicitTotal) : input + output
-  return { input, output, total }
+  const cached = nonNegativeInt(
+    raw.cached_input_tokens ?? raw.cachedInputTokens ?? raw.cache_read_input_tokens,
+  )
+  const cacheWriteRaw = nonNegativeInt(raw.cache_write_input_tokens ?? raw.cacheWriteInputTokens)
+  // 矛盾数据（缓存比 input 还大）按 raw input 截断，守住四桶之和 === total。
+  const cacheRead = Math.min(cached, rawInput)
+  const cacheWrite = Math.min(cacheWriteRaw, rawInput - cacheRead)
+  const input = Math.max(0, rawInput - cacheRead - cacheWrite)
+  const total = Number.isFinite(explicitTotal) ? nonNegativeInt(explicitTotal) : rawInput + output
+  return { input, cacheRead, cacheWrite, output, total }
 }
 
 /** 从事件里取一段可读文本，供 log 事件使用。 */
@@ -337,7 +364,7 @@ function textOf(value) {
  *   - 其余未知事件 → ignore（带可读文本时退化成 log）。
  *
  * @param {string} line
- * @returns {{kind:'ignore'}|{kind:'log',text:string,level?:string,itemType?:string}|{kind:'final',text:string}|{kind:'usage',usage:{input:number,output:number,total:number}}}
+ * @returns {{kind:'ignore'}|{kind:'log',text:string,level?:string,itemType?:string}|{kind:'final',text:string}|{kind:'usage',usage:{input:number,cacheRead:number,cacheWrite:number,output:number,total:number}}}
  */
 export function parseCodexLine(line) {
   if (typeof line !== 'string') return { kind: 'ignore' }
@@ -643,7 +670,7 @@ function tailOf(value, max) {
  *   maxEvents?: number|string,
  * }} options
  * @returns {Promise<{ok:boolean, text:string, structured:object|null, exitCode:number|null,
- *   usage:{input:number,output:number,total:number}|null, events:object[], reason?:string,
+ *   usage:{input:number,cacheRead:number,cacheWrite:number,output:number,total:number}|null, events:object[], reason?:string,
  *   code?:string, truncated?:boolean, receivedBytes?:number, retainedBytes?:number,
  *   eventCount?:number, tail?:string, message?:string,
  *   killScope:'group'|'process'|null, orphanWarning:string|null}>}

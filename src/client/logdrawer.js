@@ -1607,13 +1607,16 @@ export function conclusionOf(run, summary) {
 
   if (qualityState === 'pass') {
     // 0.11 N1 客户端兜底：旧 Host 可能仍把 legacy-only（权威覆盖 0）算成 pass。
-    // 同一份 summary 已给出权威覆盖时，覆盖不足 100% 就不许渲染绿色；没有 coverage
-    // 字段的老摘要保持兼容（无法判定，不误伤真通过）。
+    // v1.3：新 Host 会给出 `independentPassed`（peer/host 独立证据门禁的结果），
+    // 此时 pass 是服务端按 05 §8.4 判定的，客户端不再用「仅 host 的 coverage」二次
+    // 降级——peer 级独立复核同样能证明结论可复核，coverage 只用于展示。
+    // 没有 `independentPassed` 的老摘要保持旧兜底（无法判定，不误伤真通过）。
+    const hasIndependence = Number.isInteger(quality.independentPassed)
     const coverage = optionalNum(quality.authorityCoverage)
     const authoritative = optionalNum(quality.authoritativePassed)
     const total = optionalNum(quality.authoritativeTotal)
-    const shortfall = (coverage !== null && coverage < 1)
-      || (coverage === null && authoritative !== null && total !== null && authoritative < total)
+    const shortfall = !hasIndependence && ((coverage !== null && coverage < 1)
+      || (coverage === null && authoritative !== null && total !== null && authoritative < total))
     if (shortfall) {
       const percent = coverage === null ? '' : Math.round(Math.min(1, coverage) * 100) + '%'
       const fraction = authoritative !== null && total !== null ? `（${authoritative}/${total}）` : ''
@@ -3897,6 +3900,9 @@ export function FsLogDrawer({
   }
 
   // 展开态明细：五项聚合（04 §3.2）+ token 四段；收起条只留验收通过率。
+  // D：验收通过率是**纯自报**口径（summarizeAcceptance 不看证据来源），不能借质量
+  // 结论的颜色冒充权威；只有 quality.state=pass 时才允许绿，其余一律中性色。
+  const qualityPassed = Boolean(summary && summary.quality && summary.quality.state === 'pass')
   const stat = (key, label, value, hint, tone) => h('div', {
     key,
     className: 'fs-stat fs-stat-' + tone,
@@ -3907,8 +3913,9 @@ export function FsLogDrawer({
   hint ? h('span', { className: 'fs-stat-hint', title: hint }, hint) : null)
 
   const stats = !feedRun ? null : h('div', { className: 'fs-log-stats', 'aria-label': '运行指标' },
-    stat('acceptance', '验收通过率', metrics.acceptance.valueText,
-      '阶段 ' + nodeProgressText(feedRun) + ' · 跳过不计', 'success'),
+    stat('acceptance', '自报通过率', metrics.acceptance.valueText,
+      '阶段 ' + nodeProgressText(feedRun) + ' · 跳过不计 · 自报口径（不看证据来源）',
+      qualityPassed ? 'success' : 'neutral'),
     stat('duration', '总耗时', metrics.durationText, '运行中走秒，结束定格', 'neutral'),
     stat('tokens', '总 token', metrics.tokens.recorded ? formatTokens(metrics.tokens.total) : '—',
       tokenBreakdown === '' ? tokenLabel : tokenBreakdown, 'brand'),
@@ -3942,7 +3949,7 @@ export function FsLogDrawer({
     feedRun
       ? h('span', {
         className: 'fs-log-main' + (acceptance.missing ? ' missing' : ''),
-        title: '验收条目通过率（主值）' + (acceptance.rateText === '' ? '' : ' · ' + acceptance.rateText),
+        title: '验收条目自报通过率（主值）' + (acceptance.rateText === '' ? '' : ' · ' + acceptance.rateText),
       }, acceptance.text)
       : null,
     feedRun && conclusion

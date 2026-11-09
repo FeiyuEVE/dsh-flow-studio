@@ -756,4 +756,98 @@ await check('restart 服务端互斥：同一旧 run 的第二个重启被 400�
   A.equal(after, before, '被拒的重启不能新增 run')
 })
 
+// ---------------------------------------------------------------------------
+// A（0.12.3）：停止来源归因 —— runtime.dispose（宿主卸载 / 服务重启）必须写「引擎中断」
+// ---------------------------------------------------------------------------
+await check('A：runtime.dispose() 杀掉在飞 run → run/end.reason=引擎中断（不是「已停止」）', async () => {
+  const flow = flowOf('flow-dispose-source', [
+    startNode(), stage('n_hang', '长任务', 300), endNode(),
+  ], [
+    next('e1', 'n_start', 'n_hang'),
+    next('e2', 'n_hang', 'n_end'),
+  ])
+  await saveFlow(flow)
+  const run = await makeRun('flow-dispose-source', 1)
+  let resolveStarted
+  const started = new Promise(resolve => { resolveStarted = resolve })
+  const runtimeRef = { value: null }
+  const ctx = {
+    on() {
+      return () => {}
+    },
+    get(name) {
+      if (name === 'agentDefaultModel') {
+        return { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) }
+      }
+      if (name !== 'agents') return undefined
+      return {
+        async create(options) {
+          const sessionId = options.sessionId
+          let resolveIdle = null
+          const armIdle = () => {
+            const promise = new Promise(resolve => { resolveIdle = resolve })
+            return promise
+          }
+          let idle = armIdle()
+          const agent = {
+            session: { id: sessionId, header: {} },
+            followup(payload) {
+              // 真实宿主的 whenIdle() 每轮一个新 promise：先武装本轮，再按阶段决定是否放行。
+              idle = armIdle()
+              const envelope = envelopeOf(payload)
+              if (!envelope) {
+                // 预热轮：回一句 ok 并结束本轮。
+                const engine = runtimeRef.value && runtimeRef.value.get(run.id)
+                if (engine) {
+                  engine.handleSessionEvent({ id: sessionId }, {
+                    type: 'assistant/message',
+                    data: {
+                      message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+                    },
+                  })
+                }
+                if (resolveIdle) resolveIdle()
+                return
+              }
+              // 正式轮：挂住不返回，等 runtime.dispose() 从外部打断。
+              resolveStarted()
+            },
+            whenIdle() {
+              return idle
+            },
+          }
+          return { agent, dispose: async () => {} }
+        },
+        get() {
+          return null
+        },
+      }
+    },
+  }
+  const runtime = createRuntime({
+    ctx,
+    runsRoot,
+    flowsRoot,
+    worktree: 'off',
+    cwd: testWorkspace,
+    nodeRetries: 0,
+    logger: () => {},
+  })
+  runtimeRef.value = runtime
+  await runtime.start(run.id)
+  await started
+
+  const disposed = await runtime.dispose()
+  const events = await eventsOf(run.id)
+  const runEnd = events.find(event => event.kind === 'run/end')
+  const nodeEnd = events.find(event => event.kind === 'node/end')
+
+  A.equal(disposed.aborted, 1, '必须中止一个在飞 Engine')
+  A.ok(Boolean(runEnd), '必须写 run/end')
+  A.equal(runEnd.data.status, 'aborted')
+  A.equal(runEnd.data.reason, '引擎中断（宿主卸载 / 服务重启）',
+    '宿主卸载 / 服务重启不能用「已停止」冒充用户停止')
+  A.equal(nodeEnd.extra.reason, '引擎中断（宿主卸载 / 服务重启）', '节点 extra.reason 同步')
+})
+
 console.log(`\n${checks} 组通过（${assertionCount} 条断言）`)

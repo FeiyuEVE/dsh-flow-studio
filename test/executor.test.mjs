@@ -249,11 +249,11 @@ await check('parseCodexLine：final / usage / 过程 / 未知 / 非 JSON 都不�
   )
   A.deepEqual(
     parseCodexLine('{"type":"turn.completed","usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150}}'),
-    { kind: 'usage', usage: { input: 120, output: 30, total: 150 } },
+    { kind: 'usage', usage: { input: 120, cacheRead: 0, cacheWrite: 0, output: 30, total: 150 } },
   )
   A.deepEqual(
     parseCodexLine('{"type":"usage","input_tokens":5,"output_tokens":7}'),
-    { kind: 'usage', usage: { input: 5, output: 7, total: 12 } },
+    { kind: 'usage', usage: { input: 5, cacheRead: 0, cacheWrite: 0, output: 7, total: 12 } },
   )
 
   const command = parseCodexLine('{"type":"item.completed","item":{"type":"command_execution","command":"ls","aggregated_output":"a.txt"}}')
@@ -271,6 +271,58 @@ await check('parseCodexLine：final / usage / 过程 / 未知 / 非 JSON 都不�
   A.deepEqual(parseCodexLine('   '), { kind: 'ignore' })
   A.deepEqual(parseCodexLine(null), { kind: 'ignore' })
   A.equal(parseCodexLine('{"type":"turn.failed","error":{"message":"boom"}}').level, 'error')
+})
+
+await check('A：codex 四桶拆分——缓存命中从 input 扣出，四桶之和恒等于旧 total', () => {
+  // 真实形状（r-mw954abc-dcgj / n-exec attempt 1）：input_tokens 里 96~97% 是缓存命中。
+  const real = parseCodexLine(JSON.stringify({
+    type: 'turn.completed',
+    usage: {
+      input_tokens: 4669288,
+      cached_input_tokens: 4542592,
+      output_tokens: 44992,
+      total_tokens: 4714280,
+    },
+  }))
+  A.deepEqual(real, {
+    kind: 'usage',
+    usage: { input: 126696, cacheRead: 4542592, cacheWrite: 0, output: 44992, total: 4714280 },
+  })
+  const sum = usage => usage.input + usage.cacheRead + usage.cacheWrite + usage.output
+  A.equal(sum(real.usage), 4714280, '四桶之和必须等于旧口径 total')
+  A.equal(real.usage.input + real.usage.cacheRead, 4669288, 'input + cacheRead 必须仍等于原始 input_tokens')
+  A.equal(real.usage.total, 4669288 + 44992, 'total 口径不变：input_tokens + output_tokens')
+
+  // 没有显式 total_tokens：total 仍按「原始 input_tokens + output」算，四桶之和相等。
+  const noTotal = parseCodexLine(
+    '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":5}}',
+  ).usage
+  A.deepEqual(noTotal, { input: 20, cacheRead: 80, cacheWrite: 0, output: 5, total: 105 })
+  A.equal(sum(noTotal), noTotal.total)
+
+  // cache write 同样是从 input 里扣出来的子集，不是额外增量。
+  const write = parseCodexLine(
+    '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"cache_write_input_tokens":30,"output_tokens":10,"total_tokens":110}}',
+  ).usage
+  A.deepEqual(write, { input: 10, cacheRead: 60, cacheWrite: 30, output: 10, total: 110 })
+  A.equal(sum(write), write.total)
+
+  // 别名：camelCase 与 cache_read_input_tokens 都认。
+  A.deepEqual(
+    parseCodexLine('{"type":"turn.completed","usage":{"inputTokens":50,"cachedInputTokens":40,"cacheWriteInputTokens":10,"outputTokens":5,"totalTokens":55}}').usage,
+    { input: 0, cacheRead: 40, cacheWrite: 10, output: 5, total: 55 },
+  )
+  A.deepEqual(
+    parseCodexLine('{"type":"turn.completed","usage":{"input_tokens":50,"cache_read_input_tokens":30,"output_tokens":5}}').usage,
+    { input: 20, cacheRead: 30, cacheWrite: 0, output: 5, total: 55 },
+  )
+
+  // 矛盾数据（cache > input）：按 raw input 截断缓存桶，四桶之和仍 === total。
+  const bad = parseCodexLine(
+    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":99,"output_tokens":3,"total_tokens":13}}',
+  ).usage
+  A.deepEqual(bad, { input: 0, cacheRead: 10, cacheWrite: 0, output: 3, total: 13 })
+  A.equal(sum(bad), bad.total)
 })
 
 await check('runExternalExecutor：跨 chunk 半行 / usage / stderr 尾部 / onEvent', async () => {
@@ -316,7 +368,7 @@ await check('runExternalExecutor：跨 chunk 半行 / usage / stderr 尾部 / on
   A.equal(result.exitCode, 0)
   A.match(result.text, /verdict/)
   A.deepEqual(result.structured, { verdict: 'pass' })
-  A.deepEqual(result.usage, { input: 9, output: 4, total: 13 })
+  A.deepEqual(result.usage, { input: 9, cacheRead: 0, cacheWrite: 0, output: 4, total: 13 })
   A.ok(!result.events.some(event => event.kind === 'ignore'), '未知事件不应进 events')
   A.ok(result.events.some(event => event.kind === 'final'), '事件里应有 final')
   A.ok(
@@ -496,7 +548,7 @@ await check('runExternalExecutor：真 node 子进程端到端，structured 解�
     A.equal(result.exitCode, 0)
     A.match(result.text, /verdict/)
     A.deepEqual(result.structured, { verdict: 'pass', files: 2 })
-    A.deepEqual(result.usage, { input: 11, output: 7, total: 18 })
+    A.deepEqual(result.usage, { input: 11, cacheRead: 0, cacheWrite: 0, output: 7, total: 18 })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

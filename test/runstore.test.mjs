@@ -250,6 +250,121 @@ try {
     )
   })
 
+  await check('B：tokenCoverage 形状收敛（missing ≤50、buckets 四桶、坏条目丢弃、缺失时按完整处理）', async () => {
+    const meta = await makeRun()
+    created.push(meta.id)
+    // 老 run 没有该字段：读回不出现；listRuns 行按 { complete: true } 投影。
+    const before = await store.readRunMeta(runsRoot, meta.id)
+    assert.equal(before.tokenCoverage, undefined)
+    const { runs: beforeRuns } = await store.listRuns(runsRoot, { limit: 100 })
+    assert.deepEqual(beforeRuns.find(run => run.id === meta.id).tokenCoverage, { complete: true })
+
+    // 坏条目（重复 / 空 nodeId / 非法 attemptId / 非对象）被丢弃，好条目保留。
+    const written = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: {
+        complete: false,
+        missing: [
+          { nodeId: 'n_exec', attemptId: 1 },
+          { nodeId: 'n_exec', attemptId: 1 },
+          { nodeId: '', attemptId: 2 },
+          { nodeId: 'n_exec', attemptId: 0 },
+          { nodeId: 'n_exec', attemptId: 1.5 },
+          { nodeId: 'n_exec', attemptId: '2' },
+          'x', null, [1],
+          { nodeId: 'n_chk', attemptId: 2, extra: 'ignored' },
+        ],
+      },
+    })
+    assert.deepEqual(written.tokenCoverage, {
+      complete: false,
+      missing: [{ nodeId: 'n_exec', attemptId: 1 }, { nodeId: 'n_chk', attemptId: 2 }],
+      buckets: { seen: [], missing: [] },
+    })
+    // tokenCoverage 已进白名单：不能被当成未知键丢掉。
+    assert.equal(written.droppedKeys, undefined)
+
+    // 有缺口却声明 complete:true → 一致性收敛为 false。
+    const inconsistent = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: { complete: true, missing: [{ nodeId: 'n_x', attemptId: 3 }] },
+    })
+    assert.deepEqual(inconsistent.tokenCoverage, {
+      complete: false,
+      missing: [{ nodeId: 'n_x', attemptId: 3 }],
+      buckets: { seen: [], missing: [] },
+    })
+
+    // 越界：60 条只保留前 50 条（有界，不报错）。
+    const many = Array.from({ length: 60 }, (_, index) => ({ nodeId: `n_${index}`, attemptId: 1 }))
+    const bounded = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: { complete: false, missing: many },
+    })
+    assert.equal(bounded.tokenCoverage.missing.length, 50)
+    assert.deepEqual(bounded.tokenCoverage.missing[0], { nodeId: 'n_0', attemptId: 1 })
+    assert.equal(bounded.tokenCoverage.missing[49].nodeId, 'n_49')
+
+    // buckets：四桶名字原样收敛；坏名字 / 重复 / 非数组被丢弃，但不整块丢字段。
+    const withBuckets = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: {
+        complete: true,
+        missing: [],
+        buckets: { seen: ['input', 'output', 'cacheRead', 'cacheWrite'], missing: [] },
+      },
+    })
+    assert.deepEqual(withBuckets.tokenCoverage, {
+      complete: true,
+      missing: [],
+      buckets: { seen: ['input', 'output', 'cacheRead', 'cacheWrite'], missing: [] },
+    })
+    // 桶缺失（buckets.missing）不参与 complete：provider 不报缓存不是「账少了」。
+    const bucketMissing = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: {
+        complete: true,
+        missing: [],
+        buckets: { seen: ['input', 'output'], missing: ['cacheRead', 'notABucket', 'cacheRead'] },
+      },
+    })
+    assert.deepEqual(bucketMissing.tokenCoverage, {
+      complete: true,
+      missing: [],
+      buckets: { seen: ['input', 'output'], missing: ['cacheRead'] },
+    })
+    // 缺 buckets / 坏 buckets（非对象 / 数组元素）→ 收敛成空数组对，不抛错。
+    const noBuckets = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: { complete: true, missing: [] },
+    })
+    assert.deepEqual(noBuckets.tokenCoverage.buckets, { seen: [], missing: [] })
+    const badBuckets = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: { complete: true, missing: [], buckets: 'oops' },
+    })
+    assert.deepEqual(badBuckets.tokenCoverage.buckets, { seen: [], missing: [] })
+    const dirtyBuckets = await store.writeRunMeta(runsRoot, meta.id, {
+      tokenCoverage: {
+        complete: true,
+        missing: [],
+        buckets: { seen: ['input', 42, null, 'input', 'nope'], missing: ['output', 'output'] },
+      },
+    })
+    assert.deepEqual(dirtyBuckets.tokenCoverage.buckets, { seen: ['input'], missing: ['output'] })
+    // complete 与 unkeyedCalls 联动：没有 callId 的用量去了重账本 → 账不算记全。
+    const withUnkeyed = await store.writeRunMeta(runsRoot, meta.id, {
+      unkeyedCalls: 2,
+      tokenCoverage: { complete: true, missing: [], buckets: { seen: ['input'], missing: [] } },
+    })
+    assert.equal(withUnkeyed.tokenCoverage.complete, false, 'unkeyedCalls>0 时 complete 必须为 false')
+    // 复位，后续断言（列表只放 complete）不受影响。
+    await store.writeRunMeta(runsRoot, meta.id, { unkeyedCalls: 0 })
+
+    // 坏形状（非对象 / 数组）→ 整条收敛掉（等同于「没记录」），不抛错。
+    const badScalar = await store.writeRunMeta(runsRoot, meta.id, { tokenCoverage: 'oops' })
+    assert.equal(badScalar.tokenCoverage, undefined)
+    const badArray = await store.writeRunMeta(runsRoot, meta.id, { tokenCoverage: [] })
+    assert.equal(badArray.tokenCoverage, undefined)
+
+    // 列表只放 { complete }，不带 missing 明细。
+    const { runs } = await store.listRuns(runsRoot, { limit: 100 })
+    assert.deepEqual(runs.find(run => run.id === meta.id).tokenCoverage, { complete: true })
+  })
+
   await check('listRuns：按 startedAt 倒序、limit 生效、tokenTotal 从事件重算', async () => {
     const older = await makeRun()
     const newer = await makeRun()

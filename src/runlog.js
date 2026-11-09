@@ -1606,13 +1606,16 @@ function isGeneratedReportClaim(event) {
  * 指标层的权威计数（§8）：分母是「应验条目数」，缺分母时 coverageRatio 为 null。
  * @param {{ claimedPassed: number, authoritativePassed: number, legacyPassed?: number, denominator: number|null }} values
  */
-function authorityFields({ claimedPassed, authoritativePassed, legacyPassed = 0, denominator }) {
+function authorityFields({ claimedPassed, authoritativePassed, legacyPassed = 0, denominator, independentPassed = 0 }) {
   const total = Number.isInteger(denominator) && denominator > 0 ? denominator : null
   return {
     claimedPassed,
     authoritativePassed,
     // 0.11 F4：旧事件来源未知（legacy），保留「声明通过」计数但绝不计入权威。
     legacyPassed,
+    // v1.3：通过条目里带 peer / host 级独立证据的条数（§8.3 的产物归属分级）。
+    // 与 authoritativePassed（host 权威）不同：peer 也算独立复核，只是没有宿主登记。
+    independentPassed,
     authoritativeTotal: total,
     coverageRatio: total === null ? null : authoritativePassed / total,
   }
@@ -1743,6 +1746,7 @@ export function computeAcceptance(events = [], options = {}) {
   let missingLink = 0
   let unverified = 0
   let selfCertified = 0
+  let independentPassed = 0
   let claimedPassed = 0
   let authoritativePassed = 0
   let legacyPassed = 0
@@ -1750,21 +1754,32 @@ export function computeAcceptance(events = [], options = {}) {
   const unverifiedRefs = []
   const selfCertifiedRefs = []
   const generatedReportRefs = []
+  // v1.3（§8.3）：按被引用产物的归属计数——self 进 selfCertified，peer/host 进
+  // independentPassed。quality 层的门禁是「每个指标至少一条 peer/host」，不是「禁止自证」。
+  const countLevel = (level, itemId, authority) => {
+    // §8.3：产物归属优先——能对上本节点自写的产物就是 self（即使事件声明 producer=host）；
+    // 能对上别的节点 / 宿主标记的产物是独立复核。产物索引里查不到、但事件本身是宿主
+    // 权威执行（authority=host）时，也按独立复核计（宿主不是模型，不需要自证）。
+    if (level === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(itemId)
+    } else if (level === 'peer' || level === 'host' || authority === 'host') {
+      independentPassed += 1
+    }
+  }
   const countPass = (data, event) => {
     passed += 1
     const source = classifyEvidenceAuthority(event, options)
     if (source === 'host') authoritativePassed += 1
     else if (source === 'legacy') legacyPassed += 1
     else claimedPassed += 1
-    if (classifyEvidenceLevel(event, data.evidenceRef, owners) === 'self') {
-      selfCertified += 1
-      selfCertifiedRefs.push(data.itemId)
-    }
+    countLevel(classifyEvidenceLevel(event, data.evidenceRef, owners), data.itemId, source)
   }
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
     legacyPassed,
+    independentPassed,
     denominator: latest.size,
   })
   for (const { data, event } of latest.values()) {
@@ -1777,11 +1792,23 @@ export function computeAcceptance(events = [], options = {}) {
       continue
     }
     if (isModelClaim(event)) {
-      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      // R6 §8：引擎自写报告（generatedReport）不是独立复核，只能算自报。
+      // v1.3：它仍是「有证据但可能不独立」——能对上本节点产物就算自证（由 quality
+      // 层按 selfOnly 降 warn）；完全对不上产物归属时仍按缺证据 unknown。
       if (isGeneratedReportClaim(event)) {
+        const level = classifyEvidenceLevel(event, data.evidenceRef, owners)
+        if (level === null) {
+          // 没有可归属产物：不计通过（缺证据），但「模型自报」这个事实要如实计数。
+          claimedPassed += 1
+          generatedReport += 1
+          generatedReportRefs.push(data.itemId)
+          continue
+        }
         claimedPassed += 1
+        passed += 1
         generatedReport += 1
         generatedReportRefs.push(data.itemId)
+        countLevel(level, data.itemId, 'model-claim')
         continue
       }
       const claim = verifyClaimRef(event, data.evidenceRef, artifacts, options.verifyEvidence)
@@ -1813,10 +1840,10 @@ export function computeAcceptance(events = [], options = {}) {
       ...authority(),
     }
   }
-  if (generatedReport > 0) {
+  if (generatedReport > 0 && passed === 0) {
     return {
       state: 'unknown',
-      reason: `${generatedReport} 个通过的验收条目只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      reason: `${generatedReport} 个通过的验收条目只有自报报告（引擎自动生成），且找不到可归属的产物，缺独立证据`,
       items: latest.size,
       passed,
       failed,
@@ -1868,14 +1895,17 @@ export function computeAcceptance(events = [], options = {}) {
     }
   }
   // v1.3：自证不再把指标打成 unknown（unknown = 缺证据 / 自相矛盾）；
-  // 「证据不独立」由 quality 层以 warn 兜底，这里如实暴露 selfCertified 条数。
+  // 「证据不独立」由 quality 层以 warn 兜底，这里如实暴露自报 / 独立条数。
   return {
     state: 'pass',
+    reason: `${selfCertified} 条自报 + ${independentPassed} 条独立（peer/host）`,
     items: latest.size,
     passed,
     failed,
     notApplicable,
+    ...(generatedReport > 0 ? { generatedReport, generatedReportRefs } : {}),
     selfCertified,
+    independentPassed,
     selfOnly,
     selfCertifiedRefs,
     ...authority(),
@@ -1917,6 +1947,7 @@ export function computeTests(events = [], options = {}) {
   let missingLink = 0
   let unverified = 0
   let selfCertified = 0
+  let independentPassed = 0
   let claimedPassed = 0
   let authoritativePassed = 0
   let legacyPassed = 0
@@ -1925,22 +1956,27 @@ export function computeTests(events = [], options = {}) {
   const selfCertifiedRefs = []
   const generatedReportRefs = []
   const suites = []
+  // v1.3（§8.3）：self → selfCertified；peer/host → independentPassed（独立复核）。
+  const countLevel = (level, suite, authority) => {
+    if (level === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(suite)
+    } else if (level === 'peer' || level === 'host' || authority === 'host') independentPassed += 1
+  }
   const countPass = (suite, data, event) => {
     passedSuites += 1
     const source = classifyEvidenceAuthority(event, options)
     if (source === 'host') authoritativePassed += 1
     else if (source === 'legacy') legacyPassed += 1
     else claimedPassed += 1
-    if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
-      selfCertified += 1
-      selfCertifiedRefs.push(suite)
-    }
+    countLevel(classifyEvidenceLevel(event, data.reportRef, owners), suite, source)
     suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
   }
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
     legacyPassed,
+    independentPassed,
     denominator: latest.size,
   })
   for (const [suite, { data, event }] of latest) {
@@ -1970,11 +2006,22 @@ export function computeTests(events = [], options = {}) {
       continue
     }
     if (isModelClaim(event)) {
-      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      // R6 §8：引擎自写报告（generatedReport）不是独立复核。v1.3：能对上产物归属
+      // 就按自证 / 独立计数（quality 层用 selfOnly 兜底 warn）；完全无归属 → unknown。
       if (isGeneratedReportClaim(event)) {
+        const level = classifyEvidenceLevel(event, data.reportRef, owners)
+        if (level === null) {
+          claimedPassed += 1
+          generatedReport += 1
+          generatedReportRefs.push(suite)
+          continue
+        }
         claimedPassed += 1
+        passedSuites += 1
         generatedReport += 1
         generatedReportRefs.push(suite)
+        countLevel(level, suite, 'model-claim')
+        suites.push({ suite, status: 'pass', executed: data.executed, passed: data.passed, failed: data.failed })
         continue
       }
       const claim = verifyClaimRef(event, data.reportRef, artifacts, options.verifyEvidence)
@@ -1996,10 +2043,10 @@ export function computeTests(events = [], options = {}) {
   if (failedSuites > 0) {
     return { state: 'fail', reason: `${failedSuites} 个测试套件未通过`, suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, ...authority() }
   }
-  if (generatedReport > 0) {
+  if (generatedReport > 0 && passedSuites === 0) {
     return {
       state: 'unknown',
-      reason: `${generatedReport} 个通过的测试套件只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      reason: `${generatedReport} 个通过的测试套件只有自报报告（引擎自动生成），且找不到可归属的产物，缺独立证据`,
       suites: latest.size,
       passedSuites,
       failedSuites,
@@ -2043,8 +2090,21 @@ export function computeTests(events = [], options = {}) {
       ...authority(),
     }
   }
-  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
-  return { state: 'pass', suites: latest.size, passedSuites, failedSuites, details: suites, selfCertified, selfOnly, selfCertifiedRefs, ...authority() }
+  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfOnly 给 warn。
+  return {
+    state: 'pass',
+    reason: `${selfCertified} 条自报 + ${independentPassed} 条独立（peer/host）`,
+    suites: latest.size,
+    passedSuites,
+    failedSuites,
+    ...(generatedReport > 0 ? { generatedReport, generatedReportRefs } : {}),
+    details: suites,
+    selfCertified,
+    independentPassed,
+    selfOnly,
+    selfCertifiedRefs,
+    ...authority(),
+  }
 }
 
 /**
@@ -2080,6 +2140,7 @@ function checkEvidence(events, options = {}) {
   let incomplete = 0
   let unverified = 0
   let selfCertified = 0
+  let independentPassed = 0
   let claimedPassed = 0
   let authoritativePassed = 0
   let legacyPassed = 0
@@ -2104,21 +2165,26 @@ function checkEvidence(events, options = {}) {
     if (previous && seqOf(event) < previous.seq) continue
     hostStates.set(id, { state, seq: seqOf(event) })
   }
+  // v1.3（§8.3）：self → selfCertified；peer/host → independentPassed（独立复核）。
+  const countLevel = (level, ruleSetId, authority) => {
+    if (level === 'self') {
+      selfCertified += 1
+      selfCertifiedRefs.push(ruleSetId)
+    } else if (level === 'peer' || level === 'host' || authority === 'host') independentPassed += 1
+  }
   const countPass = (ruleSetId, data, event) => {
     passed += 1
     const source = classifyEvidenceAuthority(event, options)
     if (source === 'host') authoritativePassed += 1
     else if (source === 'legacy') legacyPassed += 1
     else claimedPassed += 1
-    if (classifyEvidenceLevel(event, data.reportRef, owners) === 'self') {
-      selfCertified += 1
-      selfCertifiedRefs.push(ruleSetId)
-    }
+    countLevel(classifyEvidenceLevel(event, data.reportRef, owners), ruleSetId, source)
   }
   const authority = () => authorityFields({
     claimedPassed,
     authoritativePassed,
     legacyPassed,
+    independentPassed,
     denominator: applicable,
   })
   for (const [ruleSetId, { data, event }] of latest) {
@@ -2155,11 +2221,21 @@ function checkEvidence(events, options = {}) {
       continue
     }
     if (isModelClaim(event)) {
-      // R6 §8：引擎自写报告（generatedReport）没有独立证据，只能算 claimed。
+      // R6 §8：引擎自写报告（generatedReport）不是独立复核。v1.3：能对上产物归属
+      // 就按自证 / 独立计数（quality 层用 selfOnly 兜底 warn）；完全无归属 → unknown。
       if (isGeneratedReportClaim(event)) {
+        const level = classifyEvidenceLevel(event, data.reportRef, owners)
+        if (level === null) {
+          claimedPassed += 1
+          generatedReport += 1
+          generatedReportRefs.push(ruleSetId)
+          continue
+        }
         claimedPassed += 1
+        passed += 1
         generatedReport += 1
         generatedReportRefs.push(ruleSetId)
+        countLevel(level, ruleSetId, 'model-claim')
         continue
       }
       // 模型自述的规范检查：executedAt 不算证据，必须给出可复核的 reportRef。
@@ -2184,10 +2260,10 @@ function checkEvidence(events, options = {}) {
   if (failed > 0) {
     return { state: 'fail', reason: `${failed} 个规则集未通过`, applicable, passed, failed, skipped, selfCertified, selfOnly, ...authority() }
   }
-  if (generatedReport > 0) {
+  if (generatedReport > 0 && passed === 0) {
     return {
       state: 'unknown',
-      reason: `${generatedReport} 个通过的规范检查只有自报报告（引擎自动生成），缺独立证据，不能算权威通过`,
+      reason: `${generatedReport} 个通过的规范检查只有自报报告（引擎自动生成），且找不到可归属的产物，缺独立证据`,
       applicable,
       passed,
       failed,
@@ -2253,8 +2329,21 @@ function checkEvidence(events, options = {}) {
   if (applicable === 0) {
     return { state: 'unknown', reason: '全部规则集被跳过 / 不适用', applicable, passed, failed, skipped, ...authority() }
   }
-  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfCertified 给 warn。
-  return { state: 'pass', applicable, passed, failed, skipped, selfCertified, selfOnly, selfCertifiedRefs, ...authority() }
+  // v1.3：自证仍算通过，指标层不降级；quality 层按 selfOnly 给 warn。
+  return {
+    state: 'pass',
+    reason: `${selfCertified} 条自报 + ${independentPassed} 条独立（peer/host）`,
+    applicable,
+    passed,
+    failed,
+    skipped,
+    ...(generatedReport > 0 ? { generatedReport, generatedReportRefs } : {}),
+    selfCertified,
+    independentPassed,
+    selfOnly,
+    selfCertifiedRefs,
+    ...authority(),
+  }
 }
 
 /**
@@ -2427,13 +2516,15 @@ function staleFailReason(label, ids) {
 }
 
 /**
- * 0.11 N1：pass 档要求的最小权威覆盖率。
+ * 0.11 N1 的旧常量：pass 档要求的最小「宿主权威覆盖率」。
  *
- * 取 1（100%）而不是某个比例：`authorityCoverage` 的分子只来自 host 权威通过，
- * 分母是应验条目数。pass（优/良）是「必要证据齐全且通过」的肯定结论，只要还有
- * 应验条目只有 legacy（来源未知）/ claimed（未经宿主验证）覆盖，就不能借别的
- * 条目的权威点亮整条 run —— 任何比例阈值都会让「大部分够权威」继续绿，正是 N1
- * 要修的方向倒挂。coverage 为 null（分母为 0、不可判定）同样视为不足。
+ * **v1.3 起不再作为 pass 门禁**（保留导出只为兼容旧引用 / 旧报告）。
+ * 原因见 05 §8.4：独立证据的判据是 §8.3 的产物归属分级——peer（别的节点写的产物）
+ * 与 host 一样算独立复核；只按 `authorityCoverage`（仅 host）卡 100% 会让「真实场景
+ * 里验收全是模型自写 / 由 peer 复核」的 run 永远无法出绿，指标失去意义。
+ * 现在的门禁是：每个有通过条目的指标至少 1 条 peer/host → 可 pass；全部自证 → warn；
+ * 连产物归属都对不上 → warn（缺独立复核）；unknown 只留给缺证据 / 数据矛盾。
+ * `authorityCoverage` 仍如实展示。
  */
 export const QUALITY_PASS_MIN_AUTHORITY_COVERAGE = 1
 
@@ -2447,12 +2538,15 @@ export const QUALITY_PASS_MIN_AUTHORITY_COVERAGE = 1
  *   - 有未解决 P1/P2 → warn，label 写「遗留 N 个 P1 / M 个 P2 未解决」；
  *   - 任一证据指标「全部为自证」（selfOnly）→ warn，label 写「<指标名> 全部为自证证据（N 条），缺独立复核」；
  *     每个有通过条目的指标都至少有 1 条 peer/host 级证据时才允许 pass（自证总数见 quality.selfCertified）；
- *   - 权威覆盖 < 100%（`QUALITY_PASS_MIN_AUTHORITY_COVERAGE`，例如 legacy-only 或 claimed 残留）
- *     → unknown，不给「优 / 良」；
+ *   - 通过条目找不到产物归属（既非自证、也非 peer/host 独立复核，哪怕同指标里另有
+ *     独立条目）→ warn，label 写「<指标名> 共 N 条通过条目找不到产物归属，缺独立复核」；
+ *     unknown 只留给「缺证据 / 数据矛盾」（§8.4），不吞掉这类「有证据但不独立」；
  *   - 返工 0 → pass「优：首轮通过」；返工 1 + P1=P2=0 + acceptedRate≥0.6 → pass「良」；
  *   - 其余返工情形 → warn「可：返工 n 轮」。
  * - progress.ratio < 1 → 至少 warn。
  * - 多项 warn 原因同时成立时全部写进同一个 label（不丢原因）。
+ * - v1.3：`authorityCoverage`（仅 host 权威）只用于展示，不再是 pass 门禁；
+ *   `claimed` 通过条目只要引用了 peer/host 级产物，就与自证条目一样可以共存于 pass。
  */
 export function computeQuality(events = [], options = {}) {
   // R4（§6）：外部事件在任何权威索引之前分区，避免同 path / itemId / ruleSetId 的
@@ -2562,12 +2656,29 @@ export function computeQuality(events = [], options = {}) {
   // §8.4 v1.3：三项证据指标里「证据由本节点自写」的通过条目总数（供 UI 展示）。
   // 结论层门禁不按「有一条自证就不许绿」，而是「**每个**有通过条目的指标至少要有
   // 一条 peer/host 级独立证据」——全自证（selfOnly）才是闭环。
-  const selfCertified = ['acceptance', 'tests', 'checks']
+  const evidenceMetrics = ['acceptance', 'tests', 'checks']
+  const selfCertified = evidenceMetrics
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0), 0)
-  const selfOnlyMetrics = ['acceptance', 'tests', 'checks']
+  const selfOnlyMetrics = evidenceMetrics
     .filter(key => evidence[key].selfOnly === true)
+  // v1.3：每个指标至少一条 peer/host 级独立证据才算「该指标有独立复核」。
+  const independentPassed = evidenceMetrics
+    .reduce((sum, key) => sum + (Number.isInteger(evidence[key].independentPassed) ? evidence[key].independentPassed : 0), 0)
+  // 逐指标统计「有通过条目、但产物归属对不上」的条数：既证明不了自证，也证明不了
+  // 独立复核。按 §8.4 用 warn 兜底（unknown 只留给「缺证据 / 数据矛盾」）；
+  // 同指标里另有 host/peer 条目也不能把这条无归属的通过条目抹掉。
+  const passedOf = key => (key === 'tests'
+    ? (Number.isInteger(evidence.tests.passedSuites) ? evidence.tests.passedSuites : 0)
+    : (Number.isInteger(evidence[key].passed) ? evidence[key].passed : 0))
+  const unattributedMetrics = evidenceMetrics
+    .map(key => {
+      const self = Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0
+      const independent = Number.isInteger(evidence[key].independentPassed) ? evidence[key].independentPassed : 0
+      return { key, count: Math.max(0, passedOf(key) - self - independent) }
+    })
+    .filter(entry => entry.count > 0)
   // R6（§8）：权威 / 自报汇总。分母是应验条目数之和；分母为 0 时 coverage 为 null（unknown）。
-  const authorityMetrics = ['acceptance', 'tests', 'checks']
+  const authorityMetrics = evidenceMetrics
   const claimedPassed = authorityMetrics
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0), 0)
   const authoritativePassed = authorityMetrics
@@ -2576,17 +2687,10 @@ export function computeQuality(events = [], options = {}) {
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].legacyPassed) ? evidence[key].legacyPassed : 0), 0)
   const authoritativeTotal = authorityMetrics
     .reduce((sum, key) => sum + (Number.isInteger(evidence[key].authoritativeTotal) ? evidence[key].authoritativeTotal : 0), 0)
+  // 注意：coverage 仍是「宿主权威通过 / 应验条目」的展示口径，但 v1.3 起它**不再是
+  // pass 门禁**——peer 级独立证据（别的节点写的产物）同样能证明结论可复核，只是没有
+  // 宿主执行登记。门禁看 independentPassed / selfOnly / unattributed，不看 coverage。
   const authorityCoverage = authoritativeTotal > 0 ? authoritativePassed / authoritativeTotal : null
-  // 三项指标全部只有 claimed 覆盖（如模型自述 + 引擎自写报告）→ 至少 unknown，绝不因自报刷绿。
-  const claimedOnly = authorityMetrics.every(key => (
-    (Number.isInteger(evidence[key].claimedPassed) ? evidence[key].claimedPassed : 0) > 0
-    && (Number.isInteger(evidence[key].authoritativePassed) ? evidence[key].authoritativePassed : 0) === 0
-  ))
-  // F4（返工）：旧实现只在「三项全 claimed-only」时降权，导致一个真 host check 就能
-  // 让另外两项 claimed pass 免于降权。现在任一条 claimed 通过都不算权威，不论别处
-  // 有没有 host；纯 legacy 旧 run（没有任何新来源）保留旧版 quality 判定以兼容历史，
-  // 但 legacy 权威计数已归零、coverage 反映真实覆盖。
-  const unverifiedMix = claimedPassed > 0
   const acceptedRate = findings.acceptedRate
   const goodRework = reworkRounds === 1 && p1Unresolved === 0 && p2Unresolved === 0
     && acceptedRate !== null && acceptedRate >= 0.6
@@ -2624,6 +2728,13 @@ export function computeQuality(events = [], options = {}) {
         .reduce((sum, key) => sum + (Number.isInteger(evidence[key].selfCertified) ? evidence[key].selfCertified : 0), 0)
       warnReasons.push(`${names} 全部为自证证据（${count} 条），缺独立复核`)
     }
+    if (unattributedMetrics.length > 0) {
+      // 通过条目找不到产物归属：既不能证明是自证，也不能证明有独立复核。
+      // 05 §8.4：独立性不足是 warn 的语义（unknown 只留给「缺证据 / 数据矛盾」）。
+      const names = unattributedMetrics.map(entry => EVIDENCE_LABELS[entry.key]).join('、')
+      const count = unattributedMetrics.reduce((sum, entry) => sum + entry.count, 0)
+      warnReasons.push(`${names} 共 ${count} 条通过条目找不到产物归属，缺独立复核`)
+    }
     if (warnReasons.length > 0) {
       state = 'warn'
       label = `可：${warnReasons.join('、')}`
@@ -2631,30 +2742,6 @@ export function computeQuality(events = [], options = {}) {
       state = 'pass'
       label = reworkRounds === 0 ? '优：首轮通过' : '良：返工 1 轮后达标'
     }
-  }
-  // R6（§8）：三项指标都只有模型自报时，最多 unknown；report/pass 不能靠自报点亮。
-  if (claimedOnly && state !== 'fail' && state !== 'unknown') {
-    state = 'unknown'
-    label = `证据不足：三项指标只有模型自报（claimed ${claimedPassed} 条），缺独立证据，不能判定为通过`
-  }
-  // F4（返工）：host 与 claimed 混合时，claimed 项同样不能免于降权。
-  if (unverifiedMix && state !== 'fail' && state !== 'unknown') {
-    state = 'unknown'
-    label = `证据不足：${claimedPassed} 条 claimed 通过未获宿主独立验证，不能判定为通过`
-  }
-  // 0.11 N1：pass 档必须与权威覆盖一致。旧实现在这里只看五项齐全，于是 legacy-only
-  // （coverage=0、claimed=0）仍给「优：首轮通过」，而同样 1/3 覆盖的 model-claim run 被
-  // 上面的 unverifiedMix 降成 unknown —— 越没证据越绿。现在覆盖不足 100% 一律 unknown；
-  // 带 claimed 的情形已由上面两个分支给出更具体的文案，这里只兜住 legacy / 分母留空。
-  if (state === 'pass'
-    && (authorityCoverage === null || authorityCoverage < QUALITY_PASS_MIN_AUTHORITY_COVERAGE)) {
-    state = 'unknown'
-    const coverageText = authorityCoverage === null
-      ? 'unknown'
-      : `${(authorityCoverage * 100).toFixed(0)}%`
-    label = legacyPassed > 0 && claimedPassed === 0
-      ? `证据不足：${legacyPassed} 条通过来自历史无来源事件（legacy），权威覆盖 ${authoritativePassed}/${authoritativeTotal}（${coverageText}），不能判定为通过`
-      : `证据不足：权威覆盖 ${authoritativePassed}/${authoritativeTotal}（${coverageText}），未达 100%，不能判定为通过`
   }
 
   const engine = options.engine === 'stub' ? 'stub' : 'real'
@@ -2673,6 +2760,10 @@ export function computeQuality(events = [], options = {}) {
       p1Unresolved,
       p2Unresolved,
       selfCertified,
+      independentPassed,
+      selfOnlyMetrics,
+      unattributedMetrics: unattributedMetrics.map(entry => entry.key),
+      unattributedCounts: Object.fromEntries(unattributedMetrics.map(entry => [entry.key, entry.count])),
       claimedPassed,
       authoritativePassed,
       legacyPassed,
@@ -2696,6 +2787,10 @@ export function computeQuality(events = [], options = {}) {
     p1Unresolved,
     p2Unresolved,
     selfCertified,
+    independentPassed,
+    selfOnlyMetrics,
+    unattributedMetrics: unattributedMetrics.map(entry => entry.key),
+    unattributedCounts: Object.fromEntries(unattributedMetrics.map(entry => [entry.key, entry.count])),
     claimedPassed,
     authoritativePassed,
     legacyPassed,

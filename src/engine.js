@@ -145,6 +145,288 @@ export const TEAM_CONCLUDE_NUDGE =
 export const MAX_NODE_RETRIES = 5
 
 /**
+ * 停止来源（A）：stop() 的调用方必须能区分「用户按停」与「引擎中断」。
+ *
+ * 背景（实测）：宿主卸载 / 服务重启与 flow_stop 共用同一条 abort 路径，旧实现一律
+ * 写 `run/end.reason='已停止'`、节点 `extra.reason='用户停止'`，把引擎杀掉的 run
+ * 谎报成用户停止。现在 stop(runId, { source }) 显式传来源：
+ *   - `user`（默认，保持历史行为）：flow_stop / HTTP POST /runs/<id>/stop；
+ *   - `engine`：runtime.dispose()（插件卸载 / 服务重启）等运行时回收。
+ * 老调用不传 source 时按 `user` 处理，历史行为不变。
+ */
+export const STOP_SOURCES = Object.freeze({ USER: 'user', ENGINE: 'engine' })
+
+/** 用户停止的收口文案（保持历史值「已停止」）。 */
+export const STOP_REASON_USER = '已停止'
+
+/** 引擎中断（宿主卸载 / 服务重启）的收口文案；与启动 sweep 的「引擎中断」同族。 */
+export const STOP_REASON_ENGINE = '引擎中断（宿主卸载 / 服务重启）'
+
+/**
+ * node/end.status → nodeStatus.state 的终态映射（B）。
+ *
+ * 说明：`src/runstore.js` 的 `NODE_STATUS_STATES` 只认
+ * `working / done / blocked / failed`，写别的值会在落盘时被静默回落成 `working`
+ * ——那正是本次要修的症状。所以这里只用合法终态，用 `verdict` 保留「打回」语义
+ * （结论词是 `verdict`，不是 `state`；客户端已把 verdict 单独渲染成徽标）：
+ *   - passed   → done   + verdict:pass  + progress 100
+ *   - rejected → failed + verdict:reject + progress 100（打回不是通过，也不丢「打回」语义）
+ *   - failed   → failed + 实际进度
+ *   - aborted  → failed + 实际进度（run/end.status 与 node/end.extra.aborted 仍能区分「被中止」）
+ * 终态性直接由 `state ∈ {done, failed}` 推导，**不新增持久键**（runstore 是白名单）。
+ */
+export const NODE_END_TERMINAL_STATE = Object.freeze({
+  passed: 'done',
+  rejected: 'failed',
+  failed: 'failed',
+  aborted: 'failed',
+})
+
+/**
+ * nodeStatus 的**收口**终态集合（run 级收口用）：只有 done / failed 算真正结束。
+ * `blocked` 是模型自审的过程态（「卡住了」），run 已经进入终态时它同样是陈旧状态，
+ * 必须一起收口——否则 run 结束后 `flow_watch` 还会拿 blocked 给出误导建议。
+ */
+const NODE_STATUS_FINAL_STATES = new Set(['done', 'failed'])
+
+/**
+ * 由一条 `node/end` 事件算出该节点的终态 `nodeStatus`（纯函数，便于单测）。
+ *
+ * @param {object|null} previous 该节点上一份 nodeStatus（可能来自自审回报）
+ * @param {{ nodeId: string, attemptId: number, ts?: string, data?: object }} event
+ * @param {string} [at] 覆盖时间戳（缺省用 event.ts）
+ * @returns {object} nodeStatus 条目
+ */
+export function nodeStatusFromNodeEnd(previous, event, at) {
+  const prev = previous && typeof previous === 'object' ? previous : null
+  const attempt = event && Number.isInteger(event.attemptId) ? event.attemptId : null
+  const sameAttempt = Boolean(prev) && (attempt === null || prev.attempt === attempt)
+  const status = event && event.data && typeof event.data.status === 'string' ? event.data.status : ''
+  const state = NODE_END_TERMINAL_STATE[status] || 'failed'
+  const verdict = status === 'passed' ? 'pass' : (status === 'rejected' ? 'reject' : null)
+  // 进度：passed / rejected 是「本 attempt 已给出正式结论」→ 100；failed / aborted 保留
+  // 同一 attempt 最后一次自审上报的真实进度（没有就 0），不虚构已完成。
+  let progress = 100
+  if (status !== 'passed' && status !== 'rejected') {
+    progress = sameAttempt && Number.isInteger(prev.progress)
+      ? Math.min(100, Math.max(0, prev.progress))
+      : 0
+  }
+  const entry = {
+    state,
+    progress,
+    summary: sameAttempt && typeof prev.summary === 'string' ? prev.summary : '',
+    verdict,
+    ...(attempt === null ? {} : { attempt }),
+    at: typeof at === 'string' && at !== '' ? at : (event && typeof event.ts === 'string' ? event.ts : new Date().toISOString()),
+  }
+  if (sameAttempt) {
+    entry.members = Array.isArray(prev.members) ? prev.members.slice(-20).map(member => ({ ...member })) : []
+    entry.blockers = Array.isArray(prev.blockers) ? [...prev.blockers].slice(0, 20) : []
+  } else {
+    entry.members = []
+    entry.blockers = []
+  }
+  return entry
+}
+
+/**
+ * run 进入终态时，把仍停在非终态的节点状态落成终态（B）。
+ * 复用 {@link nodeStatusFromNodeEnd} 的映射；`attempt` 由调用方按引擎权威计数对齐。
+ *
+ * @param {object} entry 现有 nodeStatus
+ * @param {'done'|'failed'|'aborted'} runStatus
+ * @param {number|null} attempt 权威 attempt（缺省沿用 entry.attempt）
+ */
+export function terminalNodeStatusForRunEnd(entry, runStatus, attempt) {
+  const prev = entry && typeof entry === 'object' ? entry : {}
+  const state = runStatus === 'done' ? 'done' : 'failed'
+  const progress = Number.isInteger(prev.progress) ? Math.min(100, Math.max(0, prev.progress)) : 0
+  return {
+    ...prev,
+    state,
+    progress: state === 'done' ? 100 : progress,
+    // 终态由引擎判：不再保留可能误导的 pass / reject 结论（done 时保留自审的 pass）。
+    verdict: state === 'done' && (prev.verdict === 'pass' || prev.verdict === 'reject') ? prev.verdict : null,
+    ...(Number.isInteger(attempt) ? { attempt } : {}),
+    at: typeof prev.at === 'string' ? prev.at : new Date().toISOString(),
+  }
+}
+
+/**
+ * 外部 executor 多条 usage 事件的四桶累加（D 的配套修正）。
+ *
+ * 旧实现只累加 input / output，只要出现任意一条 usage 事件就走 `usageSum` 分支，
+ * 于是 executor 侧拆出来的 `cacheRead` / `cacheWrite` 在引擎层被整段丢弃。
+ * 这里对每条 usage 先过 `mapHostUsage()`（保留 `alreadyMapped` 判定与
+ * `reasoning ≤ output` 裁剪），再四桶相加；`reasoning` 只在最终仍 ≤ output 时保留。
+ *
+ * @param {object|null} sum 已累加的四桶（null = 还没有）
+ * @param {object} usage 原始 usage（宿主 TokenUsage 或已映射四桶）
+ * @returns {object|null} 新的累加结果
+ */
+export function accumulateExternalUsage(sum, usage) {
+  const mapped = mapHostUsage(usage)
+  if (!mapped) return sum || null
+  const base = sum && typeof sum === 'object' ? sum : { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
+  const next = {
+    input: base.input + mapped.input,
+    cacheRead: base.cacheRead + mapped.cacheRead,
+    cacheWrite: base.cacheWrite + mapped.cacheWrite,
+    output: base.output + mapped.output,
+  }
+  // reasoning 只在至少一条 usage 真的带了它时才出现（0 不等于「有 reasoning」）。
+  if (Number.isInteger(base.reasoning) || Number.isInteger(mapped.reasoning)) {
+    const reasoning = (Number.isInteger(base.reasoning) ? base.reasoning : 0)
+      + (Number.isInteger(mapped.reasoning) ? mapped.reasoning : 0)
+    if (rationaleWithinOutput(reasoning, next.output)) next.reasoning = reasoning
+  }
+  return next
+}
+
+/** reasoning 是 output 的子集：只有 0 ≤ reasoning ≤ output 时才落盘（与 mapHostUsage 同口径）。 */
+function rationaleWithinOutput(reasoning, output) {
+  return Number.isInteger(reasoning) && reasoning >= 0 && reasoning <= output
+}
+
+// ---------------------------------------------------------------------------
+// token 覆盖度（B）：run.json.tokenCoverage
+// ---------------------------------------------------------------------------
+
+/** 05 §3 的四个互斥桶。 */
+export const TOKEN_COVERAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
+
+/** 去重账本里无法归属的调用：单独一条缺口。 */
+export const TOKEN_COVERAGE_UNKEYED = 'unkeyedCalls'
+
+/** 缺口条数上限（与 runstore 的 TOKEN_COVERAGE_MISSING_MAX 同口径）。 */
+export const TOKEN_COVERAGE_MISSING_MAX = 50
+
+/**
+ * 四个桶在「原始 usage」里的键名：既接受 05 四桶，也接受宿主 TokenUsage
+ * （`inputTokens` / 驼峰）与 codex 风格（`input_tokens` / `cached_input_tokens`）。
+ *
+ * 为什么要看原始形状而不是落盘的 model/call：引擎写事件前一定过 `mapHostUsage()`
+ * （缺桶补 0），落盘后四桶永远齐全，再判断「某桶从未出现」就永远为假——那又变成假绿。
+ */
+const USAGE_BUCKET_KEYS = Object.freeze({
+  input: ['input', 'inputTokens', 'input_tokens'],
+  cacheRead: ['cacheRead', 'cacheReadTokens', 'cache_read_input_tokens', 'cached_input_tokens'],
+  cacheWrite: ['cacheWrite', 'cacheWriteTokens', 'cache_write_input_tokens'],
+  output: ['output', 'outputTokens', 'output_tokens'],
+})
+
+/** 该原始 usage 是否给某个桶提供了「数值」（有限整数且 ≥0；0 也算有值）。 */
+function usageHasBucketValue(usage, bucket) {
+  if (!isPlainObject(usage)) return false
+  const keys = USAGE_BUCKET_KEYS[bucket] || []
+  return keys.some(key => Number.isInteger(usage[key]) && usage[key] >= 0)
+}
+
+/**
+ * 把「本 run 见过的桶」+ 结构缺口收敛成 `tokenCoverage`（父裁决：两套语义分字段）。
+ *
+ * ```ts
+ * { complete: boolean,                        // 只反映结构完整性
+ *   missing: [{ nodeId, attemptId }],         // 该有 model/call 却没有的节点/attempt
+ *   buckets: { seen: string[], missing: string[] } } // 只反映桶覆盖，纯信息
+ * ```
+ *
+ * - `complete = (missing.length === 0) && (unkeyedCalls === 0)`：**桶缺失不进 complete**。
+ *   缓存桶缺失是「这条 provider 路径没报缓存」，不是「账少了」；把它算成不完整会让
+ *   所有不支持缓存的 provider 永久黄灯。
+ * - `missing` 只放 runstore 已落地的对象形状（`nodeId` 非空 ≤128、`attemptId` ≥1），
+ *   不写桶名字符串（那套会被 `normalizeTokenCoverage()` 丢弃）。
+ * - `buckets` 用桶名，`seen ∩ missing = ∅`、各自 ≤4 条。
+ *
+ * @param {Set<string>|Array<string>} seen 已出现过数值的桶名
+ * @param {{ unkeyedCalls?: number, gaps?: Array<{nodeId:string, attemptId:number}> }} [options]
+ * @returns {{complete: boolean, missing: Array<{nodeId:string, attemptId:number}>, buckets: {seen: string[], missing: string[]}}}
+ */
+export function tokenCoverageFromSeen(seen, options = {}) {
+  const has = seen instanceof Set ? name => seen.has(name) : name => Array.isArray(seen) && seen.includes(name)
+  const bucketsSeen = TOKEN_COVERAGE_BUCKETS.filter(bucket => has(bucket))
+  const bucketsMissing = TOKEN_COVERAGE_BUCKETS.filter(bucket => !has(bucket))
+
+  const missing = []
+  const dedup = new Set()
+  const gaps = options && Array.isArray(options.gaps) ? options.gaps : []
+  for (const gap of gaps) {
+    if (missing.length >= TOKEN_COVERAGE_MISSING_MAX) break
+    if (!isPlainObject(gap)) continue
+    const nodeId = typeof gap.nodeId === 'string' ? gap.nodeId.trim() : ''
+    if (nodeId === '' || nodeId.length > 128) continue
+    if (!Number.isInteger(gap.attemptId) || gap.attemptId < 1) continue
+    const key = `${nodeId}\u0000${gap.attemptId}`
+    if (dedup.has(key)) continue
+    dedup.add(key)
+    missing.push({ nodeId, attemptId: gap.attemptId })
+  }
+
+  const unkeyedCalls = options && Number.isInteger(options.unkeyedCalls) ? options.unkeyedCalls : 0
+  // complete 必须显式给出（不靠缺省）：只看结构缺口，桶覆盖是纯信息。
+  return {
+    complete: missing.length === 0 && unkeyedCalls === 0,
+    missing,
+    buckets: { seen: bucketsSeen, missing: bucketsMissing },
+  }
+}
+
+/**
+ * 由原始 usage 列表直接算覆盖度（单测 / 离线复核用）。
+ *
+ * @param {Array<object>} usages 原始 usage（四种形状的任意组合）
+ * @param {{ unkeyedCalls?: number, gaps?: Array<{nodeId:string, attemptId:number}> }} [options]
+ * @returns {{complete: boolean, missing: Array<{nodeId:string, attemptId:number}>, buckets: {seen: string[], missing: string[]}}}
+ */
+export function computeTokenCoverage(usages, options = {}) {
+  const list = Array.isArray(usages) ? usages : []
+  const seen = new Set()
+  for (const usage of list) {
+    for (const bucket of TOKEN_COVERAGE_BUCKETS) {
+      if (!seen.has(bucket) && usageHasBucketValue(usage, bucket)) seen.add(bucket)
+    }
+  }
+  return tokenCoverageFromSeen(seen, options)
+}
+
+/**
+ * 明显的「占位符产物」判定（F）：只加标记，不改变写入行为。
+ *
+ * 判据刻意保守：整段正文 trim 后只剩一句「见文件 / 详见附件 / see file」这类，
+ * 且总字节 < 32。宁可漏标，也不把正常短产物（例如 `# 结论`）误判成占位。
+ */
+const PLACEHOLDER_ARTIFACT_MAX_BYTES = 32
+const PLACEHOLDER_ARTIFACT_TEXTS = new Set([
+  '见文件', '详见文件', '见附件', '详见附件', '见上文', '见下文', '同上',
+  'see file', 'see the file', 'see attached', 'see attachment', 'see above', 'see below',
+])
+
+/**
+ * @param {string|Buffer} content 即将落盘的产物内容
+ * @returns {boolean} 是否明显是占位符
+ */
+export function isPlaceholderArtifactContent(content) {
+  let text
+  if (Buffer.isBuffer(content)) {
+    // 二进制产物不判占位（不是文本，谈不上「见文件」）。
+    if (content.includes(0)) return false
+    text = content.toString('utf8')
+  } else {
+    text = String(content ?? '')
+  }
+  const trimmed = text.trim()
+  if (trimmed === '') return false
+  if (Buffer.byteLength(trimmed, 'utf8') >= PLACEHOLDER_ARTIFACT_MAX_BYTES) return false
+  // 去掉结尾的标点（中英文句号 / 冒号 / 省略号）与首尾空白后精确比对。
+  const normalized = trimmed
+    .replace(/[\s。．.：:…!！~～-]+$/u, '')
+    .trim()
+    .toLowerCase()
+  return PLACEHOLDER_ARTIFACT_TEXTS.has(normalized)
+}
+
+/**
  * 上游产物正文的注入预算（06 §6，单位：Unicode 码点）。
  *
  * 为什么是 1200 / 3000 / 2 个文件：
@@ -1947,6 +2229,22 @@ class FlowEngine {
     // 07 §11（R8）：nodeId → 最新自审状态（{state, progress, summary, members, blockers, verdict, at}）。
     // 事件是追加（历史可查），这里只留每个节点最新一条；随 live / run.json 一起可见。
     this.nodeStatus = new Map()
+    // B：nodeId → 已收口的终态 { attempt, retry }（只在内存，不落 run.json）。晚到的
+    // 自审回报靠它挡住回退；合法重开只走 node/start（attemptId 变 / retry 递增）。
+    this.nodeStatusTerminal = new Map()
+    // B：nodeId → 当前 attempt 内最后一次 node/start 的 retry 序号（判断「重试重开」用）。
+    this.nodeStatusRetry = new Map()
+    // B（token 覆盖度）：本 run 的原始 usage 里真正出现过数值的桶（input/cacheRead/
+    // cacheWrite/output）。run 收口时据此显式写 run.json.tokenCoverage，避免「没记录
+    // 就等于完整」的假绿灯。
+    this.tokenBucketsSeen = new Set()
+    // B（token 覆盖度）：外部 executor 跑过但没留下 model/call 的节点/attempt（结构缺口）。
+    // key = `${nodeId}\u0000${attemptId}` → { nodeId, attemptId }。
+    this.tokenGaps = new Map()
+    // B（token 覆盖度）：本 run 收口时算好的 {complete, missing} 缓存。收尾后再次调用
+    // _persistRunEndMeta（例如诊断 / runtime 重写）必须写回同一份，不能因为运行态被
+    // 清空就把 complete:true 降级成 false。
+    this.runTokenCoverage = null
     // 07 §11.3：sessionId → 当前 attempt 的「提前完成信号」deferred（自审 done+verdict 时 resolve）。
     this.selfChecks = new Map()
     // 07 §11.3（C2）：sessionId → 本轮下发的 { attempt, nonce }。正式结论与自审状态块
@@ -2412,6 +2710,139 @@ class FlowEngine {
   }
 
   /**
+   * 节点重开（B 的合法重开路径）：只有 `node/start` 能把一个已终态的节点重新置回
+   * `working`，判据显式且只有两条——
+   *   ① **attemptId 变化**（新 attempt，例如打回重跑）；
+   *   ② **同一 attempt 内的节点级重试序号递增**（`node/start.data.retry` 1..N）。
+   *
+   * 节点从没上报过状态（没有 nodeStatus 条目）时不凭空创建条目：外部 executor
+   * 节点不写 nodeStatus 是既有契约，别为了「终态化」把它们塞进 run.json。
+   *
+   * @param {{nodeId:string, attemptId:number, ts?:string, data?:object}} event
+   */
+  _beginNodeStatus(event) {
+    if (!(this.nodeStatus instanceof Map)) return
+    const nodeId = event && event.nodeId
+    if (typeof nodeId !== 'string' || nodeId === '') return
+    const attempt = Number.isInteger(event.attemptId) ? event.attemptId : null
+    const retry = event.data && Number.isInteger(event.data.retry) && event.data.retry > 0
+      ? event.data.retry
+      : 0
+    const previousRetry = this.nodeStatusRetry instanceof Map
+      ? (this.nodeStatusRetry.get(nodeId) || 0)
+      : 0
+    // 显式重开判据：attemptId 变 / retry 序号递增。两者都不满足时不动状态。
+    const entry = this.nodeStatus.get(nodeId) || null
+    const attemptChanged = !entry || (attempt !== null && entry.attempt !== attempt)
+    const retryAdvanced = retry > previousRetry
+    if (attemptChanged || retryAdvanced) {
+      if (this.nodeStatusRetry instanceof Map) this.nodeStatusRetry.set(nodeId, retry)
+      if (this.nodeStatusTerminal instanceof Map) this.nodeStatusTerminal.delete(nodeId)
+      if (entry) {
+        this.nodeStatus.set(nodeId, {
+          state: 'working',
+          progress: 0,
+          summary: '',
+          verdict: null,
+          ...(attempt === null ? {} : { attempt }),
+          at: typeof event.ts === 'string' ? event.ts : new Date().toISOString(),
+          members: [],
+          blockers: [],
+        })
+        this._syncNodeStatusLive()
+      }
+    }
+  }
+
+  /**
+   * 节点收口（B）：`node/end` 落盘时同步写终态 `nodeStatus`，不再等模型自审。
+   * 映射见 {@link NODE_END_TERMINAL_STATE}；`attempt` 用事件里的权威 attemptId。
+   * 同时记下「终态 + 该 attempt/retry」标记，供晚到自审回报的防回退判据使用。
+   *
+   * @param {{nodeId:string, attemptId:number, ts?:string, data?:object}} event
+   */
+  _settleNodeStatusFromEvent(event) {
+    if (!(this.nodeStatus instanceof Map)) return
+    const nodeId = event && event.nodeId
+    if (typeof nodeId !== 'string' || nodeId === '') return
+    const attempt = Number.isInteger(event.attemptId) ? event.attemptId : null
+    const retry = this.nodeStatusRetry instanceof Map ? (this.nodeStatusRetry.get(nodeId) || 0) : 0
+    if (this.nodeStatusTerminal instanceof Map) {
+      this.nodeStatusTerminal.set(nodeId, { attempt, retry })
+    }
+    const previous = this.nodeStatus.get(nodeId) || null
+    if (!previous) return
+    this.nodeStatus.set(nodeId, nodeStatusFromNodeEnd(previous, event))
+    this._syncNodeStatusLive()
+  }
+
+  /**
+   * run 进入终态（B）：把所有仍停在非终态的节点状态落成终态，并把 attempt 对齐引擎
+   * 权威计数（与 `progress.nodes` 同一口径）。Aborted 场景按 runstore 的合法枚举写
+   * `failed`（真实原因见 run/end.status 与 node/end.extra.aborted）。
+   *
+   * @param {{status?:string}} [endData] run/end.data
+   */
+  _settleRunNodeStatuses(endData) {
+    if (!(this.nodeStatus instanceof Map) || this.nodeStatus.size === 0) return
+    const runStatus = endData && typeof endData.status === 'string' ? endData.status : 'failed'
+    let changed = false
+    for (const [nodeId, entry] of this.nodeStatus) {
+      const state = entry && typeof entry.state === 'string' ? entry.state : 'working'
+      if (NODE_STATUS_FINAL_STATES.has(state)) continue
+      const attempt = this.attempts instanceof Map && Number.isInteger(this.attempts.get(nodeId))
+        ? this.attempts.get(nodeId)
+        : (Number.isInteger(entry && entry.attempt) ? entry.attempt : null)
+      this.nodeStatus.set(nodeId, terminalNodeStatusForRunEnd(entry, runStatus, attempt))
+      if (this.nodeStatusTerminal instanceof Map) {
+        this.nodeStatusTerminal.set(nodeId, {
+          attempt,
+          retry: this.nodeStatusRetry instanceof Map ? (this.nodeStatusRetry.get(nodeId) || 0) : 0,
+        })
+      }
+      changed = true
+    }
+    if (changed) this._syncNodeStatusLive()
+  }
+
+  /** nodeStatus 变化后同步同进程内存快照（run.json 由 `_patchRunBinding` 收口写）。 */
+  _syncNodeStatusLive() {
+    if (this.live) this.live.nodeStatus = this._nodeStatusSnapshot()
+  }
+
+  /** 记一条结构缺口：外部 executor 跑过却没有留下 model/call 的节点/attempt。 */
+  _noteTokenGap(nodeId, attemptId) {
+    if (typeof nodeId !== 'string' || nodeId === '') return
+    if (!Number.isInteger(attemptId) || attemptId < 1) return
+    if (!(this.tokenGaps instanceof Map)) this.tokenGaps = new Map()
+    this.tokenGaps.set(`${nodeId}\u0000${attemptId}`, { nodeId, attemptId })
+  }
+
+  /**
+   * 记下一条**原始** usage 里出现过的桶（B · token 覆盖度）。
+   * 只看原始形状：`mapHostUsage()` 之后四桶永远齐全，再判断就失去意义。
+   */
+  _noteRawUsage(usage) {
+    if (!isPlainObject(usage)) return
+    if (!(this.tokenBucketsSeen instanceof Set)) this.tokenBucketsSeen = new Set()
+    for (const bucket of TOKEN_COVERAGE_BUCKETS) {
+      if (!this.tokenBucketsSeen.has(bucket) && usageHasBucketValue(usage, bucket)) {
+        this.tokenBucketsSeen.add(bucket)
+      }
+    }
+  }
+
+  /** 把一批刚落盘的事件里的 `node/start` / `node/end` 应用到 nodeStatus（B）。 */
+  _applyNodeStatusEvents(events) {
+    if (!Array.isArray(events) || !this.active) return
+    for (const event of events) {
+      if (!event || typeof event !== 'object') continue
+      if (event.kind === 'node/start') this._beginNodeStatus(event)
+      else if (event.kind === 'node/end') this._settleNodeStatusFromEvent(event)
+    }
+  }
+
+  /**
    * 07 §11.2：一条自审回报落三处——
    *   1) `node/status` 事件（追加，历史可查）；
    *   2) `this.nodeStatus`（覆盖，只留最新）+ `live.nodeStatus`；
@@ -2442,6 +2873,18 @@ class FlowEngine {
       return
     }
     const nowIso = isoOf(this.now())
+    // B（父裁决 3）：同一 attempt 的节点一旦写入终态，晚到的自审回报**不许**把
+    // memory / run.json 里的 state 改回 working；事件仍照写进日志留痕（下面照旧入队），
+    // 只是不更新权威快照。合法重开只走 `node/start`（attemptId 变 / retry 递增）。
+    const terminal = this.nodeStatusTerminal instanceof Map ? this.nodeStatusTerminal.get(nodeId) : null
+    const terminated = Boolean(terminal)
+      && (terminal.attempt === null || terminal.attempt === undefined || binding.attemptId <= terminal.attempt)
+    // 另有「旧 attempt 的迟到回报」：节点已经进入 attempt N 后，attempt < N 的状态块
+    // 即便终态标记已被重开清掉，也不许覆盖当前 attempt 的状态。
+    const current = this.nodeStatus instanceof Map ? this.nodeStatus.get(nodeId) : null
+    const staleAttempt = Boolean(current)
+      && Number.isInteger(current.attempt)
+      && binding.attemptId < current.attempt
     const entry = {
       state: parsed.state,
       progress: parsed.progress,
@@ -2465,17 +2908,25 @@ class FlowEngine {
       attempt: binding.attemptId,
       at: nowIso,
     }
-    this.nodeStatus.delete(nodeId)
-    if (this.nodeStatus.size >= 200) {
-      const oldest = this.nodeStatus.keys().next().value
-      if (oldest !== undefined) this.nodeStatus.delete(oldest)
+    if (!terminated && !staleAttempt) {
+      this.nodeStatus.delete(nodeId)
+      if (this.nodeStatus.size >= 200) {
+        const oldest = this.nodeStatus.keys().next().value
+        if (oldest !== undefined) this.nodeStatus.delete(oldest)
+      }
+      this.nodeStatus.set(nodeId, entry)
+    } else {
+      this.log(
+        'warn',
+        `flow-studio: 丢弃过期的自审状态块（${nodeId}#${binding.attemptId}）：`
+        + `当前 ${Number.isInteger(current && current.attempt) ? `attempt ${current.attempt}` : '已终态'}，只记事件不覆盖 nodeStatus`,
+      )
     }
-    this.nodeStatus.set(nodeId, entry)
     // 08 §4：SELF_CHECK 只更新机器 context 的观测字段，不触发转移；正式结论仍由
     // 主循环发 PASS / REJECT / FAIL。没有 actor（flag=0 / 未跑状态机）时是 no-op。
     this._observeMachineSelfCheck(parsed.verdict)
     // live 是同步快照；即使事件写入排队，前端下一次轮询也能立刻看到。
-    if (this.live) this.live.nodeStatus = this._nodeStatusSnapshot()
+    if (!terminated && !staleAttempt) this._syncNodeStatusLive()
 
     // 事件按会话事件队列串行写入；写入时 run 已收尾就跳过（不把记录写进别的 run）。
     const evidence = parsed.evidence || null
@@ -3393,6 +3844,53 @@ class FlowEngine {
     const next = this.bindingPatchQueue.then(() => this._applyRunBindingPatch(runId, patch))
     this.bindingPatchQueue = next.catch(() => {})
     return next
+  }
+
+  /**
+   * C / B（token 覆盖度）：在写 `run/end` **之前**的同一收口里，写 run.json 的两个
+   * 终态元数据（一次 `_patchRunBinding` → 一次 `writeRunMeta`）：
+   *
+   *   1. `supervision = {enabled:false, reason:'terminal', nextDueAt:null}`（06 §18.5）。
+   *      旧顺序是「run/end 落盘 → runtime.settleInstance() 再写」，进程若死在两步之间，
+   *      run.json 会留下 `enabled:true + nextDueAt`（实例 `r-mw900w7y-r4s3` 晚 10s、
+   *      `r-mw77wlyt-1t2j` 晚 37s）。runtime 之后再写同样内容（保留现有字段）是幂等的。
+   *      只在 run.json 里**已经有** supervision 时写（从未开启的不凭空造对象）。
+   *
+   *   2. `tokenCoverage = {complete, missing, buckets}`：显式给出「本 run 的 token 是否记全」。
+   *      `complete` 只反映**结构完整性**（`missing` 空 且 `unkeyedCalls === 0`）；
+   *      `missing` 是「跑了外部 executor 却没留下 model/call」的 `{nodeId, attemptId}`；
+   *      `buckets = {seen, missing}` 只是桶覆盖信息（哪些桶从未报过数值），**不压 complete**
+   *      ——否则不支持缓存的 provider 会永久黄灯。不写这个字段的 run 会被读端按
+   *      `{complete:true}` 处理——那正是「不写而报完整」的假绿。
+   */
+  async _persistRunEndMeta(runId) {
+    if (typeof runId !== 'string' || runId === '' || this.leaseLost) return null
+    let meta = null
+    try {
+      meta = await readRunMeta(this.runsRoot, runId)
+    } catch {
+      return null
+    }
+    const patch = {}
+    const previous = meta && isPlainObject(meta.supervision) ? meta.supervision : null
+    if (previous
+      && !(previous.enabled === false && previous.reason === 'terminal' && previous.nextDueAt === null)) {
+      patch.supervision = { ...previous, enabled: false, reason: 'terminal', nextDueAt: null }
+    }
+    // 去重账本里出现过的无 key 调用数（runstore 在 appendEvents 时维护）。
+    // 覆盖度只算一次并缓存：收尾后运行态（tokenBucketsSeen）会被清空，重算会误降为
+    // complete:false——重写必须幂等。
+    if (!this.runTokenCoverage) {
+      const unkeyedCalls = meta && Number.isInteger(meta.unkeyedCalls) && meta.unkeyedCalls > 0
+        ? meta.unkeyedCalls
+        : 0
+      this.runTokenCoverage = tokenCoverageFromSeen(this.tokenBucketsSeen, {
+        unkeyedCalls,
+        gaps: this.tokenGaps instanceof Map ? [...this.tokenGaps.values()] : [],
+      })
+    }
+    patch.tokenCoverage = this.runTokenCoverage
+    return this._patchRunBinding(runId, patch)
   }
 
   async _applyRunBindingPatch(runId, extraPatch = {}) {
@@ -4598,6 +5096,11 @@ class FlowEngine {
     this.sessionMode = null
     // 07 §11：节点自审状态只属于刚结束的 run；新 run 从空 Map 开始。
     this.nodeStatus = new Map()
+    this.nodeStatusTerminal = new Map()
+    this.nodeStatusRetry = new Map()
+    this.tokenBucketsSeen = new Set()
+    this.tokenGaps = new Map()
+    this.runTokenCoverage = null
     this.selfChecks.clear()
     this.attemptEnvelopes.clear()
     this.lastStructuredBySession.clear()
@@ -4623,14 +5126,32 @@ class FlowEngine {
     this.lastStructuredBySession = new Map()
   }
 
-  /** 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。 */
-  async stop(runId) {
+  /**
+   * 停止当前 run（06 §9）：abort 在飞请求，等循环收尾后返回最新 run 元数据。
+   *
+   * A：`options.source` 区分「用户停」与「引擎中断（宿主卸载 / 服务重启）」：
+   *   - `user`（缺省，保持历史行为）：flow_stop / HTTP stop；
+   *   - `engine`：runtime.dispose() 等运行时回收。
+   * `options.reason` 可选，给了就覆盖默认收口文案（仍按同一路径写 run/end.reason
+   * 与节点 node/end.extra.reason）。
+   *
+   * @param {string} runId
+   * @param {{ source?: 'user'|'engine', reason?: string }} [options]
+   */
+  async stop(runId, options = {}) {
     if (!checkRunId(runId)) throw new EngineError(400, 'runId 不合法')
     if (!this.active || this.active.runId !== runId) {
       throw new EngineError(409, '该 run 不在运行中')
     }
     const active = this.active
-    active.controller.abort(new Error('用户停止'))
+    const opts = options && typeof options === 'object' ? options : {}
+    const source = opts.source === STOP_SOURCES.ENGINE ? STOP_SOURCES.ENGINE : STOP_SOURCES.USER
+    const reason = typeof opts.reason === 'string' && opts.reason.trim() !== '' ? opts.reason.trim() : null
+    active.stopSource = source
+    active.stopReason = reason
+    // abort 的 message 会经 abortError(signal) 成为节点 node/end.extra.reason，
+    // 所以这里必须直接写归因后的文案，不能再用固定的「用户停止」。
+    active.controller.abort(new Error(this._stopReasonText()))
     // start 可能正卡在 run/start 落盘；等 promise 挂上再等收尾。
     let waited = 0
     while (!active.promise && waited < 2000) {
@@ -4639,6 +5160,17 @@ class FlowEngine {
     }
     if (active.promise) await active.promise.catch(() => {})
     return readRunMeta(this.runsRoot, runId)
+  }
+
+  /** A：本次停止归因后的收口文案（run/end.reason 与节点 extra.reason 共用一份）。 */
+  _stopReasonText() {
+    const active = this.active
+    const custom = active && typeof active.stopReason === 'string' ? active.stopReason : ''
+    if (custom !== '') return custom
+    const source = active && active.stopSource === STOP_SOURCES.ENGINE
+      ? STOP_SOURCES.ENGINE
+      : STOP_SOURCES.USER
+    return source === STOP_SOURCES.ENGINE ? STOP_REASON_ENGINE : STOP_REASON_USER
   }
 
   /** 等当前（或指定）run 收尾。 */
@@ -5043,7 +5575,8 @@ class FlowEngine {
         for (;;) {
           try {
             outcome = await this._executeNode(runId, flow, node, attempt, stageTotal, {
-              traceId, previous, rejectContext, startedAt, signal,
+              // D：节点级重试的序号也要传下去，外部 executor 的 model/call 靠它保证 callId 唯一。
+              traceId, previous, rejectContext, startedAt, signal, retryIndex: retries,
             })
             break
           } catch (error) {
@@ -5251,7 +5784,7 @@ class FlowEngine {
         endPatch = [{
           kind: 'run/end',
           traceId: runTraceId(runId),
-          data: aborted ? { status: 'aborted', reason: '已停止' } : { status: 'done' },
+          data: aborted ? { status: 'aborted', reason: this._stopReasonText() } : { status: 'done' },
         }]
       }
     } catch (error) {
@@ -5264,7 +5797,7 @@ class FlowEngine {
         kind: 'run/end',
         traceId: runTraceId(runId),
         data: abortedNow
-          ? { status: 'aborted', reason: '已停止' }
+          ? { status: 'aborted', reason: this._stopReasonText() }
           : {
             status: 'failed',
             reason: clip(error.message || String(error), 2000),
@@ -5299,6 +5832,15 @@ class FlowEngine {
       this._sealSessionEvents(runId)
       await this._disposeRunSessions(runId)
       await this.eventQueue.catch(() => {})
+      // B / C 收口顺序（在写 run/end 之前，同一收尾路径里）：
+      //   ① 把仍停在非终态的 nodeStatus 落成终态（attempt 对齐引擎权威计数）；
+      //   ② 把 supervision 落成 {enabled:false, reason:'terminal', nextDueAt:null}；
+      //   ③ 之后才写 run/end —— 进程若死在这两步之前，run.json 也不会留下
+      //      「working 节点 + enabled:true」这种自相矛盾的快照。
+      if (!this.leaseLost) {
+        this._settleRunNodeStatuses(endPatch && endPatch[0] ? endPatch[0].data : null)
+        await this._persistRunEndMeta(runId)
+      }
       if (this.leaseLost) {
         // R1/E1：失权实例不写 live / 工作区绑定，也不释放接管者的租约；
         // 只允许追加唯一一条 lease-lost 的 run/end（幂等键 loss:epoch）。
@@ -5444,7 +5986,7 @@ class FlowEngine {
           throw new Error(`超过 run 墙钟上限（${runTimeoutMs}ms）`)
         }
         if (signal.aborted) {
-          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: '已停止' },
+          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: this._stopReasonText() },
             { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
           aborted = true
           break
@@ -5456,10 +5998,12 @@ class FlowEngine {
           const traceId = nodeTraceId(runId, node.id, attempt)
           await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
           const cycleReason = `next 边成环：节点「${node.title || node.id}」被重复访问（不是打回）`
+          // E：node/end 必须先于同一节点/attempt 的 machine/transition 落盘（观测事件
+          // 描述的是「这次 attempt 已收口」，先写转移会让人以为节点还没结束）。
+          await this._failNode(runId, node, attempt, traceId, cycleReason, { cycle: true })
           await this._sendMachineEvent(actor, {
             type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason: cycleReason,
           }, { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
-          await this._failNode(runId, node, attempt, traceId, cycleReason, { cycle: true })
           throw new Error(cycleReason)
         }
         arrivedByReject = false
@@ -5471,10 +6015,11 @@ class FlowEngine {
           // 06 §13.5：run 级步数上限（阶段数 × 3）。
           await this._append(runId, [this._nodeStartEvent(node, attempt, traceId)])
           const limitReason = `超过 run 级步数上限（阶段数 × 3 = ${maxSteps}），已执行 ${steps} 步`
+          // E：同上，node/end 先落盘，machine/transition 后写。
+          await this._failNode(runId, node, attempt, traceId, limitReason, { maxTotalSteps: maxSteps })
           await this._sendMachineEvent(actor, {
             type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason: limitReason,
           }, { runId, nodeId: node.id, attemptId: attempt, version: compiled.version })
-          await this._failNode(runId, node, attempt, traceId, limitReason, { maxTotalSteps: maxSteps })
           throw new Error(`超过 run 级步数上限（阶段数 × 3 = ${maxSteps}）`)
         }
         const previous = this.lastResults.get(node.id) || null
@@ -5512,7 +6057,8 @@ class FlowEngine {
         for (;;) {
           try {
             outcome = await this._executeNode(runId, flow, node, attempt, stageTotal, {
-              traceId, previous, rejectContext, startedAt, signal,
+              // D：节点级重试的序号也要传下去，外部 executor 的 model/call 靠它保证 callId 唯一。
+              traceId, previous, rejectContext, startedAt, signal, retryIndex: retries,
             })
             break
           } catch (error) {
@@ -5558,7 +6104,7 @@ class FlowEngine {
           const failureEvent = this.runTimedOut
             ? { type: FLOW_EVENTS.CLOCK_TIMEOUT, kind: 'run', reason }
             : (signal.aborted
-              ? { type: FLOW_EVENTS.CANCEL, reason: '已停止' }
+              ? { type: FLOW_EVENTS.CANCEL, reason: this._stopReasonText() }
               : (error instanceof NodeTimeoutError
                 ? { type: FLOW_EVENTS.CLOCK_TIMEOUT, kind: 'node', nodeId: node.id, reason }
                 : { type: FLOW_EVENTS.FAIL, nodeId: node.id, attempt, reason }))
@@ -5768,7 +6314,7 @@ class FlowEngine {
       if (signal.aborted && !aborted) {
         const position = this._machinePosition(actor.getSnapshot().value)
         if (!position.terminal && position.nodeId) {
-          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: '已停止' }, {
+          await this._sendMachineEvent(actor, { type: FLOW_EVENTS.CANCEL, reason: this._stopReasonText() }, {
             runId,
             nodeId: position.nodeId,
             attemptId: this._machineAttemptOf(actor, position.nodeId),
@@ -5801,7 +6347,7 @@ class FlowEngine {
         endPatch = [{
           kind: 'run/end',
           traceId: runTraceId(runId),
-          data: { status: 'aborted', reason: '已停止' },
+          data: { status: 'aborted', reason: this._stopReasonText() },
         }]
       } else if (finalPosition.terminal === 'failed') {
         // 恢复到一个已经失败的快照 / 机器在没有节点失败记录时收成 #failed。
@@ -5836,7 +6382,7 @@ class FlowEngine {
         kind: 'run/end',
         traceId: runTraceId(runId),
         data: abortedNow
-          ? { status: 'aborted', reason: '已停止' }
+          ? { status: 'aborted', reason: this._stopReasonText() }
           : {
             status: 'failed',
             reason: clip(error.message || String(error), 2000),
@@ -5866,6 +6412,15 @@ class FlowEngine {
       this._sealSessionEvents(runId)
       await this._disposeRunSessions(runId)
       await this.eventQueue.catch(() => {})
+      // B / C 收口顺序（在写 run/end 之前，同一收尾路径里）：
+      //   ① 把仍停在非终态的 nodeStatus 落成终态（attempt 对齐引擎权威计数）；
+      //   ② 把 supervision 落成 {enabled:false, reason:'terminal', nextDueAt:null}；
+      //   ③ 之后才写 run/end —— 进程若死在这两步之前，run.json 也不会留下
+      //      「working 节点 + enabled:true」这种自相矛盾的快照。
+      if (!this.leaseLost) {
+        this._settleRunNodeStatuses(endPatch && endPatch[0] ? endPatch[0].data : null)
+        await this._persistRunEndMeta(runId)
+      }
       if (this.leaseLost) {
         // R1/E1：失权实例不写 live / 工作区绑定，也不释放接管者的租约；
         // 只允许追加唯一一条 lease-lost 的 run/end（幂等键 loss:epoch）。
@@ -6216,7 +6771,7 @@ class FlowEngine {
    *   - 没有 structured → StructuredOutputError；非 0 退出 → 错误消息带 stderr 尾；
    *   - timeout → NodeTimeoutError；abort → AbortError（run 收成 aborted，不是 failed）。
    */
-  async _runExternalNode({ runId, node, attempt, traceId, prompt, spec, signal, isTimedOut }) {
+  async _runExternalNode({ runId, node, attempt, traceId, prompt, spec, signal, isTimedOut, retryIndex = 0 }) {
     const schemaPath = await this._writeExecutorSchema(runId, attempt)
     const runnable = { ...spec, schemaPath }
     const provider = spec.kind === 'codex' ? 'codex' : 'custom'
@@ -6265,11 +6820,12 @@ class FlowEngine {
           lastUsage = event.usage || lastUsage
           // codex 一轮 exec 可能有多条 turn.completed（工具调用后继续），各自带 usage；
           // 只取最后一条会少算前面的 token，这里逐条累加，最后一次性写 model/call。
+          // 累积口径 = 05 四桶（input / cacheRead / cacheWrite / output），不是两桶：
+          // 旧实现只加 input/output，只要出现过任意一条 usage 就整段丢掉 cacheRead /
+          // cacheWrite（实测 r-mw954abc-dcgj 的 cacheRead 全是 0）。
           if (event.usage) {
-            usageSum = {
-              input: (usageSum ? usageSum.input : 0) + event.usage.input,
-              output: (usageSum ? usageSum.output : 0) + event.usage.output,
-            }
+            this._noteRawUsage(event.usage)
+            usageSum = accumulateExternalUsage(usageSum, event.usage)
           }
           return
         }
@@ -6284,25 +6840,35 @@ class FlowEngine {
     })
     await logChain
 
-    // 5) 用量：有才记，不编造（四桶归一化由 mapHostUsage 完成，缺桶补 0）。
-    const usage = usageSum || result.usage || lastUsage
+    // 5) 用量：有才记，不编造（四桶归一化由 mapHostUsage / accumulateExternalUsage 完成）。
+    // 三条来源走同一张四桶口径表：逐条累加值 → 执行器汇总值 → 最后一条原始值。
+    // 覆盖度看的是**原始形状**（执行器汇总值 / 最后一条），逐条事件已在 onEvent 记过。
+    this._noteRawUsage(result.usage)
+    this._noteRawUsage(lastUsage)
+    const usage = usageSum || mapHostUsage(result.usage) || mapHostUsage(lastUsage)
     if (usage) {
-      const mapped = mapHostUsage(usage)
-      if (mapped) {
-        await this._append(runId, [{
-          kind: 'model/call',
-          nodeId: node.id,
-          attemptId: attempt,
-          traceId,
-          data: {
-            provider,
-            model: runnable.model || 'unknown',
-            // 同一 attempt 的重试沿用同一 callId：聚合时「后到整条替换」，不重复计。
-            callId: clip(`executor:${node.id}:${attempt}`, 128),
-            usage: mapped,
-          },
-        }]).catch(() => {})
-      }
+      await this._append(runId, [{
+        kind: 'model/call',
+        nodeId: node.id,
+        attemptId: attempt,
+        traceId,
+        data: {
+          provider,
+          model: runnable.model || 'unknown',
+          // D：节点级重试在同一 attempt 内会再跑一次外部进程，两次是**两次真实用量**。
+          // 没有重试时保持 `executor:<nodeId>:<attempt>`（历史兼容）；有重试时带序号，
+          // 保证 callId 唯一——否则聚合按「同 traceId+callId 后到替换」会把先到的吞掉
+          //（实测 r-mw8090s2-0hi4 少记 692,056，占 35.7%）。
+          callId: clip(retryIndex > 0
+            ? `executor:${node.id}:${attempt}:${retryIndex}`
+            : `executor:${node.id}:${attempt}`, 128),
+          usage,
+        },
+      }]).catch(() => {})
+    } else {
+      // 结构缺口：外部进程跑完了却一条 usage 都没有（被 kill / 不支持上报）——
+      // tokenTotal 会偏小，必须显式标出来（runstore 的 tokenCoverage.missing 口径）。
+      this._noteTokenGap(node.id, attempt)
     }
 
     if (!result.ok) {
@@ -6339,7 +6905,7 @@ class FlowEngine {
 
   /** 执行一个节点：拼提示词 → activate / 外部 executor / stub → 校验 → 落产物与证据。 */
   async _executeNode(runId, flow, node, attempt, stageTotal, context) {
-    const { traceId, previous, rejectContext, signal } = context
+    const { traceId, previous, rejectContext, signal, retryIndex = 0 } = context
     // 06 §13.10：上游产物只能取「沿 next 能到达当前节点」且仍有效的 passed 记录。
     const upstream = []
     const seenUpstream = new Set()
@@ -6426,6 +6992,7 @@ class FlowEngine {
             spec: executorSpec,
             signal: combined,
             isTimedOut: () => timedOut,
+            retryIndex,
           })
         } else if (existingSession && typeof existingSession.sessionId === 'string' && this._agentsUsable()) {
           // 06 §16：一个节点一个会话。二次激活 / 打回重跑都投进同一个会话（活会话直接
@@ -6570,6 +7137,7 @@ class FlowEngine {
 
   /** 桩的合成用量与 skill/load。 */
   async _writeStubEvidence(runId, node, attempt, traceId) {
+    this._noteRawUsage(STUB_USAGE)
     const events = []
     if (Array.isArray(node.skills)) {
       for (const name of node.skills.filter(item => typeof item === 'string' && item.trim() !== '').slice(0, 12)) {
@@ -6606,6 +7174,7 @@ class FlowEngine {
       for (let index = 0; index < rows.length && index < 200; index += 1) {
         const row = rows[index]
         if (!isPlainObject(row) || !isPlainObject(row.usage)) continue
+        this._noteRawUsage(row.usage)
         const usage = mapHostUsage(row.usage)
         if (!usage) continue
         events.push({
@@ -7105,6 +7674,10 @@ class FlowEngine {
         bytes,
         kind: artifactKind(filename),
         sha256,
+        // F（05 §8.2 v1.3 归属标记的同一通道）：明显的占位符产物（正文只剩「见文件」
+        // 这类 < 32 字节的一句话）单独标出来；只加标记，不改写入行为。证据可复核的
+        // 判定在 runlog.js，那边不归本文件改，这里只保证事件里信息不丢。
+        ...(isPlaceholderArtifactContent(content) ? { placeholder: true } : {}),
         ...(truncated ? { truncated: true, originalBytes } : {}),
       },
     }])
@@ -7344,6 +7917,7 @@ class FlowEngine {
       const out = []
 
       // 1) 原有口径：有 usage 才写 model/call（token 聚合口径不动）。
+      this._noteRawUsage(event.data && event.data.usage)
       const usage = mapHostUsage(event.data && event.data.usage)
       if (usage) {
         const callId = message && typeof message.id === 'string' && message.id !== ''
@@ -7554,6 +8128,10 @@ class FlowEngine {
       }
       throw error
     }
+    // B：node/start / node/end 是 nodeStatus 的终态化与重开判据的唯一来源。
+    // 放在落盘成功之后（写失败时内存与 run.json 不会分叉），随后的 live 刷新
+    // 会把最新 nodeStatus 交给 _patchRunBinding 收口写。
+    this._applyNodeStatusEvents(normalized)
     if (live && this.live && this.active && this.active.runId === runId) {
       this.live.lastEventSeq = result.lastSeq
       this.live.currentNodeId = this.current ? this.current.node.id : this.live.currentNodeId
@@ -7761,6 +8339,10 @@ class FlowEngine {
     this.artifactIndex.clear()
     // 07 §11：run 已收尾，自审状态 / 提前完成信号都不再跨 run 使用。
     this.nodeStatus = new Map()
+    this.nodeStatusTerminal = new Map()
+    this.nodeStatusRetry = new Map()
+    this.tokenBucketsSeen = new Set()
+    this.tokenGaps = new Map()
     this.selfChecks.clear()
     // 06 §16：run 级收件箱 / 节点会话运行态归零；跨 run 的 sessionIndex 保留。
     this._resetInboxState()

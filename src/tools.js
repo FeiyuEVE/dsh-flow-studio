@@ -858,6 +858,15 @@ function clampSeconds(value, fallback) {
   return Math.min(900, Math.max(30, value))
 }
 
+/** 毫秒 → 人类可读时长（阈值都是分钟级，不需要毫秒精度）。 */
+function durationText(ms) {
+  const value = typeof ms === 'number' && Number.isFinite(ms) ? Math.max(0, ms) : 0
+  const minutes = value / 60000
+  if (minutes >= 90) return `${(minutes / 60).toFixed(1)} 小时`
+  if (minutes >= 1) return `${Math.round(minutes)} 分钟`
+  return `${Math.max(1, Math.round(value / 1000))} 秒`
+}
+
 // ── 审计模块（真实 import，缺失时给出可操作失败） ───────────────────────────
 
 let auditModulePromise = null
@@ -974,6 +983,7 @@ async function resolveFlow(deps, args) {
  *   watchSeconds?: number,
  *   stallMs?: number,
  *   nodeTimeoutMs?: number,
+ *   runTimeoutMs?: number,
  *   maxRejectsPerEdge?: number,
  *   now?: () => Date,
  *   worktree?: object,           // 注入 worktree 模块（测试用桩；默认真实 ./worktree.js）
@@ -997,6 +1007,9 @@ export function createFlowTools(deps) {
   const nodeTimeoutMs = Number.isInteger(deps.nodeTimeoutMs) && deps.nodeTimeoutMs > 0
     ? deps.nodeTimeoutMs
     : DEFAULT_NODE_TIMEOUT_MS
+  const runTimeoutMs = Number.isInteger(deps.runTimeoutMs) && deps.runTimeoutMs > 0
+    ? deps.runTimeoutMs
+    : DEFAULT_RUN_TIMEOUT_MS
   const maxRejectsPerEdge = Number.isInteger(deps.maxRejectsPerEdge) && deps.maxRejectsPerEdge > 0
     ? deps.maxRejectsPerEdge
     : DEFAULT_MAX_REJECTS_PER_EDGE
@@ -1020,6 +1033,41 @@ export function createFlowTools(deps) {
   // 多 run 审查不是把单 run 逻辑循环 N 遍：每个 run 的 detail / events / flow 只读一次，
   // 同一份 events 同时喂给审计与 blockedNodeAdvice（同一次调用内共享一次事件读取）。
   // eventCache 还顺带保证重复 runId（理论上已去重）不会二次读盘。
+
+  /**
+   * run.json.limits 的宽松读数：只认正整数，缺失 / 坏形状一律 null。
+   * 审计阈值顺序是「run 自己的 limits > deps 配置 > 默认值」——每个 run 可能不同。
+   */
+  function limitsOfRun(run) {
+    const limits = run && typeof run === 'object' && !Array.isArray(run)
+      && run.limits && typeof run.limits === 'object' && !Array.isArray(run.limits)
+      ? run.limits
+      : null
+    const positive = value => (Number.isInteger(value) && value > 0 ? value : null)
+    return {
+      nodeTimeoutMs: positive(limits && limits.nodeTimeoutMs),
+      runTimeoutMs: positive(limits && limits.runTimeoutMs),
+    }
+  }
+
+  /**
+   * run.json.restart.skippedNodeIds（v0.9.2 续跑：上次已完成、本次跳过的阶段）。
+   * 审计用它把「从第 N 阶段续跑」排除出偏航，也用它修进度分母。
+   */
+  function skippedNodeIdsOfRun(run) {
+    const restart = run && typeof run === 'object' && !Array.isArray(run)
+      && run.restart && typeof run.restart === 'object' && !Array.isArray(run.restart)
+      ? run.restart
+      : null
+    const out = []
+    const seen = new Set()
+    for (const raw of Array.isArray(restart && restart.skippedNodeIds) ? restart.skippedNodeIds : []) {
+      if (typeof raw !== 'string' || raw === '' || seen.has(raw)) continue
+      seen.add(raw)
+      out.push(raw)
+    }
+    return out
+  }
 
   /** 读一个 run 的审查上下文；失败返回 {failure}（可读、可操作）。 */
   async function loadWatchContext(runId, eventCache) {
@@ -1070,13 +1118,26 @@ export function createFlowTools(deps) {
   async function auditRunContext(context) {
     const { runId, detail, events, flow } = context
     const auditWorkflow = await resolveAudit(deps)
+    // 阈值顺序：run 自己的 limits > deps 配置 > 默认值。run 配了 30 分钟节点上限
+    // 就不能拿 20 分钟默认值判它卡死（r-mw8q41al-w5kk 的误报就是这么来的）。
+    const runLimits = limitsOfRun(detail.run)
+    const effectiveNodeTimeoutMs = runLimits.nodeTimeoutMs === null ? nodeTimeoutMs : runLimits.nodeTimeoutMs
+    const effectiveRunTimeoutMs = runLimits.runTimeoutMs === null ? runTimeoutMs : runLimits.runTimeoutMs
+    const thresholds = {
+      stallMs,
+      nodeTimeoutMs: effectiveNodeTimeoutMs,
+      runTimeoutMs: effectiveRunTimeoutMs,
+      source: runLimits.nodeTimeoutMs === null && runLimits.runTimeoutMs === null ? 'default' : 'run',
+    }
     const audited = await auditWorkflow({
       flow,
       events,
       run: detail.run,
       now: now(),
       stallMs,
-      nodeTimeoutMs,
+      nodeTimeoutMs: effectiveNodeTimeoutMs,
+      runTimeoutMs: effectiveRunTimeoutMs,
+      thresholdSource: thresholds.source,
       maxRejectsPerEdge,
     })
     if (!audited || typeof audited !== 'object' || Array.isArray(audited)) {
@@ -1107,8 +1168,22 @@ export function createFlowTools(deps) {
     const nodeLevelSnapshot = supervisionSnapshotOf(deps.engine && deps.engine.nodeSupervision, '节点级')
     const schedulerHealth = supervisionHealthOf(runLevelSnapshot, nodeLevelSnapshot)
 
+    // restart 续跑的跳过节点：审计已在进度里返回；这里兜一层，保证 flow_watch
+    // 的 progress 一定带 skipped / skippedCount（没有 restart 的 run 不加字段，行为不变）。
+    const skippedNodeIds = skippedNodeIdsOfRun(detail.run)
+    let progress = audited.progress
+    if (skippedNodeIds.length > 0 && progress && typeof progress === 'object' && !Array.isArray(progress)) {
+      progress = { ...progress }
+      if (!Array.isArray(progress.skipped)) progress.skipped = skippedNodeIds.slice()
+      if (!Number.isInteger(progress.skippedCount)) progress.skippedCount = skippedNodeIds.length
+    }
+
     return jsonSafe({
       ...audited,
+      progress,
+      // 本次判定实际用的阈值（source=run 表示取自 run.json.limits）：
+      // 主人据此能看出「这条 stalled 是按哪个阈值算的」。
+      thresholds,
       recommended: withRecommendations(
         withRecommendations(audited.recommended, nodeAdvice),
         [...schedulerHealth.warnings, ...schedulerHealth.notices],
@@ -1951,6 +2026,10 @@ export function createFlowTools(deps) {
         '审查「整个工作流是否在正常运转」（只读，不改任何状态、不自动修复、不自动停止）。'
         + '读 run.json + 事件 + 流程模板，调用审计模块给出 verdict / headline / progress / plan / '
         + 'currentNode / rejects / anomalies / quality / tokens / idleMs / recommended 等结论，'
+        + '并附 thresholds{stallMs, nodeTimeoutMs, runTimeoutMs, source}：本次判定实际用的阈值'
+        + '（source=run 表示取自 run.json.limits，不是默认值）。'
+        + 'restart 续跑的 run 会跳过上次已完成的阶段：progress.skipped / skippedCount 单列它们，'
+        + '不算未执行、不算偏离，进度分母按「总数 − 跳过数」算。'
         + '并附 supervision：运行中给出下次审查间隔、内建调度状态（scheduler）与向后兼容的闹钟提示词，'
         + 'verdict 为 done/failed/aborted 时 nextCheckSeconds 为 null、alarmPrompt 说明不必再挂闹钟。'
         + '另附调度器实时快照（schedulerSnapshot = engine.supervision.snapshot()、'
@@ -1994,7 +2073,11 @@ export function createFlowTools(deps) {
         headline: nullable({ type: 'string', description: '一句话结论（人类可读）' }),
         // 审计字段的形状由 audit.js 决定（另一条工作流并行实现），这里用宽松 schema
         // 只声明「字段存在」，避免形状差异让注册表的逐值校验直接拒绝合法结果。
-        progress: anyJson('进度摘要（对象；审计模块原样返回）'),
+        progress: anyJson('进度摘要（对象；审计模块原样返回。restart 续跑的 run 额外带 skipped[...] / skippedCount）'),
+        thresholds: anyJson(
+          '本次判定实际用的阈值：{stallMs, nodeTimeoutMs, runTimeoutMs, source}；'
+          + 'source=run 表示节点/整轮上限取自 run.json.limits，default 表示用默认值或 deps 配置',
+        ),
         plan: anyJson('剩余计划（通常是节点数组；审计模块原样返回）'),
         currentNode: anyJson('当前节点（对象或 null；审计模块原样返回）'),
         rejects: anyJson('打回统计（对象；审计模块原样返回）'),
@@ -2096,6 +2179,20 @@ export function createFlowTools(deps) {
         const head = value.headline ? value.headline : '（审计未给出结论摘要）'
         const lines = [`run ${value.runId}：${value.verdict || value.status || 'unknown'} — ${head}`]
         if (value.currentNode && value.currentNode.title) lines.push(`当前节点：${value.currentNode.title}`)
+        // 判定依据：阈值取自哪里、是多少（run 配置的 30 分钟不能被读成默认 20 分钟）。
+        const thresholds = value.thresholds && typeof value.thresholds === 'object' ? value.thresholds : null
+        if (thresholds) {
+          const sourceText = thresholds.source === 'run' ? 'run.json.limits' : '默认值'
+          lines.push(
+            `判定阈值：节点 ${durationText(thresholds.nodeTimeoutMs)} / 整轮 ${durationText(thresholds.runTimeoutMs)}`
+            + ` / 无事件 ${durationText(thresholds.stallMs)}（来源 ${sourceText}）`,
+          )
+        }
+        // restart 续跑：跳过的阶段本次不执行，单列出来，别当成「没跑」。
+        const skipped = value.progress && Array.isArray(value.progress.skipped) ? value.progress.skipped : []
+        if (skipped.length > 0) {
+          lines.push(`restart 续跑跳过 ${skipped.length} 个阶段（本次不执行）：${skipped.join('、')}`)
+        }
         if (Array.isArray(value.anomalies) && value.anomalies.length > 0) lines.push(`异常 ${value.anomalies.length} 条`)
         if (value.supervision && value.supervision.nextCheckSeconds === null) {
           lines.push('已到终态：不必再挂闹钟，proactive_reclaim 结束本轮。')

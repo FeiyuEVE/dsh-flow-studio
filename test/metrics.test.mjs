@@ -135,9 +135,10 @@ await check('quality 能出 pass：返工 0 → 优；返工 1 + P1=0 + 采纳�
   assert.equal(good.acceptedRate, 1)
 })
 
-// N1 反向锁：把夹具改回旧 run 的 legacy 形状（证据无 extra）后不得再 pass，
-// 否则将来有人改回无 extra 的夹具，N1 会静默回退且本文件无测试发现。
-await check('N1：legacy 形状（证据无 extra）的同一份 fixture 不得 pass，标签写明来源未知', () => {
+// N1 反向锁：把夹具改回旧 run 的 legacy 形状（证据无 extra、也没有 artifact/write），
+// 通过条目既非自证也无独立归属 → 必须 warn（「有证据但不独立」），不得 pass。
+// （v1.3：判定理由从「legacy 权威覆盖 0」改为「找不到产物归属／缺独立复核」，见 05 §8.4。）
+await check('N1：legacy 形状（证据无 extra、无 artifact/write）的同一份 fixture 不得 pass', () => {
   const legacy = fixture({ rework: 0 }).map(event => {
     if (['acceptance/verdict', 'test/report', 'check/form'].includes(event.kind)) event.extra = undefined
     return event
@@ -146,9 +147,11 @@ await check('N1：legacy 形状（证据无 extra）的同一份 fixture 不得 
   probeRows.push(['legacy 形状（无 extra）', quality.state, quality.label])
   assert.equal(quality.authorityCoverage, 0)
   assert.equal(quality.claimedPassed, 0)
+  assert.equal(quality.independentPassed, 0, '没有 artifact/write 归属 → 独立证据为 0')
   assert.ok(quality.legacyPassed >= 3, `legacyPassed=${quality.legacyPassed}`)
-  assert.equal(quality.state, 'unknown', `legacy 形状不得 pass：${quality.label}`)
-  assert.match(quality.label, /legacy|来源未知/)
+  assert.equal(quality.state, 'warn', `legacy 形状不得 pass：${quality.label}`)
+  assert.match(quality.label, /找不到产物归属|来源未知|缺独立复核/)
+  assert.doesNotMatch(quality.label, /优：|良：/)
 })
 
 await check('缺证据 → unknown（列出缺项）；半成品 → warn；P1 未解决不给良', () => {
@@ -181,6 +184,137 @@ await check('v1.3 首轮通过 + P1/P2 未解决 → warn；P0 未解决 → fai
   assert.equal(p0Block.state, 'fail')
   assert.equal(p0Block.evidence.p0p1.state, 'fail')
   assert.match(p0Block.label, /P0 缺陷/)
+})
+
+/**
+ * v1.3 证据独立性夹具（05 §8.3 / §8.4）：
+ *   - 每个指标 1 条「自证」通过条目（引用本节点写的 artifact/write）；
+ *   - withPeer 时再加 1 条「独立」通过条目（引用别的节点写的 artifact/write → peer）。
+ * 事件本身不带 provenance（legacy），独立性只看产物归属，正好覆盖最常见的历史形状。
+ */
+function independenceFixture({ withPeer = false, acceptanceFail = false } = {}) {
+  const sha = 'a'.repeat(64)
+  const artifact = (nodeId, path) => ev('artifact/write', {
+    nodeId, attemptId: 1, data: { path, bytes: 10, kind: 'json', sha256: sha },
+  })
+  const events = [
+    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 2 } }),
+    ev('node/end', { nodeId: 'n_a', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ev('node/end', { nodeId: 'n_b', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
+    ev('review/finding', {
+      nodeId: 'n_review', attemptId: 1,
+      data: { id: 'f1', severity: 'P1', title: '问题', status: 'verified' },
+    }),
+    ev('review/verdict', {
+      nodeId: 'n_review', attemptId: 1, data: { verdict: 'approve', findingCount: 1 },
+    }),
+    // 自证：产物由声明节点自己写。
+    artifact('n_acc', 'ev/acc-self.json'),
+    ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'acc-self', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/acc-self.json' },
+    }),
+    artifact('n_test', 'ev/test-self.json'),
+    ev('test/report', {
+      nodeId: 'n_test', attemptId: 1,
+      data: {
+        suite: 'unit-self', executed: 10, passed: 10, failed: 0, skipped: 0,
+        reportRef: 'ev/test-self.json',
+      },
+    }),
+    artifact('n_check', 'ev/check-self.json'),
+    ev('check/form', {
+      nodeId: 'n_check', attemptId: 1,
+      data: {
+        ruleSetId: 'eslint-self', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
+        passedChecks: 5, totalChecks: 5, executedAt: '2026-11-06T10:00:00.000Z',
+        reportRef: 'ev/check-self.json',
+      },
+    }),
+  ]
+  if (withPeer) {
+    // 独立复核：产物由别的节点写 → peer。
+    events.push(
+      artifact('n_ref', 'ev/acc-peer.json'),
+      ev('acceptance/verdict', {
+        nodeId: 'n_acc', attemptId: 1,
+        data: { itemId: 'acc-peer', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/acc-peer.json' },
+      }),
+      artifact('n_ref', 'ev/test-peer.json'),
+      ev('test/report', {
+        nodeId: 'n_test', attemptId: 1,
+        data: {
+          suite: 'unit-peer', executed: 7, passed: 7, failed: 0, skipped: 0,
+          reportRef: 'ev/test-peer.json',
+        },
+      }),
+      artifact('n_ref', 'ev/check-peer.json'),
+      ev('check/form', {
+        nodeId: 'n_check', attemptId: 1,
+        data: {
+          ruleSetId: 'eslint-peer', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
+          passedChecks: 3, totalChecks: 3, executedAt: '2026-11-06T10:00:00.000Z',
+          reportRef: 'ev/check-peer.json',
+        },
+      }),
+    )
+  }
+  if (acceptanceFail) {
+    events.push(ev('acceptance/verdict', {
+      nodeId: 'n_acc', attemptId: 1,
+      data: { itemId: 'acc-self', status: 'fail', decidedBy: 'auto', evidenceRef: 'ev/acc-self.json' },
+    }))
+  }
+  return events
+}
+
+await check('C v1.3 独立性判定表：全 self → warn；peer + self → pass；fail → fail；无证据 → unknown', () => {
+  // ① 每个指标的通过条目全部为自证 → warn（不是 unknown，也不能是 pass）。
+  const selfOnly = computeQuality(independenceFixture())
+  probeRows.push(['三项指标全部自证', selfOnly.state, selfOnly.label])
+  assert.equal(selfOnly.state, 'warn', `全自证应 warn：${selfOnly.label}`)
+  assert.match(selfOnly.label, /全部为自证证据/)
+  assert.match(selfOnly.label, /缺独立复核/)
+  assert.doesNotMatch(selfOnly.label, /未检测/, '自证不是「未检测」，不能这么写')
+  assert.equal(selfOnly.independentPassed, 0)
+  assert.equal(selfOnly.selfCertified, 3)
+  for (const key of ['acceptance', 'tests', 'checks']) {
+    assert.equal(selfOnly.evidence[key].state, 'pass', key)
+    assert.equal(selfOnly.evidence[key].selfOnly, true, key)
+    assert.match(selfOnly.evidence[key].reason, /1 条自报 \+ 0 条独立/, key)
+  }
+
+  // ② 每个指标 1 条 peer + 1 条自证 → pass（自证可以共存，不降级）。
+  const mixed = computeQuality(independenceFixture({ withPeer: true }))
+  probeRows.push(['每项 1 peer + 1 自报', mixed.state, mixed.label])
+  assert.equal(mixed.state, 'pass', `peer + 自证应 pass：${mixed.label}`)
+  assert.equal(mixed.independentPassed, 3, '三项指标各 1 条独立证据')
+  assert.equal(mixed.selfCertified, 3, '三项指标各 1 条自证')
+  assert.deepEqual(mixed.selfOnlyMetrics, [])
+  for (const key of ['acceptance', 'tests', 'checks']) {
+    assert.equal(mixed.evidence[key].independentPassed, 1, key)
+    assert.match(mixed.evidence[key].reason, /1 条自报 \+ 1 条独立/, key)
+  }
+
+  // ③ 有 fail → fail（自证 / peer 都不能把它洗成 pass）。
+  const failed = computeQuality(independenceFixture({ withPeer: true, acceptanceFail: true }))
+  probeRows.push(['存在 fail 条目', failed.state, failed.label])
+  assert.equal(failed.state, 'fail')
+  assert.equal(failed.evidence.acceptance.state, 'fail')
+
+  // ④ 完全没证据 → unknown（不是 pass，也不是 warn）。
+  const nothing = computeQuality([])
+  probeRows.push(['无任何证据', nothing.state, nothing.label])
+  assert.equal(nothing.state, 'unknown')
+  assert.deepEqual([...nothing.missing].sort(), ['acceptance', 'checks', 'p0p1', 'review', 'tests'])
+
+  // ⑤ 通过条目找不到产物归属（legacy 且无 artifact/write）→ warn（有证据但不独立），
+  //    不是 unknown（unknown 只留给缺证据 / 数据矛盾）。
+  const unowned = computeQuality(independenceFixture().filter(event => event.kind !== 'artifact/write'))
+  probeRows.push(['通过条目无产物归属', unowned.state, unowned.label])
+  assert.equal(unowned.state, 'warn')
+  assert.match(unowned.label, /找不到产物归属/)
+  assert.match(unowned.label, /缺独立复核/)
 })
 
 await check('打回后 ratio 下降（A/B passed 被打回 A）', () => {
@@ -320,6 +454,46 @@ await check('GET /health 带 auth / runsDir / version（§8.5 + §13.1）', asyn
   assert.equal(result.json.auth, 'connection')
   assert.equal(result.json.runsDir, runsRoot)
   assert.equal(result.json.version, PLUGIN_VERSION)
+})
+
+await check('B：tokenCoverage 对外暴露——列表 / light 只给 { complete }，详情给全量', async () => {
+  const meta = await makeRun(1)
+  await store.writeRunMeta(runsRoot, meta.id, {
+    tokenCoverage: {
+      complete: false,
+      missing: [{ nodeId: 'n_exec', attemptId: 1 }],
+      buckets: { seen: ['input', 'output'], missing: ['cacheRead', 'cacheWrite'] },
+    },
+  })
+
+  const list = await call(route, 'GET', '/api/flow-studio/runs?limit=100')
+  const row = list.json.runs.find(item => item.id === meta.id)
+  assert.deepEqual(row.tokenCoverage, { complete: false })
+  assert.ok(!('missing' in row.tokenCoverage), '列表只放 { complete }，不带缺口明细')
+
+  const light = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}?light=1`)
+  assert.deepEqual(light.json.run.tokenCoverage, { complete: false })
+
+  const detail = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}`)
+  assert.deepEqual(detail.json.run.tokenCoverage, {
+    complete: false,
+    missing: [{ nodeId: 'n_exec', attemptId: 1 }],
+    buckets: { seen: ['input', 'output'], missing: ['cacheRead', 'cacheWrite'] },
+  })
+
+  // 老 run 没有这个字段：按 { complete: true } 处理，不报错。
+  const legacy = await makeRun(1)
+  const legacyDetail = await call(route, 'GET', `/api/flow-studio/runs/${legacy.id}`)
+  assert.deepEqual(legacyDetail.json.run.tokenCoverage, {
+    complete: true,
+    missing: [],
+    buckets: { seen: [], missing: [] },
+  })
+  const legacyList = await call(route, 'GET', '/api/flow-studio/runs?limit=100')
+  assert.deepEqual(
+    legacyList.json.runs.find(item => item.id === legacy.id).tokenCoverage,
+    { complete: true },
+  )
 })
 
 await check('坏 run 目录下 GET /runs 仍 200，并带 skipped（§8.6）', async () => {

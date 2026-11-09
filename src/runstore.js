@@ -91,6 +91,20 @@ const MAX_SESSION_KEY_CHARS = 128
 const MAX_SESSION_VALUE_CHARS = 128
 
 /**
+ * B：`run.json.tokenCoverage.missing` 的条数上限与 nodeId 字符上限。
+ *
+ * 缺口列表只用于「告诉读者哪些节点 / attempt 的 token 没记全」，不是审计台账；
+ * 50 条足够覆盖一个 run 的实际节点数（flow 上限远小于此），再多就该看事件了。
+ * 有界是为了 run.json 不被异常引擎写入撑爆（超限按前 50 条保留，不报错）。
+ */
+const TOKEN_COVERAGE_MISSING_MAX = 50
+const TOKEN_COVERAGE_NODE_ID_MAX_CHARS = 128
+
+/** 05 §3：用量四桶。tokenCoverage.buckets 只允许出现这四个名字。 */
+export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 'output'])
+const USAGE_BUCKET_SET = new Set(USAGE_BUCKETS)
+
+/**
  * D3：`run.json.startOptions`（创建 run 时记下的发起参数）。
  *
  * 06 §13.8 / `runtime.readStartOptions()` 的契约：只允许这两个键，
@@ -459,6 +473,79 @@ function normalizeExecution(raw) {
   return { epoch: epoch === null ? 0 : epoch, ownerId, state }
 }
 
+/**
+ * `tokenCoverage.buckets` 的收敛：只允许四桶名字，各自去重、≤4 条；坏条目丢弃。
+ *
+ * **纯信息字段**：桶覆盖说明「provider 报了哪几桶」，不参与 `complete` 判定——
+ * 不支持缓存的 provider 永远没有 cacheRead/cacheWrite，把它算进「账不完整」会让
+ * 这些 run 永久黄灯（05 §8.4 的 complete 只回答「该记的调用有没有漏记」）。
+ *
+ * 老 run / 坏形状没有 `buckets` 时收敛成 `{ seen: [], missing: [] }`（而不是省略
+ * 该键）：调用方永远能读到固定形状，且「没记录」与「四桶都齐」不会被混为一谈。
+ *
+ * @param {unknown} raw
+ * @returns {{seen: string[], missing: string[]}}
+ */
+export function normalizeCoverageBuckets(raw) {
+  const pick = list => {
+    const out = []
+    if (!Array.isArray(list)) return out
+    for (const item of list) {
+      if (out.length >= USAGE_BUCKETS.length) break
+      if (typeof item !== 'string' || !USAGE_BUCKET_SET.has(item)) continue
+      if (out.includes(item)) continue
+      out.push(item)
+    }
+    return out
+  }
+  const source = isPlainObject(raw) ? raw : {}
+  return { seen: pick(source.seen), missing: pick(source.missing) }
+}
+
+/**
+ * token 覆盖度（B）：`{ complete, missing: [{ nodeId, attemptId }], buckets }`。
+ *
+ * 语义与 `tokenTotalApprox` **不同**：后者是「去重账本损坏，累计值可能不准」；
+ * 这个字段是「有节点 / attempt 配置了外部 executor，但没留下 model/call」——
+ * 被 kill 的在飞 turn 没有 usage，tokenTotal 会偏小，必须显式标出「不完整」。
+ *
+ * 读路径宽松收敛（写路径也走同一函数，坏形状不 400，只收敛）：
+ *   - 非对象 → null（调用方按 `{ complete: true }` 处理，老 run 不报错）；
+ *   - `missing` 最多保留 {@link TOKEN_COVERAGE_MISSING_MAX} 条；
+ *   - 每条只保留 `{ nodeId: 非空字符串 ≤128, attemptId: ≥1 整数 }`，坏条目丢弃；
+ *   - 按 (nodeId, attemptId) 去重（重复项不占预算）；
+ *   - `complete` 只有「显式 true 且 missing 为空」才为 true —— 有缺口就不可能完整；
+ *     `normalizeMeta` 另外要求 `unkeyedCalls === 0`（没有 callId 的用量去了重账本，
+ *     同样算「账没记全」）；`buckets` 的桶缺失**不**参与 complete。
+ *   - `buckets` 见 {@link normalizeCoverageBuckets}；缺省收敛成空数组对。
+ *
+ * @param {unknown} raw
+ * @returns {{complete: boolean, missing: {nodeId: string, attemptId: number}[], buckets: {seen: string[], missing: string[]}} | null}
+ */
+function normalizeTokenCoverage(raw) {
+  if (!isPlainObject(raw)) return null
+  const missing = []
+  const seen = new Set()
+  if (Array.isArray(raw.missing)) {
+    for (const item of raw.missing) {
+      if (missing.length >= TOKEN_COVERAGE_MISSING_MAX) break
+      if (!isPlainObject(item)) continue
+      const nodeId = typeof item.nodeId === 'string' ? item.nodeId.trim() : ''
+      if (nodeId === '' || nodeId.length > TOKEN_COVERAGE_NODE_ID_MAX_CHARS) continue
+      if (!Number.isInteger(item.attemptId) || item.attemptId < 1) continue
+      const key = `${nodeId}\u0000${item.attemptId}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      missing.push({ nodeId, attemptId: item.attemptId })
+    }
+  }
+  return {
+    complete: raw.complete === true && missing.length === 0,
+    missing,
+    buckets: normalizeCoverageBuckets(raw.buckets),
+  }
+}
+
 function normalizeMeta(raw, id) {
   const source = raw && typeof raw === 'object' ? raw : {}
   const now = new Date().toISOString()
@@ -487,6 +574,13 @@ function normalizeMeta(raw, id) {
   const execution = normalizeExecution(source.execution)
   // v0.9.2：`restart` 用 undefined 区分「没传」与「显式清除」；显式 null / 坏形状都落成 null。
   const restart = source.restart === undefined ? null : normalizeRestart(source.restart)
+  // B：token 覆盖度（外部 executor 有节点 / attempt 没留下 model/call → 标记不完整）。
+  // 老 run 没有这个键 → 不出现（调用方按 { complete: true } 处理）。
+  const tokenCoverage = source.tokenCoverage === undefined ? null : normalizeTokenCoverage(source.tokenCoverage)
+  const unkeyedCalls = count(source.unkeyedCalls)
+  // complete 只反映「账记全了没有」：missing 为空 且 没有 unkeyedCalls（无 callId 的
+  // 用量进不了去重账本）。buckets 缺失只是 provider 没报缓存，不算账少。
+  if (tokenCoverage !== null && unkeyedCalls > 0) tokenCoverage.complete = false
   // v0.9.2 P0：run.json.agentPreset = { value, source }；未知 / 坏形状整条省略。
   const agentPresetBinding = source.agentPreset === undefined
     ? null
@@ -509,8 +603,9 @@ function normalizeMeta(raw, id) {
     lastSeq,
     // 兼容 v0.2：老字段 seq 与 lastSeq 同值。
     seq: lastSeq,
-    unkeyedCalls: count(source.unkeyedCalls),
+    unkeyedCalls,
     tokenTotalApprox: source.tokenTotalApprox === true,
+    ...(tokenCoverage === null ? {} : { tokenCoverage }),
     createdAt: text(source.createdAt, now),
     updatedAt: text(source.updatedAt, now),
     progress,
@@ -1278,7 +1373,7 @@ function corruptMetaError(cause, backupName) {
 const META_FIELD_KEYS = new Set([
   'id', 'name', 'flowId', 'flowName', 'status', 'started', 'engine',
   'startedAt', 'endedAt', 'nodeDone', 'nodeTotal', 'tokenTotal', 'eventCount',
-  'lastSeq', 'seq', 'unkeyedCalls', 'tokenTotalApprox', 'createdAt', 'updatedAt',
+  'lastSeq', 'seq', 'unkeyedCalls', 'tokenTotalApprox', 'tokenCoverage', 'createdAt', 'updatedAt',
   'progress', 'live', 'input', 'inbox',
   // 07 §4/§5/§7 运行绑定 + 07 §11 节点自审状态（D3 白名单）
   'sessionMode', 'workspace', 'worktree', 'supervision', 'agentPreset', 'nodeStatus',
@@ -4094,6 +4189,8 @@ export async function listRuns(runsRoot, options = {}) {
       nodeDone: meta.nodeDone,
       nodeTotal: meta.nodeTotal,
       tokenTotal: meta.tokenTotal,
+      // B：列表只放「完整与否」（缺口明细在详情里），老 run 缺失按完整处理。
+      tokenCoverage: { complete: meta.tokenCoverage ? meta.tokenCoverage.complete === true : true },
       eventCount: meta.eventCount,
       // 05 §8.3：progress（含每节点状态）三个端点都要发；列表只读 run.json 的增量计数器，
       // 不扫事件，所以和详情同口径靠 progressFromNodeStates 保证。

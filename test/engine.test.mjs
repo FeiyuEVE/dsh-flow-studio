@@ -37,6 +37,10 @@ const {
   createEngine: createEngineRaw, EngineError, STUB_USAGE, buildPrompt, PROMPT_MAX_CHARS,
   loadUpstreamArtifactContents, MAX_NODE_RETRIES, UPSTREAM_ARTIFACT_READ_MAX_BYTES,
   nodeSessionId, ENGINE_OUTPUT_SCHEMA, parseAssistantStructured, resolveModelRoute,
+  // v0.12.3：停止来源归因 / nodeStatus 终态化 / 四桶 usage / 占位符标记（本次任务新增导出）。
+  STOP_REASON_USER, STOP_REASON_ENGINE, nodeStatusFromNodeEnd, terminalNodeStatusForRunEnd,
+  accumulateExternalUsage, isPlaceholderArtifactContent, mapHostUsage,
+  computeTokenCoverage, tokenCoverageFromSeen,
 } = engineModule
 
 /**
@@ -4568,8 +4572,13 @@ try {
     A.equal(liveNodeStatus.n_status.state, 'working')
     A.equal(liveNodeStatus.n_status.progress, 40)
     A.equal(liveNodeStatus.n_status.members[0].name, '成员甲')
-    A.equal(raw.nodeStatus.n_status.state, 'working')
-    A.equal(raw.nodeStatus.n_status.progress, 70)
+    // B（0.12.3）：node/end 落盘时引擎把节点状态收成终态，不再停在模型自审的
+    // working/70%。自审的摘要 / blockers / members 保留，state / progress / verdict
+    // 由正式结论（passed）覆盖。
+    A.equal(raw.nodeStatus.n_status.state, 'done')
+    A.equal(raw.nodeStatus.n_status.progress, 100)
+    A.equal(raw.nodeStatus.n_status.verdict, 'pass')
+    A.equal(raw.nodeStatus.n_status.summary, '准备收尾')
     A.deepEqual(raw.nodeStatus.n_status.blockers, ['等接口'])
     A.equal(typeof raw.nodeStatus.n_status.at, 'string')
     // 同文本里的正式 verdict 被解析成节点结论（不是被 status 块挡掉）。
@@ -5623,10 +5632,15 @@ try {
     A.deepEqual(a2Findings.map(event => event.data.id), ['n_a:BF1'], '打回方的 finding 复报后归属目标节点，不成 n_a:n_b:BF1')
     A.equal(allIds.some(id => /^n_a:n_a:/.test(id)), false, '不许出现双前缀 id')
     A.equal(allIds.some(id => /^n_a:n_b:/.test(id)), false, '不许出现跨节点双前缀 id')
-    // 0.11 R6（F5）：无独立 evidenceRef 的 acceptance 退到引擎自写报告 = claimed，不再判 pass。
-    A.equal(summary.quality.evidence.acceptance.state, 'unknown', '自报报告只能 unknown')
-    A.match(String(summary.quality.evidence.acceptance.reason), /自报报告/, '必须说明缺独立证据')
-    A.ok(summary.quality.evidence.acceptance.claimedPassed >= 1, '至少一条验收通过被降级为 claimed')
+    // 0.11 R6（F5）→ 05 §8.3 / §8.4 v1.3：无独立 evidenceRef 的 acceptance 退到引擎
+    // 自写报告时，只要 ref 能对上本节点产物就是**自证**（self），指标不再降 unknown；
+    // 「证据不独立」交给 quality 层按 selfOnly 降 warn，不给绿灯。
+    A.equal(summary.quality.evidence.acceptance.state, 'pass', '自证是证据，不是缺证据')
+    A.equal(summary.quality.evidence.acceptance.selfOnly, true, '该指标通过条目全部为自证')
+    A.ok(summary.quality.evidence.acceptance.selfCertified >= 1, '至少一条通过被标成自证')
+    A.ok(summary.quality.evidence.acceptance.claimedPassed >= 1, '自报报告仍计入 claimed（不是权威）')
+    A.equal(summary.quality.state, 'warn', '全自证不得给绿灯')
+    A.match(String(summary.quality.label || ''), /自证/, 'quality 必须写明缺独立复核的原因')
     A.equal(summary.quality.evidence.acceptance.staleFails, undefined, '旧 n_a:R1 复判为通过，staleFails 必须为空')
   })
 
@@ -5800,7 +5814,11 @@ try {
     A.equal(memoEntry.attempt, 2, '内存 entry 带本次 attempt（权威归属）')
     A.ok(Boolean(stored), 'run.json.nodeStatus 必须落盘（真实文件断言）')
     A.equal(stored.attempt, 2, 'run.json.nodeStatus[nodeId].attempt === 2（重启恢复节点闹钟靠它）')
-    A.equal(stored.progress, 60, '落盘的确实是 attempt=2 那条状态')
+    // B（0.12.3）：node/end 落盘时引擎把节点状态收成终态——自审的 working/60% 只留在
+    // node/status 事件里，run.json 里是正式结论（passed → done / 100 / verdict=pass）。
+    A.equal(stored.state, 'done', 'passed 节点落盘必须是终态 done')
+    A.equal(stored.progress, 100, 'passed → progress 100（不再停在自审的 60）')
+    A.equal(stored.verdict, 'pass', 'verdict 取本 attempt 的正式结论')
     const statusEvents = (await eventsOf(run.id)).filter(event => event.kind === 'node/status')
     A.ok(statusEvents.length >= 2, '两个 attempt 各自的自审回报都追加成事件')
     A.equal(statusEvents[statusEvents.length - 1].attemptId, 2, 'node/status 事件的顶层 attemptId 口径不变')
@@ -6052,6 +6070,615 @@ try {
     } finally {
       delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
+  })
+
+  // =========================================================================
+  // v0.12.3 · 四件「数字对、标签错」的收口（A/B/C/D/E/F/G）
+  // =========================================================================
+  console.log('engine v0.12.3 · A 停止来源归因')
+
+  const fencedJson = value => `\`\`\`json\n${JSON.stringify(value)}\n\`\`\``
+
+  /** 造一个「一直挂着、只有 abort 才结束」的 activate（用户停 / 引擎中断共用）。 */
+  function hangUntilAbort(onStarted) {
+    return async ({ signal }) => {
+      onStarted()
+      return new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason || new Error('已中止')), { once: true })
+      })
+    }
+  }
+
+  await check('A① stop 来源归因：user →「已停止」，engine →「引擎中断（宿主卸载 / 服务重启）」', async () => {
+    const flow = flowOf('flow-stop-source', [
+      startNode(), stage('n_hang', '长任务', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_hang'),
+      next('e2', 'n_hang', 'n_end'),
+    ])
+    await saveFlow(flow)
+
+    const stopWith = async (options) => {
+      const run = await makeRun('flow-stop-source', 1)
+      const started = deferred()
+      const engine = createEngine({
+        runsRoot,
+        flowsRoot,
+        nodeRetries: 0,
+        activate: hangUntilAbort(() => started.resolve()),
+      })
+      await engine.start(run.id)
+      await started.promise
+      const stopped = await engine.stop(run.id, options)
+      const events = await eventsOf(run.id)
+      return {
+        stopped,
+        runEnd: events.find(event => event.kind === 'run/end'),
+        nodeEnd: events.find(event => event.kind === 'node/end'),
+      }
+    }
+
+    const user = await stopWith(undefined)
+    A.equal(user.stopped.status, 'aborted')
+    A.equal(user.runEnd.data.status, 'aborted')
+    A.equal(user.runEnd.data.reason, STOP_REASON_USER, '不传 source = 历史行为「已停止」')
+    A.equal(user.nodeEnd.data.status, 'failed')
+    A.equal(user.nodeEnd.extra.aborted, true)
+    A.equal(user.nodeEnd.extra.reason, STOP_REASON_USER, '节点 extra.reason 与 run/end 同步，不再写「用户停止」')
+
+    const engineStop = await stopWith({ source: 'engine' })
+    A.equal(engineStop.stopped.status, 'aborted')
+    A.equal(engineStop.runEnd.data.status, 'aborted')
+    A.equal(engineStop.runEnd.data.reason, STOP_REASON_ENGINE, '宿主卸载 / 服务重启 → 引擎中断')
+    A.match(engineStop.runEnd.data.reason, /引擎中断/)
+    A.equal(engineStop.nodeEnd.extra.reason, STOP_REASON_ENGINE, '节点 extra.reason 同步为引擎中断')
+  })
+
+  console.log('engine v0.12.3 · B nodeStatus 终态化 / 防回退 / 合法重开')
+
+  await check('B① 终态映射：passed→done/100/pass，rejected→failed/100/reject，failed→failed/实际进度', async () => {
+    const at = '2026-11-09T04:00:00.000Z'
+    const working = {
+      state: 'working',
+      progress: 95,
+      summary: '自审说快好了',
+      verdict: null,
+      attempt: 1,
+      at,
+      members: [{ name: '成员甲', state: 'working' }],
+      blockers: ['等接口'],
+    }
+    const eventOf = (status, attemptId = 1) => ({
+      nodeId: 'n_map',
+      attemptId,
+      ts: '2026-11-09T04:01:00.000Z',
+      data: { status },
+    })
+
+    const passed = nodeStatusFromNodeEnd(working, eventOf('passed'))
+    A.equal(passed.state, 'done')
+    A.equal(passed.progress, 100)
+    A.equal(passed.verdict, 'pass')
+    A.equal(passed.summary, '自审说快好了', '同 attempt 的自审摘要保留')
+    A.deepEqual(passed.blockers, ['等接口'])
+    A.equal(passed.attempt, 1)
+
+    const rejected = nodeStatusFromNodeEnd(working, eventOf('rejected'))
+    A.equal(rejected.state, 'failed', '打回不是通过：state=failed')
+    A.equal(rejected.progress, 100, '已给出正式结论 → 100')
+    A.equal(rejected.verdict, 'reject', '「打回」语义由 verdict 保留')
+
+    const failed = nodeStatusFromNodeEnd(working, eventOf('failed'))
+    A.equal(failed.state, 'failed')
+    A.equal(failed.progress, 95, 'failed 保留同一 attempt 的实际进度')
+    A.equal(failed.verdict, null, 'failed 不带 pass/reject 结论')
+
+    // 旧 attempt 的进度 / 摘要 / 成员不得被继承到新 attempt。
+    const nextAttempt = nodeStatusFromNodeEnd(working, eventOf('failed', 2))
+    A.equal(nextAttempt.progress, 0)
+    A.equal(nextAttempt.summary, '')
+    A.deepEqual(nextAttempt.members, [])
+    A.deepEqual(nextAttempt.blockers, [])
+    A.equal(nextAttempt.attempt, 2)
+
+    // run 级收口：仍 working 的节点按 run 结果落终态。
+    const abortedRun = terminalNodeStatusForRunEnd(working, 'aborted', 1)
+    A.equal(abortedRun.state, 'failed')
+    A.equal(abortedRun.progress, 95, 'abort 不虚构完成进度')
+    A.equal(abortedRun.verdict, null)
+    const doneRun = terminalNodeStatusForRunEnd({ ...working, attempt: 2 }, 'done', 2)
+    A.equal(doneRun.state, 'done')
+    A.equal(doneRun.progress, 100)
+    A.equal(doneRun.attempt, 2)
+  })
+
+  await check('B② 终态后迟到的 self-check 不回退 run.json（事件照写）；重试 / 新 attempt 可重开', async () => {
+    const flow = flowOf('flow-status-late', [
+      startNode(), stage('n_late', '节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_late'),
+      next('e2', 'n_late', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-status-late', 1)
+    const engine = createEngine({ runsRoot, flowsRoot, nodeSupervision: fakeNodeAlarmScheduler() })
+    engine.active = { runId: run.id }
+    const sessionId = 'sess-late'
+    engine.attemptEnvelopes.set(sessionId, { attempt: 1, nonce: 'nonce-late' })
+    const binding = { sessionId, nodeId: 'n_late', attemptId: 1, traceId: 'tr-late' }
+    const parsed = engine._parseNodeStatus(fencedJson({
+      nodeId: 'n_late', state: 'working', progress: 95, summary: '自审说快好了',
+      blockers: [], verdict: null, attempt: 1, nonce: 'nonce-late',
+    }))
+    const iso = attempt => `2026-11-09T04:0${attempt}:00.000Z`
+
+    engine._rememberNodeStatus(binding, parsed)
+    A.equal(engine.nodeStatus.get('n_late').state, 'working', '运行中自审可写过程态')
+    A.equal(engine.nodeStatus.get('n_late').progress, 95)
+
+    // 节点收口：passed → done/100/pass
+    engine._settleNodeStatusFromEvent({ nodeId: 'n_late', attemptId: 1, ts: iso(1), data: { status: 'passed' } })
+    A.equal(engine.nodeStatus.get('n_late').state, 'done')
+
+    // 同 attempt 迟到的 working/95：不覆盖，但事件照写。
+    engine._rememberNodeStatus(binding, parsed)
+    A.equal(engine.nodeStatus.get('n_late').state, 'done', '终态后不得回退 working')
+    A.equal(engine.nodeStatus.get('n_late').progress, 100)
+
+    await engine.eventQueue
+    await engine._patchRunBinding(run.id)
+    const raw = readRawRun(run.id)
+    A.equal(raw.nodeStatus.n_late.state, 'done', 'run.json 里也必须是终态')
+    A.equal(raw.nodeStatus.n_late.progress, 100)
+    A.equal(raw.nodeStatus.n_late.verdict, 'pass')
+    const statusEventsOf = async () => (await eventsOf(run.id)).filter(event => event.kind === 'node/status')
+    A.equal((await statusEventsOf()).length, 2, '晚到的自审回报仍要写事件留痕')
+
+    // 合法重开 ①：同一 attempt 内节点级重试（node/start.data.retry 递增）
+    engine._beginNodeStatus({ nodeId: 'n_late', attemptId: 1, ts: iso(2), data: { retry: 1 } })
+    A.equal(engine.nodeStatus.get('n_late').state, 'working', '重试必须能把终态重开为 working')
+    A.equal(engine.nodeStatus.get('n_late').progress, 0)
+    A.equal(engine.nodeStatus.get('n_late').attempt, 1)
+
+    engine._settleNodeStatusFromEvent({ nodeId: 'n_late', attemptId: 1, ts: iso(2), data: { status: 'failed' } })
+    A.equal(engine.nodeStatus.get('n_late').state, 'failed')
+
+    // 合法重开 ②：新 attemptId（打回重跑）
+    engine._beginNodeStatus({ nodeId: 'n_late', attemptId: 2, ts: iso(3), data: {} })
+    A.equal(engine.nodeStatus.get('n_late').state, 'working')
+    A.equal(engine.nodeStatus.get('n_late').attempt, 2)
+
+    // 反过来：attempt 2 已开始时，attempt 1 的迟到回报也不许把它顶回去。
+    engine._rememberNodeStatus(binding, parsed)
+    A.equal(engine.nodeStatus.get('n_late').attempt, 2, '旧 attempt 的迟到回报不覆盖新 attempt')
+    A.equal(engine.nodeStatus.get('n_late').state, 'working')
+  })
+
+  await check('B③ run 被中止：working 节点收成 failed + 实际进度，run.json.status 仍是 aborted', async () => {
+    const flow = flowOf('flow-status-abort', [
+      startNode(), stage('n_abort', '长任务', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_abort'),
+      next('e2', 'n_abort', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-status-abort', 1)
+    const engineRef = { value: null }
+    const reported = deferred()
+    const { ctx } = nodeAlarmAgents(engineRef, ({ emitStatus }) => {
+      emitStatus({ nodeId: 'n_abort', state: 'working', progress: 95, summary: '快好了', blockers: [], verdict: null })
+      reported.resolve()
+      // 不回 finishIdle：模拟节点还在跑，随后被 stop 打断。
+    })
+    const engine = createEngine({ runsRoot, flowsRoot, ctx, nodeSupervision: fakeNodeAlarmScheduler(), nodeRetries: 0 })
+    engineRef.value = engine
+    await engine.start(run.id)
+    await reported.promise
+    A.equal(engine.nodeStatus.get('n_abort').state, 'working')
+    const stopped = await engine.stop(run.id)
+    const raw = readRawRun(run.id)
+    const events = await eventsOf(run.id)
+
+    A.equal(stopped.status, 'aborted')
+    A.equal(raw.status, 'aborted', 'run.json 状态仍是 aborted（不因节点终态化而改写）')
+    A.equal(raw.nodeStatus.n_abort.state, 'failed', 'aborted 场景按 runstore 合法枚举写 failed')
+    A.equal(raw.nodeStatus.n_abort.progress, 95, '保留实际进度')
+    const nodeEnd = events.find(event => event.kind === 'node/end')
+    A.equal(nodeEnd.extra.aborted, true, 'node/end 保留 abort 标记')
+    A.equal(nodeEnd.extra.reason, STOP_REASON_USER)
+  })
+
+  console.log('engine v0.12.3 · C supervision 在 run/end 之前落 terminal')
+
+  await check('C：run/end 落盘时 supervision 已是 enabled:false/terminal，nextDueAt=null（幂等）', async () => {
+    const flow = flowOf('flow-sup-terminal', [
+      startNode(), stage('n_sup', '节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_sup'),
+      next('e2', 'n_sup', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-sup-terminal', 1)
+    const future = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    await store.writeRunMeta(runsRoot, run.id, {
+      supervision: {
+        enabled: true,
+        wakerSessionId: 'sess-waker',
+        lastWokeAt: null,
+        nextDueAt: future,
+        wakes: 3,
+        failures: 0,
+        reason: 'healthy',
+      },
+    })
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => passResult(node.id),
+      // 四桶齐全的用量：让本用例专注 supervision 收口（tokenCoverage 由下一组专测）。
+      readUsage: async ({ nodeId, attemptId }) => [{
+        callId: `${nodeId}-${attemptId}`,
+        usage: { inputTokens: 1, cacheReadTokens: 2, cacheWriteTokens: 3, outputTokens: 4 },
+      }],
+    })
+    let atRunEnd = null
+    const originalAppend = engine._append.bind(engine)
+    engine._append = async (runId, events, options) => {
+      if (Array.isArray(events) && events.some(event => event && event.kind === 'run/end')) {
+        atRunEnd = await store.readRunMeta(runsRoot, runId)
+      }
+      return originalAppend(runId, events, options)
+    }
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    A.equal(final.status, 'done')
+    A.ok(atRunEnd, 'run/end 落盘前必须能读到 run.json')
+    A.equal(atRunEnd.supervision.enabled, false, 'run/end 之前 supervision 必须已停')
+    A.equal(atRunEnd.supervision.reason, 'terminal')
+    A.equal(atRunEnd.supervision.nextDueAt, null, 'nextDueAt 必须清掉（null = 已停）')
+    A.equal(atRunEnd.supervision.wakes, 3, '既有计数保留')
+    const after = readRawRun(run.id)
+    A.equal(after.supervision.enabled, false)
+    A.equal(after.supervision.reason, 'terminal')
+    A.equal(after.supervision.nextDueAt, null)
+
+    // 幂等：runtime 之后再写一次同样内容不会覆盖成别的（它会保留现有字段）。
+    const again = await engine._persistRunEndMeta(run.id)
+    A.equal(again && again.supervision && again.supervision.enabled, false)
+    A.equal(again && again.supervision && again.supervision.reason, 'terminal')
+    A.equal(again && again.supervision && again.supervision.nextDueAt, null)
+    // 同一处收口也显式写了 tokenCoverage（不再靠读端缺省成 complete:true）。
+    A.equal(again && again.tokenCoverage && again.tokenCoverage.complete, true)
+    A.deepEqual(again && again.tokenCoverage && again.tokenCoverage.missing, [])
+    A.deepEqual(engine.runTokenCoverage && engine.runTokenCoverage.buckets,
+      { seen: ['input', 'cacheRead', 'cacheWrite', 'output'], missing: [] },
+      '同一份收口里也算出了桶覆盖（runstore 扩展后随 run.json 落盘）')
+  })
+
+  await check('B（token 覆盖度）：complete 只看结构缺口，桶覆盖单独放 buckets；run/end 收口显式写', async () => {
+    // ① 纯函数口径（父裁决：两套语义分字段）
+    const allBuckets = { seen: ['input', 'cacheRead', 'cacheWrite', 'output'], missing: [] }
+    A.deepEqual(computeTokenCoverage([{ input: 1, cacheRead: 2, cacheWrite: 3, output: 4 }]), {
+      complete: true,
+      missing: [],
+      buckets: allBuckets,
+    }, '四桶齐全 + 无结构缺口 → complete:true / buckets.missing:[]')
+    A.deepEqual(computeTokenCoverage([{ input: 100, output: 10 }]), {
+      complete: true,
+      missing: [],
+      buckets: { seen: ['input', 'output'], missing: ['cacheRead', 'cacheWrite'] },
+    }, '只有 input/output：结构没问题（complete:true），但缓存桶覆盖缺失只记进 buckets')
+    A.deepEqual(computeTokenCoverage([{ inputTokens: 1, cacheReadTokens: 2, outputTokens: 3 }]), {
+      complete: true,
+      missing: [],
+      buckets: { seen: ['input', 'cacheRead', 'output'], missing: ['cacheWrite'] },
+    }, '宿主 TokenUsage 形态同样认得')
+    A.deepEqual(computeTokenCoverage([{ input: 1, cacheRead: 2, cacheWrite: 3, output: 4 }], { unkeyedCalls: 2 }), {
+      complete: false,
+      missing: [],
+      buckets: allBuckets,
+    }, '无归属调用只影响 complete（missing 保持节点/attempt 形状）')
+    A.deepEqual(
+      computeTokenCoverage([{ input: 1, cacheRead: 2, cacheWrite: 3, output: 4 }], {
+        gaps: [{ nodeId: 'n_x', attemptId: 2 }],
+      }),
+      { complete: false, missing: [{ nodeId: 'n_x', attemptId: 2 }], buckets: allBuckets },
+      '结构缺口进 missing（对象形状，runstore 现有 schema）',
+    )
+    A.deepEqual(
+      computeTokenCoverage([], {
+        gaps: [
+          { nodeId: 'n_x', attemptId: 1 },
+          { nodeId: 'n_x', attemptId: 1 },
+          { nodeId: '', attemptId: 1 },
+          { nodeId: 'n_y', attemptId: 0 },
+        ],
+      }).missing,
+      [{ nodeId: 'n_x', attemptId: 1 }],
+      'missing 按 (nodeId, attemptId) 去重并过滤坏条目',
+    )
+    A.deepEqual(tokenCoverageFromSeen(new Set(['input', 'cacheRead', 'cacheWrite', 'output'])), {
+      complete: true, missing: [], buckets: allBuckets,
+    })
+
+    // ② run 级：四桶齐全 → run.json 显式 complete:true / missing:[]
+    const flow = flowOf('flow-token-coverage', [
+      startNode(), stage('n_cov', '用量节点', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_cov'),
+      next('e2', 'n_cov', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const runFull = await makeRun('flow-token-coverage', 1)
+    const engineFull = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => passResult(node.id),
+      readUsage: async ({ nodeId, attemptId }) => [{
+        callId: `${nodeId}-${attemptId}`,
+        usage: { inputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 0, outputTokens: 5 },
+      }],
+    })
+    await engineFull.start(runFull.id)
+    const finalFull = await engineFull.wait(runFull.id)
+    const rawFull = readRawRun(runFull.id)
+    A.equal(finalFull.status, 'done')
+    A.ok(Boolean(rawFull.tokenCoverage), 'run/end 收口必须显式写 tokenCoverage（不能靠读端缺省）')
+    A.equal(rawFull.tokenCoverage.complete, true)
+    A.deepEqual(rawFull.tokenCoverage.missing, [])
+    A.deepEqual(engineFull.runTokenCoverage && engineFull.runTokenCoverage.buckets, allBuckets,
+      '引擎侧算出四桶全覆盖')
+
+    // ③ run 级：只有 input/output（旧形状）→ 结构仍完整，但 buckets 记缺口。
+    const runOld = await makeRun('flow-token-coverage', 1)
+    const engineOld = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => passResult(node.id),
+      readUsage: async ({ nodeId, attemptId }) => [{
+        callId: `${nodeId}-${attemptId}`,
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }],
+    })
+    await engineOld.start(runOld.id)
+    await engineOld.wait(runOld.id)
+    const rawOld = readRawRun(runOld.id)
+    A.equal(rawOld.tokenCoverage.complete, true, '桶缺失不算账少，不压 complete')
+    A.deepEqual(rawOld.tokenCoverage.missing, [])
+    A.deepEqual(engineOld.runTokenCoverage && engineOld.runTokenCoverage.buckets,
+      { seen: ['input', 'output'], missing: ['cacheRead', 'cacheWrite'] })
+
+    // ④ run 级：外部 executor 跑完却没有 usage → 结构缺口进 run.json.tokenCoverage.missing。
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-no-usage-'))
+    try {
+      const stubPath = join(execDir, 'no-usage.mjs')
+      writeFileSync(stubPath, [
+        "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ verdict: 'pass', summary: '跑完了但没有 usage' }) } }))",
+        '',
+      ].join('\n'))
+      const gapFlow = flowOf('flow-token-gap', [
+        startNode(),
+        stage('n_nousage', '无用量外部节点', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_nousage'),
+        next('e2', 'n_nousage', 'n_end'),
+      ])
+      await saveFlow(gapFlow)
+      const gapRun = await makeRun('flow-token-gap', 1)
+      const gapEngine = createEngine({ runsRoot, flowsRoot, nodeRetries: 0 })
+      await gapEngine.start(gapRun.id, { worktree: 'off' })
+      const gapFinal = await gapEngine.wait(gapRun.id)
+      const gapRaw = readRawRun(gapRun.id)
+      A.equal(gapFinal.status, 'done')
+      A.equal(gapRaw.tokenCoverage.complete, false, '该有 model/call 却没有 → 必须显式不完整')
+      A.deepEqual(gapRaw.tokenCoverage.missing, [{ nodeId: 'n_nousage', attemptId: 1 }],
+        'runstore 现有 schema 下 missing 对象形状必须能落盘')
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  console.log('engine v0.12.3 · D/G 外部 executor 重试用量与四桶累加')
+
+  await check('G① accumulateExternalUsage：四桶累加，总量与两桶口径一致，reasoning 语义不变', async () => {
+    // executor 拆桶后：input 是「未命中缓存」部分，cacheRead/cacheWrite 是子集拆分；
+    // 四桶之和必须等于旧两桶口径的 input + output。
+    const split = accumulateExternalUsage(null, { input: 60, cacheRead: 40, cacheWrite: 0, output: 10 })
+    const twoBucket = accumulateExternalUsage(null, { input: 100, output: 10 })
+    const totalOf = usage => usage.input + usage.cacheRead + usage.cacheWrite + usage.output
+    A.deepEqual(split, { input: 60, cacheRead: 40, cacheWrite: 0, output: 10 })
+    A.equal(totalOf(split), totalOf(twoBucket), '拆桶不改变总量（110）')
+    A.equal(totalOf(split), 110)
+
+    const mixed = accumulateExternalUsage({ input: 60, cacheRead: 40, cacheWrite: 5, output: 10 }, {
+      input: 10, cacheRead: 20, cacheWrite: 0, output: 5,
+    })
+    A.deepEqual(mixed, { input: 70, cacheRead: 60, cacheWrite: 5, output: 15 })
+
+    // 宿主 TokenUsage 形态（未映射）也走同一张四桶表。
+    const hostShape = accumulateExternalUsage(null, {
+      inputTokens: 11, cacheReadTokens: 22, cacheWriteTokens: 33, outputTokens: 7,
+    })
+    A.deepEqual(hostShape, { input: 11, cacheRead: 22, cacheWrite: 33, output: 7 })
+
+    // reasoning：≤ output 才保留；超了丢掉（mapHostUsage 的既有语义）。
+    A.deepEqual(accumulateExternalUsage(null, { input: 10, output: 5, reasoning: 3 }),
+      { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, reasoning: 3 })
+    A.deepEqual(accumulateExternalUsage(null, { input: 10, output: 5, reasoning: 9 }),
+      { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 })
+    A.equal(mapHostUsage({ input: 10, output: 5, reasoning: 9 }).reasoning, undefined, 'mapHostUsage 语义未变')
+    A.equal(mapHostUsage({ input: 10, output: 5, reasoning: 3 }).reasoning, 3)
+  })
+
+  await check('D/G② 外部 executor 重试两次：两条 model/call、callId 不同、四桶都在、总量不丢', async () => {
+    const execDir = mkdtempSync(join(repoRoot, '.tmp', 'exec-usage-retry-'))
+    try {
+      const stubPath = join(execDir, 'usage-retry.mjs')
+      writeFileSync(stubPath, [
+        "import { existsSync, writeFileSync } from 'node:fs'",
+        "import { fileURLToPath } from 'node:url'",
+        "const stateFile = fileURLToPath(import.meta.url) + '.count'",
+        'const first = !existsSync(stateFile)',
+        "writeFileSync(stateFile, first ? '1' : '2')",
+        "console.log(JSON.stringify({ type: 'usage', input_tokens: 100, output_tokens: 10, cached_input_tokens: 40, cache_write_input_tokens: 10 }))",
+        'if (first) { console.error(\'第一次失败\'); process.exit(1) }',
+        "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ verdict: 'pass', summary: '外部节点通过' }) } }))",
+        '',
+      ].join('\n'))
+      const flow = flowOf('flow-exec-usage-retry', [
+        startNode(),
+        stage('n_retry', '外部重试', 300, { executor: 'custom', executorCommand: `node ${JSON.stringify(stubPath)}` }),
+        endNode(),
+      ], [
+        next('e1', 'n_start', 'n_retry'),
+        next('e2', 'n_retry', 'n_end'),
+      ])
+      await saveFlow(flow)
+      const run = await makeRun('flow-exec-usage-retry', 1)
+      const engine = createEngine({ runsRoot, flowsRoot, nodeRetries: 1 })
+      await engine.start(run.id, { worktree: 'off' })
+      const final = await engine.wait(run.id)
+      const events = await eventsOf(run.id)
+      const calls = events.filter(event => event.kind === 'model/call' && event.nodeId === 'n_retry')
+      const summary = summarize(events)
+
+      A.equal(final.status, 'done', '第一次失败后重试成功')
+      A.equal(calls.length, 2, '两次真实执行 → 两条 model/call（不能后到覆盖先到）')
+      A.deepEqual(calls.map(event => event.data.callId), [
+        'executor:n_retry:1',
+        'executor:n_retry:1:1',
+      ], '同一 attempt 的重试带 retryIndex，callId 唯一；无重试保持历史格式')
+      for (const call of calls) {
+        A.deepEqual(call.data.usage, {
+          input: 50, cacheRead: 40, cacheWrite: 10, output: 10,
+        }, 'model/call.usage 必须是完整四桶（input 已扣掉缓存子集）')
+      }
+      const total = calls.reduce((sum, call) => sum
+        + call.data.usage.input + call.data.usage.cacheRead
+        + call.data.usage.cacheWrite + call.data.usage.output, 0)
+      A.equal(total, 220, '两次各 110 token，合计 220（旧实现第一段被吞）')
+      A.equal(summary.tokens.total.total, 220, '聚合口径同样不丢：两条 callId 各算一次')
+      A.equal(summary.tokens.calls, 2, '去重账本里有两条独立 callId')
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+    }
+  })
+
+  console.log('engine v0.12.3 · E node/end 先于 machine/transition')
+
+  await check('E：同节点同 attempt 的 node/end 必须早于 machine/transition（步数上限路径）', async () => {
+    const flow = flowOf('flow-order-step', [
+      startNode(),
+      stage('n_a', '开发', 300, { maxRounds: 5 }),
+      stage('n_b', '复核', 600),
+      endNode(),
+    ], [
+      next('e1', 'n_start', 'n_a'),
+      next('e2', 'n_a', 'n_b'),
+      next('e3', 'n_b', 'n_end'),
+      reject('e4', 'n_b', 'n_a'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-order-step', 2)
+    const passOf = nodeId => passResult(nodeId)
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async ({ node }) => {
+        if (node.id === 'n_a') return passOf('n_a')
+        return {
+          structured: {
+            verdict: 'reject',
+            summary: 'B 打回 A',
+            rejectTarget: 'n_a',
+            rejectReason: '返工',
+            findings: [{ id: 'BF1', severity: 'P1', title: '返工点', status: 'open' }],
+          },
+          sessionId: 'sess-n_b',
+          dispose: async () => {},
+        }
+      },
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+
+    A.equal(final.status, 'failed', '步数上限路径把 run 收成 failed')
+    const nodeEnds = new Map()
+    for (const event of events) {
+      if (event.kind !== 'node/end' || !event.nodeId || !Number.isInteger(event.attemptId)) continue
+      nodeEnds.set(`${event.nodeId}#${event.attemptId}`, event.seq)
+    }
+    const transitions = events.filter(event => event.kind === 'machine/transition'
+      && typeof event.nodeId === 'string' && Number.isInteger(event.attemptId))
+    A.ok(transitions.length > 0, '本次 run 必须产生 machine/transition 观测事件')
+    const inverted = []
+    for (const transition of transitions) {
+      const key = `${transition.nodeId}#${transition.attemptId}`
+      const endSeq = nodeEnds.get(key)
+      if (endSeq === undefined) continue
+      if (!(endSeq < transition.seq)) inverted.push(`${key}: node/end=${endSeq} transition=${transition.seq}`)
+    }
+    A.deepEqual(inverted, [], '不允许出现 machine/transition 早于同节点同 attempt 的 node/end')
+    // 实例 r-mw8q41al-w5kk 的那一处：attempt 4 + 步数上限 + #failed。
+    const stepKey = 'n_a#4'
+    A.ok(nodeEnds.has(stepKey), '步数上限那条 node/end failed 必须存在')
+    const stepTransition = transitions.find(event => `${event.nodeId}#${event.attemptId}` === stepKey)
+    A.ok(Boolean(stepTransition), '同一 attempt 的 machine/transition 必须存在')
+    A.ok(nodeEnds.get(stepKey) < stepTransition.seq, 'node/end 必须先落盘')
+    A.equal(stepTransition.data && stepTransition.data.to, '#failed')
+  })
+
+  console.log('engine v0.12.3 · F 占位符产物标记')
+
+  await check('F：明显占位符产物带 placeholder=true，正常短产物不带；写入行为不变', async () => {
+    A.equal(isPlaceholderArtifactContent('见文件'), true)
+    A.equal(isPlaceholderArtifactContent('见文件。'), true)
+    A.equal(isPlaceholderArtifactContent('  see file.  '), true)
+    A.equal(isPlaceholderArtifactContent('详见附件'), true)
+    A.equal(isPlaceholderArtifactContent('# 结论\n\n正常短产物'), false)
+    A.equal(isPlaceholderArtifactContent('见文件'.repeat(20)), false, '≥32 字节不判占位')
+    A.equal(isPlaceholderArtifactContent(Buffer.from([0xff, 0xfe, 0x00, 0x01])), false, '二进制不判占位')
+
+    const flow = flowOf('flow-placeholder', [
+      startNode(), stage('n_ph', '产物', 300), endNode(),
+    ], [
+      next('e1', 'n_start', 'n_ph'),
+      next('e2', 'n_ph', 'n_end'),
+    ])
+    await saveFlow(flow)
+    const run = await makeRun('flow-placeholder', 1)
+    const engine = createEngine({
+      runsRoot,
+      flowsRoot,
+      activate: async () => ({
+        structured: {
+          verdict: 'pass',
+          summary: '通过',
+          artifacts: [
+            { name: 'placeholder.md', content: '见文件。' },
+            { name: 'real.md', content: '# 真内容\n\n这是正常产物。\n' },
+          ],
+        },
+        sessionId: 'sess-n_ph',
+        dispose: async () => {},
+      }),
+    })
+    await engine.start(run.id)
+    const final = await engine.wait(run.id)
+    const events = await eventsOf(run.id)
+    const writes = events.filter(event => event.kind === 'artifact/write' && event.nodeId === 'n_ph')
+    const placeholder = writes.find(event => event.data.path.endsWith('/placeholder.md'))
+    const real = writes.find(event => event.data.path.endsWith('/real.md'))
+
+    A.equal(final.status, 'done')
+    A.ok(Boolean(placeholder), '占位符产物仍要落盘')
+    A.equal(placeholder.data.placeholder, true, '占位符必须在 artifact/write.data 里标出来')
+    A.equal(placeholder.data.bytes, Buffer.byteLength('见文件。'), '只加标记，不改写入行为')
+    A.equal(readFileSync(join(runsRoot, run.id, placeholder.data.path), 'utf8'), '见文件。', '文件内容原样写入')
+    A.ok(Boolean(real), '正常产物照常落盘')
+    A.equal(real.data.placeholder, undefined, '正常产物不得带占位标记')
   })
 
 } finally {

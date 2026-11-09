@@ -3686,13 +3686,19 @@ class FlowEngine {
    *   - 组合只在 `agents.create()` / `agents.resume()` 的 `setup` 回调里挂载：
    *     `dsh-agent-loop/lib/index.js:1567`（`setup?.(agent.ctx, agent)`），
    *     引擎**不读** header 补挂；
-   *   - Web 侧唯一正确的调用形状（`dsh-api-session-controller/lib/index.js:424-439`）：
-   *     `create({ sessionId, agentOptions, meta:{cwd, agentPreset}, setup: composition.setup })`，
-   *     其中 `composition = await sessionController.composeAgent(requested)`。
+   *   - Web 侧对外的恢复入口是 `sessionController.resolveAgent(sessionId)`
+   *     （`packages/api/session-controller/src/index.ts:179,268-270`）；`composeAgent`
+   *     是内部 `ApiSessionAgentController` 的方法（`agent.ts:271`），**不在**
+   *     `SessionController` 的对外面上，也拿不到 `ctx.get('sessionController')`。
+   *     所以下面第 1 条 composeAgent 分支在 0.2.2 上不可达，只作兼容保留。
    *
    * 解析优先级：
-   *   1. `ctx.get('sessionController').composeAgent(presetId)` —— 与 Web 完全同一条路径
-   *      （挂 preset + 装模型切换提示），首选；
+   *   1. `ctx.get('sessionController').composeAgent(presetId)` —— **0.2.2 上不可达**
+   *      （`SessionController` 只暴露 `resolveAgent`，composeAgent 属于
+   *      `ApiSessionAgentController`）。真要沿 Web 路径走请用
+   *      `sessionController.resolveAgent(sessionId)`；本分支保留只为宿主将来改形状时
+   *      能接上（且真启用时还必须校验 composition.agentPreset，否则无 preset 注册表的
+   *      profile 会返回 `{ setup: installModelSelection }` 把 presetId 静默忽略）；
    *   2. 只有 `ctx.get('agentPresets')` → `presets.resolve(id)` + `setup` 里
    *      `presets.mount(agentCtx, resolvedId)`。这里**不**装 `installModelSelection`：
    *      那只是「会话中途换模型时追加一条提示」的 `agent/pre-step` 监听
@@ -3737,7 +3743,10 @@ class FlowEngine {
   }
 
   /**
-   * 实际调用宿主 preset 服务（`sessionController` 优先，其次 `agentPresets`）。
+   * 实际调用宿主 preset 服务。`sessionController.composeAgent` 在 0.2.2 上不可达
+   * （`ctx.get('sessionController')` 拿到的 `SessionController` 只暴露 `resolveAgent`，
+   * composeAgent 属于 `ApiSessionAgentController`），只是宿主将来若把 composeAgent 放上
+   * sessionController 时的兼容分支；生产实际走 `agentPresets`。
    * `requested === undefined` 表示「要宿主自己的默认 preset」（fallback 用）。
    */
   async _composeWithHostPresetServices(requested) {

@@ -127,14 +127,16 @@ function makePresets({ throwOn = [], mounts = [] } = {}) {
   }
 }
 
-/** 假 sessionController：composeAgent 返回 `setup(agentCtx, agent)`（记录 preset id）。 */
-function makeSessionController({ throwOn = [], mounts = [] } = {}) {
+/** 假 sessionController：composeAgent 返回 `setup(agentCtx, agent)`（记录 preset id）。
+ *  `omitPreset` = 模拟「无 preset 注册表」的 profile：setup 存在但 composition 没有
+ *  agentPreset（宿主把 presetId 静默忽略）。 */
+function makeSessionController({ throwOn = [], mounts = [], omitPreset = false } = {}) {
   return {
     mounts,
     async composeAgent(id) {
       if (id !== undefined && throwOn.includes(id)) throw new Error(`composeAgent「${id}」失败`)
       return {
-        agentPreset: id === undefined ? 'standard' : id,
+        ...(omitPreset ? {} : { agentPreset: id === undefined ? 'standard' : id }),
         async setup() {
           mounts.push(id === undefined ? 'standard' : id)
         },
@@ -384,6 +386,116 @@ try {
     A.deepEqual(badController.mounts, ['standard'], '降级到宿主默认组合')
     A.equal(badLog.warns.length, 1)
     A.match(badLog.warns[0], /sess-sc-bad/)
+  })
+
+  // 9. 生产真实形状：ctx.get('sessionController') 上只有 resolveAgent（没有 composeAgent）
+  //    —— 这正是 0.2.2 的 SessionController；必须落到 agentPresets 分支且挂载成功。
+  await check('生产形状：sessionController 只有 resolveAgent 时走 agentPresets 并挂载成功', async () => {
+    const agent = makeAgent({ sessionId: 'sess-prod', headerPreset: 'ptc' })
+    const agents = makeColdAgents(agent)
+    const { warns, log } = makeLog()
+    const presets = makePresets()
+    const resolvedAgents = []
+    const sessionController = {
+      async resolveAgent(sessionId) {
+        resolvedAgents.push(sessionId)
+        return { agent }
+      },
+    }
+    const resumed = await resumeCold(
+      makeCtx({ sessionController, agentPresets: presets }),
+      agents,
+      'sess-prod',
+      { log },
+    )
+    A.ok(resumed && resumed.agent === agent, '生产形状下 resume 必须成功')
+    A.deepEqual(presets.mounts, ['ptc'], 'sessionController 没有 composeAgent 时必须落到 agentPresets.mount')
+    A.deepEqual(resolvedAgents, [], 'resolveAgent 不是挂载入口（它只返回 agent），不应被调用')
+    A.equal(warns.length, 0, '正常挂载不应有 warn')
+  })
+
+  // 10. composeAgent 存在但 composition 没有 agentPreset（无 preset 注册表的 profile）：
+  //     setup 存在 ≠ 挂上了 preset，必须判定失败并走降级。
+  await check('setup：composeAgent 返回的 composition 没有 agentPreset → 判定失败并降级', async () => {
+    const agent = makeAgent({ sessionId: 'sess-rosterless', headerPreset: 'ptc' })
+    const agents = makeColdAgents(agent)
+    const { warns, log } = makeLog()
+    const controller = makeSessionController({ omitPreset: true })
+    const resumed = await resumeCold(makeCtx({ sessionController: controller }), agents, 'sess-rosterless', { log })
+    A.ok(resumed && resumed.agent === agent, '降级后 resume 仍必须完成')
+    A.deepEqual(controller.mounts, ['standard'], '静默忽略 presetId 不能算成功，应改挂宿主默认')
+    A.equal(warns.length, 1, '降级只打一条 warn')
+    A.match(warns[0], /sess-rosterless/, 'warn 要带 sessionId')
+    A.match(warns[0], /静默忽略/, 'warn 要指出 presetId 被静默忽略')
+  })
+
+  // 11. 投影优先：presetForSession 可用时不再扫日志（用会记录的 snapshotEvents 证明没碰）。
+  await check('setup：presetForSession 投影可用时不再扫日志', async () => {
+    let scanned = 0
+    const agent = makeAgent({
+      sessionId: 'sess-proj',
+      headerPreset: 'header-preset',
+      snapshotEvents: () => {
+        scanned += 1
+        throw new Error('snapshotEvents 不该被调用')
+      },
+    })
+    const presets = { ...makePresets(), presetForSession: () => 'projected-preset' }
+    A.equal(sessionPresetId(agent, presets), 'projected-preset', '投影值优先于日志/header')
+    const { warns, log } = makeLog()
+    await buildResumeSetup(makeCtx({ agentPresets: presets }), log)({}, agent)
+    A.deepEqual(presets.mounts, ['projected-preset'], '按投影值挂 preset')
+    A.equal(scanned, 0, '有投影时 snapshotEvents 一次都不能被调用')
+
+    let nullScanned = 0
+    const nullAgent = makeAgent({
+      sessionId: 'sess-proj-null',
+      headerPreset: 'header-preset',
+      snapshotEvents: () => { nullScanned += 1; return [] },
+    })
+    A.equal(
+      sessionPresetId(nullAgent, { presetForSession: () => null }),
+      undefined,
+      'null 投影 = 该会话确实没有 preset（宿主默认）',
+    )
+    A.equal(nullScanned, 0, 'null 投影也不该退回扫日志')
+    A.equal(warns.length, 0)
+  })
+
+  // 12. 宿主写锁竞态：resume 抛 SessionAlreadyOwnedError，get 到活 agent 就复用、不失败。
+  await check('resumeCold：SessionAlreadyOwnedError 时复用 agents.get 的活 agent', async () => {
+    const live = makeAgent({ sessionId: 'sess-owned' })
+    const owned = Object.assign(new Error('SessionAlreadyOwnedError: sess-owned'), {
+      name: 'SessionAlreadyOwnedError',
+    })
+    const agents = {
+      resumes: [],
+      get(sessionId) {
+        return sessionId === 'sess-owned' ? live : undefined
+      },
+      async resume(options) {
+        this.resumes.push(options)
+        throw owned
+      },
+    }
+    const { log } = makeLog()
+    const resumed = await resumeCold(makeCtx({ agentPresets: makePresets() }), agents, 'sess-owned', { log })
+    A.ok(resumed && resumed.agent === live, '写锁竞态要复用刚上线的 agent，而不是报失败')
+    A.equal(agents.resumes.length, 1)
+
+    const { log: retryLog } = makeLog()
+    let rethrown = false
+    try {
+      await resumeCold(
+        makeCtx({ agentPresets: makePresets() }),
+        { async resume() { throw owned } },
+        'sess-owned',
+        { log: retryLog },
+      )
+    } catch (error) {
+      rethrown = error === owned
+    }
+    A.ok(rethrown, '拿不到活 agent 时必须原样抛出')
   })
 } finally {
   rmSync(home, { recursive: true, force: true })

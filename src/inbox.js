@@ -30,6 +30,7 @@ import { resolve, sep } from 'node:path'
 
 import { EDGE_KIND, NODE_KIND } from './model.js'
 import { MESSAGE_BODY_CHARS_MAX, checkRunId, isSafeInboxBodyPath } from './runlog.js'
+import { resumeCold } from './resume.js'
 import {
   MESSAGE_REPLY_KINDS, RunError, appendEvents, appendRunInputMessages, appendRunMessages,
   normalizeReplyTarget, readNodeSessions, readRunMessages, readRunMeta, updateRunMessageStatus,
@@ -599,8 +600,14 @@ export function defaultAgentSelection(ctx) {
 /**
  * 把一段文本投进一个已存在的会话：活会话直接 followup，冷会话先 resume。
  * 返回 `{ mode, sessionId }`；不可用时抛 RunError(503)。
+ *
+ * P0（0.12.1）：冷会话 resume 必须带 `setup`，否则宿主不会挂 agent preset 组合，
+ * 恢复出来的会话只剩宿主层插件工具（bash/read/write 全部 missing）。`ctx` 由调用方
+ * 从 deps 里穿进来（本函数只做投递，不持有宿主上下文）。
  */
-export async function deliverToAgentSession(agents, sessionId, text, { runId, nodeId, from, agentOptions } = {}) {
+export async function deliverToAgentSession(
+  agents, sessionId, text, { runId, nodeId, from, agentOptions, ctx, log } = {},
+) {
   if (!agentsUsable(agents)) {
     throw new RunError(503, 'agents', 'agents 服务不可用：无法向已有会话注入消息')
   }
@@ -615,9 +622,10 @@ export async function deliverToAgentSession(agents, sessionId, text, { runId, no
     if (typeof agents.resume !== 'function') {
       throw new RunError(503, 'agents', '会话不存在，且 agents.resume 不可用')
     }
-    const resumeOptions = { resumeSessionId: sessionId }
-    if (agentOptions) resumeOptions.agentOptions = agentOptions
-    const resumed = await agents.resume(resumeOptions)
+    const resumed = await resumeCold(ctx, agents, sessionId, {
+      ...(agentOptions ? { agentOptions } : {}),
+      log,
+    })
     agent = resumed && resumed.agent ? resumed.agent : null
     mode = 'resumed'
   }
@@ -773,6 +781,9 @@ export async function deliverInboundMessage(deps, runId, body) {
         nodeId: target.nodeId,
         from: input.from,
         agentOptions: defaultAgentSelection(deps.ctx || (deps.engine && deps.engine.ctx)),
+        // P0：冷 resume 的 setup 需要宿主 ctx 才能拿 sessionController / agentPresets。
+        ctx: deps.ctx || (deps.engine && deps.engine.ctx),
+        log: deps.log,
       })
       record.status = delivered.mode
       record.sessionId = sessionId
@@ -994,6 +1005,9 @@ export async function deliverOutboundReply(deps, input) {
         nodeId,
         from: marker,
         agentOptions: defaultAgentSelection(deps.ctx || (deps.engine && deps.engine.ctx)),
+        // P0：同入站投递——冷会话 resume 必须带 setup 才挂得上 preset 组合。
+        ctx: deps.ctx || (deps.engine && deps.engine.ctx),
+        log: deps.log,
       })
     } catch (failure) {
       ok = false

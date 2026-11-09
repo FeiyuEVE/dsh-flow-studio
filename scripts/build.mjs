@@ -54,6 +54,7 @@ export const HOST_MODULES = [
   'node-tools.js',
   'restart.js',
   'runtime.js',
+  'resume.js',
   'admission.js',
   'worktree.js',
   'executor.js',

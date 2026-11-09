@@ -72,6 +72,7 @@ import {
   readLease, readNodeSessions,
   readRunMeta, releaseLease, runsDir, writeNodeSessions, writeRunMeta,
 } from './runstore.js'
+import { resumeCold } from './resume.js'
 import { RESTARTABLE_STATUSES, prepareRestart } from './restart.js'
 import { flowsDir, readFlow } from './store.js'
 import { NODE_ALARM_DEFAULT_MS, NodeSupervisionScheduler, SupervisionScheduler } from './supervise.js'
@@ -897,7 +898,8 @@ export function createRuntime(options = {}) {
       if (typeof agents.resume !== 'function') {
         throw new Error(`发起会话 ${wakerSessionId} 不在线，且 agents.resume 不可用`)
       }
-      const resumed = await agents.resume({ resumeSessionId: wakerSessionId })
+      // P0：冷 resume 必须带 setup 才能在宿主里挂 preset 组合（否则只剩宿主插件工具面）。
+      const resumed = await resumeCold(ctx, agents, wakerSessionId, { log })
       agent = resumed && resumed.agent ? resumed.agent : null
     }
     if (!agent || typeof agent.followup !== 'function') {
@@ -1077,7 +1079,8 @@ export function createRuntime(options = {}) {
     let agent = typeof agents.get === 'function' ? agents.get(entry.sessionId) : null
     if (!agent) {
       if (typeof agents.resume !== 'function') return { action: 'skip', reason: 'no-resume' }
-      const handle = await agents.resume({ resumeSessionId: entry.sessionId })
+      // P0：同 wakeRun —— 冷 resume 的 setup 是挂 preset 组合的唯一入口。
+      const handle = await resumeCold(ctx, agents, entry.sessionId, { log })
       agent = handle && handle.agent ? handle.agent : null
     }
     if (!agent) return { action: 'skip', reason: 'no-agent' }

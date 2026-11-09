@@ -249,3 +249,14 @@
 - **兼容性（升级前请读）**：存量 `flows/*.json` **一个字节不动**；`POST/PUT /flows` 的语义与校验**完全不变**，目录化是**附加路径**。要迁一份老流程：`flow_decompile` 导出目录 → 改 → `flow_compile` 存成**新流程**（会产生新 id，旧流程不受影响）。
 - **已知边界**：① `compileFlowFiles` 返回「文件里写了什么就是什么」的组装结果、不补默认值，入库前必须再走 `normalizeFlow`（宿主两处入口已做）——直接拿它当已归一对象用会缺 `executor` / `maxRounds` 这类默认字段；② 只报「节点 / 连线被 `normalizeFlow` 丢弃」这类结构损失，**不报值级收敛**（标题超长被截断、非法 `edge.kind` 被改成 `next`、`x/y` 非有限数被改 80）；③ 非 JSON 类型经往返会变形（`undefined` 丢失、`NaN`→`null`、`Date`→字符串），往返契约只覆盖 JSON 模型内的流程；④ 覆盖已有产物目录是「旧目录改名 → 新目录 rename → 删备份」两步，两步之间崩溃会在父目录留下 `.flow.old-*` / `.flow.tmp-*`（正常路径会删净）。
 - **没做**（0.12 第二批）：git hook 驱动设计期门禁（`pre-commit` 跑同一个 `flow_compile`）与设计 run 默认开 worktree。**不会**拿 git hook 驱动 run 生命周期——run 事件有自己的 JSONL 契约，hook 是同步阻塞且在无仓库 / `custom` executor 场景直接失效。
+
+## 0.12.1 — 冷恢复必须挂 preset 组合
+
+这一版修的是**恢复**，不是运行：唤醒一个冷会话时漏了 `setup`，那个会话就等于被换了一套工具面。
+
+- **事故（2026-11-09 13:53，实测）**：supervision 唤醒一个冷会话，`agents.resume({ resumeSessionId })` 不带 `setup`，而宿主只在 `agents.create()` / `agents.resume()` 的 `setup` 回调里挂 agent preset 组合（`meta.agentPreset` / `header.agentPreset` 只写持久化，**不挂组合**，且不传 `setup` 不报错）。恢复出来的 agent 只剩宿主层插件工具：`request/header` 从 **68 → 37**，紧接着 `tool-registry` 一次推 **31 条 `tool-removal`**，模型此后每轮调 `bash` 都是 `Error: unknown tool "bash"`。详见 [事故记录](../postmortem/2026-11-09-cold-resume-preset.md)。
+- **修复**：新增 `src/resume.js`，三处宿主侧冷路径（`wakeRun()` 的 supervision 唤醒、节点自检闹钟、`inbox.js` 的 `deliverToAgentSession`）统一走 `resumeCold(ctx, agents, sessionId, { agentOptions, log })`。`setup` 内部按「日志最后一条 `agent-preset/selected` > `header.agentPreset` > 宿主默认」求该会话**自己的** preset，再用 `sessionController.composeAgent(presetId)` 挂组合（与 Web 同一条路径）；没有 `sessionController` 时退回 `agentPresets.resolve` + `mount`。
+- **降级不致命**：记录的 preset 已不存在 / 挂载抛错 → warn 后改挂宿主默认；再失败 → 再 warn 并让本次 resume 照常完成。挂组合失败不能把唤醒或投递整条打死（宿主里 `setup` 抛错会让整个 resume 失败）。
+- **节点主管会话那条路早就修过**（0.9.2 的 `engine.js` 的 `_resolveAgentComposition`），这版补的是宿主侧三处；`scripts/build.mjs` 的 `HOST_MODULES` 同步加 `resume.js`。
+- **验证**：`npm test` EXIT 0（30 个 `.test.mjs`），新增 `test/resume-setup.test.mjs` 8 组 / 42 条断言——冷路径必传 `setup`、setup 挂的是会话自己的 preset、`agent-preset/selected` 优先于 header、preset 挂载失败退默认且有 warn、无 preset 服务仍能 resume、活会话不 resume。变异验证：把 `resumeCold` 改成永不带 `setup`，新用例立刻红。
+- **已知边界**：① 组合挂到一半失败只会 warn 继续，会话可能是半套工具面（不崩，可从 warn 与 `tool-registry` 观察）；② 宿主自带的 ACP / headless / SDK 三条 resume 路径都有 `setup` 但**不挂 preset**，跨 profile 共用 `~/.dsh/sessions` 时同一会话在那三条通道续跑会换一套工具面，这属于宿主行为，本插件不越权修；③ 活 agent 不会自愈：`agents.get()` 命中直接复用、不校验工具面，出问题的 agent 要被 dispose 之后下一次冷恢复才会重新组合。

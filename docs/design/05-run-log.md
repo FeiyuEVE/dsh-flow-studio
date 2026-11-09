@@ -54,7 +54,7 @@ $DSH_HOME/flow-studio/runs/
 | `agent/message` | `role`（`assistant`）、`text`（≤2000 字符）、`truncated`、`provider?`、`model?` | 宿主 `assistant/message` 归集（§8.2） |
 | `tool/call` | `name`、`argumentsDigest?`、`ok`、`durationMs?` | 宿主事件归集 |
 | `skill/load` | `skill`（唯一名）、`ok` | `tool/call` 里 `name==='skill'` |
-| `artifact/write` | `path`（相对 run 目录）、`bytes`、`kind`（`md`/`diff`/`json`/`log`） | 引擎 |
+| `artifact/write` | `path`（相对 run 目录）、`bytes`、`kind`（`md`/`diff`/`json`/`log`）、`sha256?`、`placeholder?`（正文只剩「见文件 / 详见附件」这类一句话且 < 32 字节时为 `true`；只标记，不改写入行为，06 §13.9） | 引擎 |
 | `reject/trigger` | `edgeId`、`fromNodeId`、`toNodeId`、`reason` | 引擎 |
 | `review/finding` | `id`、`severity`（`P0`/`P1`/`P2`）、`category?`、`title`、`status`（`open`/`accepted`/`fixed`/`verified`/`dismissed`） | `structured_output` |
 | `review/verdict` | `verdict`（`approve`/`reject`）、`findingCount` | `structured_output` |
@@ -73,7 +73,24 @@ $DSH_HOME/flow-studio/runs/
 - `input` = 未命中缓存的输入；`cacheRead` / `cacheWrite` 独立成桶，**不得**声称「无成本」。
 - `reasoning` 可选，且必须 `≤ output`（它是 output 的子集，不另计）。
 - 合计 `total = input + cacheRead + cacheWrite + output`（`reasoning` 不加）。
-- 重放/重试：同一 `traceId + data.callId` 的用量按**替换**处理（后到的整条替换先到的），不是累加。
+- 重放/重试：同一 `traceId + data.callId` 的用量按**替换**处理（后到的整条替换先到的），不是累加。正因为是「整条替换」，节点级重试必须换一个 `callId`（`executor:<nodeId>:<attempt>:<retryIndex>`，06 §17.5），否则第二次真实调用会把第一次的用量吞掉。
+
+**run 级覆盖度 `run.json.tokenCoverage`（v1.3 起，0.12.3 实现）**：它回答「该记的调用有没有漏记」，不回答「一共多少」，因此**不参与** `total` 的计算，也不改写历史事件。
+
+```json
+{
+  "complete": false,
+  "missing": [{ "nodeId": "n-review", "attemptId": 1 }],
+  "buckets": { "seen": ["input", "output"], "missing": ["cacheRead", "cacheWrite"] }
+}
+```
+
+- `missing`：配了外部 executor、跑完了却一条 `model/call` 都没留下的节点 / attempt（有界 50 条，按 `(nodeId, attemptId)` 去重）。
+- `buckets.seen` / `buckets.missing`：四个桶里哪些在**原始 usage** 里报过数值（0 也算「报过」）。这是信息字段，**不压** `complete`——不支持缓存的 provider 永远没有 `cacheRead` / `cacheWrite`，把它算成「账不完整」会让这些 run 永久黄灯。
+- `complete`：`(missing.length === 0) && (unkeyedCalls === 0)`，**只反映结构完整性**。`unkeyedCalls` 是去重账本里没有 `callId` 的用量条数（见 §8.1）；这类用量进不了「同 key 整条替换」的账，同样算没记全。
+- 写入时机：run 收口时与 `supervision` 终态在**同一次** `writeRunMeta` 写、且都在 `run/end` 之前（06 §18.5）；重写幂等。读端（`runstore.normalizeTokenCoverage`）做有界收敛并进白名单；老 run 没有这个字段时按 `{ complete: true }` 兼容，不把「没记录」误报成「有缺口」。
+- 对外投影：`GET /runs` 列表行只给 `{ complete }`（省字节）；`GET /runs/<runId>` 详情给全量 `{ complete, missing, buckets }`。
+- 依据：`src/engine.js` 的 `tokenCoverageFromSeen()` / `_persistRunEndMeta()`、`src/runstore.js` 的 `normalizeTokenCoverage()`、`src/index.js` 的 `tokenCoverageOf()`。
 
 ## 4 聚合口径（`GET /runs/<runId>/summary`）
 
@@ -171,9 +188,10 @@ $DSH_HOME/flow-studio/runs/
   - `unresolved` = `open + accepted + fixed`（**采纳 ≠ 修复 ≠ 复验**）；`verified` 与 `dismissed` 单列。
   - `unresolvedBySeverity.P0` 进 §8.4 的 fail 级门禁；`.P1` / `.P2` 进 warn 级门禁（未解决即压住绿灯）。
 - **证据独立性（v1.3）**：三条证据指标的**通过条目**按被引用产物的归属分级——`artifact/write.nodeId` 与声明者相同 → `self`（自证）；不同 → `peer`（独立复核）；`artifact/write.extra.producer === 'host'` → `host`（宿主生成 / 标记）。
-  - 指标对象暴露 `selfCertified`（自证通过条目数）与 `selfOnly`（有通过条目、且**全部**为自证）。
-  - **指标层不因此降级**：自证仍是证据，不是「缺证据 / 数据自相矛盾」（那是 `unknown` 的语义）；独立性不足交给 §8.4 结论层用 `warn` 兜底。
-  - 查不到产物归属的 ref（可信写入方直接给的路径）不计入自证，沿用 §8.5 的信任边界——只有能证明是同一节点写的才算自证。
+  - 指标对象暴露 `selfCertified`（自证通过条目数）、`independentPassed`（peer / host 独立通过的条目数）与 `selfOnly`（有通过条目、且**全部**为自证）。
+  - 指标层不因此降级：自证仍是证据，不是「缺证据 / 数据自相矛盾」（那是 `unknown` 的语义）；独立性不足交给 §8.4 结论层用 `warn` 兜底。
+  - 查不到产物归属的 ref（可信写入方直接给的路径）不计入自证、也不计入 `independentPassed`，沿用 §8.5 的信任边界——只有能证明是同一节点写的才算自证，能证明是别的节点 / 宿主写的才算独立。
+  - 引擎自写的兜底报告（`extra.generatedReport=true`）：能对上产物归属就按 `self` / `independent` 正常计数（结论层按 `selfOnly` 兜底 `warn`）；一条归属都对不上才整条判 `unknown`。
 - **跨 attempt 账本（v1.3，B4 扩展）**：三个证据指标各自维护**全 attempt 出现过的标识集合**（`itemId` / `suite` / `ruleSetId`）。凡在**更早 attempt** 出现过、当前 attempt 没有**复判为 `pass`** 的标识，一律计入未复判（stale）：
   - 当前 attempt 出现 `fail` → 走正常 fail 路径，不重复记 stale；
   - 出现 `skip` / `na`，或干脆不再提 → 该指标 `unknown`，reason 写「上一轮出现过、本轮没有复判为通过」并列出条数（`staleFails[]`）；
@@ -197,11 +215,13 @@ $DSH_HOME/flow-studio/runs/
 - `p0p1` 的 fail 级门禁只认**未解决 P0**（`open + accepted + fixed`）；`p0p1` 的证据文案相应收窄为「P0 缺陷」。
 - **未解决 P1 / P2 压住绿灯（v1.3）**：P1/P2 不判 fail，而是把 `evidence.p0p1` 置为 `warn`；五项全过 + `progress.ratio === 1` 时，只要有未解决 P1/P2，结论 `warn`，label 写「可：…、遗留 N 个 P1 / M 个 P2 未解决」（只列非零项）。
   依据：P1/P2 是质量问题而非「结论不成立」，但「首轮通过 + 遗留 3 个 P1」不能是「优」。
-- **证据独立性门禁（v1.3）**：**每个有通过条目的证据指标至少要有一条 `peer` / `host` 级独立证据**。
+- **证据独立性门禁（v1.3，0.12.3 实现与本节对齐）**：**每个有通过条目的证据指标至少要有一条 `peer` / `host` 级独立证据**。
   - 任一指标 `selfOnly === true`（该指标通过条目全部是 `self`）→ 结论不得 `pass`，降为 `warn`，label 写「可：<指标名> 全部为自证证据（N 条），缺独立复核」；
-  - 只要每个指标都至少有 1 条 peer/host 级证据，其余自证条目可以共存，结论仍可 `pass`，自证总数在 `quality.selfCertified` 里体现（不改「优 / 良」文案）；
+  - 有通过条目、但**找不到产物归属**（`evidenceRef` / `reportRef` 对不上 `artifact/write`）→ 同样不得 `pass`，降为 `warn`，label 写「可：<指标名> 共 N 条通过条目找不到产物归属，缺独立复核」。这类条目既证明不了自证、也证明不了独立复核；同指标里另有 peer / host 条目也不能把这条抹掉（实现按「通过数 − 自证数 − 独立数」逐指标统计，`src/runlog.js` 的 `unattributedMetrics`）；
+  - 只要每个指标都至少有 1 条 peer/host 级证据、且没有无归属的通过条目，其余自证条目可以共存，结论仍可 `pass`，自证总数在 `quality.selfCertified` 里体现（不改「优 / 良」文案）；
   - 依据：自证只能证明「模型写过这个产物」，不能证明「结论正确」，指标整体全自证就是闭环，必须 warn；但 `unknown` 的语义是「缺证据 / 数据自相矛盾」，自证是「有证据但不独立」，用 `warn` 才诚实。若改成「一条自证都不许有」，真实运行的验收通常全是模型自写，quality 会永久黄灯，指标失去意义。
-- 五项全 `pass` 且 `progress.ratio === 1`、无未解决 P1/P2、无 `selfOnly` 时：
+- **不再有的三道旧门（0.12.3 删除）**：`claimedOnly`（三项都 `claimed>0` 且 `authoritativePassed===0` → `unknown`）、`unverifiedMix`（任何 claimed 通过 → `unknown`）、以及「权威覆盖 < 100% → `unknown`」。它们与本节 v1.3 的独立性口径冲突，且会让 `pass` / `warn` 在真实 run 上不可达（0.11.0 的 G-E 已记录该后果）。`authorityCoverage` 仍如实返回，但**只用于展示**；独立性门禁只看 `selfOnly` / 无归属，五项 `unknown`、任一项 `fail`、进度未完成、未解决 P1/P2、返工不达标仍按本节前面的规则各自压住绿灯。
+- 五项全 `pass` 且 `progress.ratio === 1`、无未解决 P1/P2、无 `selfOnly`、且不存在无归属的通过条目时：
   - 返工轮次 0 → `state=pass`、`label=优：首轮通过`；
   - 返工 1 且 P1=P2=0 且 `acceptedRate ≥ 0.6` → `state=pass`、`label=良：返工 1 轮后达标`；
   - 否则 → `state=warn`、`label=可：返工 <n> 轮`（**不是绿灯**）。

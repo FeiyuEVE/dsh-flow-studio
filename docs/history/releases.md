@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.11）
+# 版本历史（0.1 → 0.12.3）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -273,3 +273,85 @@
 - **降级留痕**：挂到宿主默认 preset 时，warn 里写明「本次挂的是宿主默认，不是 header 记录的 id；不写 `agent-preset/selected`，所以每次冷唤醒都会重付一次失败+降级」。
 - **验证**：`npm test` EXIT 0（30 个套件），`test/resume-setup.test.mjs` 由 8 组 / 42 条断言扩到 **12 组 / 60 条**，新增：生产形状（只有 `resolveAgent`）走 `agentPresets` 分支、`composeAgent` 无 `agentPreset` 判失败并降级、投影可用时不碰 `snapshotEvents`（计数器证明）、`SessionAlreadyOwnedError` 复用活 agent。变异验证：改回 0.12.1 的实现后新用例立刻红。
 - **已知边界**：① `src/engine.js` 的 `_composeWithHostPresetServices` 仍是「composeAgent 返回没有 agentPreset 时用 requested 兜底报成功」，这一版只改了注释没改行为（节点建会话路径今天不受影响，因为该分支不可达；要一并收需要单独拍板）；② 守卫只判「非空字符串」，不判返回的 id 是否与请求一致；③ 仍依赖 `SessionAlreadyOwnedError` 这个 error name 约定。
+
+## 0.12.3 — 口径对齐：token 记账、节点终态与审计误报
+
+这一版不改用户可见的功能面，修的是「文档 / 裁决已经写了 v1.3 口径，实现还停在旧门禁」的七处落差：token 记账会把缓存与重试用量算丢，节点终态会被迟到的自审回报改回 `working`，健康审计拿默认阈值误报、把 restart 跳过的阶段算成偏航。
+
+> **历史 run 不回写（append-only）**：以下修复只影响此后写入的事件与 `run.json`。已有的 `.jsonl` 事件、`tokenTotal`、`run.json.tokenCoverage` 一个字节不动——事件永不改写，`run.json` 的 token 计数只随新写入的事件累加。所以历史 run 上仍然会看到旧口径（例如 `cacheRead=0`、少记的 token），这是证据保全的预期结果，不是没修。
+
+### 1. 外部 executor 的 usage 四桶化
+
+- **问题**：codex 的 `input_tokens` 是「命中缓存 + 未命中」的**总和**，`cached_input_tokens` / `cache_write_input_tokens` 是其中的子集。旧归一化把总和整段塞进 `input`、两个缓存桶恒 0，于是抽屉里的「未命中输入」被放大、四段构成条失真。`test/executor.test.mjs` 按其真实形状（`r-mw954abc-dcgj` / `n-exec` attempt 1）记录：`input_tokens` 里 96%~97% 是缓存命中。
+- **修法**：`normalizeUsage()` 改为返回四桶 `{ input, cacheRead, cacheWrite, output, total }`：`cacheRead = cached_input_tokens`（也认 `cachedInputTokens` / `cache_read_input_tokens`）、`cacheWrite = cache_write_input_tokens`（也认 `cacheWriteInputTokens`），`input = max(0, input_tokens − cacheRead − cacheWrite)`；`total` 优先取显式 `total_tokens`，否则 `input_tokens + output`。矛盾数据（缓存比 input 还大）按 raw input 截断缓存桶，`input` 不会被减成负数。
+- **口径不变**：引擎落盘的 `tokenTotal` 一直是「四桶相加」，所以总量口径不变——变的是同一笔钱记在哪个桶里。`reasoning` 仍只在 `0 ≤ reasoning ≤ output` 时保留。
+- **证据**：`src/executor.js:327-345`（归一化）、`src/executor.js:390`（`parseCodexLine` 消费）；`test/executor.test.mjs` 的「A：codex 四桶拆分——缓存命中从 input 扣出，四桶之和恒等于旧 total」（含真实形状、无显式 total、cache write、camelCase / 下划线别名、cache > input 五类断言）。
+- **引擎侧配套**：`accumulateExternalUsage()` 改为四桶累加（旧实现只加 `input` / `output`，只要出现过任意一条 usage 就整段丢掉 executor 拆出来的缓存桶）；`_runExternalNode` 的 `usage = usageSum || mapHostUsage(result.usage) || mapHostUsage(lastUsage)` 三条来源走同一张四桶表。见 `src/engine.js:268-285`、`src/engine.js:6843-6848`；回归是 `test/engine.test.mjs` 的「G① accumulateExternalUsage：四桶累加，总量与两桶口径一致，reasoning 语义不变」与「D/G② 外部 executor 重试两次：两条 model/call、callId 不同、四桶都在、总量不丢」。
+
+### 2. 重试的 callId 唯一化（token 不再被去重账本吞掉）
+
+- **问题**：去重账本是「同 `traceId + callId` 后到整条替换」。同一 attempt 内的节点级重试会再真实调用一次模型 / 外部进程，但旧实现两次都写 `callId = executor:<nodeId>:<attempt>`，后一次把前一次的用量**整条替换**掉。实测 `r-mw8090s2-0hi4`：三条 `model/call` 的事件级四桶合计 **1,938,649**，`run.json.tokenTotal` 只有 **1,246,593**，少记 **692,056**（35.7%）——丢掉的正好是 `n-review` attempt 1 第一次调用的整条用量。
+- **修法**：无重试仍用 `executor:<nodeId>:<attempt>`（历史兼容）；有重试时带重试序号 `executor:<nodeId>:<attempt>:<retryIndex>`，两条是两次真实调用，聚合层不会再替换。
+- **证据**：`src/engine.js:6858-6864`；`test/engine.test.mjs` 的「D/G② 外部 executor 重试两次：两条 model/call、callId 不同、四桶都在、总量不丢」；真实实例 `r-mw8090s2-0hi4`（该 run 是修复前的历史 run，按 append-only 不回写，少记的 692,056 不会补回）。
+
+### 3. `run.json.tokenCoverage`（新字段：账记全了吗）
+
+- **问题**：`tokenTotal` 只回答「一共多少」，不回答「该记的调用有没有漏记」。外部 executor 被 kill / 不支持上报时 `model/call` 会缺席，token 只会偏小且没有任何标记；`unkeyedCalls > 0`（没有 `callId` 的用量进不了去重账本）同样会让累计值失真。
+- **修法**：run 收口时写 `run.json.tokenCoverage = { complete, missing, buckets }`：
+  - `missing` 是「跑了外部 executor 却没留下 `model/call`」的 `{nodeId, attemptId}`（有界 50 条）；
+  - `buckets = { seen, missing }`：四个桶里哪些从未报过数值，**纯信息**；
+  - `complete = (missing.length === 0) && (unkeyedCalls === 0)`，**只反映结构完整性**。桶缺失不压 `complete`——否则不支持缓存的 provider 会永久黄灯。
+- **写入顺序**：`tokenCoverage` 与 supervision 终态在同一次 `writeRunMeta` 里写，且都在 `run/end` 落盘**之前**；重写幂等（覆盖度只算一次并缓存）。见 `src/engine.js:346-373`（`tokenCoverageFromSeen`）与 `src/engine.js:3866-3893`（`_persistRunEndMeta`）。
+- **读端**：`runstore.normalizeTokenCoverage()` 做有界收敛并进 `normalizeMeta` 白名单（`src/runstore.js:525`、`src/runstore.js:579-583`）；`src/index.js` 的 `tokenCoverageOf()` 对外投影——`GET /runs` 列表行只给 `{ complete }`，`GET /runs/<runId>` 详情给全量（`src/index.js:983-1005`、`src/index.js:1844`、`src/index.js:1942`）。老 run 没有这个字段时按 `{ complete: true }` 兼容，不把「没记录」误报成「有缺口」。
+- **证据**：`test/engine.test.mjs` 的「B（token 覆盖度）：complete 只看结构缺口，桶覆盖单独放 buckets；run/end 收口显式写」、`test/metrics.test.mjs` 的「B：tokenCoverage 对外暴露——列表 / light 只给 { complete }，详情给全量」、`test/runstore.test.mjs` 的收敛用例。
+
+### 4. quality 判定口径（实现与 05 §8.4 的 v1.3 对齐）
+
+- **问题**：0.11 起 `computeQuality` 里叠了三道旧门——`claimedOnly`（三项都 `claimed>0` 且 `authoritativePassed===0` → `unknown`）、`unverifiedMix = claimedPassed > 0`（任何 claimed 通过 → `unknown`）、以及「权威覆盖 < 100% → `unknown`」。结果 `pass` / `warn` 在真实 run 上不可达：引擎对 `acceptance/verdict`、`test/report` 一律写 `provenance:'model-claim'`，只有宿主 `check/form` 是权威。这个缺口在 [0.11 功能缺口评估](../plan/0.11-功能缺口评估.md) 里记为 G-E，05 §8.4 的 v1.3 裁决已经改成「按产物归属判独立性」，实现没跟上。
+- **修法**：删掉上述三道旧门（`claimedOnly`、`unverifiedMix`、`QUALITY_PASS_MIN_AUTHORITY_COVERAGE` 作为门禁）。现在的结论层口径以 `src/runlog.js:2663-2742` 为准：
+  - 某指标通过条目**全部为自证**（`selfOnly`）→ `warn`（label「<指标名> 全部为自证证据（N 条），缺独立复核」）；
+  - 有通过条目但**找不到产物归属**（ref 对不上 artifact / write）→ `warn`（label「<指标名> 共 N 条通过条目找不到产物归属，缺独立复核」）；
+  - 五项证据任一项 `unknown` → `unknown`；任一项 `fail` → `fail`（fail 压过 unknown）；
+  - 每个有通过条目的指标都至少有 1 条 peer / host 独立证据时仍可 `pass`，自证条目可以共存（总数在 `quality.selfCertified` 里展示）。
+  - `authorityCoverage` 仍如实返回，但**只用于展示**，不再是 pass 门禁；客户端在有 `independentPassed` 时也不再拿 coverage 二次降级（`src/client/logdrawer.js:1607-1627`）。
+- **证据**：`src/runlog.js:2520-2550`（旧常量注释改为「不再作为 pass 门禁」）；`test/metrics.test.mjs` 的「C v1.3 独立性判定表：全 self → warn；peer + self → pass；fail → fail；无证据 → unknown」。
+- **影响面**：`acceptance` / `tests` / `checks` 三处指标新增 `independentPassed`（peer / host 独立通过的条数），产物归属能对上的「引擎自写报告」不再整条判 `unknown`，而是计入自证并在 quality 层按 `selfOnly` 兜底 `warn`。
+
+### 5. `nodeStatus` 终态化（`state` 不扩枚举，结论放 `verdict`）
+
+- **问题**：`node/end` 落盘后，节点在 `run.json.nodeStatus` 里仍可能停在 `working`——终态要等模型自审回报；而同一 attempt 迟到的自审回报又会把已经收口的节点改回 `working`。`runstore` 只认 `working / done / blocked / failed` 四值，写别的值会被静默回落成 `working`。
+- **修法**：`state` 仍是四值，**不扩枚举**；通过 / 打回结论由 `verdict`（`pass` / `reject`）承载，客户端已单独渲染成徽标（`src/client/flowlist.js:246`、`src/client/flowlist.js:335-340`）。引擎在 `node/end` 收口时定终态：`passed → done + progress 100 + verdict pass`；`rejected → failed + progress 100 + verdict reject`；`failed / aborted → failed + 实际进度`（中止的真实原因仍看 `run/end.status` 与 `node/end.extra.aborted`）。
+- **迟到回报不回写**：同一 attempt 一旦写入终态，晚到的自审状态块**只写 `node/status` 事件留痕**，不改内存快照、不改 `run.json`（`src/engine.js:2880-2927`）。合法重开只有两条判据：`attemptId` 变化，或 `node/start{data.retry}` 的重试序号递增（`src/engine.js:2723-2763`）。
+- **只收口已存在的条目**：只有上报过自审状态的节点才有 `nodeStatus` 条目；`node/end` 不凭空创建条目（外部 executor 节点没有会话、不写 `nodeStatus`，这是既有契约）。
+- **run 收口兜底**：run 进入终态时，仍停在非终态的 `nodeStatus`（含 `blocked`）一并落成终态，attempt 对齐引擎权威计数（`src/engine.js:2786-2808`、`terminalNodeStatusForRunEnd`）。
+- **证据**：`src/engine.js:178-234`（映射与纯函数）、`src/runstore.js:666`（四值枚举）、`src/runstore.js:725-790`（白名单收敛，`verdict` 只接受 pass / reject）；`test/engine.test.mjs` 的「B① 终态映射：passed→done/100/pass，rejected→failed/100/reject，failed→failed/实际进度」「B② 终态后迟到的 self-check 不回退 run.json（事件照写）；重试 / 新 attempt 可重开」「B③ run 被中止：working 节点收成 failed + 实际进度，run.json.status 仍是 aborted」。
+
+### 6. 收口顺序、停止归因与占位符产物
+
+- **收口顺序**：`supervision = {enabled:false, reason:'terminal', nextDueAt:null}` 与 `tokenCoverage` 在 **`run/end` 落盘之前**、同一次 `writeRunMeta` 里写（`src/engine.js:3866-3893`，调用点在 `src/engine.js:5841`、`src/engine.js:6421`）。旧顺序是「先写 `run/end`、runtime 再落 supervision」，进程死在两步之间会留下 `enabled:true + nextDueAt` 的自相矛盾快照——实例 `r-mw900w7y-r4s3` 的 `nextDueAt` 比 `endedAt` 晚 10 秒、`r-mw77wlyt-1t2j` 晚 37 秒。
+- **停止归因**：`engine.stop(runId, { source })`。`source='user'`（默认，保持历史行为）→ `run/end.reason='已停止'`；`source='engine'`（`runtime.js:1992` 在 dispose 时传）→ `run/end.reason='引擎中断（宿主卸载 / 服务重启）'`。节点 `node/end.extra.reason` 与 `run/end.reason` 共用同一份文案（abort 的 message 就是它），不再一律写「用户停止」。常量与收口函数见 `src/engine.js:157-163`、`src/engine.js:5132-5173`。
+- **事件顺序**：`node/end` 必须先于同一节点 / attempt 的 `machine/transition`。两处倒置已修（成环与步数上限路径）：`_failNode` → `_sendMachineEvent`，见 `src/engine.js:5998-6007`、`src/engine.js:6015-6023`。
+- **占位符产物**：新增 `artifact/write.data.placeholder=true`。判据刻意保守——整段正文 trim 后只剩「见文件 / 详见附件 / see file」这类一句话且总字节 < 32；二进制产物不判。**只加标记，不改写入行为**（不因为像占位符就拒绝落盘）。见 `src/engine.js:399-427`（`isPlaceholderArtifactContent`）、`src/engine.js:7676-7681`。
+- **证据**：`test/engine.test.mjs` 的「A① stop 来源归因：user →「已停止」，engine →「引擎中断（宿主卸载 / 服务重启）」」「C：run/end 落盘时 supervision 已是 enabled:false/terminal，nextDueAt=null（幂等）」「E：同节点同 attempt 的 node/end 必须早于 machine/transition（步数上限路径）」「F：明显占位符产物带 placeholder=true，正常短产物不带；写入行为不变」。
+
+### 7. `flow_watch` 误报修复（审计模块）
+
+- **问题一（阈值）**：审计内部写死默认 20 分钟节点上限 / 2 小时 run 上限，不读 run 自己的 `run.json.limits`。本机 `r-mw8q41al-w5kk` 的 `run.json.limits` 是 `nodeTimeoutMs=1800000`（30 分钟），旧实现按 20 分钟默认值判「timeout-risk」；`src/tools.js` 的注释把这个实例记为本次误报的来由。
+- **修法一**：阈值来源链改为「显式 `options` > `input.run.limits` > 默认」（`src/audit.js:353-438`），返回体新增 `thresholds = { stallMs, nodeTimeoutMs, runTimeoutMs, source }`（`source='run'` 表示节点 / 整轮上限取自 `run.json.limits`）；timeout-risk / stalled 的文案写实际阈值与来源，不再是默认值（`src/audit.js:769-800`）。`flow_watch` 在 `src/tools.js` 里先解析 `run.json.limits` 再显式传入，返回体也带 `thresholds`。
+- **问题二（restart 误报）**：restart 续跑的 run 从中间阶段起跑，被跳过的阶段（`run.json.restart.skippedNodeIds`）在旧口径里既算「未执行」又算「偏航」，进度分母也不扣。
+- **修法二**：审计尊重 `skippedNodeIds`：进度分母 = `nodeTotal − skipped`；被跳过的阶段标 `state='skipped'`、不进 `plan.expected`、不产 deviation；进度对象带 `skipped[]` / `skippedCount`（`src/audit.js:47-61`、`src/audit.js:490-527`、`src/audit.js:626`）。实例 `r-mw79hxdq-ujlb`（`skippedNodeIds=[n_frame,n_evidence,n_axes]`、`nodeDone=4`、`nodeTotal=7`）：旧 ratio `4/7 = 0.5714` → 新 `4/(7−3) = 1`。
+- **证据**：`test/audit.test.mjs` 的「阈值：显式 nodeTimeoutMs=30 分钟 → 26 分钟的节点不报超时风险（默认 20 分钟会报）」「阈值：不传 options、只给 run.limits.nodeTimeoutMs → 也用 run 值（引擎 supervision 的调用形状）」「阈值：超时风险 detail / headline 写的是实际用的阈值，不是默认值」「restart 续跑：从第 3 阶段起跑不算偏航，跳过节点单列、分母扣减」「restart 续跑（全部跑完）：done + ratio=1，不再有偏航条目」「没有 restart 的 run：行为完全不变（skipped 为空、ratio 仍是 passed/total）」。
+
+### 验证
+
+- 全量回归：`npm test` **30 个测试文件 / 1076 组 / EXIT 0**（在版本号 bump 与 `npm run build` 之后、无并发写入的情况下重跑的一遍），其中 `test/engine.test.mjs`（140 组 / 1212 条）、`test/engine-restart.test.mjs`（10 组）、`test/tools.test.mjs`（73 组 / 1045 条）、`test/runlog.test.mjs`（101 组）、`test/runstore.test.mjs`（89 组）、`test/render.test.mjs`（103 组）、`test/executor.test.mjs`（33 组 / 230 条）、`test/audit.test.mjs`（23 组）、`test/metrics.test.mjs`（22 组）。
+- 构建门禁：`node test/build.test.mjs` 8 组 / 66 条通过，`lib/client.js` 483,806 B（上限 524,288），src ↔ lib 22 个 Host 模块逐字节一致。
+- 真实实例：`r-mw954abc-dcgj`（缓存占比）、`r-mw8090s2-0hi4`（callId 吞量）、`r-mw900w7y-r4s3` / `r-mw77wlyt-1t2j`（supervision 晚写）、`r-mw79hxdq-ujlb`（restart 跳过）、`r-mw8q41al-w5kk`（阈值误报）。它们都是修复前的 run，按 append-only 不会被回写。
+
+### 已知边界
+
+- `tokenCoverage.complete` 只回答「结构上有没有漏记」，不回答「数值对不对」；provider 少报一个桶但每条调用都有 `model/call` 时，它仍是 `complete:true`（桶覆盖只在 `buckets.missing` 里提示）。
+- `normalizeUsage()` 的显式 `total_tokens` 优先；若上游给出的 `total_tokens` 与 `input_tokens + output` 不一致，落盘的 `usage.total` 与四桶之和会不相等（引擎落盘 `tokenTotal` 仍按四桶相加，不受影响）。
+- 停机的节点 `node/end.extra.reason` 与 `run/end.reason` 是同一份文案，想区分「谁停的」要看 `run/end.status` 与文案本身，没有单独的 `source` 字段落进事件。
+- `artifact/write.data.placeholder` 只标「像占位符」，不改变证据判定；质量层怎么用这个标记不在本版范围（`src/runlog.js` 的归属判定不读它）。
+- `run.json.tokenCoverage` 在客户端指标区尚未渲染，目前只通过 `GET /runs` / `GET /runs/<id>` 暴露给集成方。

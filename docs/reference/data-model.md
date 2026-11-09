@@ -137,6 +137,7 @@ $DSH_HOME/flow-studio/runs/
 | `startOptions` | 创建 run 时记下的发起参数（`runtime.patchRunJson` 的唯一写路径） |
 | `progress` / `live` / `input` / `inbox` | 进度、运行时快照、启动输入、收件箱配置 |
 | `nodeDone` / `nodeTotal` / `tokenTotal` / `eventCount` / `lastSeq` / `seq` / `unkeyedCalls` / `tokenTotalApprox` | 计数与用量汇总（列表只读 `run.json`，不读全量事件） |
+| `tokenCoverage` | run 级 token 覆盖度 `{complete, missing: [{nodeId, attemptId}], buckets: {seen, missing}}`：`complete` 只反映结构完整性（`missing` 空且 `unkeyedCalls === 0`），`buckets` 只说明四个桶哪些报过数值、不压 `complete`。语义与判定见 [design/05 §3](../design/05-run-log.md)；老 run 没有该字段按 `{complete:true}` 处理 |
 | `sessions` | 会话索引（与 `sessions.json` 同源） |
 | `execution` | 持久执行世代 `{epoch, ownerId, state}`：每次 claim +1；`state ∈ active/released/settled`。失权收口按它做条件写 |
 

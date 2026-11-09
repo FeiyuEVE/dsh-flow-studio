@@ -200,6 +200,38 @@ lead 不返回成员级明细时，摘要标 `membersPartial: true`，不编造�
 - 其它异常（成环 / 步数 / 断头路等）都要落到 `run/end{status:'failed', reason}` 并把细节写进事件 `extra`，不允许静默停住。
 - 引擎崩溃（进程重启后残留 `running` 的 run）：启动时把超过 30 分钟无新事件的 run 标 `failed` 并注明「引擎中断」，不自动续跑（v0.4 不做断点续跑）。
 
+### 9.1 节点终态、事件顺序与停止归因（0.12.3）
+
+**nodeStatus 终态化**：`run.json.nodeStatus[nodeId].state` 仍只有四值 `working / done / blocked / failed`，**不扩枚举**——`runstore` 是白名单，写别的值会被静默回落成 `working`。通过 / 打回结论由 `verdict`（`pass` / `reject`）承载，客户端单独渲染徽标（`src/client/flowlist.js`）。引擎在 `node/end` 落盘时同步定终态（`src/engine.js` 的 `NODE_END_TERMINAL_STATE` / `nodeStatusFromNodeEnd`）：
+
+| `node/end.data.status` | `state` | `progress` | `verdict` |
+|---|---|---|---|
+| `passed` | `done` | 100 | `pass` |
+| `rejected` | `failed` | 100 | `reject` |
+| `failed` | `failed` | 实际进度（同 attempt 最后一次自审上报，缺省 0） | `null` |
+| `aborted` | `failed` | 同上 | `null` |
+
+> 引擎中止节点时实际写的是 `node/end{status:'failed', extra.aborted:true}`（`node/end.data.status` 的白名单里没有 `aborted`）；表里的 `aborted` 行是映射函数的防御输入，保留是为了让「被中止」与普通失败在状态层同样落 `failed`、不引入第五个 `state`。
+>
+> 只有**上报过自审状态**的节点才有 `nodeStatus` 条目：`node/end` 只收口已存在的条目，不凭空创建（外部 executor 节点没有节点会话、不写 `nodeStatus`，这是既有契约）。
+
+- **迟到回报不回写**：同一 attempt 一旦写入终态，晚到的自审状态块**只写 `node/status` 事件留痕**，不改内存快照、不改 `run.json`（`src/engine.js` 的 `_rememberNodeStatus`）。
+- **合法重开只有两条判据**：`attemptId` 变化，或 `node/start.data.retry` 的重试序号递增（`src/engine.js` 的 `_beginNodeStatus`）；两者都不满足时不动状态。
+- **run 收口兜底**：run 进入终态时，仍停在非终态（含 `blocked`）的 `nodeStatus` 一并收成终态，`attempt` 对齐引擎权威计数（`_settleRunNodeStatuses` / `terminalNodeStatusForRunEnd`）。
+
+**事件顺序**：同一节点 / attempt 的 `node/end` 必须先于 `machine/transition`——观测事件描述的是「这次 attempt 已收口」，先写转移会让人以为节点还没结束。成环路径与步数上限路径两处倒置已修（`src/engine.js:5998-6007`、`src/engine.js:6015-6023`）。
+
+**收口顺序**：`supervision = {enabled:false, reason:'terminal', nextDueAt:null}`、节点终态与 `tokenCoverage` 在 **`run/end` 落盘之前**、同一次 `writeRunMeta` 写入（`_persistRunEndMeta`，`src/engine.js:3866-3893`）。旧顺序是「先 `run/end`、runtime 再落 supervision」，进程死在两步之间会在 `run.json` 留下 `enabled:true + nextDueAt` 的自相矛盾快照（实例 `r-mw900w7y-r4s3` 晚 10 秒、`r-mw77wlyt-1t2j` 晚 37 秒）。只有 `run.json` 里**已经有** `supervision` 时才写（从未开启的 run 不凭空造对象）；runtime 之后再写同样内容（保留现有字段）是幂等的。
+
+**停止归因**：`stop(runId, { source })` 显式区分「用户按停」与「引擎中断」（`src/engine.js:157-163`、`src/engine.js:5132-5173`）：
+
+| `source` | 谁传 | `run/end.reason` | 节点 `node/end.extra.reason` |
+|---|---|---|---|
+| `user`（默认） | `flow_stop` / HTTP stop | 「已停止」（历史值） | 同一份文案 |
+| `engine` | `runtime.dispose()`（`src/runtime.js:1992`） | 「引擎中断（宿主卸载 / 服务重启）」 | 同一份文案 |
+
+不传 `source` 的老调用按 `user` 处理，历史行为不变；`options.reason` 可覆盖默认文案，但仍走同一路径写 `run/end.reason` 与节点 `extra.reason`。
+
 ## 10 接口
 
 | 方法 | 路径 | 说明 |
@@ -325,6 +357,7 @@ run 仍停在 `pending`）。`POST /runs/<id>/start` 与 `flow_start` 都透传�
 
 ### 13.9 预算与脱敏（M3/m3）
 单产物上限 1 MiB、单 run 产物总预算 64 MiB：超限截断写盘并在 `artifact/write` 标 `truncated:true, originalBytes`。
+**占位符产物只标记、不拦写**（0.12.3）：正文 trim 后只剩「见文件 / 详见附件 / see file」这类一句话、且总字节 < 32 时，`artifact/write.data` 加 `placeholder:true`；二进制产物（含 NUL）不判。判据刻意保守，宁可漏标也不把 `# 结论` 这种正常短产物误判；它**不改变写入行为**，也不参与质量判定（`src/engine.js` 的 `isPlaceholderArtifactContent()`）。
 `tool/call` 的 `argumentsDigest` 必须脱敏（`Bearer …`、`sk-…`、`token|password|secret|api_key` 值、超长串），
 不得把凭据原文写进日志与导出。
 
@@ -376,10 +409,12 @@ run 仍停在 `pending`）。`POST /runs/<id>/start` 与 `flow_start` 都透传�
 auditWorkflow({
   flow,                 // normalizeFlow 结果（nodes / edges；node.kind: start|stage|end，edge.kind: next|reject）
   events,               // runlog 事件数组（node/start、node/end、reject/trigger、run/start、run/end…）
-  run,                  // run.json（status / startedAt / endedAt / failedNodeId…；缺失时按事件流推断）
+  run,                  // run.json（status / startedAt / endedAt / failedNodeId / limits / restart…；缺失时按事件流推断）
   now = Date.now(),
-  stallMs = 10 * 60 * 1000,        // 多久没新事件算卡死
-  nodeTimeoutMs = 20 * 60 * 1000,  // 单节点跑多久算「有时限风险」
+  stallMs = 10 * 60 * 1000,        // 多久没新事件算卡死（显式值优先，没有就用默认）
+  nodeTimeoutMs,                   // 单节点跑多久算「有时限风险」：显式 > run.json.limits.nodeTimeoutMs > 默认 20 分钟
+  runTimeoutMs,                    // 整轮 run 的墙钟上限：显式 > run.json.limits.runTimeoutMs > 默认 2 小时
+  thresholdSource,                 // 'run' | 'default'：阈值来源；省略时按「显式传了 / limits 里有」推断
   maxRejectsPerEdge = 3,           // 同一条打回边触发几次算死循环
 })
 ```
@@ -387,6 +422,7 @@ auditWorkflow({
 - 事件按 `seq` 升序重放（缺失 `seq` 退回 `ts`，再退回原顺序），事件对象只读、不改写；
 - `flow` / `events` / `run` 任一缺失或类型不对都**不抛错**：能判的照判，缺的字段给 `null` / 空数组；
 - 时间只用注入的 `now` 比较（接受毫秒数或 `Date`），便于测试与离线回放。
+- **阈值来源链（0.12.3）**：显式 `options` > `input.run.limits` > 默认（`nodeTimeoutMs` 20 分钟、`runTimeoutMs` 2 小时）。下沉到审计内部，是为了覆盖所有调用方——`flow_watch` 与引擎侧 supervision 都不会因为忘记传阈值而把配了 30 分钟上限的节点按 20 分钟判超时（实例 `r-mw8q41al-w5kk` 的 `nodeTimeoutMs` 是 1800000，旧实现按默认值报了 timeout-risk）。
 
 ### 14.2 判据 → verdict → recommended
 
@@ -419,7 +455,8 @@ auditWorkflow({
 | `verdict` | `AUDIT_VERDICTS` 之一：`pending / healthy / stalled / looping / deviating / no-progress / failed / done / aborted` |
 | `status` | `run.status` 原样；`run` 或该字段缺失时为 `null`（不拿推断值冒充） |
 | `headline` | 中文一句话（≤120 字），可直接展示给用户；异常时含类别与节点名 |
-| `progress` | `{ passed, total, ratio, nodes: [{ id, title, state, attempt }] }`；`ratio` 为 `null` 表示无法判定 |
+| `progress` | `{ passed, total, ratio, skipped: string[], skippedCount: number, nodes: [{ id, title, state, attempt }] }`；`ratio` 为 `null` 表示无法判定 |
+| `thresholds` | `{ stallMs, nodeTimeoutMs, runTimeoutMs, source }`：本次判定实际用的阈值；`source='run'` 表示节点 / 整轮上限取自 `run.json.limits`，`'default'` 表示用默认值或调用方配置 |
 | `plan` | `{ expected, actual, deviations }`：预期阶段 id 链 / 实际 `node/start` 顺序 / 偏航明细 |
 | `currentNode` | running 时最近启动且未结束的节点：`{ id, title, attempt, elapsedMs, idleMs }`，否则 `null` |
 | `rejects` | `{ total, byNode: [{ nodeId, title, count }], looped: [{ nodeId, title, count }] }` |
@@ -444,6 +481,8 @@ auditWorkflow({
   `count` 取该节点上超阈值边里的最大计数。
 - **进度**：`passed / ratio` 复用 `runlog.computeProgress`（打回失效、旧 attempt 不计、skipped 不进分母）；
   `total` 优先取 `run/start.nodeTotal`，其次观察到的节点数，未开跑时退回模板阶段数（此时 `ratio` 为 `null`）。
+- **restart 续跑（0.12.3）**：`run.json.restart.skippedNodeIds` 里的阶段本次不执行——进度分母 = `nodeTotal − skipped`，这些阶段标 `state='skipped'`、不进 `plan.expected`、不产 deviation，进度对象带 `skipped[]` / `skippedCount`。实例 `r-mw79hxdq-ujlb`（跳过 3 个、`nodeDone=4`、`nodeTotal=7`）旧 ratio `4/7=0.5714` → 新 `4/(7−3)=1`。没有 `restart` 的 run 行为完全不变。
+- **阈值文案**：timeout-risk / stall 的 `detail` / `headline` 写实际阈值与来源，不能写默认值——30 分钟的节点被 20 分钟默认值判超时，正是这条要消灭的误报。
 - **节点状态**：`state` ∈ `pending / running / passed / rejected / failed / skipped / invalidated`；
   `running` = 已 `node/start` 未 `node/end`，`invalidated` = 被后续打回作废的旧 passed，`attempt` 为当前 attemptId（未开始为 0）。
 - **currentNode**：取打开节点中启动最晚的那个；`elapsedMs` 从它最近一条 `node/start` 起算，
@@ -891,11 +930,21 @@ stdout 的消费与 codex 同一套：逐行 JSONL → log / usage / final；如
   `provider:'codex'|'custom'`、有 model 时带 `model`。每个节点 attempt 最多写 200 条
   （`LOG_LIMIT`），超出的过程日志丢弃，避免一条刷屏命令撑爆事件数组。
 - **`model/call`**：`provider` 同上、`model` = 节点 model 或 `'unknown'`、
-  `callId = executor:<nodeId>:<attemptId>`（≤128）。同一 attempt 重试用**同一个 callId**，
-  聚合层按「后到整条替换」处理，不会重复计 token。
+  `callId = executor:<nodeId>:<attemptId>`（≤128）；**有节点级重试时**为
+  `executor:<nodeId>:<attemptId>:<retryIndex>`。同一 attempt 的重试是**两次真实调用**，
+  必须用不同 `callId`——聚合层按「同 `traceId + callId` 后到整条替换」（05 §3），
+  沿用同一个 id 会把前一次的用量整条吞掉（实测 `r-mw8090s2-0hi4` 少记 692,056 / 35.7%）。
 - **四桶归一化**：`mapHostUsage()` 输出 `{ input, cacheRead, cacheWrite, output }`，缺桶补 0；
-  `reasoning` 仅在 `≤ output` 时附带。codex 的 `usage`（`input_tokens/output_tokens/total_tokens`）
-  先归一成 `{input,output,total}`，因此外部 executor 通常 `cacheRead=cacheWrite=0`。
+  `reasoning` 仅在 `≤ output` 时附带。codex 的 `usage` 先由 `normalizeUsage()` 拆成四桶：
+  `cacheRead = cached_input_tokens`、`cacheWrite = cache_write_input_tokens`、
+  `input = max(0, input_tokens − cacheRead − cacheWrite)`；`total` 优先取显式 `total_tokens`，
+  否则 `input_tokens + output`。因此外部 executor 不再「通常 `cacheRead=cacheWrite=0`」——
+  缓存命中会如实进入缓存桶，四桶之和仍等于旧口径的「原始 `input_tokens + output`」
+  （`src/executor.js` 的 `normalizeUsage`；引擎落盘的 `tokenTotal` 一直按四桶相加，
+  不受显式 `total_tokens` 影响）。
+  一轮 exec 可能有多条 usage 事件：`accumulateExternalUsage()` 逐条按四桶累加，最终
+  `usage = usageSum || mapHostUsage(result.usage) || mapHostUsage(lastUsage)` 三条来源同一归一
+  （`src/engine.js` 的 `accumulateExternalUsage` / `_runExternalNode`）。
 - **结构化输出**：最终文本先试整段 JSON，再试 ```json 围栏，最后取首个 `{` 到末个 `}`；
   只有普通对象算数。解析不出 → `StructuredOutputError`（不伪造 pass）。
 
@@ -1078,8 +1127,8 @@ proactive_set 闹钟」；`enabled=false`（引擎没有 `enableSupervision` 或
 - `failures >= 3` → `enabled:false`、`reason:'wake-failed: <原因>'`、`unregister(runId)`，
   并写一条 warn 级宿主日志；**不新增 runlog 事件**，状态只在 `run.json.supervision` 与日志里。
 - 降级后不再尝试；要恢复由 `flow_supervise` / `POST /runs/<id>/supervision` 重新开启。
-- 终态（done / failed / aborted）：run 收尾时 runtime 立即 `unregister` 并落盘
-  `{ enabled:false, reason:'terminal' }`；调度器 tick 里也会做同样收口。
+- 终态（done / failed / aborted）：**引擎**在写 `run/end` 之前就把 `supervision` 落成 `{ enabled:false, reason:'terminal', nextDueAt:null }`（与 `tokenCoverage` 同一次 `writeRunMeta`，见 §9.1）；runtime 收尾时再 `unregister`，把 `enabled:false` / `reason:'terminal'` 写回（保留现有其它字段，引擎已写的 `nextDueAt:null` 不会被改回）。调度器 tick 里也会做同样收口。
+  旧顺序是「先 `run/end`、runtime 再落盘」，进程死在两步之间会留下 `enabled:true + nextDueAt` 的陈旧快照（实例 `r-mw900w7y-r4s3` 晚 10s、`r-mw77wlyt-1t2j` 晚 37s）。
 
 ### 18.6 唤醒动作
 

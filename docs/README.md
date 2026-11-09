@@ -16,7 +16,7 @@
 | 用容器测试台验收一次改动 | [容器测试台](cookbook/run-container-testbed.md) |
 | 发一个版本 | [发版](cookbook/release.md) |
 | 给节点加一种新的外部执行器 | [加执行器](cookbook/add-executor.md) |
-| 看 0.1 → 0.12 每一版改了什么 | [版本历史](history/releases.md) |
+| 看 0.1 → 0.12.3 每一版改了什么 | [版本历史](history/releases.md) |
 | 找常见问题的答案 | [FAQ](faq.md) |
 | 看设计总案、01–08 分册与独立审核 | [设计总案](DESIGN.md) · [设计任务书](DESIGN-BRIEF.md) · [分册](design/01-ia-interaction.md) · [审核](design/REVIEW.md) |
 | 给这个仓库写文档（人或 agent） | [文档标准](AGENTS.md) |
@@ -35,7 +35,7 @@
 | [reference/host-api.md](reference/host-api.md) | `/api/flow-studio` 路由、模型工具、鉴权、环境变量与安全开关 | 集成方 / 运维 |
 | [reference/data-model.md](reference/data-model.md) | 流程 JSON、校验分级、run 目录与 `run.json` 字段、worktree 布局 | 集成方 / 排障 |
 | [reference/run-log.md](reference/run-log.md) | 事件契约的入口与速查；契约正文在 [design/05-run-log.md](design/05-run-log.md) | 集成方 / 排障 |
-| [history/releases.md](history/releases.md) | 0.1 → 0.12 逐版本变化（README 不再承载历史） | 升级 / 回溯的人 |
+| [history/releases.md](history/releases.md) | 0.1 → 0.12.3 逐版本变化（README 不再承载历史） | 升级 / 回溯的人 |
 | [faq.md](faq.md) | 四个高频问题：顶层会话、worktree、两种闹钟、为什么自研 | 所有人 |
 | [cookbook/run-container-testbed.md](cookbook/run-container-testbed.md) | 用 `scripts/e2e-docker.sh` 在容器里端到端验收 | 贡献者 |
 | [cookbook/release.md](cookbook/release.md) | build → verify → pack 检查 → publish → 装机对账 | 发版者 |

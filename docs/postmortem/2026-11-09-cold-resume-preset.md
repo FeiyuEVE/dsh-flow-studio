@@ -39,7 +39,7 @@ supervision 到点唤醒一个**冷**会话时，本插件调 `agents.resume({ r
 新增 `src/resume.js`，三处冷路径统一走 `resumeCold(ctx, agents, sessionId, { agentOptions, log })`：
 
 - **`setup` 内部**求该会话自己的有效 preset：日志最后一条 `agent-preset/selected` > `header.agentPreset` > 宿主默认（header 只记创建时的 stamp，中途换过 preset 后不再更新，所以事件优先）。
-- `sessionController.composeAgent(presetId)` → 调它返回的 `setup`（与 Web 同一条路径）；没有 `sessionController` 则退回 `agentPresets.resolve(id)` + `mount(agentCtx, resolvedId)`。
+- `agentPresets.resolve(presetId)` + `mount(agentCtx, resolvedId)` 挂组合（与宿主 Web 的 `composeAgent` **同一实现**，`presets.mount` 是它 setup 里的最后一步）；没有注册表服务则只 warn、不抛错。注意本机 0.2.2 的 `sessionController` 服务**只暴露 `resolveAgent`**，`composeAgent` 属于内部 `ApiSessionAgentController`（`packages/api/session-controller/src/index.ts:179,268` 与 `agent.ts:271`），所以 0.12.1 里那行「优先 composeAgent」的分支在生产上从不执行——0.12.2 复核时改正了注释并加了守卫。
 - **降级不致命**：记录的 preset 已不存在 / 挂载抛错 → warn 后改挂宿主默认；再失败 → 再 warn 并让本次 resume 照常完成。挂组合失败不能把唤醒或投递整条打死。
 - 宿主两个服务都没有 → 只 warn（点名会话与后果），不抛错。
 

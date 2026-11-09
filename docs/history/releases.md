@@ -137,6 +137,8 @@
 - **已知边界**：续跑 run 刻意走旧主循环（它支持显式起点），因此不写状态机快照；冷会话能否 `resume` 不预先逐个探测，失败时在节点处给带节点与 sessionId 的中文 `503`；preset 真实存在性由宿主 registry 判断，插件只做安全 id 校验，不维护会过期的白名单。
 - **测试**：**23 个测试文件 / 802 组**全绿（含发布门禁 `test/build.test.mjs` 的 8 组 / 56 条断言；10 个功能套件显式计数合计 3998 条断言）。本版新增 `test/engine-restart.test.mjs`（5 组 / 55 条断言）与 `engine.test.mjs` 的 6 组（路由成对、preset 三来源、setup 挂载、只有 `agentPresets` 的 fallback、resume 带 setup、preset 不存在报 400），以及 `runstore.test.mjs` 的 2 组竞态回归。关键用例做过**红→绿**双向验证（把修复改回旧行为对应用例必红；`engine-restart` 的门控与 provider 成对两条在旧代码快照上确认变红）。
 
+- **复核更正（0.12.2，2026-11-09）**：本节写的「优先 `sessionController.composeAgent`（与 Web 同一条路径）」不准确——本机 0.2.2 的 `sessionController` 服务只暴露 `resolveAgent`，`composeAgent` 属于内部 `ApiSessionAgentController`（`packages/api/session-controller/src/index.ts:179,268`），所以实际生效的一直是 `agentPresets.resolve` + `mount` 分支；该分支行为正确，0.9.2 以来的结论不受影响。细节见 [2026-11-09 事故记录](../postmortem/2026-11-09-cold-resume-preset.md)。
+
 ## 0.9.3 — 节点会话的预热轮（团队主管才派得出子 agent）
 
 0.9.2 让节点会话真的挂上了 preset，但**实测发现工具面还是不够**：首轮精简插件（`@feiyueve/dsh-minimal-first-turn`）会把**新根会话的第一轮**工具面裁到最小对（`bash` + `str_replace_editor`），下一轮才恢复 preset 的完整清单。节点会话是程序化顶层会话，同样被裁——于是「主管 + 子 agent」节点在第一轮里根本看不到 `subagent`，派不出成员，父子结构形同虚设；开发 / 测试节点也没有 `glob` / `grep` / `todo_write` 可用。
@@ -255,8 +257,19 @@
 这一版修的是**恢复**，不是运行：唤醒一个冷会话时漏了 `setup`，那个会话就等于被换了一套工具面。
 
 - **事故（2026-11-09 13:53，实测）**：supervision 唤醒一个冷会话，`agents.resume({ resumeSessionId })` 不带 `setup`，而宿主只在 `agents.create()` / `agents.resume()` 的 `setup` 回调里挂 agent preset 组合（`meta.agentPreset` / `header.agentPreset` 只写持久化，**不挂组合**，且不传 `setup` 不报错）。恢复出来的 agent 只剩宿主层插件工具：`request/header` 从 **68 → 37**，紧接着 `tool-registry` 一次推 **31 条 `tool-removal`**，模型此后每轮调 `bash` 都是 `Error: unknown tool "bash"`。详见 [事故记录](../postmortem/2026-11-09-cold-resume-preset.md)。
-- **修复**：新增 `src/resume.js`，三处宿主侧冷路径（`wakeRun()` 的 supervision 唤醒、节点自检闹钟、`inbox.js` 的 `deliverToAgentSession`）统一走 `resumeCold(ctx, agents, sessionId, { agentOptions, log })`。`setup` 内部按「日志最后一条 `agent-preset/selected` > `header.agentPreset` > 宿主默认」求该会话**自己的** preset，再用 `sessionController.composeAgent(presetId)` 挂组合（与 Web 同一条路径）；没有 `sessionController` 时退回 `agentPresets.resolve` + `mount`。
+- **修复**：新增 `src/resume.js`，三处宿主侧冷路径（`wakeRun()` 的 supervision 唤醒、节点自检闹钟、`inbox.js` 的 `deliverToAgentSession`）统一走 `resumeCold(ctx, agents, sessionId, { agentOptions, log })`。`setup` 内部按「日志最后一条 `agent-preset/selected` > `header.agentPreset` > 宿主默认」求该会话**自己的** preset，再用 `agentPresets.resolve(id)` + `mount(agentCtx, resolvedId)` 挂组合（0.12.2 复核确认：这台宿主上 `sessionController` 服务只暴露 `resolveAgent`，`composeAgent` 属于内部控制器，所以 0.12.1 写的那条「优先 composeAgent」分支从不执行；实际生效的就是这条，它与宿主 `composeAgent` 的 setup 实现同构）。
 - **降级不致命**：记录的 preset 已不存在 / 挂载抛错 → warn 后改挂宿主默认；再失败 → 再 warn 并让本次 resume 照常完成。挂组合失败不能把唤醒或投递整条打死（宿主里 `setup` 抛错会让整个 resume 失败）。
 - **节点主管会话那条路早就修过**（0.9.2 的 `engine.js` 的 `_resolveAgentComposition`），这版补的是宿主侧三处；`scripts/build.mjs` 的 `HOST_MODULES` 同步加 `resume.js`。
 - **验证**：`npm test` EXIT 0（30 个 `.test.mjs`），新增 `test/resume-setup.test.mjs` 8 组 / 42 条断言——冷路径必传 `setup`、setup 挂的是会话自己的 preset、`agent-preset/selected` 优先于 header、preset 挂载失败退默认且有 warn、无 preset 服务仍能 resume、活会话不 resume。变异验证：把 `resumeCold` 改成永不带 `setup`，新用例立刻红。
 - **已知边界**：① 组合挂到一半失败只会 warn 继续，会话可能是半套工具面（不崩，可从 warn 与 `tool-registry` 观察）；② 宿主自带的 ACP / headless / SDK 三条 resume 路径都有 `setup` 但**不挂 preset**，跨 profile 共用 `~/.dsh/sessions` 时同一会话在那三条通道续跑会换一套工具面，这属于宿主行为，本插件不越权修；③ 活 agent 不会自愈：`agents.get()` 命中直接复用、不校验工具面，出问题的 agent 要被 dispose 之后下一次冷恢复才会重新组合。
+
+## 0.12.2 — 把「碰巧对」加固成「结构上对」（0.12.1 的对抗性复核）
+
+0.12.1 修好了事故，但复核发现它有三处「今天能跑、明天会翻车」的假设。这一版只加守卫、不改行为。
+
+- **`sessionController.composeAgent` 在生产上不存在**：本机 0.2.2 的 `SessionController` 只暴露 `resolveAgent`，`composeAgent` 属于内部 `ApiSessionAgentController`（`packages/api/session-controller/src/index.ts:179,268` 与 `agent.ts:271`）。所以 0.12.1 写的「优先 composeAgent（与 Web 同一条路径）」分支**从来没执行过**，真正一直在跑的是 `agentPresets.resolve` + `mount`（正确的那条）。这一版改正了注释，并给那条兼容分支加了守卫：**返回的 composition 没带 `agentPreset` 就判失败**——否则宿主在无 preset 注册表的 profile 会返回「只装模型选择」的 setup 并静默忽略 presetId，正好复刻事故。
+- **读会话 preset 改用受支持的投影**：`snapshotEvents()` 已被宿主标 `@deprecated`（`core/session/src/index.ts:718-723`）。改为首选 `agentPresets.presetForSession(session)`（语义 = header + 最后一条 `agent-preset/selected`，与 `docs/design` 的 fold 完全一致），日志扫描降级为兜底。已核该投影对「尚未 enter 的 setup 期会话」可用（`session-projection/src/index.ts:840-853` 懒折叠）。
+- **并发冷恢复不再误记失败**：同进程另一条路径（用户消息 / 另一个闹钟）刚把同一会话 resume 起来时，本插件的 `agents.resume` 会因宿主写锁抛 `SessionAlreadyOwnedError`；现在改为复用已上线的 agent，而不是记一次 wake 失败（supervision 连续 3 次失败会降级停调度）。
+- **降级留痕**：挂到宿主默认 preset 时，warn 里写明「本次挂的是宿主默认，不是 header 记录的 id；不写 `agent-preset/selected`，所以每次冷唤醒都会重付一次失败+降级」。
+- **验证**：`npm test` EXIT 0（30 个套件），`test/resume-setup.test.mjs` 由 8 组 / 42 条断言扩到 **12 组 / 60 条**，新增：生产形状（只有 `resolveAgent`）走 `agentPresets` 分支、`composeAgent` 无 `agentPreset` 判失败并降级、投影可用时不碰 `snapshotEvents`（计数器证明）、`SessionAlreadyOwnedError` 复用活 agent。变异验证：改回 0.12.1 的实现后新用例立刻红。
+- **已知边界**：① `src/engine.js` 的 `_composeWithHostPresetServices` 仍是「composeAgent 返回没有 agentPreset 时用 requested 兜底报成功」，这一版只改了注释没改行为（节点建会话路径今天不受影响，因为该分支不可达；要一并收需要单独拍板）；② 守卫只判「非空字符串」，不判返回的 id 是否与请求一致；③ 仍依赖 `SessionAlreadyOwnedError` 这个 error name 约定。

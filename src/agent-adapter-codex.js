@@ -978,7 +978,7 @@ export function createCodexAdapter(options = {}) {
     let resumeChild = null
     let exitedResolve
     let exitedDone = false
-    // 物理退出确认按进程记录（见 trackChild）：逻辑结局（exited）可以在杀进程未生效时
+    // 物理退出确认按进程组记录（见 trackGroup）：逻辑结局（exited）可以在杀进程未生效时
     // 自行收口，但不能把物理清理也当成完成（review-0139 F3 / review-0140 N2）。
     let graceTimer = null
     let forceKillTimer = null
@@ -1212,44 +1212,131 @@ export function createCodexAdapter(options = {}) {
     }
 
     /**
-     * N2：每个 codex 子进程都有**独立**的退出确认记录。
+     * review-0141 M1：每个 spawn（初始 exec / 每次 resume / start 失败路径）都登记一份
+     * **进程组清理责任**，而不是只登记「组长进程」。
      *
-     * 初始 exec 与每次 `exec resume` 是不同的进程：初始进程退出不能证明续跑进程
-     * 已退出（review-0140 N2）。`cleanup.disposed` 只在整个 tracked 集合为空时成立，
-     * 而不是复用某一个布尔标志。
+     * 组长退出不等于进程组清空：codex 会拉起 MCP server，MCP / 工具后代可能比组长活得久。
+     * 因此记录不在 `exit` 时删除，只有 `kill(-pgid, 0)` 探针确认整组消失后才算清理完成。
+     * `cleanup.disposed` 只在整个集合为空时成立。
      */
-    const trackedChildren = new Set()
-    const trackChild = (spawned, kind) => {
-      const record = { kind, child: spawned, exitConfirmed: false }
-      record.exitPromise = new Promise(resolveExit => { record.confirmExit = resolveExit })
+    const trackedGroups = new Set()
+    const groupAlive = record => {
+      if (!record.exitConfirmed) return true
+      // spawn 失败（没有 pid）/ Windows 没有 POSIX 进程组：只能以组长退出为准。
+      if (record.pid === null || process.platform === 'win32') return false
+      try {
+        process.kill(-record.pid, 0)
+        return true
+      } catch (error) {
+        return Boolean(error && error.code === 'EPERM')
+      }
+    }
+    const pendingGroups = () => {
+      const pending = []
+      for (const record of trackedGroups) {
+        if (groupAlive(record)) pending.push(record)
+        else trackedGroups.delete(record)
+      }
+      return pending
+    }
+    const cleanupSnapshot = () => {
+      const pending = pendingGroups()
+      if (pending.length === 0) return { disposed: true }
+      return {
+        disposed: false,
+        pending: pending.map(record => record.kind),
+        processes: pending.map(record => ({ kind: record.kind, pid: record.pid })),
+        reason: `仍有 ${pending.length} 个 codex 进程组未确认退出（${pending.map(record => record.kind).join(' / ')}）`,
+      }
+    }
+
+    /**
+     * 独立的**最终清理 Promise**：只有所有被跟踪进程组确认消失才 resolve disposed:true。
+     *
+     * 旧的 runtime 侧只读一次 `handle.cleanup` 快照：dispose 返回 false 后，即使进程组
+     * 之后才退出也不会释放槽位（review-0141 M1 ③）。这个 Promise 由 dispose / start
+     * 失败路径启动、有界盯住进程组消失，让 runtime 可以等它 settle 再释放。
+     */
+    const FINAL_CLEANUP_WATCH_MS = Math.min(60_000, Math.max(5_000, settings.killTimeoutMs * 2 + 2_000))
+    let finalCleanupSettled = false
+    let resolveFinalCleanup = null
+    const cleanupFinal = new Promise(resolve => { resolveFinalCleanup = resolve })
+    const settleFinalCleanup = value => {
+      if (finalCleanupSettled) return
+      finalCleanupSettled = true
+      resolveFinalCleanup(value)
+    }
+    // 只用于「兜底盯守」：定时器 unref，进程可以随时退出，不会被它拖住。
+    const sleepUnref = ms => new Promise(resolveSleep => {
+      const timer = setTimeout(resolveSleep, ms)
+      timer.unref?.()
+    })
+    const watchFinalCleanup = () => {
+      ;(async () => {
+        const deadline = Date.now() + FINAL_CLEANUP_WATCH_MS
+        for (;;) {
+          const snapshot = cleanupSnapshot()
+          if (snapshot.disposed === true) {
+            settleFinalCleanup(snapshot)
+            return
+          }
+          const remaining = deadline - Date.now()
+          if (remaining <= 0) {
+            settleFinalCleanup({
+              ...snapshot,
+              timedOut: true,
+              reason: `${snapshot.reason}；最终清理等待 ${FINAL_CLEANUP_WATCH_MS}ms 超时`,
+            })
+            return
+          }
+          await sleepUnref(Math.min(remaining, 100))
+        }
+      })().catch(error => {
+        settleFinalCleanup({
+          disposed: false,
+          reason: `最终清理盯守失败：${error && error.message ? error.message : error}`,
+        })
+      })
+    }
+
+    const trackGroup = (spawned, kind) => {
+      const record = {
+        kind,
+        child: spawned,
+        pid: spawned.pid ?? null,
+        exitConfirmed: false,
+      }
       const confirmExit = () => {
         if (record.exitConfirmed) return
         record.exitConfirmed = true
-        trackedChildren.delete(record)
-        record.confirmExit()
       }
-      // `exit` 是物理退出的正式证据；spawn 失败（没有 pid）不会再有 exit。
-      spawned.once('exit', confirmExit)
+      // `exit` 是组长物理退出的正式证据；spawn 失败（没有 pid）不会再有 exit。
+      spawned.once('exit', () => {
+        confirmExit()
+        // 组长退出后，同组里可能还留着 MCP / 工具后代：顺手收一次。
+        if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', spawned)
+      })
       spawned.once('error', () => {
         if (!spawned.pid) confirmExit()
       })
-      trackedChildren.add(record)
+      trackedGroups.add(record)
       return record
     }
-    const pendingChildren = () => [...trackedChildren].filter(record => !record.exitConfirmed)
 
-    /** 有界等待所有被跟踪子进程退出；返回是否全部确认。 */
-    const waitTrackedExit = async timeoutMs => {
+    /** 有界等待所有被跟踪进程组（含组长已退出、后代仍活着的组）消失。 */
+    const waitTrackedGroupsGone = async timeoutMs => {
       const deadline = Date.now() + Math.max(0, timeoutMs)
       for (;;) {
-        const live = pendingChildren()
-        if (live.length === 0) return true
+        if (pendingGroups().length === 0) return true
         const remaining = deadline - Date.now()
         if (remaining <= 0) return false
-        await Promise.race([
-          Promise.all(live.map(record => record.exitPromise)),
-          sleep(remaining),
-        ])
+        await sleep(Math.min(remaining, 50))
+      }
+    }
+
+    const killAllTrackedGroups = signal => {
+      for (const record of trackedGroups) {
+        if (record.pid) killTree(signal, record.child)
       }
     }
 
@@ -1261,7 +1348,7 @@ export function createCodexAdapter(options = {}) {
         detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       })
-      trackChild(spawned, kind)
+      trackGroup(spawned, kind)
       return attach(spawned)
     }
 
@@ -1352,7 +1439,7 @@ export function createCodexAdapter(options = {}) {
     child.on('error', error => {
       state.spawnError = error
       // 没有 pid 时不会再触发 exit：立刻收口并让 hello 竞速快速失败（M2）。
-      // 退出确认由 trackChild 的 error 分支落账（没有 pid 才视为已退出）。
+      // 退出确认由 trackGroup 的 error 分支落账（没有 pid 才视为已退出）。
       if (!mainPid) {
         resolveExited({
           ok: false,
@@ -1365,11 +1452,9 @@ export function createCodexAdapter(options = {}) {
     child.on('exit', (code, signal) => {
       state.exitCode = code
       state.signal = signal
-      // N2：这里只确认**初始进程**退出；trackChild 已把该记录移出 tracked 集合。
+      // N2：这里只确认**初始进程**退出；组责任由 trackGroup 保留到整组确认消失。
       // 续跑进程由各自 spawn 时的记录独立确认，绝不复用这个事件。
-      // 子进程退出后，顺手收掉同一进程组里可能残留的 MCP server（只针对初始进程组；
-      // 提醒续跑由 resumeChild 自己的退出路径 + 宽限清理负责，别在这里打成活跃进程组）。
-      if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', child)
+      // 组长退出后的同组残留清理统一由 trackGroup 处理（每个 spawn 都有责任记录）。
       if (!channel.contacted && !state.canceled) earlyExitResolve?.({ code, signal })
       finishAfterNaturalExit().catch(error => {
         resolveExited({
@@ -1434,14 +1519,14 @@ export function createCodexAdapter(options = {}) {
        * 才报告 true；未确认时给出原因和仍存活的进程种类。
        */
       get cleanup() {
-        const pending = pendingChildren()
-        if (pending.length === 0) return { disposed: true }
-        return {
-          disposed: false,
-          pending: pending.map(record => record.kind),
-          reason: `仍有 ${pending.length} 个 codex 子进程未确认退出（${pending.map(record => record.kind).join(' / ')}）`,
-        }
+        return cleanupSnapshot()
       },
+      /**
+       * review-0141 M1 ③：独立的最终清理 Promise。只有所有被跟踪进程组确认消失
+       * 才 resolve `{disposed:true}`；有界超时会 resolve `{disposed:false,timedOut:true}`。
+       * runtime 等它 settle 后才释放槽位，不再只读一次快照。
+       */
+      cleanupFinal,
       cancel: reason => cancelHandle(handle, reason),
       dispose: () => disposeHandle(handle),
     }
@@ -1451,21 +1536,20 @@ export function createCodexAdapter(options = {}) {
       cancelHandle(handle, 'ctx.signal').catch(() => {})
     }
 
-    /** start 阶段失败的统一收尾：杀进程树、有界等退出、关通道、删 runDir。 */
+    /**
+     * review-0141 M1 ①：start 阶段失败也必须等**物理清理**。
+     *
+     * 旧实现等的是逻辑 `exited`（失败路径上早已 resolve），SIGTERM 被忽略时
+     * 会在进程还活着时就抛出 NODE_FINISH_TOOL_UNAVAILABLE。现在按进程组有界等待，
+     * 未确认就如实返回 `disposed:false + reason`（挂到错误对象上供调用方识别）。
+     */
     const cleanupAfterStartFailure = async () => {
-      killTree('SIGTERM')
-      forceKillTimer = setTimeout(() => {
-        forceKillTimer = null
-        killTree('SIGKILL')
-        if (resumeChild) killTree('SIGKILL', resumeChild)
-      }, settings.killTimeoutMs)
-      forceKillTimer.unref?.()
-      await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
-      if (!exitedDone) {
-        killTree('SIGKILL')
-        await Promise.race([exited, sleep(1_000)])
+      killAllTrackedGroups('SIGTERM')
+      let gone = await waitTrackedGroupsGone(settings.killTimeoutMs)
+      if (!gone) {
+        killAllTrackedGroups('SIGKILL')
+        gone = await waitTrackedGroupsGone(1_000)
       }
-      if (resumeChild) killTree('SIGKILL', resumeChild)
       removeSignalListener()
       try {
         await channel.close()
@@ -1473,6 +1557,18 @@ export function createCodexAdapter(options = {}) {
         // ignore
       }
       await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
+      // 仍有活着的进程组时，最终清理 Promise 会继续有界盯守到它们消失/超时。
+      watchFinalCleanup()
+      return { cleanup: cleanupSnapshot(), cleanupFinal, gone }
+    }
+
+    /** 把物理清理信号挂到 start 失败错误上（runtime / 探针按此判断是否已清理）。 */
+    const attachCleanup = (error, outcome) => {
+      if (error && typeof error === 'object' && outcome) {
+        error.cleanup = outcome.cleanup
+        error.cleanupFinal = outcome.cleanupFinal
+      }
+      return error
     }
 
     // 等 MCP server 第一次连上通道：说明 codex 真的把它拉起来了（probe 已验证工具可调用）。
@@ -1493,12 +1589,12 @@ export function createCodexAdapter(options = {}) {
       if (!contacted) {
         if (state.canceled) {
           abortGate('canceled')
-          await cleanupAfterStartFailure()
-          throw new CodexAdapterError(
+          const cleanupOutcome = await cleanupAfterStartFailure()
+          throw attachCleanup(new CodexAdapterError(
             'NODE_FINISH_CANCELED',
             'Codex 活动在 MCP 握手期间被取消（finish.sock 与 runDir 已清理）',
             { adapterId: CODEX_ADAPTER_ID, reason: 'canceled-during-handshake' },
-          )
+          ), cleanupOutcome)
         }
         if (!finishGate.settled()) {
           abortGate('mcp-handshake-failed')
@@ -1511,8 +1607,8 @@ export function createCodexAdapter(options = {}) {
                 : 'Codex 没有启动本插件的 MCP 完成通道（tool 不可见），按 11 §1.6 失败',
             })
           }
-          await cleanupAfterStartFailure()
-          throw new CodexAdapterError(
+          const cleanupOutcome = await cleanupAfterStartFailure()
+          throw attachCleanup(new CodexAdapterError(
             ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
             outcome === 'spawn-failed'
               ? `Codex 进程无法启动（${state.spawnError && state.spawnError.code ? state.spawnError.code : 'unknown'}）`
@@ -1526,7 +1622,7 @@ export function createCodexAdapter(options = {}) {
                 ? { cause: state.spawnError.code }
                 : {}),
             },
-          )
+          ), cleanupOutcome)
         }
       }
     }
@@ -1553,20 +1649,18 @@ export function createCodexAdapter(options = {}) {
           state.cancelReason = typeof reason === 'string' && reason !== '' ? reason : 'canceled'
           abortGate(state.cancelReason)
           cancelSignalResolve?.()
-          killTree('SIGTERM')
+          // 每个 spawn 都登记过进程组：取消时把所有组一起收掉（含组长已退出的 resume 组）。
+          killAllTrackedGroups('SIGTERM')
           forceKillTimer = setTimeout(() => {
             forceKillTimer = null
-            killTree('SIGKILL')
-            if (resumeChild) killTree('SIGKILL', resumeChild)
+            killAllTrackedGroups('SIGKILL')
           }, settings.killTimeoutMs)
           forceKillTimer.unref?.()
-          if (resumeChild) killTree('SIGTERM', resumeChild)
         }
         // 有界 grace：先等自然退出 / SIGKILL 生效。
         await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
         if (!exitedDone) {
-          killTree('SIGKILL')
-          if (resumeChild) killTree('SIGKILL', resumeChild)
+          killAllTrackedGroups('SIGKILL')
           await Promise.race([exited, sleep(1_000)])
         }
         if (!exitedDone) {
@@ -1602,13 +1696,12 @@ export function createCodexAdapter(options = {}) {
           message: 'Codex 句柄释放时仍未确认进程退出，按取消收口',
         })
       }
-      // 兜底：即使 codex 已经退出，也清掉同进程组里可能残留的 MCP server 子进程。
-      killTree('SIGKILL')
-      if (resumeChild) killTree('SIGKILL', resumeChild)
-      // N2：有界等待**所有**被跟踪进程的 exit；未确认就保留 disposed:false。
+      // 兜底：即使 codex 已经退出，也清掉所有被跟踪进程组里残留的 MCP / 工具后代。
+      killAllTrackedGroups('SIGKILL')
+      // M1：有界等待**所有进程组**消失（组长已退出、后代仍活着的组也算未清理）。
       // 这里绝不把「发出了 SIGKILL」当成「进程已退出」——killImpl 可能没生效，
       // resume 进程也可能忽略信号并继续存活。
-      await waitTrackedExit(settings.killTimeoutMs)
+      await waitTrackedGroupsGone(settings.killTimeoutMs)
       removeSignalListener()
       try {
         await channel.close()
@@ -1616,6 +1709,8 @@ export function createCodexAdapter(options = {}) {
         // ignore
       }
       await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
+      // 独立最终清理 Promise：dispose 返回后组才退出，也要让 runtime 能看到 disposed:true。
+      watchFinalCleanup()
     }
 
     return handle

@@ -21,6 +21,7 @@
 
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import {
   chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile,
 } from 'node:fs/promises'
@@ -62,6 +63,8 @@ export const RESOURCE_ERROR = Object.freeze({
   SNAPSHOT_CORRUPT: 'RESOURCE_SNAPSHOT_CORRUPT',
   LOCK_TIMEOUT: 'RESOURCE_LOCK_TIMEOUT',
   LOCK_FAILED: 'RESOURCE_LOCK_FAILED',
+  /** 持锁 helper 在持有期间退出：临界区的互斥保证已失效，必须中止。 */
+  LOCK_LOST: 'RESOURCE_LOCK_LOST',
   WRITE_FAILED: 'RESOURCE_WRITE_FAILED',
 })
 
@@ -77,8 +80,6 @@ const MAX_RESOURCE_EVENT_BYTES = 8 * 1024
 const LOCK_WAIT_MS = 15 * 1000
 
 let tmpCounter = 0
-
-const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
 
 /** 带 code 的资源错误。 */
 export class ResourceError extends Error {
@@ -209,10 +210,15 @@ export const RESOURCE_LOCK_VERSION = 1
  * 里面的 owner/pid 只用于排障，不参与任何 stale / 抢占判定。
  */
 const KERNEL_LOCK_BIN = process.env.FLOW_STUDIO_FLOCK_BIN || 'flock'
-// 拿到锁后先打标记（父进程据此确认已持有），再由 cat 阻塞读 stdin；关闭 stdin
-// 即 EOF → cat 退出 → 内核释放 flock。整个过程没有按路径 unlink/rename。
-const KERNEL_LOCK_COMMAND = 'echo locked; exec cat >/dev/null'
+// 宿主自己打开锁文件，并把 fd 副本交给 helper 的 fd 3；`flock -x -w N 3` 是
+// util-linux 的「按 fd 加锁」形式。flock(2) 的锁挂在**打开文件描述**上，宿主与
+// helper 共享同一个描述：helper 单独死亡只关闭它自己那份 fd，宿主仍持有锁
+// （review-0141 M9）。helper 仍保留用于观测——它在持有期间退出说明守卫已降级，
+// 临界区会通过 AbortSignal / assertHeld() 感知并中止后续写入。
+const KERNEL_LOCK_COMMAND = 'bin=$2; "$bin" -x -w "$1" 3; status=$?; [ "$status" -eq 0 ] || exit "$status"; echo locked; exec cat >/dev/null'
 const KERNEL_LOCK_RELEASE_MS = 2_000
+/** 失锁后给异步回调自我中止的窗口：之后才关闭宿主 fd、真正放掉内核锁。 */
+const LOCK_LOSS_ABORT_GRACE_MS = 1_500
 /** 'unknown' | 'available' | 'unavailable'；首次 acquire 后定案。 */
 let kernelLockState = 'unknown'
 /** 进程内队列：Windows / 找不到 flock 时的退路。 */
@@ -220,14 +226,109 @@ const processLockQueues = new Map()
 
 /** spawn 层面的「后端不可用」错误：只对它们退回进程内队列。 */
 function backendUnavailable(error) {
-  return Boolean(error && typeof error.code === 'string'
+  if (!error) return false
+  // sh 找不到 flock（命令不存在）时退出码 127：宿主 fd 形式无法使用。
+  if (error.exitCode === 127) return true
+  return Boolean(typeof error.code === 'string'
     && ['ENOENT', 'EACCES', 'ENOSYS', 'EPERM'].includes(error.code))
 }
 
-/** 等一个已 spawn 的子进程退出（已经退出则立即 resolve）。 */
-function waitChildExit(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
-  return new Promise(resolveWait => { child.once('exit', () => resolveWait()) })
+/** 进程是否仍存在（EPERM = 存在但不可发信号，仍算活着）。 */
+function processAlive(pid) {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && error.code === 'EPERM')
+  }
+}
+
+function childExited(child) {
+  return child.exitCode !== null || child.signalCode !== null
+}
+
+/** Linux：进程已退出但还没被父进程回收时是僵尸（zombie），fd 已关闭。 */
+function isZombie(pid) {
+  if (process.platform !== 'linux' || !pid) return false
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const close = stat.lastIndexOf(')')
+    // /proc/<pid>/stat: "pid (comm) STATE ..."；comm 里可能有空格 / 括号，取最后一个 ')'。
+    const state = close >= 0 ? stat.slice(close + 1).trim().charAt(0) : ''
+    return state === 'Z' || state === 'X'
+  } catch {
+    // 读不到 = 已不存在。
+    return true
+  }
+}
+
+/**
+ * helper 是否已退出：`exit` 事件是异步的，同步回调不能依赖它。
+ *
+ * 这里额外做同步探针（`kill(pid, 0)` + Linux 僵尸态），让 `assertHeld()` 在
+ * 同步写入路径上也能立刻拒绝——helper 被杀掉但事件还没派发时同样算失锁。
+ * 非 Linux 只能等 exit 事件；但锁本身在宿主 fd 上，第二个获取者仍会被内核挡住。
+ */
+function helperGone(child) {
+  if (childExited(child)) return true
+  if (!processAlive(child.pid)) return true
+  return isZombie(child.pid)
+}
+
+/**
+ * 有界等待子进程退出（已退出则立即 resolve）。
+ *
+ * 定时器在「退出先到」时被 clearTimeout，绝不像旧实现那样把一个 ref 着的
+ * `sleep(...)` 留在事件循环里（review-0141 MINOR：锁 13ms 返回、进程多活 2s）。
+ */
+function waitChildExitBounded(child, timeoutMs) {
+  return new Promise(resolveWait => {
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolveWait(value)
+    }
+    const onExit = () => finish(true)
+    const timer = setTimeout(() => finish(false), Math.max(1, timeoutMs))
+    if (childExited(child)) {
+      finish(true)
+      return
+    }
+    child.once('exit', onExit)
+  })
+}
+
+/** 收掉 helper 的整个进程组（sh + flock 子进程），避免超时后留下等待者。 */
+function killLockHelper(child, signal) {
+  if (!child || !child.pid) return
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      // 已经退出
+    }
+  }
+}
+
+/** 有界等待一个 Promise settle；返回是否在期限内 settle（定时器同样会被清理）。 */
+function waitSettledBounded(promise, timeoutMs) {
+  return new Promise(resolveWait => {
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveWait(value)
+    }
+    const timer = setTimeout(() => finish(false), Math.max(1, timeoutMs))
+    promise.then(() => finish(true), () => finish(true))
+  })
 }
 
 /** 锁文件先以 0600 建好并常驻；flock 只把它当 inode 锚点。 */
@@ -257,39 +358,127 @@ async function writeHolderInfo(lockPath, owner) {
 }
 
 /**
+ * 确认 fd 形式的 flock 真的生效：只要宿主还持有锁，按路径的 `flock -n` 必须失败。
+ *
+ * 这一步仅在进程内第一次获取时跑一次。有的平台（非 util-linux 的 flock）会把
+ * fd 参数当成普通文件名，从而「成功」锁定一个无关文件——那会静默失去跨进程
+ * 互斥，必须识别出来并退回进程内队列（明确降级，而不是假装安全）。
+ */
+function verifyKernelLockHeld(lockPath) {
+  return new Promise(resolveProbe => {
+    let probe
+    try {
+      probe = spawn(KERNEL_LOCK_BIN, ['-n', lockPath, '-c', 'true'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        windowsHide: true,
+      })
+    } catch {
+      resolveProbe('error')
+      return
+    }
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveProbe(value)
+    }
+    const timer = setTimeout(() => {
+      try {
+        probe.kill('SIGKILL')
+      } catch {
+        // 已经退出
+      }
+      finish('timeout')
+    }, 3_000)
+    probe.once('error', () => finish('error'))
+    probe.once('exit', code => finish(code === 0 ? 'free' : 'held'))
+  })
+}
+
+/**
  * 用 util-linux `flock` 在 `<lockPath>` 上持有内核排他锁。
  *
- * `-F/--no-fork` 让 flock 直接 exec shell，锁 fd 由 `cat` 继承并一直持有；
- * `-w` 只是内核侧的兜底，JS 计时器负责毫秒级 waitMs。返回的 `release()`
- * 关闭 stdin 并等持锁进程退出，确保「await 返回后锁真的已释放」。
+ * 锁在**宿主打开的 fd** 上（helper 的 fd 3 是它的副本，见 KERNEL_LOCK_COMMAND）：
+ * helper 单独死亡不再释放互斥。helper 仍被监听——持有期间退出会让临界区通过
+ * `signal` / `assertHeld()` 感知失锁；`release()` 有界等 helper 退出后关闭宿主
+ * fd，确保「await 返回后锁真的已释放」。
+ *
+ * @returns {Promise<{signal:AbortSignal, lostSignal:Promise<Error>, assertHeld:()=>void, release:()=>Promise<void>}>}
  */
 async function acquireKernelLock(lockPath, waitMs) {
   const startedAt = Date.now()
   const timeoutSeconds = Math.max(1, Math.ceil(Math.max(1, waitMs) / 1000))
-  const child = spawn(KERNEL_LOCK_BIN, [
-    '-x', '-w', String(timeoutSeconds), '-F', lockPath, 'sh', '-c', KERNEL_LOCK_COMMAND,
-  ], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-  })
+  let lockFd
+  try {
+    lockFd = await open(lockPath, 'a', FILE_MODE)
+    await lockFd.chmod(FILE_MODE).catch(() => {})
+  } catch (error) {
+    throw fail(RESOURCE_ERROR.LOCK_FAILED, `打开资源锁文件失败：${error?.message ?? error}`, {
+      path: lockPath,
+      cause: error,
+    })
+  }
+  let child
+  try {
+    child = spawn('sh', [
+      '-c', KERNEL_LOCK_COMMAND, 'flow-studio-lock', String(timeoutSeconds), KERNEL_LOCK_BIN,
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe', lockFd.fd],
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+    })
+  } catch (error) {
+    await lockFd.close().catch(() => {})
+    throw fail(RESOURCE_ERROR.LOCK_FAILED, `启动 flock helper 失败：${error?.message ?? error}`, {
+      path: lockPath,
+      cause: error,
+    })
+  }
   let stdout = ''
   let stderr = ''
   let settled = false
+  let acquired = false
+  let releasing = false
+  let lostError = null
+  let resolveLost = null
   let timer = null
-  // 子进程可能先退出（超时 / 后端报错），此时写 stdin 会 EPIPE；不能让它变成未捕获异常。
+  const lostSignal = new Promise(resolvePromise => { resolveLost = resolvePromise })
+  const controller = new AbortController()
+  // helper 可能先退出（超时 / 后端报错），此时写 stdin 会 EPIPE；不能让它变成未捕获异常。
   child.stdin.on('error', () => {})
   child.stdout.on('error', () => {})
   child.stderr.on('error', () => {})
+
+  const createLostError = (code, signal) => fail(
+    RESOURCE_ERROR.LOCK_LOST,
+    `资源锁 helper 在持有期间退出（${signal || code || 'unknown'}），临界区已无法确认互斥：${lockPath}`,
+    {
+      path: lockPath,
+      ...(signal ? { signal } : (typeof code === 'number' ? { exitCode: code } : {})),
+    },
+  )
+  const markLost = (code, signal) => {
+    if (lostError !== null || releasing) return
+    lostError = createLostError(code, signal)
+    try {
+      controller.abort(lostError)
+    } catch {
+      // abort 不应失败；失败也保留 lostError。
+    }
+    resolveLost?.(lostError)
+  }
+
   return await new Promise((resolveAcquire, rejectAcquire) => {
     const finishReject = error => {
-      if (settled) return
+      if (acquired || settled) return
       settled = true
-      if (timer !== null) clearTimeout(timer)
-      try {
-        child.kill('SIGKILL')
-      } catch {
-        // 已经退出
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
       }
+      killLockHelper(child, 'SIGKILL')
+      lockFd.close().catch(() => {})
       rejectAcquire(error)
     }
     timer = setTimeout(() => {
@@ -302,26 +491,42 @@ async function acquireKernelLock(lockPath, waitMs) {
     timer.unref?.()
     child.stdout.on('data', chunk => {
       stdout += String(chunk)
-      if (settled || !stdout.includes('locked')) return
+      if (acquired || settled || !stdout.includes('locked')) return
+      acquired = true
       settled = true
-      if (timer !== null) clearTimeout(timer)
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
       resolveAcquire({
+        signal: controller.signal,
+        lostSignal,
+        get lost() { return lostError !== null },
+        get lostError() { return lostError },
+        assertHeld() {
+          if (lostError !== null) throw lostError
+          if (!helperGone(child)) return
+          markLost(child.exitCode, child.signalCode)
+          // 防御：release 期间 markLost 会跳过置位，断言也绝不能抛 null / undefined。
+          if (lostError === null) lostError = createLostError(child.exitCode, child.signalCode)
+          throw lostError
+        },
         async release() {
+          if (releasing) return
+          releasing = true
           try {
             child.stdin.end()
           } catch {
             // 已经退出
           }
-          // 等内核真正释放锁：不能让调用方在锁仍被持有时继续。
-          await Promise.race([waitChildExit(child), sleep(KERNEL_LOCK_RELEASE_MS)])
-          if (child.exitCode === null && child.signalCode === null) {
-            try {
-              child.kill('SIGKILL')
-            } catch {
-              // 已经退出
-            }
-            await Promise.race([waitChildExit(child), sleep(1_000)])
+          // 等 helper 退出；有界且定时器随退出清理。
+          const exited = await waitChildExitBounded(child, KERNEL_LOCK_RELEASE_MS)
+          if (!exited) {
+            killLockHelper(child, 'SIGKILL')
+            await waitChildExitBounded(child, 1_000)
           }
+          // 宿主 fd 是锁描述的最后一份引用：关闭后内核才真正释放。
+          await lockFd.close().catch(() => {})
         },
       })
     })
@@ -329,10 +534,18 @@ async function acquireKernelLock(lockPath, waitMs) {
       stderr = (stderr + String(chunk)).slice(-2_048)
     })
     child.once('error', error => finishReject(error))
-    child.once('exit', code => {
+    child.once('exit', (code, signal) => {
+      if (acquired) {
+        markLost(code, signal)
+        return
+      }
       if (settled) return
       settled = true
-      if (timer !== null) clearTimeout(timer)
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      lockFd.close().catch(() => {})
       const elapsed = Date.now() - startedAt
       const timedOut = elapsed >= Math.max(1, waitMs) - 50 || (code === 1 && elapsed >= waitMs / 2)
       rejectAcquire(fail(
@@ -347,14 +560,24 @@ async function acquireKernelLock(lockPath, waitMs) {
 }
 
 /** 进程内串行队列：只保证同进程互斥（Windows / 无 flock 的退路）。 */
-async function withProcessQueue(lockPath, task) {
+async function withProcessQueue(lockPath, task, waitMs) {
   const key = resolve(lockPath)
   const previous = processLockQueues.get(key) ?? Promise.resolve()
   let releaseGate
   const gate = new Promise(resolveGate => { releaseGate = resolveGate })
   const tail = previous.then(() => gate)
   processLockQueues.set(key, tail)
-  await previous.catch(() => {})
+  // review-0141 MINOR：降级队列以前忽略 waitMs（35ms 请求实际等 181ms 还进入）。
+  const acquired = await waitSettledBounded(previous.catch(() => {}), waitMs)
+  if (!acquired) {
+    releaseGate()
+    if (processLockQueues.get(key) === tail) processLockQueues.delete(key)
+    throw fail(
+      RESOURCE_ERROR.LOCK_TIMEOUT,
+      `等待资源锁超时（${waitMs}ms）：${lockPath}`,
+      { path: lockPath },
+    )
+  }
   try {
     return await task()
   } finally {
@@ -379,11 +602,16 @@ export function resourceLockBackend() {
  * 内核自动释放，不存在「读旧 owner → 按路径删除/搬走」的 check-then-delete
  * 窗口，因此不会误删 / 搬走继任者的活锁（review-0140 N3）。
  *
+ * review-0141 M9：锁由**宿主进程自己的 fd** 持有，helper 只负责调用 flock(2)；
+ * helper 单独死亡不再等于失锁。持有期间 helper 退出会 abort 回调的 signal 并
+ * 让 `assertHeld()` 抛 `RESOURCE_LOCK_LOST`；`withResourceLock` 在释放内核锁前
+ * 有界等待回调中止，因此第二个获取者不会与仍在写盘的宿主同时进入。
+ *
  * `ttlMs` 仅为兼容旧调用保留：flock 后端不使用 TTL（活锁不需要续租，死锁由
  * 内核判定），进程内退路也不需要。
  *
  * @param {string} lockPath
- * @param {() => Promise<any>} task
+ * @param {(context?: {signal: AbortSignal, lockPath: string, assertHeld: () => void}) => Promise<any>} task
  * @param {{ttlMs?:number, waitMs?:number}} [options]
  */
 export async function withResourceLock(lockPath, task, options = {}) {
@@ -406,18 +634,56 @@ export async function withResourceLock(lockPath, task, options = {}) {
       kernelLockState = 'unavailable'
     }
     if (kernelLock !== null) {
+      if (kernelLockState === 'unknown') {
+        const verification = await verifyKernelLockHeld(lockPath)
+        if (verification === 'free') {
+          // 后端能跑但 fd 锁不成立（非 util-linux 语义）：明确降级，不假装跨进程互斥。
+          kernelLockState = 'unavailable'
+          await kernelLock.release()
+          return await withProcessQueue(lockPath, task, waitMs)
+        }
+        if (verification !== 'held') {
+          await kernelLock.release()
+          throw fail(
+            RESOURCE_ERROR.LOCK_FAILED,
+            `flock 后端自检失败（${verification}）：${lockPath}`,
+            { path: lockPath, verification },
+          )
+        }
+      }
       kernelLockState = 'available'
       // 诊断信息：owner token 与 pid 只用于排障，不参与互斥 / stale 判定。
       await writeHolderInfo(lockPath, `${process.pid}-${randomBytes(8).toString('hex')}`)
+      const context = {
+        signal: kernelLock.signal,
+        lockPath,
+        assertHeld: () => kernelLock.assertHeld(),
+      }
+      const taskPromise = Promise.resolve().then(() => task(context))
+      let outcome
       try {
-        return await task()
+        // 「任务正常结束」与「helper 死亡」竞速：失锁时即使回调没抛错也不能返回成功。
+        outcome = await Promise.race([
+          taskPromise.then(value => ({ ok: true, value }), error => ({ ok: false, error })),
+          kernelLock.lostSignal.then(error => ({ ok: false, error, lost: true })),
+        ])
+        // 任务结束、释放之前再同步确认一次：同步回调路径里 helper 的 exit
+        // 事件可能还没派发，只有 `kill(pid, 0)` 探针能立刻发现它已经死了。
+        if (outcome.ok === true) kernelLock.assertHeld()
       } finally {
+        // 失锁时先给异步回调一个自我中止的窗口，再释放宿主 fd——
+        // 否则回调可能在第二个持有者进入之后继续写盘。
+        if (!outcome || outcome.ok === false) {
+          await waitSettledBounded(taskPromise, LOCK_LOSS_ABORT_GRACE_MS)
+        }
         await kernelLock.release()
       }
+      if (outcome.ok !== true) throw outcome.error
+      return outcome.value
     }
   }
 
-  return await withProcessQueue(lockPath, task)
+  return await withProcessQueue(lockPath, task, waitMs)
 }
 
 /** 资源记录形状校验（读 / 写共用）。 */
@@ -522,8 +788,10 @@ export async function writeResourceRecord({ registryRoot, record } = {}) {
   })
   const lockPath = join(resolve(registryRoot), normalized.workspaceId, '.lock')
   await ensureDir(resolve(path, '..'))
-  return await withResourceLock(lockPath, async () => {
+  return await withResourceLock(lockPath, async lock => {
+    lock?.assertHeld?.()
     await writeTextAtomic(path, `${JSON.stringify(normalized, null, 2)}\n`)
+    lock?.assertHeld?.()
     return { ...normalized }
   })
 }
@@ -535,12 +803,17 @@ export async function removeResourceRecord({ registryRoot, workspaceId, instance
   }
   const path = recordPath({ registryRoot, workspaceId, instanceId })
   const lockPath = join(resolve(registryRoot), workspaceId, '.lock')
-  return await withResourceLock(lockPath, async () => {
+  return await withResourceLock(lockPath, async lock => {
+    lock?.assertHeld?.()
     try {
       await unlink(path)
+      lock?.assertHeld?.()
       return true
     } catch (error) {
-      if (error && error.code === 'ENOENT') return false
+      if (error && error.code === 'ENOENT') {
+        lock?.assertHeld?.()
+        return false
+      }
       throw error
     }
   })
@@ -651,8 +924,10 @@ export async function writeWorkspaceSnapshot({ instancesRoot, instanceId, snapsh
   const path = workspaceSnapshotPath(instancesRoot, id)
   await ensureDir(resolve(path, '..'))
   const lockPath = join(resourceDirFor(instancesRoot, id), '.lock')
-  return await withResourceLock(lockPath, async () => {
+  return await withResourceLock(lockPath, async lock => {
+    lock?.assertHeld?.()
     await writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`)
+    lock?.assertHeld?.()
     return value
   })
 }
@@ -692,7 +967,8 @@ export async function appendResourceEvent({ instancesRoot, instanceId, event, no
   const at = typeof now === 'function' && now() instanceof Date
     ? now().toISOString()
     : new Date().toISOString()
-  return await withResourceLock(lockPath, async () => {
+  return await withResourceLock(lockPath, async lock => {
+    lock?.assertHeld?.()
     const state = await readResourceState(instancesRoot, id)
     const seq = state.resourceSeq + 1
     const normalized = { ...event, seq, at }
@@ -704,8 +980,11 @@ export async function appendResourceEvent({ instancesRoot, instanceId, event, no
         { instanceId: id, type: event.type },
       )
     }
+    lock?.assertHeld?.()
     await writeTextAtomic(join(dir, 'state.json'), `${JSON.stringify({ v: RESOURCE_STATE_VERSION, resourceSeq: seq }, null, 2)}\n`)
+    lock?.assertHeld?.()
     await writeFile(join(dir, 'events.jsonl'), line, { encoding: 'utf8', mode: FILE_MODE, flag: 'a' })
+    lock?.assertHeld?.()
     return { seq, event: normalized }
   })
 }

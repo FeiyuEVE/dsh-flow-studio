@@ -298,3 +298,48 @@ test('失败文案保留服务端原因；客户端缺接口时面板不崩', as
   const tree = await harness.flush()
   assert.match(textOfNode(tree), /当前客户端没有指标接口/)
 })
+
+// ── 0.14.5 M7：null 桶显示「未知」、partial 总量标「部分」，绝不默认成 0 ─────────
+
+test('M7：null 桶显示未知；partial 总量标「部分」；覆盖率含部分', () => {
+  const partialUsage = {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, partial: true,
+  }
+  assert.equal(formatTokens(partialUsage), '部分')
+  assert.equal(formatTokens({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 }), '0')
+  assert.equal(
+    tokenBreakdownText(partialUsage),
+    '输入 10 · 缓存读 未知 · 缓存写 未知 · 输出 未知',
+    '未观测桶必须写「未知」，不能渲染成 0',
+  )
+  assert.equal(coverageText({ known: 1, partial: 2, unknown: 0 }), '已观测 1 · 部分 2 · 未知 0')
+  assert.equal(coverageText({ known: 0, unknown: 2 }), '已观测 0 · 未知 2', 'partial=0 时不额外显示「部分」')
+})
+
+test('M7：面板把 null 桶与 partial 总量如实上屏', async () => {
+  const payload = {
+    ...INSTANCE_METRICS,
+    schemaVersion: 2,
+    agent: {
+      invocations: 1,
+      modelCalls: 1,
+      observedTokens: {
+        input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, partial: true,
+      },
+      observedTokensPartial: {
+        input: 10, cacheRead: null, cacheWrite: null, output: null,
+      },
+      usageCoverage: { known: 0, partial: 1, unknown: 0 },
+      buckets: { seen: ['input'], missing: ['cacheRead', 'cacheWrite', 'output'], complete: false },
+    },
+    dataQuality: { skippedEvents: 0, skippedResources: 0, reasons: ['usage-partial'] },
+  }
+  const client = { async readInstanceMetrics() { return payload } }
+  const harness = createHarness(InstanceMetricsPanel, { client, instanceId: 'i-1', instanceStatus: 'ACTIVE' })
+  const tree = await harness.flush()
+  const text = textOfNode(tree)
+  assert.match(text, /观测 token部分/)
+  assert.match(text, /输入 10 · 缓存读 未知 · 缓存写 未知 · 输出 未知/)
+  assert.match(text, /已观测 0 · 部分 1 · 未知 0/)
+  assert.match(text, /部分调用只观测到部分桶/)
+})

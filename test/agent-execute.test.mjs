@@ -133,6 +133,7 @@ function makeFakeAdapter(behavior = {}) {
         exited,
         usage: behavior.usage,
         usageCalls: behavior.usageCalls,
+        usageSnapshots: behavior.usageSnapshots,
         disposed: false,
         cancelCalls: [],
         finish: resolveExited,
@@ -742,7 +743,8 @@ await check('usage 遥测：超时 / 取消 / NODE_FINISH_MISSING 都保留已�
   const usageCalls = () => [{
     provider: 'dsh',
     callId: 'call-1',
-    usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 3 },
+    // 显式上报 cacheWrite=0：缺桶现在是 null，完整 total（15）必须由夹具给全四桶。
+    usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 0 },
   }]
   const telemetryCapabilities = {
     finishTool: 'native',
@@ -1230,12 +1232,81 @@ await check('集成·F9 dispose 永不返回：槽位 / activeAgents 仍保留�
   // handler 的 finally 与实例读回不共享同一个 await 链：满量程跑全量套件时（机器被
   // 别的套件压满），dispose 可能比 readInstance 晚一拍才发起。这里做有界轮询而不是
   // 赌「同一 tick」，否则用例会被负载抖成假红。
-  for (let waited = 0; waited < 2000 && disposeAttempts === 0; waited += 25) {
+  //
+  // 0.14.5：2000ms 在 `node --test <多文件>` 的并行调度下仍会偶发假红（已用 c57e0f4
+  // 基线在同样并行负载下复现同一失败），放宽到 10s。断言不变——dispose 没发起仍然失败，
+  // 这里只是不想拿调度延迟当产品缺陷。
+  for (let waited = 0; waited < 10_000 && disposeAttempts === 0; waited += 25) {
     await new Promise(resolveWait => setTimeout(resolveWait, 25))
   }
   A.equal(disposeAttempts, 1, 'dispose 必须发起一次')
   A.equal(runtime._activeAgents.get(created.id), 1, 'dispose 未确认前必须保留 activeAgents 占用')
   A.equal(runtime.executionLimits.snapshot().active, 1, 'dispose 未确认前必须保留执行槽位')
+})
+
+// 0.14.5：可选的 `handle.usageSnapshots()`（结算快照）必须与 usageCalls 一起落盘，
+// 失败路径（超时 / 取消 / 未 finish）同样不能只落调用不落快照。
+await check('usage 快照：可选 usageSnapshots 落成 agent/usage-snapshot（失败路径也落）', async () => {
+  const workspace = freshWorkspace()
+  const observedBuckets = ['input', 'cacheRead', 'cacheWrite', 'output']
+  const adapter = makeFakeAdapter({
+    capabilities: { finishTool: 'native', hooks: { 'turn.stop': 'native' }, usage: 'native' },
+    usageCalls: () => [{
+      provider: 'claude',
+      callId: 'claude-message-v1:base',
+      usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11, canonical: 1 },
+      observedBuckets,
+      source: 'assistant',
+    }],
+    usageSnapshots: () => [{
+      provider: 'claude',
+      snapshotId: 'claude-result-v1:base',
+      scope: 'invocation',
+      usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40, canonical: 1 },
+      observedBuckets,
+      provenance: { contract: 'claude-result-usage-v1', realCliVerified: false },
+    }],
+    run() { return new Promise(() => {}) }, // 永不结算 → 走超时失败路径
+    onCancel(handle) { handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 }) },
+  })
+  const failure = await executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-snapshot', variables: {}, timeoutMs: 30,
+  }, { adapters: registryWith(adapter), workspaceRoot: workspace }).catch(error => error)
+
+  A.equal(failure.code, 'BPMN_ACTIVITY_TIMEOUT')
+  A.ok(Array.isArray(failure.events), '失败路径必须携带已观测事件')
+  const calls = failure.events.filter(event => event.type === 'agent/usage')
+  A.equal(calls.length, 1, '调用事实照旧落盘')
+  A.deepEqual(calls[0].observedBuckets, observedBuckets, 'observedBuckets 必须保留')
+  const snapshots = failure.events.filter(event => event.type === 'agent/usage-snapshot')
+  A.equal(snapshots.length, 1, '结算快照必须转成 agent/usage-snapshot 事件')
+  A.equal(snapshots[0].scope, 'invocation')
+  A.equal(snapshots[0].usage.total, 40)
+  A.equal(snapshots[0].invocationId, 'exec-snapshot:invoke-1', '快照必须挂到本次 invocation')
+  A.equal(snapshots[0].provenance.contract, 'claude-result-usage-v1')
+  for (const event of failure.events) {
+    A.ok(Buffer.byteLength(JSON.stringify(event), 'utf8') < 8 * 1024, `${event.type} 事件必须 < 8 KiB`)
+  }
+})
+
+// 0.14.5：适配器宣称 native 但 calls 与 snapshots 都为空 → 仍只发一条 synthetic unknown，
+// 且 synthetic 记录不能算一次已识别模型调用（指标层规则，事件侧只留标记）。
+await check('usage 快照：只有 synthetic 未知记录时仍保留 synthetic 标记', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({
+    capabilities: { finishTool: 'native', hooks: { 'turn.stop': 'native' }, usage: 'native' },
+    usageCalls: () => [],
+    usageSnapshots: () => [],
+    run() { return new Promise(() => {}) },
+    onCancel(handle) { handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 }) },
+  })
+  const failure = await executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-synthetic', variables: {}, timeoutMs: 30,
+  }, { adapters: registryWith(adapter), workspaceRoot: workspace }).catch(error => error)
+  const usage = failure.events.filter(event => event.type === 'agent/usage')
+  A.equal(usage.length, 1)
+  A.equal(usage[0].trust, 'unknown')
+  A.equal(usage[0].synthetic, true, '未知占位必须显式标 synthetic')
 })
 
 try {

@@ -80,7 +80,7 @@ test('未知不是零：无 usage 时 observedTokens=null，并在 reasons 记�
   assert.equal(metrics.agent.observedTokens, null, '没有 usage 不能给 0 token')
   assert.equal(metrics.agent.modelCalls, 0)
   assert.equal(metrics.agent.invocations, 0)
-  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, unknown: 0 })
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 0, unknown: 0 })
   assert.equal(metrics.complete, true)
   assert.equal(metrics.duration.wallMs, 10_000)
 })
@@ -98,7 +98,7 @@ test('有 agent 调用但没有 usage 事件 → modelCalls null、unknown 覆�
   assert.equal(metrics.agent.invocations, 1)
   assert.equal(metrics.agent.modelCalls, null, '没有底层观测时模型调用数未知，不是 0')
   assert.equal(metrics.agent.observedTokens, null)
-  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, unknown: 1 })
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 0, unknown: 1 })
   assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.USAGE_UNAVAILABLE))
 })
 
@@ -111,7 +111,7 @@ test('旧实例没有遥测事件：lastAgentOutput 证明 agent 跑过 → 调�
   assert.equal(metrics.agent.invocations, null)
   assert.equal(metrics.agent.modelCalls, null)
   assert.equal(metrics.agent.observedTokens, null)
-  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, unknown: 1 })
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 0, unknown: 1 })
   assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.INVOCATION_UNAVAILABLE))
   assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.USAGE_UNAVAILABLE))
 })
@@ -149,9 +149,16 @@ test('callId 去重替换；activity/end.usage 不与 agent/usage 双计', () =>
   })
   assert.equal(metrics.agent.observedTokens.input, 130, 'call-1 替换成 120 + 兜底 10')
   assert.equal(metrics.agent.observedTokens.output, 55)
-  assert.equal(metrics.agent.observedTokens.total, 185)
-  assert.equal(metrics.agent.usageCoverage.known, 2)
+  // M7：legacy 兜底那份 usage 没有 cache 两桶，旧断言 total=185 是拿补零算出来的；
+  // 缺桶后完整 total 必须未知，但已观测小计仍可展示。
+  assert.equal(metrics.agent.observedTokens.total, null)
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.observedTokensPartial, { input: 130, cacheRead: 0, cacheWrite: 0, output: 55 })
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 2, unknown: 0 })
+  assert.equal(metrics.agent.buckets.complete, false, 'seen 并集不能证明完整')
   assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.LEGACY_USAGE_FALLBACK))
+  assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.USAGE_HISTORY_MASK_MISSING),
+    '旧事件没有 observedBuckets → 完整性未知')
 })
 
 test('节点耗时按 executionId：循环两次独立；错误 / 取消 / 中断不伪造 completed', () => {
@@ -548,4 +555,105 @@ test('MINOR-1：API 侧同指纹重算——补写事件后不再命中窗口期
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+// ── 0.14.5 M7 / M2：null 桶、partial 覆盖、结算快照、缓存指纹 ──────────────────
+
+test('M7：只上报 input 时其余桶是 null、覆盖 partial、total 未知', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'e1:invoke-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'e1:invoke-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', observedBuckets: ['input'], usage: { input: 10 },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.deepEqual(metrics.agent.observedTokens, {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, partial: true,
+  }, '未观测桶是 null；显式 0 才保留为 0')
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 1, unknown: 0 })
+  assert.deepEqual(metrics.agent.buckets.seen, ['input'])
+  assert.deepEqual(metrics.agent.buckets.missing, ['cacheRead', 'cacheWrite', 'output'])
+  assert.equal(metrics.agent.buckets.complete, false)
+  assert.ok(metrics.dataQuality.reasons.includes(METRICS_REASON.USAGE_MISSING_BUCKETS))
+})
+
+test('M2：agent/usage-snapshot 按 scope 覆盖调用桶，且不增加模型调用数', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', observedBuckets: ['input', 'output'], usage: { input: 10, output: 1 },
+      }),
+      event(3, 'agent/usage', 20, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-2', trust: 'known', observedBuckets: ['input', 'output'], usage: { input: 5, output: 2 },
+      }),
+      event(4, 'agent/usage-snapshot', 30, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        snapshotId: 'snap-1', scope: 'invocation', agentScope: 'main', sessionScopeId: 'sess-1',
+        usage: { input: 15, cacheRead: 0, cacheWrite: 0, output: 33, total: 48 },
+        observedBuckets: ['input', 'cacheRead', 'cacheWrite', 'output'],
+        provenance: { contract: 'claude-result-usage-v1', realCliVerified: false },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.modelCalls, 2, '快照是结算，不是第 3 次模型调用')
+  assert.deepEqual(metrics.agent.observedTokens, {
+    input: 15, cacheRead: 0, cacheWrite: 0, output: 33, total: 48, partial: false,
+  }, '有效快照覆盖的桶用快照值（output 33 而非占位的 1+2）')
+  assert.equal(metrics.agent.snapshots.invocation, 1)
+})
+
+test('M7：历史事件没有 observedBuckets → 完整性未知（不把补零反推成已知）', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'e1:invoke-1', provider: 'dsh' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'e1:invoke-1', provider: 'dsh',
+        callId: 'legacy-call', trust: 'known',
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, total: 15 },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.observedTokens.input, 10)
+  assert.equal(metrics.agent.observedTokens.output, 5)
+  assert.equal(metrics.agent.observedTokens.total, null, '旧事件无法证明补零来自真实观测 → 总量未知')
+  assert.equal(metrics.agent.usageCoverage.known, 0)
+  assert.equal(metrics.agent.usageCoverage.partial, 1)
+  assert.ok(metrics.dataQuality.reasons.includes('usage-history-mask-missing'))
+})
+
+test('M7：指标缓存 key 包含 usage schema 与快照指纹', () => {
+  const base = instanceFact({ lastSeq: 1, revision: 1 })
+  const callUsage = input => [
+    event(1, 'agent/usage', 0, {
+      elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+      callId: 'call-1', trust: 'known', observedBuckets: ['input'], usage: { input },
+    }),
+  ]
+  const keyA = metricsCacheKey(metricsFingerprintFor(base, { events: callUsage(10) }))
+  const keyB = metricsCacheKey(metricsFingerprintFor(base, { events: callUsage(20) }))
+  assert.notEqual(keyA, keyB, '同一 seq/type/at 但 usage 正文不同 → key 必须不同')
+
+  const snapshot = scope => [event(1, 'agent/usage-snapshot', 0, {
+    elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+    snapshotId: 'snap-1', scope, usage: { input: 10 }, observedBuckets: ['input'],
+  })]
+  const keyC = metricsCacheKey(metricsFingerprintFor(base, { events: snapshot('invocation') }))
+  const keyD = metricsCacheKey(metricsFingerprintFor(base, { events: snapshot('unknown') }))
+  assert.notEqual(keyC, keyD, '同一 seq/type/at 但快照 scope 不同 → key 必须不同')
+
+  const parsed = JSON.parse(metricsCacheKey({}))
+  assert.equal(parsed.schemaVersion, METRICS_SCHEMA_VERSION)
+  assert.equal(parsed.schemaVersion, 2, 'M7 要求 METRICS_SCHEMA_VERSION 升到 2')
+  assert.equal(parsed.usageSchema, 2)
 })

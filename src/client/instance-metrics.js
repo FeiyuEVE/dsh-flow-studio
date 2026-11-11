@@ -23,6 +23,10 @@ export const METRICS_REASON_TEXT = Object.freeze({
   'usage-unavailable': '没有可观测的 usage（token 未知，不是 0）',
   'usage-malformed': 'usage 字段形状不可识别',
   'usage-missing-buckets': '四桶里有些桶从未上报',
+  'usage-partial': '部分调用只观测到部分桶（完整 total 未知，展示的是已观测小计）',
+  'usage-scope-unknown': '结算快照的作用域不可证明（resume / 缺范围 id），未按数值猜总量',
+  'usage-output-provisional': 'assistant 的 output 可能只是占位值，且没有 result 结算',
+  'usage-history-mask-missing': '旧事件没有观测掩码，无法区分真实 0 与补零（完整性未知）',
   'legacy-usage-fallback': 'token 来自旧 activity/end.usage 兜底',
   'agent-invocation-unavailable': '旧事件流没有 agent 调用身份',
   'events-skipped': '事件流有坏行被跳过',
@@ -66,28 +70,34 @@ export function formatDurationMs(value) {
   return `${hours}h${rest === 0 ? '' : `${rest}m`}`
 }
 
-/** token 总量：`null` = 未知；有观测才渲染数字。 */
+/** token 总量：`null` = 未知；`partial` = 只观测到一部分（**不是 0**）。 */
 export function formatTokens(usage) {
-  if (!isObject(usage) || typeof usage.total !== 'number' || !Number.isFinite(usage.total)) return '未知'
-  return String(usage.total)
+  if (!isObject(usage)) return '未知'
+  if (typeof usage.total === 'number' && Number.isFinite(usage.total)) return String(usage.total)
+  if (usage.partial === true) return '部分'
+  return '未知'
 }
 
-/** 一次 token 四桶明细；未知返回空串。 */
+/** 一次 token 四桶明细：未观测的桶写「未知」，绝不渲染成 0。 */
 export function tokenBreakdownText(usage) {
   if (!isObject(usage)) return ''
   const parts = []
   for (const [key, label] of [['input', '输入'], ['cacheRead', '缓存读'], ['cacheWrite', '缓存写'], ['output', '输出']]) {
-    if (typeof usage[key] === 'number' && Number.isFinite(usage[key])) parts.push(`${label} ${usage[key]}`)
+    const value = usage[key]
+    parts.push(`${label} ${typeof value === 'number' && Number.isFinite(value) ? value : '未知'}`)
   }
   return parts.join(' · ')
 }
 
-/** 覆盖率文案：known / unknown 都显示，不让未知消失。 */
+/** 覆盖率文案：known / partial / unknown 都显示，不让未知消失（partial=0 不显示）。 */
 export function coverageText(coverage) {
   if (!isObject(coverage)) return '未知'
   const known = Number.isFinite(coverage.known) ? coverage.known : 0
+  const partial = Number.isFinite(coverage.partial) ? coverage.partial : 0
   const unknown = Number.isFinite(coverage.unknown) ? coverage.unknown : 0
-  return `已观测 ${known} · 未知 ${unknown}`
+  return partial > 0
+    ? `已观测 ${known} · 部分 ${partial} · 未知 ${unknown}`
+    : `已观测 ${known} · 未知 ${unknown}`
 }
 
 /** 成功率文案：没有样本 → 「无样本」，绝不显示 0%。 */

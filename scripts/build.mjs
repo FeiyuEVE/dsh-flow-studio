@@ -17,9 +17,10 @@
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  * 体积只报数（raw / gzip），不设自设上限；结构错误（缺文件、依赖错位、陈旧产物）仍硬失败。
  *
- * 构建末尾写出 lib/build-meta.json：schemaVersion + inputsHash（源码/脚本/锁文件/依赖内容）
- * + 每个生成产物的 bytes/gzipBytes/sha256 + 输入清单。verify-build.mjs 只读它也能判断
- * 「眼前这份 lib 是不是当前输入的产物」，不需要 mtime，也不允许缺 meta 时静默跳过。
+ * 构建末尾写出 lib/build-meta.json：schemaVersion + inputsHash（源码/脚本/锁文件/依赖内容
+ * / 官方 CSS 与 woff2 字体）+ 每个生成产物的 bytes/gzipBytes/sha256 + 模块清单 + 输入清单。
+ * verify-build.mjs 以「用同一个 buildClientBundles(write:false) 按当前源码重建 + 逐字节
+ * 比较」为主判据，meta 只作交叉核对与差异定位；缺 meta 一律失败，不静默跳过。
  *
  * 门禁：lib/ 是 .gitignore 排除的构建产物，包里一个 js 都没有过、也发过陈旧 lib。
  * 所以构建末尾会核对三件事 —— 清单非空、lib/ 的 .js 集合与清单完全一致、每个
@@ -43,7 +44,7 @@ import { gzipSync } from 'node:zlib'
 import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { buildBpmnAssets } from './build-bpmn-assets.mjs'
+import { buildBpmnAssets, collectBpmnAssetInputs, renderBpmnAssets } from './build-bpmn-assets.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -106,7 +107,17 @@ export const EXPECTED_LIB_MODULES = [...HOST_MODULES, ...GENERATED_MODULES]
 export const BUILD_META_FILE = 'build-meta.json'
 
 /** 元数据 schema 版本；verify-build.mjs 只接受这个值，不做向后兼容猜测。 */
-export const BUILD_META_SCHEMA_VERSION = 1
+export const BUILD_META_SCHEMA_VERSION = 2
+
+/** 两个生成产物的注册外壳：构建与 verify 的独立重建必须逐字节相同。 */
+export const CLIENT_BANNER = '// Generated from src/client/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
+  + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', factory: (require) => {\n'
+  + 'var module = { exports: {} }; var exports = module.exports;'
+export const CLIENT_FOOTER = 'return module.exports.createPlugin(require);\n} });'
+export const CHUNK_BANNER = '// Generated from src/client/bpmn/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
+  + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', chunk: \'client.bpmn.js\', factory: (require) => {\n'
+  + 'var module = { exports: {} }; var exports = module.exports;'
+export const CHUNK_FOOTER = 'return module.exports;\n} });'
 
 /** 参与构建的脚本：scripts/build*.mjs 全部纳入输入哈希（新增构建助手自动覆盖）。 */
 const BUILD_SCRIPT_PATTERN = /^build.*\.mjs$/
@@ -172,37 +183,63 @@ function walkFiles(rootDir, relDir) {
 /**
  * 收集一次构建的完整输入清单，并逐文件算 sha256。
  *
- * 覆盖三部分：
+ * 覆盖四部分：
  *   1. 源码树 + 构建脚本 + package.json / package-lock.json（目录整体扫描，新增/删除都变）；
- *   2. esbuild 自身的 package.json（构建工具版本）；
- *   3. esbuild metafile 记录的实际打包输入（含 node_modules 里的依赖文件内容）。
+ *   2. 生成画布资源的官方输入：四份 CSS + CSS 里实际引用的 woff2 字体
+ *      （build-bpmn-assets.mjs 读取的文件；只绑生成后的 assets.generated.js 会漏检）；
+ *   3. esbuild 自身的 package.json（构建工具版本）；
+ *   4. esbuild metafile 记录的实际打包输入（含 node_modules 里的依赖文件内容）。
  *
- * 这样 verify-build.mjs 不需要跑 esbuild，也能判断「当前输入还是不是产出这份 lib 的那份输入」。
+ * 每条 entry 带 `feeds`：这份输入最终进入哪条产物（client.js / client.bpmn.js /
+ * lib/<host 模块> / build 本身）。它只用于人工核对，不参与 inputsHash。
+ * 这样 CSS / 字体被换掉时，清单能说清影响的是 chunk，而不是只报「某个文件变了」。
+ *
  * strict=true 时缺文件直接抛错（构建路径）；verify 传 false，把缺失记成 sha256='missing'
  * 由它给出可读错误。
  *
  * @param {string} [rootDir] 仓库根目录
  * @param {string[]} [bundledPaths] esbuild metafile 的 inputs 键
- * @param {{strict?: boolean}} [options]
- * @returns {Array<{path: string, bytes: number, sha256: string}>} 按 path 排序
+ * @param {{strict?: boolean, outputInputs?: Record<string, string[]>}} [options]
+ * @returns {Array<{path: string, bytes: number, sha256: string, feeds: string[]}>} 按 path 排序
  */
 export function collectBuildInputs(rootDir = root, bundledPaths = [], options = {}) {
-  const { strict = true } = options
-  const entries = []
-  const seen = new Set()
+  const { strict = true, outputInputs = {} } = options
+  const entries = new Map()
+  const bundled = new Set(bundledPaths.map(toPosixPath))
+  const assetInputs = new Set(collectBpmnAssetInputs(rootDir))
+  const mainInputs = new Set((outputInputs['client.js'] ?? []).map(toPosixPath))
+  const chunkInputs = new Set((outputInputs['client.bpmn.js'] ?? []).map(toPosixPath))
+  const hostModulePaths = new Set(HOST_MODULES.map(name => `src/${name}`))
+
+  /** 这份输入属于哪条产物；同一文件可能同时喂多个产物，所以返回数组。 */
+  const feedsFor = relPath => {
+    const feeds = new Set()
+    if (assetInputs.has(relPath) || relPath === 'src/client/bpmn/assets.generated.js') {
+      feeds.add('client.bpmn.js')
+    }
+    if (mainInputs.has(relPath)) feeds.add('client.js')
+    if (chunkInputs.has(relPath)) feeds.add('client.bpmn.js')
+    if (hostModulePaths.has(relPath)) feeds.add(`lib/${relPath.slice('src/'.length)}`)
+    if (feeds.size === 0) feeds.add('build')
+    return [...feeds].sort()
+  }
 
   const addEntry = relPath => {
     const normalized = toPosixPath(relPath)
-    if (seen.has(normalized)) return
-    seen.add(normalized)
+    const feeds = feedsFor(normalized)
+    const existing = entries.get(normalized)
+    if (existing !== undefined) {
+      existing.feeds = [...new Set([...existing.feeds, ...feeds])].sort()
+      return
+    }
     const abs = resolve(rootDir, normalized)
     if (!existsSync(abs)) {
       if (strict) throw new Error(`构建输入缺失：${normalized}`)
-      entries.push({ path: normalized, bytes: -1, sha256: 'missing' })
+      entries.set(normalized, { path: normalized, bytes: -1, sha256: 'missing', feeds })
       return
     }
     const data = readFileSync(abs)
-    entries.push({ path: normalized, bytes: data.length, sha256: sha256Hex(data) })
+    entries.set(normalized, { path: normalized, bytes: data.length, sha256: sha256Hex(data), feeds })
   }
 
   // 1) 源码树 / 构建脚本 / 清单：按目录整体扫描，新增文件也会改变 inputsHash。
@@ -216,7 +253,10 @@ export function collectBuildInputs(rootDir = root, bundledPaths = [], options = 
   }
   for (const rel of BUILD_MANIFEST_FILES) addEntry(rel)
 
-  // 2) 构建工具本身：esbuild 版本变了，产物可能变，输入哈希必须跟着变。
+  // 2) 画布资源的官方输入：CSS 与 woff2 字体（资源生成链的上游，不是生成后的 JS）。
+  for (const rel of assetInputs) addEntry(rel)
+
+  // 3) 构建工具本身：esbuild 版本变了，产物可能变，输入哈希必须跟着变。
   try {
     const esbuildPkg = createRequire(import.meta.url).resolve('esbuild/package.json')
     addEntry(relative(rootDir, esbuildPkg))
@@ -224,10 +264,20 @@ export function collectBuildInputs(rootDir = root, bundledPaths = [], options = 
     // esbuild 没装时构建本来就跑不起来；这里不掩盖构建路径的错误。
   }
 
-  // 3) esbuild 实际读过的依赖文件（metafile inputs，含 src 与 node_modules）。
-  for (const raw of [...new Set(bundledPaths)].sort()) addEntry(raw)
+  // 4) esbuild 实际读过的依赖文件（metafile inputs，含 src 与 node_modules）。
+  for (const raw of [...bundled].sort()) addEntry(raw)
 
-  return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  // 没有 per-output 信息时（例如只拿旧清单重算），bundled 输入至少标到两条产物上。
+  if (mainInputs.size === 0 && chunkInputs.size === 0) {
+    for (const rel of bundled) {
+      const entry = entries.get(toPosixPath(rel))
+      if (entry !== undefined && entry.feeds.length === 1 && entry.feeds[0] === 'build') {
+        entry.feeds = ['client.bpmn.js', 'client.js']
+      }
+    }
+  }
+
+  return [...entries.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
 /** 输入清单的稳定哈希：path + 字节数 + 内容 sha256，排序后逐行喂给 sha256。 */
@@ -304,6 +354,137 @@ export function auditLibModules(rootDir = root) {
 }
 
 /**
+ * 从 esbuild metafile 取「真正进入该产物」的模块清单与字节数。
+ * metafile.inputs 是整次构建的输入并集；outputs[*].inputs 才是每个产物的依赖图，
+ * 泄漏断言必须看后者，否则被 tree-shake 掉的模块会被误判。
+ *
+ * 构建期生成的 CSS/字体模块是内存里的虚拟模块（namespace 'bpmn-assets'），
+ * 不是磁盘依赖；这里排除掉，避免输入清单去解析一个不存在的路径。
+ *
+ * @param {object} metafile esbuild 构建结果里的 metafile
+ * @returns {Array<{path: string, bytes: number}>} 按 path 排序
+ */
+function collectBundleModules(metafile) {
+  const output = Object.values(metafile.outputs)[0] ?? { inputs: {} }
+  return Object.entries(output.inputs)
+    .filter(([path]) => !path.startsWith('bpmn-assets:'))
+    .map(([path, info]) => ({ path: toPosixPath(path), bytes: info.bytesInOutput }))
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+/**
+ * 构建两个客户端包（主包 + BPMN chunk）。
+ *
+ * 这是 `npm run build` 与 verify「独立重建」共用的唯一实现：
+ *   - write=true：写 lib/client.js、lib/client.bpmn.js（正常构建）；
+ *   - write=false：esbuild `write:false`，只返回内存字节，不碰工作树（verify 用）。
+ *
+ * 生成资源（src/client/bpmn/assets.generated.js）通过虚拟模块注入 esbuild：
+ * 调用方传 `assetSource`（renderBpmnAssets 的结果），重建时就不会读到工作树上
+ * 可能陈旧/被篡改的生成文件。不传时现场在内存渲染一份。
+ *
+ * @param {{rootDir?: string, write?: boolean, assetSource?: string}} [options]
+ * @returns {Promise<{
+ *   outputs: Record<string, Buffer>,
+ *   metafiles: Record<string, object>,
+ *   modules: Record<string, Array<{path: string, bytes: number}>>,
+ *   inputs: Record<string, string[]>,
+ * }>}
+ */
+export async function buildClientBundles(options = {}) {
+  const { rootDir = root, write = true, assetSource } = options
+  const libDir = resolve(rootDir, 'lib')
+  if (write) mkdirSync(libDir, { recursive: true })
+
+  const require = createRequire(import.meta.url)
+  const { build } = require('esbuild')
+  const assetsSource = assetSource ?? renderBpmnAssets(rootDir).source
+
+  /** 把构建期生成的 CSS/字体模块当成内存文件交给 esbuild。 */
+  const assetPlugin = {
+    name: 'bpmn-assets-in-memory',
+    setup(buildApi) {
+      buildApi.onResolve({ filter: /(^|\/)assets\.generated\.js$/ }, () => ({
+        path: 'bpmn-assets.generated.js',
+        namespace: 'bpmn-assets',
+      }))
+      buildApi.onLoad({ filter: /.*/, namespace: 'bpmn-assets' }, () => ({
+        contents: assetsSource,
+        loader: 'js',
+      }))
+    },
+  }
+
+  /**
+   * 两次产物共用同一套编译配置：都是 closure-factory 里的 CJS bundle，React 由宿主
+   * 模块表提供。主包与 chunk 分开构建、分别包装，不启用会生成第三个匿名共享文件的
+   * ESM splitting —— 宿主只认固定文件名 client.js / client.bpmn.js。
+   */
+  const common = {
+    bundle: true,
+    format: 'cjs',
+    platform: 'browser',
+    target: 'es2022',
+    // metafile 里的输入路径固定相对仓库根，输入哈希才能跨 cwd 稳定复现。
+    absWorkingDir: rootDir,
+    // React 由宿主模块表提供（createPlugin 里 bindReact(require('react'))）。
+    // esbuild 的 external 会连 `react` 的子路径一起外置，所以 react/jsx-runtime 必须用
+    // alias 指到真实文件再打进产物 —— 宿主模块表不保证有 jsx-runtime。
+    external: ['react', 'react-dom'],
+    alias: {
+      'react/jsx-runtime': require.resolve('react/jsx-runtime'),
+    },
+    minify: true,
+    keepNames: true,
+    legalComments: 'none',
+    charset: 'utf8',
+    metafile: true,
+    logLevel: 'warning',
+    write,
+    plugins: [assetPlugin],
+  }
+
+  const [mainResult, chunkResult] = await Promise.all([
+    build({
+      ...common,
+      entryPoints: [resolve(rootDir, 'src/client/entry.js')],
+      outfile: resolve(libDir, 'client.js'),
+      banner: { js: CLIENT_BANNER },
+      footer: { js: CLIENT_FOOTER },
+    }),
+    build({
+      ...common,
+      entryPoints: [resolve(rootDir, 'src/client/bpmn/entry.js')],
+      outfile: resolve(libDir, 'client.bpmn.js'),
+      banner: { js: CHUNK_BANNER },
+      footer: { js: CHUNK_FOOTER },
+    }),
+  ])
+
+  const readResult = (file, result) => (
+    write ? readFileSync(resolve(libDir, file)) : Buffer.from(result.outputFiles[0].contents)
+  )
+  return {
+    outputs: {
+      'client.js': readResult('client.js', mainResult),
+      'client.bpmn.js': readResult('client.bpmn.js', chunkResult),
+    },
+    metafiles: {
+      'client.js': mainResult.metafile,
+      'client.bpmn.js': chunkResult.metafile,
+    },
+    modules: {
+      'client.js': collectBundleModules(mainResult.metafile),
+      'client.bpmn.js': collectBundleModules(chunkResult.metafile),
+    },
+    inputs: {
+      'client.js': Object.keys(mainResult.metafile.inputs).filter(path => !path.startsWith('bpmn-assets:')),
+      'client.bpmn.js': Object.keys(chunkResult.metafile.inputs).filter(path => !path.startsWith('bpmn-assets:')),
+    },
+  }
+}
+
+/**
  * 真正跑构建：esbuild 打 client，其余 Host 模块原样拷贝，最后做打包门禁自检。
  * 用 process.exit 而不是 throw：npm 生命周期把非零退出码当失败，日志要能一眼看出是哪一项。
  */
@@ -324,66 +505,16 @@ export async function buildPlugin() {
     + `CSS ${assets.cssBytes} 字节`,
   )
 
-  const require = createRequire(import.meta.url)
-  const { build } = require('esbuild')
-
-  /**
-   * 两次产物共用同一套编译配置：都是 closure-factory 里的 CJS bundle，React 由宿主
-   * 模块表提供。主包与 chunk 分开构建、分别包装，不启用会生成第三个匿名共享文件的
-   * ESM splitting —— 宿主只认固定文件名 client.js / client.bpmn.js。
-   */
-  const common = {
-    bundle: true,
-    format: 'cjs',
-    platform: 'browser',
-    target: 'es2022',
-    // metafile 里的输入路径固定相对仓库根，输入哈希才能跨 cwd 稳定复现。
-    absWorkingDir: root,
-    // React 由宿主模块表提供（createPlugin 里 bindReact(require('react'))）。
-    // esbuild 的 external 会连 `react` 的子路径一起外置，所以 react/jsx-runtime 必须用
-    // alias 指到真实文件再打进产物 —— 宿主模块表不保证有 jsx-runtime。
-    external: ['react', 'react-dom'],
-    alias: {
-      'react/jsx-runtime': require.resolve('react/jsx-runtime'),
-    },
-    minify: true,
-    keepNames: true,
-    legalComments: 'none',
-    charset: 'utf8',
-    metafile: true,
-    logLevel: 'warning',
-  }
-
-  // 主包：保持既有语义，factory 返回 createPlugin(require)。
-  const mainResult = await build({
-    ...common,
-    entryPoints: [resolve(root, 'src/client/entry.js')],
-    outfile: resolve(libDir, 'client.js'),
-    banner: {
-      js: '// Generated from src/client/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
-        + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', factory: (require) => {\n'
-        + 'var module = { exports: {} }; var exports = module.exports;',
-    },
-    footer: { js: 'return module.exports.createPlugin(require);\n} });' },
-  })
-
-  // 画布 chunk：宿主协议要求 chunk 字段为**固定文件名**，且由 `require.async('./client.bpmn.js')` 加载。
-  // factory 返回 chunk 的 exports（后续阶段接入 Modeler / 属性面板）。
-  const chunkResult = await build({
-    ...common,
-    entryPoints: [resolve(root, 'src/client/bpmn/entry.js')],
-    outfile: resolve(libDir, 'client.bpmn.js'),
-    banner: {
-      js: '// Generated from src/client/bpmn/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
-        + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', chunk: \'client.bpmn.js\', factory: (require) => {\n'
-        + 'var module = { exports: {} }; var exports = module.exports;',
-    },
-    footer: { js: 'return module.exports;\n} });' },
+  // 两个客户端包统一由 buildClientBundles() 构建；verify 用同一个函数 write:false 重建。
+  const bundles = await buildClientBundles({
+    rootDir: root,
+    write: true,
+    assetSource: assets.generatedSource,
   })
 
   /** 只报体积：raw / gzip 都打出来，不再用自设上限硬失败。 */
   const reportSize = (label, file) => {
-    const data = readFileSync(resolve(libDir, file))
+    const data = bundles.outputs[file]
     const raw = data.length
     const gzip = gzipSync(data, { level: 9 }).length
     console.log(`✓ lib/${file} raw=${raw} gzip=${gzip}`)
@@ -450,16 +581,27 @@ export async function buildPlugin() {
   console.log('✓ client.js 主包注册形状正确，client.bpmn.js 带 chunk 字段、自包含样式与内联字体')
 
   // 主包依赖图不得包含 bpmn-js / 官方属性面板：它们属于 chunk，不能拖慢每次打开 GUI 的首屏。
-  const mainInputs = Object.keys(mainResult.metafile.inputs)
-  const chunkInputs = Object.keys(chunkResult.metafile.inputs)
-  const heavyInMain = mainInputs.filter(input => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(input))
+  const mainInputs = bundles.inputs['client.js']
+  const chunkInputs = bundles.inputs['client.bpmn.js']
+  const heavyPattern = /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//
+  const heavyInMain = mainInputs.filter(input => heavyPattern.test(input))
   if (heavyInMain.length > 0) {
     console.error(`✗ 主包依赖图里混进了画布重依赖（应只进 chunk）：\n  ${heavyInMain.join('\n  ')}`)
     process.exit(1)
   }
-  const xyflowInChunk = chunkInputs.filter(input => /node_modules\/@xyflow\//.test(input))
+  // 模块级判据（metafile outputs[*].inputs）：只看真正进入产物的模块与字节数，
+  // 不依赖可被删除/篡改的字符串特征。
+  const heavyModulesInMain = bundles.modules['client.js'].filter(item => heavyPattern.test(item.path))
+  if (heavyModulesInMain.length > 0) {
+    console.error(
+      '✗ 主包模块清单里混进了画布重依赖（应只进 chunk）：\n  '
+      + heavyModulesInMain.map(item => `${item.path} (${item.bytes} 字节)`).join('\n  '),
+    )
+    process.exit(1)
+  }
+  const xyflowInChunk = bundles.modules['client.bpmn.js'].filter(item => /node_modules\/@xyflow\//.test(item.path))
   if (xyflowInChunk.length > 0) {
-    console.error(`✗ 画布 chunk 里混进了 React Flow（旧画布不属于 chunk）：\n  ${xyflowInChunk.join('\n  ')}`)
+    console.error(`✗ 画布 chunk 里混进了 React Flow（旧画布不属于 chunk）：\n  ${xyflowInChunk.map(item => item.path).join('\n  ')}`)
     process.exit(1)
   }
   // 依赖图之外再做一层内容特征检查：即使 metafile 被换掉，混进来的真实代码也会命中这些串。
@@ -534,26 +676,34 @@ export async function buildPlugin() {
   console.log(`✓ src ↔ lib 逐字节一致（${HOST_MODULES.length} 个 Host 模块）`)
 
   // ---- 构建元数据：把「这份产物」和「产出它的输入」一起钉死 ----------------------
-  // verify-build.mjs 只读这份文件 + 磁盘字节即可回答三个问题：
-  //   ① 产物是不是当前输入的产物（inputsHash）；② 产物字节有没有被换（sha256）；
-  //   ③ 每个产物由哪些依赖构成（inputs，仅供人工核对，不是唯一判据）。
+  // verify-build.mjs 用**独立重建 + 逐字节比较**作为主判据；这份元数据提供：
+  //   ① 输入清单与 inputsHash（人工核对 / 差异定位）；
+  //   ② 每个产物的 sha256（兼容旧口径的快速绑定）；
+  //   ③ modules：metafile 里真正进入该产物的模块与字节数 —— verify 会拿重建的
+  //      metafile 交叉核对，字符串特征只作为辅助。
   const outputs = [
     {
       file: 'client.js',
       bytes: mainSize.raw,
       gzipBytes: mainSize.gzip,
-      sha256: sha256Hex(readFileSync(resolve(libDir, 'client.js'))),
+      sha256: sha256Hex(bundles.outputs['client.js']),
       inputs: mainInputs,
+      modules: bundles.modules['client.js'],
     },
     {
       file: 'client.bpmn.js',
       bytes: chunkSize.raw,
       gzipBytes: chunkSize.gzip,
-      sha256: sha256Hex(readFileSync(resolve(libDir, 'client.bpmn.js'))),
+      sha256: sha256Hex(bundles.outputs['client.bpmn.js']),
       inputs: chunkInputs,
+      modules: bundles.modules['client.bpmn.js'],
     },
   ]
-  const inputEntries = collectBuildInputs(root, [...new Set([...mainInputs, ...chunkInputs])])
+  const inputEntries = collectBuildInputs(
+    root,
+    [...new Set([...mainInputs, ...chunkInputs])],
+    { outputInputs: { 'client.js': mainInputs, 'client.bpmn.js': chunkInputs } },
+  )
   const inputsHash = hashInputManifest(inputEntries)
   writeFileSync(resolve(libDir, BUILD_META_FILE), `${JSON.stringify({
     schemaVersion: BUILD_META_SCHEMA_VERSION,

@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto'
 import {
   appendFileSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -39,7 +40,17 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
 
-import { BUILD_META_FILE, GENERATED_MODULES, HOST_MODULES, EXPECTED_LIB_MODULES } from '../scripts/build.mjs'
+import { build as esbuildBuild } from 'esbuild'
+
+import {
+  BUILD_META_FILE,
+  GENERATED_MODULES,
+  HOST_MODULES,
+  EXPECTED_LIB_MODULES,
+  collectBuildInputs,
+  findLeakMarkers,
+  hashInputManifest,
+} from '../scripts/build.mjs'
 
 let checks = 0
 /** 统计断言数（用户要求回报断言数）。 */
@@ -185,6 +196,11 @@ function syncTree(from, to, base = '') {
 const tmpRoot = resolve(repo, '.tmp')
 mkdirSync(tmpRoot, { recursive: true })
 const work = mkdtempSync(join(tmpRoot, 'build-test-'))
+// 反例案例统一放 .tmp/verify-build-cases/：每个案例都是一份可独立构建的工作树，
+// 只有这里的副本会被篡改，工作树与 checkout 保持原样。
+const casesRoot = join(tmpRoot, 'verify-build-cases')
+mkdirSync(casesRoot, { recursive: true })
+const casesWork = mkdtempSync(join(casesRoot, 'build-test-'))
 
 try {
   const checkout = join(work, 'checkout')
@@ -283,10 +299,15 @@ try {
     A.ok(files.includes(`lib/${BUILD_META_FILE}`), `tarball 含 lib/${BUILD_META_FILE}`)
     A.ok(!files.includes('lib/.build-meta.json'), 'tarball 不含旧版 lib/.build-meta.json')
     const meta = JSON.parse(readFileSync(join(packageDir, 'lib', BUILD_META_FILE), 'utf8'))
-    A.equal(meta.schemaVersion, 1, '元数据 schemaVersion 为 1')
+    A.equal(meta.schemaVersion, 2, '元数据 schemaVersion 为 2（含 modules 模块清单）')
     A.match(meta.inputsHash, /^[0-9a-f]{64}$/, '元数据有合法 inputsHash')
     A.ok(Array.isArray(meta.inputs) && meta.inputs.length > 0, '元数据有非空输入清单')
     A.ok(Array.isArray(meta.outputs) && meta.outputs.length === GENERATED_MODULES.length, '元数据恰好覆盖两个生成产物')
+    const inputPaths = meta.inputs.map(entry => entry.path)
+    A.ok(inputPaths.some(path => path.endsWith('diagram-js/assets/diagram-js.css')), '输入清单含官方 diagram-js.css')
+    A.ok(inputPaths.some(path => path.endsWith('.woff2')), '输入清单含内联的 woff2 字体')
+    const diagramCss = meta.inputs.find(entry => entry.path.endsWith('diagram-js/assets/diagram-js.css'))
+    A.deepEqual(diagramCss.feeds, ['client.bpmn.js'], 'CSS 输入标明只喂给 client.bpmn.js')
     for (const file of GENERATED_MODULES) {
       const output = meta.outputs.find(entry => entry.file === file)
       A.ok(output, `元数据含产物 ${file}`)
@@ -295,6 +316,8 @@ try {
       A.equal(output.sha256, sha256(data), `${file} 的 sha256 与产物一致`)
       A.equal(output.gzipBytes, gzipSync(data, { level: 9 }).length, `${file} 的 gzipBytes 与产物一致`)
       A.ok(Array.isArray(output.inputs), `${file} 的 inputs 是数组`)
+      A.ok(Array.isArray(output.modules) && output.modules.length > 0, `${file} 的 modules 是非空模块清单`)
+      A.ok(output.modules.every(item => typeof item.path === 'string' && Number.isInteger(item.bytes)), `${file} 的 modules 每项都有 path/bytes`)
     }
     const mainInputs = meta.outputs.find(entry => entry.file === 'client.js').inputs
     const chunkInputs = meta.outputs.find(entry => entry.file === 'client.bpmn.js').inputs
@@ -305,6 +328,16 @@ try {
     A.ok(
       !chunkInputs.some(input => /node_modules\/@xyflow\//.test(input)),
       '画布 chunk 依赖图不含 React Flow',
+    )
+    const mainModules = meta.outputs.find(entry => entry.file === 'client.js').modules
+    const chunkModules = meta.outputs.find(entry => entry.file === 'client.bpmn.js').modules
+    A.ok(
+      !mainModules.some(item => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(item.path)),
+      '主包模块清单不含 bpmn-js / diagram-js / 官方属性面板',
+    )
+    A.ok(
+      !chunkModules.some(item => /node_modules\/@xyflow\//.test(item.path)),
+      '画布 chunk 模块清单不含 React Flow',
     )
   })
 
@@ -392,6 +425,112 @@ try {
     return Buffer.byteLength(mixed)
   }
 
+  /**
+   * 反例案例：从 checkout 复制一份独立工作树，只在副本里构建/篡改。
+   * checkout 的 node_modules 是软链；案例默认也软链到工作树依赖，只有需要改
+   * diagram-js.css 的案例才复制一份本地 diagram-js（不污染共享 node_modules）。
+   */
+  const repoModulesDir = resolve(repo, 'node_modules')
+
+  function makeCase(name, options = {}) {
+    const dir = join(casesWork, name)
+    mkdirSync(dir, { recursive: true })
+    for (const rel of ['scripts', 'src', 'lib']) {
+      cpSync(join(checkout, rel), join(dir, rel), { recursive: true })
+    }
+    for (const rel of ['package.json', 'package-lock.json', 'icon.svg', 'cordis.patch.yml', 'THIRD-PARTY.md', 'LICENSE']) {
+      if (existsSync(join(checkout, rel))) copyFileSync(join(checkout, rel), join(dir, rel))
+    }
+    if (options.localDiagramJs) createLocalNodeModules(dir)
+    else symlinkSync(repoModulesDir, join(dir, 'node_modules'), 'dir')
+    return dir
+  }
+
+  /** 案例的 node_modules：除 diagram-js 外全部软链；diagram-js 复制一份，可安全改 CSS。 */
+  function createLocalNodeModules(dir) {
+    const local = join(dir, 'node_modules')
+    mkdirSync(local)
+    for (const name of readdirSync(repoModulesDir)) {
+      if (name === 'diagram-js') continue
+      symlinkSync(join(repoModulesDir, name), join(local, name))
+    }
+    cpSync(join(repoModulesDir, 'diagram-js'), join(local, 'diagram-js'), { recursive: true })
+  }
+
+  function buildCase(dir) {
+    mustRun('node', ['scripts/build.mjs'], dir, '案例构建')
+  }
+
+  function verifyCase(dir) {
+    return run('node', ['scripts/verify-build.mjs'], dir)
+  }
+
+  /** 在 styles.js 的模板字符串末尾插入一条真实 CSS（不是注释，会改变产物字节）。 */
+  function appendStyleRule(dir, rule) {
+    const path = join(dir, 'src/client/styles.js')
+    const source = readFileSync(path, 'utf8')
+    const index = source.lastIndexOf('`')
+    A.ok(index > 0, '案例里找到 styles.js 模板字符串结尾')
+    writeFileSync(path, `${source.slice(0, index)}\n${rule}\n${source.slice(index)}`)
+  }
+
+  /** 在 createPlugin 开头注入一段代码（构造恶意 / 卡死的 factory）。 */
+  function injectPluginCode(dir, code) {
+    const path = join(dir, 'src/client/plugin.js')
+    const source = readFileSync(path, 'utf8')
+    const needle = 'export function createPlugin(require) {'
+    A.ok(source.includes(needle), '案例里找到 createPlugin 入口')
+    writeFileSync(path, source.replace(needle, `${needle}\n  ${code}`))
+  }
+
+  /** 只重算 meta.inputsHash，保留旧 outputs / modules：伪造「输入哈希自洽」。 */
+  function forgeInputsHash(dir) {
+    const caseMetaPath = join(dir, 'lib', BUILD_META_FILE)
+    const meta = JSON.parse(readFileSync(caseMetaPath, 'utf8'))
+    const current = collectBuildInputs(dir, meta.inputs.map(entry => entry.path), { strict: false })
+    meta.inputsHash = hashInputManifest(current)
+    writeFileSync(caseMetaPath, `${JSON.stringify(meta, null, 2)}\n`)
+  }
+
+  /** 只更新 outputs 的 bytes / sha256 / gzipBytes，保留旧 modules：伪造「产物哈希自洽」。 */
+  function forgeOutputs(dir) {
+    const caseMetaPath = join(dir, 'lib', BUILD_META_FILE)
+    const meta = JSON.parse(readFileSync(caseMetaPath, 'utf8'))
+    for (const output of meta.outputs) {
+      const data = readFileSync(join(dir, 'lib', output.file))
+      output.bytes = data.length
+      output.sha256 = sha256(data)
+      output.gzipBytes = gzipSync(data, { level: 9 }).length
+    }
+    writeFileSync(caseMetaPath, `${JSON.stringify(meta, null, 2)}\n`)
+  }
+
+  /** 向主包 factory 体尾部追加一段真实代码（模拟夹带 BPMN bundle）。 */
+  function injectCodeIntoMain(dir, code) {
+    const caseMainPath = join(dir, 'lib/client.js')
+    const source = readFileSync(caseMainPath, 'utf8')
+    const footer = 'return module.exports.createPlugin(require);'
+    const index = source.lastIndexOf(footer)
+    A.ok(index >= 0, '案例里找到主包 footer')
+    writeFileSync(caseMainPath, `${source.slice(0, index)}\n${code}\n${source.slice(index)}`)
+  }
+
+  /** 用 esbuild 真实打包官方 BPMN Modeling 特性（约 170KB 真实代码）。 */
+  async function bundleBpmnModeling() {
+    const result = await esbuildBuild({
+      absWorkingDir: repo,
+      bundle: true,
+      entryPoints: [resolve(repo, 'node_modules/bpmn-js/lib/features/modeling/Modeling.js')],
+      format: 'cjs',
+      platform: 'browser',
+      target: 'es2022',
+      minify: true,
+      write: false,
+      logLevel: 'silent',
+    })
+    return result.outputFiles[0].contents.toString('utf8')
+  }
+
   await check('反例一：lib/supervise.js 陈旧时 verify-build 非零退出并点名文件', async () => {
     const supervisePath = join(libDir, 'supervise.js')
     const original = readFileSync(supervisePath)
@@ -402,16 +541,13 @@ try {
     writeFileSync(supervisePath, original)
   })
 
-  await check('反例二：主包 factory 改成 return null（并伪造 meta 使字节自洽）必须被打回', async () => {
-    const original = pristine.main.toString('utf8')
-    const tampered = original.replace('return module.exports.createPlugin(require);', 'return null;')
-    A.notEqual(tampered, original, '主包 factory 已被改成返回 null')
-    writeFileSync(mainPath, tampered)
-    forgeMeta()
-    const result = run('node', ['scripts/verify-build.mjs'], checkout)
-    A.ok(!result.ok, 'factory 不可用时 verify-build 非零退出')
+  await check('反例二：主包 factory 返回 null（源码级改动并重建，字节自洽）必须被打回', async () => {
+    const dir = makeCase('factory-null')
+    injectPluginCode(dir, 'return null')
+    buildCase(dir)
+    const result = verifyCase(dir)
+    A.ok(!result.ok, 'factory 返回 null 时 verify-build 非零退出')
     A.match(`${result.stdout}${result.stderr}`, /factory|插件对象/, '报错指向 factory / 插件对象')
-    restoreBundles()
   })
 
   await check('反例三：主包混入真实 BPMN chunk 代码并删除 meta，必须同时因泄漏与缺元数据失败', async () => {
@@ -474,7 +610,103 @@ try {
     A.ok(recovered.ok, '恢复输入后 verify-build 再次通过')
   })
 
-  await check('反例七：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
+  await check('反例七：只改官方 diagram-js.css（元数据不变）必须被独立重建打回', async () => {
+    const dir = makeCase('css-change', { localDiagramJs: true })
+    buildCase(dir)
+    const clean = verifyCase(dir)
+    A.ok(clean.ok, '案例初始状态 verify-build 通过（未改 CSS）')
+
+    appendFileSync(
+      join(dir, 'node_modules/diagram-js/assets/diagram-js.css'),
+      '\n.fs-css-input-probe{outline:1px solid red}\n',
+    )
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '只改官方 CSS 也让 verify-build 非零退出')
+    A.match(output, /diagram-js\.css/, '报错点名被改的 diagram-js.css')
+    A.match(output, /独立重建不一致|输入已变化/, 'CSS 变化被独立重建或输入绑定发现')
+    A.match(output, /client\.bpmn\.js/, '报错指向受影响产物 client.bpmn.js')
+  })
+
+  await check('反例八：改源码、保留旧产物、只重算 inputsHash 必须被独立重建打回', async () => {
+    const dir = makeCase('forge-inputs')
+    buildCase(dir)
+    appendStyleRule(dir, '.fs-forge-inputs-probe{color:red}')
+    forgeInputsHash(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '伪造 inputsHash 后 verify-build 仍非零退出')
+    A.ok(!output.includes('构建输入已变化'), 'inputsHash 已被伪造成自洽（输入绑定这一条不再报错）')
+    A.match(output, /与独立重建不一致/, '独立重建逐字节比较抓到了旧产物')
+    A.match(output, /client\.js/, '报错指向受影响产物 client.js')
+  })
+
+  await check('反例九：主包夹带真实 BPMN Modeling bundle 并伪造输出哈希必须被打回', async () => {
+    const dir = makeCase('bpmn-in-main')
+    buildCase(dir)
+    const code = await bundleBpmnModeling()
+    A.ok(code.length > 100_000, `真实 BPMN Modeling bundle 约 170KB（实际 ${code.length} 字节）`)
+    A.equal(findLeakMarkers('client.js', code).length, 0, '真实 BPMN 代码不含旧字符串特征（只靠特征会漏检）')
+    injectCodeIntoMain(dir, code)
+    forgeOutputs(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '主包夹带真实 BPMN 代码后 verify-build 非零退出')
+    A.ok(!output.includes('依赖泄漏'), '内容特征确实没命中（证明不能只靠字符串）')
+    A.ok(!output.includes('与构建元数据不一致'), '输出 bytes/sha256 已被伪造成自洽')
+    A.match(output, /与独立重建不一致/, '独立重建逐字节比较抓到了夹带代码')
+    A.match(output, /client\.js/, '报错指向 client.js')
+  })
+
+  await check('反例十：factory 里 require("process").exit(0) 必须被受限沙箱拦下', async () => {
+    const dir = makeCase('factory-exit')
+    injectPluginCode(dir, "require('process').exit(0)")
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'factory 试图 require("process").exit(0) 时 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /未授权的宿主模块/, '受限 require 拒绝了 process 模块')
+    A.match(output, /process/, '报错点名 process')
+  })
+
+  await check('反例十一：factory 里直接 process.exit(0) 必须因沙箱无 process 被打回', async () => {
+    const dir = makeCase('factory-direct-exit')
+    injectPluginCode(dir, 'process.exit(0)')
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'factory 直接 process.exit(0) 时 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行失败/, '直接调用 process 被当作 factory 执行失败')
+    A.match(output, /process/, '报错点名 process')
+  })
+
+  await check('反例十二：factory 死循环必须被 VM 超时中止，不能挂住校验', async () => {
+    const dir = makeCase('factory-timeout')
+    injectPluginCode(dir, 'while (true) {}')
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'factory 死循环时 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行超时/, '报错指出 factory 超时')
+    A.match(output, /3000ms/, '报错给出超时阈值')
+  })
+
+  await check('反例十三：不能借 host 函数构造器逃逸回 process', async () => {
+    const dir = makeCase('factory-escape')
+    injectPluginCode(dir, "window.__ModuleLoader__.load.constructor('return process')().exit(0)")
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '借 host 函数构造器逃逸时 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行失败/, '逃逸尝试被当作 factory 执行失败')
+    A.match(output, /process/, '沙箱里 process 不可达')
+  })
+
+  await check('反例十四：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
     rmSync(join(checkout, 'lib'), { recursive: true, force: true })
     const packDir2 = join(work, 'pack-no-scripts')
     mkdirSync(packDir2, { recursive: true })
@@ -490,4 +722,5 @@ try {
   console.log(`\nbuild/pack 门禁自检：${checks} 组通过（${assertionCount} 条断言）`)
 } finally {
   rmSync(work, { recursive: true, force: true })
+  rmSync(casesWork, { recursive: true, force: true })
 }

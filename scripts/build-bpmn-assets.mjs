@@ -22,7 +22,7 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -102,13 +102,51 @@ export function inlineStylesheet(cssFile, cssText) {
   return css.replace(/\r\n/g, '\n').trim() + '\n'
 }
 
+/** 统一成正斜杠，保证 Windows / Linux 的输入清单路径写法一致。 */
+function toPosixPath(file) {
+  return file.split('\\').join('/')
+}
+
 /**
- * 生成 `src/client/bpmn/assets.generated.js`。
+ * 收集生成画布资源实际读过的全部文件（相对仓库根，正斜杠）：
+ * 四份官方样式表 + 样式表里引用的 woff2 字体。
+ *
+ * 这是 `collectBuildInputs()` 的输入之一 —— 只绑定生成后的
+ * `assets.generated.js` 不够：官方 CSS / 字体被换掉而上游清单没变，
+ * 旧产物依然会通过「自报哈希」的校验。
  *
  * @param {string} [root] 仓库根目录
- * @returns {{ modulePath: string, cssBytes: number, fontCount: number, files: string[] }}
+ * @returns {string[]} 排序去重后的相对路径
  */
-export function buildBpmnAssets(root = defaultRoot) {
+export function collectBpmnAssetInputs(root = defaultRoot) {
+  const paths = new Set()
+  for (const sheet of BPMN_STYLESHEETS) {
+    paths.add(sheet.path)
+    let raw
+    try {
+      raw = readFileSync(resolve(root, sheet.path), 'utf8')
+    } catch {
+      // CSS 缺失时保留路径本身：调用方（strict=false 的 verify）会把它记成 missing。
+      continue
+    }
+    for (const match of raw.matchAll(/url\(\s*(['"]?)([^'")]+\.woff2(?:[?#][^'"]*)?)\1\s*\)/gi)) {
+      const url = cleanAssetPath(match[2].trim())
+      if (url.startsWith('data:')) continue
+      const fontPath = resolve(dirname(resolve(root, sheet.path)), url)
+      paths.add(toPosixPath(relative(root, fontPath)))
+    }
+  }
+  return [...paths].sort()
+}
+
+/**
+ * 在内存里渲染 `assets.generated.js` 的源码（不写盘）。
+ * 构建与 verify 的独立重建共用它，保证两边看到的是同一份官方 CSS/字体。
+ *
+ * @param {string} [root] 仓库根目录
+ * @returns {{ modulePath: string, source: string, cssBytes: number, fontCount: number, files: string[] }}
+ */
+export function renderBpmnAssets(root = defaultRoot) {
   const parts = []
   const files = []
   let fontCount = 0
@@ -122,16 +160,39 @@ export function buildBpmnAssets(root = defaultRoot) {
   }
 
   const combined = parts.join('\n')
-  const modulePath = resolve(root, BPMN_ASSETS_MODULE)
   const source = [
     '// 构建产物：由 scripts/build-bpmn-assets.mjs 生成，不要手改，也不要提交。',
     '// 官方 CSS + 内联 woff2 字体（bpmn-js / diagram-js / @bpmn-io/properties-panel）。',
     `export const BPMN_ASSETS_CSS = ${JSON.stringify(combined)};`,
     '',
   ].join('\n')
-  writeFileSync(modulePath, source)
 
-  return { modulePath, cssBytes: Buffer.byteLength(combined), fontCount, files }
+  return {
+    modulePath: resolve(root, BPMN_ASSETS_MODULE),
+    source,
+    cssBytes: Buffer.byteLength(combined),
+    fontCount,
+    files,
+  }
+}
+
+/**
+ * 生成 `src/client/bpmn/assets.generated.js`（只给 npm run build 用；
+ * verify 的独立重建走 renderBpmnAssets()，不碰工作树）。
+ *
+ * @param {string} [root] 仓库根目录
+ * @returns {{ modulePath: string, generatedSource: string, cssBytes: number, fontCount: number, files: string[] }}
+ */
+export function buildBpmnAssets(root = defaultRoot) {
+  const result = renderBpmnAssets(root)
+  writeFileSync(result.modulePath, result.source)
+  return {
+    modulePath: result.modulePath,
+    generatedSource: result.source,
+    cssBytes: result.cssBytes,
+    fontCount: result.fontCount,
+    files: result.files,
+  }
 }
 
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)

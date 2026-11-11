@@ -16,7 +16,7 @@
 
 ## worktree 建在哪？为什么不自动删？
 
-路径是 `$DSH_HOME/flow-studio/worktrees/<workspaceId>/<instanceId>`，分支 `flow-instance/<instanceId>`（被占用时依次 `-2`…）。实例收尾默认保留（`retain`），因为用户可能还要进去看产物；只有 `on-terminal-clean` 策略且树干净时才自动清理。删除入口是 `DELETE /instances/<id>/worktree`，孤儿清理是 `GET/POST /instance-worktrees`。
+路径是 `$DSH_HOME/flow-studio/worktrees/<workspaceId>/<instanceId>`，分支 `flow-instance/<instanceId>`（被占用时依次 `-2`…）。实例收尾默认保留（`retain`），因为用户可能还要进去看产物；只有 `on-terminal-clean` 策略且树干净时才自动清理。删除入口是 `DELETE /instances/<id>/worktree`；孤儿清理用 `GET /instance-worktrees` 看清单，`POST /instance-worktrees/prune` 预览（`dryRun` 默认 `true`，返回 `planHash`），再带 `planHash` 执行。
 
 路径校验、所有权记录与清理顺序：[数据模型 · Worktree](reference/data-model.md#worktree)、[实例域接口 · worktree](reference/instance-api.md#实例-worktree)。
 

@@ -19,7 +19,7 @@
 | 给节点加一种新的 agent 适配器（历史：旧外部执行器） | [加执行器](cookbook/add-executor.md) |
 | 看 0.1 → 0.13.x 每一版改了什么 | [版本历史](history/releases.md) |
 | 找常见问题的答案 | [FAQ](faq.md) |
-| 看设计总案、01–08 分册与独立审核 | [设计总案](DESIGN.md) · [设计任务书](DESIGN-BRIEF.md) · [分册](design/01-ia-interaction.md) · [审核](design/REVIEW.md) |
+| 看历史设计总案、01–08 分册与独立审核（历史资料） | [历史设计总案](DESIGN.md) · [设计任务书](DESIGN-BRIEF.md) · [分册](design/01-ia-interaction.md) · [审核](design/REVIEW.md) |
 | 给这个仓库写文档（人或 agent） | [文档标准](AGENTS.md) |
 
 ## 文件地图与职责
@@ -44,7 +44,7 @@
 | [cookbook/add-executor.md](cookbook/add-executor.md) | **历史资料**：旧外部 executor 的改动面；当前请改 AgentAdapter | 扩展开发者 |
 | [postmortem/2026-11-07-oom.md](postmortem/2026-11-07-oom.md) | 2026-11-07 XState 断言把宿主打成 22 GB OOM 的事故记录 | 所有人（尤其写测试的人） |
 | [postmortem/2026-11-09-cold-resume-preset.md](postmortem/2026-11-09-cold-resume-preset.md) | 2026-11-09 冷恢复没挂 preset 组合、一个会话掉 31 个工具的事故记录 | 所有人（尤其写投递 / 唤醒路径的人） |
-| [DESIGN.md](DESIGN.md) | 设计仲裁层：定位、视觉方向、布局、三个核心语义、冲突裁决表、验收口径 | 设计与实现者 |
+| [DESIGN.md](DESIGN.md) | **历史资料**：旧运行域时代的设计总案（定位、视觉方向、布局、打回 / executor、冲突裁决表）；0.14.0 起冻结，不再作为现行契约 | 想理解旧设计决策的人 |
 | [DESIGN-BRIEF.md](DESIGN-BRIEF.md) | 最初的设计任务书（历史输入，不再更新） | 想理解设计来源的人 |
 | [design/01–08 + REVIEW.md](design/01-ia-interaction.md) | 旧运行域时代的分册数值规格与独立审核（**历史资料，编号与内容冻结**） | 想理解旧设计的人 |
 | [design/09–13](design/10-bpmn-instance-api.md) | 当前契约：适配器 hooks、BPMN 实例 API、finish 工具、实例指标、业务证据 | 实现者 |
@@ -59,6 +59,6 @@
 ## 维护约定
 
 - 事实只有一个家；发现两处冲突，先定 owner，另一处改成链接。层级划分见 [AGENTS.md](AGENTS.md)。
-- 事件契约的唯一真相源是 [design/05-run-log.md](design/05-run-log.md)；[reference/run-log.md](reference/run-log.md) 只做入口与速查。
+- 当前实例事件契约的唯一真相源是 [design/10-bpmn-instance-api.md](design/10-bpmn-instance-api.md)；[design/05-run-log.md](design/05-run-log.md) 与 [reference/run-log.md](reference/run-log.md) 只作历史资料（旧 run 事件）。
 - 版本历史只进 [history/releases.md](history/releases.md)，README 不写版本历史。
 - 相对链接必须能打开；改文件名前先全仓搜链接。

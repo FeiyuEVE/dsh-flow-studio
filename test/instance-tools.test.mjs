@@ -339,6 +339,12 @@ try {
     eq(result.code, 'INSTANCE_WORKTREE_INSTANCE_ACTIVE')
     ok(result.hint.includes('ACTIVE'))
     ok(result.error.includes('force 不能越过'))
+    // 0.14.1：停止实例的正确入口是 POST /instances/<id>/stop / flow_instance_cancel，
+    // 不是已删除的 flow_stop，也不是返回 405 的 DELETE。
+    ok(result.hint.includes('POST /instances/<id>/stop'))
+    ok(result.hint.includes('flow_instance_cancel'))
+    eq(result.hint.includes('flow_stop'), false)
+    eq(result.hint.includes('DELETE '), false)
   })
 
   await check('结果裁剪：长字符串截到 2 KiB，数组上限 200 项', async () => {

@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.0）
+# 版本历史（0.1 → 0.14.1）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -849,3 +849,15 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 代码退役**不删除磁盘上的旧数据**：`~/.dsh/flow-studio/flows/`、`runs/`、旧 worktree 目录不会再被加载，清理属于独立维护动作。
 - 回滚以完整版本包为单位，不在新版本里保留切回旧域的开关，也不做双写或历史数据迁移。
 - 并发 / 超时 / 取消 / 鉴权 / 脱敏 / 路径校验这些横切能力没有随旧域消失，它们已在新域（见 0.13.x 记录）。
+
+## 0.14.1 — 修数据根解析：`resolveHome` 的 `process.env` 兜底
+
+0.14.0 把旧 `store.js` 的公共存储口径抽到 `storage-contract.js` 时，`resolveHome(env)` 丢掉了「省略 `env` 时读 `process.env`」的兜底：`dsh` 进程里 `HOME` 可能仍是 `/root`，真正的家目录由宿主以 `DSH_HOME` 注入。结果数据根被解析到 `~/.dsh/flow-studio`，与宿主实际使用的家目录变成两套目录。
+
+- `resolveHome()` 省略参数时回落到 `process.env`（与旧 `store.flowsDir()` 同口径）；`null` 视同省略；显式传 `{}` 仍按 homedir 解析（测试注入路径不变）；空白 `DSH_HOME` 视为未设置。
+- `flowStudioDir()` 随之修正，`/health` 的 `dir` 在容器 / 多 profile 部署下重新指向真实数据根。
+- 新增 `test/storage-contract.test.mjs`（4 组）覆盖三种入参形态与 `checkRunId` 边界。
+- 这个缺陷是 **0.14.0 的容器 e2e 抓到的**（安装后 `/health.dir` 落在 `/root/.dsh/flow-studio`，前置检查拒绝在该路径下 `rm -rf`），不是靠单元测试发现。
+
+**已知边界**
+- 仍然只认 `DSH_HOME` 与 `homedir()` 两个来源；宿主若改用其它配置项注入家目录，需要同步扩展本函数。

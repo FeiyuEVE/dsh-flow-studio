@@ -16,9 +16,16 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-/** DSH 家目录：容器/多 profile 部署下 homedir() 与 DSH_HOME 并不相等，优先环境变量。 */
+/**
+ * DSH 家目录：容器 / 多 profile 部署下 `homedir()` 与 `DSH_HOME` 并不相等，优先环境变量。
+ *
+ * 省略 `env` 时必须回落到 `process.env`（旧 `store.flowsDir()` 的口径）：
+ * dsh 的进程里 `HOME` 可能还是 `/root`，真正的家目录由宿主以 `DSH_HOME` 注入；
+ * 丢掉这层兜底会把数据根解析到 `~/.dsh`，容器里就是两套目录。
+ */
 export function resolveHome(env) {
-  const fromEnv = env && typeof env.DSH_HOME === 'string' ? env.DSH_HOME.trim() : ''
+  const source = env === undefined || env === null ? process.env : env
+  const fromEnv = source && typeof source.DSH_HOME === 'string' ? source.DSH_HOME.trim() : ''
   if (fromEnv.length > 0) return fromEnv
   return join(homedir(), '.dsh')
 }

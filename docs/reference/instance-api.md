@@ -345,7 +345,7 @@
 | `removeBranch` | boolean | `false` | 删目录后是否同时删本实例分支；结果单独放在 `branchRemoval`，不以目录删除冒充分支成功 |
 | `expectedHead` | string | 无 | 40–64 位十六进制；与当前 HEAD 不一致 → 409，`force` 不能绕过 |
 
-规则：实例 `ACTIVE` / `SUSPENDED` 一律 409；目录存在但主仓库未登记 → 409；当前分支不是本实例的 `flow-instance/<instanceId>`（或与记录不一致）→ 409；脏树且没有 `force:true` → 409；目录本来就不存在时返回 200 + `removed:false, reason:"not-found"`；成功后才清残留目录并回查 Git 登记。响应：
+规则：实例 `ACTIVE` / `SUSPENDED` 一律 409；目录存在但主仓库未登记 → 409；当前分支不是本实例的 `flow-instance/<instanceId>`（或与记录不一致）→ 409；脏树且没有 `force:true` → 409；目录本来就不存在时只做**定向注销**：`git worktree remove --force <path>` 仅作用于这一条已核对过路径与分支所有权的登记，不跑仓库级 `git worktree prune`（那会顺带清掉别的缺失路径登记）；注销成功返回 `removed:true, registrationRemoved:true`，注销失败返回 `removed:false, reason:"not-found"` 并带 `warning`。响应：
 
 ```json
 { "ok": true, "id": "i-…", "removed": true, "reason": "removed",
@@ -356,7 +356,7 @@
 
 `branchRemoval` 只在请求带 `removeBranch:true` 时出现；分支未合并、未证明合并或删除失败都会让 `removed:false` 并带原因，但目录删除结果仍是 200。
 
-失败：400 `BPMN_BODY_INVALID` / `BPMN_EXPECTED_HEAD_INVALID`，404 `INSTANCE_NOT_FOUND` / `INSTANCE_WORKTREE_NOT_CONFIGURED`，409 `INSTANCE_WORKTREE_INSTANCE_ACTIVE` / `INSTANCE_WORKTREE_DIRTY` / `INSTANCE_WORKTREE_LOCKED` / `INSTANCE_WORKTREE_NOT_REGISTERED` / `INSTANCE_WORKTREE_BRANCH_NOT_OWNED` / `INSTANCE_WORKTREE_HEAD_MISMATCH`，500 `INSTANCE_WORKTREE_REMOVE_FAILED` / `BPMN_INTERNAL_ERROR`，503 `INSTANCE_WORKTREE_GIT_UNAVAILABLE`。
+失败：400 `BPMN_BODY_INVALID` / `BPMN_EXPECTED_HEAD_INVALID`，404 `INSTANCE_NOT_FOUND` / `INSTANCE_WORKTREE_NOT_CONFIGURED`，409 `INSTANCE_WORKTREE_INSTANCE_ACTIVE` / `INSTANCE_WORKTREE_EXECUTION_ACTIVE` / `INSTANCE_WORKTREE_DIRTY` / `INSTANCE_WORKTREE_LOCKED` / `INSTANCE_WORKTREE_NOT_REGISTERED` / `INSTANCE_WORKTREE_BRANCH_NOT_OWNED` / `INSTANCE_WORKTREE_HEAD_MISMATCH`，500 `INSTANCE_WORKTREE_REMOVE_FAILED` / `BPMN_INTERNAL_ERROR`，503 `INSTANCE_WORKTREE_GIT_UNAVAILABLE`。
 
 ### `DELETE /instances/<id>/worktree/branch`
 
@@ -372,7 +372,7 @@
                      "reason": "unmerged", "warning": "…", "forced": false } }
 ```
 
-分支不属于本实例（`not-owned`）时 409 `INSTANCE_WORKTREE_BRANCH_NOT_OWNED`；未配置 worktree 404；分支不存在 / 未合并不改变状态码（200 + `removed:false`）；Git 不可用同样返回 200，但 `branchRemoval.reason:"git-unavailable"`。失败：400 `BPMN_BODY_INVALID`，404 `INSTANCE_NOT_FOUND` / `INSTANCE_WORKTREE_NOT_CONFIGURED`，409 `INSTANCE_WORKTREE_INSTANCE_ACTIVE` / `INSTANCE_WORKTREE_BRANCH_NOT_OWNED`，500 `INSTANCE_CORRUPT` / `BPMN_INTERNAL_ERROR`。
+分支不属于本实例（`not-owned`）时 409 `INSTANCE_WORKTREE_BRANCH_NOT_OWNED`；未配置 worktree 404；分支不存在 / 未合并不改变状态码（200 + `removed:false`）；Git 不可用同样返回 200，但 `branchRemoval.reason:"git-unavailable"`。失败：400 `BPMN_BODY_INVALID`，404 `INSTANCE_NOT_FOUND` / `INSTANCE_WORKTREE_NOT_CONFIGURED`，409 `INSTANCE_WORKTREE_INSTANCE_ACTIVE` / `INSTANCE_WORKTREE_EXECUTION_ACTIVE` / `INSTANCE_WORKTREE_BRANCH_NOT_OWNED`，500 `INSTANCE_CORRUPT` / `BPMN_INTERNAL_ERROR`。
 
 ### `GET /instance-worktrees`
 
@@ -424,6 +424,8 @@
 ```
 
 计划条目的 `action` 只有三种：`remove`（实例终态或实例确实不存在、记录完整、分支属于本实例、目录已登记且干净）、`retain`（实例 `ACTIVE` / `SUSPENDED`）、`report`（无所有权记录、记录损坏 / 实例状态未知、分支不属于本实例、目录缺失、未登记、脏树或脏状态未知）。执行只处理 `action:"remove"` 的条目；其余条目原样进 `skipped`。删目录后会尝试删本实例分支（未证明合并则不删，记录进资源事件），并删除对应的所有权记录。
+
+执行前还会核对**物理退出**：计划里 `action:"remove"` 的实例若仍有 agent 执行未确认退出（进程活着、或清理未完成），整次执行 409 `INSTANCE_WORKTREE_EXECUTION_ACTIVE`，响应带 `instanceIds`，一条都不删。
 
 `planHash` 的约束：预览返回的计划在服务端缓存 10 分钟；执行时会重新扫描并与缓存的计划比较，超过 10 分钟、服务已重启、或工作区状态变化导致 hash 不一致，都返回 409 `INSTANCE_WORKTREE_PLAN_STALE`。缺少 / 格式错误的 `planHash` 返回 400 `INSTANCE_WORKTREE_PLAN_INVALID`，`workspaceId` 非法 400 `BPMN_WORKSPACE_ID_INVALID`，body 非对象 400 `BPMN_BODY_INVALID`，单条删除失败进 `skipped`，扫描或执行的整体失败 500。
 
@@ -581,6 +583,8 @@
 | `mark-failed` | 把记录标成 `failed`，错误码 `HTTP_MANUAL_FAILED`；已由人工标失败则幂等 |
 | `retry` | 只把未成功的记录重置为 `started` / `attempts:0` 并推进世代；已 `succeeded` 的记录拒绝（409 `HTTP_RESOLVE_CONFLICT`，避免重发已成功的副作用） |
 | `clear-tombstone` | 只删除实例 `state.json` 里的不可恢复墓碑并给记录打处置标记；不改记录状态、不重放任何前序副作用 |
+
+调用记录的写盘按「同一记录」串行化：进程内共享队列 + 跨进程 `.locks/<digest>.lock` 文件锁，`generation` 的读—检查—落盘整个在锁内完成；旧 fence 的迟到写入不会覆盖新世代的终态。
 
 处置**只改调用记录与审计**：不调用 runner、不写 `activity/end`、不改实例状态，也不让实例自动继续。所有真实变更追加 `connector/audit.jsonl`（含 evidence / operator / 前后状态）。实例终态 → 409 `BPMN_INSTANCE_TERMINAL`；实例正在停止 → 409 `BPMN_INSTANCE_STOPPING`；记录不存在 → 404 `HTTP_INVOCATION_NOT_FOUND`；动作非法 / 冲突 → 400 / 409；其它存储错误统一 500 `BPMN_INTERNAL_ERROR`。
 

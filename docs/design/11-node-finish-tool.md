@@ -7,7 +7,7 @@
 1. **agent 节点要完结自己、让流程往后流转，只能通过调用工具 `flow_finish_node`。** 自然语言收尾、进程退出、token 用尽都不算完结——节点会一直等（直到活动超时/取消）。
 2. 这个约定**与 `endEvent` 无关**：`endEvent` 是 BPMN 的结束事件，照旧由引擎处理，不要求调用任何工具。
 3. 一次活动执行只接受**一次**成功调用；重复调用返回 `NODE_ALREADY_FINISHED`（幂等：同参数重放也返回该错误，不重复写产物）。
-4. agent 停下来（本轮结束、进程退出）但没调用过工具 → **默认先唤醒提醒**，不是立刻失败：每个 agent 节点默认挂一个内置 `turn.stop` hook（`finish_reminder`，默认最多 3 次），由 adapter 把它唤醒并明确要求调用 `flow_finish_node`；提醒用尽仍未调用 → 节点以 `NODE_FINISH_MISSING` **阻塞**实例（`blocked`，等人重试/补数据），**不**把实例判成 failed——用户 2026-11-11 定调：不要随意把流程实例判定为失败。**禁止**把「模型说了完成」当成完成。
+4. agent 停下来（本轮结束、进程退出）但没调用过工具 → **默认先唤醒提醒**，不是立刻失败：每个 agent 节点默认挂一个内置 `turn.stop` hook（`finish_reminder`，默认最多 3 次），由 adapter 把它唤醒并明确要求调用 `flow_finish_node`；提醒用尽仍未调用 → 节点以 `NODE_FINISH_MISSING` 停下，实例 `status` **保持 `ACTIVE`**、写 `lastError{code:'NODE_FINISH_MISSING',reminders}`，发 `error` 事件；要不要重试/终止由业务或人决定（引擎不设 failed、也不设「卡住」状态）。**禁止**把「模型说了完成」当成完成。
 5. 工具调用是**流转的触发器**：`executeAgent` 拿到工具参数后返回，runner 才把该活动标记完成并评估出向连线（网关条件读的就是这次注入的变量）。
 6. adapter 若无法向该 agent 暴露工具（能力表 `capabilities.finishTool` ≠ `native`），**在 admission 阶段拒绝**该节点，不允许静默降级成「看输出文本猜结论」。
 
@@ -54,7 +54,7 @@ $DSH_HOME/flow-studio/instances/<id>/
   现在就调用它：variables 放后续网关要用的短变量，documents 放你写下的文件相对路径，summary 一句话。
   ```
 - 每次提醒写一条 handler 事件 `{ type: 'agent/reminder', count, maxFires }`（经 runner 的 handler `events[]` 透传，不是新的一等 kind），便于审计与 UI 展示。
-- 提醒次数用尽 → 实例进 `blocked`，`blockedReason={code:'NODE_FINISH_MISSING', reminders, sessionId?, processId?}`；人可重试该节点或终止实例，**不自动 failed**。
+- 提醒次数用尽 → 实例 `status` 保持 `ACTIVE`，`lastError={code:'NODE_FINISH_MISSING', reminders, sessionId?, processId?}`；是否重试/终止由业务决定。
 
 ## 4 各 adapter 怎么提供工具
 
@@ -87,10 +87,10 @@ adapter 必须把「怎么完结当前节点」写进节点提示词（不是可
 ## 7 验收（0.13.1 必须有的）
 
 1. 正常：agent 调工具 → 节点完结、`activity/end` 带 `output` 与 `artifacts`，实例变量里能看到注入的 `verdict`，网关按它路由到正确的下一条连线；
-2. 不调工具：会话正常结束（提醒用尽）→ 实例 `blocked` + `blockedReason.code='NODE_FINISH_MISSING'`（不是 done，也没有 failed 可判）；
+2. 不调工具：会话正常结束（提醒用尽）→ 实例 `status==='ACTIVE'` 且 `lastError.code==='NODE_FINISH_MISSING'`（既不 done，也没有 failed/blocked 状态可判）；
 3. 变量超限：塞 9 KiB 或嵌套对象 → `NODE_VARIABLES_INVALID`，节点不结束；
 4. 文档不存在 / 路径越界 / 超 5 MiB → `NODE_DOCUMENT_INVALID`；
 5. 重复调用 → `NODE_ALREADY_FINISHED`，产物索引不重复；
 6. 超时中断：工具从未调用且活动超时 → `BPMN_ACTIVITY_TIMEOUT` 且会话被 abort（不是挂住）。
 7. 提醒：agent 停下来没调工具 → 收到一次提醒并被唤醒；调用后正常完结，事件流里有 `agent/reminder`（count=1），实例状态不变（不 blocked、不 failed）。
-8. 提醒用尽：连续 3 次停下都不调工具 → 3 条 `agent/reminder` + 实例 `blocked`（`blockedReason.code='NODE_FINISH_MISSING'`、`reminders:3`），**不是 failed**；把 maxFires 配成 0 时，第一次停下就直接 blocked。
+8. 提醒用尽：连续 3 次停下都不调工具 → 3 条 `agent/reminder` + 实例仍 `ACTIVE`、`lastError.code='NODE_FINISH_MISSING'`（`reminders:3`）；把 maxFires 配成 0 时，第一次停下就直接记 lastError。

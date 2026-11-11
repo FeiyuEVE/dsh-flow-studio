@@ -154,10 +154,15 @@ function parseStateSource(sourceJson, label) {
   } catch (error) {
     throw new BpmnStateError('BPMN_STATE_INVALID', `${label} 的 source 不是合法 JSON：${errorMessageOf(error)}`)
   }
-  if (!isPlainObject(parsed) || !isPlainObject(parsed.elements)) {
+  // `SerializableContext.serialize()` 把 elements 摊平在顶层（`{id,type,name,activities,…}`）；
+  // 内存里的 SerializableContext 则是 `{elements:{…}}`。两种都接受，统一成后者。
+  const elements = isPlainObject(parsed?.elements)
+    ? parsed.elements
+    : parsed
+  if (!isPlainObject(parsed) || !Array.isArray(elements.activities) || !Array.isArray(elements.sequenceFlows)) {
     throw new BpmnStateError('BPMN_STATE_INVALID', `${label} 的 source 不是 bpmn-engine 的序列化执行上下文`)
   }
-  return parsed
+  return isPlainObject(parsed.elements) ? parsed : { ...parsed, elements: parsed }
 }
 
 /**
@@ -202,12 +207,6 @@ export function validateStateEnvelope(state, { identity, definition, instanceId 
   }
   if (typeof state.instanceId !== 'string' || state.instanceId === '') {
     throw new BpmnStateError('BPMN_STATE_INVALID', 'state.instanceId 必须是非空字符串')
-  }
-  if (typeof instanceId === 'string' && instanceId !== '' && state.instanceId !== instanceId) {
-    throw new BpmnStateError(
-      'BPMN_STATE_INVALID',
-      `state 属于实例 ${state.instanceId}，当前 runner 是 ${instanceId}；拒绝跨实例恢复`
-    )
   }
   if (typeof state.definitionId !== 'string' || state.definitionId !== identity.id) {
     throw new BpmnStateError(
@@ -328,7 +327,9 @@ export function readSerializedMaxTakes(behaviour) {
  * @returns {object}
  */
 export function describeExecutionStructure(sourceContext) {
-  const elements = isPlainObject(sourceContext?.elements) ? sourceContext.elements : {}
+  const elements = isPlainObject(sourceContext?.elements)
+    ? sourceContext.elements
+    : (isPlainObject(sourceContext) ? sourceContext : {})
   const definition = isPlainObject(elements.definition) ? elements.definition : {}
   const processes = toArray(elements.processes)
     .map(process => ({

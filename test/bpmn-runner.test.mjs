@@ -28,6 +28,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 
 import { activeInstanceCount, bpmnXmlFromDefinition, createBpmnRunner } from '../src/bpmn-runner.js'
 
@@ -52,6 +53,27 @@ const openRunners = []
 function track(runner) {
   openRunners.push(runner)
   return runner
+}
+
+/**
+ * runner 现在必须带 `definitionIdentity`（state v2 信封的必填身份）。
+ * 测试里按「实际执行 XML」重算 sha256——与 runtime 的做法一致：不信调用方自报。
+ */
+function identityOf(options) {
+  const sourceXml = options.xml ?? bpmnXmlFromDefinition(options.definition)
+  return {
+    id: options.definition?.id ?? 'unknown-definition',
+    version: 1,
+    hash: createHash('sha256').update(sourceXml, 'utf8').digest('hex'),
+  }
+}
+
+/** 测试用 runner 工厂：默认自动补 identity，其余选项原样透传。 */
+function createRunner(options) {
+  return createBpmnRunner({
+    ...options,
+    definitionIdentity: options.definitionIdentity ?? identityOf(options),
+  })
 }
 
 async function check(name, fn) {
@@ -300,7 +322,7 @@ try {
   // -------------------------------------------------------------------------
   await check('XML 夹具：跑到 userTask 等待、flow/taken 跟着网关、signalTask 续到 process/end', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition(),
       xml: FIXTURE_XML,
       variables: { approved: null },
@@ -382,7 +404,7 @@ try {
   // -------------------------------------------------------------------------
   await check('恢复：A 落 state → 全新实例 B recover → signalTask 跑到结束（没有复用旧对象）', async () => {
     const recorderA = makeRecorder()
-    const a = track(createBpmnRunner({
+    const a = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       // 故意不给 xml：定义-only 也必须能跑（走 definition 反向生成的 XML）
       services: recorderA.services(() => ({ output: { draft: 'A' } })),
@@ -401,7 +423,7 @@ try {
 
     // 全新实例（新的 id、新的 Engine、新的 services 闭包）。
     const recorderB = makeRecorder()
-    const b = track(createBpmnRunner({
+    const b = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       services: recorderB.services(() => ({ output: { draft: 'B' } })),
     }))
@@ -437,7 +459,7 @@ try {
 
     // 从同一份 state 恢复第二次也必须成功（state 是只读的起点，不是一次性令牌）。
     const recorderC = makeRecorder()
-    const c = track(createBpmnRunner({
+    const c = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       services: recorderC.services(() => ({ output: { draft: 'C' } })),
     }))
@@ -451,7 +473,7 @@ try {
 
     // stop() 之后的 state（引擎 stopped）是可以恢复的：这是「手动挂起 → 恢复」的落点。
     const stopperRecorder = makeRecorder()
-    const stopper = track(createBpmnRunner({
+    const stopper = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       services: stopperRecorder.services(),
     }))
@@ -459,7 +481,7 @@ try {
     await stopper.stop()
     const stoppedState = await stopper.getState()
     A.equal(stoppedState.engine.state, 'stopped', 'stop 之后引擎状态是 stopped')
-    const reviver = track(createBpmnRunner({
+    const reviver = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       services: makeRecorder().services(),
     }))
@@ -470,7 +492,7 @@ try {
     // 已经结束（done）的 state 没有可推进的点：必须结构化拒绝，而不是挂住调用方。
     const doneState = await b.getState()
     A.equal(doneState.status, 'done')
-    const late = track(createBpmnRunner({
+    const late = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
       services: makeRecorder().services(),
     }))
@@ -479,7 +501,7 @@ try {
 
     // 真正的「在跑」（handler 在飞、engine.execution.isRunning）也不许 recover。
     let handlerAborted = false
-    const slow = track(createBpmnRunner({
+    const slow = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-running' }),
       services: {
         executeAgent(element, ctx) {
@@ -508,7 +530,7 @@ try {
   await check('快照只在 activity/wait 与 activity/end 之后触发（不在每条事件上 getState）', async () => {
     const seen = []
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-snapshot' }),
       shouldSnapshot(event) {
         seen.push(event.type)
@@ -527,7 +549,7 @@ try {
 
     // 去抖为 false 时一次都不取（显式 getState 仍然可用）。
     const quietRecorder = makeRecorder()
-    const quiet = track(createBpmnRunner({
+    const quiet = track(createRunner({
       definition: makeDefinition({ id: 'def-snapshot-quiet' }),
       shouldSnapshot: () => false,
       services: quietRecorder.services(),
@@ -554,7 +576,7 @@ try {
     // (a) 字面 `= false`：永远不该走回退边（恒真实现会走）。
     {
       const recorder = makeRecorder()
-      const runner = track(createBpmnRunner({
+      const runner = track(createRunner({
         definition: definitionWithBackCondition('= false'),
         services: recorder.services(),
       }))
@@ -570,7 +592,7 @@ try {
     // (b) `= approved = false`：approved=false 时真的走回退边（false 分支不是「恒真」也不是「恒假」）。
     {
       const recorder = makeRecorder()
-      const runner = track(createBpmnRunner({
+      const runner = track(createRunner({
         definition: definitionWithBackCondition('= approved = false'),
         services: recorder.services(),
       }))
@@ -590,31 +612,20 @@ try {
       A.equal(recorder.flowEvents().filter((event) => event.flowId === 'f_back').length, 1, '回退边只走了那一次')
     }
 
-    // (c) 注入点：上层（bpmn-expr）说 false 就 false，内置求值不参与。
+    // (c) 自定义求值器入口已删除：传 evaluateCondition 即 BPMN_OPTIONS_INVALID
+    //     （条件只允许经 bpmn-expr.evaluateFeel 求值，防止上层把条件交回别的实现）。
     {
       const recorder = makeRecorder()
-      const seen = []
-      const runner = track(createBpmnRunner({
-        definition: definitionWithBackCondition('= approved = false'),
-        evaluateCondition(expression, context) {
-          seen.push({ expression, flowId: context.flowId, to: context.to, variables: { ...context.variables } })
-          return false
-        },
-        services: recorder.services(),
-      }))
-      await runner.start()
-      await runner.signalTask({ activityId: 'n_human', payload: { approved: false } })
-      A.equal(runner.status(), 'done', '注入的求值器说 false → 默认边，直接结束')
-      A.equal(recorder.flowIds().includes('f_back'), false, '注入的 false 覆盖了内置 FEEL（= false 仍成立的那条）')
-      A.equal(seen.length, 1, '注入点被调用一次')
-      A.equal(seen[0].expression, '= approved = false', '注入点拿到表达式原文')
-      A.equal(seen[0].flowId, 'f_back', '注入点拿到连线 id')
-      A.equal(seen[0].variables.approved, false, '注入点拿到人工载荷')
-      A.equal(seen[0].variables.draft, 'v1', '注入点拿到 agent 输出（同一本变量账本）')
-      // 引擎环境里会混进 broker message 的 content/fields/properties（ProcessExecution
-      // 的 assignVariables 副作用）；注入点拿到的账本里必须没有这些脏 key。
-      A.equal('content' in seen[0].variables, false, '变量账本不夹带引擎 message 垃圾（坑 d）')
-      A.equal('fields' in seen[0].variables, false, '变量账本不夹带引擎 message 垃圾（坑 d）')
+      A.throws(
+        () => createBpmnRunner({
+          definition: definitionWithBackCondition('= approved = false'),
+          definitionIdentity: identityOf({ definition: definitionWithBackCondition('= approved = false') }),
+          evaluateCondition: () => false,
+          services: recorder.services(),
+        }),
+        { code: 'BPMN_OPTIONS_INVALID' }
+      )
+      A.equal(recorder.handlerCalls.length, 0, '拒绝选项时 handler 一次都不执行')
     }
   })
 
@@ -626,7 +637,7 @@ try {
       '>= false</bpmn:conditionExpression>'
     )
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-nolang' }),
       xml,
       services: recorder.services(),
@@ -644,7 +655,7 @@ try {
     {
       const recorder = makeRecorder()
       const { definition, xml } = fixtureWithBackCondition('= 1 > 2', 'def-cond-gt')
-      const runner = track(createBpmnRunner({ definition, xml, services: recorder.services() }))
+      const runner = track(createRunner({ definition, xml, services: recorder.services() }))
       await runner.start()
       await runner.signalTask({ activityId: 'n_human', payload: { approved: false } })
       A.equal(runner.status(), 'done')
@@ -656,7 +667,7 @@ try {
     {
       const recorder = makeRecorder()
       const { definition, xml } = fixtureWithBackCondition('= 1 + 1 = 2', 'def-cond-arith')
-      const runner = track(createBpmnRunner({ definition, xml, services: recorder.services() }))
+      const runner = track(createRunner({ definition, xml, services: recorder.services() }))
       await runner.start()
       await runner.signalTask({ activityId: 'n_human', payload: { approved: true } })
       A.equal(runner.status(), 'waiting', '回退边成环：又停在 userTask')
@@ -673,7 +684,7 @@ try {
       const definition = makeDefinition({ id: 'def-cond-invalid' })
       definition.flows = definition.flows.map((flow) => (flow.id === 'f_back' ? { ...flow, condition: null } : flow))
       const xml = FIXTURE_XML.replace('= approved = false', '= approved =')
-      const runner = track(createBpmnRunner({ definition, xml, services: recorder.services() }))
+      const runner = track(createRunner({ definition, xml, services: recorder.services() }))
       A.equal((await runner.start()).state, 'waiting')
       await A.rejects(
         () => runner.signalTask({ activityId: 'n_human', payload: { approved: false } }),
@@ -697,7 +708,7 @@ try {
       const definition = makeDefinition({ id: 'def-cond-engine-expr' })
       definition.flows = definition.flows.map((flow) => (flow.id === 'f_back' ? { ...flow, condition: null } : flow))
       const xml = FIXTURE_XML.replace('= approved = false', '${environment.services.__cond_f_back}')
-      const runner = track(createBpmnRunner({ definition, xml, services: recorder.services() }))
+      const runner = track(createRunner({ definition, xml, services: recorder.services() }))
       A.equal((await runner.start()).state, 'waiting')
       await A.rejects(
         () => runner.signalTask({ activityId: 'n_human', payload: { approved: false } }),
@@ -710,7 +721,7 @@ try {
 
   await check('连线次数上限：`= true` + fs:maxRounds=3 → 目标跑 4 次后 BPMN_FLOW_TAKE_LIMIT 失败', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeLoopDefinition({ definitionId: 'def-take-limit-3', maxRounds: 3 }),
       services: recorder.services((element, ctx) => ({ output: { attempt: ctx.attempt } })),
     }))
@@ -750,7 +761,7 @@ try {
 
   await check('连线次数上限：fs:maxRounds=1 → 目标跑 2 次（上限是「连线被走次数」，不是节点总次数）', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeLoopDefinition({ definitionId: 'def-take-limit-1', maxRounds: 1 }),
       services: recorder.services((element, ctx) => ({ output: { attempt: ctx.attempt } })),
     }))
@@ -772,7 +783,7 @@ try {
 
   await check('循环护栏：没有 fs:maxRounds 的 `= true` 死环被 BPMN_LOOP_LIMIT 拦下', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeLoopDefinition({ definitionId: 'def-loop-guard', maxRounds: null }),
       // 故意把护栏设小，别真跑 1000 次。
       loopGuardMax: 5,
@@ -796,7 +807,7 @@ try {
 
     // loopGuardMax=0 关闭护栏：这里只验证选项被接受、不会因为护栏误杀（用一轮就结束的流程）。
     const okRecorder = makeRecorder()
-    const okRunner = track(createBpmnRunner({
+    const okRunner = track(createRunner({
       definition: makeLoopDefinition({ definitionId: 'def-loop-guard-off', maxRounds: 2, condition: '= attempt < 2' }),
       loopGuardMax: 0,
       services: okRecorder.services((element, ctx) => ({ output: { attempt: ctx.attempt } })),
@@ -806,7 +817,7 @@ try {
 
   await check('连线次数上限不误伤：fs:maxRounds=2 只走 1 次 → 正常 done', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeLoopDefinition({
         definitionId: 'def-take-limit-once',
         maxRounds: 2,
@@ -834,7 +845,7 @@ try {
     definition.flows = definition.flows.map((flow) => (
       flow.id === 'r01' ? { ...flow, extensions } : flow
     ))
-    const runner = track(createBpmnRunner({ definition, services: recorder.services() }))
+    const runner = track(createRunner({ definition, services: recorder.services() }))
     const flow = runner.definition.flows.find((entry) => entry.id === 'r01')
     A.deepEqual(flow.extensions, extensions, 'extensions 原样保留（下一层还要拿 fs 信息）')
     A.equal(flow.maxTakes, 2, '从 extensions 派生出 maxTakes')
@@ -849,7 +860,7 @@ try {
         definitionId: `def-ext-bad-${String(bad)}`,
         extensions: [{ type: 'fs:MaxRounds', name: 'maxRounds', value: bad }],
       })
-      const badRunner = track(createBpmnRunner({ definition: badDefinition, services: makeRecorder().services() }))
+      const badRunner = track(createRunner({ definition: badDefinition, services: makeRecorder().services() }))
       A.equal(
         badRunner.definition.flows.find((entry) => entry.id === 'r01').maxTakes,
         null,
@@ -861,7 +872,7 @@ try {
       definitionId: 'def-ext-string',
       extensions: [{ type: 'fs:MaxRounds', name: 'maxRounds', value: '3' }],
     })
-    const stringRunner = track(createBpmnRunner({ definition: stringDefinition, services: makeRecorder().services() }))
+    const stringRunner = track(createRunner({ definition: stringDefinition, services: makeRecorder().services() }))
     A.equal(stringRunner.definition.flows.find((entry) => entry.id === 'r01').maxTakes, 3)
   })
 
@@ -878,7 +889,7 @@ try {
       return definition
     }
 
-    const a = track(createBpmnRunner({ definition: makeLimitedDefinition(), services: recorderA.services() }))
+    const a = track(createRunner({ definition: makeLimitedDefinition(), services: recorderA.services() }))
     A.equal((await a.start()).state, 'waiting')
     // 第 1 次走这条连线：允许（已走 0 次 < 上限 1），agent 第 2 次执行后再等人。
     await a.signalTask({ activityId: 'n_human', payload: { approved: false } })
@@ -891,7 +902,7 @@ try {
 
     // 全新实例恢复：再走一次就必须超限（若计数丢了，这里会误判成第 1 次而放行）。
     const recorderB = makeRecorder()
-    const b = track(createBpmnRunner({ definition: makeLimitedDefinition(), services: recorderB.services() }))
+    const b = track(createRunner({ definition: makeLimitedDefinition(), services: recorderB.services() }))
     await b.recover(state)
     A.equal(b.pendingTasks()[0].elementId, 'n_human')
     await A.rejects(() => b.signalTask({ activityId: 'n_human', payload: { approved: false } }), (error) => {
@@ -915,7 +926,7 @@ try {
     //     会在 e_back 的**第 1 次**判定就误报 BPMN_FLOW_TAKE_LIMIT。
     {
       const recorder = makeRecorder()
-      const runner = track(createBpmnRunner({
+      const runner = track(createRunner({
         definition: makeMultiInboundDefinition('def-multi-inbound-once'),
         variables: { phase: 'in' },
         services: recorder.services((element, ctx) => ({
@@ -937,7 +948,7 @@ try {
     // (b) e_back 走满 2 次（上限），第 3 次判定时失败：takes=2 / maxTakes=2。
     {
       const recorder = makeRecorder()
-      const runner = track(createBpmnRunner({
+      const runner = track(createRunner({
         definition: makeMultiInboundDefinition('def-multi-inbound-limit'),
         variables: { phase: 'in' },
         services: recorder.services((element, ctx) => ({
@@ -972,7 +983,7 @@ try {
   // -------------------------------------------------------------------------
   await check('handler 抛错：实例 failed + onError + error 事件', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-boom' }),
       services: recorder.services(async () => {
         throw new Error('agent exploded')
@@ -1010,7 +1021,7 @@ try {
     const errors = []
     let aborted = false
     const startedAt = Date.now()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout' }),
       limits: { activityWaitMs: 50 },
       services: {
@@ -1042,7 +1053,7 @@ try {
 
   await check('activityWaitMs：userTask 一直没人完成任务 → 超时 failed', async () => {
     const recorder = makeRecorder()
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout-human' }),
       limits: { activityWaitMs: 60 },
       services: recorder.services(),
@@ -1060,7 +1071,7 @@ try {
 
   await check('runTimeoutMs：整轮跑不完 → failed', async () => {
     const errors = []
-    const runner = track(createBpmnRunner({
+    const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout-run' }),
       limits: { runTimeoutMs: 60 },
       services: {
@@ -1089,7 +1100,7 @@ try {
 
     // (a) 正向：A 停在等待点（默认 shouldSnapshot 已在 activity/wait 落过 state）。
     const aRecorder = makeRecorder()
-    const a = track(createBpmnRunner({
+    const a = track(createRunner({
       definition: makeDefinition({ id: 'def-lru-a' }),
       maxActiveInstances: 1,
       services: aRecorder.services(),
@@ -1099,7 +1110,7 @@ try {
     A.equal(activeInstanceCount(), 1)
 
     const bRecorder = makeRecorder()
-    const b = track(createBpmnRunner({
+    const b = track(createRunner({
       definition: makeDefinition({ id: 'def-lru-b' }),
       maxActiveInstances: 1,
       services: bRecorder.services(),
@@ -1116,7 +1127,7 @@ try {
 
     // (b) 负向：C 的 shouldSnapshot 一直 false → 淘汰时必须报错，并且不动集合。
     const cRecorder = makeRecorder()
-    const c = track(createBpmnRunner({
+    const c = track(createRunner({
       definition: makeDefinition({ id: 'def-lru-c' }),
       maxActiveInstances: 1,
       shouldSnapshot: () => false,
@@ -1128,7 +1139,7 @@ try {
 
     let evictionError = null
     try {
-      createBpmnRunner({
+      createRunner({
         definition: makeDefinition({ id: 'def-lru-d' }),
         maxActiveInstances: 1,
         services: makeRecorder().services(),
@@ -1146,7 +1157,7 @@ try {
     const cState = await c.getState()
     A.equal(cState.status, 'waiting')
     const dRecorder = makeRecorder()
-    const d = track(createBpmnRunner({
+    const d = track(createRunner({
       definition: makeDefinition({ id: 'def-lru-d' }),
       maxActiveInstances: 1,
       services: dRecorder.services(),
@@ -1162,7 +1173,7 @@ try {
   await check('加载期校验：缺 handler / 未知 kind / javascript 条件 / parallelGateway / 默认流条件', async () => {
     // 缺 handler：agent 节点必须配 executeAgent（否则引擎会跑到那里才 fatal）。
     A.throws(
-      () => createBpmnRunner({ definition: makeDefinition({ id: 'def-no-handler' }), services: {} }),
+      () => createRunner({ definition: makeDefinition({ id: 'def-no-handler' }), services: {} }),
       { code: 'BPMN_HANDLER_MISSING' }
     )
 
@@ -1172,7 +1183,7 @@ try {
       element.id === 'n_human' ? { ...element, kind: 'script' } : element
     ))
     A.throws(
-      () => createBpmnRunner({ definition: unknown, services: makeRecorder().services() }),
+      () => createRunner({ definition: unknown, services: makeRecorder().services() }),
       { code: 'BPMN_UNKNOWN_NODE_KIND' }
     )
 
@@ -1182,7 +1193,7 @@ try {
       flow.id === 'f_back' ? { ...flow, condition: { expression: 'approved === false', language: 'javascript' } } : flow
     ))
     A.throws(
-      () => createBpmnRunner({ definition: jsCondition, services: makeRecorder().services() }),
+      () => createRunner({ definition: jsCondition, services: makeRecorder().services() }),
       { code: 'BPMN_CONDITION_LANGUAGE_UNSUPPORTED' }
     )
 
@@ -1192,7 +1203,7 @@ try {
       '<bpmn:parallelGateway id="n_gw_p"'
     )
     A.throws(
-      () => createBpmnRunner({
+      () => createRunner({
         definition: makeDefinition({ id: 'def-parallel' }),
         xml: parallelXml,
         services: makeRecorder().services(),
@@ -1202,7 +1213,7 @@ try {
 
     // definition 与 xml 不是同一版：节点 id 对不上要报错（否则派发不到 handler）。
     A.throws(
-      () => createBpmnRunner({
+      () => createRunner({
         definition: makeDefinition({ id: 'def-mismatch', startId: 'n_start' }),
         xml: FIXTURE_XML.replace(/id="n_agent"/g, 'id="n_agent_renamed"'),
         services: makeRecorder().services(),
@@ -1223,7 +1234,7 @@ try {
     defaultWithCondition.flows = defaultWithCondition.flows.map((flow) => (
       flow.id === 'f_ok' ? { ...flow, condition: { expression: '= true', language: 'feel' } } : flow
     ))
-    const warned = track(createBpmnRunner({
+    const warned = track(createRunner({
       definition: defaultWithCondition,
       services: makeRecorder().services(),
     }))

@@ -27,8 +27,6 @@ export const ALLOWED_ACTIVITY_TYPES = Object.freeze([
   'bpmn:ExclusiveGateway',
 ])
 
-const ALLOWED_ACTIVITY_SET = new Set(ALLOWED_ACTIVITY_TYPES)
-
 /** 统一 BPMN 类型的写法（`bpmn:ServiceTask` / `serviceTask` → `bpmn:serviceTask`）。 */
 export function canonicalBpmnType(rawType) {
   const type = bpmnTypeOf(rawType)
@@ -128,6 +126,12 @@ const TYPE_CODES = Object.freeze({
   },
 })
 
+/** 白名单 / 禁止类型的统一写法表（`bpmn:ServiceTask` 与 `bpmn:serviceTask` 视为同一类型）。 */
+const ALLOWED_ACTIVITY_CANONICAL = new Set(ALLOWED_ACTIVITY_TYPES.map(type => canonicalBpmnType(type)))
+const TYPE_CODES_CANONICAL = new Map(
+  Object.entries(TYPE_CODES).map(([type, mapped]) => [canonicalBpmnType(type), mapped])
+)
+
 /** `bpmn:` 前缀补齐（parse 的归一化 type 与 moddle `$type` 都吃）。 */
 export function bpmnTypeOf(rawType) {
   if (typeof rawType !== 'string' || rawType.trim() === '') return null
@@ -143,9 +147,10 @@ export function bpmnTypeOf(rawType) {
  * @returns {null | {code: string, message: string, elementId?: string}}
  */
 export function violationForActivityType(rawType, elementId) {
+  const canonical = canonicalBpmnType(rawType)
+  if (canonical !== null && ALLOWED_ACTIVITY_CANONICAL.has(canonical)) return null
   const type = bpmnTypeOf(rawType)
-  if (type !== null && ALLOWED_ACTIVITY_SET.has(type)) return null
-  const mapped = type === null ? null : TYPE_CODES[type]
+  const mapped = canonical === null ? null : TYPE_CODES_CANONICAL.get(canonical)
   const id = typeof elementId === 'string' && elementId !== '' ? elementId : '?'
   if (mapped) return violation(mapped.code, `${mapped.reason}：${id}（${type ?? '(无类型)'}）。`, { elementId })
   return violation(
@@ -270,8 +275,8 @@ export function collectRawExecutionViolations(process) {
     violations.push(...loopViolations(element, elementId))
     violations.push(...implementationViolations(element, elementId))
 
-    if (ALLOWED_ACTIVITY_SET.has(type)) continue
-    const mapped = TYPE_CODES[type]
+    if (ALLOWED_ACTIVITY_CANONICAL.has(canonicalBpmnType(type))) continue
+    const mapped = TYPE_CODES_CANONICAL.get(canonicalBpmnType(type))
     if (mapped) {
       violations.push(violation(
         mapped.code,
@@ -300,10 +305,14 @@ export function collectRawExecutionViolations(process) {
  */
 export function collectSerializedExecutionViolations(serializedContext) {
   const violations = []
+  // 内存里的 SerializableContext 是 `{elements:{…}}`；`serialize()` 出来的 JSON 把
+  // elements 摊平在顶层。两种形状都接受。
   const elements = serializedContext && typeof serializedContext === 'object'
-    ? serializedContext.elements
+    ? (serializedContext.elements && typeof serializedContext.elements === 'object'
+      ? serializedContext.elements
+      : serializedContext)
     : null
-  if (!elements || typeof elements !== 'object') {
+  if (!elements || typeof elements !== 'object' || !Array.isArray(elements.activities)) {
     return [violation('BPMN_STATE_INVALID', '快照里没有可读取的执行结构（elements）。')]
   }
 
@@ -334,8 +343,8 @@ export function collectSerializedExecutionViolations(serializedContext) {
     violations.push(...loopViolations(behaviour, elementId))
     violations.push(...implementationViolations(behaviour, elementId))
 
-    if (ALLOWED_ACTIVITY_SET.has(type)) continue
-    const mapped = TYPE_CODES[type]
+    if (ALLOWED_ACTIVITY_CANONICAL.has(canonicalBpmnType(type))) continue
+    const mapped = TYPE_CODES_CANONICAL.get(canonicalBpmnType(type))
     if (mapped) {
       violations.push(violation(mapped.code, `${mapped.reason}：${elementId ?? '?'}（${type}）。`, { elementId }))
     } else {

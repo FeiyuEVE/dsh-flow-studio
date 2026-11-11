@@ -134,7 +134,7 @@ $DSH_HOME/flow-studio/
   "definitionHash": "…", "recovered": false }
 ```
 
-- 若 start 阶段 handler 失败 / 条件非法，实例已存在，仍返回 201，`status:"blocked"` 并在
+- 若 start 阶段 handler 失败 / 条件非法，实例已存在，仍返回 201，`status:"ACTIVE"`（错误记进 `lastError`）并在
   `error` 里带 `{code,message}`（进程失败不是「接口没建成」）；实例详情的
   `result.error.code` 保留 handler 的真实错误码（如 `BPMN_AGENT_ADAPTER_UNAVAILABLE`），
   不让 runner 外层的 `BPMN_HANDLER_FAILED` 盖掉。
@@ -145,7 +145,7 @@ $DSH_HOME/flow-studio/
 
 ### 3.5 `GET /instances`
 
-- `?definitionId=`、`?status=`（`pending|running|waiting|blocked|done|aborted`）、`?limit=`
+- `?definitionId=`、`?status=`（`ACTIVE|COMPLETED|SUSPENDED|CANCELED`）、`?limit=`
   （默认 200，封顶 1000）。
 - 出参：`{ok:true, instances:[{…instance.json, active:boolean}], skipped:[…]}`。
 - `active` = 当前内存注册表里是否还有该实例的 runner。
@@ -191,7 +191,7 @@ $DSH_HOME/flow-studio/
   `decidedBy` 就自动并入（不另造事件）。
 - 出参：`{ok:true, id, status, pendingTasks, lastSeq, activityId, executionId, decidedBy, recovered}`。
 - 完成 = `runner.signalTask({activityId, executionId, payload})`；返回时已跑到下一个
-  等待点 / done / blocked。
+  等待点 / 终态。
 - 错误：400（activityId/payload 非法）、404（实例/任务不存在 = `BPMN_TASK_NOT_FOUND`）、
   409（实例终态 / 非 waiting / 失败 / 无法恢复）、500（事件或快照写入失败）。
 
@@ -202,39 +202,35 @@ $DSH_HOME/flow-studio/
 - 重复 stop 幂等：200 + `alreadyTerminal:true`，返回当前终态。
 - 错误：400（instanceId 非法）、404（不存在）、500/503（收口失败 / 引擎不可用）。
 
-## 4 实例状态（status 字段）与 runner 五态换算
+## 4 实例状态（对齐 Camunda，只有 4 个）
 
-> 新引擎**没有独立状态机**（没有 xstate / `flowmachine` 参与）：`instance.json.status` 只是一个普通持久字段，由 runtime 按事件直接写。下面的图只说明**允许的取值与流转**，不是状态机实现。
+新引擎**没有状态机**，`instance.json.status` 只是普通持久字段，由 runtime 按事件直接写。
 
-实例状态（`instance.json.status`）：
+状态取值与 [Camunda 8 的 `ProcessInstanceState`](https://raw.githubusercontent.com/camunda/camunda/main/search/search-domain/src/main/java/io/camunda/search/entities/ProcessInstanceEntity.java) 一致：
 
-```
-pending ──start──▶ running ──wait──▶ waiting ──signal──▶ running ──┐
-                      │                 │                          ├──▶ done
-                      │                 └──stop───────────────────▶ aborted
-                      ├──任何问题（条件错/超时/handler 失败/提醒用尽/连线超限/
-                      │   状态或定义无法反序列化等）──────────────▶ blocked ──retry──▶ running
-                      └──stop─────────────────────────────────────▶ aborted
-```
+| 状态 | 含义 |
+|---|---|
+| `ACTIVE` | 活着：正在跑、停在人工任务、或出错后停住等人处理，**都是 ACTIVE** |
+| `COMPLETED` | 走到结束事件、正常完成 |
+| `SUSPENDED` | 被挂起（本轮只保留取值，suspend/resume 操作后续再加） |
+| `CANCELED` | 被取消（`POST /instances/<id>/stop`） |
 
-- `pending`：建了实例但 runner 还没启动（`createInstance` 后、start 前）。
-- `running`：引擎正在推进（含 serviceTask handler 在飞）。
-- `waiting`：停在 userTask（或引擎的 wait 状态），`pendingTasks` 非空。
-- `blocked`：**卡住，不是失败**。任何问题（条件求值错、活动/整轮超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏、快照或定义无法反序列化）都只把实例停在这里，带 `blockedReason{code,message,nodeId?,reminders?}`；人可 retry 或 stop。**用户口径（2026-11-11）：没有 `failed` 这种状态，最多就是流转卡住。**
-- `done` / `aborted`：终态（完成 / 被人终止），不再恢复 runner。
+- **没有 `failed`，也没有 `blocked`/「卡住」状态**。用户口径（2026-11-11）：卡住不具备通用性，属于业务自己判别，引擎不做这个状态。
+- `running` / `waiting` 不是状态：它们是 runner 的内部执行态，不写进 `instance.json.status`；「在等人」用 `ACTIVE` + `pendingTasks` 非空表达。
+- 引擎内部出错（条件求值错、活动/整轮超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏）时：`status` **保持 `ACTIVE` 不变**，同时写 `lastError{code,message,nodeId?,activityId?,retries?}` 并发 `error` 事件；是否重试/终止/继续，由业务或人决定，引擎不替它判「卡住」。
+- 终态只有 `COMPLETED` 与 `CANCELED`。
 
-与 `bpmn-runner` 五态的换算：
+runner 内部执行态（不对外当实例状态）：
 
-| runner.status() | instance.status | 说明 |
-|---|---|---|
-| `idle` | `pending`（新建）/ `aborted`（已 stop） | runner 还没启动或已释放；aborted 是运行时写入的终态 |
-| `running` | `running` | 引擎推进中 |
-| `waiting` | `waiting` | `activity/wait` 后落 `pendingTasks` + `state.json` |
-| `done` | `done` | `process/end` → `completeInstance('done')` |
-| —（无对应） | `aborted` | runner 没有 aborted 态；`stop()` 后由运行时收成 aborted |
+| runner.status() | 实例 status |
+|---|---|
+| `idle` | `ACTIVE`（未启动或已停住） |
+| `running` | `ACTIVE` |
+| `waiting` | `ACTIVE` + `pendingTasks` 非空 |
+| `done` | `COMPLETED` |
+| `blocked`（内部错误态） | `ACTIVE` + `lastError` |
 
-状态写入优先级：`error` / `process/end` 走 `completeInstance`（终态不可被后续事件改回）；
-`activity/start` / `activity/end` 只刷新 `running` 与待办；`activity/wait` 写 `waiting`。
+`instance.json` 字段：`status` / `pendingTasks[]` / `lastError|null` / `variables` / `result` / `artifacts[]`。
 
 ## 5 事件 kind 表
 
@@ -247,8 +243,8 @@ pending ──start──▶ running ──wait──▶ waiting ──signal─
 | `activity/end` | runner | `at, elementId, activityId, durationMs, output?, usage?, artifacts?, status?, headers?` | 事件 + 实例 running + 刷新 `pendingTasks` |
 | `activity/wait` | runner | `at, elementId, activityId` | 事件 + 实例 waiting + `pendingTasks` |
 | `flow/taken` | runner | `at, flowId, from, to, condition:{expression,value}\|null` | 事件（不含状态写入） |
-| `process/end` | runner | `at, elementId, activityId` | 事件 + `completeInstance('done')` |
-| `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + 实例 `blocked` + `blockedReason`（**不**判失败） |
+| `process/end` | runner | `at, elementId, activityId` | 事件 + `status=COMPLETED` |
+| `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + 实例 `lastError`（**status 仍是 ACTIVE**） |
 | `agent/log` 等 | handler `events[]` | handler 自定义 | 原样透传（runner 禁止保留类型） |
 
 落盘规则：

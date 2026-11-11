@@ -189,36 +189,6 @@ const STATE_VERSION = BPMN_STATE_VERSION
 const STATE_KIND = BPMN_STATE_KIND
 
 /**
- * 可修复失败（实例进 `blocked`，不是 `failed`）的错误码。
- *
- * 口径（2026-11-11 用户定调）：handler 失败 / adapter 不可用 / 条件求值错 /
- * 活动或整轮超时 / 连线超限 / 循环护栏都属于「人可以修一下再重试」的问题，
- * 不能让实例直接判死；只有引擎不可恢复（state/定义无法反序列化、结构不一致、
- * 内部不变量被破坏）才是 `failed`。
- */
-const BLOCKED_FAILURE_CODES = new Set([
-  'BPMN_FLOW_TAKE_LIMIT',
-  'BPMN_LOOP_LIMIT',
-  'BPMN_ACTIVITY_TIMEOUT',
-  'BPMN_RUN_TIMEOUT',
-  'BPMN_HANDLER_FAILED',
-  'BPMN_CONDITION_INVALID',
-  'BPMN_CONDITION_NOT_BOOLEAN',
-  'BPMN_ABORTED',
-])
-
-/** 一次失败是「可重试阻塞」还是「不可恢复失败」。 */
-function classifyFailure(error) {
-  const codes = []
-  if (error && typeof error.code === 'string') codes.push(error.code)
-  if (error?.cause && typeof error.cause.code === 'string') codes.push(error.cause.code)
-  for (const code of codes) {
-    if (BLOCKED_FAILURE_CODES.has(code)) return 'blocked'
-  }
-  return 'failed'
-}
-
-/**
  * 统一事件的 type 白名单（**runner 自己生成的事件只用这些**）。
  * handler 通过返回值 `events[]` 上报的适配器事件按原样透传，不走这个白名单。
  */
@@ -971,18 +941,40 @@ class BpmnRunner {
     this.maxActiveInstances = normalizeMaxActive(options.maxActiveInstances)
     this.loopGuardMax = normalizeLoopGuardMax(options.loopGuardMax)
     this.shouldSnapshotHook = typeof options.shouldSnapshot === 'function' ? options.shouldSnapshot : null
-    this.evaluateConditionHook = typeof options.evaluateCondition === 'function' ? options.evaluateCondition : null
     if (options.shouldSnapshot !== undefined && options.shouldSnapshot !== null && this.shouldSnapshotHook === null) {
       throw new BpmnRunnerError('BPMN_OPTIONS_INVALID', 'options.shouldSnapshot 必须是函数', { instanceId: this.instanceId })
     }
-    if (options.evaluateCondition !== undefined && options.evaluateCondition !== null && this.evaluateConditionHook === null) {
-      throw new BpmnRunnerError('BPMN_OPTIONS_INVALID', 'options.evaluateCondition 必须是函数', { instanceId: this.instanceId })
+    // 条件求值只有一个入口：bpmn-expr.evaluateFeel。生产入口不再接受自定义求值器
+    // （传了就报错，避免上层悄悄把条件交回引擎/别的实现）。
+    if (options.evaluateCondition !== undefined) {
+      throw new BpmnRunnerError(
+        'BPMN_OPTIONS_INVALID',
+        'options.evaluateCondition 已移除：条件只允许经 bpmn-expr.evaluateFeel 求值（0.13 红线）',
+        { instanceId: this.instanceId }
+      )
     }
     this.warnings = [...this.definition.warnings]
     if (this.xml !== null) assertXmlConsistent(this.xml, this.definition)
 
     /** 传给引擎的 XML：有 xml 用 xml，没有就用 definition 反向生成。 */
     this.sourceXml = this.xml ?? buildBpmnXml(this.definition)
+
+    // 定义身份（存储域 definitionId + 版本 + XML 原文 sha256）：start 与 recover 都要对，
+    // state v2 信封把它当必填字段；runtime 从实例快照自己重算 hash，不信请求自报。
+    try {
+      this.identity = normalizeDefinitionIdentity(options.definitionIdentity)
+      this._sourceHash = assertDefinitionIdentity(this.identity, {
+        sourceXml: this.sourceXml,
+        definition: this.definition,
+      }).sourceHash
+    } catch (error) {
+      throw asRunnerError(error, 'BPMN_OPTIONS_INVALID', { instanceId: this.instanceId })
+    }
+    /** 可信 XML 的执行结构（恢复时用来对照 state 里的实际来源）。 */
+    this._trustedStructure = null
+    /** 拒绝型内置表达式解析器（Environment.clone / recover 后必须还是它）。 */
+    this._rejectExpressions = createRejectingExpressions()
+    this._expressionsGuardChecked = false
 
     // 运行态
     this._status = 'idle'
@@ -993,6 +985,8 @@ class BpmnRunner {
     this._stopping = false
     this._sawRun = false
     this._fatal = null
+    /** 执行代次：每次 start / recover / stop / fail / evict 自增，作废在飞的 Promise 回调。 */
+    this._generation = 0
     this._lastState = null
     this._deferred = null
     this._settleTimer = null
@@ -1025,9 +1019,22 @@ class BpmnRunner {
   // 公开 API
   // -------------------------------------------------------------------------
 
-  /** `'idle' | 'running' | 'waiting' | 'done' | 'failed'`（淘汰后回到 idle）。 */
+  /** `'idle' | 'running' | 'waiting' | 'done' | 'blocked'`（淘汰后回到 idle）。 */
   status() {
     return this._status
+  }
+
+  /** 阻塞原因（runner 侧 `status()==='blocked'` 时才有）；实例层据此写 `blockedReason`。 */
+  failure() {
+    return this._fatal
+  }
+
+  /** 当前执行代次是否还活着（没停 / 没阻塞 / 没淘汰 / 没换代）。 */
+  _isLive(generation) {
+    return generation === this._generation
+      && !this._evicted
+      && !this._stopping
+      && this._fatal === null
   }
 
   /**
@@ -1049,7 +1056,7 @@ class BpmnRunner {
    * 启动并跑到**第一个等待点或结束**。
    *
    * 失败（handler 抛错 / 超时 / 引擎 fatal）时这个 Promise 会**失败**（`BpmnRunnerError`），
-   * 同时 `status()==='failed'`、`onError` 被调用、`error` 事件已发。
+   * 同时 `status()==='blocked'`、`onError` 被调用、`error` 事件已发。
    *
    * @returns {Promise<{ state: 'waiting' | 'done' | 'running' | 'idle' }>}
    */
@@ -1062,23 +1069,56 @@ class BpmnRunner {
         { instanceId: this.instanceId }
       )
     }
+    // 启动前先过执行白名单 + 与 definition 的形状对照：任何 handler 都还没机会执行。
+    await this._prepareTrustedStructure('start')
+
+    this._generation += 1
+    const generation = this._generation
     this._started = true
     this._status = 'running'
+    this._fatal = null
     this._engine = this._createEngine()
     this._listener = this._attachListener()
     this._armRunTimer()
     this._syncEngineVariables()
+    this._assertEngineExpressionsGuarded()
 
     const settled = this._wait()
     try {
       // 坑 1：活动事件只从 listener 出来；callback 只兜底 end/stop/error。
-      const result = this._engine.execute({ listener: this._listener }, (error) => this._onEngineCallback(error))
-      if (isThenable(result)) result.catch((error) => this._onEngineCallback(error))
+      const result = this._engine.execute(
+        { listener: this._listener },
+        (error) => this._onEngineCallback(error, generation)
+      )
+      if (isThenable(result)) result.catch((error) => this._onEngineCallback(error, generation))
     } catch (error) {
       this._fail(asRunnerError(error, 'BPMN_ENGINE_ERROR', { instanceId: this.instanceId }))
     }
     this._scheduleSettle()
     return settled
+  }
+
+  /**
+   * 可信 XML → 执行结构（含执行白名单），并核对调用方给的 definition。
+   *
+   * 只读、可缓存在实例上；失败时 handler 一次都不会被派发。
+   *
+   * @param {'start'|'recover'} phase 错误文案用
+   * @returns {Promise<object>}
+   */
+  async _prepareTrustedStructure(phase) {
+    if (this._trustedStructure !== null) {
+      assertDefinitionMatchesStructure(this.definition, this._trustedStructure, phase)
+      return this._trustedStructure
+    }
+    try {
+      const structure = await readTrustedExecutionStructure(this.sourceXml)
+      assertDefinitionMatchesStructure(this.definition, structure, phase)
+      this._trustedStructure = structure
+      return structure
+    } catch (error) {
+      throw asRunnerError(error, 'BPMN_DEFINITION_INVALID', { instanceId: this.instanceId })
+    }
   }
 
   /**
@@ -1110,23 +1150,41 @@ class BpmnRunner {
       )
     }
 
-    const { engineState, envelope } = unwrapState(state, this.definition.id)
+    // 恢复顺序固定：信封 + 身份 → 有界解析 source → 实际结构对照 → engine.recover
+    // → 恢复后 context 复核 → 最后才挂监听 / 计时器 / resume。
+    // 前面任何一步失败都不会创建活动、不会派发 handler。
+    let validated
+    let trusted
+    try {
+      validated = validateStateEnvelope(state, {
+        identity: this.identity,
+        definition: this.definition,
+        instanceId: this.instanceId,
+      })
+      trusted = await this._prepareTrustedStructure('recover')
+      assertStructuresMatch(
+        trusted,
+        describeExecutionStructure(validated.sourceContext),
+        'state.engine.definitions[0].source'
+      )
+    } catch (error) {
+      throw asRunnerError(error, 'BPMN_STATE_INVALID', { instanceId: this.instanceId })
+    }
 
     // 只有「running / stopped」的 state 有可推进的点。实测：恢复 done / error / idle 的
-    // state 时 `resume()` 不会产生任何事件，等静默的循环会白白转满上限（表现为调用方挂住）。
-    // 这里提前拒绝，别让调用方等 5 分钟才发现自己恢复了一份结束了的快照。
-    const resumableState = engineState.state
+    // state 时 `resume()` 不会产生任何事件，等静默的循环会白白转满上限（调用方挂住）。
+    const resumableState = validated.engineState.state
     if (resumableState !== 'running' && resumableState !== 'stopped') {
       throw new BpmnRunnerError(
         'BPMN_STATE_NOT_RESUMABLE',
-        `这份 state 的引擎状态是 ${typeof resumableState === 'string' ? resumableState : '(缺失)'}，只有 running / stopped 能恢复（done / error / idle 没有可推进的点）`,
+        `这份 state 的引擎状态是 ${typeof resumableState === 'string' ? resumableState : '(缺失)'}，只有 running / stopped 能恢复（done / error / idle 没有可推进的点，实例已卡住（blocked））`,
         { instanceId: this.instanceId }
       )
     }
 
-    const recoveredVariables = isPlainObject(envelope?.variables) ? envelope.variables : {}
-
-    // 新的一条命：清计时器 / 重开 abort / 清待办与错误。
+    // 新的一条命：清计时器 / 重开 abort / 清待办与错误 / 作废旧代次的回调。
+    this._generation += 1
+    const generation = this._generation
     this._clearAllTimers()
     this._instanceAbort = new AbortController()
     this._activityAborts.clear()
@@ -1135,37 +1193,53 @@ class BpmnRunner {
     this._handlerResults.clear()
     this._pendingHandlerErrors.clear()
     this._pendingConditionErrors.clear()
+    this._evaluatedConditions.clear()
     this._fatal = null
     this._lastState = null
     this._sawRun = false
     this._started = true
     this._status = 'running'
-    this.variables = { ...this.variables, ...recoveredVariables }
+    this.variables = { ...this.variables, ...validated.variables }
 
     // 计数跨恢复延续：否则在环里恢复一次就能把已用掉的次数「清零」重来。
-    this._attempts = restoreCounts(envelope?.attempts)
-    this._flowTakes = restoreCounts(envelope?.flowTakes)
+    this._attempts = restoreCounts(validated.attempts)
+    this._flowTakes = restoreCounts(validated.flowTakes)
 
     this._engine = this._createEngine()
+    try {
+      this._engine.recover(validated.engineState)
+      // 复核的是引擎**实际**加载出来的执行来源，不是再次相信传入的 XML。
+      assertRecoveredEngineStructure(this._engine, trusted)
+      this._assertEngineExpressionsGuarded()
+      this._assertDefinitionExpressionsGuarded()
+    } catch (error) {
+      this._status = 'idle'
+      this._started = false
+      this._engine = null
+      this._listener = null
+      this._generation += 1
+      this._clearAllTimers()
+      this._abortAll()
+      this._pending.clear()
+      this._completing.clear()
+      this._handlerResults.clear()
+      this._pendingHandlerErrors.clear()
+      this._pendingConditionErrors.clear()
+      this._startedAt.clear()
+      throw asRunnerError(error, 'BPMN_STATE_RECOVER_FAILED', { instanceId: this.instanceId })
+    }
+
     this._listener = this._attachListener()
     this._armRunTimer()
     this._syncEngineVariables()
 
-    try {
-      this._engine.recover(engineState)
-    } catch (error) {
-      this._status = 'idle'
-      throw new BpmnRunnerError(
-        'BPMN_STATE_RECOVER_FAILED',
-        `bpmn-engine 拒绝这份 state：${errorMessageOf(error)}`,
-        { instanceId: this.instanceId, cause: error }
-      )
-    }
-
     const settled = this._wait()
     try {
-      const result = this._engine.resume({ listener: this._listener }, (error) => this._onEngineCallback(error))
-      if (isThenable(result)) result.catch((error) => this._onEngineCallback(error))
+      const result = this._engine.resume(
+        { listener: this._listener },
+        (error) => this._onEngineCallback(error, generation)
+      )
+      if (isThenable(result)) result.catch((error) => this._onEngineCallback(error, generation))
     } catch (error) {
       this._fail(asRunnerError(error, 'BPMN_ENGINE_ERROR', { instanceId: this.instanceId }))
     }
@@ -1197,10 +1271,10 @@ class BpmnRunner {
    */
   async signalTask(request = {}) {
     this._assertUsable('signalTask')
-    if (this._status === 'failed') {
+    if (this._status === 'blocked') {
       throw new BpmnRunnerError(
-        'BPMN_INSTANCE_FAILED',
-        `实例 ${this.instanceId} 已经失败，不能再完成任务：${this._fatal?.message ?? ''}`,
+        'BPMN_INSTANCE_BLOCKED',
+        `实例 ${this.instanceId} 已阻塞（blocked），不能再完成任务：${this._fatal?.message ?? ''}`,
         { instanceId: this.instanceId, cause: this._fatal ?? undefined }
       )
     }
@@ -1259,9 +1333,11 @@ class BpmnRunner {
   async stop() {
     if (this._evicted) return undefined
     this._stopping = true
+    // 作废在飞回调：stop 之后到达的 handler 结果 / 引擎回调都不许回写。
+    this._generation += 1
     // 先收状态再停引擎：引擎停下来的过程会触发 execute 的 callback，那里会 resolve 在等的
     // start()/signalTask()；状态先摆好，调用方看到的才是真实终态（idle）。
-    if (this._status !== 'done' && this._status !== 'failed') this._status = 'idle'
+    if (this._status !== 'done' && this._status !== 'blocked') this._status = 'idle'
     this._clearAllTimers()
     this._abortAll()
     this._pending.clear()
@@ -1326,6 +1402,24 @@ class BpmnRunner {
    *   - `variables`：初始变量（运行期账本仍是 `this.variables`，坑 5）。
    */
   _createEngine() {
+    const runner = this
+    /**
+     * `elements` 是 bpmn-engine 的元素构造注入点（`TypeResolver({...Elements, ...opts.elements})`）。
+     * 包住 `SequenceFlow` 的**原 `take`**：在发布 take、推动目标之前统一检查并预占
+     * `flowTakes`——覆盖条件边、默认边、无条件边（依赖源码与全局 prototype 都不改）。
+     *
+     * @param {object} flowDef 序列化后的连线定义
+     * @param {object} context Elements.Context
+     */
+    function RunnerSequenceFlow(flowDef, context) {
+      const flow = new SequenceFlow(flowDef, context)
+      flow.take = function take(content) {
+        return runner._takeSequenceFlow(flow, content)
+      }
+      return flow
+    }
+    RunnerSequenceFlow.prototype = SequenceFlow.prototype
+
     const engine = new Engine({
       name: `${this.definition.id}:${this.instanceId}`,
       source: this.sourceXml,
@@ -1333,8 +1427,51 @@ class BpmnRunner {
       settings: { assignOutput: 'id' },
       extensions: { dshRunner: (activity) => this._extendActivity(activity) },
       scripts: this._scriptsAdapter(),
+      // 内置表达式入口设为拒绝：白名单已经挡住条件事件/标准循环/实现表达式，
+      // 这层保证「即使漏了某个入口」，引擎也不会用内置 resolveExpression 求值。
+      expressions: this._rejectExpressions,
+      elements: { SequenceFlow: RunnerSequenceFlow },
     })
     return engine
+  }
+
+  /**
+   * 确认拒绝型表达式解析器在 `Environment.clone()` / `recover()` 之后仍在
+   * （引擎在 clone 时显式带 `expressions`，recover 只合并变量/输出，不会替换它）。
+   */
+  _assertEngineExpressionsGuarded() {
+    const environment = this._engine?.environment
+    if (!environment) {
+      throw new BpmnRunnerError('BPMN_OPTIONS_INVALID', '引擎没有 environment，无法确认内置表达式已被拒绝', {
+        instanceId: this.instanceId,
+      })
+    }
+    if (environment.expressions?.resolveExpression !== this._rejectExpressions.resolveExpression) {
+      throw new BpmnRunnerError(
+        'BPMN_BUILTIN_EXPRESSION_FORBIDDEN',
+        '引擎的 expressions.resolveExpression 不是拒绝型解析器：内置表达式入口没有被封闭',
+        { instanceId: this.instanceId }
+      )
+    }
+    this._expressionsGuardChecked = true
+  }
+
+  /** 恢复后逐个定义环境再查一遍（每个 Definition 的 environment 都是 clone 出来的）。 */
+  _assertDefinitionExpressionsGuarded() {
+    const definitions = this._engine?.execution?.definitions
+    if (!Array.isArray(definitions) || definitions.length === 0) return
+    for (const definition of definitions) {
+      const environment = definition?.environment
+      if (!environment) continue
+      if (environment.expressions?.resolveExpression !== this._rejectExpressions.resolveExpression) {
+        throw new BpmnRunnerError(
+          'BPMN_BUILTIN_EXPRESSION_FORBIDDEN',
+          '定义环境的 expressions.resolveExpression 不是拒绝型解析器：clone/recover 把防线丢了',
+          { instanceId: this.instanceId }
+        )
+      }
+    }
+    this._expressionsGuardChecked = true
   }
 
   /**
@@ -1382,38 +1519,33 @@ class BpmnRunner {
    */
   _scriptsAdapter() {
     const runner = this
+    /** 明确失败的脚本对象（**绝不返回 undefined**——那会触发引擎内置表达式 fallback）。 */
+    const failingScript = (error) => ({
+      execute(scope, callback) {
+        callback(error)
+      },
+    })
     return {
       register() {},
       getScript(language, activity) {
         const activityType = activity?.type
         const condition = activity?.behaviour?.conditionExpression
-        if (activityType !== 'bpmn:SequenceFlow' && !condition) {
-          // 非条件脚本（scriptTask / 脚本数据对象）：只有一个明确支持的语言，其余拒绝。
-          return {
-            execute(scope, callback) {
-              callback(
-                new BpmnRunnerError(
-                  'BPMN_SCRIPT_UNSUPPORTED',
-                  `活动 ${activity?.id ?? '?'} 使用了脚本（${language || '无 language'}）；执行器只支持 FEEL 条件表达式`,
-                  { elementId: activity?.id }
-                )
-              )
-            },
-          }
+        if (activityType !== 'bpmn:SequenceFlow' || !condition) {
+          // 只有 sequenceFlow 的条件由我们接管；scriptTask / 条件事件定义 / 其它脚本
+          // 一律明确失败，不能返回 undefined 让引擎退回内置表达式。
+          return failingScript(new BpmnRunnerError(
+            'BPMN_SCRIPT_UNSUPPORTED',
+            `活动 ${activity?.id ?? '?'} 使用了脚本/非连线条件（${language || '无 language'}）；执行器只支持 sequenceFlow 的 FEEL 条件表达式`,
+            { elementId: activity?.id }
+          ))
         }
         const normalizedLanguage = typeof language === 'string' ? language.trim().toLowerCase() : ''
         if (normalizedLanguage !== '' && !isFeelLanguage(normalizedLanguage)) {
-          return {
-            execute(scope, callback) {
-              callback(
-                new BpmnRunnerError(
-                  'BPMN_CONDITION_LANGUAGE_UNSUPPORTED',
-                  `连线 ${activity?.id ?? '?'} 的条件语言是 ${normalizedLanguage}；只支持 FEEL（javascript 走 node:vm，实测可逃逸到 process）`,
-                  { elementId: activity?.id }
-                )
-              )
-            },
-          }
+          return failingScript(new BpmnRunnerError(
+            'BPMN_CONDITION_LANGUAGE_UNSUPPORTED',
+            `连线 ${activity?.id ?? '?'} 的条件语言是 ${normalizedLanguage}；只支持 FEEL（javascript 走 node:vm，实测可逃逸到 process）`,
+            { elementId: activity?.id }
+          ))
         }
         return {
           execute(scope, callback) {
@@ -1442,21 +1574,9 @@ class BpmnRunner {
       callback(structured)
     }
     const done = (value) => {
+      // 条件只判真假；连线次数上限 / 循环护栏的唯一权威在 SequenceFlow.take 之前
+      // （`_takeSequenceFlow`）——那里覆盖条件边、默认边、无条件边。
       const decided = this._assertConditionBoolean(value, flowId, body)
-      if (decided) {
-        // 连线次数上限 / 循环护栏都在「条件成立、即将沿这条边回去」这一瞬间判。
-        const flow = flowId === null ? null : this.definition.flowById.get(flowId) ?? null
-        const limitError = this._checkFlowTakeLimitBefore(flow)
-        if (limitError !== null) {
-          failWith(limitError)
-          return
-        }
-        const loopError = this._checkLoopGuard(flowId)
-        if (loopError !== null) {
-          failWith(loopError)
-          return
-        }
-      }
       if (flowId !== null) this._evaluatedConditions.set(flowId, { expression: body, value: decided })
       callback(null, decided)
     }
@@ -1491,12 +1611,10 @@ class BpmnRunner {
 
     let value
     try {
-      value = this._evaluateCondition(body, {
+      value = defaultConditionValue(body, this._conditionVariables(), {
         flowId,
-        elementId: flowId,
         from: typeof content.sourceId === 'string' ? content.sourceId : null,
         to: typeof content.targetId === 'string' ? content.targetId : null,
-        variables: this._conditionVariables(),
       })
     } catch (error) {
       failWith(error)
@@ -1522,18 +1640,9 @@ class BpmnRunner {
     }
   }
 
-  _evaluateCondition(expression, context) {
-    if (this.evaluateConditionHook !== null) return this.evaluateConditionHook(expression, context)
-    return defaultConditionValue(expression, context.variables, {
-      flowId: context.flowId,
-      from: context.from,
-      to: context.to,
-    })
-  }
-
   /**
-   * 注入的求值器可以直接返回 `bpmn-expr.evaluateFeel()` 的结果（`{ ok, value, error }`）：
-   * 这里解包；`ok:false` 与抛错同样处理（→ 实例 failed，不静默当 false）。
+   * `evaluateFeel()` 的结果形状是 `{ ok, value, error }`：这里解包；`ok:false` 与抛错
+   * 同样处理（→ 实例 blocked，不静默当 false）。
    */
   _normalizeConditionOutcome(value, flowId, expression) {
     if (isPlainObject(value) && typeof value.ok === 'boolean') {
@@ -1586,7 +1695,7 @@ class BpmnRunner {
   // -------------------------------------------------------------------------
 
   _onProcessStart(api) {
-    if (this._evicted) return
+    if (this._evicted || this._stopping || this._fatal !== null) return
     this._sawRun = true
     const content = isPlainObject(api?.content) ? api.content : {}
     this._status = 'running'
@@ -1600,7 +1709,8 @@ class BpmnRunner {
   }
 
   _onActivityStart(api) {
-    if (this._evicted) return
+    // failed/blocked 之后不得再出现 activity/start（审查实测的回归点）。
+    if (this._evicted || this._stopping || this._fatal !== null) return
     this._sawRun = true
     const content = isPlainObject(api?.content) ? api.content : {}
     const elementId = typeof content.id === 'string' ? content.id : null
@@ -1621,7 +1731,8 @@ class BpmnRunner {
   }
 
   _onActivityEnd(api) {
-    if (this._evicted) return
+    // 终态/停止之后到达的 activity/end：不合并输出、不发事件、不回调 onTaskDone。
+    if (this._evicted || this._stopping || this._fatal !== null) return
     const content = isPlainObject(api?.content) ? api.content : {}
     const elementId = typeof content.id === 'string' ? content.id : null
     const executionId = typeof content.executionId === 'string' ? content.executionId : null
@@ -1685,7 +1796,8 @@ class BpmnRunner {
   }
 
   _onActivityWait(api) {
-    if (this._evicted) return
+    // activity/wait 不得把 blocked 改回 waiting。
+    if (this._evicted || this._stopping || this._fatal !== null) return
     this._sawRun = true
     const content = isPlainObject(api?.content) ? api.content : {}
     const elementId = typeof content.id === 'string' ? content.id : null
@@ -1730,117 +1842,95 @@ class BpmnRunner {
     this._scheduleSettle()
   }
 
+  /**
+   * `SequenceFlow.take` 的包装（`_createEngine` 注入）：**先检查并预占** `flowTakes`，
+   * 再调用原 `take` 发布事件 / 推动目标。
+   *
+   * 这是连线次数上限与循环护栏的**唯一权威**：
+   *   - 覆盖条件边（条件求值只判真假）、默认边（条件求值通道根本管不到）、无条件边；
+   *   - 超限时返回 false 且**不调用原 take**：目标活动不会被驱动，
+   *     `_fail()` 同步锁定阻塞态并 abort 在飞活动；
+   *   - `_onFlowTake` 只记录「已经成功走过的边」，不再自增计数。
+   *
+   * @param {object} flow 引擎里的 SequenceFlow 实例
+   * @param {object} content 引擎的 take 消息内容
+   * @returns {boolean}
+   */
+  _takeSequenceFlow(flow, content) {
+    const flowId = typeof flow?.id === 'string' && flow.id !== '' ? flow.id : null
+    if (this._evicted || this._stopping || this._fatal !== null) return false
+    const definitionFlow = flowId === null ? null : this.definition.flowById.get(flowId) ?? null
+    if (flowId === null) return false
+
+    const takes = this._flowTakes.get(flowId) ?? 0
+    const attemptedTake = takes + 1
+    // 两者都检查；都触发时优先报告明确的边上限（fs:maxRounds）。
+    const limitError = this._flowTakeLimitError(definitionFlow, flowId, takes, attemptedTake)
+    const error = limitError ?? this._loopGuardError(flowId, takes, attemptedTake)
+    if (error !== null) {
+      this._fail(error)
+      return false
+    }
+
+    this._flowTakes.set(flowId, attemptedTake)
+    try {
+      return SequenceFlow.prototype.take.call(flow, content)
+    } catch (cause) {
+      // 原 take 失败：把预占还回去（错误本身交引擎处理）。
+      if (this._flowTakes.get(flowId) === attemptedTake) this._flowTakes.set(flowId, takes)
+      throw cause
+    }
+  }
+
+  _flowTakeLimitError(flow, flowId, takes, attemptedTake) {
+    if (!flow || flow.maxTakes === null || flow.maxTakes === undefined) return null
+    if (attemptedTake <= flow.maxTakes) return null
+    return new BpmnRunnerError(
+      'BPMN_FLOW_TAKE_LIMIT',
+      `连线 ${flowId} 已被走过 ${takes} 次，第 ${attemptedTake} 次超过 fs:maxRounds=${flow.maxTakes} 的连线次数上限`,
+      {
+        elementId: flowId,
+        flowId,
+        maxTakes: flow.maxTakes,
+        takes,
+        attemptedTake,
+        instanceId: this.instanceId,
+      }
+    )
+  }
+
+  _loopGuardError(flowId, takes, attemptedTake) {
+    const limit = this.loopGuardMax
+    if (!(limit > 0)) return null
+    if (attemptedTake <= limit) return null
+    return new BpmnRunnerError(
+      'BPMN_LOOP_LIMIT',
+      `连线 ${flowId} 已走过 ${takes} 次，第 ${attemptedTake} 次超过循环护栏（上限 ${limit}）；疑似没有上限的成环，请给环上的连线加 fs:maxRounds 或检查条件`,
+      { flowId, takes, attemptedTake, loopGuardMax: limit, instanceId: this.instanceId }
+    )
+  }
+
+  /** `flow/taken` 只记录已经成功走过的边（计数已在 `_takeSequenceFlow` 预占）。 */
   _onFlowTake(api) {
-    if (this._evicted) return
+    if (this._evicted || this._stopping || this._fatal !== null) return
     const content = isPlainObject(api?.content) ? api.content : {}
     const flowId = typeof content.id === 'string' ? content.id : null
-    const flow = flowId === null ? null : this.definition.flowById.get(flowId) ?? null
-    // 循环护栏的计数点：**每一条** taken 的连线都计数（含默认流 / 无条件流，
-    // 那些没有条件求值通道可拦）。
-    const takes = flowId === null ? 0 : (this._flowTakes.get(flowId) ?? 0) + 1
-    if (flowId !== null) this._flowTakes.set(flowId, takes)
-
-    const event = {
+    if (flowId === null) return
+    const flow = this.definition.flowById.get(flowId) ?? null
+    this._emit({
       type: 'flow/taken',
       at: nowIso(),
-      flowId: flowId ?? undefined,
+      flowId,
       from: typeof content.sourceId === 'string' ? content.sourceId : flow?.from,
       to: typeof content.targetId === 'string' ? content.targetId : flow?.to,
       // 条件：带条件的连线给 `{ expression, value }`（value 是我们求值出来的布尔，
       // 不是引擎的结果）；默认流 / 无条件流给 null。
-      condition: buildFlowCondition(flow ?? null, flowId === null ? null : this._evaluatedConditions.get(flowId) ?? null, content.result),
-    }
-    this._emit(event)
-
-    // 兜底（条件求值通道管不到默认流上的 fs:maxRounds，也管不了无条件连线的死环）。
-    // 条件求值已经判过一次的连线，这里看到的计数/次数一致，不会重复触发。
-    const limitError = this._checkFlowTakeLimitAfter(flow, takes)
-    if (limitError !== null) {
-      this._fail(limitError)
-      return
-    }
-    const loopError = this._checkLoopGuardTaken(flowId, takes)
-    if (loopError !== null) this._fail(loopError)
-  }
-
-  // -------------------------------------------------------------------------
-  // 连线通过次数上限与循环护栏
-  // -------------------------------------------------------------------------
-
-  /**
-   * 单条连线的通过次数上限（`fs:maxRounds` → `maxTakes`）——**按这条连线自己的通过次数**判。
-   *
-   * 计数主体是 `_flowTakes`（`_onFlowTake` 里每 take 一次自增，随 state 跨恢复还原）。
-   * 不能用「目标节点进入次数」代替：目标节点可以有多条入向连线（正常前进边 + 环回边，
-   * 甚至两条环回边），那样会把别的入向边的进入也记到这条头上（提前误判），也会漏记
-   * 「这条边走了但目标没重新 start」的情况。
-   *
-   * 判定点一（条件求值通过、**即将** take 之前）：`takes` 是已走过次数（不含本次），
-   * `takes >= maxTakes` → 再走一次就超限。
-   *
-   * @param {{ id: string, maxTakes: number | null } | null} flow
-   * @returns {BpmnRunnerError | null}
-   */
-  _checkFlowTakeLimitBefore(flow) {
-    if (!flow || flow.maxTakes === null || flow.maxTakes === undefined) return null
-    const takes = this._flowTakes.get(flow.id) ?? 0
-    if (takes < flow.maxTakes) return null
-    return this._flowTakeLimitError(flow, takes, true)
-  }
-
-  /**
-   * 判定点二（`_onFlowTake` 里、**已经** take 之后兜底）：`takes` 含本次。
-   * 只有条件求值通道管不到的连线（默认流上带 fs:maxRounds）才会走到这里。
-   *
-   * @param {{ id: string, maxTakes: number | null } | null} flow
-   * @param {number} takes 已经含本次的通过次数
-   * @returns {BpmnRunnerError | null}
-   */
-  _checkFlowTakeLimitAfter(flow, takes) {
-    if (!flow || flow.maxTakes === null || flow.maxTakes === undefined) return null
-    if (takes <= flow.maxTakes) return null
-    return this._flowTakeLimitError(flow, takes, false)
-  }
-
-  _flowTakeLimitError(flow, takes, upcoming) {
-    const message = upcoming
-      ? `连线 ${flow.id} 已被走过 ${takes} 次，第 ${takes + 1} 次超过 fs:maxRounds=${flow.maxTakes} 的连线次数上限`
-      : `连线 ${flow.id} 已被走过 ${takes} 次，超过 fs:maxRounds=${flow.maxTakes} 的连线次数上限`
-    return new BpmnRunnerError('BPMN_FLOW_TAKE_LIMIT', message, {
-      elementId: flow.id,
-      flowId: flow.id,
-      maxTakes: flow.maxTakes,
-      takes,
-      instanceId: this.instanceId,
+      condition: buildFlowCondition(flow, this._evaluatedConditions.get(flowId) ?? null, content.result),
     })
   }
 
-  /** 循环护栏（条件求值通道的预判）：这条边再走一次会不会超上限。 */
-  _checkLoopGuard(flowId) {
-    const limit = this.loopGuardMax
-    if (!(limit > 0) || flowId === null) return null
-    const takes = this._flowTakes.get(flowId) ?? 0
-    if (takes + 1 <= limit) return null
-    return new BpmnRunnerError(
-      'BPMN_LOOP_LIMIT',
-      `连线 ${flowId} 已走过 ${takes} 次，第 ${takes + 1} 次超过循环护栏（上限 ${limit}）；疑似没有上限的成环，请给环上的连线加 fs:maxRounds 或检查条件`,
-      { flowId, takes, loopGuardMax: limit, instanceId: this.instanceId }
-    )
-  }
-
-  /** 循环护栏（take 之后的兜底判定）：takes 是已经含本次在内的次数。 */
-  _checkLoopGuardTaken(flowId, takes) {
-    const limit = this.loopGuardMax
-    if (!(limit > 0) || flowId === null || takes <= limit) return null
-    return new BpmnRunnerError(
-      'BPMN_LOOP_LIMIT',
-      `连线 ${flowId} 已被走过 ${takes} 次，超过循环护栏（上限 ${limit}）；疑似没有上限的成环，请给环上的连线加 fs:maxRounds 或检查条件`,
-      { flowId, takes, loopGuardMax: limit, instanceId: this.instanceId }
-    )
-  }
-
   _onActivityError(api) {
-    if (this._evicted || this._stopping) return
+    if (this._evicted || this._stopping || this._fatal !== null) return
     const content = isPlainObject(api?.content) ? api.content : {}
     const executionId = typeof content.executionId === 'string' ? content.executionId : null
     const elementId = typeof content.id === 'string' ? content.id : null
@@ -1856,7 +1946,7 @@ class BpmnRunner {
   }
 
   _onProcessError(api) {
-    if (this._evicted || this._stopping) return
+    if (this._evicted || this._stopping || this._fatal !== null) return
     if (this._fatal !== null) return
     const content = isPlainObject(api?.content) ? api.content : {}
     const conditionError = this._takeAnyPendingConditionError()
@@ -1877,9 +1967,9 @@ class BpmnRunner {
   }
 
   _onProcessEnd(api) {
-    if (this._evicted || this._stopping) return
+    if (this._evicted || this._stopping || this._fatal !== null) return
     const content = isPlainObject(api?.content) ? api.content : {}
-    if (this._status !== 'failed') this._status = 'done'
+    if (this._status !== 'blocked') this._status = 'done'
     this._clearAllTimers()
     this._emit({
       type: 'process/end',
@@ -1891,9 +1981,15 @@ class BpmnRunner {
     this._finishSettle(this._status)
   }
 
-  /** `execute(cb)` / `resume(cb)` 的兜底：引擎只在 end/stop/error 上回调。 */
-  _onEngineCallback(error) {
+  /**
+   * `execute(cb)` / `resume(cb)` 的兜底：引擎只在 end/stop/error 上回调。
+   *
+   * `generation` 是注册回调时的执行代次：stop / fail / recover / evict 之后旧代次的
+   * 迟到回调一律丢弃（否则慢 handler 的晚到完成会把实例改回 done）。
+   */
+  _onEngineCallback(error, generation) {
     if (this._evicted) return
+    if (typeof generation === 'number' && generation !== this._generation) return
     // stop() 期间引擎也会回调（stop/end）：这段窗口里的错误属于「被我们停掉」，不是失败。
     if (this._stopping) {
       this._finishSettle(this._status)
@@ -1925,18 +2021,21 @@ class BpmnRunner {
     const content = isPlainObject(message?.content) ? message.content : {}
     const elementId = typeof activity?.id === 'string' ? activity.id : null
     const executionId = typeof content.executionId === 'string' ? content.executionId : null
+    const generation = this._generation
 
     let settled = false
     const finish = (error, output) => {
       if (settled) return
       settled = true
+      // 晚到的结果（stop / fail / recover / evict 之后）不回调引擎、不写回任何状态。
+      if (!this._isLive(generation)) return
       // handler 成功后立刻收掉活动计时器：活动到此完成，剩下的推进归 runTimeoutMs 管；
       // 否则「48ms 完成、50ms 计时器才到」会被判成假超时。
       if (!error && executionId !== null) this._clearActivityTimer(executionId)
       callback(error, output)
     }
 
-    if (this._evicted || this._stopping) {
+    if (this._evicted || this._stopping || this._fatal !== null || !this._isLive(generation)) {
       finish(new BpmnRunnerError('BPMN_STOPPED', `实例 ${this.instanceId} 已停止/被淘汰，活动 ${elementId ?? '?'} 不再执行`, {
         elementId: elementId ?? undefined,
         activityId: executionId ?? undefined,
@@ -1999,6 +2098,10 @@ class BpmnRunner {
     }
     Promise.resolve(pending).then(
       (result) => {
+        if (!this._isLive(generation)) {
+          finish(null, undefined)
+          return
+        }
         const normalized = normalizeHandlerResult(result)
         if (executionId !== null) this._handlerResults.set(executionId, normalized)
         for (const rawEvent of normalized.events) {
@@ -2006,12 +2109,22 @@ class BpmnRunner {
         }
         finish(null, normalized.output)
       },
-      (error) => this._handlerFailed(element, executionId, error, finish)
+      (error) => {
+        if (!this._isLive(generation)) {
+          finish(null, undefined)
+          return
+        }
+        this._handlerFailed(element, executionId, error, finish)
+      }
     )
   }
 
   /** handler 抛错：记一份自己的结构化错误（引擎的 ActivityError 会弄丢 message），再回错误。 */
   _handlerFailed(element, executionId, error, finish) {
+    if (!this._isLive(this._generation)) {
+      finish(null, undefined)
+      return
+    }
     const fatal = new BpmnRunnerError(
       'BPMN_HANDLER_FAILED',
       `节点 ${element.id} 的 handler 失败：${errorMessageOf(error)}`,
@@ -2146,10 +2259,14 @@ class BpmnRunner {
 
   /** 失败收尾：状态、事件、onError、在等的 Promise、引擎停止（幂等）。 */
   _fail(error) {
+    // 幂等：第一个 fatal 就是唯一终态；stop 期间的错误不升级成阻塞。
     if (this._fatal !== null) return this._fatal
+    if (this._stopping || this._evicted) return null
     const fatal = asRunnerError(error, 'BPMN_ENGINE_ERROR', { instanceId: this.instanceId })
     this._fatal = fatal
-    this._status = 'failed'
+    this._status = 'blocked'
+    // 同步作废在飞 Promise 的回调（执行代次），再 abort 活动并拒绝等待者。
+    this._generation += 1
     this._clearAllTimers()
     this._abortAll()
     this._pending.clear()
@@ -2253,7 +2370,7 @@ class BpmnRunner {
   }
 
   _shouldFinishSettle() {
-    if (this._status === 'done' || this._status === 'failed') return true
+    if (this._status === 'done' || this._status === 'blocked') return true
     const execution = this._engine?.execution
     if (!execution) return false
     if (execution.isRunning) {
@@ -2373,8 +2490,14 @@ class BpmnRunner {
     return {
       v: STATE_VERSION,
       kind: STATE_KIND,
-      definitionId: this.definition.id,
+      // 身份：definitionId 是存储域定义 id，processId 才是 XML process.id；
+      // definitionHash 是执行 XML 原文的 sha256（runtime 从实例快照重算，不信请求自报）。
+      definitionId: this.identity.id,
+      version: this.identity.version,
+      definitionHash: this.identity.hash,
+      processId: this.definition.id,
       instanceId: this.instanceId,
+      sourceHash: this._sourceHash,
       engineVersion: typeof engineState?.engineVersion === 'string' ? engineState.engineVersion : null,
       status: this._status,
       takenAt: nowIso(),
@@ -2397,11 +2520,15 @@ class BpmnRunner {
   /** runner 自己生成的事件：type 必在白名单里，字段按契约逐个构造（别乱加）。 */
   _emit(event) {
     if (!EVENT_TYPES.includes(event.type)) return
+    if (this._evicted) return
+    // 阻塞之后只允许 error 事件本身（事实留痕），其余事件不能再出现。
+    if (this._fatal !== null && event.type !== 'error') return
     this._safeCall(this.services.onEvent, event)
   }
 
   /** handler 通过 `events[]` 上报的适配器事件：原样透传，只补 at/elementId/activityId。 */
   _emitHandlerEvent(rawEvent, elementId, executionId) {
+    if (this._evicted || this._stopping || this._fatal !== null) return
     if (!isPlainObject(rawEvent) || typeof rawEvent.type !== 'string' || rawEvent.type === '') return
     // 保留类型只能由 runner 发（否则事件流里会出现两条 process/end / 假 error）。
     if (EVENT_TYPES.includes(rawEvent.type)) return
@@ -2433,6 +2560,7 @@ class BpmnRunner {
 
   /** 活动输出并入账本：对象按 key 合并（扁平常量），标量/数组以活动 id 为 key。 */
   _mergeOutput(output, elementId) {
+    if (this._fatal !== null || this._stopping || this._evicted) return
     if (output === undefined) return
     if (isPlainObject(output)) {
       Object.assign(this.variables, output)
@@ -2445,6 +2573,7 @@ class BpmnRunner {
 
   /** 把账本写进引擎环境（`${...}` 模板 / 引擎侧表达式用）；失败不影响运行。 */
   _syncEngineVariables() {
+    if (this._fatal !== null || this._stopping || this._evicted) return
     const environment = this._definitionEnvironment()
     if (!environment) return
     const variables = environment.variables
@@ -2454,6 +2583,7 @@ class BpmnRunner {
 
   /** 坑 e：serviceTask 没挂内置 OutputExtension，自己补 `environment.output[id]`。 */
   _syncEngineOutput(elementId, output) {
+    if (this._fatal !== null || this._stopping || this._evicted) return
     const environment = this._definitionEnvironment()
     if (!environment) return
     const target = environment.output
@@ -2473,7 +2603,7 @@ class BpmnRunner {
   }
 
   // -------------------------------------------------------------------------
-  // 待办 / 状态机辅助
+  // 待办 / 状态辅助
   // -------------------------------------------------------------------------
 
   _findPendingTask({ activityId, executionId }) {
@@ -2507,7 +2637,7 @@ class BpmnRunner {
 
   /** 坑 7：能被淘汰 = 已落过 state / 终态 / 从未启动（没有东西可丢）。 */
   _canEvict() {
-    if (this._status === 'done' || this._status === 'failed') return true
+    if (this._status === 'done' || this._status === 'blocked') return true
     if (!this._started) return true
     return this._lastState !== null
   }
@@ -2515,6 +2645,7 @@ class BpmnRunner {
   _markEvicted() {
     if (this._evicted) return
     this._evicted = true
+    this._generation += 1
     this._clearAllTimers()
     this._abortAll()
     this._pending.clear()
@@ -2657,38 +2788,4 @@ function buildFlowCondition(flow, evaluated, engineResult) {
     return { expression: flow.condition.expression, value: value === undefined ? null : value }
   }
   return null
-}
-
-/**
- * state 解包：接受 `getState()` 的信封，也接受裸 `bpmn-engine` state。
- *
- * 同时做三件事：版本校验、定义一致性校验（别把 A 流程的 state 恢复到 B 上）、取出变量账本。
- */
-function unwrapState(state, definitionId) {
-  if (!isPlainObject(state)) {
-    throw new BpmnRunnerError('BPMN_STATE_INVALID', 'recover(state) 需要一个 state 对象', {})
-  }
-  if (state.v !== undefined && state.v !== STATE_VERSION) {
-    throw new BpmnRunnerError(
-      'BPMN_STATE_VERSION_UNSUPPORTED',
-      `state 版本是 ${state.v}，本执行器只认 v${STATE_VERSION}`,
-      {}
-    )
-  }
-  if (state.kind !== undefined && state.kind !== STATE_KIND) {
-    throw new BpmnRunnerError('BPMN_STATE_INVALID', `state.kind=${state.kind} 不是 BPMN 执行器快照`, {})
-  }
-  const envelope = state.kind === STATE_KIND ? state : null
-  const engineState = envelope !== null ? envelope.engine : isPlainObject(state.engine) ? state.engine : state
-  if (!isPlainObject(engineState) || !Array.isArray(engineState.definitions) || engineState.definitions.length === 0) {
-    throw new BpmnRunnerError('BPMN_STATE_INVALID', 'state 里没有 bpmn-engine 的 definitions（不是一份可恢复的快照）', {})
-  }
-  if (typeof state.definitionId === 'string' && state.definitionId !== definitionId) {
-    throw new BpmnRunnerError(
-      'BPMN_STATE_DEFINITION_MISMATCH',
-      `state 属于 definition ${state.definitionId}，当前执行器是 ${definitionId}；拒绝跨流程恢复`,
-      {}
-    )
-  }
-  return { engineState, envelope }
 }

@@ -72,6 +72,8 @@ export const HOST_MODULES = [
   'bpmn-expr.js',
   'bpmn-parse.js',
   'bpmn-convert.js',
+  'bpmn-policy.js',
+  'bpmn-state.js',
   'bpmn-runner.js',
   'bpmn-runtime.js',
   'node-finish.js',

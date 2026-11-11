@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.2）
+# 版本历史（0.1 → 0.14.3）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -888,3 +888,22 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 用户自己的 `~/.claude` settings / CLAUDE.md / hooks 仍会生效（只隔离了 MCP 配置）；用户 Stop hook 可能额外阻止停止，但不改变我们的单层提醒计数。
 - `messages` 能力为 unsupported；Windows 的进程树回收（`taskkill /T /F`）未在 Windows 实测。
 - Claude 的 `result.usage` 是会话累计值：有 assistant usage 时忽略它，只在整次执行没有任何 assistant usage 时兜底一次。
+
+## 0.14.3 — 实例挂起 / 恢复（quiesce 式软挂起）
+
+补齐计划里最后一个能力缺口：实例可以**挂起**（不再推进、不接人工完成、消息排队）与**恢复**（回到 ACTIVE，下一次推进沿用懒恢复）。
+
+- 两条路由：`POST /instances/<id>/suspend` 与 `POST /instances/<id>/resume`，body 可带 `reason`（≤200 字符，回显进事件）。响应带 `status` / `lastSeq` / `suspendedAt|resumedAt`。
+- 工具：`flow_instance_suspend` / `flow_instance_resume`（工具总数 11 → **13**），错误码映射到可读中文 hint。
+- **只允许无在飞活动时挂起**：实例必须 `ACTIVE`，且没有未结算的 agent 活动、在飞 connector 调用或执行中的引擎活动；否则 409 `INSTANCE_SUSPEND_BUSY`，响应带 `activities[]`（kind / state / attempts）点名是谁没结束。判忙在实例锁外先做一次，避免「排在慢活动后面变成活动结束后才挂起」。
+- 挂起后：`GET /instances/<id>` 与 `GET .../tasks` 仍可读，`recovery.code = BPMN_STATE_SUSPENDED`，但**不建 runner、不推进**；`POST .../tasks/<id>/complete` → 409 `INSTANCE_SUSPENDED`；入站消息排队（`delivery.deferred:true`）；`stop` 仍可用并收成 `CANCELED`。
+- 恢复：只置回 `ACTIVE` 并写事件，不主动跑；下一次推进沿用既有懒恢复（wait 点不重放、`process/end` 仍只有一条）。
+- 事件与状态同一次写入提交（`instance/suspended` / `instance/resumed` 与 `instance.json` 的 `status` 同锁同写）；迟到的 runner 事件在挂起闩生效后被丢弃，不会把 `SUSPENDED` 写回 `ACTIVE`。
+- 指标：挂起区间进入 `duration.suspendedMs`，`wallMs` 继续增长；恢复后区间收口（`design/12` 的口径，不是 0）。
+
+**已知边界**
+- 有在飞活动只能等它结束再挂起（没有 force）；`HTTP_OUTCOME_UNKNOWN` 需先走 connector resolve 处置。
+- 软挂起不是硬冻结：不写新的引擎状态快照、不 stop runner；「不推进」由「无在飞活动 + 跳过懒恢复 + complete/消息拒绝或排队」保证。
+- 状态与事件先写 `instance.json` 再追加事件行；两步之间崩溃会留下 `SUSPENDED` 但缺事件（指标报 `suspendedMs:null` + `suspend-timeline-unavailable`，不是 0）。
+- 恢复不主动 drain 排队消息：要等下一次投递触发；进程重启后没有 live execution 登记时，排队消息不会自动投递（收件箱既有行为）。
+- 未做硬挂起（停引擎 + 快照恢复）、未做挂起/恢复 GUI。

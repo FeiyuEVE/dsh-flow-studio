@@ -1,6 +1,12 @@
 /**
  * Host 数据通道：同源 fetch 到 /api/flow-studio。
  *
+ * 0.13.3 起客户端只认 **定义域 / 实例域** 契约（docs/design/10-bpmn-instance-api.md）：
+ * 定义版本（`/definitions`）、实例（`/instances`）、增量事件（`?since=`）、
+ * 人工待办与实例定义快照。旧运行域（`/flows`、`/runs`）的请求函数暂时留在
+ * `legacyApi` 里——页面接线在下一阶段（步骤 5 后半），本阶段不改 page.js /
+ * logdrawer.js，不能先删掉它们仍在调用的方法。
+ *
  * 浏览器端没有 remote/host builtin，HTTP 是唯一的跨进程通道；
  * 同源请求会自动带上 dsh 的鉴权 cookie。
  *
@@ -97,6 +103,8 @@ export function requestFailureText(status, data) {
  *  - 500：执行引擎未启用 / 不支持 restart；
  *  - 503：有可继承会话但宿主 agents 不可用；
  *  - 网络错误（没有 status）：用 error.message。
+ *
+ * @deprecated 0.13.3 步骤 7 删除（旧运行域）。
  */
 export function restartFailureText(status, data, message) {
   const detail = data && typeof data.error === 'string' ? data.error.trim() : ''
@@ -120,6 +128,8 @@ export function restartFailureText(status, data, message) {
  *  - `start` 撞上全局运行锁 → 「已有 run 在运行」；
  *  - `stop` 时目标已经不在跑 → 「不在运行中」。
  * 两种都把 Host 的原始原因附在后面，但先说人话——用户不需要读 HTTP 码。
+ *
+ * @deprecated 0.13.3 步骤 7 删除（旧运行域）。
  */
 export function runActionFailureText(action, status, data) {
   const detail = data && typeof data.error === 'string' ? data.error.trim() : ''
@@ -146,7 +156,7 @@ export function runActionFailureText(action, status, data) {
   return prefix + '连不上 Host 或响应不可读。'
 }
 
-/** 拼查询串：省略空值，数组按重复键发送（事件的 kind 过滤用得到）。 */
+/** 拼查询串：省略空值，数组按重复键发送。`0` 是有效值（例如 `?since=0`）。 */
 function withQuery(path, params) {
   const search = new URLSearchParams()
   for (const [key, value] of Object.entries(params || {})) {
@@ -164,7 +174,7 @@ function withQuery(path, params) {
   return text === '' ? path : `${path}?${text}`
 }
 
-/** 路径段编码；runId 由 Host 校验，这里只防 URL 注入。 */
+/** 路径段编码；id 由 Host 校验，这里只防 URL 注入。 */
 function segment(value) {
   return encodeURIComponent(String(value))
 }
@@ -180,7 +190,10 @@ async function request(method, path, body) {
   try {
     response = await fetch(BASE + path, init)
   } catch (error) {
-    throw new Error(`连不上 Host：${error && error.message ? error.message : String(error)}`)
+    const failure = new Error(`连不上 Host：${error && error.message ? error.message : String(error)}`)
+    failure.code = 'NETWORK_ERROR'
+    failure.status = 0
+    throw failure
   }
   let data = {}
   try {
@@ -190,17 +203,104 @@ async function request(method, path, body) {
   }
   if (!response.ok || data.ok === false) {
     const error = new Error(requestFailureText(response.status, data))
-    // 运行控制需要区分 409（业务态）/ 404 / 405（Host 未实现）与真正的连接失败。
+    // 调用方要能区分 409（业务态）/ 404 / 405（Host 未实现）与真正的连接失败，
+    // 也要能按稳定业务码分流（INSTANCE_NOT_FOUND / BPMN_TASK_NOT_FOUND…）。
     error.status = response.status
+    error.code = typeof data.code === 'string' ? data.code : ''
     error.data = data
     throw error
   }
   return data
 }
 
+// ---------------------------------------------------------------------------
+// 定义域 / 实例域（0.13.3 新契约）
+// ---------------------------------------------------------------------------
+
+/** `GET /definitions`。 */
+export function definitionsPath() {
+  return '/definitions'
+}
+
+/** `GET /definitions/<id>[?version=N]`；version 省略 = 最新版。 */
+export function definitionPath(id, options = {}) {
+  return withQuery(`/definitions/${segment(id)}`, {
+    version: options && options.version,
+  })
+}
+
+/** `GET /instances[?definitionId=&status=&limit=]`。 */
+export function instancesPath(options = {}) {
+  return withQuery('/instances', {
+    definitionId: options && options.definitionId,
+    status: options && options.status,
+    limit: options && options.limit,
+  })
+}
+
+/** `GET /instances/<id>`。 */
+export function instancePath(id) {
+  return `/instances/${segment(id)}`
+}
+
+/** `GET /instances/<id>/events[?since=N]`；只发 since，不再发旧接口的 kind/order/light。 */
+export function instanceEventsPath(id, options = {}) {
+  return withQuery(`${instancePath(id)}/events`, {
+    since: options && options.since,
+  })
+}
+
+/** `GET /instances/<id>/tasks`。 */
+export function instanceTasksPath(id) {
+  return `${instancePath(id)}/tasks`
+}
+
+/** `POST /instances/<id>/tasks/<activityId>/complete`。 */
+export function completeTaskPath(id, activityId) {
+  return `${instanceTasksPath(id)}/${segment(activityId)}/complete`
+}
+
+/** `POST /instances/<id>/stop`。 */
+export function stopInstancePath(id) {
+  return `${instancePath(id)}/stop`
+}
+
+/** `GET /instances/<id>/definition`（实例冻结快照，只读）。 */
+export function instanceDefinitionPath(id) {
+  return `${instancePath(id)}/definition`
+}
+
 /**
- * 事件查询路径（纯函数，便于单测 M5 的 `since` + `kind` 形态）：
- * kinds 数组按重复 `kind` 发送；单值 kind 保留给旧调用方。
+ * 0.13.3 主契约：定义 / 实例。页面只用这些方法，不再走「先建 run 再 /start」。
+ * 所有方法返回 Host 原样信封（`{ok:true, …}`），失败抛带 `status/code/data` 的 Error。
+ */
+export const api = {
+  health: () => request('GET', '/health'),
+
+  // ── 定义域 ────────────────────────────────────────────────────────────
+  listDefinitions: () => request('GET', definitionsPath()),
+  readDefinition: (id, options) => request('GET', definitionPath(id, options)),
+  saveDefinition: body => request('POST', definitionsPath(), body || {}),
+
+  // ── 实例域 ────────────────────────────────────────────────────────────
+  createInstance: body => request('POST', instancesPath(), body || {}),
+  listInstances: options => request('GET', instancesPath(options)),
+  readInstance: id => request('GET', instancePath(id)),
+  readInstanceEvents: (id, options) => request('GET', instanceEventsPath(id, options)),
+  readInstanceTasks: id => request('GET', instanceTasksPath(id)),
+  completeInstanceTask: (id, activityId, body) => request('POST', completeTaskPath(id, activityId), body || {}),
+  stopInstance: id => request('POST', stopInstancePath(id)),
+  readInstanceDefinition: id => request('GET', instanceDefinitionPath(id)),
+}
+
+// ---------------------------------------------------------------------------
+// 旧运行域（/flows、/runs）——0.13.3 步骤 7 删除
+// ---------------------------------------------------------------------------
+
+/**
+ * 事件查询路径（旧 `/runs` 契约，纯函数，便于单测 `since` + `kind` 形态）。
+ *
+ * @deprecated 0.13.3 步骤 7 删除（新实例事件走 {@link instanceEventsPath}）。
  */
 export function readEventsPath(id, options = {}) {
   const kinds = []
@@ -222,11 +322,9 @@ export function readEventsPath(id, options = {}) {
 }
 
 /**
- * G5-a：run 详情路径。`light: true` 只取运行元信息（live / nodeStatus / workspace /
- * worktree 摘要），Host 侧**不读、不解析事件文件**——运行中 2s 轮询用它，
- * 避免长 run（实测 20k 事件约 113ms/次）把单线程 Host 拖住。
+ * G5-a：run 详情路径。`light: true` 只取运行元信息。
  *
- * 需要完整事件明细（打开日志抽屉、节点标题）时不要带 light，仍走原来的详情接口。
+ * @deprecated 0.13.3 步骤 7 删除（旧运行域）。
  */
 export function readRunPath(id, options = {}) {
   return withQuery(`/runs/${segment(id)}`, {
@@ -234,22 +332,19 @@ export function readRunPath(id, options = {}) {
   })
 }
 
-/** G5-a：只有「Host 不认这个接口」才算能力降级；网络错误 / 5xx 照常抛。 */
+/** G5-a：只有「Host 不认这个接口」才算能力降级；网络错误 / 5xx 照常抛。 @deprecated 步骤 7 删除 */
 export function isLightPollUnsupported(error) {
   return Boolean(error && (error.status === 400 || error.status === 404))
 }
 
-/** G5-a：降级一次的提示文案（给用户看，不是控制台静默）。 */
+/** G5-a：降级一次的提示文案。 @deprecated 步骤 7 删除 */
 export const LIGHT_POLL_FALLBACK_NOTICE =
   'Host 不支持轻量轮询（GET /runs/<id>?light=1），已回退到完整详情接口；本次会话不再尝试 light=1。'
 
 /**
- * G5-a：轻量轮询读取器。第一次撞上 400/404 就永久降级到旧详情接口，并只警告一次；
- * 之后每一轮直接走旧接口（不会每轮再先试一次 light、也不会无限重试）。
+ * G5-a：轻量轮询读取器（旧运行域）。
  *
- * @param {object} [options]
- * @param {(id: string, options?: object) => Promise<object>} [options.readRun]
- * @param {(message: string) => void} [options.warn]
+ * @deprecated 0.13.3 步骤 7 删除。
  */
 export function createLightRunReader(options = {}) {
   const readRun = typeof options.readRun === 'function'
@@ -286,22 +381,15 @@ export function createLightRunReader(options = {}) {
   }
 }
 
-/** G5-d：无运行中 run 时的列表轮询间隔（降频，不是完全停）。 */
+/** G5-d：无运行中 run 时的列表轮询间隔（降频，不是完全停）。 @deprecated 步骤 7 删除 */
 export const RUNS_IDLE_POLL_MS = 15000
-/** G5-d：列表轮询失败后的退避上限；避免 Host 抖动时把 15s 档打成 0.5s 档。 */
+/** G5-d：列表轮询失败后的退避上限。 @deprecated 步骤 7 删除 */
 export const RUNS_MAX_BACKOFF_MS = 60000
 
 /**
- * G5-d：共享 runs 数据源。
+ * G5-d：共享 runs 数据源（旧运行域）。
  *
- * 左栏「运行记录」和日志抽屉里的 run 列表必须吃**同一份轮询结果 + 同一个 tick**：
- *  - `subscribe(fn)` 的所有订阅方拿到同一个快照对象，不会各拉各的；
- *  - 并发 `refresh()` 共用同一个在飞 promise（两处同时挂载只发一次请求）；
- *  - `start()` 立即刷新一次，之后按 `idleMs`（默认 15s）定时刷新；
- *  - `foreground()` 供切回前台 / 重新打开面板时立即刷新一次；
- *  - 失败按 2 倍退避（15s→30s→60s），成功后清零。
- *
- * 纯逻辑 + 注入 reader / 定时器，SSR 与单测都能直接使用。
+ * @deprecated 0.13.3 步骤 7 删除。
  */
 export function createRunsSource(options = {}) {
   const read = typeof options.read === 'function' ? options.read : () => api.listRuns(20)
@@ -434,8 +522,14 @@ export function createRunsSource(options = {}) {
   }
 }
 
-export const api = {
-  health: () => request('GET', '/health'),
+/**
+ * 旧运行域 API 的临时出口（**0.13.3 步骤 7 删除**）。
+ *
+ * page.js / logdrawer.js 尚未迁移到 definitions/instances（页面接线在下一阶段），
+ * 现有测试也仍按 `api.readRun` / `api.startRun` 取用；本阶段只能保留这些方法，
+ * 否则会先弄断旧页面而不是完成迁移。新代码禁止调用它们。
+ */
+export const legacyApi = {
   listFlows: () => request('GET', '/flows'),
   createFlow: body => request('POST', '/flows', body || {}),
   readFlow: id => request('GET', `/flows/${encodeURIComponent(id)}`),
@@ -444,8 +538,6 @@ export const api = {
   listSkills: () => request('GET', '/skills'),
 
   // ── 运行日志（docs/design/05-run-log.md §5）────────────────────────────
-  // 返回值保持 Host 原样信封；绘制层统一走 logdrawer.js 里的归一化函数，
-  // 这样 Host 换信封（runs / list / data.runs）时客户端不会白屏。
   listRuns: (limit = 20) => request('GET', withQuery('/runs', { limit })),
   createRun: body => request('POST', '/runs', body || {}),
   readRun: (id, options) => request('GET', readRunPath(id, options)),
@@ -463,9 +555,14 @@ export const api = {
   restartRun: (id, body) => request('POST', `/runs/${segment(id)}/restart`, body || {}),
 }
 
+// 旧页面与旧测试还按 `api.listFlows` / `api.readRun` 取用；保留到步骤 7 一起删。
+Object.assign(api, legacyApi)
+
 /**
- * 导出链接：浏览器直接下载 `text/markdown`，不经过 fetch，因此带不了
+ * 导出链接（旧运行域）：浏览器直接下载 `text/markdown`，不经过 fetch，因此带不了
  * Authorization 头；可选鉴权模式下用 Host 支持的 `?token=` 形式（05 §8.5）。
+ *
+ * @deprecated 0.13.3 步骤 7 删除。
  */
 export function exportUrl(runId) {
   const token = resolveToken()

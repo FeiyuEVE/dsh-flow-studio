@@ -103,6 +103,16 @@ function makeDraftScheduler() {
   return { timer, storage, store, scheduler }
 }
 
+/** 0.13.3：草稿是 XML 形状，不再携带整份 JSON flow。 */
+function makeDraft(definitionId, text = '初始') {
+  return {
+    definitionId,
+    baseVersion: 1,
+    baseHash: 'hash-v1',
+    xml: `<xml>${text}</xml>`,
+  }
+}
+
 console.log('client perf')
 
 // ── 缺陷 7：拖拽只在松手时提交一次 ──────────────────────────────────────
@@ -189,27 +199,27 @@ check('节点 props 引用稳定：未变化的节点复用同一个 React Flow 
 // ── 缺陷 8：草稿写盘去抖 / maxWait / flush ──────────────────────────────
 check('草稿去抖：一个去抖窗内连续 5 次变更只写 1 次 localStorage', () => {
   const { timer, storage, store, scheduler } = makeDraftScheduler()
-  const draft = { ...model.defaultFlow(), id: 'flow-debounce' }
+  const draft = makeDraft('def-debounce')
 
   for (let i = 0; i < 5; i += 1) {
-    draft.name = '第 ' + i + ' 个字'
+    draft.xml = `<xml>第 ${i} 个字</xml>`
     assert.equal(scheduler.schedule(draft), true)
     timer.advance(100)
   }
   assert.equal(storage.writes, 0, '去抖窗内不能写盘')
   timer.advance(DRAFT_DEBOUNCE_MS)
   assert.equal(storage.writes, 1, '5 次变更只应写最后一次')
-  assert.equal(store.read('flow-debounce').flow.name, '第 4 个字')
+  assert.equal(store.read('def-debounce').xml, '<xml>第 4 个字</xml>')
   assert.equal(timer.pending(), 0, '写完后不能留下定时器')
 })
 
 check('草稿去抖：一直不停手也会在 maxWait 内强制落一次盘', () => {
   const { timer, storage, scheduler } = makeDraftScheduler()
-  const draft = { ...model.defaultFlow(), id: 'flow-maxwait' }
+  const draft = makeDraft('def-maxwait')
 
   // 每 100ms 敲一下、持续 3s：去抖窗永远被重置，只有 maxWait（2s）能落盘。
   for (let i = 0; i < 30; i += 1) {
-    draft.name = '连续输入 ' + i
+    draft.xml = `<xml>连续输入 ${i}</xml>`
     scheduler.schedule(draft)
     timer.advance(100)
   }
@@ -219,20 +229,20 @@ check('草稿去抖：一直不停手也会在 maxWait 内强制落一次盘', (
 
 check('页面隐藏 / 卸载：flush 立即写最后一次，不等去抖，且旧定时器不再写', () => {
   const { timer, storage, store, scheduler } = makeDraftScheduler()
-  const draft = { ...model.defaultFlow(), id: 'flow-flush' }
+  const draft = makeDraft('def-flush')
 
-  draft.name = '第一个字'
+  draft.xml = '<xml>第一个字</xml>'
   scheduler.schedule(draft)
   timer.advance(200)
-  draft.name = '最后一个字'
+  draft.xml = '<xml>最后一个字</xml>'
   scheduler.schedule(draft)
   assert.equal(storage.writes, 0)
 
   // 相当于 visibilitychange → hidden / 组件卸载。
   const record = scheduler.flush()
   assert.equal(storage.writes, 1, '隐藏时必须立即 flush')
-  assert.equal(record.flow.name, '最后一个字')
-  assert.equal(store.read('flow-flush').flow.name, '最后一个字')
+  assert.equal(record.xml, '<xml>最后一个字</xml>')
+  assert.equal(store.read('def-flush').xml, '<xml>最后一个字</xml>')
   assert.equal(timer.pending(), 0, 'flush 后不得留下定时器')
 
   timer.advance(10000)
@@ -241,10 +251,9 @@ check('页面隐藏 / 卸载：flush 立即写最后一次，不等去抖，且�
 
 check('草稿调度：保存成功可 cancel，待写内容不会再落盘', () => {
   const { timer, storage, scheduler } = makeDraftScheduler()
-  const draft = { ...model.defaultFlow(), id: 'flow-cancel' }
-  draft.name = '待写'
+  const draft = makeDraft('def-cancel', '待写')
   scheduler.schedule(draft)
-  assert.equal(scheduler.cancel('flow-cancel'), true)
+  assert.equal(scheduler.cancel('def-cancel'), true)
   timer.advance(5000)
   assert.equal(storage.writes, 0, 'cancel 后不能再写盘')
   assert.equal(scheduler.pending(), null)

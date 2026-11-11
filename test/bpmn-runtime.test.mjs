@@ -320,7 +320,70 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  // 3. 建实例 → serviceTask → userTask waiting + pendingTasks + 事件
+  // 3. 实例定义快照：冻结 XML / 定义域新增版本或缺失都不影响 / 404 / 405
+  // -------------------------------------------------------------------------
+  await check('实例定义快照：定义新增版本、定义域被删后仍返回冻结 XML', async home => {
+    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const v1 = await seed(route)
+    const instance = await startInstance(route)
+
+    const first = await call(route, 'GET', `${API}/instances/${instance.id}/definition`)
+    eq(first.status, 200, JSON.stringify(first.json))
+    eq(first.json.ok, true)
+    eq(first.json.id, instance.id)
+    eq(first.json.definitionId, 'flow-demo')
+    eq(first.json.definitionVersion, 1)
+    eq(first.json.definitionHash, v1.hash)
+    eq(first.json.xml, workflowXml(), '返回的必须是实例自己的冻结快照')
+
+    // 定义域新增 v2：实例快照不能跟着变。
+    const v2Xml = workflowXml().replace('name="演示流程"', 'name="演示流程 v2"')
+    const v2 = await call(route, 'POST', `${API}/definitions`, {
+      id: 'flow-demo',
+      name: '演示流程 v2',
+      xml: v2Xml,
+    })
+    eq(v2.status, 201, JSON.stringify(v2.json))
+    eq(v2.json.version, 2)
+    ok(v2.json.hash !== v1.hash, 'v2 的 hash 必须与 v1 不同')
+    const latest = await call(route, 'GET', `${API}/definitions/flow-demo`)
+    eq(latest.json.version, 2)
+    eq(latest.json.xml, v2Xml, '定义域确实已经有 v2')
+
+    const frozen = await call(route, 'GET', `${API}/instances/${instance.id}/definition`)
+    eq(frozen.status, 200, JSON.stringify(frozen.json))
+    eq(frozen.json.definitionVersion, 1, '实例仍钉住 v1')
+    eq(frozen.json.definitionHash, v1.hash)
+    eq(frozen.json.xml, workflowXml(), '新增版本后实例画布仍拿到 v1 冻结 XML')
+
+    // 定义域整个删掉也不能影响实例画布。
+    rmSync(join(home, 'flow-studio', 'definitions'), { recursive: true, force: true })
+    const afterDelete = await call(route, 'GET', `${API}/instances/${instance.id}/definition`)
+    eq(afterDelete.status, 200, JSON.stringify(afterDelete.json))
+    eq(afterDelete.json.xml, workflowXml(), '定义域缺失时仍从实例快照读')
+    eq(afterDelete.json.definitionVersion, 1)
+
+    const missing = await call(route, 'GET', `${API}/instances/i-not-exist/definition`)
+    eq(missing.status, 404)
+    eq(missing.json.code, 'INSTANCE_NOT_FOUND')
+
+    const badId = await call(route, 'GET', `${API}/instances/${encodeURIComponent('bad id')}/definition`)
+    eq(badId.status, 400)
+    eq(badId.json.code, 'BPMN_INSTANCE_ID_INVALID')
+
+    const wrongMethod = await call(route, 'POST', `${API}/instances/${instance.id}/definition`, {})
+    eq(wrongMethod.status, 405)
+    eq(wrongMethod.json.code, 'BPMN_METHOD_NOT_ALLOWED')
+
+    // 快照被篡改：不能拿实例元数据冒充成功（沿用 store 的既有 500 码）。
+    writeFileSync(join(home, 'flow-studio', 'instances', instance.id, 'definition.bpmn'), 'tampered', 'utf8')
+    const corrupt = await call(route, 'GET', `${API}/instances/${instance.id}/definition`)
+    eq(corrupt.status, 500)
+    eq(corrupt.json.code, 'INSTANCE_SNAPSHOT_CORRUPT')
+  })
+
+  // -------------------------------------------------------------------------
+  // 4. 建实例 → serviceTask → userTask waiting + pendingTasks + 事件
   // -------------------------------------------------------------------------
   await check('实例：跑到 userTask 变 waiting，instance.json 有 pendingTasks，事件流三类齐全', async home => {
     const calls = []

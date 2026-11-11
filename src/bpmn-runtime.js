@@ -628,6 +628,11 @@ class BpmnRuntime {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readEvents(id, url)
       }
+      if (parts[2] === 'definition') {
+        // 实例画布永远读冻结快照，不回查定义域（定义新增版本 / 被删都不影响）。
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readInstanceDefinitionSnapshot(id)
+      }
       if (parts[2] === 'tasks') {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readTasks(id)
@@ -906,6 +911,37 @@ class BpmnRuntime {
         lastSeq: instance.lastSeq,
         skipped: events?.skipped ?? 0,
         shards: events?.shards ?? 0,
+      },
+    }
+  }
+
+  /**
+   * `GET /instances/<id>/definition`：返回实例启动时冻结的定义快照。
+   *
+   * 只调用 `readInstanceDefinition()`（实例目录里的 `definition.bpmn`）——它已经
+   * 核对过快照与 `instance.json.definitionHash` 一致，所以这里不读定义域，也不会
+   * 因为定义新增版本 / 定义域文件缺失而改变结果。快照缺失 / 损坏沿用 store 的
+   * 500 `INSTANCE_SNAPSHOT_MISSING` / `INSTANCE_SNAPSHOT_CORRUPT`；实例不存在返回
+   * 404 `INSTANCE_NOT_FOUND`。若 store 以后为快照读取引入 409，`handle()` 的
+   * `errorResult()` 会原样带出该既有业务码，不在这里另造新码。
+   *
+   * 这是只读请求：不创建 runner、不触发懒恢复、不改实例状态。
+   *
+   * @param {string} id 已通过 `checkRunId` 校验的 instanceId
+   * @returns {Promise<{status: number, body: object}>}
+   */
+  async _readInstanceDefinitionSnapshot(id) {
+    const snapshot = await this._readDefinitionSnapshot(id)
+    if (snapshot === null) return instanceNotFound(id)
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        id: snapshot.instanceId,
+        definitionId: snapshot.definitionId,
+        definitionVersion: snapshot.definitionVersion,
+        definitionHash: snapshot.definitionHash,
+        xml: snapshot.xml,
       },
     }
   }

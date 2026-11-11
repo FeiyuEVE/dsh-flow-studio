@@ -1,8 +1,18 @@
 /**
- * 本地草稿：保存失败或切页时，把整份流程落到 `flow-studio:draft:<flowId>`。
+ * 本地 XML 草稿（0.13.3）。
  *
- * 承诺的文案必须与实现一致：只有服务器确认保存成功才叫「已保存」；
- * 失败时写本地副本，界面显示「保存失败 · 本地副本」，下次打开该流程可恢复。
+ * 去抖自动保存**只落本地草稿**：每次服务端保存都会创建新版本，不能按每次输入
+ * 建版本。草稿形状固定为：
+ *
+ * ```js
+ * { definitionId, baseVersion, baseHash, xml, savedAt }
+ * ```
+ *
+ * - `definitionId` 是定义域 id（新定义还没有服务端 id 时由页面给临时 id）；
+ * - `baseVersion` / `baseHash` 记录草稿基于的服务端版本，用于提示「服务器上已有
+ *   新版本」；尚未保存过的定义用 `null` / `''`；
+ * - 使用**新的 storage key**（`flow-studio:bpmn-draft:`），不读取 0.12 的 JSON
+ *   flow 草稿（旧记录里的 `flow` 字段直接判为无效）。
  *
  * localStorage 在 SSR / 测试环境可能不存在，也可能被隐私模式禁写：
  * 这里做能力探测，写失败退化为内存草稿，任何路径都不抛错。
@@ -10,11 +20,14 @@
  * @module @feiyueve/dsh-flow-studio/client/drafts
  */
 
-const PREFIX = 'flow-studio:draft:'
+const PREFIX = 'flow-studio:bpmn-draft:'
+
+/** 草稿记录形状版本（文档用；记录本身不写这个字段，避免多一份真相）。 */
+export const XML_DRAFT_SHAPE = 2
 
 /** localStorage 键名。 */
-export function draftKey(flowId) {
-  return PREFIX + String(flowId == null ? '' : flowId)
+export function draftKey(definitionId) {
+  return PREFIX + String(definitionId == null ? '' : definitionId)
 }
 
 /**
@@ -34,13 +47,29 @@ export function detectStorage() {
   }
 }
 
-function isDraftRecord(value, flowId) {
-  return Boolean(value
-    && typeof value === 'object'
-    && value.flow
-    && typeof value.flow === 'object'
-    && typeof value.flow.id === 'string'
-    && value.flow.id === flowId)
+function positiveVersion(value) {
+  if (Number.isSafeInteger(value) && value >= 1) return value
+  return null
+}
+
+/**
+ * 校验 / 归一化一条 XML 草稿记录。
+ * 旧 JSON flow 草稿（记录里有 `flow` 字段或没有 `xml`）一律返回 null。
+ */
+export function normalizeDraft(value, definitionId) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  if (value.flow !== undefined) return null
+  const id = typeof value.definitionId === 'string' ? value.definitionId.trim() : ''
+  if (id === '') return null
+  if (definitionId !== undefined && definitionId !== null && id !== String(definitionId)) return null
+  if (typeof value.xml !== 'string' || value.xml.trim() === '') return null
+  return {
+    definitionId: id,
+    baseVersion: positiveVersion(value.baseVersion),
+    baseHash: typeof value.baseHash === 'string' ? value.baseHash : '',
+    xml: value.xml,
+    savedAt: typeof value.savedAt === 'string' ? value.savedAt : '',
+  }
 }
 
 /**
@@ -51,35 +80,35 @@ export function createDraftStore(storage) {
   const memory = new Map()
 
   const persist = record => {
-    memory.set(record.flow.id, record)
+    memory.set(record.definitionId, record)
     if (!storage) return
     try {
-      storage.setItem(draftKey(record.flow.id), JSON.stringify(record))
+      storage.setItem(draftKey(record.definitionId), JSON.stringify(record))
     } catch {
       // 配额满 / 隐私模式：内存副本已经在了，不抛错。
     }
   }
 
-  const read = flowId => {
-    const id = String(flowId == null ? '' : flowId)
+  const read = definitionId => {
+    const id = String(definitionId == null ? '' : definitionId)
     if (!id) return null
     if (storage) {
       try {
         const raw = storage.getItem(draftKey(id))
         if (raw) {
-          const parsed = JSON.parse(raw)
-          if (isDraftRecord(parsed, id)) return parsed
+          const parsed = normalizeDraft(JSON.parse(raw), id)
+          if (parsed !== null) return parsed
         }
       } catch {
         // 坏 JSON / 读被禁：落到内存。
       }
     }
     const cached = memory.get(id)
-    return isDraftRecord(cached, id) ? cached : null
+    return normalizeDraft(cached, id)
   }
 
-  const clear = flowId => {
-    const id = String(flowId == null ? '' : flowId)
+  const clear = definitionId => {
+    const id = String(definitionId == null ? '' : definitionId)
     if (!id) return
     memory.delete(id)
     if (!storage) return
@@ -90,13 +119,20 @@ export function createDraftStore(storage) {
     }
   }
 
-  const write = (flow, options = {}) => {
-    if (!flow || typeof flow.id !== 'string' || flow.id === '') return null
-    const record = {
-      flow,
-      savedAt: options.savedAt || new Date().toISOString(),
-      baseSavedAt: options.baseSavedAt || flow.updatedAt || '',
-    }
+  /**
+   * 写一条草稿。返回落盘记录（含 savedAt）；非法输入返回 null。
+   * `baseVersion` / `baseHash` 省略时保留为 null / ''。
+   */
+  const write = (draft, options = {}) => {
+    if (!draft || typeof draft !== 'object') return null
+    const record = normalizeDraft({
+      definitionId: draft.definitionId,
+      baseVersion: draft.baseVersion,
+      baseHash: draft.baseHash,
+      xml: draft.xml,
+      savedAt: options.savedAt || draft.savedAt || new Date().toISOString(),
+    }, draft.definitionId)
+    if (record === null) return null
     persist(record)
     return record
   }
@@ -106,19 +142,19 @@ export function createDraftStore(storage) {
 
 const defaultStore = createDraftStore(detectStorage())
 
-/** 写入本地草稿；返回记录（含 savedAt / baseSavedAt），无 id 的流程返回 null。 */
-export function writeDraft(flow, options) {
-  return defaultStore.write(flow, options)
+/** 写入本地 XML 草稿；返回记录（含 savedAt），非法输入返回 null。 */
+export function writeDraft(draft, options) {
+  return defaultStore.write(draft, options)
 }
 
-/** 读某份流程的本地草稿；没有或已损坏返回 null。 */
-export function readDraft(flowId) {
-  return defaultStore.read(flowId)
+/** 读某份定义的本地草稿；没有 / 已损坏 / 旧 flow 草稿返回 null。 */
+export function readDraft(definitionId) {
+  return defaultStore.read(definitionId)
 }
 
-/** 丢掉某份流程的本地草稿（保存成功 / 用户选择丢弃时）。 */
-export function clearDraft(flowId) {
-  defaultStore.clear(flowId)
+/** 丢掉某份定义的本地草稿（保存成功 / 用户选择丢弃时）。 */
+export function clearDraft(definitionId) {
+  defaultStore.clear(definitionId)
 }
 
 /** 草稿落盘的默认去抖窗：连续输入时每个字符不各写一次。 */
@@ -129,21 +165,22 @@ export const DRAFT_MAX_WAIT_MS = 2000
 /**
  * 草稿写盘调度器：去抖 + maxWait，外加可显式 flush（切页 / 页面隐藏 / 卸载）。
  *
- * 设计约束（缺陷 8）：
+ * 设计约束：
  *  - 去抖窗（默认 600ms）内连续变更只写最后一次；
- *  - 从本轮第一次变更起最多等 maxWait（默认 2s），避免用户一直打字永不落盘；
- *  - `flush()` 立即写掉待写内容并清定时器，重复调用不会重复写。
+ *  - 从本轮第一次变更起最多等 maxWait（默认 2s），避免用户一直编辑永不落盘；
+ *  - `flush()` 立即写掉待写内容并清定时器，重复调用不会重复写；
+ *  - 写盘抛错时**保留待写内容**（不丢用户输入），下次 schedule / flush 会重试；
+ *    但不在失败后自动重排，避免配额满时无限重试。
  *
  * 定时器与写盘函数都可注入，测试用假 timer + 假 storage 断言写入次数，
  * 不依赖真实 setTimeout / localStorage。
  *
  * @param {object} [options]
- * @param {(flow: object) => any} [options.write] 实际写盘函数（接收整份流程快照）
+ * @param {(draft: object) => any} [options.write] 实际写盘函数（接收草稿快照）
  * @param {number} [options.debounceMs] 去抖窗，默认 {@link DRAFT_DEBOUNCE_MS}
  * @param {number} [options.maxWaitMs] 上限等待，默认 {@link DRAFT_MAX_WAIT_MS}
  * @param {(fn: Function, ms: number) => any} [options.setTimeout]
  * @param {(id: any) => void} [options.clearTimeout]
- * @returns {{ schedule: Function, flush: Function, cancel: Function, pending: Function }}
  */
 export function createDraftScheduler(options = {}) {
   const write = typeof options.write === 'function' ? options.write : () => null
@@ -160,9 +197,10 @@ export function createDraftScheduler(options = {}) {
     ? options.clearTimeout
     : id => clearTimeout(id)
 
-  let pendingFlow = null
+  let pendingDraft = null
   let debounceTimer = null
   let maxWaitTimer = null
+  let lastError = null
 
   const clearTimers = () => {
     if (debounceTimer !== null) {
@@ -177,29 +215,32 @@ export function createDraftScheduler(options = {}) {
 
   const run = () => {
     clearTimers()
-    if (!pendingFlow) return null
-    const flow = pendingFlow
-    pendingFlow = null
+    if (!pendingDraft) return null
+    const draft = pendingDraft
     try {
-      return write(flow)
-    } catch {
-      // 写盘失败不能反向打断输入；内存副本由 createDraftStore 负责。
+      const result = write(draft)
+      pendingDraft = null
+      lastError = null
+      return result
+    } catch (error) {
+      // 写盘失败不能反向打断输入；保留待写内容，等下一次 flush / schedule 重试。
+      lastError = error
       return null
     }
   }
 
   /**
    * 记一次待写变更。同一轮里的重复调用只更新快照，不增加写盘次数。
-   * 切到另一份流程时先把上一份立即写掉，避免跨流程串稿。
+   * 切到另一份定义时先把上一份立即写掉，避免跨定义串稿。
    */
-  const schedule = flow => {
-    if (!flow || typeof flow.id !== 'string' || flow.id === '') return false
-    if (pendingFlow && pendingFlow.id !== flow.id) run()
-    if (!pendingFlow) {
-      pendingFlow = flow
+  const schedule = draft => {
+    if (!draft || typeof draft.definitionId !== 'string' || draft.definitionId === '') return false
+    if (pendingDraft && pendingDraft.definitionId !== draft.definitionId) run()
+    if (!pendingDraft) {
+      pendingDraft = draft
       maxWaitTimer = setTimer(run, maxWaitMs)
     } else {
-      pendingFlow = flow
+      pendingDraft = draft
     }
     if (debounceTimer !== null) clearTimer(debounceTimer)
     debounceTimer = setTimer(run, debounceMs)
@@ -209,11 +250,11 @@ export function createDraftScheduler(options = {}) {
   /** 立即写掉待写内容；没有待写内容时返回 null。 */
   const flush = () => run()
 
-  /** 丢弃待写内容（保存成功 / 删除流程时）。传 flowId 时只取消同一份流程。 */
-  const cancel = flowId => {
-    if (flowId != null && pendingFlow && pendingFlow.id !== flowId) return false
+  /** 丢弃待写内容（保存成功 / 删除定义时）。传 definitionId 时只取消同一份定义。 */
+  const cancel = definitionId => {
+    if (definitionId != null && pendingDraft && pendingDraft.definitionId !== definitionId) return false
     clearTimers()
-    pendingFlow = null
+    pendingDraft = null
     return true
   }
 
@@ -221,42 +262,42 @@ export function createDraftScheduler(options = {}) {
     schedule,
     flush,
     cancel,
-    pending: () => pendingFlow,
+    pending: () => pendingDraft,
+    get lastError() {
+      return lastError
+    },
     debounceMs,
     maxWaitMs,
   }
 }
 
-/** 稳定序列化：键排序，忽略 null/undefined 差异，用于「内容是否相同」判定。 */
-function canonical(value) {
-  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']'
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort()
-    return '{' + keys.map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+/** XML 比较前的归一化：BOM / 换行 / 首尾空白不制造「有未保存草稿」。 */
+export function normalizeXml(xml) {
+  if (typeof xml !== 'string') return ''
+  return xml.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim()
+}
+
+/**
+ * 草稿是否值得打扰用户。
+ *
+ * @param {object|null} record 草稿记录
+ * @param {string|{xml?: string, hash?: string}|null} current
+ *        当前服务器内容：可传 XML 字符串，或 `{xml, hash}`。
+ *        - 有 xml 时按归一化 XML 比较（内容相同就是相同，与时间戳无关）；
+ *        - 只有 hash 时，草稿的 `baseHash` 相同即视为同一内容。
+ */
+export function draftDiffers(record, current) {
+  const draft = normalizeDraft(record)
+  if (draft === null) return false
+  if (typeof current === 'string') {
+    return normalizeXml(draft.xml) !== normalizeXml(current)
   }
-  return JSON.stringify(value)
-}
-
-/**
- * 内容指纹：只比流程内容，不比 createdAt / updatedAt。
- * 服务器版本与草稿内容相同就不必打扰用户。
- */
-export function contentSignature(flow) {
-  if (!flow || typeof flow !== 'object') return ''
-  return canonical({
-    id: flow.id || '',
-    name: flow.name || '',
-    description: flow.description || '',
-    nodes: Array.isArray(flow.nodes) ? flow.nodes : [],
-    edges: Array.isArray(flow.edges) ? flow.edges : [],
-  })
-}
-
-/**
- * 草稿是否值得打扰用户：内容与服务器版本不同才提示「发现未保存的本地副本」。
- * 只有时间戳不同（例如同一份内容被重新保存）不算。
- */
-export function draftDiffers(flow, record) {
-  if (!record || !record.flow || !flow) return false
-  return contentSignature(record.flow) !== contentSignature(flow)
+  if (!current || typeof current !== 'object') return false
+  if (typeof current.xml === 'string') {
+    return normalizeXml(draft.xml) !== normalizeXml(current.xml)
+  }
+  if (typeof current.hash === 'string' && current.hash !== '') {
+    return draft.baseHash !== current.hash
+  }
+  return false
 }

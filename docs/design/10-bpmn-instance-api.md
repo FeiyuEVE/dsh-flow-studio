@@ -70,6 +70,7 @@ $DSH_HOME/flow-studio/
 | GET | `/instances/<id>` | 详情（状态、变量、pendingTasks、lastSeq、recovered） | 200 |
 | GET | `/instances/<id>/events` | 事件流（按 seq 升序，支持 `?since=`） | 200 |
 | GET | `/instances/<id>/tasks` | 当前待办人工任务 | 200 |
+| GET | `/instances/<id>/definition` | 实例定义快照（冻结 XML，只读实例自己的 `definition.bpmn`） | 200 |
 | POST | `/instances/<id>/tasks/<activityId>/complete` | 完成人工任务 `{payload?, decidedBy?}` | 200 |
 | POST | `/instances/<id>/stop` | 中止实例 | 200 |
 
@@ -164,14 +165,32 @@ $DSH_HOME/flow-studio/
 - 终态或无法恢复时不报 500：`recovered:false` + `recovery.reason`（可读原因）。
 - 错误：400（instanceId 非法）、404（不存在）、500（state/定义快照损坏）。
 
-### 3.7 `GET /instances/<id>/events`
+### 3.7 `GET /instances/<id>/definition`
+
+- 返回实例启动时复制的定义快照，供实例画布（只读 `NavigatedViewer`）渲染。
+- 只读实例目录里的 `definition.bpmn`：**不读定义域**，因此定义新增版本、被删除、
+  甚至定义域目录缺失都不影响结果；也不能拿定义域最新版冒充实例快照。
+- 出参：
+
+```json
+{ "ok": true, "id": "i-…", "definitionId": "flow-demo",
+  "definitionVersion": 1, "definitionHash": "…", "xml": "<?xml …?>" }
+```
+
+- 这是只读请求：不创建 runner、不触发懒恢复、不改实例状态（终态实例同样可读）。
+- 错误：400（instanceId 非法 = `BPMN_INSTANCE_ID_INVALID`）、
+  404（实例不存在 = `INSTANCE_NOT_FOUND`）、405（非 GET = `BPMN_METHOD_NOT_ALLOWED`）、
+  500（快照缺失 / 损坏 = `INSTANCE_SNAPSHOT_MISSING` / `INSTANCE_SNAPSHOT_CORRUPT`）。
+  快照读取不产生 409；若 store 以后为它引入 409，沿用既有业务码，不另造新码。
+
+### 3.8 `GET /instances/<id>/events`
 
 - 出参：`{ok:true, id, events:[…], lastSeq, skipped, shards}`。
 - `events[]` 每条带全局 `seq`；`?since=N` 只返回 `seq > N` 的事件。
 - 读侧宽容：坏行跳过并计入 `skipped`，不因一条坏事件让整条流 500。
 - 错误：400（since 非整数）、404（实例不存在）。
 
-### 3.8 `GET /instances/<id>/tasks`
+### 3.9 `GET /instances/<id>/tasks`
 
 - 内存里有 runner → 以 `runner.pendingTasks()` 为准；没有 → 以 `instance.json` 的
   `pendingTasks` 为准。
@@ -179,7 +198,7 @@ $DSH_HOME/flow-studio/
   recovered, recovery?}`。
 - **GUI 与外部系统同一入口**；0.13.0 没有 assignee / 认领 / 表单，只有「谁在等人」。
 
-### 3.9 `POST /instances/<id>/tasks/<activityId>/complete`
+### 3.10 `POST /instances/<id>/tasks/<activityId>/complete`
 
 入参：
 
@@ -195,7 +214,7 @@ $DSH_HOME/flow-studio/
 - 错误：400（activityId/payload 非法）、404（实例/任务不存在 = `BPMN_TASK_NOT_FOUND`）、
   409（实例终态 / 非 waiting / 失败 / 无法恢复）、500（事件或快照写入失败）。
 
-### 3.10 `POST /instances/<id>/stop`
+### 3.11 `POST /instances/<id>/stop`
 
 - 中止在飞 handler + 停引擎，实例收成 `aborted`，清空 `pendingTasks`，写 `completedAt`。
 - **不追加伪造事件**：不会写 `process/end`，也不会重复已有的 `activity/wait`。
@@ -284,7 +303,7 @@ runner 内部执行态（不对外当实例状态）：
 
 ## 7 懒恢复语义
 
-请求碰到一个不在内存里的实例时（`GET /instances/<id>`、`/tasks`、`complete` 等）：
+请求碰到一个不在内存里的实例时（`GET /instances/<id>`、`/tasks`、`complete` 等；`GET /instances/<id>/definition` 只读快照，**不触发恢复**）：
 
 1. 读 `instance.json`；终态 → **不恢复**，返回 `recovered:false` + 终态原因。
 2. 读 `state.json`；缺失/空 → 返回 `recovered:false` + `BPMN_STATE_MISSING` 原因
@@ -330,7 +349,7 @@ runner 内部执行态（不对外当实例状态）：
 | 404 | `DEFINITION_NOT_FOUND` / `DEFINITION_VERSION_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND` / `BPMN_ROUTE_NOT_FOUND` | 开关关着 / 资源不存在 |
 | 405 | `BPMN_METHOD_NOT_ALLOWED` | 方法不匹配 |
 | 409 | `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_NOT_RECOVERABLE` / `DEFINITION_VERSION_IMMUTABLE` / `DEFINITION_STALE` / `INSTANCE_VERSION_CONFLICT` | 版本/并发/状态冲突 |
-| 500 | `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED` / `BPMN_DEFINITION_INVALID` / `INSTANCE_CORRUPT` | 落盘或数据损坏（不静默） |
+| 500 | `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED` / `BPMN_DEFINITION_INVALID` / `INSTANCE_CORRUPT` / `INSTANCE_SNAPSHOT_MISSING` / `INSTANCE_SNAPSHOT_CORRUPT` | 落盘或数据损坏（不静默） |
 | 503 | `BPMN_HANDLER_MISSING` / `BPMN_LRU_EVICT_UNSNAPSHOTTED` / `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_RUNTIME_DISPOSED` | 引擎不可用 |
 
 开关关着时即使请求带只读令牌也返回 404（不是 403）：功能不存在，不是权限问题。

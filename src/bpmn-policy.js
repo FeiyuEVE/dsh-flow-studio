@@ -245,6 +245,48 @@ function eventlessString(value) {
 }
 
 /**
+ * 补偿相关属性 / 元素：一律拒绝。
+ *
+ * 补偿活动（`isForCompensation`）会被引擎登记成**补偿处理器**，绕过我们对
+ * serviceTask 的派发次序；补偿事件定义 / `compensateActivityRef` 同样能把执行
+ * 引到白名单之外。它们不是「普通任务带了个无关键」，必须在解析期就拒。
+ */
+function compensationViolations(element, elementId) {
+  const items = []
+  const id = elementId ?? '?'
+  const compensation = element?.isForCompensation
+  if (compensation !== undefined && compensation !== false) {
+    items.push(violation(
+      'BPMN_EXECUTION_UNSUPPORTED',
+      `0.13 禁止 isForCompensation=${JSON.stringify(compensation)}：${id} 是补偿活动，引擎会把它登记为补偿处理器并绕过正常派发次序，不在执行白名单内。`,
+      { elementId }
+    ))
+  }
+  const definitions = Array.isArray(element?.eventDefinitions) ? element.eventDefinitions : []
+  const hasCompensateEvent = definitions.some((item) => {
+    const type = typeof item?.$type === 'string' ? item.$type : item?.type
+    return type === 'bpmn:CompensateEventDefinition'
+  })
+  if (hasCompensateEvent) {
+    items.push(violation(
+      'BPMN_EXECUTION_UNSUPPORTED',
+      `0.13 禁止 compensateEventDefinition：${id} 的补偿事件会触发补偿处理链，不在执行白名单内。`,
+      { elementId }
+    ))
+  }
+  // 原始 moddle 属性名是 activityRef；部分序列化实现用 compensateActivityRef，两个都查。
+  const ref = element?.compensateActivityRef ?? element?.activityRef
+  if (ref !== undefined && ref !== null && ref !== '') {
+    items.push(violation(
+      'BPMN_EXECUTION_UNSUPPORTED',
+      `0.13 禁止 compensateActivityRef=${JSON.stringify(ref)}：${id} 引用的补偿活动会绕过执行白名单。`,
+      { elementId }
+    ))
+  }
+  return items
+}
+
+/**
  * 在 moddle 原始结构上收集违规项（parseBpmn 在**归一化之前**调用）。
  *
  * @param {object|null} process `bpmn:Process` 原始 moddle 元素
@@ -271,10 +313,13 @@ export function collectRawExecutionViolations(process) {
     if (type === 'bpmn:SequenceFlow') {
       // 条件语言/安全由 readCondition 负责；这里只查 flow 上不该出现的执行属性。
       violations.push(...implementationViolations(element, elementId))
+      violations.push(...compensationViolations(element, elementId))
       continue
     }
     if (type === '' || INERT_ELEMENT_TYPES.has(type)) continue
 
+    // 补偿检查放在事件定义之前：命中补偿时给出更精确的「补偿」原因。
+    violations.push(...compensationViolations(element, elementId))
     violations.push(...eventDefinitionViolations(element, elementId))
     violations.push(...loopViolations(element, elementId))
     violations.push(...implementationViolations(element, elementId))
@@ -343,6 +388,7 @@ export function collectSerializedExecutionViolations(serializedContext) {
     const elementId = typeof activity?.id === 'string' && activity.id !== '' ? activity.id : null
     const behaviour = activity?.behaviour && typeof activity.behaviour === 'object' ? activity.behaviour : {}
 
+    violations.push(...compensationViolations(behaviour, elementId))
     violations.push(...eventDefinitionViolations(behaviour, elementId))
     violations.push(...loopViolations(behaviour, elementId))
     violations.push(...implementationViolations(behaviour, elementId))

@@ -66,7 +66,7 @@ import {
 } from './instance-store.js'
 import { parseBpmn } from './bpmn-parse.js'
 import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
-import { sha256Hex } from './bpmn-state.js'
+import { BPMN_STATE_KIND, BPMN_STATE_VERSION, sha256Hex } from './bpmn-state.js'
 import { normalizeExecutor, runExternalExecutor } from './executor.js'
 import { checkRunId } from './runlog.js'
 
@@ -960,6 +960,19 @@ class BpmnRuntime {
         throw error
       }
       const after = await readInstance(id, { instancesRoot: this.instancesRoot })
+      // 返回前复查停止闩：stop 可能在 complete 等 handler 期间抢先收口，
+      // 不能把「盘上已 CANCELED、决定被丢弃」报成 200 + ACTIVE（假阳性成功最危险）。
+      // 注意：自己跑到 COMPLETED 是正常成功（runner.status()==='done'），不算被抢收。
+      if (this._stopping.has(id)) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'INSTANCE_TERMINAL_IMMUTABLE',
+            error: `实例 ${id} 正在停止（stop 已置停止闩），本次任务完成未被采纳（以 stop 收口的终态为准）`,
+          },
+        }
+      }
       if (signalError !== null) {
         const result = errorResult(signalError)
         return { status: result.status, body: { ...result.body, id, tasks: runner.pendingTasks() } }
@@ -1205,6 +1218,19 @@ class BpmnRuntime {
         code: 'BPMN_STATE_MISSING',
       }
     }
+    // 失败停机后快照被写成「不可恢复」墓碑：保留 ACTIVE + lastError 是事实，但绝不允许
+    // 重启 / 淘汰后自动恢复旧执行位置（否则 complete 可以重放失败前的工作）。
+    if (isPlainObject(state.unrecoverable)) {
+      const code = typeof state.unrecoverable.code === 'string' && state.unrecoverable.code !== ''
+        ? state.unrecoverable.code
+        : 'BPMN_STATE_UNRECOVERABLE'
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例因执行失败已停机（${code}），快照被标记为不可恢复：${typeof state.unrecoverable.message === 'string' ? state.unrecoverable.message : '需要人工处理后重新创建实例'}`,
+        code,
+      }
+    }
 
     const snapshot = await readInstanceDefinition(instance.id, { instancesRoot: this.instancesRoot })
     if (snapshot === null) {
@@ -1302,7 +1328,40 @@ class BpmnRuntime {
     const status = runner.status()
     if (status !== 'waiting' && status !== 'running') return
     const state = await runner.getState()
-    await writeInstanceState(instanceId, state, { instancesRoot: this.instancesRoot })
+    try {
+      await writeInstanceState(instanceId, state, { instancesRoot: this.instancesRoot })
+    } catch (error) {
+      // stop 已经先一步把实例收成终态：晚到的快照不许覆盖，按「stop 赢」静默跳过。
+      if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
+      throw error
+    }
+  }
+
+  /**
+   * 失败停机：把持久化快照写成**不可恢复墓碑**（保留实例 ACTIVE + lastError）。
+   *
+   * 旧快照（waiting/running）若留着，重启 / 淘汰后 `_ensureRunner` 会自动恢复它，
+   * 后续 complete 就能重放失败前的工作——「保留 ACTIVE」不等于「应该自动重试」。
+   * 墓碑里写清 code/message/at；恢复路径遇到它必须给出明确错误码且零派发。
+   */
+  async _persistUnrecoverableState(instanceId, lastError) {
+    try {
+      await writeInstanceState(instanceId, {
+        v: BPMN_STATE_VERSION,
+        kind: BPMN_STATE_KIND,
+        instanceId,
+        status: BPMN_RUNNER_STATUS.BLOCKED,
+        unrecoverable: {
+          code: lastError?.code ?? 'BPMN_STATE_UNRECOVERABLE',
+          message: lastError?.message ?? '',
+          at: new Date().toISOString(),
+        },
+        engine: null,
+      }, { instancesRoot: this.instancesRoot })
+    } catch (error) {
+      if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
+      throw error
+    }
   }
 
   /**
@@ -1332,7 +1391,12 @@ class BpmnRuntime {
       return
     }
     if (status === BPMN_RUNNER_STATUS.BLOCKED) {
-      await this._markInstanceError(instanceId, this._lastErrorFor(instanceId, runner.failure()))
+      const lastError = this._lastErrorFor(instanceId, runner.failure())
+      const marked = await this._markInstanceError(instanceId, lastError)
+      // stop 抢先把实例收成终态时不写墓碑（终态实例本来就不会被恢复）。
+      if (marked !== null && !TERMINAL_STATUSES.has(marked.status)) {
+        await this._persistUnrecoverableState(instanceId, lastError)
+      }
       return
     }
     if (status === 'waiting') {
@@ -1387,35 +1451,46 @@ class BpmnRuntime {
     const attempt = this._nextAttempt(instanceId, event)
     const persisted = persistableEvent(event)
     this._enqueueEvent(instanceId, async () => {
-      if (persisted === null) {
-        throw new BpmnRuntimeError(500, 'BPMN_EVENT_UNSERIALIZABLE', `实例 ${instanceId} 的事件 ${event.type} 不能被序列化为 JSON`)
-      }
-      await appendInstanceEvents(instanceId, activityId, attempt, persisted, { instancesRoot: this.instancesRoot })
-      if (event.type === 'process/start' || event.type === 'activity/start') {
-        await updateInstance(instanceId, { status: 'ACTIVE' }, { instancesRoot: this.instancesRoot })
-      } else if (event.type === 'activity/wait') {
-        await updateInstance(instanceId, {
-          status: 'ACTIVE',
-          pendingTasks: runner === null ? [] : runner.pendingTasks(),
-        }, { instancesRoot: this.instancesRoot })
-      } else if (event.type === 'activity/end') {
-        await updateInstance(instanceId, {
-          status: 'ACTIVE',
-          pendingTasks: runner === null ? [] : runner.pendingTasks(),
-        }, { instancesRoot: this.instancesRoot })
-      } else if (event.type === 'error') {
-        // 出错**不改 status**：实例继续 ACTIVE，只把事实留成 lastError（连同 error 事件）。
-        await updateInstance(instanceId, {
-          lastError: {
+      // 事件是入队执行的：轮到这里时 stop 可能已经置闩 / 实例可能已终态，
+      // 必须复查，不能把停止前排队的事件晚写到终态实例上。
+      if (this._stopping.has(instanceId)) return
+      try {
+        if (persisted === null) {
+          throw new BpmnRuntimeError(500, 'BPMN_EVENT_UNSERIALIZABLE', `实例 ${instanceId} 的事件 ${event.type} 不能被序列化为 JSON`)
+        }
+        await appendInstanceEvents(instanceId, activityId, attempt, persisted, { instancesRoot: this.instancesRoot })
+        if (event.type === 'process/start' || event.type === 'activity/start') {
+          await updateInstance(instanceId, { status: 'ACTIVE' }, { instancesRoot: this.instancesRoot })
+        } else if (event.type === 'activity/wait') {
+          await updateInstance(instanceId, {
+            status: 'ACTIVE',
+            pendingTasks: runner === null ? [] : runner.pendingTasks(),
+          }, { instancesRoot: this.instancesRoot })
+        } else if (event.type === 'activity/end') {
+          await updateInstance(instanceId, {
+            status: 'ACTIVE',
+            pendingTasks: runner === null ? [] : runner.pendingTasks(),
+          }, { instancesRoot: this.instancesRoot })
+        } else if (event.type === 'error') {
+          // 出错**不改 status**：实例继续 ACTIVE，只把事实留成 lastError（连同 error 事件）。
+          const lastError = {
             code: typeof event.error?.code === 'string' ? event.error.code : 'BPMN_ENGINE_ERROR',
             message: typeof event.error?.message === 'string' ? event.error.message : '',
             ...(typeof event.elementId === 'string' ? { nodeId: event.elementId } : {}),
             ...(typeof event.activityId === 'string' ? { activityId: event.activityId } : {}),
-          },
-        }, { instancesRoot: this.instancesRoot })
+          }
+          await updateInstance(instanceId, { lastError }, { instancesRoot: this.instancesRoot })
+          // 失败事实一旦落盘，旧快照立刻变成不可恢复：不能等下一个请求/收口才处理
+          // （runTimeout 等异步失败可能没有在等的请求）。
+          await this._persistUnrecoverableState(instanceId, lastError)
+        }
+        // 终态 / blocked 一律由 `_syncInstanceStatus` 在收口时一次提交：
+        // 事件链只负责落盘，不抢先把 status 写死（否则最终 variables 会被终态保护挡住）。
+      } catch (error) {
+        // 另一个请求先收成终态：晚到事件丢弃，不升级成事件写入失败。
+        if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
+        throw error
       }
-      // 终态 / blocked 一律由 `_syncInstanceStatus` 在收口时一次提交：
-      // 事件链只负责落盘，不抢先把 status 写死（否则最终 variables 会被终态保护挡住）。
     })
   }
 

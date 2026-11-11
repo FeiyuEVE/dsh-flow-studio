@@ -31,6 +31,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 
 import { activeInstanceCount, bpmnXmlFromDefinition, createBpmnRunner } from '../src/bpmn-runner.js'
+import { parseBpmn } from '../src/bpmn-parse.js'
 
 let checks = 0
 let asserts = 0
@@ -421,13 +422,17 @@ try {
     const executionA = stateA.pendingTasks[0].executionId
     const aTypesBefore = recorderA.types().length
 
-    // 全新实例（新的 id、新的 Engine、新的 services 闭包）。
+    // 新 runner 对象（新的 Engine、新的 services 闭包），但必须复用同一个实例 id：
+    // 快照属于实例，跨实例恢复要拒绝（MAJOR-1）。
+    // 活跃实例表按 instanceId 唯一：先把 A 停掉再建 B。
+    await a.stop()
     const recorderB = makeRecorder()
     const b = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
+      instanceId: a.instanceId,
       services: recorderB.services(() => ({ output: { draft: 'B' } })),
     }))
-    A.notEqual(b.instanceId, a.instanceId, '恢复用的是新实例')
+    A.equal(b.instanceId, a.instanceId, '恢复用同一实例 id（新 runner 对象）')
     await b.recover(restored)
 
     // 拒绝型 expressions 解析器必须扛过 Environment.clone / recover。
@@ -467,14 +472,19 @@ try {
     A.deepEqual(recorderB.types().slice(-1), ['process/end'])
     A.equal(b.pendingTasks().length, 0)
 
-    // A 留在原地（它的引擎没有推进）——这就是「没有复用旧对象状态」的正面证据。
-    A.equal(a.status(), 'waiting', 'A 仍是 waiting：B 的推进没有落到 A 身上')
+    // A 已停止：B 的推进没有落到 A 身上（事件流全程没变）。
+    A.equal(a.status(), 'idle', 'A 已停止；B 的推进没有落到 A 身上')
     A.equal(recorderA.types().length, aTypesBefore, 'A 的事件流全程没变')
 
     // 从同一份 state 恢复第二次也必须成功（state 是只读的起点，不是一次性令牌）。
+    // 先把 B 的 done 快照取出来，再停掉 B（活跃表按 instanceId 唯一），同一 id 建 C。
+    const doneState = await b.getState()
+    A.equal(doneState.status, 'done')
+    await b.stop()
     const recorderC = makeRecorder()
     const c = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
+      instanceId: a.instanceId,
       services: recorderC.services(() => ({ output: { draft: 'C' } })),
     }))
     await c.recover(JSON.parse(serialized))
@@ -484,6 +494,7 @@ try {
     await A.rejects(() => c.recover(stateA), { code: 'BPMN_RECOVER_RUNNING' })
     // 已经启动过的实例不允许再 start。
     await A.rejects(() => c.start(), { code: 'BPMN_ALREADY_STARTED' })
+    await c.stop()
 
     // stop() 之后的 state（引擎 stopped）是可以恢复的：这是「手动挂起 → 恢复」的落点。
     const stopperRecorder = makeRecorder()
@@ -497,17 +508,18 @@ try {
     A.equal(stoppedState.engine.state, 'stopped', 'stop 之后引擎状态是 stopped')
     const reviver = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
+      instanceId: stopper.instanceId,
       services: makeRecorder().services(),
     }))
     await reviver.recover(stoppedState)
     A.equal(reviver.status(), 'waiting', 'stopped 的 state 恢复后回到等待点')
     A.equal(reviver.pendingTasks()[0].elementId, 'n_human')
+    await reviver.stop()
 
     // 已经结束（done）的 state 没有可推进的点：必须结构化拒绝，而不是挂住调用方。
-    const doneState = await b.getState()
-    A.equal(doneState.status, 'done')
     const late = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-a' }),
+      instanceId: a.instanceId,
       services: makeRecorder().services(),
     }))
     await A.rejects(() => late.recover(doneState), { code: 'BPMN_STATE_NOT_RESUMABLE' })
@@ -915,9 +927,10 @@ try {
     A.deepEqual(state.attempts.find(([key]) => key === 'n_agent'), ['n_agent', 2], '快照里带着 agent 的进入次数')
     A.deepEqual(state.flowTakes.find(([key]) => key === 'f_back'), ['f_back', 1], '快照里带着回退边的 take 次数')
 
-    // 全新实例恢复：再走一次就必须超限（若计数丢了，这里会误判成第 1 次而放行）。
+    // 新 runner 恢复（同一 instanceId）：再走一次就必须超限（若计数丢了，这里会误判成第 1 次而放行）。
+    await a.stop()
     const recorderB = makeRecorder()
-    const b = track(createRunner({ definition: makeLimitedDefinition(), services: recorderB.services() }))
+    const b = track(createRunner({ definition: makeLimitedDefinition(), instanceId: a.instanceId, services: recorderB.services() }))
     await b.recover(state)
     A.equal(b.pendingTasks()[0].elementId, 'n_human')
     await A.rejects(() => b.signalTask({ activityId: 'n_human', payload: { approved: false } }), (error) => {
@@ -1070,11 +1083,15 @@ try {
     const events = []
     let release = null
     let abortObserved = false
+    let capturedCtx = null
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout-late' }),
+      // 嵌套对象：浅拷贝基线测不到「共享引用被改」，这里必须深拷贝后再比。
+      variables: { obj: { x: 'before' } },
       limits: { activityWaitMs: 40 },
       services: {
         executeAgent(element, ctx) {
+          capturedCtx = ctx
           ctx.signal.addEventListener('abort', () => { abortObserved = true }, { once: true })
           return new Promise((resolve) => {
             release = () => resolve({ output: { late: 'yes' } })
@@ -1086,11 +1103,13 @@ try {
     await A.rejects(() => runner.start(), { code: 'BPMN_ACTIVITY_TIMEOUT' })
     A.equal(abortObserved, true)
     const eventsAtFail = events.length
-    const variablesAtFail = { ...runner.variables }
+    const variablesAtFail = JSON.parse(JSON.stringify(runner.variables))
+    // 超时后 handler 仍持有 ctx：改嵌套对象也不能影响 runner 账本。
+    capturedCtx.variables.obj.x = 'late'
     release()
     await new Promise((resolve) => setTimeout(resolve, 50))
     A.equal(events.length, eventsAtFail, '超时之后不得再发事件')
-    A.deepEqual(runner.variables, variablesAtFail, '晚到成功不得写进变量账本')
+    A.deepEqual(runner.variables, variablesAtFail, '晚到成功 / 晚到写入都不得改到变量账本')
     A.equal(
       events.filter(event => event.type === 'activity/end' && event.elementId === 'n_agent').length,
       0,
@@ -1312,9 +1331,11 @@ try {
     <bpmn:startEvent id="s">
       <bpmn:conditionalEventDefinition id="ced"><bpmn:condition xsi:type="bpmn:tFormalExpression" language="feel">= 1 &gt; 2</bpmn:condition></bpmn:conditionalEventDefinition>
     </bpmn:startEvent>
+    <bpmn:serviceTask id="a" />
     <bpmn:userTask id="h" />
     <bpmn:endEvent id="e" />
-    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="h" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="a" />
+    <bpmn:sequenceFlow id="f1" sourceRef="a" targetRef="h" />
     <bpmn:sequenceFlow id="f2" sourceRef="h" targetRef="e" />
   </bpmn:process>
 </bpmn:definitions>`
@@ -1322,11 +1343,14 @@ try {
       id: 'proc-cond', startId: 's', endIds: ['e'],
       elements: [
         { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        // 真 serviceTask：让 handler=0 能证明「拒绝发生在任何派发之前」。
+        { id: 'a', type: 'bpmn:ServiceTask', kind: 'agent' },
         { id: 'h', type: 'bpmn:UserTask', kind: 'human' },
         { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
       ],
       flows: [
-        { id: 'f1', from: 's', to: 'h' },
+        { id: 'f0', from: 's', to: 'a' },
+        { id: 'f1', from: 'a', to: 'h' },
         { id: 'f2', from: 'h', to: 'e' },
       ],
     }
@@ -1417,6 +1441,7 @@ try {
     const recorder = makeRecorder()
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-bare' }),
+      instanceId: state.instanceId,
       services: recorder.services(),
     }))
     await A.rejects(() => runner.recover(bare), { code: 'BPMN_STATE_VERSION_UNSUPPORTED' })
@@ -1440,6 +1465,7 @@ try {
     const recorder = makeRecorder()
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-recover-identity' }),
+      instanceId: tampered.instanceId,
       services: recorder.services(),
     }))
     await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
@@ -1463,6 +1489,7 @@ try {
       const recorder = makeRecorder()
       const runner = track(createRunner({
         definition: makeDefinition({ id: 'def-recover-tamper' }),
+        instanceId: conditionTampered.instanceId,
         services: recorder.services(),
       }))
       await A.rejects(() => runner.recover(conditionTampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
@@ -1478,6 +1505,7 @@ try {
       const recorder = makeRecorder()
       const runner = track(createRunner({
         definition: makeDefinition({ id: 'def-recover-tamper' }),
+        instanceId: defaultTampered.instanceId,
         services: recorder.services(),
       }))
       await A.rejects(() => runner.recover(defaultTampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
@@ -1490,6 +1518,7 @@ try {
       delete noHash.definitionHash
       const runner = track(createRunner({
         definition: makeDefinition({ id: 'def-recover-tamper' }),
+        instanceId: noHash.instanceId,
         services: makeRecorder().services(),
       }))
       await A.rejects(() => runner.recover(noHash), { code: 'BPMN_STATE_VERSION_UNSUPPORTED' })
@@ -1499,6 +1528,7 @@ try {
       wrongVersion.version = 99
       const runner = track(createRunner({
         definition: makeDefinition({ id: 'def-recover-tamper' }),
+        instanceId: wrongVersion.instanceId,
         services: makeRecorder().services(),
       }))
       await A.rejects(() => runner.recover(wrongVersion), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
@@ -1614,6 +1644,512 @@ try {
     A.deepEqual(runner.variables, {}, '晚到输出不得写进变量账本')
     A.equal(runner.pendingTasks().length, 0)
     await started.catch(() => {})
+  })
+
+  // -------------------------------------------------------------------------
+  // BLOCKER-1 · 快照布尔字段严格归一化 + 出边顺序 + 节点路由标记
+  // -------------------------------------------------------------------------
+
+  /** 两条条件出边（都为 true）：谁在前面谁先执行，用来证明顺序参与比较。 */
+  function twoConditionalFixture() {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="D-order" targetNamespace="http://x">
+  <bpmn:process id="P-order" isExecutable="true">
+    <bpmn:startEvent id="s"/>
+    <bpmn:userTask id="h"/>
+    <bpmn:exclusiveGateway id="g"/>
+    <bpmn:serviceTask id="a"/>
+    <bpmn:serviceTask id="b"/>
+    <bpmn:endEvent id="e"/>
+    <bpmn:sequenceFlow id="f_sh" sourceRef="s" targetRef="h"/>
+    <bpmn:sequenceFlow id="f_hg" sourceRef="h" targetRef="g"/>
+    <bpmn:sequenceFlow id="f_ga" sourceRef="g" targetRef="a">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="feel">= true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_gb" sourceRef="g" targetRef="b">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="feel">= true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_ae" sourceRef="a" targetRef="e"/>
+    <bpmn:sequenceFlow id="f_be" sourceRef="b" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const definition = {
+      id: 'P-order', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'h', type: 'bpmn:UserTask', kind: 'human' },
+        { id: 'g', type: 'bpmn:ExclusiveGateway', kind: 'gateway' },
+        { id: 'a', type: 'bpmn:ServiceTask', kind: 'agent' },
+        { id: 'b', type: 'bpmn:ServiceTask', kind: 'agent' },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f_sh', from: 's', to: 'h' },
+        { id: 'f_hg', from: 'h', to: 'g' },
+        { id: 'f_ga', from: 'g', to: 'a', condition: { expression: '= true', language: 'feel' } },
+        { id: 'f_gb', from: 'g', to: 'b', condition: { expression: '= true', language: 'feel' } },
+        { id: 'f_ae', from: 'a', to: 'e' },
+        { id: 'f_be', from: 'b', to: 'e' },
+      ],
+    }
+    return { xml, definition, definitionId: 'def-order' }
+  }
+
+  /** 起一个停在 userTask 的 runner，取快照后 stop（活跃表按 instanceId 唯一，必须释放）。 */
+  async function waitingStateOf(options) {
+    const runner = track(createRunner(options))
+    const started = await runner.start()
+    A.equal(started.state, 'waiting', '夹具必须停在 userTask')
+    const state = JSON.parse(JSON.stringify(await runner.getState()))
+    const instanceId = runner.instanceId
+    await runner.stop()
+    return { state, instanceId }
+  }
+
+  await check('B1：快照布尔字段只接受 true/false/缺省（isDefault 非布尔一律拒绝，handler=0）', async () => {
+    const { state } = await makeWaitingState('def-bool-strict')
+    for (const value of ['false', 1, {}, [], null]) {
+      const tampered = JSON.parse(JSON.stringify(state))
+      const source = JSON.parse(tampered.engine.definitions[0].source)
+      source.sequenceFlows.find(flow => flow.id === 'f_back').isDefault = value
+      tampered.engine.definitions[0].source = JSON.stringify(source)
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-bool-strict' }),
+        instanceId: state.instanceId,
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_INVALID' })
+      A.equal(recorder.handlerCalls.length, 0, `isDefault=${JSON.stringify(value)} 必须在恢复前拒绝且零派发`)
+      A.equal(runner.status(), 'idle')
+    }
+
+    // 节点行为标记：字符串 "false" 同样拒绝；真正的 true 不拒绝类型，但必须与可信结构比较后拒绝。
+    {
+      const tampered = JSON.parse(JSON.stringify(state))
+      const source = JSON.parse(tampered.engine.definitions[0].source)
+      source.activities.find(activity => activity.id === 'n_gw').isParallelGateway = 'false'
+      tampered.engine.definitions[0].source = JSON.stringify(source)
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-bool-strict' }),
+        instanceId: state.instanceId,
+        services: makeRecorder().services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_INVALID' })
+    }
+    {
+      const tampered = JSON.parse(JSON.stringify(state))
+      const source = JSON.parse(tampered.engine.definitions[0].source)
+      source.activities.find(activity => activity.id === 'n_gw').isParallelGateway = true
+      tampered.engine.definitions[0].source = JSON.stringify(source)
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-bool-strict' }),
+        instanceId: state.instanceId,
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+      A.equal(recorder.handlerCalls.length, 0, '节点路由标记必须参与结构比较')
+    }
+  })
+
+  await check('B1：交换两条条件边顺序 → 恢复前拒绝（handler=0）', async () => {
+    const fixture = twoConditionalFixture()
+    const { state, instanceId } = await waitingStateOf({
+      definition: fixture.definition,
+      xml: fixture.xml,
+      services: makeRecorder().services(),
+    })
+    const tampered = JSON.parse(JSON.stringify(state))
+    const source = JSON.parse(tampered.engine.definitions[0].source)
+    const flows = source.sequenceFlows
+    const indexA = flows.findIndex(flow => flow.id === 'f_ga')
+    const indexB = flows.findIndex(flow => flow.id === 'f_gb')
+    ;[flows[indexA], flows[indexB]] = [flows[indexB], flows[indexA]]
+    tampered.engine.definitions[0].source = JSON.stringify(source)
+
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: fixture.definition,
+      xml: fixture.xml,
+      instanceId,
+      services: recorder.services(),
+    }))
+    await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+    A.equal(recorder.handlerCalls.length, 0, '顺序被改动时必须在恢复前拒绝，不能派发到错误分支')
+  })
+
+  // -------------------------------------------------------------------------
+  // BLOCKER-2 · 补偿属性（isForCompensation / compensateEventDefinition）解析期拒绝
+  // -------------------------------------------------------------------------
+
+  await check('BLOCKER-2：补偿属性解析期拒绝，真实 serviceTask 在审批前零派发', async () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="D-comp" targetNamespace="http://x">
+  <bpmn:process id="P-comp" isExecutable="true">
+    <bpmn:startEvent id="s"/>
+    <bpmn:userTask id="h"/>
+    <bpmn:serviceTask id="b" isForCompensation="true">
+      <bpmn:extensionElements>
+        <fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo b"/></fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="h"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="h" targetRef="b"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const parsed = await parseBpmn(xml)
+    A.equal(parsed.ok, false, '带 isForCompensation 的流程必须解析失败')
+    A.equal(
+      parsed.errors.some(error => error.code === 'BPMN_EXECUTION_UNSUPPORTED' && /isForCompensation/.test(error.message)),
+      true,
+      '错误必须明确指出 isForCompensation'
+    )
+
+    const definition = {
+      id: 'P-comp', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'h', type: 'bpmn:UserTask', kind: 'human' },
+        { id: 'b', type: 'bpmn:ServiceTask', kind: 'agent' },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f1', from: 's', to: 'h' },
+        { id: 'f2', from: 'h', to: 'b' },
+        { id: 'f3', from: 'b', to: 'e' },
+      ],
+    }
+    const recorder = makeRecorder()
+    const runner = track(createRunner({ definition, xml, services: recorder.services() }))
+    await A.rejects(() => runner.start(), { code: 'BPMN_EXECUTION_UNSUPPORTED' })
+    A.equal(recorder.handlerCalls.length, 0, '审批前零派发：下游 serviceTask 的 handler 一次都不能跑')
+
+    // 补偿事件定义（boundary 上）同样拒绝；错误原因里要能看出补偿。
+    const compensateEventXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D-comp-event" targetNamespace="http://x">
+  <bpmn:process id="P-comp-event" isExecutable="true">
+    <bpmn:startEvent id="s"/>
+    <bpmn:userTask id="h"/>
+    <bpmn:boundaryEvent id="be" attachedToRef="h">
+      <bpmn:compensateEventDefinition id="ced" activityRef="h"/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="h"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="h" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const parsedEvent = await parseBpmn(compensateEventXml)
+    A.equal(parsedEvent.ok, false, 'compensateEventDefinition 必须解析失败')
+    A.equal(
+      parsedEvent.errors.some(error => /compensate|补偿/i.test(error.message)),
+      true,
+      '错误原因必须能看出是补偿事件'
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // BLOCKER-3 · 异步准备期间 stop：取消代次必须阻止创建引擎 / 派发 / 状态复活
+  // -------------------------------------------------------------------------
+
+  await check('BLOCKER-3：start 在异步校验中遇 stop → 零派发、状态不复活', async () => {
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-stop-during-start' }),
+      services: recorder.services(),
+    }))
+    let release
+    const gate = new Promise((resolveGate) => { release = resolveGate })
+    const original = runner._prepareTrustedStructure.bind(runner)
+    runner._prepareTrustedStructure = async (phase) => {
+      await gate
+      return original(phase)
+    }
+
+    const started = runner.start().catch(error => error)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await runner.stop()
+    release()
+    const outcome = await started
+
+    A.equal(outcome?.code, 'BPMN_STOPPED', '已取消的启动必须抛 BPMN_STOPPED')
+    A.equal(recorder.handlerCalls.length, 0, 'stop 之后不得再派发 handler')
+    A.equal(runner.status(), 'idle', '状态不得复活成 waiting/running')
+    A.equal(runner._engine, null)
+    A.equal(runner.pendingTasks().length, 0)
+  })
+
+  await check('BLOCKER-3：recover 在异步校验中遇 stop → 不创建引擎、状态不复活', async () => {
+    const { state } = await makeWaitingState('def-stop-during-recover')
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-stop-during-recover' }),
+      instanceId: state.instanceId,
+      services: recorder.services(),
+    }))
+    let release
+    const gate = new Promise((resolveGate) => { release = resolveGate })
+    const original = runner._prepareTrustedStructure.bind(runner)
+    runner._prepareTrustedStructure = async (phase) => {
+      await gate
+      return original(phase)
+    }
+
+    const recovered = runner.recover(state).catch(error => error)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await runner.stop()
+    release()
+    const outcome = await recovered
+
+    A.equal(outcome?.code, 'BPMN_STOPPED', '已取消的恢复必须抛 BPMN_STOPPED')
+    A.equal(runner.status(), 'idle', '状态不得复活成 waiting/running')
+    A.equal(runner._engine, null, 'stop 之后不得创建引擎')
+    A.equal(runner.pendingTasks().length, 0, '不得恢复出待办（执行位置不复活）')
+    A.equal(recorder.handlerCalls.length, 0)
+  })
+
+  // -------------------------------------------------------------------------
+  // MAJOR-1 · 信封绑定实例 / sourceHash / flowTakes 严格
+  // -------------------------------------------------------------------------
+
+  await check('MAJOR-1：instanceId 必须绑定目标实例；sourceHash 必须与 XML 一致', async () => {
+    const { state } = await makeWaitingState('def-envelope-bind')
+
+    // 异实例：即使结构、定义身份都对，也必须拒绝。
+    {
+      const tampered = JSON.parse(JSON.stringify(state))
+      tampered.instanceId = 'i-another-instance'
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-envelope-bind' }),
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_INSTANCE_MISMATCH' })
+      A.equal(recorder.handlerCalls.length, 0)
+    }
+
+    // sourceHash：缺失 / 伪造都拒绝。
+    for (const mutate of [
+      (tampered) => { delete tampered.sourceHash },
+      (tampered) => { tampered.sourceHash = 'f'.repeat(64) },
+      (tampered) => { tampered.sourceHash = 'not-a-hash' },
+    ]) {
+      const tampered = JSON.parse(JSON.stringify(state))
+      mutate(tampered)
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-envelope-bind' }),
+        instanceId: state.instanceId,
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_SOURCE_HASH_MISMATCH' })
+      A.equal(recorder.handlerCalls.length, 0)
+    }
+  })
+
+  await check('MAJOR-1：flowTakes 缺失/错类型/负数/删单条都拒绝，已耗尽边不复活', async () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="D-takes" targetNamespace="http://x">
+  <bpmn:process id="P-takes" isExecutable="true">
+    <bpmn:startEvent id="s"/>
+    <bpmn:exclusiveGateway id="g" default="f_exit"/>
+    <bpmn:serviceTask id="t"/>
+    <bpmn:userTask id="h"/>
+    <bpmn:endEvent id="e"/>
+    <bpmn:sequenceFlow id="f_start" sourceRef="s" targetRef="g"/>
+    <bpmn:sequenceFlow id="f_entry" sourceRef="g" targetRef="t">
+      <bpmn:extensionElements><fs:maxRounds>1</fs:maxRounds></bpmn:extensionElements>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_th" sourceRef="t" targetRef="h"/>
+    <bpmn:sequenceFlow id="f_hg" sourceRef="h" targetRef="g"/>
+    <bpmn:sequenceFlow id="f_exit" sourceRef="g" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const definition = {
+      id: 'P-takes', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'g', type: 'bpmn:ExclusiveGateway', kind: 'gateway' },
+        { id: 't', type: 'bpmn:ServiceTask', kind: 'agent' },
+        { id: 'h', type: 'bpmn:UserTask', kind: 'human' },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f_start', from: 's', to: 'g' },
+        { id: 'f_entry', from: 'g', to: 't', extensions: [{ type: 'fs:MaxRounds', name: 'maxRounds', value: 1 }] },
+        { id: 'f_th', from: 't', to: 'h' },
+        { id: 'f_hg', from: 'h', to: 'g' },
+        { id: 'f_exit', from: 'g', to: 'e', isDefault: true },
+      ],
+    }
+    const { state } = await waitingStateOf({ definition, xml, services: makeRecorder().services() })
+    A.deepEqual(state.flowTakes.find(([key]) => key === 'f_entry'), ['f_entry', 1], '夹具里 f_entry 已耗尽')
+
+    for (const [label, mutate] of [
+      ['删除整张 flowTakes', (tampered) => { delete tampered.flowTakes }],
+      ['flowTakes 改成字符串', (tampered) => { tampered.flowTakes = 'f_entry:1' }],
+      ['flowTakes 计数为负数', (tampered) => { tampered.flowTakes = [['f_entry', -1]] }],
+      ['删掉已走过的那条计数', (tampered) => { tampered.flowTakes = tampered.flowTakes.filter(([key]) => key !== 'f_entry') }],
+    ]) {
+      const tampered = JSON.parse(JSON.stringify(state))
+      mutate(tampered)
+      const recorder = makeRecorder()
+      const runner = track(createRunner({ definition, xml, instanceId: state.instanceId, services: recorder.services() }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_INVALID' })
+      A.equal(recorder.handlerCalls.length, 0, `${label}：拒绝发生在任何 handler 之前`)
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // MAJOR-3 · handler 变量深拷贝（晚到写入不得改到 runner）
+  // -------------------------------------------------------------------------
+
+  await check('MAJOR-3：ctx.variables 是深拷贝，超时后改嵌套对象也影响不到 runner', async () => {
+    let captured = null
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-deep-vars' }),
+      variables: { obj: { x: 'before' }, list: [{ y: 1 }] },
+      limits: { activityWaitMs: 40 },
+      services: {
+        executeAgent(element, ctx) {
+          captured = ctx
+          return new Promise(() => {})
+        },
+        onEvent() {},
+      },
+    }))
+    await A.rejects(() => runner.start(), { code: 'BPMN_ACTIVITY_TIMEOUT' })
+    A.ok(captured, 'handler 拿到 ctx')
+    A.deepEqual(captured.variables, { obj: { x: 'before' }, list: [{ y: 1 }] })
+
+    // 超时后 handler 仍可能改自己手里的嵌套对象：不得影响 runner 账本，也不得抛未捕获异常。
+    captured.variables.obj.x = 'late'
+    captured.variables.list.push({ y: 2 })
+    A.deepEqual(runner.variables, { obj: { x: 'before' }, list: [{ y: 1 }] }, '嵌套对象必须深拷贝')
+    A.equal(runner.status(), 'blocked')
+  })
+
+  // -------------------------------------------------------------------------
+  // F1 · 异构 execution/broker：恢复前快速拒绝（不挂 298s）
+  // -------------------------------------------------------------------------
+
+  await check('F1：source 相同但 execution/broker 来自另一份引擎 → 2s 内拒绝且零派发', async () => {
+    const foreignXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D-foreign" targetNamespace="http://x">
+  <bpmn:process id="P-foreign" isExecutable="true">
+    <bpmn:startEvent id="fs"/><bpmn:userTask id="fh"/><bpmn:endEvent id="fe"/>
+    <bpmn:sequenceFlow id="ff1" sourceRef="fs" targetRef="fh"/>
+    <bpmn:sequenceFlow id="ff2" sourceRef="fh" targetRef="fe"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const foreignDefinition = {
+      id: 'P-foreign', startId: 'fs', endIds: ['fe'],
+      elements: [
+        { id: 'fs', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'fh', type: 'bpmn:UserTask', kind: 'human' },
+        { id: 'fe', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'ff1', from: 'fs', to: 'fh' },
+        { id: 'ff2', from: 'fh', to: 'fe' },
+      ],
+    }
+    const foreignRunner = track(createRunner({ definition: foreignDefinition, xml: foreignXml, services: makeRecorder().services() }))
+    A.equal((await foreignRunner.start()).state, 'waiting')
+    const foreignState = JSON.parse(JSON.stringify(await foreignRunner.getState()))
+    await foreignRunner.stop()
+
+    const { state } = await makeWaitingState('def-foreign-guard')
+    state.engine.definitions[0].execution = foreignState.engine.definitions[0].execution
+    state.engine.definitions[0].broker = foreignState.engine.definitions[0].broker
+
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-foreign-guard' }),
+      instanceId: state.instanceId,
+      services: recorder.services(),
+    }))
+    const startedAt = Date.now()
+    await A.rejects(() => runner.recover(state), { code: 'BPMN_STATE_INVALID' })
+    const elapsed = Date.now() - startedAt
+    A.ok(elapsed < 2000, `异构 state 必须快速拒绝（实测 ${elapsed}ms，不能靠 298s settle 兜底）`)
+    A.equal(recorder.handlerCalls.length, 0)
+    A.equal(runner.status(), 'idle', '拒绝后不得留下半截执行状态')
+  })
+
+  await check('F1：recover settle 有界超时（BPMN_RECOVER_TIMEOUT，不无限等）', async () => {
+    const { state } = await makeWaitingState('def-recover-timeout')
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-recover-timeout' }),
+      instanceId: state.instanceId,
+      limits: { recoverSettleTimeoutMs: 40 },
+      services: makeRecorder().services(),
+    }))
+    // 模拟「resume 后不产生事件、也永远不会静默」的坏引擎：settle 判定永远不完成。
+    runner._shouldFinishSettle = () => false
+    runner._checkQuiescent = async () => {}
+    await A.rejects(() => runner.recover(state), { code: 'BPMN_RECOVER_TIMEOUT' })
+    A.equal(runner.status(), 'blocked', '超时按失败收口，不把僵尸实例当恢复成功')
+  })
+
+  // -------------------------------------------------------------------------
+  // F5 / F6 · 重复 id 与顶层 maxTakes 契约
+  // -------------------------------------------------------------------------
+
+  await check('F5：重复的 activity / sequenceFlow id → 稳定 BPMN_STATE_INVALID', async () => {
+    const { state } = await makeWaitingState('def-duplicate-id')
+    for (const target of ['activities', 'sequenceFlows']) {
+      const tampered = JSON.parse(JSON.stringify(state))
+      const source = JSON.parse(tampered.engine.definitions[0].source)
+      source[target].push(JSON.parse(JSON.stringify(source[target][0])))
+      tampered.engine.definitions[0].source = JSON.stringify(source)
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-duplicate-id' }),
+        instanceId: state.instanceId,
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_INVALID' })
+      A.equal(recorder.handlerCalls.length, 0)
+    }
+  })
+
+  await check('F6：definition-only 顶层 maxTakes 生效（不再被静默丢弃）', async () => {
+    const definition = {
+      id: 'def-top-max', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', kind: 'start' }, { id: 't', kind: 'agent' },
+        { id: 'g', kind: 'gateway' }, { id: 'e', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f1', from: 's', to: 't' },
+        { id: 'f2', from: 't', to: 'g' },
+        { id: 'r1', from: 'g', to: 't', condition: { expression: '= true', language: 'feel' }, maxTakes: 1 },
+        { id: 'f3', from: 'g', to: 'e', isDefault: true },
+      ],
+    }
+    const recorder = makeRecorder()
+    const runner = track(createRunner({ definition, loopGuardMax: 5, services: recorder.services() }))
+    await A.rejects(() => runner.start(), (error) => {
+      A.equal(error.code, 'BPMN_FLOW_TAKE_LIMIT', '顶层 maxTakes=1 必须在第 2 次 take 前生效，而不是等 loopGuard')
+      A.equal(error.flowId, 'r1')
+      return true
+    })
+    A.equal(recorder.handlerCalls.length, 2, 'handler 只跑 2 次（首次 + 唯一一次回边）')
+
+    // 顶层与扩展冲突必须显式报错，不静默择一。
+    const conflicting = JSON.parse(JSON.stringify(definition))
+    conflicting.flows = conflicting.flows.map((flow) => (
+      flow.id === 'r1'
+        ? { ...flow, extensions: [{ type: 'fs:MaxRounds', name: 'maxRounds', value: 2 }] }
+        : flow
+    ))
+    A.throws(
+      () => createRunner({ definition: conflicting, services: makeRecorder().services() }),
+      { code: 'BPMN_DEFINITION_INVALID' }
+    )
   })
 
 } finally {

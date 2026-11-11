@@ -174,8 +174,11 @@ import {
   BPMN_STATE_VERSION,
   assertDefinitionIdentity,
   assertDefinitionMatchesStructure,
+  assertEngineStateBoundToStructure,
   assertRecoveredEngineStructure,
   assertStructuresMatch,
+  collectEngineFlowTakes,
+  collectTakenFlowIds,
   describeExecutionStructure,
   normalizeDefinitionIdentity,
   readTrustedExecutionStructure,
@@ -240,6 +243,12 @@ const MAX_SETTLE_CHECKS = 6000
 
 /** `engine.stop()` 无响应时别把调用方挂死（研究的 26.x 行为，加个上限更稳）。 */
 const STOP_TIMEOUT_MS = 1000
+
+/**
+ * `recover()` 等引擎静默的上限（背压：正常恢复在毫秒级；异构 state 由结构校验提前拒绝）。
+ * 没有它时，`resume()` 不产生事件的坏 state 会让调用方挂到 6000 次 settle 重试（≈298s）。
+ */
+const RECOVER_SETTLE_TIMEOUT_MS = 30_000
 
 /**
  * BPMN 执行器错误：`code` 是稳定契约，`message` 是给人看的中文。
@@ -472,7 +481,7 @@ function readMaxTakes(extensions) {
  * @returns {{
  *   id: string, name: string | null, startId: string, endIds: string[],
  *   elements: Array<{ id: string, type: string, name: string | null, kind: string, node: object | null }>,
- *   flows: Array<{ id: string, from: string, to: string, condition: { expression: string, language: string } | null, isDefault: boolean, extensions: object[], maxTakes: number | null }>,
+ *   flows: Array<{ id: string, from: string, to: string, condition: { expression: string, language: string } | null, isDefault: boolean, extensions: object[], maxTakes?: number | null }>,
  *   elementById: Map<string, object>, flowById: Map<string, object>, flowsByFrom: Map<string, object[]>,
  *   warnings: string[],
  * }}
@@ -597,8 +606,28 @@ function normalizeDefinition(raw) {
     const condition = normalizeCondition(entry.condition, flowId)
     // fs: 扩展原样留在 flow 上（上层要能拿到 fs:note / fs:maxRounds 等原文），
     // 同时派生只读语义字段 maxTakes（这条连线最多被走几次）供上限判定用。
+    // definition-only 调用方也可以直接给顶层 `maxTakes`（JSDoc 契约）；两处都给且不一致时拒绝，
+    // 绝不静默丢弃——否则上限会被 loopGuardMax 兜底，等于慢速无限循环。
     const extensions = Array.isArray(entry.extensions) ? entry.extensions.slice() : []
-    const maxTakes = readMaxTakes(extensions)
+    const extensionMaxTakes = readMaxTakes(extensions)
+    let maxTakes = extensionMaxTakes
+    if (entry.maxTakes !== undefined && entry.maxTakes !== null) {
+      if (!Number.isSafeInteger(entry.maxTakes) || entry.maxTakes < 1) {
+        throw new BpmnRunnerError(
+          'BPMN_DEFINITION_INVALID',
+          `连线 ${flowId} 的 maxTakes 必须是 ≥1 的整数（${JSON.stringify(entry.maxTakes)} 非法）`,
+          { elementId: flowId }
+        )
+      }
+      if (extensionMaxTakes !== null && extensionMaxTakes !== entry.maxTakes) {
+        throw new BpmnRunnerError(
+          'BPMN_DEFINITION_INVALID',
+          `连线 ${flowId} 的 maxTakes=${entry.maxTakes} 与 extensions 里的 fs:maxRounds=${extensionMaxTakes} 冲突`,
+          { elementId: flowId }
+        )
+      }
+      maxTakes = entry.maxTakes
+    }
 
     if (condition && isDefault) {
       // BPMN 规范：默认流无条件可用（引擎对默认流直接 evaluate=true，不看表达式）。
@@ -902,7 +931,7 @@ function newInstanceId() {
  *     onTaskDone?: (taskResult: object) => void,
  *     onError?: (error: BpmnRunnerError) => void,
  *   },
- *   limits?: { activityWaitMs?: number, runTimeoutMs?: number },
+ *   limits?: { activityWaitMs?: number, runTimeoutMs?: number, recoverSettleTimeoutMs?: number },
  *   variables?: object,
  *   // 通用循环护栏：同一条连线在单个实例里最多被 take 多少次（默认 1000，0 = 关）。
  *   // 这是「防死环」的最后一道保险，和 fs:maxRounds 的连线次数上限互不替代。
@@ -1078,7 +1107,17 @@ class BpmnRunner {
       )
     }
     // 启动前先过执行白名单 + 与 definition 的形状对照：任何 handler 都还没机会执行。
+    // 校验是异步的：期间 stop() 可能已经把这个实例取消（执行代次 +1）。
+    // 放行前必须复核代次，否则 stop 返回后仍会创建引擎并派发 handler（状态复活）。
+    const epoch = this._generation
     await this._prepareTrustedStructure('start')
+    if (this._stopping || this._evicted || epoch !== this._generation) {
+      throw new BpmnRunnerError(
+        'BPMN_STOPPED',
+        `实例 ${this.instanceId} 在启动准备期间已被停止/淘汰，不再创建引擎、不再派发`,
+        { instanceId: this.instanceId }
+      )
+    }
 
     this._generation += 1
     const generation = this._generation
@@ -1161,6 +1200,7 @@ class BpmnRunner {
     // 恢复顺序固定：信封 + 身份 → 有界解析 source → 实际结构对照 → engine.recover
     // → 恢复后 context 复核 → 最后才挂监听 / 计时器 / resume。
     // 前面任何一步失败都不会创建活动、不会派发 handler。
+    const epoch = this._generation
     let validated
     let trusted
     try {
@@ -1175,8 +1215,21 @@ class BpmnRunner {
         describeExecutionStructure(validated.sourceContext),
         'state.engine.definitions[0].source'
       )
+      // `source` 对得上不代表 `execution` / `broker` 也来自同一份引擎：异构 state 会让
+      // resume() 不产生任何事件（挂死 / 僵尸实例）。必须在创建引擎前拒掉。
+      assertEngineStateBoundToStructure(validated.engineState, trusted)
+      assertFlowTakesBoundToStructure(validated.flowTakes, validated.engineState, trusted)
     } catch (error) {
       throw asRunnerError(error, 'BPMN_STATE_INVALID', { instanceId: this.instanceId })
+    }
+
+    // 校验是异步的：期间可能已经有 stop()（实例被取消）。已取消就不得创建引擎 / 派发 / 复活状态。
+    if (this._stopping || this._evicted || epoch !== this._generation) {
+      throw new BpmnRunnerError(
+        'BPMN_STOPPED',
+        `实例 ${this.instanceId} 在恢复准备期间已被停止/淘汰，不再创建引擎、不再派发`,
+        { instanceId: this.instanceId }
+      )
     }
 
     // 只有「running / stopped」的 state 有可推进的点。实测：恢复 done / error / idle 的
@@ -1252,7 +1305,39 @@ class BpmnRunner {
       this._fail(asRunnerError(error, 'BPMN_ENGINE_ERROR', { instanceId: this.instanceId }))
     }
     this._scheduleSettle()
-    await settled
+    await this._awaitSettleWithTimeout(settled, this.limits.recoverSettleTimeoutMs, 'recover')
+  }
+
+  /**
+   * 给 `recover()` 的等待设上限：正常恢复毫秒级完成；坏 state 若 `resume()` 后不产生
+   * 任何事件，不能挂到 6000 次 settle 重试（≈298s）。超时按 `BPMN_RECOVER_TIMEOUT`
+   * 失败（runner 转 blocked），并主动停掉引擎。
+   *
+   * @param {Promise<{state: string}>} settled
+   * @param {number} timeoutMs
+   * @param {string} action
+   */
+  async _awaitSettleWithTimeout(settled, timeoutMs, action) {
+    if (!(timeoutMs > 0)) return await settled
+    let timer = null
+    const timeout = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new BpmnRunnerError(
+          'BPMN_RECOVER_TIMEOUT',
+          `${action} 在 ${timeoutMs}ms 内没有推进到等待点或结束（引擎已 resume 但不产生事件）；拒绝把僵尸实例当成恢复成功`,
+          { instanceId: this.instanceId, timeoutMs }
+        )
+        // 先锁定失败态（在等的 settle 会被 reject），再停引擎。
+        this._fail(error)
+        this._stopEngineQuietly()
+        reject(error)
+      }, timeoutMs)
+    })
+    try {
+      return await Promise.race([settled, timeout])
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+    }
   }
 
   /**
@@ -2087,13 +2172,22 @@ class BpmnRunner {
     const activityAbort = new AbortController()
     if (executionId !== null) this._activityAborts.set(executionId, activityAbort)
     const signal = combineSignals([this._instanceAbort.signal, activityAbort.signal])
+    // handler 拿到的变量必须是**深拷贝**：只做 `{ ...variables }` 时，嵌套对象仍与账本共享引用，
+    // 超时 / stop 之后 handler 改 `ctx.variables.obj.x` 仍会改到 runner 的变量。
+    let variablesCopy
+    try {
+      variablesCopy = cloneJson(this.variables, 'BPMN_HANDLER_CONTEXT_INVALID', 'handler 的 ctx.variables')
+    } catch (error) {
+      this._handlerFailed(element, executionId, error, finish)
+      return
+    }
     const ctx = {
       activityId: element.id,
       executionId: executionId ?? null,
       definitionId: this.definition.id,
       instanceId: this.instanceId,
       attempt: this._attempts.get(element.id) ?? 1,
-      variables: { ...this.variables },
+      variables: variablesCopy,
       timeoutMs: this.limits.activityWaitMs > 0 ? this.limits.activityWaitMs : null,
       signal,
     }
@@ -2496,6 +2590,13 @@ class BpmnRunner {
   }
 
   _buildEnvelope(engineState, trigger, eventType) {
+    // 连线计数写**全部**定义里的连线（未走过的写 0）：恢复时逐条核对，
+    // 缺一条就说明快照被删过计数（已耗尽的边会因此复活）。
+    const flowTakes = new Map()
+    for (const flow of this.definition.flows) flowTakes.set(flow.id, this._flowTakes.get(flow.id) ?? 0)
+    for (const [flowId, count] of this._flowTakes) {
+      if (!flowTakes.has(flowId)) flowTakes.set(flowId, count)
+    }
     return {
       v: STATE_VERSION,
       kind: STATE_KIND,
@@ -2516,7 +2617,8 @@ class BpmnRunner {
       pendingTasks: this.pendingTasks(),
       // 连线次数上限 / 循环护栏的计数：随快照走，恢复后继续生效。
       attempts: [...this._attempts.entries()],
-      flowTakes: [...this._flowTakes.entries()],
+      // 全量连线计数（含 0）：恢复时按引擎快照的 counters.take 逐条核对。
+      flowTakes: [...flowTakes.entries()],
       warnings: [...this.warnings],
       engine: engineState ?? null,
     }
@@ -2714,9 +2816,12 @@ function normalizeServices(raw) {
 
 function normalizeLimits(raw) {
   const limits = isPlainObject(raw) ? raw : {}
+  const recoverSettleTimeoutMs = normalizeDuration(limits.recoverSettleTimeoutMs, 'limits.recoverSettleTimeoutMs')
   return {
     activityWaitMs: normalizeDuration(limits.activityWaitMs, 'limits.activityWaitMs'),
     runTimeoutMs: normalizeDuration(limits.runTimeoutMs, 'limits.runTimeoutMs'),
+    // 0 / 缺省 = 用默认上限（有界是硬要求，不能关成无限等）。
+    recoverSettleTimeoutMs: recoverSettleTimeoutMs > 0 ? recoverSettleTimeoutMs : RECOVER_SETTLE_TIMEOUT_MS,
   }
 }
 
@@ -2745,17 +2850,80 @@ function normalizeLoopGuardMax(value) {
   return value
 }
 
-/** 从快照的 `[[key, count], …]` 还原计数表（坏形状一律忽略，不让恢复失败）。 */
+/** 从快照的 `[[key, count], …]` 还原计数表（形状已由 bpmn-state 严格校验，坏数据不会走到这里）。 */
 function restoreCounts(raw) {
   const counts = new Map()
-  if (!Array.isArray(raw)) return counts
-  for (const entry of raw) {
-    if (!Array.isArray(entry) || entry.length !== 2) continue
-    const [key, value] = entry
-    if (typeof key !== 'string' || !Number.isSafeInteger(value) || value < 0) continue
-    counts.set(key, value)
+  // attempts 允许缺省（按 0 处理）；flowTakes 已由 bpmn-state 强制要求存在。
+  if (raw === undefined || raw === null) return counts
+  if (!Array.isArray(raw)) {
+    throw new BpmnRunnerError('BPMN_STATE_INVALID', '计数表必须是 [[key, count], …] 数组（缺失会让上限清零）', {})
   }
+  for (const [key, value] of raw) counts.set(key, value)
   return counts
+}
+
+/**
+ * 连线计数必须与快照里「已经走过」的连线对得上。
+ *
+ * - `flowTakes` 里出现可信结构之外的连线 → 拒绝（伪造计数）；
+ * - 快照的 execution/broker 显示某条边已经走过，但 `flowTakes` 没有这条计数 → 拒绝
+ *   （删掉一条计数就能让 `fs:maxRounds` 已耗尽的边再执行一次）。
+ *
+ * @param {Array<[string, number]>} flowTakes
+ * @param {object} engineState
+ * @param {object} structure `describeExecutionStructure()` 的输出
+ */
+function assertFlowTakesBoundToStructure(flowTakes, engineState, structure) {
+  const flowIds = new Set((structure?.flows ?? []).map(flow => flow.id))
+  const counts = new Map(flowTakes ?? [])
+  for (const flowId of counts.keys()) {
+    if (!flowIds.has(flowId)) {
+      throw new BpmnRunnerError(
+        'BPMN_STATE_INVALID',
+        `state.flowTakes 里的连线 ${flowId} 不在可信执行结构里：拒绝伪造的连线计数`,
+        { elementId: flowId }
+      )
+    }
+  }
+  // 引擎快照给每条连线都记了 `counters.take`（未走过 = 0）。恢复时逐条核对：
+  // 缺一条、把计数改小 / 改大都拒绝——否则删掉计数就能让 fs:maxRounds 已耗尽的边复活。
+  const engineTakes = collectEngineFlowTakes(engineState)
+  if (engineTakes.size > 0) {
+    for (const flow of structure?.flows ?? []) {
+      const expected = engineTakes.get(flow.id) ?? 0
+      const actual = counts.get(flow.id)
+      if (actual === undefined) {
+        throw new BpmnRunnerError(
+          'BPMN_STATE_INVALID',
+          `state.flowTakes 缺少连线 ${flow.id} 的计数（引擎快照记的是 ${expected} 次）；缺失会让已耗尽的边复活`,
+          { elementId: flow.id }
+        )
+      }
+      if (actual !== expected) {
+        throw new BpmnRunnerError(
+          'BPMN_STATE_INVALID',
+          `state.flowTakes 里连线 ${flow.id} 的计数是 ${actual}，引擎快照记的是 ${expected} 次；拒绝被篡改的计数`,
+          { elementId: flow.id }
+        )
+      }
+    }
+  }
+  for (const flowId of collectTakenFlowIds(engineState)) {
+    if (!flowIds.has(flowId)) {
+      throw new BpmnRunnerError(
+        'BPMN_STATE_INVALID',
+        `快照的 execution/broker 引用了可信结构之外的连线 ${flowId}：state 来自另一份引擎`,
+        { elementId: flowId }
+      )
+    }
+    if (!((counts.get(flowId) ?? 0) >= 1)) {
+      throw new BpmnRunnerError(
+        'BPMN_STATE_INVALID',
+        `快照显示连线 ${flowId} 已经走过，但 state.flowTakes 里没有它的计数；删除计数会让已耗尽的边复活`,
+        { elementId: flowId }
+      )
+    }
+  }
 }
 
 /** handler 返回值归一化（允许直接返回 output、允许 undefined）。 */

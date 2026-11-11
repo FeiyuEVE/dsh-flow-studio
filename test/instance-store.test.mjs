@@ -418,4 +418,67 @@ await check('lastError：ACTIVE 时可写可读；最终 variables/result 与终
   )
 })
 
+await check('终态写保护：事件 / state.json 晚到写入被拒，revision 不涨、文件字节不变', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-terminal-writes')
+  // 先落一份 ACTIVE 快照，再进终态：证明终态后连快照覆盖都不允许。
+  await store.writeInstanceState(instance.id, { step: 1 }, { home })
+  const terminal = await store.completeInstance(instance.id, 'COMPLETED', { home })
+  const instanceBefore = readFileSync(join(dir, 'instance.json'), 'utf8')
+  const stateBefore = readFileSync(join(dir, 'state.json'), 'utf8')
+
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'task-a', 1, [{ type: 'artifact/write', path: 'late.md' }], { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+    '终态后不允许追加事件（含 artifact/write）',
+  )
+  eq(readFileSync(join(dir, 'instance.json'), 'utf8'), instanceBefore, '被拒绝的事件追加不得改 instance.json（revision 不涨）')
+  eq(existsSync(join(dir, 'events', 'task-a', '1.jsonl')), false, '被拒绝的事件不得落分片文件')
+
+  await rejects(
+    () => store.writeInstanceState(instance.id, { evil: true }, { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+    '终态后不允许覆盖 state.json',
+  )
+  eq(readFileSync(join(dir, 'state.json'), 'utf8'), stateBefore, '被拒绝的快照写入不得改 state.json 字节')
+  eq((await store.readInstance(instance.id, { home })).revision, terminal.revision, '终态 revision 不涨')
+})
+
+await check('进入终态时强制清空 pendingTasks（显式非空也不行）', async ({ home }) => {
+  const { instance } = await seed(home, 'flow-terminal-pending')
+  const done = await store.updateInstance(instance.id, {
+    status: 'COMPLETED',
+    pendingTasks: [{ activityId: 'late-task' }],
+    variables: { final: true },
+  }, { home })
+  eq(done.status, 'COMPLETED')
+  deep(done.pendingTasks, [], '同一次更新进入终态时 pendingTasks 必须为空')
+  deep(done.variables, { a: 1, final: true }, '终态与最终变量一次提交')
+})
+
+await check('artifacts[]：默认空、可更新、终态拒写；坏形状 400', async ({ home }) => {
+  const { instance } = await seed(home, 'flow-artifacts')
+  eq(Array.isArray(instance.artifacts), true, '新实例有 artifacts 字段')
+  deep(instance.artifacts, [], '默认空数组')
+
+  const updated = await store.updateInstance(instance.id, {
+    artifacts: [{ path: 'n1/report.md', sha256: 'a'.repeat(64), bytes: 12, kind: 'report', nodeId: 'n1', attempt: 1 }],
+  }, { home })
+  eq(updated.artifacts.length, 1, 'artifacts 可更新')
+  eq(updated.artifacts[0].path, 'n1/report.md')
+  eq((await store.readInstance(instance.id, { home })).artifacts[0].sha256, 'a'.repeat(64), 'artifacts 落盘可读')
+
+  await rejects(
+    () => store.updateInstance(instance.id, { artifacts: 'not-array' }, { home }),
+    error => error.status === 400 && error.code === 'INSTANCE_SHAPE_INVALID',
+    'artifacts 必须是数组',
+  )
+
+  await store.completeInstance(instance.id, 'CANCELED', { home })
+  await rejects(
+    () => store.updateInstance(instance.id, { artifacts: [{ path: 'late.md' }] }, { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+    '终态后 artifacts 也拒写',
+  )
+})
+
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

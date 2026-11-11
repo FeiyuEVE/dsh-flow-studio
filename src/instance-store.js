@@ -68,9 +68,12 @@ const STATUS_SET = new Set(INSTANCE_STATUSES)
 const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'CANCELED'])
 const TERMINAL_SET = new Set(TERMINAL_STATUSES)
 /** updateInstance 的字段白名单；定义域字段是钉死的，改它们一律 400。 */
-const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError'])
+const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError', 'artifacts'])
 /** 人工待办上限：BPMN 0.13.0 一次只会停在少量 userTask 上，100 是异常闸门。 */
 const MAX_PENDING_TASKS = 100
+/** 产物索引上限：instance.json 只存引用（path/hash/bytes），不存正文。 */
+const MAX_ARTIFACTS = 200
+const MAX_ARTIFACTS_BYTES = 256 * 1024
 
 let tmpCounter = 0
 
@@ -347,6 +350,35 @@ function normalizeResult(raw) {
 }
 
 /**
+ * 产物索引（`artifacts[]`）：instance.json 只保存引用，不保存正文。
+ *
+ * 形状按 `docs/design/11-node-finish-tool.md`：`{ path, sha256, bytes, kind, title, nodeId, attempt, at }`
+ * （未知字段允许保留，便于后续扩展）；整表有界，终态后同样不可写。
+ *
+ * @param {unknown} raw
+ * @returns {Array<object>}
+ */
+function normalizeArtifacts(raw) {
+  if (raw === undefined || raw === null) return []
+  if (!Array.isArray(raw)) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'artifacts 必须是数组', { field: 'artifacts' })
+  }
+  if (raw.length > MAX_ARTIFACTS) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `artifacts 最多 ${MAX_ARTIFACTS} 条`, { field: 'artifacts' })
+  }
+  const list = raw.map((item, index) => {
+    if (!isPlainObject(item)) {
+      throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `artifacts[${index}] 必须是对象`, { field: `artifacts[${index}]` })
+    }
+    return { ...item }
+  })
+  if (sizeOfJson(list, 'artifacts') > MAX_ARTIFACTS_BYTES) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `artifacts 超过 ${MAX_ARTIFACTS_BYTES} 字节上限`, { field: 'artifacts' })
+  }
+  return list
+}
+
+/**
  * 人工待办表（BPMN userTask）。`pendingTasks` 是**观测面**：由 BPMN 运行时在
  * `activity/wait` 时整表替换，读侧只用来回答「谁在等人」。
  *
@@ -418,6 +450,14 @@ function normalizeInstance(raw, id) {
   if (raw.result !== null && raw.result !== undefined && !isPlainObject(raw.result)) {
     throw new InstanceError(500, 'INSTANCE_CORRUPT', 'instance.json 的 result 必须是 JSON 对象或 null')
   }
+  let artifacts = []
+  if (raw.artifacts !== null && raw.artifacts !== undefined) {
+    try {
+      artifacts = normalizeArtifacts(raw.artifacts)
+    } catch (error) {
+      throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 artifacts 形状非法：${error?.reason ?? error?.message ?? error}`)
+    }
+  }
   let lastError = null
   if (raw.lastError !== null && raw.lastError !== undefined) {
     try {
@@ -446,6 +486,7 @@ function normalizeInstance(raw, id) {
     status: raw.status,
     variables: { ...raw.variables },
     result: raw.result === undefined || raw.result === null ? null : { ...raw.result },
+    artifacts,
     lastError,
     pendingTasks: normalizePendingTasks(raw.pendingTasks),
     revision: raw.revision,
@@ -515,6 +556,9 @@ function normalizePatch(patch) {
   }
   if (patch.result !== undefined) {
     source.result = normalizeResult(patch.result)
+  }
+  if (patch.artifacts !== undefined) {
+    source.artifacts = normalizeArtifacts(patch.artifacts)
   }
   if (patch.pendingTasks !== undefined) {
     source.pendingTasks = normalizePendingTasks(patch.pendingTasks)
@@ -608,6 +652,7 @@ export async function createInstance(input = {}) {
         status: 'ACTIVE',
         variables,
         result: null,
+        artifacts: [],
         lastError: null,
         pendingTasks: [],
         revision: 1,
@@ -734,7 +779,7 @@ export async function updateInstance(id, patch = {}, options = {}) {
     }
     const hasChange = source.status !== undefined || source.variables !== undefined
       || source.result !== undefined || source.pendingTasks !== undefined
-      || source.lastError !== undefined
+      || source.lastError !== undefined || source.artifacts !== undefined
     if (!hasChange) return current
 
     // 终态不可逆（同一把写锁内判定）：晚到的 variables / result / 待办 / 产物 /
@@ -754,11 +799,12 @@ export async function updateInstance(id, patch = {}, options = {}) {
       revision: current.revision + 1,
       updatedAt: now,
     }
+    const enteringTerminal = source.status !== undefined && TERMINAL_SET.has(source.status)
     if (source.status !== undefined) {
       next.status = source.status
-      next.completedAt = TERMINAL_SET.has(source.status) ? (current.completedAt || now) : null
-      // 终态不再有「谁在等人」：即便调用方漏了 pendingTasks，也在这里清空。
-      if (TERMINAL_SET.has(source.status) && source.pendingTasks === undefined) next.pendingTasks = []
+      next.completedAt = enteringTerminal ? (current.completedAt || now) : null
+      // 终态不再有「谁在等人」：进入终态时必须清空，调用方显式带的非空 pendingTasks 也不采纳。
+      if (enteringTerminal) next.pendingTasks = []
     }
     if (source.variables !== undefined) {
       next.variables = { ...current.variables, ...source.variables }
@@ -767,7 +813,9 @@ export async function updateInstance(id, patch = {}, options = {}) {
       }
     }
     if (source.result !== undefined) next.result = source.result
-    if (source.pendingTasks !== undefined) next.pendingTasks = source.pendingTasks
+    if (source.artifacts !== undefined) next.artifacts = source.artifacts
+    // 进入终态的那次更新已经强制清空 pendingTasks，不允许被 source.pendingTasks 覆盖回来。
+    if (source.pendingTasks !== undefined && !enteringTerminal) next.pendingTasks = source.pendingTasks
     if (source.lastError !== undefined) next.lastError = source.lastError
     const normalized = normalizeInstance(next, loc.id)
     await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), normalized)
@@ -837,6 +885,15 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
 
   return withFileLock(loc.dir, async () => {
     const current = await readInstanceUnlocked(loc)
+    // 终态后一切写都被拒：事件（含 artifact/write）不能追加，revision / eventCount 都不能涨。
+    if (TERMINAL_SET.has(current.status)) {
+      throw new InstanceError(
+        409,
+        'INSTANCE_TERMINAL_IMMUTABLE',
+        `实例 ${loc.id} 已是终态 ${current.status}，拒绝追加事件（终态不可逆）`,
+        { field: 'events', actualStatus: current.status },
+      )
+    }
     if (current.eventCount + list.length > MAX_INSTANCE_EVENTS) {
       throw new InstanceError(400, 'INSTANCE_EVENTS_LIMIT', `单实例事件总数上限 ${MAX_INSTANCE_EVENTS}`, { field: 'events' })
     }
@@ -1024,7 +1081,19 @@ export async function writeInstanceState(id, state, options = {}) {
   if (bytes > MAX_INSTANCE_STATE_BYTES) {
     throw new InstanceError(400, 'INSTANCE_STATE_INVALID', `引擎快照超过 ${MAX_INSTANCE_STATE_BYTES} 字节上限`, { field: 'state' })
   }
-  await writeTextAtomic(join(loc.dir, STATE_FILE), text)
+  // 终态后 state.json 也不能再被覆盖：它是恢复入口，晚到的快照会把终态实例「复活」。
+  await withFileLock(loc.dir, async () => {
+    const current = await readInstanceUnlocked(loc)
+    if (TERMINAL_SET.has(current.status)) {
+      throw new InstanceError(
+        409,
+        'INSTANCE_TERMINAL_IMMUTABLE',
+        `实例 ${loc.id} 已是终态 ${current.status}，拒绝覆盖引擎快照（终态不可逆）`,
+        { field: 'state', actualStatus: current.status },
+      )
+    }
+    await writeTextAtomic(join(loc.dir, STATE_FILE), text)
+  })
   return { instanceId: loc.id, savedAt, bytes }
 }
 
@@ -1066,7 +1135,7 @@ export async function readInstanceState(id, options = {}) {
  *
  * @param {string} id
  * @param {'COMPLETED'|'CANCELED'} status
- * @param {{ home?: string, instancesRoot?: string, variables?: object, result?: object|null }} [options]
+ * @param {{ home?: string, instancesRoot?: string, variables?: object, result?: object|null, artifacts?: object[] }} [options]
  */
 export async function completeInstance(id, status, options = {}) {
   const loc = requireLoc(instancesRootOf(options), id)
@@ -1107,6 +1176,7 @@ export async function completeInstance(id, status, options = {}) {
       next.variables = { ...current.variables, ...normalizeVariables(options.variables) }
     }
     if (options.result !== undefined) next.result = normalizeResult(options.result)
+    if (options.artifacts !== undefined) next.artifacts = normalizeArtifacts(options.artifacts)
     const normalized = normalizeInstance(next, loc.id)
     await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), normalized)
     return normalized

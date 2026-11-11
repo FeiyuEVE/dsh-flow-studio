@@ -15,6 +15,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs'
@@ -31,6 +32,8 @@ const {
 const { createHandler } = await import('../src/index.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
+const instStore = await import('../src/instance-store.js')
+const { createBpmnRunner } = await import('../src/bpmn-runner.js')
 
 let checks = 0
 let assertions = 0
@@ -844,15 +847,166 @@ try {
     const lastSeqAtStop = stopped.json.lastSeq
     releaseSlow()
     const completed = await completePromise
-    ok([200, 409].includes(completed.status), `在飞的 complete 只允许成功返回或 409，实际 ${completed.status}`)
+    // 盘上已是 CANCELED：complete 必须明确 409，不能返回 200 + ACTIVE（假阳性成功）。
+    eq(completed.status, 409, `并发的 complete 必须 409，实际 ${completed.status}`)
+    eq(completed.json?.code, 'INSTANCE_TERMINAL_IMMUTABLE')
     await new Promise((resolve) => setTimeout(resolve, 100))
 
     const raw = readInstanceJson(home, id)
     eq(raw.status, 'CANCELED', '终态不可逆：晚到的 complete 不能把实例改回 ACTIVE')
     eq(raw.lastError, null, 'stop 不是错误：不应写 lastError')
-    eq(raw.variables.approved, undefined, '晚到 agent2 的输出不得写回 variables')
+    eq(raw.variables.late, undefined, '晚到 agent2 的输出（late）不得写回 variables')
     const events = await call(route, 'GET', `${API}/instances/${id}/events`)
     eq(events.json.lastSeq, lastSeqAtStop, 'stop 之后不得再追加事件')
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.4 F1 · 异构 execution/broker：GET 不卡、快速标记不可恢复、零派发
+  // -------------------------------------------------------------------------
+  await check('F1：source 相同但 execution/broker 异构 → GET <2s 拒绝，ACTIVE + lastError，无待办', async home => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs-f1" targetNamespace="http://x">
+  <bpmn:process id="proc-f1" isExecutable="true">
+    <bpmn:startEvent id="start"/><bpmn:userTask id="human1"/><bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="human1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="human1" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const foreignXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs-foreign" targetNamespace="http://x">
+  <bpmn:process id="proc-foreign" isExecutable="true">
+    <bpmn:startEvent id="fs"/><bpmn:userTask id="fh"/><bpmn:endEvent id="fe"/>
+    <bpmn:sequenceFlow id="ff1" sourceRef="fs" targetRef="fh"/>
+    <bpmn:sequenceFlow id="ff2" sourceRef="fh" targetRef="fe"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const dir = store.flowsDir(home)
+    const url = new URL('http://localhost/')
+    const runtimeA = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor() })
+    let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-f1', name: 'F1', xml } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-f1' } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    const id = res.body.id
+    const statePath = join(home, 'flow-studio', 'instances', id, 'state.json')
+    const wrapper = JSON.parse(readFileSync(statePath, 'utf8'))
+    await runtimeA.dispose()
+
+    // 另一份引擎的执行状态（id 全不同），只替换 execution/broker，source 保持可信。
+    const foreignRunner = createBpmnRunner({
+      definition: {
+        id: 'proc-foreign', startId: 'fs', endIds: ['fe'],
+        elements: [
+          { id: 'fs', type: 'bpmn:StartEvent', kind: 'start' },
+          { id: 'fh', type: 'bpmn:UserTask', kind: 'human' },
+          { id: 'fe', type: 'bpmn:EndEvent', kind: 'end' },
+        ],
+        flows: [{ id: 'ff1', from: 'fs', to: 'fh' }, { id: 'ff2', from: 'fh', to: 'fe' }],
+      },
+      xml: foreignXml,
+      definitionIdentity: { id: 'defs-foreign', version: 1, hash: createHash('sha256').update(foreignXml, 'utf8').digest('hex') },
+      services: { executeAgent: async () => ({}), onEvent() {} },
+    })
+    await foreignRunner.start()
+    const foreign = await foreignRunner.getState()
+    await foreignRunner.stop()
+    wrapper.state.engine.definitions[0].execution = foreign.engine.definitions[0].execution
+    wrapper.state.engine.definitions[0].broker = foreign.engine.definitions[0].broker
+    await instStore.writeInstanceState(id, wrapper.state, { home })
+
+    const runtimeB = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor() })
+    const startedAt = Date.now()
+    const detail = await Promise.race([
+      runtimeB.handle({ method: 'GET', parts: ['instances', id], url }),
+      new Promise(resolve => setTimeout(() => resolve({ status: 'TIMEOUT' }), 2000)),
+    ])
+    const elapsed = Date.now() - startedAt
+    ok(elapsed < 2000, `GET 不能卡住（实测 ${elapsed}ms）`)
+    eq(detail.status, 200, JSON.stringify(detail.body))
+    eq(detail.body.status, 'ACTIVE', '异构 state 不改实例状态')
+    eq(detail.body.recovered, false)
+    eq(detail.body.runnerStatus, null)
+    deep(detail.body.pendingTasks, [], '不得恢复旧执行位置')
+    eq(detail.body.recovery.code, 'BPMN_STATE_INVALID', '恢复路径给出明确错误码')
+    eq(detail.body.lastError.code, 'BPMN_STATE_INVALID', 'lastError 记下事实')
+    const complete = await runtimeB.handle({
+      method: 'POST', parts: ['instances', id, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+    })
+    eq(complete.status, 409, '异构 state 不可恢复，不能 complete')
+    eq(complete.body.code, 'BPMN_INSTANCE_NOT_RECOVERABLE')
+    await runtimeB.dispose()
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.5 MAJOR-2 · 失败停机后快照不可恢复：重启 GET 不复活执行位置
+  // -------------------------------------------------------------------------
+  await check('失败停机：重启后 GET 无 pendingTasks/无执行位置，complete 明确 409', async home => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-fail" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-fail" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="agent1"><bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo a"/></fs:node></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:userTask id="human1"/>
+    <bpmn:serviceTask id="agent2"><bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo b"/></fs:node></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="human1"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="human1" targetRef="agent2"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="agent2" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const env = {}
+    const dir = store.flowsDir(home)
+    const url = new URL('http://localhost/')
+    let calls = 0
+    const executor = async () => {
+      calls += 1
+      if (calls === 1) {
+        return { ok: true, text: 'a', structured: {}, usage: {}, exitCode: 0, events: [] }
+      }
+      return { ok: false, error: 'boom', exitCode: 1, events: [] }
+    }
+    const runtimeA = createBpmnRuntime({ dir, env, executorRunner: executor })
+    let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-fail', name: '失败停机', xml } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-fail' } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    const id = res.body.id
+    eq(res.body.pendingTasks.length, 1, 'agent1 成功后停在 human1')
+
+    const completed = await runtimeA.handle({
+      method: 'POST', parts: ['instances', id, 'tasks', 'human1', 'complete'], url, body: { payload: { approved: true } },
+    })
+    eq(completed.status, 503, 'agent2 失败必须显式报错')
+    const raw = readInstanceJson(home, id)
+    eq(raw.status, 'ACTIVE', '失败不改实例状态（仍是 ACTIVE）')
+    ok(typeof raw.lastError?.code === 'string' && raw.lastError.code !== '', '失败写 lastError')
+    deep(raw.pendingTasks, [], '失败后待办清空')
+
+    // 持久化快照必须被标记为不可恢复（不是留着旧的 waiting 快照）。
+    const stateRaw = JSON.parse(readFileSync(join(home, 'flow-studio', 'instances', id, 'state.json'), 'utf8'))
+    ok(stateRaw.state.unrecoverable, '失败停机后 state.json 必须有不可恢复标记')
+    eq(stateRaw.state.unrecoverable.code, raw.lastError.code, '标记里保留失败 code')
+    eq(typeof stateRaw.state.unrecoverable.at, 'string', '标记里带时间')
+    eq(stateRaw.state.pendingTasks, undefined, '墓碑快照不再带执行位置')
+
+    await runtimeA.dispose()
+    const runtimeB = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor() })
+    const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', id], url })
+    eq(detail.status, 200, JSON.stringify(detail.body))
+    eq(detail.body.status, 'ACTIVE', 'GET 仍返回 ACTIVE')
+    eq(detail.body.lastError.code, raw.lastError.code, 'GET 仍返回 lastError')
+    eq(detail.body.recovered, false, '不得再从旧快照自动恢复')
+    eq(detail.body.runnerStatus, null)
+    deep(detail.body.pendingTasks, [], '无执行位置、无待办')
+    eq(detail.body.recovery.code, raw.lastError.code, '恢复路径给出明确错误码')
+
+    const replay = await runtimeB.handle({
+      method: 'POST', parts: ['instances', id, 'tasks', 'human1', 'complete'], url, body: { payload: { approved: true } },
+    })
+    eq(replay.status, 409, '不可恢复实例不能再 complete（不能重放失败前的工作）')
+    eq(replay.body.code, 'BPMN_INSTANCE_NOT_RECOVERABLE')
+    await runtimeB.dispose()
   })
 
   // -------------------------------------------------------------------------

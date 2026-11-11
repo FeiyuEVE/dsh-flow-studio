@@ -7,10 +7,13 @@
  * 「安全 XML + 恶意裸快照」——快照里的并行网关、条件事件、脚本任务都会被直接执行。
  *
  * 因此恢复路径固定为：
- *   1. 校验信封（`v=2`、必填字段、身份 `definitionId/hash/version/processId`）；
- *   2. 有界解析 `engine.definitions[].source`（恰好一份、有 source、大小受限）；
+ *   1. 校验信封（`v=2`、必填字段、身份 `definitionId/hash/version/processId`，
+ *      并绑定目标 `instanceId` 与执行 XML 的 `sourceHash`）；
+ *   2. 有界解析 `engine.definitions[].source`（恰好一份、有 source、大小受限），
+ *      拒绝重复 id，布尔路由标记只接受 true/false/缺省；`flowTakes` 必须严格且完整；
  *   3. 用与执行完全相同的 moddle/serializer 从**可信 XML** 生成执行结构，
- *      与快照里的结构逐项比较（元素 id/type/配置、连线端点/条件/default/上限、start/end）；
+ *      与快照里的结构逐项比较（元素 id/type/配置、连线端点/条件/default/上限/顺序、start/end），
+ *      并拒绝 `execution` / `broker` 引用可信结构之外的 id 的异构 state；
  *   4. 交给 `engine.recover()`；
  *   5. 再核对恢复后的 `definition.context` 与 `environment.options.source`。
  *
@@ -47,6 +50,26 @@ export const STATE_ENVELOPE_FIELDS = Object.freeze([
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/
 
+/**
+ * 参与路由判定的布尔标记：快照里只允许真正的 `true` / `false` / 缺省。
+ *
+ * 引擎按**真值**解释这些字段（`"false"`、`1`、`{}`、`[]` 都是真）；
+ * 一旦允许字符串 "false" 混进来，就能把「条件为假」改成「默认流必走」。
+ * `isParallelGateway` / `isExclusiveGateway` 等也属于路由判定字段，必须严格比对。
+ */
+const ROUTING_BOOLEAN_FIELDS = Object.freeze([
+  'isDefault',
+  'isParallelGateway',
+  'isExclusiveGateway',
+  'isInclusiveGateway',
+  'isEventBasedGateway',
+  'isComplexGateway',
+  'isForCompensation',
+  'triggeredByEvent',
+  'isInterrupting',
+  'cancelActivity',
+])
+
 /** 恢复/定义校验类错误：`code` 是稳定契约，runner 转成 `BpmnRunnerError`。 */
 export class BpmnStateError extends Error {
   constructor(code, message, details = {}) {
@@ -70,6 +93,119 @@ function errorMessageOf(error) {
   if (typeof error === 'string' && error !== '') return error
   if (error && typeof error.message === 'string' && error.message !== '') return error.message
   return '未知错误'
+}
+
+/**
+ * 快照布尔字段严格归一化：只接受真正的 `true` / `false` / 缺省（undefined）。
+ *
+ * 不做真值转换——`"false"` / `1` / `{}` / `null` 一律拒绝。
+ *
+ * @param {object|null} container
+ * @param {string} field
+ * @param {string} label
+ * @param {string|null} elementId
+ */
+function assertStrictBooleanField(container, field, label, elementId) {
+  if (!isPlainObject(container) || container[field] === undefined) return
+  const value = container[field]
+  if (typeof value === 'boolean') return
+  throw new BpmnStateError(
+    'BPMN_STATE_INVALID',
+    `${label} 的 ${field} 必须是布尔值 true / false（缺省 = 未设置），实际是 ${JSON.stringify(value)}（${typeof value}）；引擎按真值解释，非布尔值会改变路由`,
+    { elementId: elementId ?? undefined }
+  )
+}
+
+/**
+ * 扫描快照执行结构里的布尔路由标记；任何非布尔值都在恢复前拒绝。
+ *
+ * @param {object} sourceContext `parseStateSource()` 的输出（`{elements}`）
+ */
+function assertSnapshotBooleanTypes(sourceContext) {
+  const elements = isPlainObject(sourceContext?.elements) ? sourceContext.elements : {}
+  const lists = [
+    ['process', toArray(elements.processes)],
+    ['节点', toArray(elements.activities)],
+    ['连线', toArray(elements.sequenceFlows)],
+  ]
+  for (const [label, list] of lists) {
+    for (const item of list) {
+      const id = typeof item?.id === 'string' && item.id !== '' ? item.id : null
+      for (const field of ROUTING_BOOLEAN_FIELDS) {
+        assertStrictBooleanField(item, field, `${label} ${id ?? '(无 id)'}`, id)
+        assertStrictBooleanField(item?.behaviour, field, `${label} ${id ?? '(无 id)'} 的 behaviour`, id)
+      }
+    }
+  }
+}
+
+/**
+ * 执行结构里的活动 / 连线 id 必须唯一（Map 按 id 去重会掩盖重复项）。
+ *
+ * @param {object} sourceContext
+ * @param {string} code 快照用 BPMN_STATE_*，可信 XML 用 BPMN_DEFINITION_*
+ */
+function assertUniqueStructureIds(sourceContext, code) {
+  const elements = isPlainObject(sourceContext?.elements) ? sourceContext.elements : sourceContext
+  const seen = new Map()
+  const lists = [
+    ['process', toArray(elements?.processes)],
+    ['节点', toArray(elements?.activities)],
+    ['连线', toArray(elements?.sequenceFlows)],
+  ]
+  for (const [label, list] of lists) {
+    for (const item of list) {
+      const id = typeof item?.id === 'string' && item.id !== '' ? item.id : null
+      if (id === null) continue
+      if (seen.has(id)) {
+        throw new BpmnStateError(code, `执行结构里 id 重复：${id}（已作为${seen.get(id)}出现，又出现为${label}）；拒绝恢复/执行`, { elementId: id })
+      }
+      seen.set(id, label)
+    }
+  }
+}
+
+/**
+ * 校验快照里的计数表（`[[key, count], …]`）。
+ *
+ * 形状错误必须拒绝而不是静默丢弃：删掉 `flowTakes` 会让「已耗尽的连线」复活。
+ *
+ * @param {unknown} raw
+ * @param {string} label
+ * @param {{ required: boolean }} options
+ * @returns {Array<[string, number]>|undefined}
+ */
+function normalizeCountPairs(raw, label, { required }) {
+  if (raw === undefined || raw === null) {
+    if (!required) return undefined
+    throw new BpmnStateError(
+      'BPMN_STATE_INVALID',
+      `${label} 缺失：v2 快照必须带连线通过次数 / 节点进入次数，否则上限会被清零`
+    )
+  }
+  if (!Array.isArray(raw)) {
+    throw new BpmnStateError('BPMN_STATE_INVALID', `${label} 必须是 [[key, 非负整数], …] 数组，实际是 ${typeof raw}`)
+  }
+  const seen = new Set()
+  const pairs = []
+  for (const [index, entry] of raw.entries()) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      throw new BpmnStateError('BPMN_STATE_INVALID', `${label}[${index}] 必须是 [key, count] 二元组`)
+    }
+    const [key, value] = entry
+    if (typeof key !== 'string' || key === '') {
+      throw new BpmnStateError('BPMN_STATE_INVALID', `${label}[${index}] 的 key 必须是非空字符串`)
+    }
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new BpmnStateError('BPMN_STATE_INVALID', `${label}[${index}]（${key}）的计数必须是非负整数，实际是 ${JSON.stringify(value)}`)
+    }
+    if (seen.has(key)) {
+      throw new BpmnStateError('BPMN_STATE_INVALID', `${label} 里 ${key} 重复出现（同一计数不能有两个值）`)
+    }
+    seen.add(key)
+    pairs.push([key, value])
+  }
+  return pairs
 }
 
 /** 对字符串/字节做 sha256（小写 hex）。runtime 与 runner 用同一实现。 */
@@ -208,6 +344,14 @@ export function validateStateEnvelope(state, { identity, definition, instanceId 
   if (typeof state.instanceId !== 'string' || state.instanceId === '') {
     throw new BpmnStateError('BPMN_STATE_INVALID', 'state.instanceId 必须是非空字符串')
   }
+  // 快照必须绑定到**目标实例**：异实例的 state 即使结构与身份都对，也不能拿来恢复。
+  if (typeof instanceId === 'string' && instanceId !== '' && state.instanceId !== instanceId) {
+    throw new BpmnStateError(
+      'BPMN_STATE_INSTANCE_MISMATCH',
+      `state 属于实例 ${JSON.stringify(state.instanceId)}，当前执行器是 ${JSON.stringify(instanceId)}；拒绝跨实例恢复`,
+      { expectedInstanceId: instanceId, actualInstanceId: state.instanceId }
+    )
+  }
   if (typeof state.definitionId !== 'string' || state.definitionId !== identity.id) {
     throw new BpmnStateError(
       'BPMN_STATE_DEFINITION_MISMATCH',
@@ -224,6 +368,20 @@ export function validateStateEnvelope(state, { identity, definition, instanceId 
     throw new BpmnStateError(
       'BPMN_STATE_DEFINITION_MISMATCH',
       `state 的 definitionHash=${JSON.stringify(state.definitionHash)} 与当前定义的 ${identity.hash} 不一致；拒绝恢复`
+    )
+  }
+  // `sourceHash` 是**执行 XML 原文**的 SHA-256（handler 源与 definitionHash 同源，
+  // 但语义上单独绑定「实际执行来源」）。缺失 / 伪造都拒绝，不能只信 definitionHash。
+  if (typeof state.sourceHash !== 'string' || !HASH_PATTERN.test(state.sourceHash)) {
+    throw new BpmnStateError(
+      'BPMN_STATE_SOURCE_HASH_MISMATCH',
+      `state.sourceHash 必须是 64 位小写十六进制（执行来源的 sha256），实际是 ${JSON.stringify(state.sourceHash)}；拒绝恢复`
+    )
+  }
+  if (state.sourceHash !== identity.hash) {
+    throw new BpmnStateError(
+      'BPMN_STATE_SOURCE_HASH_MISMATCH',
+      `state.sourceHash=${state.sourceHash} 与当前执行 XML 的 sha256=${identity.hash} 不一致；拒绝恢复`
     )
   }
   const processId = typeof definition?.id === 'string' ? definition.id : ''
@@ -247,18 +405,26 @@ export function validateStateEnvelope(state, { identity, definition, instanceId 
   }
   const source = definitions[0]?.source
   const sourceContext = parseStateSource(source, 'state.engine.definitions[0]')
+  // 重复 id 会让「按 id 对照」掩盖第二条连线；必须在结构比较之前拒绝。
+  assertUniqueStructureIds(sourceContext, 'BPMN_STATE_INVALID')
+  // 布尔字段严格归一化（isDefault="false" / 1 / {} 一律拒绝，不允许真值转换）。
+  assertSnapshotBooleanTypes(sourceContext)
 
   if (state.variables !== undefined && state.variables !== null && !isPlainObject(state.variables)) {
     throw new BpmnStateError('BPMN_STATE_INVALID', 'state.variables 必须是 JSON 对象')
   }
+
+  // 计数表：flowTakes 必须存在且严格；attempts 可选但形状必须对。
+  const flowTakes = normalizeCountPairs(state.flowTakes, 'state.flowTakes', { required: true })
+  const attempts = normalizeCountPairs(state.attempts, 'state.attempts', { required: false })
 
   return {
     envelope: state,
     engineState,
     sourceContext,
     variables: isPlainObject(state.variables) ? state.variables : {},
-    attempts: state.attempts,
-    flowTakes: state.flowTakes,
+    attempts,
+    flowTakes,
   }
 }
 
@@ -317,11 +483,24 @@ export function readSerializedMaxTakes(behaviour) {
   return null
 }
 
+/** 取一份执行结构条目上的路由布尔标记（只记录确实出现的字段，便于逐项比较）。 */
+function routingFlagsOf(item) {
+  const flags = {}
+  for (const field of ROUTING_BOOLEAN_FIELDS) {
+    const top = item?.[field]
+    const inside = item?.behaviour?.[field]
+    if (top !== undefined) flags[`top.${field}`] = top
+    else if (inside !== undefined) flags[`behaviour.${field}`] = inside
+  }
+  return flags
+}
+
 /**
  * 把一份序列化执行上下文压成**可比较的结构描述**。
  *
  * 保留完整 `behaviour`（节点扩展配置 / 条件 / 默认流标记都在里面）——只比图的拓扑不够，
- * 换条件、换扩展配置同样必须拒绝。
+ * 换条件、换扩展配置同样必须拒绝。`flows` **不排序**：条件边的先后就是派发顺序，
+ * 重排两条真条件边可以换执行目标，所以顺序也必须参与比较。
  *
  * @param {{ elements?: object } | null} sourceContext
  * @returns {object}
@@ -337,6 +516,7 @@ export function describeExecutionStructure(sourceContext) {
       type: typeof process?.type === 'string' ? process.type : null,
       name: typeof process?.name === 'string' ? process.name : null,
       parentId: parentIdOf(process),
+      flags: routingFlagsOf(process),
       behaviour: process?.behaviour ?? null,
     }))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)))
@@ -346,6 +526,7 @@ export function describeExecutionStructure(sourceContext) {
       type: typeof activity?.type === 'string' ? activity.type : null,
       name: typeof activity?.name === 'string' ? activity.name : null,
       parentId: parentIdOf(activity),
+      flags: routingFlagsOf(activity),
       behaviour: activity?.behaviour ?? null,
     }))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)))
@@ -357,12 +538,13 @@ export function describeExecutionStructure(sourceContext) {
       parentId: parentIdOf(flow),
       from: typeof flow?.sourceId === 'string' ? flow.sourceId : null,
       to: typeof flow?.targetId === 'string' ? flow.targetId : null,
-      isDefault: flow?.isDefault === true,
+      // 不在这里做真值转换：快照路径已经严格校验过布尔类型；这里保留原值参与比较。
+      isDefault: flow?.isDefault ?? false,
+      flags: routingFlagsOf(flow),
       condition: readConditionOf(flow?.behaviour),
       maxTakes: readSerializedMaxTakes(flow?.behaviour),
       behaviour: flow?.behaviour ?? null,
     }))
-    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
 
   return {
     definition: {
@@ -376,7 +558,9 @@ export function describeExecutionStructure(sourceContext) {
     endIds: activities.filter(activity => activity.type === 'bpmn:EndEvent').map(activity => activity.id).sort(),
     processes,
     elements: activities,
+    // 顺序即出边派发顺序，必须原样保留（不排序）。
     flows,
+    flowIds: flows.map(flow => flow.id),
   }
 }
 
@@ -419,6 +603,12 @@ export function diffExecutionStructures(expected, actual) {
   compareById(expected?.processes ?? [], actual?.processes ?? [], 'process', diffs)
   compareById(expected?.elements ?? [], actual?.elements ?? [], '节点', diffs)
   compareById(expected?.flows ?? [], actual?.flows ?? [], '连线', diffs)
+  // 顺序比较：条件边的先后就是派发顺序，重排即可把执行目标从 A 换成 B。
+  const expectedOrder = (expected?.flows ?? []).map(flow => flow.id)
+  const actualOrder = (actual?.flows ?? []).map(flow => flow.id)
+  if (stableStringify(expectedOrder) !== stableStringify(actualOrder)) {
+    diffs.push(`连线定义顺序不一致（期望 ${JSON.stringify(expectedOrder)}，实际 ${JSON.stringify(actualOrder)}）`)
+  }
   if (stableStringify(expected?.startIds) !== stableStringify(actual?.startIds)) {
     diffs.push(`startEvent 集合不一致（期望 ${JSON.stringify(expected?.startIds)}，实际 ${JSON.stringify(actual?.startIds)}）`)
   }
@@ -437,6 +627,136 @@ export function assertStructuresMatch(expected, actual, label) {
     `${label}：快照里的执行结构与可信定义不一致（${diffs.join('；')}）`,
     { differences: diffs }
   )
+}
+
+/** 引擎内部 executionId / flow take id 形如 `<元素 id>_<十六进制>`。 */
+const DERIVED_ID_SUFFIX = /^[A-Za-z0-9._-]{2,}$/
+
+/**
+ * 从引擎快照里读取**每条连线**的通过次数（`execution...flows[].counters.take`）。
+ *
+ * 这是比 `sequenceId` 更完整的真相：bpmn-engine 会给每条连线条目记 `take` 计数
+ * （未走过的边是 0）。恢复时用它逐条核对 `flowTakes`，删一条 / 改成 0 都拒绝。
+ *
+ * @param {object} engineState
+ * @returns {Map<string, number>}
+ */
+export function collectEngineFlowTakes(engineState) {
+  const counts = new Map()
+  const visited = new WeakSet()
+  const visit = (value) => {
+    if (value === null || typeof value !== 'object' || visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    if (typeof value.id === 'string' && value.id !== ''
+      && isPlainObject(value.counters) && Number.isSafeInteger(value.counters.take)) {
+      counts.set(value.id, Math.max(counts.get(value.id) ?? 0, value.counters.take))
+    }
+    for (const item of Object.values(value)) visit(item)
+  }
+  visit(engineState?.definitions?.[0]?.execution)
+  visit(engineState?.definitions?.[0]?.broker)
+  visit(engineState?.broker)
+  return counts
+}
+
+/**
+ * 从引擎快照里收集「已经走过的连线 id」。
+ *
+ * 快照里的 broker 消息带 `isSequenceFlow: true` 的 flow 内容，或 `sequenceId: "<flowId>_take_<hex>"`。
+ * 这些连线必须在 `flowTakes` 里有计数——否则删掉一条计数就能让已耗尽的边复活。
+ *
+ * @param {object} engineState
+ * @returns {Set<string>}
+ */
+export function collectTakenFlowIds(engineState) {
+  const ids = new Set()
+  const visited = new WeakSet()
+  const visit = (value) => {
+    if (value === null || typeof value !== 'object') return
+    if (visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    if (value.isSequenceFlow === true && typeof value.id === 'string' && value.id !== '') {
+      ids.add(value.id)
+    }
+    if (typeof value.sequenceId === 'string' && value.sequenceId !== '') {
+      const match = /^(.+)_take_[0-9a-f]+$/i.exec(value.sequenceId)
+      if (match) ids.add(match[1])
+    }
+    for (const item of Object.values(value)) visit(item)
+  }
+  visit(engineState?.definitions?.[0]?.execution)
+  visit(engineState?.definitions?.[0]?.broker)
+  visit(engineState?.broker)
+  return ids
+}
+
+/**
+ * 校验快照里的 `engine.definitions[0].execution` / `broker` 只引用可信结构里的 id。
+ *
+ * 攻击面：`source` 与可信结构完全一致，但 `execution` / `broker` 被换成另一份引擎的状态。
+ * 这样所有「比较 source」的校验都会通过，`resume()` 却不产生任何事件（挂死 / 僵尸实例）。
+ * 这里在 `recover()` 之前把异构 state 直接拒掉，不创建活动、不派发 handler。
+ *
+ * @param {object} engineState 快照里的 `state.engine`
+ * @param {object} structure `describeExecutionStructure()` 的输出
+ */
+export function assertEngineStateBoundToStructure(engineState, structure) {
+  const known = new Set()
+  const add = (value) => {
+    if (typeof value === 'string' && value !== '') known.add(value)
+  }
+  add(structure?.definition?.id)
+  for (const process of structure?.processes ?? []) add(process.id)
+  for (const element of structure?.elements ?? []) add(element.id)
+  for (const flow of structure?.flows ?? []) add(flow.id)
+
+  const allowed = (id) => {
+    if (known.has(id)) return true
+    for (const base of known) {
+      if (id.startsWith(`${base}_`) && DERIVED_ID_SUFFIX.test(id.slice(base.length + 1))) return true
+    }
+    return false
+  }
+
+  const checkedKeys = new Set(['id', 'sourceId', 'targetId', 'elementId', 'activityId', 'flowId', 'executionId'])
+  const visited = new WeakSet()
+  const violations = []
+  const visit = (value, path) => {
+    if (value === null || typeof value !== 'object') return
+    if (visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`))
+      return
+    }
+    for (const [key, item] of Object.entries(value)) {
+      const childPath = path === '' ? key : `${path}.${key}`
+      if (checkedKeys.has(key) && typeof item === 'string' && item !== '' && !allowed(item)) {
+        violations.push(`${childPath}=${JSON.stringify(item)}`)
+      }
+      visit(item, childPath)
+    }
+  }
+  visit(engineState?.definitions?.[0]?.execution, 'definitions[0].execution')
+  visit(engineState?.definitions?.[0]?.broker, 'definitions[0].broker')
+  visit(engineState?.broker, 'broker')
+
+  if (violations.length > 0) {
+    const preview = violations.slice(0, 5).join('、')
+    throw new BpmnStateError(
+      'BPMN_STATE_INVALID',
+      `快照的 execution/broker 引用了可信结构之外的 id（${preview}${violations.length > 5 ? ` 等 ${violations.length} 处` : ''}）：state 来自另一份引擎，拒绝恢复`,
+      { elementId: violations[0] }
+    )
+  }
 }
 
 /**
@@ -473,6 +793,7 @@ export async function readTrustedExecutionStructure(xml) {
   if (!sourceContext) {
     throw new BpmnStateError('BPMN_DEFINITION_INVALID', '可信 XML 加载后没有执行上下文')
   }
+  assertUniqueStructureIds(sourceContext, 'BPMN_DEFINITION_INVALID')
   const violations = collectSerializedExecutionViolations(sourceContext)
   if (violations.length > 0) {
     const first = violations[0]

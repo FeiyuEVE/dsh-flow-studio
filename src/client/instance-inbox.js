@@ -10,6 +10,10 @@
  *   - 发送成功只表示「已受理」；投递状态以消息行的 status / delivery 为准，
  *     不能把「已受理」当成 agent 已读。
  *
+ * 0.13.11（N10–N13）：所有状态按实例归属（世代 + 请求序号丢弃迟到响应），
+ * 列表按 Host 的 nextCursor 分页（可「加载更多」），目标模式可显式切换，
+ * exact 目标消失时回退到「下次激活」，一次逻辑提交固定 messageId。
+ *
  * @module @feiyueve/dsh-flow-studio/client/instance-inbox
  */
 
@@ -130,6 +134,96 @@ function errorTextOf(error) {
   return inboxFailurePlan('list', error).text
 }
 
+/** 每页条数：Host 列表默认 50、上限 100（见 instance-message-store）。 */
+const INBOX_PAGE_SIZE = 100
+/** 首屏 / 每次「加载更多」最多连续翻多少页，避免一次点击拉爆 Host。 */
+const INBOX_MAX_PAGES = 10
+
+/** 空白列表态；`instanceId` 标记归属，渲染时据此拒绝跨实例数据。 */
+function emptyList(instanceId) {
+  return {
+    instanceId,
+    loading: instanceId !== '',
+    error: '',
+    messages: [],
+    total: 0,
+    nextCursor: null,
+    liveExecutions: [],
+    loadingMore: false,
+  }
+}
+
+/** 空白编辑态；一次逻辑提交（messageId + 内容/目标签名）也放在这里。 */
+function emptyCompose(instanceId) {
+  return {
+    instanceId,
+    text: '',
+    mode: 'auto',
+    nextActivityId: '',
+    selectedExecutionId: '',
+    sending: false,
+    pendingId: '',
+    pendingKey: '',
+  }
+}
+
+/** 列表去重键：优先 messageId，其次 seq。 */
+function messageKey(message) {
+  const messageId = isObject(message) ? textOf(message.messageId) : ''
+  if (messageId !== '') return 'id:' + messageId
+  return 'seq:' + String(isObject(message) && Number.isSafeInteger(message.seq) ? message.seq : '')
+}
+
+/**
+ * 按 Host 的 `nextCursor`（上一页最后一条的 seq）连续翻页。
+ *
+ * `isCurrent()` 由调用方提供：实例世代 / 请求序号失效时返回 false，结果整页丢弃。
+ * 返回 `null` 表示本次读取已过期。翻页有硬上限（INBOX_MAX_PAGES），
+ * 余下的交给「加载更多」，不把已取回的列表再截断。
+ */
+async function readMessagePages(client, instanceId, options = {}) {
+  const maxPages = Number.isSafeInteger(options.maxPages) && options.maxPages > 0
+    ? options.maxPages
+    : INBOX_MAX_PAGES
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : () => true
+  let cursor = Number.isSafeInteger(options.cursor) ? options.cursor : null
+  const messages = []
+  const seen = new Set()
+  let total = 0
+  let nextCursor = null
+  let liveExecutions = []
+  for (let pageNo = 0; pageNo < maxPages; pageNo += 1) {
+    const query = cursor === null ? { limit: INBOX_PAGE_SIZE } : { cursor, limit: INBOX_PAGE_SIZE }
+    const data = await client.readInstanceMessages(instanceId, query)
+    if (!isCurrent()) return null
+    const page = isObject(data) ? data : {}
+    const pageMessages = Array.isArray(page.messages) ? page.messages.filter(isObject) : []
+    const before = messages.length
+    for (const message of pageMessages) {
+      const key = messageKey(message)
+      if (seen.has(key)) continue
+      seen.add(key)
+      messages.push(message)
+    }
+    if (Number.isSafeInteger(page.total) && page.total >= 0) total = page.total
+    if (Array.isArray(page.liveExecutions)) liveExecutions = page.liveExecutions
+    const returned = Number.isSafeInteger(page.nextCursor) && page.nextCursor > 0 ? page.nextCursor : null
+    if (returned === null) {
+      nextCursor = null
+      break
+    }
+    // 游标没有前进 / 整页都是重复项：停止，避免死循环。
+    if (returned === cursor || messages.length === before) {
+      nextCursor = null
+      break
+    }
+    nextCursor = returned
+    if (pageNo + 1 >= maxPages) break
+    cursor = returned
+  }
+  return { messages, total, nextCursor, liveExecutions }
+}
+
 /**
  * @param {{
  *   client?: object,          // 默认全局 api；测试可注入桩
@@ -150,77 +244,165 @@ export function InstanceInboxPanel(props = {}) {
   const notice = typeof props.notice === 'function' ? props.notice : () => {}
   const onChanged = typeof props.onChanged === 'function' ? props.onChanged : () => {}
 
-  const [payload, setPayload] = useState(null)
-  const [loading, setLoading] = useState(instanceId !== '')
-  const [listError, setListError] = useState('')
-  const [reloadTick, setReloadTick] = useState(0)
-  const [draft, setDraft] = useState('')
-  const [sending, setSending] = useState(false)
-  const [mode, setMode] = useState('auto')
-  const [nextActivityId, setNextActivityId] = useState('')
-  const [selectedExecutionId, setSelectedExecutionId] = useState('')
+  // 实例世代 + 请求序号守卫：`useState` 持有可变对象（不依赖 useRef，探针只需
+  // useState/useEffect）。世代在实例切换时 +1；列表/正文各自再有一个递增序号，
+  // 同实例切走再切回、连续刷新时的迟到响应都会被丢弃。
+  const [guard] = useState(() => ({
+    instanceId: '',
+    epoch: 0,
+    listSeq: 0,
+    listApplied: 0,
+    bodySeq: 0,
+    bodyApplied: 0,
+  }))
+  // 所有随实例变化的状态都带 `instanceId` 归属；渲染时只看属于当前实例的那份。
+  const [list, setList] = useState(() => emptyList(instanceId))
+  const [compose, setCompose] = useState(() => emptyCompose(instanceId))
   const [bodyView, setBodyView] = useState(null)
   const [bodyTick, setBodyTick] = useState(0)
+  const [reloadTick, setReloadTick] = useState(0)
+  const [focus, setFocus] = useState({ instanceId, messageId: '' })
 
   useEffect(() => {
-    if (instanceId === '') {
-      setPayload(null)
-      setLoading(false)
-      setListError('')
-      return undefined
+    const switched = guard.instanceId !== instanceId
+    if (switched) {
+      guard.instanceId = instanceId
+      guard.epoch += 1
+      guard.listSeq = 0
+      guard.listApplied = 0
+      guard.bodySeq = 0
+      guard.bodyApplied = 0
+      setList(emptyList(instanceId))
+      setCompose(emptyCompose(instanceId))
+      setBodyView(null)
+      setFocus({ instanceId, messageId: '' })
     }
+    if (instanceId === '') return undefined
+    const epoch = guard.epoch
+    const seq = ++guard.listSeq
     let cancelled = false
-    setLoading(true)
-    setListError('')
-    client.readInstanceMessages(instanceId).then(data => {
-      if (cancelled) return
-      setPayload(isObject(data) ? data : null)
-      setLoading(false)
+    const isCurrent = () => !cancelled && guard.epoch === epoch && seq >= guard.listApplied
+    setList(current => (current.instanceId === instanceId
+      ? { ...current, loading: true, error: '' }
+      : { ...emptyList(instanceId), loading: true }))
+    void readMessagePages(client, instanceId, { isCurrent }).then(result => {
+      if (result === null || !isCurrent()) return
+      guard.listApplied = seq
+      setList({
+        instanceId,
+        loading: false,
+        error: '',
+        messages: result.messages,
+        total: result.total,
+        nextCursor: result.nextCursor,
+        liveExecutions: result.liveExecutions,
+        loadingMore: false,
+      })
     }, error => {
-      if (cancelled) return
-      setLoading(false)
+      if (!isCurrent()) return
+      // 失败也算「这一代请求已结束」：更旧的响应不能把错误态覆盖回旧数据。
+      guard.listApplied = seq
       const plan = inboxFailurePlan('list', error)
-      setListError(plan.text)
-      notice(plan.kind, plan.text)
+      setList(current => (current.instanceId === instanceId
+        ? { ...current, loading: false, error: plan.text }
+        : current))
+      if (guard.epoch === epoch && guard.instanceId === instanceId) notice(plan.kind, plan.text)
     })
     return () => { cancelled = true }
   }, [client, instanceId, reloadTick])
 
   useEffect(() => {
-    if (bodyView === null || bodyView.text !== undefined || bodyView.loading === true) return undefined
+    const view = bodyView
+    if (view === null || view.instanceId !== instanceId) return undefined
+    if (view.text !== undefined || view.error !== undefined || view.loading === true) return undefined
+    const epoch = guard.epoch
+    const seq = ++guard.bodySeq
     let cancelled = false
-    const messageId = bodyView.messageId
-    setBodyView(current => (current && current.messageId === messageId ? { ...current, loading: true } : current))
+    const messageId = view.messageId
+    setBodyView(current => (current && current.instanceId === instanceId && current.messageId === messageId
+      && current.text === undefined && current.error === undefined
+      ? { ...current, loading: true }
+      : current))
     client.readInstanceMessageBody(instanceId, messageId).then(data => {
-      if (cancelled) return
-      setBodyView({ messageId, text: typeof data?.text === 'string' ? data.text : '' })
+      if (cancelled || guard.epoch !== epoch || guard.instanceId !== instanceId) return
+      if (seq < guard.bodyApplied) return
+      guard.bodyApplied = seq
+      setBodyView(current => (current && current.instanceId === instanceId && current.messageId === messageId
+        ? { instanceId, messageId, text: typeof data?.text === 'string' ? data.text : '' }
+        : current))
     }, error => {
-      if (cancelled) return
+      if (cancelled || guard.epoch !== epoch || guard.instanceId !== instanceId) return
       const plan = inboxFailurePlan('body', error)
-      setBodyView({ messageId, error: plan.text })
+      setBodyView(current => (current && current.instanceId === instanceId && current.messageId === messageId
+        ? { instanceId, messageId, error: plan.text }
+        : current))
       notice(plan.kind, plan.text)
     })
     return () => { cancelled = true }
   }, [client, instanceId, bodyView === null ? '' : bodyView.messageId, bodyTick])
 
-  const messages = isObject(payload) && Array.isArray(payload.messages) ? payload.messages : []
-  const live = isObject(payload) && Array.isArray(payload.liveExecutions) ? payload.liveExecutions : []
+  const shown = list.instanceId === instanceId ? list : emptyList(instanceId)
+  const comp = compose.instanceId === instanceId ? compose : emptyCompose(instanceId)
+  const messages = shown.messages
+  const live = shown.liveExecutions
+  const shownTotal = Math.max(shown.total, messages.length)
   const candidates = targetCandidates(live, tasks)
-  const effectiveMode = mode === 'auto' ? (candidates.length > 0 ? 'exact' : 'next') : mode
-  const selected = candidates.find(item => item.executionId === selectedExecutionId) || candidates[0] || null
-  const sendable = status !== 'COMPLETED' && status !== 'CANCELED'
-    && draft.trim() !== '' && !sending && instanceId !== ''
-    && (effectiveMode === 'exact' ? selected !== null : nextActivityId.trim() !== '')
+  const hasCandidates = candidates.length > 0
+  const selected = candidates.find(item => item.executionId === comp.selectedExecutionId) || candidates[0] || null
+  // 手选过 exact、之后执行结束：自动回退到「下次激活」并在界面上说明。
+  const fallbackToNext = comp.mode === 'exact' && !hasCandidates
+  const targetMode = fallbackToNext
+    ? 'next'
+    : comp.mode === 'auto'
+      ? (hasCandidates ? 'exact' : 'next')
+      : comp.mode
+  const terminal = status === 'COMPLETED' || status === 'CANCELED'
+  const sendable = !terminal && instanceId !== '' && comp.text.trim() !== '' && !comp.sending
+    && (targetMode === 'exact' ? selected !== null : comp.nextActivityId.trim() !== '')
+
+  function updateCompose(fn) {
+    setCompose(current => (current.instanceId === instanceId ? fn(current) : current))
+  }
+
+  function editText(text) {
+    updateCompose(current => (current.text === text ? current : { ...current, text, pendingId: '', pendingKey: '' }))
+  }
+
+  function chooseMode(nextMode) {
+    if (nextMode === 'exact' && !hasCandidates) return
+    updateCompose(current => (current.mode === nextMode && current.pendingId === ''
+      ? current
+      : { ...current, mode: nextMode, pendingId: '', pendingKey: '' }))
+  }
+
+  function chooseExecution(executionId) {
+    updateCompose(current => ({ ...current, mode: 'exact', selectedExecutionId: executionId, pendingId: '', pendingKey: '' }))
+  }
+
+  function editNextActivityId(value) {
+    updateCompose(current => ({ ...current, nextActivityId: value, pendingId: '', pendingKey: '' }))
+  }
+
+  function targetOf() {
+    return targetMode === 'exact'
+      ? { activityId: selected.activityId, executionId: selected.executionId }
+      : { activityId: comp.nextActivityId.trim(), delivery: 'nextActivation' }
+  }
 
   async function send() {
-    if (!sendable) return
-    setSending(true)
-    const messageId = messageIdForUi()
-    const target = effectiveMode === 'exact'
-      ? { activityId: selected.activityId, executionId: selected.executionId }
-      : { activityId: nextActivityId.trim(), delivery: 'nextActivation' }
+    if (!sendable || selected === null && targetMode === 'exact') return
+    const epoch = guard.epoch
+    const target = targetOf()
+    const text = comp.text
+    // 一次逻辑提交 = 内容 + 目标 + messageId。响应丢失后的重试必须复用同一个
+    // messageId；只有内容/目标变了（pendingKey 不匹配）才生成新 id。
+    const signature = JSON.stringify([target.activityId, target.executionId || '', target.delivery || '', text])
+    const reuse = comp.pendingId !== '' && comp.pendingKey === signature
+    const messageId = reuse ? comp.pendingId : messageIdForUi()
+    updateCompose(current => ({ ...current, sending: true, pendingId: messageId, pendingKey: signature }))
     try {
-      const data = await client.sendInstanceMessage(instanceId, { messageId, target, text: draft })
+      const data = await client.sendInstanceMessage(instanceId, { messageId, target, text })
+      if (guard.epoch !== epoch || guard.instanceId !== instanceId) return
       const message = isObject(data) && isObject(data.message) ? data.message : {}
       const delivery = isObject(data) && isObject(data.delivery) ? data.delivery : null
       const failed = delivery && Array.isArray(delivery.failed) ? delivery.failed.length : 0
@@ -235,14 +417,59 @@ export function InstanceInboxPanel(props = {}) {
         notice('success', `消息 ${message.messageId || messageId} 已受理（状态 ${messageStatusText(message.status)}）`
           + `${confirmed > 0 ? `，本次确认投递 ${confirmed} 条` : ''}。`)
       }
-      setDraft('')
+      const locatedId = textOf(message.messageId) || messageId
+      updateCompose(current => (current.pendingId === messageId
+        ? { ...current, text: '', sending: false, pendingId: '', pendingKey: '' }
+        : current))
+      // 重新拉首屏并高亮新消息；列表较长时「加载更多」继续定位。
+      setFocus({ instanceId, messageId: locatedId })
       setReloadTick(tick => tick + 1)
       onChanged()
     } catch (error) {
+      if (guard.epoch !== epoch || guard.instanceId !== instanceId) return
+      // 草稿与 pendingId 都保留：同一个 messageId + 同一份内容可以直接重试。
       const plan = inboxFailurePlan('send', error)
       notice(plan.kind, plan.text)
     } finally {
-      setSending(false)
+      if (guard.epoch === epoch && guard.instanceId === instanceId) {
+        updateCompose(current => (current.sending ? { ...current, sending: false } : current))
+      }
+    }
+  }
+
+  async function loadMore() {
+    if (shown.instanceId !== instanceId || shown.nextCursor === null || shown.loadingMore) return
+    const epoch = guard.epoch
+    const seq = guard.listSeq
+    const startCursor = shown.nextCursor
+    const isCurrent = () => guard.epoch === epoch && guard.listSeq === seq
+    setList(current => (current.instanceId === instanceId ? { ...current, loadingMore: true, error: '' } : current))
+    try {
+      const result = await readMessagePages(client, instanceId, { cursor: startCursor, isCurrent })
+      if (result === null || !isCurrent()) return
+      setList(current => {
+        if (current.instanceId !== instanceId || current.nextCursor !== startCursor || guard.listSeq !== seq) return current
+        const merged = current.messages.slice()
+        const seen = new Set(merged.map(messageKey))
+        for (const message of result.messages) {
+          const key = messageKey(message)
+          if (seen.has(key)) continue
+          seen.add(key)
+          merged.push(message)
+        }
+        return {
+          ...current,
+          loadingMore: false,
+          messages: merged,
+          total: Math.max(current.total, result.total, merged.length),
+          nextCursor: result.nextCursor,
+        }
+      })
+    } catch (error) {
+      if (!isCurrent()) return
+      const plan = inboxFailurePlan('list', error)
+      setList(current => (current.instanceId === instanceId ? { ...current, loadingMore: false, error: plan.text } : current))
+      notice(plan.kind, plan.text)
     }
   }
 
@@ -250,11 +477,18 @@ export function InstanceInboxPanel(props = {}) {
     setReloadTick(tick => tick + 1)
   }
 
-  const sendHint = status === 'COMPLETED' || status === 'CANCELED'
+  const focusMessageId = focus.instanceId === instanceId ? focus.messageId : ''
+  const focusVisible = focusMessageId !== '' && messages.some(message => textOf(message.messageId) === focusMessageId)
+  const shownBody = bodyView !== null && bodyView.instanceId === instanceId ? bodyView : null
+  const sendHint = terminal
     ? '实例已结束：不再受理新消息。'
-    : candidates.length === 0
-      ? '当前没有活执行：默认发给节点的下一次激活。'
-      : `将发给当前 ${effectiveMode === 'exact' ? selected.label : '节点下次激活'}。`
+    : fallbackToNext
+      ? '原选中的执行已结束：已自动改发「下次激活」，填写节点 id 即可发送。'
+      : targetMode === 'exact'
+        ? `将发给当前 ${selected.label}（${selected.activityId}）。`
+        : hasCandidates
+          ? '将发给节点的下一次激活（需填写节点 id）。'
+          : '当前没有活执行：默认发给节点的下一次激活。'
 
   return h('section', {
     className: 'fs-inbox',
@@ -265,28 +499,38 @@ export function InstanceInboxPanel(props = {}) {
     h('strong', null, '消息'),
     h('button', {
       type: 'button', className: 'fs-btn sm ghost',
-      disabled: !instanceId || loading || sending,
+      disabled: !instanceId || shown.loading || comp.sending,
       'data-action': 'inbox-refresh',
       onClick: refresh,
       title: '重新读取消息列表（只读，不启动 runner）',
-    }, loading ? '读取中…' : '刷新')),
+    }, shown.loading ? '读取中…' : '刷新')),
 
-  listError !== ''
-    ? h('p', { className: 'fs-inbox-error', role: 'alert', 'data-inbox-error': 'true' }, listError)
+  shownTotal > 0
+    ? h('p', { className: 'fs-inbox-total', 'data-inbox-total': String(shownTotal) },
+      shownTotal > messages.length
+        ? `共 ${shownTotal} 条 · 已显示 ${messages.length} 条`
+        : `共 ${messages.length} 条`)
+    : null,
+
+  shown.error !== ''
+    ? h('p', { className: 'fs-inbox-error', role: 'alert', 'data-inbox-error': 'true' }, shown.error)
     : null,
 
   messages.length === 0
-    ? h('p', { className: 'fs-inbox-empty' }, instanceId === '' ? '选中实例后显示它的消息。' : '还没有消息。')
+    ? h('p', { className: 'fs-inbox-empty' },
+      instanceId === '' ? '选中实例后显示它的消息。' : shown.loading ? '读取中…' : '还没有消息。')
     : h('ul', { className: 'fs-inbox-rows', 'data-inbox-count': String(messages.length) },
-      messages.slice(0, 50).map(message => {
+      messages.map(message => {
         const messageId = textOf(message.messageId)
         const body = isObject(message.body) ? message.body : {}
         const long = body.kind === 'file' || (Number.isInteger(message.bytes) && message.bytes > 4096)
+        const focused = focusMessageId !== '' && messageId === focusMessageId
         return h('li', {
           key: messageId || String(message.seq),
-          className: 'fs-inbox-row',
+          className: 'fs-inbox-row' + (focused ? ' fs-inbox-row-focus' : ''),
           'data-message-id': messageId,
           'data-message-status': textOf(message.status),
+          'data-message-focus': focused ? 'true' : undefined,
         },
         h('div', { className: 'fs-inbox-row-head' },
           h('span', { className: 'fs-status-chip ' + messageStatusTone(message.status) }, messageStatusText(message.status)),
@@ -299,59 +543,87 @@ export function InstanceInboxPanel(props = {}) {
             type: 'button', className: 'fs-btn sm ghost',
             'data-action': 'inbox-view-body',
             onClick: () => {
-              setBodyView({ messageId })
+              setBodyView({ instanceId, messageId })
               setBodyTick(tick => tick + 1)
             },
           }, '查看全文' + (Number.isInteger(message.bytes) ? `（${message.bytes} 字节）` : ''))
           : null)
       })),
 
-  bodyView !== null
-    ? h('div', { className: 'fs-inbox-body-view', 'data-inbox-body-for': bodyView.messageId },
+  shown.nextCursor !== null
+    ? h('button', {
+      type: 'button', className: 'fs-btn sm ghost',
+      'data-action': 'inbox-load-more',
+      disabled: shown.loadingMore || shown.loading || comp.sending,
+      onClick: () => { void loadMore() },
+    }, shown.loadingMore ? '加载中…' : `加载更多（还有 ${Math.max(0, shownTotal - messages.length)} 条）`)
+    : null,
+
+  focusMessageId !== '' && !shown.loading && !focusVisible
+    ? h('p', { className: 'fs-inbox-hint', 'data-inbox-focus-missing': 'true' },
+      `已发送消息 ${focusMessageId}；它不在已加载的 ${messages.length} 条里，点「加载更多」继续定位。`)
+    : null,
+
+  shownBody !== null
+    ? h('div', { className: 'fs-inbox-body-view', 'data-inbox-body-for': shownBody.messageId },
       h('div', { className: 'fs-inbox-row-head' },
-        h('strong', null, `正文 ${bodyView.messageId}`),
+        h('strong', null, `正文 ${shownBody.messageId}`),
         h('button', {
           type: 'button', className: 'fs-btn sm ghost',
+          'data-action': 'inbox-hide-body',
           onClick: () => setBodyView(null),
         }, '收起')),
-      bodyView.error !== undefined
-        ? h('p', { className: 'fs-inbox-error', role: 'alert' }, bodyView.error)
-        : bodyView.text === undefined
+      shownBody.error !== undefined
+        ? h('p', { className: 'fs-inbox-error', role: 'alert' }, shownBody.error)
+        : shownBody.text === undefined
           ? h('p', { className: 'fs-inbox-empty' }, '读取中…')
-          : h('pre', { className: 'fs-inbox-body-text' }, bodyView.text))
+          : h('pre', { className: 'fs-inbox-body-text' }, shownBody.text))
     : null,
 
   h('div', { className: 'fs-inbox-compose' },
     h('p', { className: 'fs-inbox-hint' }, sendHint),
-    candidates.length > 0
+    h('div', { className: 'fs-inbox-mode', role: 'group', 'aria-label': '消息目标模式' },
+      h('button', {
+        type: 'button',
+        className: 'fs-btn sm ' + (targetMode === 'exact' ? 'primary' : 'ghost'),
+        'data-action': 'inbox-mode-exact',
+        'aria-pressed': targetMode === 'exact',
+        disabled: !hasCandidates,
+        onClick: () => chooseMode('exact'),
+      }, '当前执行'),
+      h('button', {
+        type: 'button',
+        className: 'fs-btn sm ' + (targetMode === 'next' ? 'primary' : 'ghost'),
+        'data-action': 'inbox-mode-next',
+        'aria-pressed': targetMode === 'next',
+        onClick: () => chooseMode('next'),
+      }, '下次激活')),
+    targetMode === 'exact'
       ? h('select', {
         className: 'fs-inbox-target',
         value: selected ? selected.executionId : '',
         'aria-label': '消息目标',
-        disabled: !sendable && sending,
-        onChange: event => {
-          setSelectedExecutionId(event.target.value)
-          setMode('exact')
-        },
+        disabled: comp.sending || terminal,
+        onChange: event => chooseExecution(event.target.value),
       }, candidates.map(item => h('option', { key: item.executionId, value: item.executionId },
         `${item.label} · ${item.activityId}`)))
       : h('input', {
         className: 'fs-inbox-target',
         type: 'text',
-        value: nextActivityId,
+        value: comp.nextActivityId,
         placeholder: '未来激活的节点 id（如 review）',
         'aria-label': '未来激活的节点 id',
-        disabled: !sendable && sending,
-        onInput: event => setNextActivityId(event.target.value),
+        disabled: comp.sending || terminal,
+        onInput: event => editNextActivityId(event.target.value),
       }),
     h('textarea', {
       className: 'fs-inbox-draft',
       rows: 3,
-      value: draft,
+      value: comp.text,
       placeholder: '输入消息正文（长正文由 Host 落盘，列表只显示摘要）',
       'aria-label': '消息正文',
-      disabled: status === 'COMPLETED' || status === 'CANCELED' || sending,
-      onInput: event => setDraft(event.target.value),
+      disabled: terminal || comp.sending,
+      onInput: event => editText(event.target.value),
     }),
     h('button', {
       type: 'button', className: 'fs-btn sm',
@@ -359,7 +631,7 @@ export function InstanceInboxPanel(props = {}) {
       'data-action': 'inbox-send',
       title: '发送消息（POST /instances/<id>/messages）',
       onClick: () => { void send() },
-    }, sending ? '发送中…' : '发送消息')))
+    }, comp.sending ? '发送中…' : '发送消息')))
 }
 
 // 兼容未使用导出的静态检查：errorTextOf 在面板外也有复用价值。

@@ -1553,6 +1553,8 @@ export function FlowStudioPage(props = {}) {
         }),
         h(MetricsSummaryPanel, { client }),
         h(InstanceInboxPanel, {
+          // 0.13.11 N10：切实例强制重建面板，组件内部的世代守卫再兜一层迟到响应。
+          key: activeInstanceId || 'none',
           client,
           instanceId: activeInstanceId,
           instanceStatus: activeInstance ? activeInstance.status : '',

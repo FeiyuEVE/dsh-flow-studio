@@ -206,6 +206,58 @@ export function failureMessage(error) {
   return String(error)
 }
 
+/** 在飞活动 → 人能认出的标识：优先 activityId，其次 title / executionId，最后按 kind 兜底。 */
+function lifecycleActivityLabel(activity) {
+  if (activity === null || typeof activity !== 'object' || Array.isArray(activity)) return ''
+  for (const value of [activity.activityId, activity.title, activity.executionId]) {
+    if (typeof value === 'string' && value !== '') return value
+  }
+  if (activity.kind === 'agent') return 'agent 活动'
+  if (activity.kind === 'http') return 'HTTP 调用'
+  if (activity.kind === 'engine') return '引擎推进'
+  return ''
+}
+
+/**
+ * 挂起 / 恢复失败 → 可操作中文（0.14.3）。
+ *
+ * `INSTANCE_SUSPEND_BUSY` 必须用响应里的 `activities[]` 说清「还差几个、差哪个」，
+ * 而不是只回一句「不能挂起」；其余稳定业务码各给一句人话 + 下一步。
+ */
+export function instanceLifecycleFailureText(error, action) {
+  const verb = action === 'resume' ? '恢复' : '挂起'
+  const code = error && typeof error.code === 'string' ? error.code : ''
+  const data = error && error.data && typeof error.data === 'object' && !Array.isArray(error.data)
+    ? error.data
+    : null
+  const detail = data && typeof data.error === 'string' && data.error.trim() !== '' ? data.error.trim() : ''
+  if (code === 'INSTANCE_SUSPEND_BUSY') {
+    const activities = data && Array.isArray(data.activities) ? data.activities : []
+    if (activities.length > 0) {
+      const labels = activities.map(lifecycleActivityLabel).filter(label => label !== '')
+      const listed = labels.length > 0 ? `（${labels.join('、')}）` : ''
+      return `实例还有 ${activities.length} 个活动未结束${listed}，等它们结束再${verb}；急着收尾可以点「停止实例」。`
+    }
+    return `${detail !== '' ? detail : '实例还有未结束的活动'}，等它们结束再${verb}。`
+  }
+  if (code === 'INSTANCE_ALREADY_SUSPENDED') {
+    return '实例已经处于挂起状态，不用重复挂起；要继续推进请点「恢复实例」。'
+  }
+  if (code === 'INSTANCE_NOT_SUSPENDED') {
+    return '实例当前不是挂起状态，不能恢复；先刷新实例列表确认状态，再决定挂起或停止。'
+  }
+  if (code === 'BPMN_INSTANCE_STOPPING') {
+    return `实例正在停止，暂时不能${verb}；等它收成终态后刷新查看。`
+  }
+  if (code === 'BPMN_INSTANCE_TERMINAL') {
+    return `实例已结束（终态），不能再${verb}；刷新列表查看最终状态。`
+  }
+  if (code === 'INSTANCE_NOT_FOUND') {
+    return '实例不存在（可能已被清理）；刷新实例列表后重试。'
+  }
+  return `${detail !== '' ? detail : failureMessage(error)}（若实例状态刚变过，先刷新实例再${verb}）`
+}
+
 /**
  * 编辑器控制器报告的「不可用」原因（导入回滚重建失败后的显式降级态）。
  * 页面必须据此把画布标成 error 并展示原因，不能继续提示“导入成功”。
@@ -996,6 +1048,42 @@ export function FlowStudioPage(props = {}) {
     }
   }, [client, openInstance, refreshInstances])
 
+  /** 挂起实例（POST /instances/<id>/suspend）：没有在飞活动才成功；成功后刷新详情显示「已挂起」。 */
+  const suspendInstance = useCallback(async id => {
+    if (typeof id !== 'string' || id === '') return false
+    setLoadingInstance(true)
+    try {
+      await client.suspendInstance(id)
+      if (!mountedRef.current) return false
+      await refreshInstances()
+      await openInstance(id)
+      setNotice({ kind: 'success', text: `实例 ${id} 已挂起（不再推进 / 派发，恢复后才继续）` })
+      return true
+    } catch (error) {
+      setLoadingInstance(false)
+      setNotice({ kind: 'error', text: '挂起实例失败：' + instanceLifecycleFailureText(error, 'suspend') })
+      return false
+    }
+  }, [client, openInstance, refreshInstances])
+
+  /** 恢复实例（POST /instances/<id>/resume）：只回 ACTIVE，不主动推进。 */
+  const resumeInstance = useCallback(async id => {
+    if (typeof id !== 'string' || id === '') return false
+    setLoadingInstance(true)
+    try {
+      await client.resumeInstance(id)
+      if (!mountedRef.current) return false
+      await refreshInstances()
+      await openInstance(id)
+      setNotice({ kind: 'success', text: `实例 ${id} 已恢复；下次操作会继续推进，不会重放已完成节点` })
+      return true
+    } catch (error) {
+      setLoadingInstance(false)
+      setNotice({ kind: 'error', text: '恢复实例失败：' + instanceLifecycleFailureText(error, 'resume') })
+      return false
+    }
+  }, [client, openInstance, refreshInstances])
+
   /** 完成人工待办：payload / decidedBy / 当前 executionId；提交期间禁用重复操作。 */
   const completeTask = useCallback(async (task, input) => {
     const key = tasksGuardRef.current.begin(task)
@@ -1541,6 +1629,8 @@ export function FlowStudioPage(props = {}) {
       onSelectInstance: id => { void openInstance(id) },
       onRefresh: () => { void refreshInstances() },
       onStop: id => { void stopInstance(id) },
+      onSuspend: id => { void suspendInstance(id) },
+      onResume: id => { void resumeInstance(id) },
       onCompleteTask: (task, input) => { void completeTask(task, input) },
       // 0.13.8：工作区 / worktree 检查与清理（面板自己读 worktree，页面只给通知与列表刷新）。
       // 0.13.10：实例详情里的「消息」区（只读列表 + 发送；长正文走鉴权正文接口）。

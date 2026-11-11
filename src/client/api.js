@@ -227,6 +227,21 @@ export function stopInstancePath(id) {
   return `${instancePath(id)}/stop`
 }
 
+/** `POST /instances/<id>/suspend`（0.14.3：只在该实例没有在飞活动时成功）。 */
+export function suspendInstancePath(id) {
+  return `${instancePath(id)}/suspend`
+}
+
+/** `POST /instances/<id>/resume`（只允许 SUSPENDED → ACTIVE，不主动推进）。 */
+export function resumeInstancePath(id) {
+  return `${instancePath(id)}/resume`
+}
+
+/** 挂起 / 恢复的可选请求体：`reason` 是 ≤200 字符的短说明；省略时发空对象。 */
+function lifecycleBody(reason) {
+  return typeof reason === 'string' && reason.trim() !== '' ? { reason: reason.trim() } : {}
+}
+
 /** `GET /instances/<id>/definition`（实例冻结快照，只读）。 */
 export function instanceDefinitionPath(id) {
   return `${instancePath(id)}/definition`
@@ -311,6 +326,8 @@ export const api = {
   readInstanceTasks: id => request('GET', instanceTasksPath(id)),
   completeInstanceTask: (id, activityId, body) => request('POST', completeTaskPath(id, activityId), body || {}),
   stopInstance: id => request('POST', stopInstancePath(id)),
+  suspendInstance: (id, reason) => request('POST', suspendInstancePath(id), lifecycleBody(reason)),
+  resumeInstance: (id, reason) => request('POST', resumeInstancePath(id), lifecycleBody(reason)),
   readInstanceDefinition: id => request('GET', instanceDefinitionPath(id)),
 
   // ── 实例收件箱（0.13.10）──────────────────────────────────────────────

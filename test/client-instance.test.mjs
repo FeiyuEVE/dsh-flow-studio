@@ -13,7 +13,7 @@
 
 import assert from 'node:assert/strict'
 
-import { api, instanceEventsPath, instanceDefinitionPath, instancePath, instanceTasksPath } from '../src/client/api.js'
+import { api, instanceEventsPath, instanceDefinitionPath, instancePath, instanceTasksPath, resumeInstancePath, suspendInstancePath } from '../src/client/api.js'
 import {
   KNOWN_INSTANCE_EVENTS, completionFailurePlan, createInstanceProjection, createTaskCompletionGuard,
   elementStateMap, eventIdentity, latestEventForElement, mergeInstanceEvents, nextEventsQuery,
@@ -238,6 +238,65 @@ await check('实例详情 / 事件 / 待办 / 停止：只走新实例路由', a
         '/api/flow-studio/instances/i-1/tasks',
         '/api/flow-studio/instances/i-1/stop',
       ])
+    },
+  )
+})
+
+await check('挂起 / 恢复：POST 路径、可选 reason 请求体、409 BUSY 带出 activities', async () => {
+  eq(suspendInstancePath('i/1'), '/instances/i%2F1/suspend')
+  eq(resumeInstancePath('i/1'), '/instances/i%2F1/resume')
+  await withFetch(
+    (url, init) => {
+      if (url.endsWith('/instances/i-1/suspend')) {
+        const body = JSON.parse(init.body)
+        return response(200, {
+          ok: true, id: 'i-1', status: 'SUSPENDED', reason: body.reason ?? null,
+          lastSeq: 13, suspendedAt: '2026-11-12T00:00:00.000Z',
+        })
+      }
+      if (url.endsWith('/instances/i-1/resume')) {
+        return response(200, {
+          ok: true, id: 'i-1', status: 'ACTIVE', reason: null,
+          lastSeq: 14, resumedAt: '2026-11-12T00:05:00.000Z',
+        })
+      }
+      return response(404, { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' })
+    },
+    async calls => {
+      const suspended = await api.suspendInstance('i-1', ' 窗口维护 ')
+      eq(suspended.status, 'SUSPENDED')
+      eq(suspended.reason, '窗口维护', 'reason 客户端 trim 后发送，Host 再按契约落事件')
+      eq(suspended.lastSeq, 13)
+      const resumed = await api.resumeInstance('i-1')
+      eq(resumed.status, 'ACTIVE')
+      eq(resumed.lastSeq, 14)
+      deep(calls.map(call => [call.init.method, call.url]), [
+        ['POST', '/api/flow-studio/instances/i-1/suspend'],
+        ['POST', '/api/flow-studio/instances/i-1/resume'],
+      ])
+      deep(JSON.parse(calls[0].init.body), { reason: '窗口维护' }, '挂起必须带 reason')
+      deep(JSON.parse(calls[1].init.body), {}, '省略 reason 时发空对象，不夹带 undefined')
+    },
+  )
+
+  const busyBody = {
+    ok: false,
+    code: 'INSTANCE_SUSPEND_BUSY',
+    error: '实例 i-1 还有未结束的活动，不能挂起',
+    activities: [
+      { kind: 'agent', activityId: 'agent-a', state: 'running' },
+      { kind: 'http', activityId: 'http-b', state: 'sent' },
+    ],
+  }
+  await withFetch(
+    () => response(409, busyBody),
+    async () => {
+      await assert.rejects(api.suspendInstance('i-1'), error => {
+        eq(error.status, 409)
+        eq(error.code, 'INSTANCE_SUSPEND_BUSY')
+        eq(error.data.activities.length, 2, 'BUSY 的 activities 必须随错误带出，供页面说明原因')
+        return true
+      })
     },
   )
 })

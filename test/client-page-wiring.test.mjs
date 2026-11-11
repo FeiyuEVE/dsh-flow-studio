@@ -35,7 +35,7 @@ import { BpmnCanvas } from '../src/client/canvas.js'
 import { clearDraft, readDraft } from '../src/client/drafts.js'
 import { DefinitionList } from '../src/client/flowlist.js'
 import { InstanceEventDrawer } from '../src/client/logdrawer.js'
-import { FlowStudioPage } from '../src/client/page.js'
+import { FlowStudioPage, instanceLifecycleFailureText } from '../src/client/page.js'
 import { bindReact } from '../src/client/runtime.js'
 import { InstancePanel } from '../src/client/tasklist.js'
 
@@ -498,7 +498,8 @@ const definitionB = {
 function makeClient(overrides = {}) {
   const calls = {
     readDefinition: [], saveDefinition: [], readInstance: [], readInstanceEvents: [],
-    completeInstanceTask: [], listDefinitions: 0, listInstances: 0,
+    completeInstanceTask: [], suspendInstance: [], resumeInstance: [],
+    listDefinitions: 0, listInstances: 0,
   }
   const client = {
     async listDefinitions() {
@@ -540,6 +541,14 @@ function makeClient(overrides = {}) {
     },
     async stopInstance(id) {
       return { id, status: 'CANCELED' }
+    },
+    async suspendInstance(id, reason) {
+      calls.suspendInstance.push({ id, reason })
+      return { ok: true, id, status: 'SUSPENDED' }
+    },
+    async resumeInstance(id, reason) {
+      calls.resumeInstance.push({ id, reason })
+      return { ok: true, id, status: 'ACTIVE' }
     },
   }
   return { client: { ...client, ...overrides }, calls }
@@ -1972,6 +1981,105 @@ await check('F 旧域退役：页面默认 client 的网络请求没有 /flows�
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+// 16. 0.14.3：挂起 / 恢复的页面回调 ------------------------------------------
+
+await check('0.14.3 挂起 / 恢复：成功刷新详情并提示；BUSY 提示带活动数量与标识', async () => {
+  await withFakeTimers(async () => {
+    const instanceA = { id: 'i-a', status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }
+    let status = 'ACTIVE'
+    const { client, calls } = makeClient({
+      readInstance: async id => ({ id, status, lastSeq: 1, pendingTasks: [] }),
+      suspendInstance: async (id, reason) => {
+        calls.suspendInstance.push({ id, reason })
+        status = 'SUSPENDED'
+        return { ok: true, id, status: 'SUSPENDED' }
+      },
+      resumeInstance: async (id, reason) => {
+        calls.resumeInstance.push({ id, reason })
+        status = 'ACTIVE'
+        return { ok: true, id, status: 'ACTIVE' }
+      },
+    })
+    const mounted = await mountPage({
+      client,
+      props: {
+        initialDefinition: definitionA,
+        initialInstance: instanceA,
+        initialInstanceDefinition: { xml: XML_A },
+        initialEvents: [],
+        initialTasks: [],
+      },
+    })
+    const { probe } = mounted
+    const panel = () => findElement(probe.tree, node => node.type === InstancePanel)
+    const noticeOf = () => findElement(probe.tree,
+      node => node.props && node.props['data-notice-kind'] !== undefined)
+
+    panel().props.onSuspend('i-a')
+    await settle(probe)
+    deep(calls.suspendInstance, [{ id: 'i-a', reason: undefined }], '挂起必须原样转交实例 id')
+    eq(panel().props.activeInstance.status, 'SUSPENDED', '挂起成功后详情必须刷新为已挂起')
+    eq(calls.listInstances, 1, '成功路径必须刷新实例列表')
+    eq(noticeOf().props['data-notice-kind'], 'success')
+    ok(textOf(noticeOf()).includes('已挂起'), '成功提示必须说明已挂起')
+
+    panel().props.onResume('i-a')
+    await settle(probe)
+    deep(calls.resumeInstance, [{ id: 'i-a', reason: undefined }], '恢复必须原样转交实例 id')
+    eq(panel().props.activeInstance.status, 'ACTIVE', '恢复成功后详情必须刷新为活跃')
+    eq(calls.listInstances, 2, '恢复成功同样刷新实例列表')
+    ok(textOf(noticeOf()).includes('已恢复'), '成功提示必须说明已恢复')
+
+    // 409 BUSY：不刷新详情，错误文案必须点名未结束的活动与下一步。
+    const busy = new Error('实例 i-a 还有未结束的活动，不能挂起')
+    busy.status = 409
+    busy.code = 'INSTANCE_SUSPEND_BUSY'
+    busy.data = {
+      ok: false,
+      code: 'INSTANCE_SUSPEND_BUSY',
+      error: busy.message,
+      activities: [
+        { kind: 'agent', activityId: 'agent-a', state: 'running' },
+        { kind: 'http', activityId: 'http-b', state: 'sent' },
+      ],
+    }
+    const failing = makeClient({
+      readInstance: async id => ({ id, status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }),
+      suspendInstance: async () => { throw busy },
+    })
+    const mountedBusy = await mountPage({
+      client: failing.client,
+      props: {
+        initialDefinition: definitionA,
+        initialInstance: instanceA,
+        initialInstanceDefinition: { xml: XML_A },
+        initialEvents: [],
+        initialTasks: [],
+      },
+    })
+    const probeBusy = mountedBusy.probe
+    findElement(probeBusy.tree, node => node.type === InstancePanel).props.onSuspend('i-a')
+    await settle(probeBusy)
+    const noticeBusy = findElement(probeBusy.tree,
+      node => node.props && node.props['data-notice-kind'] !== undefined)
+    eq(noticeBusy.props['data-notice-kind'], 'error')
+    const text = textOf(noticeBusy)
+    ok(text.includes('实例还有 2 个活动未结束'), '提示必须给出未结束活动数量：' + text)
+    ok(text.includes('agent-a') && text.includes('http-b'), '提示必须点名未结束的活动：' + text)
+    ok(text.includes('等它们结束再挂起'), '提示必须给出下一步：' + text)
+    eq(failing.calls.listInstances, 0, 'BUSY 失败不改列表（只在成功后刷新）')
+    eq(failing.calls.readInstance.length, 0, 'BUSY 失败不重开详情（避免把原因提示冲掉）')
+
+    // 其余稳定业务码至少给一句人话 + 下一步（纯函数，不起服务）。
+    ok(instanceLifecycleFailureText({ code: 'INSTANCE_ALREADY_SUSPENDED' }, 'suspend').includes('恢复实例'))
+    ok(instanceLifecycleFailureText({ code: 'INSTANCE_NOT_SUSPENDED' }, 'resume').includes('先刷新'))
+    ok(instanceLifecycleFailureText({ code: 'BPMN_INSTANCE_STOPPING' }, 'suspend').includes('正在停止'))
+    ok(instanceLifecycleFailureText({ code: 'BPMN_INSTANCE_TERMINAL' }, 'resume').includes('终态'))
+    ok(instanceLifecycleFailureText({ code: 'INSTANCE_NOT_FOUND' }, 'suspend').includes('刷新'))
+    ok(instanceLifecycleFailureText({ code: 'WEIRD' }, 'suspend').includes('先刷新实例再挂起'))
+  })
 })
 
 if (failures.length > 0) {

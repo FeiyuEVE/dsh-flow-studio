@@ -7,7 +7,7 @@
 1. **agent 节点要完结自己、让流程往后流转，只能通过调用工具 `flow_finish_node`。** 自然语言收尾、进程退出、token 用尽都不算完结——节点会一直等（直到活动超时/取消）。
 2. 这个约定**与 `endEvent` 无关**：`endEvent` 是 BPMN 的结束事件，照旧由引擎处理，不要求调用任何工具。
 3. 一次活动执行只接受**一次**成功调用；重复调用返回 `NODE_ALREADY_FINISHED`（幂等：同参数重放也返回该错误，不重复写产物）。
-4. 会话/进程结束但没调用过 → 节点失败 `NODE_FINISH_MISSING`，事件流里带 `error{code:'NODE_FINISH_MISSING'}`；**禁止**把「模型说了完成」当成完成。
+4. agent 停下来（本轮结束、进程退出）但没调用过工具 → **默认先唤醒提醒**，不是立刻失败：每个 agent 节点默认挂一个内置 `turn.stop` hook（`finish_reminder`，默认最多 3 次），由 adapter 把它唤醒并明确要求调用 `flow_finish_node`；提醒用尽仍未调用 → 节点失败 `NODE_FINISH_MISSING`。**禁止**把「模型说了完成」当成完成。
 5. 工具调用是**流转的触发器**：`executeAgent` 拿到工具参数后返回，runner 才把该活动标记完成并评估出向连线（网关条件读的就是这次注入的变量）。
 6. adapter 若无法向该 agent 暴露工具（能力表 `capabilities.finishTool` ≠ `native`），**在 admission 阶段拒绝**该节点，不允许静默降级成「看输出文本猜结论」。
 
@@ -43,12 +43,25 @@ $DSH_HOME/flow-studio/instances/<id>/
 - `instance.json.artifacts[]` 由运行时维护；`activity/end` 事件的 `artifacts[]` 只带引用（path/hash/bytes/kind/title），事件里**不出现**文档正文。
 - 产物校验失败（路径越界、不存在、符号链接逃逸、超 5 MiB、校验中被改）→ `NODE_DOCUMENT_INVALID`，节点不结束；错误信息带 `path` 与原因，不打印文件内容。
 
+## 3.1 默认的「停下来但没调工具」hook
+
+- 节点配置里 agent 节点**默认注入**一条 hook：`{ event: 'turn.stop', kind: 'finish_reminder', maxFires: 3 }`；可由节点配置覆盖次数或关闭（关闭后行为退化为「停下来即 `NODE_FINISH_MISSING`」）。
+- 触发点 = agent 本轮结束时（不是流结束、不是 token 用尽）。
+- 动作 = 把提醒文本作为**新的一轮输入**送回同一个 agent 会话，让它继续调用工具；提醒轮不算节点完成，也不重置活动超时。
+- 提醒文本（固定模板，可加节点上下文）：
+  ```
+  【必须调用工具】你还没有调用 flow_finish_node，本节点没有完结，流程不会往下走。
+  现在就调用它：variables 放后续网关要用的短变量，documents 放你写下的文件相对路径，summary 一句话。
+  ```
+- 每次提醒写一条 handler 事件 `{ type: 'agent/reminder', count, maxFires }`（经 runner 的 handler `events[]` 透传，不是新的一等 kind），便于审计与 UI 展示。
+- 提醒次数用尽 → `NODE_FINISH_MISSING`（错误体带 `reminders` 次数与最后一次会话 id/进程 id，便于排查）。
+
 ## 4 各 adapter 怎么提供工具
 
 | adapter | 工具通道 | 校验「必须调用」的方式 | 能力标记 |
 |---|---|---|---|
-| `dsh` | 子 agent 会话注册模型工具 `flow_finish_node`（宿主 `ctx` 工具注册，会话级可见） | 工具 handler 记一次完成；会话结束仍未调用 → `NODE_FINISH_MISSING` | `finishTool: native` |
-| `codex` | 插件自带 MCP stdio server 暴露同名工具，`codex exec` 配置 `mcp_servers` 指向它 | MCP 调用记完成；进程退出仍未调用 → `NODE_FINISH_MISSING` | `finishTool: native`（依赖 MCP 能力，probe 时必须实测） |
+| `dsh` | 子 agent 会话注册模型工具 `flow_finish_node`（`agents.create` 的 `setup` 里 `agentCtx.tools.register`，会话级可见） | 工具 handler 记一次完成；`agent/turn-stopping` 时未完成 → `agent.steer(提醒)` 唤醒（native）；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`，`hooks['turn.stop']: native` |
+| `codex` | 插件自带 MCP stdio server 暴露同名工具，`codex exec` 配置 `mcp_servers` 指向它 | 工具调用记完成；原生 `Stop` hook（0.167+）注入提醒（native）；无 hook 能力时用 `codex exec resume <session>` 重发提醒（emulated，进程级）；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测 MCP），`hooks['turn.stop']: native/emulated` |
 | 其它/旧版 | 无 | admission 拒绝 | `finishTool: unsupported` |
 
 工具调用与活动生命周期的关系：`executeAgent` **不返回**直到工具被调用（或失败/超时/取消）。因此 runner 的活动超时照常生效，超时 → `BPMN_ACTIVITY_TIMEOUT`，同时 abort 会话。
@@ -79,3 +92,5 @@ adapter 必须把「怎么完结当前节点」写进节点提示词（不是可
 4. 文档不存在 / 路径越界 / 超 5 MiB → `NODE_DOCUMENT_INVALID`；
 5. 重复调用 → `NODE_ALREADY_FINISHED`，产物索引不重复；
 6. 超时中断：工具从未调用且活动超时 → `BPMN_ACTIVITY_TIMEOUT` 且会话被 abort（不是挂住）。
+7. 提醒：agent 停下来没调工具 → 收到一次提醒并被唤醒；调用后正常完结，事件流里有 `agent/reminder`（count=1），实例**不**进 failed。
+8. 提醒用尽：连续 3 次停下都不调工具 → 3 条 `agent/reminder` + 最终 `NODE_FINISH_MISSING`（错误体带 `reminders:3`）；把 maxFires 配成 0 时，第一次停下就直接失败。

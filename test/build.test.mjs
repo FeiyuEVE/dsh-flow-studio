@@ -211,6 +211,7 @@ try {
     // 必须和当前交付一致，不能用 HEAD 里的旧版本。
     for (const rel of [
       'scripts/build.mjs',
+      'scripts/build-bpmn-assets.mjs',
       'scripts/verify-build.mjs',
       'package.json',
       'package-lock.json',

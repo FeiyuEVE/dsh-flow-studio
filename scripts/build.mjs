@@ -37,6 +37,8 @@ import { gzipSync } from 'node:zlib'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { buildBpmnAssets } from './build-bpmn-assets.mjs'
+
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
 
@@ -166,6 +168,14 @@ export async function buildPlugin() {
   const libDir = resolve(root, 'lib')
   mkdirSync(libDir, { recursive: true })
 
+  // 步骤 4：先内联官方 CSS/字体，生成 chunk 可 import 的样式字符串。
+  // 生成物是构建产物（src/client/bpmn/assets.generated.js，.gitignore 排除）。
+  const assets = buildBpmnAssets(root)
+  console.log(
+    `✓ bpmn 资源：${assets.files.length} 个官方样式表，${assets.fontCount} 个 woff2 base64，`
+    + `CSS ${assets.cssBytes} 字节`,
+  )
+
   const require = createRequire(import.meta.url)
   const { build } = require('esbuild')
 
@@ -270,7 +280,24 @@ export async function buildPlugin() {
     console.error('✗ lib/client.js 里找不到 React Flow 特征串 react-flow__（步骤 2 尚未退役，应有）')
     process.exit(1)
   }
-  console.log('✓ client.js 主包注册形状正确，client.bpmn.js 带 chunk 字段与 factory')
+  // 步骤 4：官方 CSS + 内联字体只能进 chunk；主包一个字节都不该有。
+  if (client.includes('data:font/woff2;base64,')) {
+    console.error('✗ lib/client.js 里混进了 bpmn 字体（应只进 chunk）')
+    process.exit(1)
+  }
+  if (!chunk.includes('data:font/woff2;base64,')) {
+    console.error('✗ lib/client.bpmn.js 里没有内联 woff2 字体（步骤 4 要求自包含）')
+    process.exit(1)
+  }
+  if (!chunk.includes('--bio-surface') || !chunk.includes('.bio-theme-parent')) {
+    console.error('✗ lib/client.bpmn.js 里没有主题桥接样式（--bio-* → --dsw-*）')
+    process.exit(1)
+  }
+  if (/url\(\s*['"]?(?:\.\.?\/|https?:)/.test(chunk)) {
+    console.error('✗ lib/client.bpmn.js 里残留外部 url()（CSS/字体必须内联，不能额外请求）')
+    process.exit(1)
+  }
+  console.log('✓ client.js 主包注册形状正确，client.bpmn.js 带 chunk 字段、自包含样式与内联字体')
 
   // 主包依赖图不得包含 bpmn-js / 官方属性面板：它们属于 chunk，不能拖慢每次打开 GUI 的首屏。
   const mainInputs = Object.keys(mainResult.metafile.inputs)

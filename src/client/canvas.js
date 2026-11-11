@@ -120,7 +120,9 @@ export function BpmnCanvas(props = {}) {
         }
         editorRef.current = editor
         setState({ status: 'ready', error: null, version: chunk.version ?? null })
-        if (typeof latest.onReady === 'function') latest.onReady(chunk)
+        // 第二个参数是 chunk 的命令式控制器（importXML / saveXML / setViewerMode /
+        // setRuntimeState / destroy）；步骤 5 的页面用它保存/切换实例只读视图。
+        if (typeof latest.onReady === 'function') latest.onReady(chunk, editor)
       })
       .catch(error => {
         if (isStale()) return

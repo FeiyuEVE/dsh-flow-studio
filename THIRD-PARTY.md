@@ -403,17 +403,33 @@ THE SOFTWARE.
 
 # 四、画布组件：bpmn-js 的 bpmn.io License（不是 MIT）
 
-工作流画布用 `bpmn-js`（构建期依赖，打进 `lib/client.js`，不 vendor 进 `src/`）。
-它的许可是 **bpmn.io License**：MIT 条款 + 一条额外的水印条款。
+工作流画布用 `bpmn-js`（构建期依赖，打进画布 chunk `lib/client.bpmn.js`，不 vendor
+进 `src/`；主包 `lib/client.js` 不含 bpmn-js / diagram-js / 官方属性面板）。它的许可是
+**bpmn.io License**：MIT 条款 + 一条额外的水印条款。
+
+同一 chunk 里还打进了下列官方包（均为构建期依赖，随 `lib/client.bpmn.js` 分发）：
+
+| 包 | 版本 | 许可 | 说明 |
+|---|---|---|---|
+| `bpmn-js` | 18.31.1 | bpmn.io License（见下） | 画布、palette、右键菜单、替换菜单、水印 |
+| `diagram-js` | 15.28.1 | MIT | bpmn-js 的底层图引擎 |
+| `bpmn-js-properties-panel` | 5.65.3 | MIT | 官方属性面板（BpmnPropertiesPanel / BpmnPropertiesProvider） |
+| `@bpmn-io/properties-panel` | 3.59.0 | MIT | 面板组件与 Preact runtime 副本（`properties-panel/preact`） |
+| `@bpmn-io/*`（feel / codemirror 等传递依赖） | 见 `package-lock.json` | MIT | 由官方属性面板引入，随 chunk 打包 |
+| `bpmn-font`（`bpmn-js/dist/assets/bpmn-font`） | 随 bpmn-js 18.31.1 | 随 bpmn-js 包分发 | 图标字体；构建时 woff2 以 base64 内联 |
+
+官方 CSS（`diagram-js/assets/diagram-js.css`、`bpmn-js/dist/assets/bpmn-js.css`、
+`@bpmn-io/properties-panel/dist/assets/properties-panel.css`）也随 chunk 内联，见
+`scripts/build-bpmn-assets.mjs`。
 
 - **对使用者的要求**：负责渲染 `https://bpmn.io` 水印的源码**不得删除或修改**；当软件用在
   网站或应用里时，水印必须**完整可见、不能被其它元素遮挡**。所以画布上会一直带着 bpmn.io
   水印，这是许可要求，不是可以关掉的 UI 选项。
 - **已确认接受**：这一点已由用户确认（2026-11-11）：接受画布带 bpmn.io 水印，不遮挡它。
-- **注意**：`scripts/build.mjs` 打包 client 时用 `legalComments: 'none'`，会把 bpmn-js 的
-  license banner 从 `lib/client.js` 里剥掉；因此这份 `THIRD-PARTY.md` 会随包分发
-  （`package.json` 的 `files` 白名单包含它），由它承担许可原文的告知义务。**不要**把这份
-  文件从 `files` 里删掉。
+- **注意**：`scripts/build.mjs` 打包两个客户端产物时都用 `legalComments: 'none'`，会把
+  bpmn-js 等依赖的 license banner 从 `lib/client.js` / `lib/client.bpmn.js` 里剥掉；因此
+  这份 `THIRD-PARTY.md` 会随包分发（`package.json` 的 `files` 白名单包含它），由它承担
+  许可原文的告知义务。**不要**把这份文件从 `files` 里删掉。
 
 ### License
 

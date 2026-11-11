@@ -3,5 +3,8 @@ lib/
 *.tgz
 .tmp/
 
+# 构建期生成：官方 CSS + 内联字体的字符串（scripts/build-bpmn-assets.mjs）
+src/client/bpmn/assets.generated.js
+
 # 测试/评审留下的临时产物
 .tmp-*

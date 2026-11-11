@@ -97,54 +97,29 @@ check('主包 factory 在无 document / 无 window 组件的裸 Node 里可执�
   A.equal(Array.from(plugin.inject).join(','), 'slots')
 })
 
-check('chunk factory 返回 exports，占位 mountEditor 能挂载并在 destroy 后清干净', () => {
+check('chunk factory 返回 exports；真实 mountEditor 在非 DOM 环境给出可读错误', () => {
   const definition = evaluateRegistration('client.bpmn.js')
   A.equal(typeof definition.factory, 'function')
   const chunk = definition.factory(nodeRequire)
   A.equal(typeof chunk.version, 'string')
   A.ok(chunk.version.length > 0, 'chunk 有 version')
   A.equal(typeof chunk.mountEditor, 'function')
+  A.equal(typeof chunk.BPMN_EDITOR_CSS, 'string', 'chunk 自带官方样式 + 主题桥接')
+  A.ok(chunk.BPMN_EDITOR_CSS.includes('--bio-surface'), '主题桥接含 --bio-* 映射')
+  A.ok(chunk.BPMN_EDITOR_CSS.includes('data:font/woff2;base64,'), '字体已内联为 woff2 data URI')
+  A.ok(!/url\(\s*['"]?(?:\.\.?\/|https?:)/.test(chunk.BPMN_EDITOR_CSS), '样式里没有外部 url()')
 
-  const created = []
-  const fakeDocument = {
-    createElement(tag) {
-      const element = {
-        tagName: String(tag).toUpperCase(),
-        className: '',
-        textContent: '',
-        parentNode: null,
-        attributes: {},
-        setAttribute(name, value) { this.attributes[name] = String(value) },
-      }
-      created.push(element)
-      return element
-    },
+  // 步骤 3 起 mountEditor 会创建真实 Modeler：非 DOM 容器必须同步抛可读错误，
+  // 而不是静默挂一个占位节点。真实浏览器挂载由 test/client-bpmn.browser.test.mjs 覆盖。
+  let thrown = null
+  try {
+    chunk.mountEditor(null, {})
+  } catch (error) {
+    thrown = error
   }
-  const container = {
-    ownerDocument: fakeDocument,
-    children: [],
-    appendChild(element) {
-      element.parentNode = this
-      this.children.push(element)
-      return element
-    },
-    removeChild(element) {
-      const index = this.children.indexOf(element)
-      if (index >= 0) this.children.splice(index, 1)
-      element.parentNode = null
-      return element
-    },
-  }
-  const editor = chunk.mountEditor(container, { placeholderText: '占位' })
-  A.equal(container.children.length, 1, '挂载后容器里有占位节点')
-  A.equal(container.children[0].attributes['data-bpmn-chunk'], 'client.bpmn.js')
-  A.equal(container.children[0].textContent, '占位')
-  A.equal(editor.isDestroyed(), false)
-  editor.destroy()
-  A.equal(container.children.length, 0, 'destroy 后占位节点被移除')
-  A.equal(editor.isDestroyed(), true)
-  editor.destroy()
-  A.equal(container.children.length, 0, '重复 destroy 不抛错也不重复删除')
+  A.ok(thrown && typeof thrown.message === 'string', 'mountEditor(null) 抛错')
+  A.equal(thrown.name, 'TypeError', '错误类型是 TypeError（跨 vm realm 只比名字）')
+  A.match(thrown.message, /DOM 容器/, '错误信息说明需要 DOM 容器')
 })
 
 check('画布壳使用相对 chunk 名，且顶层不 import bpmn-js / 不读 document', () => {

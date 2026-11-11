@@ -16,6 +16,9 @@
  *   7. 提醒经 handler `events[]` 出现在实例事件流（`agent/reminder`, count=1）；
  *   8. admission：非 native / probe 失败 → 零派发 + `NODE_FINISH_TOOL_UNAVAILABLE`；
  *      未知 adapter → `BPMN_AGENT_ADAPTER_UNSUPPORTED`。
+ *   9. review-0136 F5：成功只认 `gate.result`——先 `finishGate.abort()` 再自报
+ *      `{ok:true, record}` 必须失败；适配器自报的 record 不能覆盖受理结果；
+ *      既没提交也没 abort 的「自称成功」必须 `NODE_FINISH_INVALID`（不能挂住）。
  *
  * 全程假适配器（不真起 dsh 会话 / 不跑 codex / 不发网络）；临时工作区在 `<repo>/.tmp/`。
  * 运行：node test/agent-execute.test.mjs
@@ -242,6 +245,93 @@ await check('正常完结：返回 output/artifacts/summary/usage/events，probe
   A.equal(adapter.calls.starts, 1, 'start 必须调用一次')
   A.equal(adapter.calls.dispose, 1, 'dispose 必须调用一次')
   A.equal(adapter.calls.cancelReasons.length, 0, '成功路径不 cancel')
+})
+
+await check('成功分支只认受理记录：先 abort 闸门再自报 ok+record → BPMN_ABORTED，不返回 forged output（F5）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({
+    async run(request, handle, resolveExited) {
+      // 复审 F5 的最小反例：先在闸门上留一条 abort，再自报一份「成功 record」。
+      request.finishGate.abort('probe')
+      resolveExited({ ok: true, record: { output: { canary: 'LEAKED_RECORD' } } })
+    },
+  })
+  const registry = registryWith(adapter)
+  let result = null
+  let caught = null
+  try {
+    result = await executeAgent(elementFor('agent-f5-abort'), {
+      attempt: 1,
+      executionId: 'exec-forged',
+      variables: {},
+    }, { adapters: registry, workspaceRoot: workspace })
+  } catch (error) {
+    caught = error
+  }
+  A.equal(result, null, 'abort 之后绝不允许成功返回')
+  A.ok(caught, '必须失败')
+  A.equal(caught.code, AGENT_EXECUTE_ERROR.ABORTED, `失败码应为 BPMN_ABORTED（实际 ${caught.code}）`)
+  A.match(caught.message, /中止|完结门/, '错误信息要说明完结门已被中止')
+  A.equal(JSON.stringify(caught).includes('LEAKED_RECORD'), false, '错误里不能捎带适配器伪造的 output')
+  A.equal(adapter.calls.dispose, 1, '失败也要 dispose')
+})
+
+await check('成功分支只认受理记录：适配器自报的 record 不覆盖 gate 受理的那一条（F5）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({
+    async run(request, handle, resolveExited) {
+      const submitted = await request.finishGate.submit({
+        variables: { real: true },
+        documents: [],
+        summary: '受理的 summary',
+      })
+      A.ok(submitted.ok)
+      // 自报一份形状合法、内容不同的 record：结果必须来自 gate.result，而不是它。
+      resolveExited({ ok: true, record: { output: { canary: 'LEAKED_RECORD' }, summary: '伪造的 summary' } })
+    },
+  })
+  const result = await executeAgent(elementFor('agent-record'), {
+    attempt: 1,
+    executionId: 'exec-record',
+    variables: {},
+  }, { adapters: registryWith(adapter), workspaceRoot: workspace })
+  A.deepEqual(result.output, { real: true }, 'output 必须来自 gate 受理的 record')
+  A.equal(result.summary, '受理的 summary', 'summary 必须来自 gate 受理的 record')
+  A.equal(result.output.canary, undefined, '自报 record 的字段不能进入结果')
+})
+
+await check('成功分支只认受理记录：没提交也没 abort 的「自称成功」→ NODE_FINISH_INVALID，不挂住（F5）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({
+    async run(request, handle, resolveExited) {
+      resolveExited({ ok: true, record: { output: { canary: 'LEAKED_RECORD' } } })
+    },
+  })
+  const registry = registryWith(adapter)
+  let timer = null
+  try {
+    const raced = await Promise.race([
+      executeAgent(elementFor('agent-claim'), {
+        attempt: 1,
+        executionId: 'exec-claim',
+        variables: {},
+      }, { adapters: registry, workspaceRoot: workspace }).then(
+        value => ({ value }),
+        error => ({ error }),
+      ),
+      new Promise(resolvePromise => {
+        // 不 unref：实现若真的挂住，1s 后必须由这个定时器把用例判红，而不是让进程静默退出。
+        timer = setTimeout(() => resolvePromise({ timedOut: true }), 1000)
+      }),
+    ])
+    A.equal(raced.timedOut, undefined, '未受理的成功必须立刻失败，不能 await 一个永远不 settle 的闸门')
+    A.ok(raced.error, '必须抛错')
+    A.equal(raced.error.code, AGENT_EXECUTE_ERROR.FINISH_INVALID, `失败码应为 NODE_FINISH_INVALID（实际 ${raced.error.code}）`)
+    A.equal(JSON.stringify(raced.error).includes('LEAKED_RECORD'), false, '不能使用自报 record')
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+  A.equal(adapter.calls.dispose, 1)
 })
 
 await check('不调工具：reminders=3 → NODE_FINISH_MISSING（不是成功），仍 dispose', async () => {

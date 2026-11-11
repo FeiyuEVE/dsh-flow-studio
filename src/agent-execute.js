@@ -15,7 +15,8 @@
  * resolveAdapter / admit(probe → assertFinishToolNative)
  *   └─ createFinishGate(executionId, nodeId, attempt, workspaceRoot)
  *        └─ adapter.start({ element, ctx, finishGate, workspaceRoot, reminder })
- *             ├─ handle.exited 先到 → 成功（gate 必须已 settled）或结构化失败
+ *             ├─ handle.exited 先到 → 成功只取 `await gate.result`（必须 finished）；
+ *             │    gate 已 abort / 未受理 → 失败，绝不采用适配器自报的 record
  *             ├─ 有效时限先到 → adapter.cancel(handle, 'timeout') → BPMN_ACTIVITY_TIMEOUT
  *             └─ ctx.signal abort 先到 → adapter.cancel(handle, 'aborted') → BPMN_ABORTED
  *        └─ finally: gate.abort（未完结时）+ adapter.dispose(handle)
@@ -36,7 +37,7 @@ import { resolve as resolvePath } from 'node:path'
 import {
   ADAPTER_ERROR, AdapterError, assertFinishToolNative,
 } from './agent-adapter.js'
-import { createFinishGate } from './node-finish.js'
+import { NODE_FINISH_ERROR, createFinishGate } from './node-finish.js'
 
 /** 处理器错误码（runtime 把它们写进 `instance.lastError.code`）。 */
 export const AGENT_EXECUTE_ERROR = Object.freeze({
@@ -538,22 +539,30 @@ export async function runAgentNode(options = {}) {
 
     const outcome = isPlainObject(first.outcome) ? first.outcome : {}
     if (outcome.ok === true) {
-      // 11 §1.5：完成只认闸门受理的那一条 record；适配器不能「自称完成」。
+      // 11 §1.5 / review-0136 F5：完成只认闸门**受理**的那一条 record。
+      // 适配器的 `outcome.record` 只是它自报的副本，不能替代提交结果——先 abort
+      // 再报 ok 的适配器因此必须失败，而不是拿着伪造 record 成功返回。
       if (!gate.settled()) {
         throw agentHandlerError(
           AGENT_EXECUTE_ERROR.FINISH_INVALID,
-          `适配器 ${adapter.id} 回报成功，但 ${FINISH_TOOL_NAME} 闸门没有受理过任何提交`,
+          `适配器 ${adapter.id} 回报成功，但 ${FINISH_TOOL_NAME} 闸门既没有受理提交也没有被中止`,
           { elementId: nodeId, activityId: executionId, adapter: adapter.id },
         )
       }
       let record
       try {
-        record = isPlainObject(outcome.record) ? outcome.record : await gate.result
+        // settled() 为真时只有两种状态：finished（result resolve）或 aborted（result reject）。
+        record = await gate.result
       } catch (error) {
+        const aborted = Boolean(error)
+          && (error.aborted === true || error.code === NODE_FINISH_ERROR.ABORTED)
         throw agentHandlerError(
-          error && typeof error.code === 'string' ? error.code : AGENT_EXECUTE_ERROR.FINISH_INVALID,
-          `节点 ${nodeId} 的完结记录不可用：${errorText(error)}`,
-          { elementId: nodeId, activityId: executionId, cause: error },
+          aborted ? AGENT_EXECUTE_ERROR.ABORTED : AGENT_EXECUTE_ERROR.FINISH_INVALID,
+          aborted
+            ? `适配器 ${adapter.id} 回报成功，但完结门已被中止（${errorText(error)}）：`
+              + `成功结果只认 ${FINISH_TOOL_NAME} 受理的 record，自报 record 一律不采用`
+            : `节点 ${nodeId} 的完结记录不可用：${errorText(error)}`,
+          { elementId: nodeId, activityId: executionId, adapter: adapter.id, cause: error },
         )
       }
       if (!isPlainObject(record) || !isPlainObject(record.output)) {

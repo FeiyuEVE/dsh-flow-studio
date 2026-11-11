@@ -3,13 +3,21 @@
 #
 # 用法：
 #   bash scripts/e2e-bpmn.sh          # 打包当前仓库 → 装进测试台容器 → 重启容器内 dsh → 只走 HTTP 跑完整链路
-#   KEEP=1 bash scripts/e2e-bpmn.sh   # 失败时保留现场（默认也打印取证；KEEP 只影响是否清理旧证据）
+#   TESTBED_CONTAINER=dsh-testbed-x TESTBED_PORT=3120 bash scripts/e2e-bpmn.sh
 #
-# 环境变量覆盖：TESTBED_CONTAINER（默认 dsh-testbed-bpmn）、TESTBED_PORT（默认 3110）、KEEP。
+# 环境变量覆盖：TESTBED_CONTAINER（默认 dsh-testbed-bpmn）、TESTBED_PORT（默认 3110）、
+#   E2E_RUN_ID（测试用；默认「时间戳-pid」，决定本次证据子目录名）、
+#   E2E_PREFLIGHT_ONLY=1（测试用：只跑前置身份校验后退出，不做安装 / 杀进程）。
 #
 # 边界：
 #   - 只读宿主 dsh-web（systemctl is-active / ActiveEnterTimestamp），绝不重启、不碰宿主 ~/.dsh。
-#   - 容器内测试台根 /testbed；所有临时产物落在仓库 .tmp/e2e-bpmn/（已 gitignore）。
+#   - **先身份校验、后破坏性操作**：容器在跑 / 端口映射 / PID+NET namespace 隔离 / 挂载 /
+#     监听 3080 的进程 / 用容器日志令牌登录 303 全部通过，才允许安装 profile 与杀进程。
+#   - 只终止本容器内**监听 3080 的 dsh**（socket inode 反查 PID，再核对 comm/cwd/cmdline），
+#     不按 `pkill node` 一把杀。
+#   - 容器内测试台根 /testbed；证据按运行隔离到仓库 .tmp/e2e-bpmn/<runId>/（已 gitignore），
+#     并用 .tmp/e2e-bpmn/.e2e-bpmn.lock 串行化——并行运行会互相改 lib/ 与测试台，直接拒绝。
+#     旧版本平铺在 .tmp/e2e-bpmn/ 下的证据只作兼容读取，不删除。
 #   - 安装必须走包管理器：拷 tgz → sed profile 依赖 → pnpm install，不手工解包。
 #
 # 为什么这里单独起一个 FLOW_STUDIO_TOKEN：
@@ -20,7 +28,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CONTAINER="${TESTBED_CONTAINER:-dsh-testbed-bpmn}"
 PORT="${TESTBED_PORT:-3110}"
-KEEP="${KEEP:-0}"
+# 测试用：只跑前置身份校验就退出，供无副作用演练（正常验收不需要设置）。
+PREFLIGHT_ONLY="${E2E_PREFLIGHT_ONLY:-0}"
 
 GUEST_ROOT="/testbed"
 GUEST_HOME="$GUEST_ROOT/home"
@@ -35,8 +44,14 @@ BPMN_BASE=""
 BASE="http://127.0.0.1:$PORT/api/flow-studio"
 ORIGIN="http://127.0.0.1:$PORT"
 VERSION="$(node -p "require('$REPO/package.json').version")"
-EVID="$REPO/.tmp/e2e-bpmn"
+# 证据按运行隔离：runId 带时间戳与 pid；旧版本的平铺文件不再读写。
+EVID_BASE="$REPO/.tmp/e2e-bpmn"
+RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}"
+EVID="$EVID_BASE/$RUN_ID"
+LOCK="$EVID_BASE/.e2e-bpmn.lock"
+LOCK_DIR="$LOCK.d"
 JAR="$EVID/cookies.txt"
+PRE_JAR="$EVID/preflight-cookies.txt"
 TOKEN="bpmn-$(node -e 'process.stdout.write(require("crypto").randomBytes(24).toString("hex"))')"
 
 say() { printf '\033[1;34m==> \033[0m%s\n' "$*"; }
@@ -88,36 +103,147 @@ assert_true() {
   [ "$actual" = "true" ] || die "$msg（实际：${actual:-空}）"
 }
 
+# ---------------------------------------------------------------------------
+# 容器身份校验（review-0136 F6）
+#
+# 破坏性操作之前必须先证明「宿主 $PORT 上的服务就是容器 $CONTAINER 里的这次 dsh」：
+# 端口映射、PID/NET namespace、挂载、监听 3080 的进程、容器日志令牌登录 303。
+# ---------------------------------------------------------------------------
+
+# 容器内监听 3080 的进程（JSON 数组：pid / comm / cwd / cmdline）。
+# 用 node 读 /proc/net/tcp{,6} 的 LISTEN socket inode，再按 fd 反查 PID，
+# 不依赖容器里有没有 ss / lsof；宿主网络或共享 PID namespace 会在上层被拒。
+guest_listeners() {
+  docker exec -i \
+    -e "PATH=$GUEST_PREFIX/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$CONTAINER" node -e '
+const fs = require("fs")
+const portHex = (3080).toString(16).toUpperCase().padStart(4, "0")
+const inodes = new Set()
+for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+  let text
+  try { text = fs.readFileSync(file, "utf8") } catch { continue }
+  for (const line of text.split("\n").slice(1)) {
+    const cols = line.trim().split(/\s+/)
+    if (cols.length < 10) continue
+    if (!cols[1].endsWith(":" + portHex)) continue
+    if (cols[3] !== "0A") continue
+    inodes.add(cols[9])
+  }
+}
+const read = path => { try { return fs.readFileSync(path, "utf8") } catch { return "" } }
+const readlink = path => { try { return fs.readlinkSync(path) } catch { return "" } }
+const rows = []
+for (const name of fs.readdirSync("/proc")) {
+  if (!/^[0-9]+$/.test(name)) continue
+  const dir = "/proc/" + name
+  let fds
+  try { fds = fs.readdirSync(dir + "/fd") } catch { continue }
+  let hit = false
+  for (const fd of fds) {
+    const match = /^socket:\[([0-9]+)\]$/.exec(readlink(dir + "/fd/" + fd))
+    if (match && inodes.has(match[1])) { hit = true; break }
+  }
+  if (!hit) continue
+  rows.push({
+    pid: Number(name),
+    comm: read(dir + "/comm").trim(),
+    cwd: readlink(dir + "/cwd"),
+    cmdline: read(dir + "/cmdline").split("\0").filter(Boolean).join(" "),
+  })
+}
+process.stdout.write(JSON.stringify(rows))
+'
+}
+
+# 校验监听 3080 的进程确实是本容器的 dsh；失败打印期望/实际并退出。PID 列表写入
+# VERIFIED_PIDS（不用命令替换，确保 die 真的终止主脚本而不是只退出子 shell）。
+VERIFIED_PIDS=""
+verify_guest_dsh() {
+  local raw="$1" count pids bad
+  count="$(printf '%s' "$raw" | jqr 'Array.isArray(j)?j.length:-1')"
+  case "$count" in
+    ''|-1)
+      die "容器 $CONTAINER 内读不出 /proc 监听信息（期望读到监听 3080 的 dsh 进程，实际：$(printf '%.300s' "$raw")）" ;;
+    0)
+      die "容器 $CONTAINER 内没有进程监听 3080——宿主 $PORT 上的服务不属于该容器（期望该容器内有一个 dsh 监听 3080）" ;;
+  esac
+  pids="$(printf '%s' "$raw" | jqr 'j.map(x=>x.pid).join(" ")')"
+  [ -n "$pids" ] || die "容器 $CONTAINER 内监听 3080 的 PID 解析失败（实际：$(printf '%.300s' "$raw")）"
+  bad="$(printf '%s' "$raw" | jqr 'j.filter(x=>x.comm!=="node"&&x.comm!=="MainThread").map(x=>"pid "+x.pid+" comm="+x.comm).join("；")')"
+  [ -z "$bad" ] || die "监听 3080 的进程 comm 不是 node/MainThread（期望 node|MainThread，实际：$bad）"
+  bad="$(printf '%s' "$raw" | jqr "j.filter(x=>!String(x.cwd).startsWith('$GUEST_ROOT/')).map(x=>'pid '+x.pid+' cwd='+x.cwd).join('；')")"
+  [ -z "$bad" ] || die "监听 3080 的进程 cwd 不在测试台根 $GUEST_ROOT 下（期望 $GUEST_ROOT/...，实际：$bad）"
+  bad="$(printf '%s' "$raw" | jqr "j.filter(x=>!String(x.cmdline).includes('$GUEST_PREFIX/bin/dsh')).map(x=>'pid '+x.pid+' cmdline='+x.cmdline).join('；')")"
+  [ -z "$bad" ] || die "监听 3080 的进程不是测试台 dsh（期望 cmdline 含 $GUEST_PREFIX/bin/dsh，实际：$bad）"
+  VERIFIED_PIDS="$pids"
+}
+
+# 宿主侧 namespace 标识：优先 /proc/1/ns/<kind>，读不到（受限沙箱 / 权限）退到 /proc/self。
+host_ns() {
+  local value=""
+  value="$(readlink "/proc/1/ns/$1" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(readlink "/proc/self/ns/$1" 2>/dev/null || true)"
+  printf '%s' "$value"
+}
+
+# 容器内某个 namespace 的标识（readlink /proc/1/ns/<kind>）。
+guest_ns() {
+  docker exec -i "$CONTAINER" sh -c "readlink /proc/1/ns/$1" 2>/dev/null | tr -d '\r\n' || true
+}
+
+# 容器内路径的 dev:inode（node 一定在，避免宿主 stat 与 busybox 参数差异）。
+guest_path_id() {
+  docker exec -i -e "PATH=$GUEST_PREFIX/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -e "TARGET_PATH=$1" "$CONTAINER" node -e '
+try {
+  const st = require("fs").statSync(process.env.TARGET_PATH)
+  process.stdout.write(st.dev + ":" + st.ino)
+} catch {
+  process.exit(3)
+}
+'
+}
+
+EVID_READY=0
+PREFLIGHT_OK=0
+LOCK_KIND=""
 on_exit() {
   local rc=$1
-  if [ "$rc" -ne 0 ]; then
+  if [ "$rc" -ne 0 ] && [ "$EVID_READY" = "1" ]; then
     printf '\n'
-    say "失败取证（rc=$rc）：容器日志尾部 + 最近 HTTP 响应"
-    docker exec -i "$CONTAINER" sh -c "tail -80 $GUEST_LOG 2>/dev/null" 2>/dev/null || true
-    for f in "$EVID/last-response.json" "$EVID/definition-save.json" "$EVID/instance.json" "$EVID/events.json"; do
-      [ -f "$f" ] || continue
-      printf '\n--- %s ---\n' "${f#"$REPO"/}"
-      head -c 4000 "$f" || true
-      printf '\n'
-    done
-    printf '\n证据目录：%s（KEEP=%s；容器测试数据未清理）\n' "${EVID#"$REPO"/}" "$KEEP"
+    if [ "$PREFLIGHT_OK" = "1" ]; then
+      say "失败取证（rc=$rc）：容器日志尾部 + 最近 HTTP 响应"
+      docker exec -i "$CONTAINER" sh -c "tail -80 $GUEST_LOG 2>/dev/null" 2>/dev/null || true
+      for f in "$EVID/last-response.json" "$EVID/definition-save.json" "$EVID/instance.json" "$EVID/events.json"; do
+        [ -f "$f" ] || continue
+        printf '\n--- %s ---\n' "${f#"$REPO"/}"
+        head -c 4000 "$f" || true
+        printf '\n'
+      done
+    else
+      say "失败发生在容器身份校验之前/之中：不读取该容器日志、不改测试台，现场未被触碰"
+    fi
+    printf '\n证据目录：%s（本次现场保留；其它运行的证据不会被清理）\n' "${EVID#"$REPO"/}"
+  fi
+  if [ "$LOCK_KIND" = "mkdir" ]; then
+    rm -rf "$LOCK_DIR"
   fi
 }
 trap 'on_exit $?' EXIT
 
-mkdir -p "$EVID"
-if [ "$KEEP" != "1" ]; then
-  # 只清本脚本自己的旧产物，不 rm 整个目录（外部 tee 的 run.log 等不该被误删）。
-  rm -f "$EVID"/feiyueve-dsh-flow-studio-*.tgz \
-        "$EVID"/health.json "$EVID"/index.html "$EVID"/client.bpmn.js \
-        "$EVID"/installed-client.bpmn.js "$EVID"/definitions.json \
-        "$EVID"/definition.json "$EVID"/definition-save.json \
-        "$EVID"/definition.xml "$EVID"/definition-body.json \
-        "$EVID"/instance-body.json "$EVID"/instance.json \
-        "$EVID"/complete-body.json "$EVID"/complete.json \
-        "$EVID"/events.json "$EVID"/instance-definition.json \
-        "$EVID"/instances-after-cleanup.json "$EVID"/definitions-after-cleanup.json
+# 串行化：并发运行会同时改 lib/、同一容器与同一端口，必须互斥。
+mkdir -p "$EVID_BASE"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  flock -n 9 || die "另一个 e2e-bpmn 运行正在使用测试台（锁 ${LOCK#"$REPO"/}）；并行运行会互相改构建产物与测试台，已拒绝"
+else
+  mkdir "$LOCK_DIR" 2>/dev/null || die "另一个 e2e-bpmn 运行正在使用测试台（锁 ${LOCK_DIR#"$REPO"/}）"
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+  LOCK_KIND="mkdir"
 fi
+mkdir -p "$EVID"
+EVID_READY=1
 
 # 每次跑都用新的定义 id，避免上一轮残留把「新建」断言变成「更新」。
 DEF_ID="e2e-bpmn-$(date +%s)-$$"
@@ -128,12 +254,96 @@ HOST_DSH_ACTIVE_BEFORE="$(systemctl is-active dsh-web 2>/dev/null || true)"
 HOST_DSH_START_BEFORE="$(systemctl show -p ActiveEnterTimestamp --value dsh-web 2>/dev/null || true)"
 printf '    dsh-web active=%s ActiveEnterTimestamp=%s\n' "$HOST_DSH_ACTIVE_BEFORE" "$HOST_DSH_START_BEFORE"
 
-say "1. 前置检查"
+say "1. 前置检查：先在容器身份 / 端口对应上失败，绝不先杀进程或装 profile"
 [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" = "true" ] \
   || die "容器 $CONTAINER 不存在或未运行"
 ok "容器 $CONTAINER 在运行"
+
+# 1a. 端口映射：容器 3080 的每一条宿主映射都必须正好是 TESTBED_PORT。
+PORT_MAP="$(docker port "$CONTAINER" 3080 2>/dev/null || true)"
+[ -n "$PORT_MAP" ] || die "容器 $CONTAINER 没有发布容器端口 3080（期望映射到宿主 $PORT，实际：docker port 为空）"
+MAPPED_PORTS="$(printf '%s\n' "$PORT_MAP" | sed -E 's/.*:([0-9]+)$/\1/' | sort -u)"
+[ -n "$MAPPED_PORTS" ] || die "读不出容器 $CONTAINER 的 3080 宿主端口（docker port 实际：$PORT_MAP）"
+BAD_MAPPED=""
+for mapped in $MAPPED_PORTS; do
+  case "$mapped" in
+    ''|*[!0-9]*) BAD_MAPPED="$BAD_MAPPED $mapped" ;;
+    *) [ "$mapped" = "$PORT" ] || BAD_MAPPED="$BAD_MAPPED $mapped" ;;
+  esac
+done
+[ -z "$BAD_MAPPED" ] || die "端口映射错配：期望宿主端口 $PORT（TESTBED_PORT），但容器 $CONTAINER 的 3080 映射到了$(printf '%s' "$BAD_MAPPED")（docker port 实际：$(printf '%s' "$PORT_MAP" | tr '\n' ' ')）"
+ok "端口映射对应：容器 $CONTAINER:3080 → 宿主 $PORT（docker port：$(printf '%s' "$PORT_MAP" | tr '\n' ' ')）"
+
 curl -s -m 5 -o /dev/null "$ORIGIN/" || die "宿主端口 $PORT 不可达（$ORIGIN/）"
 ok "宿主端口 $PORT 可达"
+
+# 1b. PID / NET namespace 必须与宿主隔离；共享 namespace 时 /proc 扫描与端口归属都不可信。
+PID_MODE="$(docker inspect -f '{{.HostConfig.PidMode}}' "$CONTAINER" 2>/dev/null || true)"
+case "$PID_MODE" in
+  host|container:*) die "容器 $CONTAINER 的 PidMode=$PID_MODE（期望私有 PID namespace；共享时会误伤宿主或别的容器进程）" ;;
+esac
+NET_MODE="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER" 2>/dev/null || true)"
+case "$NET_MODE" in
+  host|container:*) die "容器 $CONTAINER 的 NetworkMode=$NET_MODE（期望私有 network namespace；共享时宿主端口 $PORT 不能证明属于该容器）" ;;
+esac
+HOST_PID_NS="$(host_ns pid)"
+GUEST_PID_NS="$(guest_ns pid)"
+[ -n "$HOST_PID_NS" ] || die "宿主读不到 /proc/1/ns/pid 或 /proc/self/ns/pid"
+[ -n "$GUEST_PID_NS" ] || die "容器 $CONTAINER 内读不到 /proc/1/ns/pid（期望独立 PID namespace）"
+[ "$HOST_PID_NS" != "$GUEST_PID_NS" ] \
+  || die "容器 $CONTAINER 与宿主共用 PID namespace（宿主=$HOST_PID_NS，容器=$GUEST_PID_NS）：/proc 扫描会看到宿主进程，拒绝继续"
+HOST_NET_NS="$(host_ns net)"
+GUEST_NET_NS="$(guest_ns net)"
+[ -n "$HOST_NET_NS" ] || die "宿主读不到 /proc/1/ns/net 或 /proc/self/ns/net"
+[ -n "$GUEST_NET_NS" ] || die "容器 $CONTAINER 内读不到 /proc/1/ns/net（期望独立 network namespace）"
+[ "$HOST_NET_NS" != "$GUEST_NET_NS" ] \
+  || die "容器 $CONTAINER 与宿主共用 network namespace（宿主=$HOST_NET_NS，容器=$GUEST_NET_NS）：宿主端口 $PORT 不能证明属于该容器，拒绝继续"
+ok "namespace 隔离：PID（宿主 $HOST_PID_NS / 容器 $GUEST_PID_NS）、NET（宿主 $HOST_NET_NS / 容器 $GUEST_NET_NS）均独立"
+
+# 1c. 挂载：不能把宿主 ~/.dsh 挂进测试台；容器内测试台数据目录也不能与它是同一份。
+HOST_DSH_DIR="$(readlink -f "${HOME:-}/.dsh" 2>/dev/null || true)"
+[ -n "$HOST_DSH_DIR" ] || HOST_DSH_DIR="${HOME:-}/.dsh"
+MOUNT_SOURCES="$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
+while IFS= read -r mount_src; do
+  [ -n "$mount_src" ] || continue
+  case "$mount_src" in
+    "$HOST_DSH_DIR"|"$HOST_DSH_DIR"/*)
+      die "挂载错配：容器 $CONTAINER 挂载了宿主 $HOST_DSH_DIR（实际挂载：$(printf '%s' "$MOUNT_SOURCES" | tr '\n' ' ')）；期望测试台数据目录是容器内独立目录 $GUEST_HOME" ;;
+  esac
+done <<< "$MOUNT_SOURCES"
+if [ -d "$HOST_DSH_DIR" ]; then
+  HOST_DSH_ID="$(stat -Lc '%d:%i' "$HOST_DSH_DIR" 2>/dev/null || true)"
+  GUEST_HOME_ID="$(guest_path_id "$GUEST_HOME" || true)"
+  [ -n "$GUEST_HOME_ID" ] \
+    || die "容器 $CONTAINER 内读不到测试台数据目录 $GUEST_HOME 的 dev:inode（期望它是容器内独立目录）"
+  [ "$HOST_DSH_ID" != "$GUEST_HOME_ID" ] \
+    || die "测试台数据目录 $GUEST_HOME 就是宿主 $HOST_DSH_DIR（dev:inode=$GUEST_HOME_ID 相同）：拒绝在宿主 home 上跑测试"
+  ok "挂载隔离：测试台 $GUEST_HOME（dev:inode=$GUEST_HOME_ID）不是宿主 $HOST_DSH_DIR（$HOST_DSH_ID）"
+else
+  ok "挂载隔离：宿主 $HOST_DSH_DIR 不存在，容器未挂载它（实际挂载：$(printf '%s' "$MOUNT_SOURCES" | tr '\n' ' ')）"
+fi
+
+# 1d. 监听 3080 的 PID 必须属于该容器，且就是测试台 dsh。
+LISTENERS="$(guest_listeners || true)"
+verify_guest_dsh "$LISTENERS"
+LISTENER_PIDS="$VERIFIED_PIDS"
+ok "容器内监听 3080 的进程：PID $LISTENER_PIDS（comm/cwd/cmdline 已核对属于本容器）"
+
+# 1e. 端口归属：用容器日志里的令牌登录，303 才能证明端口上的服务就是该容器这次启动的 dsh。
+PRE_LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_LOG 2>/dev/null | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n' || true)"
+[ -n "$PRE_LOGIN_TOKEN" ] \
+  || die "容器 $CONTAINER 的日志 $GUEST_LOG 里取不到登录令牌（期望本次启动的 dsh 写过 token=...；实际为空）"
+rm -f "$PRE_JAR"
+PRE_LOGIN_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -c "$PRE_JAR" "$ORIGIN/?token=$PRE_LOGIN_TOKEN")"
+assert_eq "$PRE_LOGIN_CODE" "303" "端口归属错配：宿主端口 $PORT 上的服务不是容器 $CONTAINER 这次启动的 dsh（用该容器日志令牌登录）"
+ok "端口归属对应：用容器日志令牌登录返回 303，$ORIGIN 就是容器 $CONTAINER 的 dsh"
+# 从这里开始才允许读取 / 改动测试台（安装 profile / 杀进程都在后面）。
+PREFLIGHT_OK=1
+
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  say "E2E_PREFLIGHT_ONLY=1：前置身份校验通过，按请求在任何安装 / 杀进程之前退出"
+  exit 0
+fi
 
 # 前置要求容器里有 git 与 pnpm。git 只在缺少时补装（容器内，不碰宿主）。
 if ! dex_sh 'command -v git >/dev/null 2>&1'; then
@@ -179,11 +389,17 @@ cmp -s "$EVID/installed-client.bpmn.js" "$REPO/lib/client.bpmn.js" \
   || die "容器内 lib/client.bpmn.js 与仓库构建产物不一致（装的不是本轮构建）"
 ok "容器内版本 $INSTALLED_VERSION，lib/client.bpmn.js 与仓库逐字节一致（$(stat -c '%s' "$REPO/lib/client.bpmn.js") 字节）"
 
-say "4. 重启容器内 dsh（按 /proc comm 精确杀 node / MainThread）"
-# 只按 comm 匹配（等价 pkill -x）：sh -c 自身的命令行里也含启动命令，-f 会连自己一起杀；
-# node 主线程名可能是 MainThread，只杀 node 会漏。
-dex_sh 'for p in /proc/[0-9]*; do n=$(cat "$p/comm" 2>/dev/null) || continue; \
-  case "$n" in MainThread|node) kill "${p#/proc/}" 2>/dev/null ;; esac; done'
+say "4. 重启容器内 dsh（只终止本容器内监听 3080 的 dsh 进程）"
+# review-0136 F6：不能按 comm 一把杀。先按 socket inode 找到监听 3080 的 PID，
+# 再核对 comm / cwd / cmdline；任何一项不符就拒绝动手，避免杀掉容器里别的 node。
+KILL_JSON="$(guest_listeners || true)"
+verify_guest_dsh "$KILL_JSON"
+KILL_PIDS="$VERIFIED_PIDS"
+[ -n "$KILL_PIDS" ] || die "端口 $PORT 仍在监听，但容器 $CONTAINER 内找不到对应的 dsh 进程；拒绝盲杀"
+for pid in $KILL_PIDS; do
+  dex_sh "kill $pid 2>/dev/null || true"
+done
+ok "已终止容器内 dsh PID：$KILL_PIDS（仅限监听 3080 且 comm/cwd/cmdline 核对通过）"
 # 等端口真正释放，避免新进程起在旧进程占用的 3080 上（那样冒烟看到的还是旧进程）。
 OLD_GONE=0
 for _ in $(seq 1 40); do
@@ -207,10 +423,14 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 [ "$PORT_UP" = "1" ] || die "容器内 dsh 启动后端口 $PORT 仍不可达"
-ok "容器内 dsh 已重启（$ORIGIN/ 返回 $CODE）"
+# 重启后端口上的服务也必须是本容器内的 dsh（防止端口被别人先占用）。
+NEW_LISTENERS="$(guest_listeners || true)"
+verify_guest_dsh "$NEW_LISTENERS"
+NEW_PIDS="$VERIFIED_PIDS"
+ok "容器内 dsh 已重启（$ORIGIN/ 返回 $CODE，监听 3080 的 PID：$NEW_PIDS）"
 
 say "5. 登录换 cookie"
-LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_LOG | head -1 | cut -d= -f2" | tr -d '\r\n')"
+LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_LOG 2>/dev/null | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n' || true)"
 [ -n "$LOGIN_TOKEN" ] || { dex_sh "tail -20 $GUEST_LOG" || true; die "没能从容器日志取到登录令牌"; }
 rm -f "$JAR"
 LOGIN_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -c "$JAR" "$ORIGIN/?token=$LOGIN_TOKEN")"
@@ -451,3 +671,4 @@ ok "宿主 dsh-web 未被触碰：active=$HOST_DSH_ACTIVE_AFTER，ActiveEnterTim
 
 say "全部通过"
 ok "BPMN 域容器验收通过（版本 $VERSION，容器 $CONTAINER）"
+ok "本次证据：${EVID#"$REPO"/}（按运行隔离；其它运行的证据未被清理）"

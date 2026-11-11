@@ -144,6 +144,12 @@ function bpmnRuntimeFor(env) {
       ...(env.bpmnHttpPolicy && typeof env.bpmnHttpPolicy === 'object' ? { httpPolicy: env.bpmnHttpPolicy } : {}),
       ...(env.bpmnHttpPolicies && typeof env.bpmnHttpPolicies === 'object' ? { httpPolicies: env.bpmnHttpPolicies } : {}),
       ...(typeof env.bpmnHttpAuthResolver === 'function' ? { httpAuthResolver: env.bpmnHttpAuthResolver } : {}),
+      // 0.13.10：实例收件箱回复目标只认宿主维护的 ID（嵌入方 / 测试台注入）。
+      ...(env.bpmnInboxReplyTargets && typeof env.bpmnInboxReplyTargets === 'object'
+        ? { inboxReplyTargets: env.bpmnInboxReplyTargets }
+        : {}),
+      ...(typeof env.bpmnInboxSessionDeliver === 'function' ? { inboxSessionDeliver: env.bpmnInboxSessionDeliver } : {}),
+      ...(typeof env.bpmnInboxHttpRequest === 'function' ? { inboxHttpRequest: env.bpmnInboxHttpRequest } : {}),
     })
     bpmnRuntimes.set(env, runtime)
   }

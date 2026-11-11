@@ -152,6 +152,50 @@ function makeFakeAdapters(adapter = makeFakeAdapter()) {
   }
 }
 
+/**
+ * 慢 agent 适配器 + 收件箱能力（0.13.10 路由用例）：
+ * `finishGate` 由测试显式提交，用来在 agent 还在跑时投递消息。
+ */
+function makeSlowMessageAdapter() {
+  const calls = []
+  const delivered = []
+  let finishGate = null
+  let resolveExited = null
+  const adapter = {
+    id: 'dsh',
+    calls,
+    delivered,
+    async probe() {
+      return { version: 'stub', helpDigest: 'stub' }
+    },
+    capabilities() {
+      return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' }, messages: 'native' }
+    },
+    async start(request) {
+      calls.push(request)
+      finishGate = request.finishGate
+      return {
+        exited: new Promise(resolve => { resolveExited = resolve }),
+      }
+    },
+    async deliverMessage(handle, message) {
+      delivered.push({ handle, message })
+      return { ok: true, deliveryUnknown: true }
+    },
+    async cancel() {},
+    async dispose() {},
+  }
+  adapter.finish = async () => {
+    const submitted = await finishGate.submit({
+      variables: { ok: true },
+      documents: [],
+      summary: 'slow-agent-done',
+    })
+    resolveExited({ ok: true, record: submitted.record })
+  }
+  return adapter
+}
+
 function makeEnv(home, opts = {}) {
   return {
     dir: store.flowsDir(home),
@@ -2463,6 +2507,293 @@ try {
       else process.env.FLOW_STUDIO_TOKEN = previousToken
       await new Promise(resolveClose => server.close(() => resolveClose()))
     }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12b. 0.13.10 实例收件箱：消息路由 / 正文 / 回复 / 工具一致性 / 只读
+  // -------------------------------------------------------------------------
+  await check('实例收件箱路由：live agent / 人工 / 未来节点 / 幂等 / 正文 / 回复 / 工具一致', async home => {
+    const slow = makeSlowMessageAdapter()
+    const sessionCalls = []
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(slow),
+      inboxReplyTargets: {
+        'operator-session': { kind: 'session', sessionId: 'approved-session' },
+      },
+      inboxSessionDeliver: async payload => {
+        sessionCalls.push(payload)
+        return { ok: true, deliveryUnknown: true }
+      },
+    })
+    const url = new URL('http://localhost/')
+    const saved = await runtime.handle({
+      method: 'POST',
+      parts: ['definitions'],
+      url,
+      body: { id: 'flow-inbox', name: '收件箱', xml: workflowXml('proc-inbox') },
+    })
+    eq(saved.status, 201, JSON.stringify(saved.body))
+
+    // agent1 卡在慢适配器里：创建请求挂起，直到测试提交 finishGate。
+    const creating = runtime.handle({
+      method: 'POST',
+      parts: ['instances'],
+      url,
+      body: { definitionId: 'flow-inbox' },
+    })
+    const started = await waitUntil(() => slow.calls.length > 0, 3000)
+    eq(started, true, 'agent 已开始执行')
+    const agentCtx = slow.calls[0].ctx
+    const agentExecutionId = agentCtx.executionId
+    ok(typeof agentExecutionId === 'string' && agentExecutionId !== '', '拿到 agent executionId')
+
+    // 精确目标：live agent，投递并幂等。
+    let res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', 'missing-instance', 'messages'],
+      url,
+      body: { messageId: 'm-x', target: { activityId: 'agent1', executionId: agentExecutionId }, text: 'x' },
+    })
+    eq(res.status, 404, '未知实例 404')
+    const instanceId = String((await runtime.handle({
+      method: 'GET', parts: ['instances'], url,
+    })).body.instances[0].id)
+    ok(instanceId.startsWith('i-'), '列表里能拿到实例 id')
+    // adapter.start 已返回，但宿主的 live 登记是在 runAgentNode 的 onStart 里异步完成的：
+    // 等它真登记后再投，避免测试自己制造竞态。
+    const liveRegistered = await waitUntil(() => runtime.inbox.liveExecutions(instanceId)
+      .some(entry => entry.executionId === agentExecutionId), 3000)
+    eq(liveRegistered, true, 'agent execution 已登记 live')
+
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: {
+        messageId: 'm-live',
+        target: { activityId: 'agent1', executionId: agentExecutionId },
+        text: '请补充兼容性说明。',
+        replyTargetId: 'operator-session',
+      },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.message.status, 'injected', '发到 live agent')
+    eq(res.body.message.delivery.deliveryUnknown, true, 'DSH 不承诺 exactly-once')
+    eq(slow.delivered.length, 1, '适配器收到一次投递')
+    eq(slow.delivered[0].message.messageId, 'm-live')
+
+    const duplicate = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: {
+        messageId: 'm-live',
+        target: { activityId: 'agent1', executionId: agentExecutionId },
+        text: '请补充兼容性说明。',
+        replyTargetId: 'operator-session',
+      },
+    })
+    eq(duplicate.status, 200)
+    eq(duplicate.body.duplicate, true, '重复入站幂等')
+    eq(slow.delivered.length, 1, '重复入站不重复投递')
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: {
+        messageId: 'm-live',
+        target: { activityId: 'agent1', executionId: agentExecutionId },
+        text: '不同内容',
+      },
+    })
+    eq(res.status, 409, '同 id 不同内容 409')
+    eq(res.body.code, 'MESSAGE_ID_CONFLICT')
+
+    // 正文接口：短消息内联直接可读。
+    res = await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages', 'm-live', 'body'], url,
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.text, '请补充兼容性说明。')
+
+    // 已结束 / 不存在的 execution：410。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: { messageId: 'm-gone', target: { activityId: 'agent1', executionId: 'exec-gone' }, text: 'x' },
+    })
+    eq(res.status, 410)
+    eq(res.body.code, 'MESSAGE_TARGET_EXPIRED')
+
+    await slow.finish()
+    const created = await creating
+    eq(created.status, 201, JSON.stringify(created.body))
+    eq(created.body.status, 'ACTIVE', '继续走到人工任务')
+
+    // 人工任务进入 wait：等收件箱 live 表登记后再投。
+    const humanTask = (await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'tasks'], url,
+    })).body.tasks[0]
+    ok(humanTask && humanTask.executionId, '人工任务有 executionId')
+    await waitUntil(() => runtime.inbox.liveExecutions(instanceId)
+      .some(entry => entry.kind === 'human' && entry.executionId === humanTask.executionId), 3000)
+
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: {
+        messageId: 'm-human',
+        target: { activityId: 'human1', executionId: humanTask.executionId },
+        text: '人工任务的讨论消息',
+      },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.message.status, 'delivered', '人工任务可投递')
+    eq(res.body.message.delivery.kind, 'human')
+
+    // 未来节点：只排队，不投当前。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: { messageId: 'm-next', target: { activityId: 'agent1', delivery: 'nextActivation' }, text: '下一轮' },
+    })
+    eq(res.status, 200)
+    eq(res.body.message.status, 'queued', '未来节点未激活前排队')
+
+    // 带冒号的 messageId 走 URL 路径时由客户端 encode，运行时负责解码。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: { messageId: 'ext:42', target: { activityId: 'agent1', delivery: 'nextActivation' }, text: '冒号 id' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    res = await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages', 'ext%3A42', 'body'], url,
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.text, '冒号 id', '路径段解码后能读回正文')
+
+    // 超 4 KiB：落盘 + 正文接口逐字节一致。
+    const longText = `长正文：${'兼容性'.repeat(2000)}`
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: { messageId: 'm-long', target: { activityId: 'human1', executionId: humanTask.executionId }, text: longText },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.message.body.kind, 'file')
+    res = await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages', 'm-long', 'body'], url,
+    })
+    eq(res.status, 200)
+    eq(res.body.text, longText, '正文接口逐字节一致')
+
+    // 回复：宿主白名单 session；任意 URL / 非白名单目标被拒。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages', 'm-live', 'replies'],
+      url,
+      body: { replyId: 'r-1', text: '已收到。' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.delivered, true)
+    eq(sessionCalls.length, 1)
+    eq(sessionCalls[0].sessionId, 'approved-session')
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages', 'm-live', 'replies'],
+      url,
+      body: { replyId: 'r-2', url: 'https://evil.example/hook', text: 'x' },
+    })
+    eq(res.status, 400)
+    eq(res.body.code, 'MESSAGE_REPLY_TARGET_ARBITRARY', '任意 URL 被拒')
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages', 'm-live', 'replies'],
+      url,
+      body: { replyId: 'r-3', targetId: 'evil-target', text: 'x' },
+    })
+    eq(res.status, 403, '非白名单目标 403')
+    eq(res.body.code, 'MESSAGE_REPLY_TARGET_UNKNOWN')
+
+    // 工具与路由一致性：未绑定工具写到同一个 inbox，GET 列表能看到。
+    const tools = createInstanceTools({ runtime })
+    const sendTool = tools.find(tool => tool.name === 'flow_instance_send_message')
+    const replyTool = tools.find(tool => tool.name === 'flow_instance_reply')
+    ok(sendTool && replyTool, '注册了 send / reply 工具')
+    const toolResult = await sendTool.execute({
+      instanceId,
+      messageId: 'm-tool',
+      target: { activityId: 'human1', executionId: humanTask.executionId },
+      text: '工具投递',
+    })
+    eq(toolResult.ok, true, JSON.stringify(toolResult))
+    eq(toolResult.message.status, 'delivered')
+    res = await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages'], url: new URL('http://localhost/?limit=100'),
+    })
+    eq(res.status, 200)
+    const listed = res.body.messages.find(item => item.messageId === 'm-tool')
+    ok(listed, '工具写入与路由列表一致')
+    eq(listed.status, 'delivered')
+    const replyResult = await replyTool.execute({
+      instanceId,
+      messageId: 'm-live',
+      replyId: 'r-tool',
+      text: '工具回复',
+    })
+    eq(replyResult.ok, true, JSON.stringify(replyResult))
+    eq(replyResult.reply.status, 'delivered')
+    eq(sessionCalls.length, 2)
+
+    // 只读：新 runtime 读消息 / 正文不启动 runner。
+    const runtimeB = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(),
+    })
+    eq(runtimeB._runners.size, 0, '新 runtime 没有 runner')
+    res = await runtimeB.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages'], url,
+    })
+    eq(res.status, 200)
+    ok(res.body.messages.length >= 5)
+    eq(runtimeB._runners.size, 0, 'GET messages 不启动 runner')
+    res = await runtimeB.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages', 'm-long', 'body'], url,
+    })
+    eq(res.status, 200)
+    eq(runtimeB._runners.size, 0, 'GET body 不启动 runner')
+
+    // 完成人工任务 → COMPLETED：拒绝新消息，但消息仍可读。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'tasks', 'human1', 'complete'],
+      url,
+      body: { payload: {} },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'COMPLETED')
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: { messageId: 'm-after', target: { activityId: 'agent1', delivery: 'nextActivation' }, text: '终态消息' },
+    })
+    eq(res.status, 409, 'COMPLETED 拒绝新消息')
+    eq(res.body.code, 'MESSAGE_INSTANCE_TERMINAL')
+    res = await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'messages'], url,
+    })
+    eq(res.status, 200)
+    eq(res.body.messages.find(item => item.messageId === 'm-next').status, 'failed', '终态收尾把未投递消息标失败')
   })
 
   // -------------------------------------------------------------------------

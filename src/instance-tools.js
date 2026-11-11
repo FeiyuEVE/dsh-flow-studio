@@ -22,8 +22,14 @@ const INSTANCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const WORKSPACE_ID_PATTERN = /^[0-9a-f]{12}$/
 const HEAD_PATTERN = /^[0-9a-f]{40,64}$/i
 const PLAN_HASH_PATTERN = /^[0-9a-f]{64}$/
+/** 与 instance-message-store 同口径（这里只做本地早拒绝，真上限在 Host 侧）。 */
+const MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const ACTIVITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const EXECUTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
+const MAX_MESSAGE_BYTES = 1024 * 1024
 
 const TIMEOUT_WORKTREE_MS = 60_000
+const TIMEOUT_MESSAGE_MS = 30_000
 
 class ParamError extends Error {
   constructor(message, hint) {
@@ -84,6 +90,111 @@ function requireInstanceId(args, action) {
       '参数 instanceId 不合法（只允许字母、数字、点、下划线、连字符，1–64 位，且以字母或数字开头）',
       '照实例列表里的 id 原样传。',
     )
+  }
+  return value
+}
+
+/**
+ * 实例 id：agent 会话里的工具带 binding 时**不允许改参数跨实例投递**。
+ *
+ * @param {object} args
+ * @param {{instanceId?: string}|null} binding
+ * @param {string} action
+ */
+function resolveBoundInstanceId(args, binding, action) {
+  const provided = optionalString(args, 'instanceId', { max: 64 })
+  const bound = binding && typeof binding.instanceId === 'string' && binding.instanceId !== ''
+    ? binding.instanceId
+    : null
+  if (bound !== null) {
+    if (provided !== undefined && provided !== bound) {
+      throw new ParamError(
+        `本会话的工具绑定实例 ${bound}，不能通过改 instanceId 向 ${provided} 投递`,
+        '去掉 instanceId（默认就是绑定实例），或改用面向该实例的宿主入口。',
+      )
+    }
+    return bound
+  }
+  if (provided === undefined) {
+    throw new ParamError(`action=「${action}」需要 instanceId`, '照实例列表里的 id 原样传。')
+  }
+  if (!INSTANCE_ID_PATTERN.test(provided)) {
+    throw new ParamError('参数 instanceId 不合法', '照实例列表里的 id 原样传。')
+  }
+  return provided
+}
+
+/** 消息 / 回复目标校验（Host 侧还有一遍，这里只给出可行动的早错误）。 */
+function requireMessageTarget(args) {
+  const raw = args && args.target
+  if (!isObject(raw)) {
+    throw new ParamError(
+      '参数 target 必须是对象：{activityId, executionId} 或 {activityId, delivery:"nextActivation"}',
+      '精确目标带 executionId；未来节点用 delivery:"nextActivation"。',
+    )
+  }
+  const activityId = typeof raw.activityId === 'string' ? raw.activityId.trim() : ''
+  if (!ACTIVITY_ID_PATTERN.test(activityId)) {
+    throw new ParamError('target.activityId 必须是 1–128 个安全字符', '照 BPMN 元素 id 原样传。')
+  }
+  if (raw.delivery === 'nextActivation') {
+    if (raw.executionId !== undefined && raw.executionId !== null) {
+      throw new ParamError('nextActivation 目标不能同时带 executionId', '两种目标互斥，只留一种。')
+    }
+    return { activityId, delivery: 'nextActivation' }
+  }
+  if (raw.delivery !== undefined) {
+    throw new ParamError('target.delivery 只接受 "nextActivation"', '精确目标不要带 delivery。')
+  }
+  const executionId = typeof raw.executionId === 'string' ? raw.executionId.trim() : ''
+  if (!EXECUTION_ID_PATTERN.test(executionId)) {
+    throw new ParamError('精确目标需要 target.executionId（1–256 个安全字符）', '从实例待办 / 消息接口的 liveExecutions 拿 executionId。')
+  }
+  return { activityId, executionId }
+}
+
+function requireMessageId(args) {
+  const value = optionalString(args, 'messageId', { max: 128 })
+  if (value === undefined) throw new ParamError('缺少必填参数 messageId', '为这条外部消息生成一个稳定的 id，重试时复用。')
+  if (!MESSAGE_ID_PATTERN.test(value)) {
+    throw new ParamError('参数 messageId 必须是 1–128 个安全字符（字母/数字开头，可含点、下划线、冒号、连字符）', '换一个安全 id 后重发。')
+  }
+  return value
+}
+
+function requireMessageText(args) {
+  const value = args && args.text
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ParamError('缺少必填参数 text', '消息正文不能为空；长正文由 Host 自动落盘并返回摘要。')
+  }
+  const bytes = Buffer.byteLength(value, 'utf8')
+  if (bytes > MAX_MESSAGE_BYTES) {
+    throw new ParamError(`消息正文 ${bytes} 字节超过 1 MiB 硬上限`, '把正文缩短到 1 MiB（UTF-8）以内。')
+  }
+  return value
+}
+
+function optionalReplyId(args) {
+  const value = optionalString(args, 'replyId', { max: 128 })
+  if (value !== undefined && !MESSAGE_ID_PATTERN.test(value)) {
+    throw new ParamError('参数 replyId 必须是 1–128 个安全字符', '换一个安全 id 后重发。')
+  }
+  return value
+}
+
+function optionalReplyTargetId(args) {
+  const value = optionalString(args, 'replyTargetId', { max: 64 })
+  if (value !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
+    throw new ParamError('参数 replyTargetId 必须是宿主白名单里的 id（1–64 个安全字符）', '用消息接口 / 宿主配置给出的回复目标 id，不要传 URL。')
+  }
+  return value
+}
+
+function optionalDocument(args) {
+  const value = args && args.document
+  if (value === undefined || value === null) return undefined
+  if (!isObject(value) || typeof value.path !== 'string' || value.path.trim() === '') {
+    throw new ParamError('参数 document 必须是 { path, sha256? }', 'path 用实例工作区内的相对路径。')
   }
   return value
 }
@@ -156,17 +267,42 @@ function failureHint(status, body, action) {
   if (code === 'INSTANCE_WORKTREE_PLAN_INVALID') {
     return '执行 prune 必须带预览返回的 planHash；先不带 planHash 调一次（dryRun 默认 true）。'
   }
-  if (status === 404) return `${action}失败：实例或工作区记录不存在，先 action:"list" 或 action:"inspect" 确认 id。`
-  if (status === 409) return '冲突（409）：实例状态或工作区已变化；先 action:"inspect" / action:"list" 读回最新状态再决定。'
+  if (code === 'MESSAGE_ID_CONFLICT') {
+    return '同一 messageId 已有不同内容：换一个 messageId，或保持内容不变重发以拿回原结果。'
+  }
+  if (code === 'MESSAGE_TARGET_EXPIRED') {
+    return '目标 execution 已结束：不要投到同名节点的下一轮；要发给未来激活请用 {activityId, delivery:"nextActivation"}。'
+  }
+  if (code === 'MESSAGE_BODY_TOO_LARGE') {
+    return '正文超过 1 MiB 硬上限：缩短正文（Host 已拒绝且没有写半文件）。'
+  }
+  if (code === 'MESSAGE_REPLY_TARGET_UNKNOWN' || code === 'MESSAGE_REPLY_TARGET_REQUIRED') {
+    return '回复目标只能来自宿主白名单：从消息的 replyTargetId 里取，模型不能临时提供 URL / session。'
+  }
+  if (code === 'MESSAGE_DELIVERY_UNSUPPORTED') {
+    return '适配器没有原生消息投递能力：消息已如实记为 failed + deliveryUnknown，不要假装已读。'
+  }
+  if (code === 'MESSAGE_INSTANCE_TERMINAL') {
+    return '实例已 COMPLETED / CANCELED：不再受理新入站消息；已受理的回复仍可尝试投递（CANCELED 除外）。'
+  }
+  if (status === 404) return `${action}失败：实例或消息记录不存在，先读取实例详情 / 消息列表确认 id。`
+  if (status === 409) return '冲突（409）：实例状态或幂等键已变化；读回最新状态再决定。'
+  if (status === 410) return '目标已过期（410）：按 error 原文改用 nextActivation 或当前 live execution。'
+  if (status === 413) return '正文 / 附件超过上限（413）：缩短后重发。'
+  if (status === 403) return '回复目标不在宿主白名单（403）：不要尝试任意 URL / session。'
   if (status === 400) return '参数或请求不合法：按 error 原文改正后重发。'
-  if (status >= 500) return 'Host 侧资源操作失败：git / 目录权限可能有问题；重试一次，持续失败就报告原因。'
+  if (status >= 500) return 'Host 侧投递 / 存储失败：重试一次，持续失败就报告原因。'
   return '按 error 原文处理。'
 }
 
 /**
- * 创建实例域模型工具（当前只有一个）。E3 会在同一文件里追加实例生命周期工具。
+ * 创建实例域模型工具：worktree（0.13.8）+ 收件箱（0.13.10）。
  *
- * @param {{runtime?: {handle: Function}, getRuntime?: () => {handle: Function}}} deps
+ * `binding` 由运行时在 agent 节点会话里注入：`{instanceId, executionId?, activityId?}`。
+ * 绑定后 `instanceId` 参数只能省略或与绑定值相同，改参数跨实例投递会被本地拒绝。
+ *
+ * @param {{runtime?: {handle: Function}, getRuntime?: () => {handle: Function},
+ *   binding?: {instanceId?: string, executionId?: string, activityId?: string}|null}} deps
  * @returns {object[]} 可直接交给 `tools.register` 的工具定义数组
  */
 export function createInstanceTools(deps = {}) {
@@ -179,6 +315,7 @@ export function createInstanceTools(deps = {}) {
   if (getRuntime === null) {
     throw new TypeError('createInstanceTools 需要 { runtime } 或 { getRuntime }（BpmnRuntime.handle）')
   }
+  const binding = isObject(deps?.binding) ? { ...deps.binding } : null
 
   function runtimeOrError() {
     const runtime = getRuntime()
@@ -188,7 +325,40 @@ export function createInstanceTools(deps = {}) {
     return { runtime, error: '' }
   }
 
-  return [{
+  /** 发一个 JSON 请求给实例域路由；统一把 Host 错误翻成工具结果。 */
+  async function callRoute(runtime, { method = 'POST', parts, url, body, action }) {
+    let result
+    try {
+      result = await runtime.handle({ method, parts, url, body })
+    } catch (error) {
+      return failure(
+        `调用实例消息接口失败：${error && error.message ? error.message : String(error)}`,
+        '这是 Host 侧运行时错误；稍后重试，持续失败就报告。',
+        true,
+        { action },
+      )
+    }
+    const status = result && Number.isInteger(result.status) ? result.status : 0
+    const responseBody = isObject(result && result.body) ? result.body : null
+    if (responseBody === null) {
+      return failure('Host 返回了不可读的响应', '检查 BPMN 运行时是否正常；稍后重试。', true, { action, status })
+    }
+    if (status < 200 || status >= 300 || responseBody.ok !== true) {
+      return failure(
+        typeof responseBody.error === 'string' && responseBody.error !== '' ? responseBody.error : `Host 返回 HTTP ${status}`,
+        failureHint(status, responseBody, action),
+        status >= 500,
+        {
+          action,
+          status,
+          ...(typeof responseBody.code === 'string' ? { code: responseBody.code } : {}),
+        },
+      )
+    }
+    return trimDeep({ action, status, ...responseBody })
+  }
+
+  const worktreeTool = {
     name: 'flow_instance_worktrees',
     description:
       '查看 / 清理实例域的一棵 git worktree（0.13.8；实例创建时由 workspace.worktree 触发，运行中不能切换）。'
@@ -446,5 +616,214 @@ export function createInstanceTools(deps = {}) {
       }
       return trimDeep({ action, status, ...responseBody })
     },
-  }]
+  }
+
+  const sendMessageTool = {
+    name: 'flow_instance_send_message',
+    description:
+      '向实例域投递一条外部消息（0.13.10）。两种互斥目标：'
+      + '精确目标 {activityId, executionId} 只投给当前这一次执行；'
+      + '未来节点 {activityId, delivery:"nextActivation"} 只绑定后续第一次激活，不广播到循环的每一轮。'
+      + '同一实例下 messageId 相同且内容相同返回原结果，内容不同 409。'
+      + '执行已结束返回 MESSAGE_TARGET_EXPIRED；实例 SUSPENDED 可受理排队但不唤起 agent，'
+      + 'COMPLETED / CANCELED 拒绝新消息。正文超过 4 KiB 自动落盘（只回摘要 + 正文引用），'
+      + '超过 1 MiB 返回 413。消息不会代替 flow_finish_node 或人工任务完成。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: {
+          type: 'string',
+          description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）',
+        },
+        messageId: {
+          type: 'string',
+          description: '外部消息的稳定幂等键（1–128 个安全字符，重试复用同一个）',
+        },
+        target: {
+          type: 'object',
+          description: '精确目标 {activityId, executionId}，或未来节点 {activityId, delivery:"nextActivation"}',
+          properties: {
+            activityId: { type: 'string', description: 'BPMN 元素 id' },
+            executionId: { type: 'string', description: '精确目标：当前活动的 executionId' },
+            delivery: { type: 'string', enum: ['nextActivation'], description: '未来节点：只绑定后续第一次激活' },
+          },
+          required: ['activityId'],
+        },
+        text: { type: 'string', description: '消息正文（非空，UTF-8 ≤ 1 MiB）' },
+        replyTargetId: {
+          type: 'string',
+          description: '可选：宿主白名单里的回复目标 id（不是 URL / session 本身）',
+        },
+      },
+      required: ['messageId', 'target', 'text'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', description: '成功为 true；失败为 false（看 error / hint / retryable / code）' },
+          action: { type: 'string' },
+          status: { type: 'integer', description: 'Host 路由返回的 HTTP 语义状态' },
+          code: { type: 'string', description: '失败时的稳定业务码' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          id: { type: 'string', description: '实例 id' },
+          duplicate: { type: 'boolean', description: '是否命中同 messageId + 同内容的幂等结果' },
+          message: anyJson('受理后的消息投影（含 status / preview / body 引用 / delivery）'),
+          delivery: anyJson('本次投递结果（confirmed / failed / remaining / deferred）'),
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const message = isObject(value.message) ? value.message : {}
+        const status = typeof message.status === 'string' ? message.status : 'queued'
+        const delivery = isObject(value.delivery) ? value.delivery : null
+        const confirmed = delivery && Array.isArray(delivery.confirmed) ? delivery.confirmed.length : 0
+        const failed = delivery && Array.isArray(delivery.failed) ? delivery.failed.length : 0
+        return [{
+          type: 'text',
+          text: `消息 ${message.messageId || '?'} ${value.duplicate === true ? '已存在（幂等返回）' : '已受理'}，`
+            + `状态 ${status}${confirmed > 0 ? `，本次确认投递 ${confirmed} 条` : ''}`
+            + `${failed > 0 ? `，失败 ${failed} 条` : ''}`
+            + `${delivery && delivery.deferred === true ? '，实例挂起：已排队不唤起 agent' : ''}。`
+            + '消息不会代替节点完结或人工任务完成。',
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_MESSAGE_MS,
+    async execute(args) {
+      let instanceId
+      let messageId
+      let target
+      let text
+      let replyTargetId
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'send_message')
+        messageId = requireMessageId(args)
+        target = requireMessageTarget(args)
+        text = requireMessageText(args)
+        replyTargetId = optionalReplyTargetId(args)
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      return await callRoute(runtime, {
+        action: 'send_message',
+        parts: ['instances', instanceId, 'messages'],
+        url: new URL('http://localhost/'),
+        body: {
+          messageId,
+          target,
+          text,
+          ...(replyTargetId === undefined ? {} : { replyTargetId }),
+        },
+      })
+    },
+  }
+
+  const replyTool = {
+    name: 'flow_instance_reply',
+    description:
+      '对一条已受理的实例消息发送受控回复（0.13.10）。回复目标来自宿主白名单（消息的 '
+      + 'replyTargetId），模型不能临时提供 URL / session；回复先写 outbox，再用稳定 replyId 投递，'
+      + '重试不会生成新的 replyId。给人工任务的消息只是讨论 / 附件，不写完成变量、不完成节点。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: {
+          type: 'string',
+          description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）',
+        },
+        messageId: { type: 'string', description: '要回复的消息 id' },
+        replyId: {
+          type: 'string',
+          description: '可选：稳定幂等键；重试复用同一个（省略时按内容确定性生成）',
+        },
+        text: { type: 'string', description: '回复正文（与 document 至少给一项）' },
+        document: {
+          type: 'object',
+          description: '可选附件：{ path, sha256? }，path 必须是实例工作区内的相对路径',
+          properties: {
+            path: { type: 'string' },
+            sha256: { type: 'string' },
+          },
+          required: ['path'],
+        },
+      },
+      required: ['messageId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          status: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          id: { type: 'string' },
+          duplicate: { type: 'boolean' },
+          reply: anyJson('outbox 记录（status / delivery / attempts / lastError）'),
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const reply = isObject(value.reply) ? value.reply : {}
+        const status = typeof reply.status === 'string' ? reply.status : 'queued'
+        const unknown = isObject(reply.delivery) && reply.delivery.deliveryUnknown === true
+        return [{
+          type: 'text',
+          text: `回复 ${reply.replyId || '?'} 状态 ${status}${unknown ? '（deliveryUnknown：不能确认对端已收到）' : ''}`
+            + `${value.duplicate === true ? '，重复请求已幂等返回' : ''}。`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_MESSAGE_MS,
+    async execute(args) {
+      let instanceId
+      let messageId
+      let replyId
+      let text
+      let document
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'reply')
+        messageId = requireMessageId(args)
+        replyId = optionalReplyId(args)
+        text = args && args.text
+        if (text !== undefined && typeof text !== 'string') {
+          throw new ParamError('参数 text 必须是字符串', '文字回复用 text；附件用 document。')
+        }
+        document = optionalDocument(args)
+        if ((text === undefined || text.trim() === '') && document === undefined) {
+          throw new ParamError('回复需要 text 或 document 至少一项', '补上正文或工作区内附件路径。')
+        }
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      return await callRoute(runtime, {
+        action: 'reply',
+        parts: ['instances', instanceId, 'messages', messageId, 'replies'],
+        url: new URL('http://localhost/'),
+        body: {
+          ...(replyId === undefined ? {} : { replyId }),
+          ...(text === undefined ? {} : { text }),
+          ...(document === undefined ? {} : { document }),
+        },
+      })
+    },
+  }
+
+  return [worktreeTool, sendMessageTool, replyTool]
 }

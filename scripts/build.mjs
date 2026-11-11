@@ -67,6 +67,8 @@ export const HOST_MODULES = [
   'instance-resources.js',
   'workspace-policy.js',
   'instance-worktree.js',
+  'instance-message-store.js',
+  'instance-inbox.js',
   'instance-tools.js',
   'artifact-store.js',
   'execution-limits.js',

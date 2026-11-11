@@ -208,6 +208,9 @@ export const DSH_ADAPTER_CAPABILITIES = Object.freeze({
   finishTool: FINISH_TOOL_SUPPORT.NATIVE,
   hooks: Object.freeze({ 'turn.stop': HOOK_SUPPORT.NATIVE }),
   cancel: FINISH_TOOL_SUPPORT.NATIVE,
+  // 0.13.10：收件箱消息通过 `agent.followup` 投递（新的一轮 / 队列尾部），宿主只能
+  // 确认「已交给会话」，不能确认模型一定读过——上层必须显示 deliveryUnknown。
+  messages: 'native',
   reminder: Object.freeze({
     mechanism: 'agent.steer',
     maxFires: DEFAULT_FINISH_REMINDER_MAX_FIRES,
@@ -226,6 +229,9 @@ export const DSH_ADAPTER_CAPABILITIES = Object.freeze({
       'agent.cancel: @deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts:184',
       "AgentCancelCause {kind:'parent'}: @deepseek-ai/dsh-session/lib/types/types.d.ts:153",
     ],
+    messages: [
+      'agent.followup: @deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts',
+    ],
   }),
 })
 
@@ -240,11 +246,14 @@ export const DSH_ADAPTER_UNPROBED_CAPABILITIES = Object.freeze({
   finishTool: FINISH_TOOL_SUPPORT.UNSUPPORTED,
   hooks: Object.freeze({ 'turn.stop': HOOK_SUPPORT.UNSUPPORTED }),
   cancel: FINISH_TOOL_SUPPORT.NATIVE,
+  // probe 之前不宣称可投递：没有会话就没有 followup 通道。
+  messages: 'unsupported',
   reminder: DSH_ADAPTER_CAPABILITIES.reminder,
   evidence: Object.freeze({
     finishTool: ['probe() 尚未成功：在 probe() 成功前 finishTool 只能是 unsupported'],
     'turn.stop': ['probe() 尚未成功：宿主会话能力未验证'],
     cancel: DSH_ADAPTER_CAPABILITIES.evidence.cancel,
+    messages: ['probe() 尚未成功：收件箱投递能力未验证'],
   }),
 })
 
@@ -362,6 +371,24 @@ export function buildReminderText(options = {}) {
   const maxFires = Number.isSafeInteger(options.maxFires) && options.maxFires >= 0 ? options.maxFires : null
   if (count === null || maxFires === null) return base
   return `${base}\n（第 ${count}/${maxFires} 次提醒；提醒用尽后本节点会以 ${NODE_FINISH_MISSING} 停下，流程不会继续。）`
+}
+
+/**
+ * 收件箱消息的模型侧文本（0.13.10）。
+ *
+ * 正文已在 `instance-inbox` 侧裁剪：长正文只给工作区相对路径 + 摘要，这里不再展开，
+ * 也不把 messageId 之外的内部路径写进提示词。
+ *
+ * @param {object} message `deliverMessage(handle, message)` 的第二个参数
+ * @returns {string}
+ */
+export function buildInboxMessageText(message = {}) {
+  const messageId = nonEmptyString(message.messageId) ? message.messageId : '(未知)'
+  const reply = nonEmptyString(message.replyTargetId)
+    ? `\n可回复目标：${message.replyTargetId}（用 flow_instance_reply）`
+    : ''
+  const text = typeof message.text === 'string' ? message.text : ''
+  return `[流程收件箱消息 ${messageId}]${reply}\n${text}`
 }
 
 /** 工具结果的人类可读投影（成功 / 失败都给模型一段可行动文本）。 */
@@ -783,6 +810,7 @@ export function createDshAdapter(options = {}) {
         createdHandle: null,
         sessionId,
         toolDispose: null,
+        inboxToolDispose: null,
         unlisteners: [],
         signalOff: null,
         disposed: false,
@@ -847,6 +875,15 @@ export function createDshAdapter(options = {}) {
             dispose()
           } catch (error) {
             log('warn', `flow-studio: 注销 ${FINISH_TOOL_NAME} 失败：${errorText(error)}`)
+          }
+        }
+        if (st.inboxToolDispose) {
+          const dispose = st.inboxToolDispose
+          st.inboxToolDispose = null
+          try {
+            dispose()
+          } catch (error) {
+            log('warn', `flow-studio: 注销收件箱工具失败：${errorText(error)}`)
           }
         }
       }
@@ -1050,6 +1087,21 @@ export function createDshAdapter(options = {}) {
         // 会话错误必须让真实原因冒泡，不能被 whenIdle 兜底成 NODE_FINISH_MISSING。
         const offError = agentCtx.on('agent/error', payload => onAgentError(payload))
         if (typeof offError === 'function') st.unlisteners.push(offError)
+        // 0.13.10：宿主可把「绑定本实例/执行身份」的收件箱工具注册进这个会话。
+        // 未提供时保持旧行为（全局工具仍在宿主 tools 服务里）。
+        if (typeof req.registerTools === 'function') {
+          let disposeTools
+          try {
+            disposeTools = await req.registerTools(agentCtx, { element, ctx: runnerCtx })
+          } catch (error) {
+            throw new AdapterError(
+              'DSH_INBOX_TOOLS_UNAVAILABLE',
+              `注册收件箱工具失败（节点 ${nodeId}）：${errorText(error)}`,
+              { adapterId: DSH_ADAPTER_ID, nodeId, field: 'registerTools', cause: error },
+            )
+          }
+          if (typeof disposeTools === 'function') st.inboxToolDispose = disposeTools
+        }
       }
 
       const meta = {}
@@ -1122,6 +1174,21 @@ export function createDshAdapter(options = {}) {
         )
       }
       st.agent = agent
+      /**
+       * 收件箱投递通道（0.13.10）：`followup` 在宿主里是「排队一轮新用户消息」，
+       * 不等待这一轮结束，所以投递是**有界**的；但只能确认消息已交给会话，
+       * 不能确认模型读过，上层据此标 deliveryUnknown / 非 exactly-once。
+       */
+      st.deliverInbox = text => {
+        if (st.settled || st.canceled) return false
+        const pending = agent.followup(userMessage(text, 'inbox'))
+        if (pending && typeof pending.then === 'function') {
+          Promise.resolve(pending).catch((error) => {
+            log('warn', `flow-studio: 收件箱消息投递异步失败（节点 ${nodeId}）：${errorText(error)}`)
+          })
+        }
+        return true
+      }
 
       try {
         agent.followup(userMessage(buildNodePrompt(element, runnerCtx, { workspaceRoot }), 'prompt'))
@@ -1154,6 +1221,67 @@ export function createDshAdapter(options = {}) {
       }
 
       return makeHandle()
+    },
+
+    /**
+     * 可选能力（0.13.10）：把收件箱消息投递给本次节点会话。
+     *
+     * 返回 `{ok:true, deliveryUnknown:true}`：`followup` 只保证消息排进会话队列，
+     * 不保证模型在本次完结前读到（因此不声称 exactly-once）。会话已完结 / 已取消
+     * 时明确拒绝，宿主会把消息记为 failed，而不是假投递。
+     *
+     * @param {object} handle `start()` 返回的句柄
+     * @param {object} message 收件箱投递载荷
+     */
+    async deliverMessage(handle, message) {
+      const st = handle && typeof handle === 'object' ? states.get(handle) : undefined
+      if (!st) {
+        throw new AdapterError(
+          ADAPTER_ERROR.INVALID,
+          'deliverMessage 收到不认识的 handle（必须用 start 返回的句柄）',
+          { adapterId: DSH_ADAPTER_ID, field: 'handle' },
+        )
+      }
+      if (st.settled || st.canceled) {
+        return {
+          ok: false,
+          code: 'DSH_SESSION_NOT_ACTIVE',
+          error: '节点会话已完结或已取消，不能继续投递收件箱消息',
+          deliveryUnknown: true,
+        }
+      }
+      if (typeof st.deliverInbox !== 'function') {
+        return {
+          ok: false,
+          code: 'DSH_DELIVERY_UNAVAILABLE',
+          error: '节点会话还没有 followup 通道（创建尚未完成）',
+          deliveryUnknown: true,
+        }
+      }
+      try {
+        const accepted = st.deliverInbox(buildInboxMessageText(isPlainObject(message) ? message : {}))
+        if (accepted !== true) {
+          return {
+            ok: false,
+            code: 'DSH_SESSION_NOT_ACTIVE',
+            error: '节点会话已收口，投递被拒绝',
+            deliveryUnknown: true,
+          }
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          code: 'DSH_INBOX_DELIVERY_FAILED',
+          error: errorText(error),
+          deliveryUnknown: true,
+        }
+      }
+      return {
+        ok: true,
+        // 只确认「已交给会话」；不承诺模型读过，也不承诺 exactly-once。
+        deliveryUnknown: true,
+        accepted: true,
+      }
     },
 
     async cancel(handle, reason) {

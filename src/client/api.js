@@ -255,6 +255,29 @@ export function instanceTasksPath(id) {
   return `${instancePath(id)}/tasks`
 }
 
+/** `GET /instances/<id>/messages[?cursor=&limit=]`（0.13.10 收件箱）。 */
+export function instanceMessagesPath(id, options = {}) {
+  return withQuery(`${instancePath(id)}/messages`, {
+    cursor: options && options.cursor,
+    limit: options && options.limit,
+  })
+}
+
+/** `POST /instances/<id>/messages`：受理一条外部消息。 */
+export function instanceMessageSendPath(id) {
+  return `${instancePath(id)}/messages`
+}
+
+/** `GET /instances/<id>/messages/<messageId>/body`：鉴权后读正文全文。 */
+export function instanceMessageBodyPath(id, messageId) {
+  return `${instanceMessagesPath(id)}/${segment(messageId)}/body`
+}
+
+/** `POST /instances/<id>/messages/<messageId>/replies`：受控回复（replyId 幂等）。 */
+export function instanceMessageRepliesPath(id, messageId) {
+  return `${instanceMessagesPath(id)}/${segment(messageId)}/replies`
+}
+
 /** `POST /instances/<id>/tasks/<activityId>/complete`。 */
 export function completeTaskPath(id, activityId) {
   return `${instanceTasksPath(id)}/${segment(activityId)}/complete`
@@ -323,6 +346,12 @@ export const api = {
   completeInstanceTask: (id, activityId, body) => request('POST', completeTaskPath(id, activityId), body || {}),
   stopInstance: id => request('POST', stopInstancePath(id)),
   readInstanceDefinition: id => request('GET', instanceDefinitionPath(id)),
+
+  // ── 实例收件箱（0.13.10）──────────────────────────────────────────────
+  readInstanceMessages: (id, options) => request('GET', instanceMessagesPath(id, options)),
+  sendInstanceMessage: (id, body) => request('POST', instanceMessageSendPath(id), body || {}),
+  readInstanceMessageBody: (id, messageId) => request('GET', instanceMessageBodyPath(id, messageId)),
+  replyInstanceMessage: (id, messageId, body) => request('POST', instanceMessageRepliesPath(id, messageId), body || {}),
 
   // ── 实例工作区（0.13.8）────────────────────────────────────────────────
   readInstanceWorktree: id => request('GET', instanceWorktreePath(id)),

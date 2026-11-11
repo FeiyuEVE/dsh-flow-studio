@@ -753,10 +753,14 @@ export function createCodexAdapter(options = {}) {
     return {
       finishTool,
       hooks: { 'turn.stop': hookLevel },
+      // 0.13.10：codex 的 exec 通道没有稳定的「轮次中投递」能力，本轮明确不支持；
+      // 宿主会把消息记成 failed + deliveryUnknown，不假装成功（CLI 投递下一轮补）。
+      messages: 'unsupported',
       evidence: {
         finishTool: CODEX_FINISH_TOOL_EVIDENCE,
         'turn.stop': hooksContinueEvidence(probeValue, hookLevel),
         userConfig: CODEX_USER_CONFIG_EVIDENCE,
+        messages: ['codex exec 目前没有可去重的轮次中投递通道：capabilities().messages=unsupported'],
         sandbox: `exec: -s ${settings.sandbox} + -c approval_policy=${JSON.stringify(settings.approvalPolicy)}；`
           + `resume: -c sandbox_mode=${JSON.stringify(settings.sandbox)}（${CODEX_USER_CONFIG_EVIDENCE}）`,
       },
@@ -1516,6 +1520,21 @@ export function createCodexAdapter(options = {}) {
     capabilities,
     invalidateProbe,
     start,
+    /**
+     * 0.13.10 可选消息能力的显式占位：本轮不支持轮次中投递。
+     *
+     * 不抛异常（宿主按 `{ok:false, unsupported:true, deliveryUnknown:true}` 记录），
+     * 也绝不返回 ok:true —— CLI 侧安全投递留到下一轮实现。
+     */
+    async deliverMessage() {
+      return {
+        ok: false,
+        unsupported: true,
+        deliveryUnknown: true,
+        code: 'CODEX_MESSAGE_DELIVERY_UNSUPPORTED',
+        error: 'codex 适配器本轮没有收件箱投递能力：按 deliveryUnknown 记录，不假装成功',
+      }
+    },
     cancel: (handle, reason) => (handle && typeof handle.cancel === 'function'
       ? handle.cancel(reason)
       : Promise.reject(new CodexAdapterError(

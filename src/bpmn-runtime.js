@@ -106,6 +106,12 @@ import {
   removeInstanceWorktree,
 } from './instance-worktree.js'
 import {
+  INSTANCE_INBOX_ERROR,
+  InstanceInboxError,
+  createInstanceInbox,
+} from './instance-inbox.js'
+import { createInstanceTools } from './instance-tools.js'
+import {
   WORKSPACE_ALLOWLIST_ENV,
   WORKSPACE_ERROR,
   normalizeAllowlist,
@@ -282,6 +288,9 @@ function errorResult(error) {
   if (error instanceof BpmnRunnerError) {
     return { status: runnerErrorStatus(error.code), body: { ok: false, code: error.code, error: error.message } }
   }
+  if (error instanceof InstanceInboxError) {
+    return { status: error.status, body: error.toPayload() }
+  }
   return {
     status: 500,
     body: { ok: false, code: 'BPMN_INTERNAL_ERROR', error: errorText(error) },
@@ -322,6 +331,10 @@ function runnerErrorStatus(code) {
  *   workspaceAllowlist?: string[]|string, // 工作区 allowlist（默认读 FLOW_STUDIO_WORKSPACE_ROOTS）
  *   executionLimits?: object,    // 覆盖 execution-limits 的默认上限
  *   worktreeRunner?: Function,   // 注入 git runner（测试用）
+ *   inboxReplyTargets?: object,  // 收件箱回复白名单：id → {kind:'session',sessionId} / {kind:'http',url,authRef}
+ *   inboxHttpPolicy?: object,    // 回复 HTTP 目标策略（缺省复用 httpPolicy）
+ *   inboxSessionDeliver?: Function, // 宿主会话投递（缺省从 ctx.agents 取 live agent）
+ *   inboxHttpRequest?: Function,    // 测试注入：直接替换回复 HTTP 发送
  * }} [options]
  * @returns {BpmnRuntime}
  */
@@ -347,6 +360,10 @@ export function createBpmnRuntime(options = {}) {
     workspaceAllowlist: options.workspaceAllowlist,
     executionLimits: options.executionLimits,
     worktreeRunner: options.worktreeRunner,
+    inboxReplyTargets: options.inboxReplyTargets,
+    inboxHttpPolicy: options.inboxHttpPolicy,
+    inboxSessionDeliver: options.inboxSessionDeliver,
+    inboxHttpRequest: options.inboxHttpRequest,
   })
 }
 
@@ -479,6 +496,16 @@ function createExecutionLifecycle() {
   }
 }
 
+/** 路径段解码：消息 / 回复 id 允许冒号，客户端会 encodeURIComponent。 */
+function decodePathSegment(value) {
+  if (typeof value !== 'string') return ''
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
 class BpmnRuntime {
   constructor(options) {
     this.ctx = options.ctx
@@ -522,6 +549,20 @@ class BpmnRuntime {
     })
     /** 可注入 Git runner（测试 / 嵌入方）；缺省由各模块的 execFile 包装。 */
     this.gitRunner = typeof options.worktreeRunner === 'function' ? options.worktreeRunner : undefined
+    /** 收件箱回复白名单：只有宿主维护的 id 能被消息 / 模型引用。 */
+    this.inboxReplyTargets = isPlainObject(options.inboxReplyTargets) ? options.inboxReplyTargets : {}
+    /** 回复 HTTP 策略：缺省复用 connector 的同一份网络策略。 */
+    this.inboxHttpPolicy = isPlainObject(options.inboxHttpPolicy) ? options.inboxHttpPolicy : options.httpPolicy
+    /** 宿主会话投递（缺省从 ctx 的 agents 服务取 live agent 的 followup）。 */
+    this.inboxSessionDeliver = typeof options.inboxSessionDeliver === 'function'
+      ? options.inboxSessionDeliver
+      : null
+    /** 测试注入：替换回复 HTTP 发送（仍先过 validateDestination）。 */
+    this.inboxHttpRequest = typeof options.inboxHttpRequest === 'function' ? options.inboxHttpRequest : null
+    /** 实例域 inbox：懒建（查看消息不启动 runner，也不构建无用对象）。 */
+    this._inbox = null
+    /** 本 runtime 恢复过 runner 的实例（用于收件箱 cold/resumed 标注）。 */
+    this._recoveredInstances = new Set()
     /** 每个 runtime 的 probe 缓存：同一 adapter id 只 probe 一次（成功/失败都缓存）。 */
     this._probeAdapter = createAdapterProbeCache()
 
@@ -564,6 +605,80 @@ class BpmnRuntime {
       worktreeRoot: this.worktreeRoot,
       worktreeRegistryRoot: this.worktreeRegistryRoot,
       artifactRoot: this.artifactRoot,
+    }
+  }
+
+  /**
+   * 实例域 inbox（懒建）。只读接口也走它，但**不会** `_ensureRunner()`。
+   */
+  get inbox() {
+    if (this._inbox !== null) return this._inbox
+    const sessionDeliver = this.inboxSessionDeliver ?? this._defaultSessionDeliver()
+    this._inbox = createInstanceInbox({
+      instancesRoot: this.instancesRoot,
+      replyTargets: this.inboxReplyTargets,
+      httpPolicy: this.inboxHttpPolicy,
+      env: this.env,
+      ...(sessionDeliver === null ? {} : { sessionDeliver }),
+      ...(this.inboxHttpRequest === null ? {} : { httpRequest: this.inboxHttpRequest }),
+      activityExists: (instanceId, activityId) => this._activityExists(instanceId, activityId),
+      // 精确目标校验优先用内存 runner 的待办（刚落盘的 pendingTasks 可能晚一拍）。
+      pendingTasksFor: instanceId => {
+        const runner = this._runners.get(instanceId)
+        return runner && typeof runner.pendingTasks === 'function' ? runner.pendingTasks() : null
+      },
+      emitResourceEvent: (instanceId, event) => this._appendResourceEventSafe(instanceId, event),
+    })
+    return this._inbox
+  }
+
+  /** 默认回复通道：只投给宿主注册表里**当前 live** 的会话；没有就不假装送达。 */
+  _defaultSessionDeliver() {
+    const ctx = this.ctx
+    const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : null
+    if (!agents || typeof agents.get !== 'function') return null
+    return async ({ sessionId, text, replyId, messageId, instanceId }) => {
+      const agent = agents.get(sessionId)
+      if (!agent || typeof agent.followup !== 'function') {
+        return {
+          ok: false,
+          code: 'MESSAGE_REPLY_SESSION_NOT_LIVE',
+          error: `回复目标会话 ${sessionId} 当前不在宿主 live 注册表里`,
+          deliveryUnknown: false,
+          retryable: true,
+        }
+      }
+      agent.followup({
+        id: `flow-reply-${replyId}`,
+        role: 'user',
+        source: {
+          kind: 'user',
+          flowStudio: {
+            kind: 'inbox-reply',
+            instanceId,
+            messageId,
+            replyId,
+            from: 'flow-studio:inbox',
+          },
+        },
+        content: [{ type: 'text', text }],
+      })
+      // followup 只保证排进会话；能否被读不确认。
+      return { ok: true, deliveryUnknown: true }
+    }
+  }
+
+  /** 冻结定义里是否存在该 activity（nextActivation 目标校验；读失败时不误杀）。 */
+  async _activityExists(instanceId, activityId) {
+    try {
+      const snapshot = await readInstanceDefinition(instanceId, { instancesRoot: this.instancesRoot })
+      if (snapshot === null) return true
+      const parsed = await parseBpmn(snapshot.xml)
+      if (!parsed.ok || !parsed.definition) return true
+      const known = parsed.definition.elementById
+      return known instanceof Map ? known.has(activityId) : true
+    } catch {
+      return true
     }
   }
 
@@ -654,6 +769,8 @@ class BpmnRuntime {
     this._workspaces.clear()
     this._activeAgents.clear()
     this._prunePlans.clear()
+    this._recoveredInstances.clear()
+    this._inbox = null
   }
 
   // -------------------------------------------------------------------------
@@ -861,6 +978,11 @@ class BpmnRuntime {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readTasks(id)
       }
+      if (parts[2] === 'messages') {
+        if (method === 'GET') return await this._readInstanceMessages(id, url)
+        if (method === 'POST') return await this._acceptInstanceMessage(id, body)
+        return methodNotAllowed('GET / POST')
+      }
       if (parts[2] === 'resource-events') {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readResourceEvents(id, url)
@@ -885,6 +1007,16 @@ class BpmnRuntime {
       if (method !== 'POST') return methodNotAllowed('POST')
       if (!id) return invalidInstanceId()
       return await this._completeTask(id, parts[3], body)
+    }
+    if (parts.length === 5 && parts[2] === 'messages' && parts[4] === 'body') {
+      if (method !== 'GET') return methodNotAllowed('GET')
+      if (!id) return invalidInstanceId()
+      return await this._readInstanceMessageBody(id, decodePathSegment(parts[3]))
+    }
+    if (parts.length === 5 && parts[2] === 'messages' && parts[4] === 'replies') {
+      if (method !== 'POST') return methodNotAllowed('POST')
+      if (!id) return invalidInstanceId()
+      return await this._postInstanceReply(id, decodePathSegment(parts[3]), body)
     }
     // m1：HTTP connector 调用记录的人工处置入口。只改记录，不推进引擎、不伪造活动完成。
     if (parts.length === 5 && parts[2] === 'connector' && parts[4] === 'resolve') {
@@ -1582,6 +1714,165 @@ class BpmnRuntime {
     })
   }
 
+  // -------------------------------------------------------------------------
+  // 实例收件箱（0.13.10 D）：只读列表 / 正文读取不启动 runner
+  // -------------------------------------------------------------------------
+
+  async _readInstanceMessages(id, url) {
+    const cursorRaw = url.searchParams.get('cursor')
+    const limitRaw = url.searchParams.get('limit')
+    let cursor = 0
+    if (cursorRaw !== null && cursorRaw !== '') {
+      if (!/^\d+$/.test(cursorRaw)) {
+        return { status: 400, body: { ok: false, code: 'MESSAGE_CURSOR_INVALID', error: 'cursor 必须是非负整数' } }
+      }
+      cursor = Number(cursorRaw)
+    }
+    let limit = 50
+    if (limitRaw !== null && limitRaw !== '') {
+      if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1) {
+        return { status: 400, body: { ok: false, code: 'MESSAGE_LIMIT_INVALID', error: 'limit 必须是正整数' } }
+      }
+      limit = Number(limitRaw)
+    }
+    try {
+      const page = await this.inbox.listMessages(id, { cursor, limit })
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          messages: page.messages,
+          total: page.total,
+          nextCursor: page.nextCursor,
+          cursor: page.cursor,
+          limit: page.limit,
+          liveExecutions: page.liveExecutions,
+        },
+      }
+    } catch (error) {
+      if (error instanceof InstanceInboxError) {
+        return { status: error.status, body: error.toPayload({ id }) }
+      }
+      throw error
+    }
+  }
+
+  async _acceptInstanceMessage(id, body) {
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ messageId, target, text, replyTargetId? }' },
+      }
+    }
+    const input = isPlainObject(body) ? body : {}
+    // 不占实例写锁：消息可以在 agent / 人工任务执行期间并发受理；
+    // 幂等与持久化由 inbox 自己的跨进程锁保证。
+    try {
+      const result = await this.inbox.acceptInstanceMessage({
+        instanceId: id,
+        messageId: input.messageId,
+        target: input.target,
+        text: input.text,
+        ...(input.replyTargetId === undefined ? {} : { replyTargetId: input.replyTargetId }),
+      })
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          duplicate: result.duplicate,
+          message: result.message,
+          delivery: result.delivery,
+        },
+      }
+    } catch (error) {
+      if (error instanceof InstanceInboxError) {
+        return { status: error.status, body: error.toPayload({ id }) }
+      }
+      throw error
+    }
+  }
+
+  async _readInstanceMessageBody(id, messageId) {
+    try {
+      const body = await this.inbox.readMessageBody(id, messageId)
+      return { status: 200, body: { ok: true, id, ...body } }
+    } catch (error) {
+      if (error instanceof InstanceInboxError) {
+        return { status: error.status, body: error.toPayload({ id, messageId }) }
+      }
+      throw error
+    }
+  }
+
+  async _postInstanceReply(id, messageId, body) {
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ replyId?, targetId?, text?, document? }' },
+      }
+    }
+    const input = isPlainObject(body) ? body : {}
+    // 回复目标只能是宿主白名单 id：任何 URL / session / target 字段都明确拒绝。
+    for (const forbidden of ['url', 'sessionId', 'session', 'target']) {
+      if (input[forbidden] !== undefined) {
+        return {
+          status: 400,
+          body: {
+            ok: false,
+            code: INSTANCE_INBOX_ERROR.REPLY_TARGET_ARBITRARY,
+            error: `禁止在回复请求里提供 ${forbidden}：回复目标只能来自宿主维护的 ID（targetId）`,
+          },
+        }
+      }
+    }
+    // 回复也不占实例写锁：agent 运行中就可以回复；先写 outbox 再投递。
+    try {
+      const enqueued = await this.inbox.enqueueReply({
+        instanceId: id,
+        messageId,
+        ...(input.replyId === undefined ? {} : { replyId: input.replyId }),
+        ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
+        ...(input.text === undefined ? {} : { text: input.text }),
+        ...(input.document === undefined ? {} : { document: input.document }),
+      })
+      const dispatched = await this.inbox.dispatchReply({ instanceId: id, replyId: enqueued.reply.replyId })
+      const reply = dispatched.reply
+      const delivered = reply.status === 'delivered'
+      const skipped = reply.status === 'skipped'
+      return {
+        status: delivered ? 200 : (skipped ? 409 : 502),
+        body: {
+          ok: delivered,
+          id,
+          messageId,
+          duplicate: enqueued.duplicate === true,
+          enqueued: true,
+          delivered,
+          reply,
+          ...(skipped
+            ? {
+              code: INSTANCE_INBOX_ERROR.INSTANCE_TERMINAL,
+              error: `实例 ${id} 已取消（CANCELED），未发送回复`,
+            }
+            : {}),
+          ...(!delivered && !skipped
+            ? {
+              code: typeof reply.lastError?.code === 'string' ? reply.lastError.code : INSTANCE_INBOX_ERROR.DELIVERY_FAILED,
+              error: typeof reply.lastError?.message === 'string' ? reply.lastError.message : '回复投递失败',
+            }
+            : {}),
+        },
+      }
+    } catch (error) {
+      if (error instanceof InstanceInboxError) {
+        return { status: error.status, body: error.toPayload({ id, messageId }) }
+      }
+      throw error
+    }
+  }
+
   async _completeTask(id, activityId, body) {
     const requested = activityIdLabel(activityId)
     if (requested === null) {
@@ -1775,6 +2066,7 @@ class BpmnRuntime {
       throw error
     }
     await this._maybeTerminalCleanup(id).catch(() => {})
+    await this._finalizeInbox(id, 'CANCELED')
     return {
       status: 200,
       body: {
@@ -2014,6 +2306,18 @@ class BpmnRuntime {
     }
   }
 
+  /**
+   * 实例进入终态后的收件箱收尾：COMPLETED / CANCELED 都不再受理新入站消息；
+   * 已受理的回复在 COMPLETED 后仍可 dispatch，CANCELED 未发送的回复标 skipped。
+   */
+  async _finalizeInbox(instanceId, status) {
+    try {
+      await this.inbox.finalizeInstance(instanceId, status)
+    } catch {
+      // 收件箱收尾失败不改变实例终态。
+    }
+  }
+
   async _readResourceEvents(id, url) {
     const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
     if (instance === null) return instanceNotFound(id)
@@ -2243,10 +2547,9 @@ class BpmnRuntime {
     for (;;) {
       if ((this._activeAgents.get(instanceId) ?? 0) === 0) return true
       if (Date.now() >= deadline) return false
-      await new Promise(resolveWait => {
-        const timer = setTimeout(resolveWait, 25)
-        timer.unref?.()
-      })
+      // 等待有界（timeoutMs）且必须让事件循环保持活跃：unref 会让「只有这个等待
+      // 还在跑」的进程直接 beforeExit，调用方永远拿不到 false。
+      await new Promise(resolveWait => setTimeout(resolveWait, 25))
     }
   }
 
@@ -2499,6 +2802,27 @@ class BpmnRuntime {
         workspaceId,
         artifactStore: this.artifactStore,
         instanceId,
+        // 0.13.10：句柄可用后登记 live execution，并把排队消息投给本次执行。
+        onStart: async (handle, info) => {
+          await this.inbox.registerExecution({
+            instanceId,
+            activityId: typeof element?.id === 'string' ? element.id : null,
+            executionId: info.executionId,
+            attempt: info.attempt,
+            kind: 'agent',
+            adapterId: info.adapterId ?? null,
+            adapter: info.adapter ?? null,
+            handle,
+            workspaceRoot: info.workspaceRoot,
+            cold: this._recoveredInstances.has(instanceId),
+          })
+        },
+        // 0.13.10：会话内注册绑定本实例 / 本执行的工具，改参数不能跨实例。
+        registerTools: agentCtx => this._registerInboxTools(agentCtx, {
+          instanceId,
+          executionId: typeof ctx?.executionId === 'string' ? ctx.executionId : null,
+          activityId: typeof element?.id === 'string' ? element.id : null,
+        }),
       })
     } catch (error) {
       // 失败落点（如 NODE_FINISH_MISSING）也必须让提醒事件进实例事件流：
@@ -2518,6 +2842,14 @@ class BpmnRuntime {
       }
       throw error
     } finally {
+      // 0.13.10：执行结束（成功 / 失败 / 取消）先摘掉 live 表，未投递完的消息按过期处理。
+      if (typeof ctx?.executionId === 'string' && ctx.executionId !== '') {
+        try {
+          await this.inbox.finishExecution({ instanceId, executionId: ctx.executionId })
+        } catch {
+          // 收件箱收尾失败不改变节点结局。
+        }
+      }
       const releaseExecution = () => {
         ticket.release()
         const remaining = (this._activeAgents.get(instanceId) ?? 1) - 1
@@ -2554,6 +2886,29 @@ class BpmnRuntime {
     const summary = this._agentSummaries.get(key)
     this._agentSummaries.delete(key)
     return summary
+  }
+
+  /**
+   * 把收件箱工具注册进**本次 agent 会话**（0.13.10）。
+   *
+   * binding 固定 instanceId / executionId：模型改 instanceId 会被工具本地拒绝，
+   * 因此不能通过参数跨实例投递。只注册 send / reply，不把 worktree 工具塞进节点会话。
+   */
+  _registerInboxTools(agentCtx, binding) {
+    const toolsSvc = agentCtx && agentCtx.tools
+    if (!toolsSvc || typeof toolsSvc.register !== 'function') return undefined
+    const tools = createInstanceTools({ getRuntime: () => this, binding })
+      .filter(tool => tool.name === 'flow_instance_send_message' || tool.name === 'flow_instance_reply')
+    const disposers = tools.map(tool => toolsSvc.register(tool))
+    return () => {
+      for (const dispose of disposers.reverse()) {
+        try {
+          dispose()
+        } catch {
+          // 注销失败不影响节点收尾。
+        }
+      }
+    }
   }
 
   _limits() {
@@ -2717,6 +3072,7 @@ class BpmnRuntime {
     }
 
     await this._afterSettle(instance.id, runner)
+    this._recoveredInstances.add(instance.id)
     return { runner, recovered: true }
   }
 
@@ -2821,6 +3177,7 @@ class BpmnRuntime {
         ...(variables === undefined ? {} : { variables }),
         ...(result === undefined ? {} : { result }),
       })
+      await this._finalizeInbox(instanceId, 'COMPLETED')
       this._lastAgentOutputs.delete(instanceId)
       await this._maybeTerminalCleanup(instanceId).catch(() => {})
       return
@@ -2882,6 +3239,29 @@ class BpmnRuntime {
           return
         }
       }
+    }
+
+    // 0.13.10：人工任务进入 wait = 一个可投递的 human execution；只登记，不推进。
+    if (event.type === 'activity/wait') {
+      const elementId = typeof event.elementId === 'string' ? event.elementId : ''
+      const executionId = typeof event.activityId === 'string' ? event.activityId : ''
+      if (elementId !== '' && executionId !== '') {
+        void this.inbox.registerExecution({
+          instanceId,
+          activityId: elementId,
+          executionId,
+          attempt: this._attempts.get(elementId) ?? 1,
+          kind: 'human',
+        }).catch(() => {
+          // 收件箱登记失败不影响流程推进。
+        })
+      }
+    }
+    // 活动结束（人工完成 / agent 收口）：live execution 失效，未投递消息按过期处理。
+    if (event.type === 'activity/end' && typeof event.activityId === 'string' && event.activityId !== '') {
+      void this.inbox.finishExecution({ instanceId, executionId: event.activityId }).catch(() => {
+        // 同上。
+      })
     }
 
     const activityId = shardIdOf(event)
@@ -3289,6 +3669,9 @@ export async function executeAgent(element, ctx, options = {}) {
       ? { artifactStore: options.artifactStore }
       : {}),
     instanceId: options.instanceId,
+    // 0.13.10 收件箱：句柄可用后的登记回调 / 会话内收件箱工具注册。
+    ...(typeof options.onStart === 'function' ? { onStart: options.onStart } : {}),
+    ...(typeof options.registerTools === 'function' ? { registerTools: options.registerTools } : {}),
     // 配置口径的总时限（透传给适配器 ctx.timeoutMs）与扣掉 probe 后剩余的执行预算。
     effectiveTimeoutMs,
     ...(remainingTimeoutMs > 0 ? { timeoutMs: remainingTimeoutMs } : {}),

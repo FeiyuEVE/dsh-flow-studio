@@ -506,6 +506,8 @@ export async function runAgentNode(options = {}) {
             },
           }
           : {}),
+        // 0.13.10：宿主可把绑定执行身份的收件箱工具注册进节点会话。
+        ...(typeof options.registerTools === 'function' ? { registerTools: options.registerTools } : {}),
         reminder,
       })
     } catch (error) {
@@ -557,6 +559,23 @@ export async function runAgentNode(options = {}) {
         `适配器 ${adapter.id} 的 start() 没有返回带 exited Promise 的 handle`,
         { elementId: nodeId, activityId: executionId, adapter: adapter.id },
       )
+    }
+
+    // 0.13.10 收件箱：句柄可用后立刻登记 live 执行并投递排队消息。
+    // 登记 / 投递失败不能把节点判失败（消息是旁路能力），但必须留下警告。
+    if (typeof options.onStart === 'function') {
+      try {
+        await options.onStart(handle, {
+          executionId,
+          nodeId,
+          attempt,
+          workspaceRoot,
+          adapterId: adapter.id,
+          adapter,
+        })
+      } catch (error) {
+        log('warn', `flow-studio: 登记收件箱执行失败（节点 ${nodeId}）：${errorText(error)}`)
+      }
     }
 
     const racers = [

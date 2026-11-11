@@ -99,9 +99,10 @@ const OK_BODY = {
 
 function toolOf(runtime) {
   const tools = createInstanceTools({ runtime })
-  eq(tools.length, 1, '只注册这一个实例域工具')
-  eq(tools[0].name, 'flow_instance_worktrees')
-  return tools[0]
+  eq(tools.length, 3, '实例域工具：worktree + send_message + reply')
+  const worktree = tools.find(tool => tool.name === 'flow_instance_worktrees')
+  ok(worktree, '注册了 flow_instance_worktrees')
+  return worktree
 }
 
 try {
@@ -111,7 +112,7 @@ try {
     assert.throws(() => createInstanceTools({}), /runtime/)
     assertions += 1
     const runtime = makeRuntime(async () => ({ status: 200, body: { ok: true } }))
-    ok(createInstanceTools({ getRuntime: () => runtime }).length === 1)
+    ok(createInstanceTools({ getRuntime: () => runtime }).length === 3)
   })
 
   await check('参数：缺少 / 非法 action 在调用 runtime 前就失败', async () => {
@@ -318,7 +319,7 @@ try {
     const runtime = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {} })
     const tools = createInstanceTools({ runtime })
     try {
-      const toolList = await tools[0].execute({ action: 'list' })
+      const toolList = await tools.find(tool => tool.name === 'flow_instance_worktrees').execute({ action: 'list' })
       eq(toolList.ok, true)
       const routeList = await runtime.handle({
         method: 'GET',
@@ -334,7 +335,7 @@ try {
         parts: ['instances', 'i-missing', 'worktree'],
         url: new URL('http://localhost/'),
       })
-      const toolMissing = await tools[0].execute({ action: 'inspect', instanceId: 'i-missing' })
+      const toolMissing = await tools.find(tool => tool.name === 'flow_instance_worktrees').execute({ action: 'inspect', instanceId: 'i-missing' })
       eq(toolMissing.ok, false)
       eq(toolMissing.status, routeMissing.status)
       eq(toolMissing.code, routeMissing.body.code)

@@ -67,6 +67,19 @@ export const HOOK_SUPPORT = Object.freeze({
 })
 
 /**
+ * `capabilities().messages` 的合法取值（0.13.10 实例域 inbox 的可选能力扩展）。
+ *
+ * - `native`：适配器实现了可选的 `deliverMessage(handle, message)`，宿主可以在 agent
+ *   执行期间投递收件箱消息；
+ * - `unsupported`：没有消息能力；宿主必须把消息标记为 `deliveryUnknown`，不能声称
+ *   已投递。**旧适配器不写这个字段时按 `unsupported` 处理**，冻结接口不受影响。
+ */
+export const MESSAGE_SUPPORT = Object.freeze({
+  NATIVE: 'native',
+  UNSUPPORTED: 'unsupported',
+})
+
+/**
  * `probeAll()` 里**单个适配器**的探测上限（毫秒）。探测会起子进程 / 走 MCP 握手，
  * 任何一个挂住都不能让注册表整体挂住；超时按 `ok:false` 记录（m9）。
  */
@@ -77,6 +90,7 @@ const ADAPTER_METHODS = Object.freeze(['probe', 'capabilities', 'start', 'cancel
 
 const FINISH_TOOL_LEVELS = new Set(Object.values(FINISH_TOOL_SUPPORT))
 const HOOK_LEVELS = new Set(Object.values(HOOK_SUPPORT))
+const MESSAGE_LEVELS = new Set(Object.values(MESSAGE_SUPPORT))
 
 /**
  * 带结构化错误码的适配器错误。
@@ -194,6 +208,23 @@ export function validateAdapter(adapter) {
         { adapterId: adapter.id, field: `hooks['${event}']`, value: caps.hooks[event] },
       )
     }
+  }
+  // 0.13.10 可选扩展：缺省 = unsupported（不破坏旧适配器）；声明 native 必须有
+  // deliverMessage()，否则「声称能投递但宿主调不到」比不可用更危险。
+  if (caps.messages !== undefined && !MESSAGE_LEVELS.has(caps.messages)) {
+    throw fail(
+      ADAPTER_ERROR.CAPABILITY_INVALID,
+      `适配器 ${adapter.id} 的 capabilities().messages 必须是 native 或 unsupported`
+        + `（收到 ${JSON.stringify(caps.messages)}）`,
+      { adapterId: adapter.id, field: 'messages', value: caps.messages },
+    )
+  }
+  if (caps.messages === MESSAGE_SUPPORT.NATIVE && typeof adapter.deliverMessage !== 'function') {
+    throw fail(
+      ADAPTER_ERROR.CAPABILITY_INVALID,
+      `适配器 ${adapter.id} 声明了 capabilities().messages=native，但没有 deliverMessage(handle, message)`,
+      { adapterId: adapter.id, field: 'deliverMessage', reason: 'missing-method' },
+    )
   }
   return adapter
 }

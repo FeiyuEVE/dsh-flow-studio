@@ -368,9 +368,11 @@ check('页面不再渲染旧 flows/runs UI', () => {
     initialInstanceDefinition: { xml: XML },
     initialTasks: instance.pendingTasks,
   })))
+  // 0.13.10 起实例详情有**新域**收件箱区块（`.fs-inbox`），指标区块随后补上；
+  // 这两处不再属于「旧 flows/runs UI」，黑名单只保留旧域真正的渲染标记。
   for (const legacy of [
     'react-flow__', 'fs-node ', 'fs-canvas', '检查器', '运行记录', '流程模板',
-    '开始运行', '重启', 'inbox', '指标', '打回上限',
+    '开始运行', '重启', '打回上限',
   ]) {
     assert.ok(!html.includes(legacy), `页面仍渲染旧 UI 片段：${legacy}`)
   }

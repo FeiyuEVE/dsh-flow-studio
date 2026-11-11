@@ -731,8 +731,28 @@ export function createInstanceTools(deps = {}) {
     return { error: null, status, body: responseBody }
   }
 
-  /** rawRequest 的失败分流；成功返回 null。 */
-  function routeFailure(raw, action) {
+  /** 错误体里是否带着**实例状态**字符串（ACTIVE / COMPLETED / SUSPENDED / CANCELED）。 */
+  function instanceStatusOf(body) {
+    const status = isObject(body) ? body.status : undefined
+    return typeof status === 'string' && INSTANCE_STATUSES.includes(status) ? status : undefined
+  }
+
+  /**
+   * rawRequest 的失败分流；成功返回 null。
+   *
+   * `options.statusField === 'httpStatus'` 是**只给生命周期工具**的显式字段映射：
+   * HTTP 语义状态写进 `httpStatus:number`，`status` 只在错误体确实带实例状态字符串时
+   * 才输出（0.14.4 MINOR-4）。其它 11 个工具保持旧契约（`status` = HTTP 状态），
+   * 不因为本地修一个 schema 违例而改掉它们的错误形状。
+   */
+  function routeFailure(raw, action, options = {}) {
+    const statusField = options?.statusField === 'httpStatus' ? 'httpStatus' : 'status'
+    const withHttpStatus = status => (statusField === 'httpStatus' ? { httpStatus: status } : { status })
+    const withInstanceStatus = body => {
+      if (statusField !== 'httpStatus') return {}
+      const status = instanceStatusOf(body)
+      return status === undefined ? {} : { status }
+    }
     if (raw.error) {
       return failure(
         `调用实例域接口失败：${raw.error && raw.error.message ? raw.error.message : String(raw.error)}`,
@@ -742,7 +762,10 @@ export function createInstanceTools(deps = {}) {
       )
     }
     if (raw.body === null) {
-      return failure('Host 返回了不可读的响应', '检查 BPMN 运行时是否正常；稍后重试。', true, { action, status: raw.status })
+      return failure('Host 返回了不可读的响应', '检查 BPMN 运行时是否正常；稍后重试。', true, {
+        action,
+        ...withHttpStatus(raw.status),
+      })
     }
     if (raw.status < 200 || raw.status >= 300 || raw.body.ok !== true) {
       return failure(
@@ -751,8 +774,9 @@ export function createInstanceTools(deps = {}) {
         raw.status >= 500,
         {
           action,
-          status: raw.status,
+          ...withHttpStatus(raw.status),
           ...(typeof raw.body.code === 'string' ? { code: raw.body.code } : {}),
+          ...withInstanceStatus(raw.body),
         },
       )
     }
@@ -2140,6 +2164,9 @@ export function createInstanceTools(deps = {}) {
    * + 错误映射，业务语义（无在飞活动才能挂起、恢复不主动跑）全部在 runtime。
    */
   function lifecycleTool(spec) {
+    // 生命周期工具的错误契约（0.14.4 MINOR-4）：HTTP 语义状态只进 `httpStatus:number`，
+    // `status` 只在确有实例状态字符串时输出——与成功返回的 `status` 语义一致。
+    const failureOptions = { statusField: 'httpStatus' }
     return {
       name: spec.name,
       description: spec.description,
@@ -2206,14 +2233,15 @@ export function createInstanceTools(deps = {}) {
             false,
             {
               action: spec.action,
-              status: raw.status,
+              httpStatus: raw.status,
               code: 'INSTANCE_SUSPEND_BUSY',
               instanceId,
               activities: Array.isArray(raw.body.activities) ? raw.body.activities : [],
+              ...(instanceStatusOf(raw.body) === undefined ? {} : { status: instanceStatusOf(raw.body) }),
             },
           )
         }
-        const bad = routeFailure(raw, spec.action)
+        const bad = routeFailure(raw, spec.action, failureOptions)
         if (bad !== null) return bad
         return trimDeep({
           ok: true,

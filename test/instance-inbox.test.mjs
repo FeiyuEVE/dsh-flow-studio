@@ -356,6 +356,174 @@ await check('SUSPENDED 受理排队但不唤起；恢复 ACTIVE 后可投递', a
   await inbox.finishExecution({ instanceId: instance.id, executionId: 'human_exec_s' })
 })
 
+// MINOR-2（0.14.4）：已启动的 drain 不能越过挂起点。drain 入口读到 ACTIVE 之后、
+// 队列扫描返回之前提交的 suspend 必须生效：消息保持 queued，一条都不投递。
+await check('MINOR-2：扫描阶段挂起 → 消息保持 queued；恢复后新触发恰好投递一次', async () => {
+  const instance = await makeInstance()
+  const adapter = makeAdapter()
+  const inbox = makeInbox()
+  await inbox.acceptInstanceMessage({
+    instanceId: instance.id,
+    messageId: 'msg-gate-1',
+    target: { activityId: 'agent1', delivery: 'nextActivation' },
+    text: '排队中的消息。',
+  })
+  const scanEntered = deferred()
+  const scanRelease = deferred()
+  const originalList = inbox.store.listQueuedForExecution
+  inbox.store.listQueuedForExecution = async (...args) => {
+    scanEntered.resolve()
+    await scanRelease.promise
+    return originalList(...args)
+  }
+  const pending = inbox.registerExecution({
+    instanceId: instance.id,
+    activityId: 'agent1',
+    executionId: 'exec-gate',
+    kind: 'agent',
+    adapterId: 'dsh',
+    adapter,
+    handle: {},
+    workspaceRoot,
+  })
+  await scanEntered.promise
+  // drain 已经读过 ACTIVE 并进入队列扫描：此刻提交挂起。
+  patchInstance(instance, { status: 'SUSPENDED' })
+  scanRelease.resolve()
+  const registered = await pending
+  inbox.store.listQueuedForExecution = originalList
+
+  eq(registered.delivery.suspended, true, '结果明确说明因挂起停止')
+  eq(registered.delivery.deliveryBlocked, 'instance-suspended')
+  eq(registered.delivery.confirmed.length, 0, '挂起提交后一条都不投递')
+  eq(adapter.calls.length, 0, 'adapter 一次都没进')
+  let stored = await inbox.store.readMessage(instance.id, 'msg-gate-1')
+  eq(stored.status, 'queued', '消息仍排队，不能被标 failed / delivered')
+
+  // 恢复后由下一次合法触发消费原消息，且恰好一次。
+  patchInstance(instance, { status: 'ACTIVE' })
+  const resumed = await inbox.deliverQueued(instance.id, 'exec-gate')
+  eq(resumed.confirmed.length, 1, '恢复后的新触发投递原消息')
+  eq(adapter.calls.length, 1)
+  stored = await inbox.store.readMessage(instance.id, 'msg-gate-1')
+  eq(stored.status, 'injected')
+  const again = await inbox.deliverQueued(instance.id, 'exec-gate')
+  eq(again.confirmed.length, 0, '同一消息不会重复投递')
+  eq(adapter.calls.length, 1, '恰好一次')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-gate' })
+})
+
+// MINOR-2（0.14.4）：投递已进入 adapter 时无法回滚。此时提交的 suspend 不能让工具
+// 谎报「没投递」，但必须给出诊断标记，供上层知道这次投递越过了挂起点。
+await check('MINOR-2：已进 adapter 的投递如实 delivered，并标 deliveredWhileSuspended', async () => {
+  const instance = await makeInstance()
+  const adapterEntered = deferred()
+  const adapterRelease = deferred()
+  const calls = []
+  const adapter = {
+    id: 'dsh',
+    capabilities() {
+      return { finishTool: 'native', hooks: { 'turn.stop': 'native' }, messages: 'native' }
+    },
+    async deliverMessage(handle, message) {
+      calls.push({ handle, message })
+      adapterEntered.resolve()
+      await adapterRelease.promise
+      return { ok: true, deliveryUnknown: false }
+    },
+  }
+  const inbox = makeInbox()
+  await inbox.acceptInstanceMessage({
+    instanceId: instance.id,
+    messageId: 'msg-inflight',
+    target: { activityId: 'agent1', delivery: 'nextActivation' },
+    text: '飞行中的投递。',
+  })
+  const pending = inbox.registerExecution({
+    instanceId: instance.id,
+    activityId: 'agent1',
+    executionId: 'exec-inflight',
+    kind: 'agent',
+    adapterId: 'dsh',
+    adapter,
+    handle: {},
+    workspaceRoot,
+  })
+  await adapterEntered.promise
+  patchInstance(instance, { status: 'SUSPENDED' })
+  adapterRelease.resolve()
+  const registered = await pending
+
+  eq(calls.length, 1, '投递已经交给 adapter，无法回滚')
+  eq(registered.delivery.confirmed.length, 1, '如实报告已投递')
+  eq(registered.delivery.deliveredWhileSuspended, true, '附诊断标记')
+  eq(registered.delivery.suspended, true, 'drain 观察到挂起后停止（不是「未投递」的意思）')
+  const stored = await inbox.store.readMessage(instance.id, 'msg-inflight')
+  eq(stored.status, 'injected', '如实记录已投递，不谎报未投递')
+  eq(stored.delivery.deliveryUnknown, false, '适配器确认了送达')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-inflight' })
+})
+
+// MINOR-2（0.14.4）：投递前读不到可信实例状态（ENOENT / 坏 JSON）→ 不投递、不改消息
+// 状态（不标 failed），并在 drain 结果里明确原因。
+await check('MINOR-2：投递前读不到实例（ENOENT / 坏 JSON）→ 不投递、不标 failed', async () => {
+  const runScenario = async (label, breakInstance, expectedReason) => {
+    const instance = await makeInstance()
+    const adapter = makeAdapter()
+    const inbox = makeInbox()
+    await inbox.acceptInstanceMessage({
+      instanceId: instance.id,
+      messageId: `msg-unreadable-${label}`,
+      target: { activityId: 'agent1', delivery: 'nextActivation' },
+      text: '读不到实例状态的消息。',
+    })
+    const scanEntered = deferred()
+    const scanRelease = deferred()
+    const originalList = inbox.store.listQueuedForExecution
+    inbox.store.listQueuedForExecution = async (...args) => {
+      scanEntered.resolve()
+      await scanRelease.promise
+      return originalList(...args)
+    }
+    const pending = inbox.registerExecution({
+      instanceId: instance.id,
+      activityId: 'agent1',
+      executionId: `exec-unreadable-${label}`,
+      kind: 'agent',
+      adapterId: 'dsh',
+      adapter,
+      handle: {},
+      workspaceRoot,
+    })
+    await scanEntered.promise
+    breakInstance(instance)
+    scanRelease.resolve()
+    const registered = await pending
+    inbox.store.listQueuedForExecution = originalList
+
+    eq(registered.delivery.deliveryBlocked, expectedReason, `${label}：原因明确`)
+    eq(registered.delivery.confirmed.length, 0, `${label}：一条都不投递`)
+    eq(adapter.calls.length, 0, `${label}：adapter 没被调用`)
+    const stored = await inbox.store.readMessage(instance.id, `msg-unreadable-${label}`)
+    eq(stored.status, 'queued', `${label}：消息保持 queued，不被标 failed`)
+    return { instance, inbox, adapter }
+  }
+
+  const missing = await runScenario(
+    'missing',
+    instance => unlinkSync(join(instance.dir, 'instance.json')),
+    'instance-missing',
+  )
+  await missing.inbox.finishExecution({ instanceId: missing.instance.id, executionId: 'exec-unreadable-missing' })
+
+  const corrupt = await runScenario(
+    'corrupt',
+    instance => writeFileSync(join(instance.dir, 'instance.json'), '{ 不是 JSON', 'utf8'),
+    'instance-unreadable',
+  )
+  await corrupt.inbox.finishExecution({ instanceId: corrupt.instance.id, executionId: 'exec-unreadable-corrupt' })
+})
+
 await check('已结束 execution 410；终态实例拒绝新消息', async () => {
   const instance = await makeInstance()
   const inbox = makeInbox()

@@ -476,13 +476,162 @@ try {
     const tool = createInstanceTools({ runtime }).find(item => item.name === 'flow_instance_suspend')
     const result = await tool.execute({ instanceId: 'i-1' })
     eq(result.ok, false)
-    eq(result.status, 409)
+    eq(result.httpStatus, 409, 'HTTP 状态进 httpStatus')
+    eq(result.status, undefined, 'status 不能是 HTTP 状态码（schema 声明为 string）')
     eq(result.code, 'INSTANCE_SUSPEND_BUSY')
     eq(result.retryable, false)
     eq(result.activities.length, 1)
     eq(result.activities[0].kind, 'agent')
     ok(/未结束的活动/.test(result.error))
     ok(result.hint.includes('等活动结束'))
+  })
+
+  // MINOR-4（0.14.4）：用 ajv 对工具**实际返回值**跑它自己的 input/output schema。
+  // 基线 BUSY / 普通路由错误把 HTTP 409 写进声明为 string 的 status，会在这里红。
+  await check('MINOR-4：生命周期工具实际返回值通过自身 schema；HTTP 状态只进 httpStatus', async () => {
+    const Ajv = (await import('ajv')).default
+    const ajv = new Ajv({ allErrors: true, strict: false })
+    const toolsFor = handler => createInstanceTools({ runtime: makeRuntime(handler) })
+    const suspend = toolsFor(async () => ({
+      status: 200,
+      body: { ok: true, status: 'SUSPENDED', reason: null, lastSeq: 3, suspendedAt: '2026-11-12T00:00:00.000Z' },
+    })).find(item => item.name === 'flow_instance_suspend')
+    const resume = toolsFor(async () => ({
+      status: 200,
+      body: { ok: true, status: 'ACTIVE', reason: null, lastSeq: 4, resumedAt: '2026-11-12T00:00:01.000Z' },
+    })).find(item => item.name === 'flow_instance_resume')
+
+    const validateInput = ajv.compile(suspend.parameters)
+    const validateSuspendOutput = ajv.compile(suspend.output.schema)
+    const validateResumeOutput = ajv.compile(resume.output.schema)
+    const assertValid = (validate, value, label) => {
+      if (validate(value)) return
+      const detail = (validate.errors ?? []).map(e => `${e.instancePath || '/'} ${e.message}`).join('；')
+      assert.fail(`${label} 违反自身 schema：${detail}\n实际值：${JSON.stringify(value)}`)
+    }
+    const assertStatusIsString = (value, label) => {
+      if (value.status !== undefined) ok(typeof value.status === 'string', `${label}：status 只能是实例状态字符串`)
+      if (value.httpStatus !== undefined) eq(typeof value.httpStatus, 'number', `${label}：httpStatus 是数字`)
+    }
+
+    // input schema：合法参数必须通过；实例 id 规则是 string。
+    assertValid(validateInput, { instanceId: 'i-1' }, 'suspend 入参')
+    assertValid(validateInput, { instanceId: 'i-1', reason: '维护' }, 'suspend 入参 + reason')
+
+    // 成功返回。
+    const suspended = await suspend.execute({ instanceId: 'i-1' })
+    assertValid(validateSuspendOutput, suspended, 'suspend 成功返回')
+    eq(suspended.ok, true)
+    eq(suspended.httpStatus, 200)
+    eq(suspended.status, 'SUSPENDED')
+    assertStatusIsString(suspended, 'suspend 成功返回')
+    const resumed = await resume.execute({ instanceId: 'i-1' })
+    assertValid(validateResumeOutput, resumed, 'resume 成功返回')
+    eq(resumed.status, 'ACTIVE')
+
+    const cases = [
+      {
+        label: 'BUSY',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({
+          status: 409,
+          body: {
+            ok: false,
+            code: 'INSTANCE_SUSPEND_BUSY',
+            error: '实例 i-1 还有未结束的活动，不能挂起：agent 活动 agent1 正在执行。等活动结束后再挂起。',
+            activities: [{ kind: 'agent', activityId: 'agent1', executionId: 'agent1_1', state: 'running' }],
+          },
+        }),
+        expect: { httpStatus: 409, code: 'INSTANCE_SUSPEND_BUSY' },
+      },
+      {
+        label: '终态',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({ status: 409, body: { ok: false, code: 'BPMN_INSTANCE_TERMINAL', error: '实例 i-1 已结束（COMPLETED），不能挂起' } }),
+        expect: { httpStatus: 409, code: 'BPMN_INSTANCE_TERMINAL' },
+      },
+      {
+        label: '非 SUSPENDED',
+        tool: 'resume',
+        output: validateResumeOutput,
+        handler: async () => ({ status: 409, body: { ok: false, code: 'INSTANCE_NOT_SUSPENDED', error: '实例 i-1 当前状态是 ACTIVE，只有 SUSPENDED 才能恢复' } }),
+        expect: { httpStatus: 409, code: 'INSTANCE_NOT_SUSPENDED' },
+      },
+      {
+        label: '非 ACTIVE',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({ status: 409, body: { ok: false, code: 'INSTANCE_NOT_ACTIVE', error: '实例 i-1 当前状态是 COMPLETED，只有 ACTIVE 才能挂起' } }),
+        expect: { httpStatus: 409, code: 'INSTANCE_NOT_ACTIVE' },
+      },
+      {
+        label: '400 参数错',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({ status: 400, body: { ok: false, code: 'BPMN_REASON_INVALID', error: 'reason 含控制字符' } }),
+        expect: { httpStatus: 400, code: 'BPMN_REASON_INVALID' },
+      },
+      {
+        label: '500 内部错',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({ status: 500, body: { ok: false, code: 'BPMN_INTERNAL', error: '内部错误' } }),
+        expect: { httpStatus: 500, code: 'BPMN_INTERNAL', retryable: true },
+      },
+      {
+        label: '不可读响应',
+        tool: 'suspend',
+        output: validateSuspendOutput,
+        handler: async () => ({ status: 502 }),
+        expect: { httpStatus: 502 },
+      },
+      {
+        label: '错误体带实例状态字符串',
+        tool: 'resume',
+        output: validateResumeOutput,
+        handler: async () => ({ status: 409, body: { ok: false, code: 'INSTANCE_SUSPENDED', status: 'SUSPENDED', error: '实例已挂起' } }),
+        expect: { httpStatus: 409, code: 'INSTANCE_SUSPENDED', status: 'SUSPENDED' },
+      },
+    ]
+    for (const item of cases) {
+      const tool = toolsFor(item.handler).find(entry => entry.name === `flow_instance_${item.tool}`)
+      const value = await tool.execute({ instanceId: 'i-1' })
+      assertValid(item.output, value, `${item.label} 失败返回`)
+      eq(value.ok, false, `${item.label}：ok=false`)
+      eq(value.httpStatus, item.expect.httpStatus, `${item.label}：httpStatus 是数字 ${item.expect.httpStatus}`)
+      if (item.expect.code !== undefined) eq(value.code, item.expect.code, `${item.label}：保留错误码`)
+      if (item.expect.retryable !== undefined) eq(value.retryable, item.expect.retryable)
+      if (item.expect.status !== undefined) {
+        eq(value.status, item.expect.status, `${item.label}：确实有实例状态时才输出 status`)
+      } else {
+        eq('status' in value, false, `${item.label}：不能把 HTTP 状态码写进 status`)
+      }
+      assertStatusIsString(value, item.label)
+    }
+
+    // BUSY 的可操作 hint 保留。
+    const busy = await toolsFor(cases[0].handler).find(entry => entry.name === 'flow_instance_suspend')
+      .execute({ instanceId: 'i-1' })
+    ok(busy.hint.includes('等活动结束'), 'BUSY hint 仍指向「等活动结束」')
+    eq(busy.activities.length, 1)
+
+    // Host 侧抛错（没有 HTTP 响应）：不伪造 httpStatus。
+    const thrown = await toolsFor(async () => { throw new Error('runtime boom') })
+      .find(entry => entry.name === 'flow_instance_suspend')
+      .execute({ instanceId: 'i-1' })
+    assertValid(validateSuspendOutput, thrown, 'Host 抛错')
+    eq(thrown.ok, false)
+    eq('httpStatus' in thrown, false, '没有 HTTP 响应就不写 httpStatus')
+    eq('status' in thrown, false)
+
+    // 其它工具的错误契约不变：status 仍是 HTTP 语义状态（只对生命周期工具做映射）。
+    const listTools = toolsFor(async () => ({ status: 500, body: { ok: false, code: 'BPMN_INTERNAL', error: 'boom' } }))
+    const listResult = await listTools.find(entry => entry.name === 'flow_instance_list').execute({})
+    eq(listResult.ok, false)
+    eq(listResult.status, 500, '非生命周期工具保持 status=HTTP 状态')
+    eq(listResult.httpStatus, undefined)
   })
 
   await check('E4 resume / complete_task：SUSPENDED 状态错误码映射到中文 hint', async () => {

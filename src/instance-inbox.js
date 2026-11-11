@@ -12,6 +12,10 @@
  *   - 人工任务收消息只当作讨论 / 附件：不写完成变量、不调 signalTask。
  *   - 回复目标只认宿主维护的 ID（`replyTargets`），消息 / 模型不能临时提供 URL 或
  *     session；回复先写 outbox，重试使用稳定 replyId。
+ *   - 投递门禁（0.14.4 MINOR-2）：每次真正领取投递权（进入 adapter / 写 delivered）
+ *     之前都重读一次实例状态；`SUSPENDED`（以及终态 / 读不到实例）一律不投递，
+ *     消息保持 `queued`，drain 停止。已进入 adapter 的投递无法回滚：投递完成后才
+ *     发现挂起时如实记 delivered，并在 drain 结果附 `deliveredWhileSuspended:true`。
  *
  * 本模块不启动 runner：受理只看实例元数据与内存里的 live execution 表，查看消息
  * 不会推进流程。
@@ -1101,6 +1105,52 @@ export function createInstanceInbox(options = {}) {
     }
   }
 
+  /**
+   * 投递门禁：每次**真正领取投递权**（进入 adapter / 写 delivered）之前读一次实例状态。
+   *
+   * 语义（0.14.4 MINOR-2）：
+   *   - `ACTIVE` → 放行；
+   *   - `SUSPENDED` → 不投递、**不标 failed**，消息保持 `queued`，drain 停止；
+   *   - 终态 / 实例缺失（ENOENT）/ `instance.json` 坏 JSON / 其它读失败 → 同样保守处理
+   *     （不投递、不改消息状态），分别给出 `instance-terminal` / `instance-missing` /
+   *     `instance-unreadable`。
+   *
+   * 读取失败不抛：投递是可选推进，读不到事实时宁可不投递，也不能把「不知道」写成
+   * 「投递失败」，更不能用上一拍的 ACTIVE 快照穿过挂起点。
+   */
+  async function readDeliveryGate(instanceId) {
+    let instance
+    try {
+      instance = await readInstance(instanceId, { instancesRoot })
+    } catch (error) {
+      // 坏 JSON（INSTANCE_CORRUPT）/ 权限 / IO 错误：都按「读不到可信状态」保守处理。
+      const mapped = mapStoreError(error)
+      return { allowed: false, reason: 'instance-unreadable', code: mapped.code, error: mapped.message }
+    }
+    if (instance === null) return { allowed: false, reason: 'instance-missing' }
+    if (instance.status === 'SUSPENDED') return { allowed: false, reason: 'instance-suspended', status: instance.status }
+    if (isTerminal(instance.status)) return { allowed: false, reason: 'instance-terminal', status: instance.status }
+    if (instance.status !== 'ACTIVE') {
+      return { allowed: false, reason: 'instance-not-active', status: instance.status }
+    }
+    return { allowed: true, reason: null, status: instance.status }
+  }
+
+  /**
+   * 把门禁结果写进 drain 结果：明确「一条都没投递」以及为什么，而不是含糊的空列表。
+   * 只有确实发生过投递（`deliveredSinceCheck`）之后才发现挂起，才标
+   * `deliveredWhileSuspended`——那是诊断，不是「未投递」。
+   */
+  function noteDeliveryBlocked(result, gate, deliveredSinceCheck) {
+    result.deliveryBlocked = gate.reason
+    if (gate.status !== undefined) result.blockedStatus = gate.status
+    if (gate.code !== undefined) result.blockedCode = gate.code
+    if (gate.reason === 'instance-suspended') {
+      result.suspended = true
+      if (deliveredSinceCheck === true) result.deliveredWhileSuspended = true
+    }
+  }
+
   /** drain 的所有权循环：空队列 / 达到上限前都重新确认 pending 标志。 */
   async function drainOwned(state, instanceId, executionId, max) {
     const result = { confirmed: [], failed: [], remaining: 0, skipped: false }
@@ -1108,10 +1158,29 @@ export function createInstanceInbox(options = {}) {
     let restarts = 0
     /** 本次 drain 内已经尝试过的消息：即使状态写回失败留在 queued，也不再重复外发。 */
     const attemptedIds = new Set()
+    /** 上一次门禁之后是否真的投递成功过：用于「投递完成后才发现已挂起」的诊断标记。 */
+    let deliveredSinceCheck = false
     const entry = liveEntry(instanceId, executionId)
     if (entry === null) return result
-    const instance = await readInstance(instanceId, { instancesRoot })
-    if (instance === null || isTerminal(instance.status) || instance.status === 'SUSPENDED') return result
+    // 入口门禁：SUSPENDED / 终态 / 读不到实例时连队列都不扫（不发新消息）。
+    const initialGate = await readDeliveryGate(instanceId)
+    if (!initialGate.allowed) {
+      noteDeliveryBlocked(result, initialGate, false)
+      return result
+    }
+    /**
+     * 从 drain 返回前的收口：本次投递过就再读一次状态——若此刻已挂起，说明投递是在
+     * 挂起提交之后才收口的（无法回滚），如实标 `deliveredWhileSuspended`，让调用方别
+     * 把这个结果当成「挂起期间没投递」。
+     */
+    async function settle() {
+      if (deliveredSinceCheck === true) {
+        deliveredSinceCheck = false
+        const gate = await readDeliveryGate(instanceId)
+        if (!gate.allowed) noteDeliveryBlocked(result, gate, true)
+      }
+      return result
+    }
     for (;;) {
       let queued
       try {
@@ -1123,20 +1192,20 @@ export function createInstanceInbox(options = {}) {
       const fresh = queued.filter(record => !attemptedIds.has(record.messageId))
       if (fresh.length === 0) {
         if (consumePending(state)) {
-          if (++restarts > INBOX_DRAIN_ACTIVATION_LIMIT) return result
+          if (++restarts > INBOX_DRAIN_ACTIVATION_LIMIT) return await settle()
           continue
         }
-        return result
+        return await settle()
       }
       if (attempted >= max) {
         // 新触发（pending）代表一次新的 drain 请求：重置本次预算继续消费，避免
         // 「旧 drain 达到上限就退出、新消息没人唤醒」。重启次数有上界。
         if (consumePending(state)) {
-          if (++restarts > INBOX_DRAIN_ACTIVATION_LIMIT) return result
+          if (++restarts > INBOX_DRAIN_ACTIVATION_LIMIT) return await settle()
           attempted = 0
           continue
         }
-        return result
+        return await settle()
       }
       const batch = fresh.slice(0, Math.min(INBOX_DRAIN_BATCH, max - attempted))
       let progressed = 0
@@ -1144,13 +1213,23 @@ export function createInstanceInbox(options = {}) {
         // 投递期间执行可能已结束：立刻停止，不再往死句柄里塞；剩余消息由
         // finishExecution 的条件过期收口。
         const current = liveEntry(instanceId, executionId)
-        if (current === null) return result
+        if (current === null) return await settle()
+        // **领取投递权前**重读实例状态：扫描队列与真正投递之间的挂起提交必须生效。
+        const claim = await readDeliveryGate(instanceId)
+        if (!claim.allowed) {
+          noteDeliveryBlocked(result, claim, deliveredSinceCheck)
+          deliveredSinceCheck = false
+          return result
+        }
+        deliveredSinceCheck = false
         attempted += 1
         progressed += 1
         attemptedIds.add(record.messageId)
         const outcome = await deliverOne(current, record)
-        if (outcome.confirmed) result.confirmed.push(record.messageId)
-        else {
+        if (outcome.confirmed) {
+          result.confirmed.push(record.messageId)
+          deliveredSinceCheck = true
+        } else {
           result.failed.push({ messageId: record.messageId, code: outcome.code, error: outcome.error })
         }
         // 副作用已发生但结果写不回去：停止本次 drain，绝不自动重发同一条消息。
@@ -1161,11 +1240,11 @@ export function createInstanceInbox(options = {}) {
           } catch {
             // 读不到就保留旧值，不改变「停止重发」的结论。
           }
-          return result
+          return await settle()
         }
       }
       // 没有任何推进时退出，避免坏记录把循环钉死。
-      if (progressed === 0) return result
+      if (progressed === 0) return await settle()
     }
   }
 

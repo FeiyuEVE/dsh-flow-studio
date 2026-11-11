@@ -680,6 +680,26 @@ await check('normalizeNodeCheck 边界：command 2000 / exit 0、255 / timeout 1
   assert.equal(validateNodeCheck({ command: 'true', timeoutMs: 1800001 }).field, 'timeoutMs')
 })
 
+await check('normalizeNodeCheck 诊断值 256 字符上限：错误消息有界、command 不截短', () => {
+  const huge = 'x'.repeat(10000)
+  // 旧实现（0.13 model.js 的 extras 收敛）把诊断字符串裁到 256；抽取后一度丢失，
+  // 一条 10k 假值会把错误消息撑到 10047 字符。这里锁住与旧实现相同的上限。
+  for (const field of ['timeoutMs', 'expectExitCode']) {
+    const normalized = normalizeNodeCheck({ command: 'true', [field]: huge })
+    assert.equal(typeof normalized[field], 'string', `${field} 应按原类型进入诊断`)
+    assert.equal(normalized[field].length, 256, `${field} 诊断值应裁到 256 字符`)
+    const verdict = validateNodeCheck(normalized)
+    assert.equal(verdict.ok, false)
+    assert.equal(verdict.field, field)
+    assert.ok(verdict.message.length <= 512, `${field} 错误消息应有界，当前 ${verdict.message.length} 字符`)
+    assertChinese(verdict.message)
+  }
+  // 只裁诊断值，不裁实际执行命令：10k 命令照样原样保留，交给 commandLen 校验拒绝。
+  const command = normalizeNodeCheck({ command: huge, timeoutMs: huge })
+  assert.equal(command.command.length, huge.length, '实际执行的 command 不能被诊断裁剪')
+  assert.equal(validateNodeCheck(command).field, 'command')
+})
+
 await check('normalizeNodeCheck 非法：绝对路径 / .. / NUL / 非整数 / 非对象都被诊断', () => {
   const cases = [
     { command: 'true', reportPath: '/etc/passwd' },

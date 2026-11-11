@@ -14,8 +14,9 @@
  * <flow-studio>/definitions/<definitionId>/<version>.bpmn
  * <flow-studio>/instances/<instanceId>/{instance.json,state.json,events/...}
  * ```
- * 传入的 `dir` 通常是老的 `flows/` 目录；本模块自动取它的父目录作为 flow-studio
- * 根。也接受显式 `definitionsRoot` / `instancesRoot` 覆盖（测试与嵌入方使用）。
+ * 传入的 `dir` 是 flow-studio 数据根；为兼容旧调用，若它指向名为 `flows` 的
+ * 旧数据目录，本模块自动取父目录作为根。也接受显式 `definitionsRoot` /
+ * `instancesRoot` 覆盖（测试与嵌入方使用）。
  *
  * 事件桥（runner onEvent → 落盘）：
  *   - `process/start` / `activity/start` → 事件落盘 + 实例 running；

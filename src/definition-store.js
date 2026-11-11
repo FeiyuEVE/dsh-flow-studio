@@ -14,7 +14,8 @@
  *   - JSON 先收敛形状再写，坏形状抛结构化错误，绝不写半截；
  *   - 不可变性只在锁内判定：不同 hash 写同一版本 → {@link DefinitionError}(409)。
  *
- * 与老 run 存储（`src/runstore.js`）完全隔离：新目录、新 id 空间，互不读写。
+ * 与实例域存储（`src/instance-store.js`）互不读写：本模块只管 `definitions/`，
+ * 实例域只管 `instances/`，各自的目录与 id 空间不共享。
  *
  * @module @feiyueve/dsh-flow-studio/definition-store
  */
@@ -203,7 +204,7 @@ async function readTextOrNull(path) {
 }
 
 /**
- * 跨进程互斥（照 `src/runstore.js` 的 `meta.lock` 模式，只保留本模块需要的最小实现）：
+ * 跨进程互斥（本模块自有的最小实现）：
  * `O_EXCL` 原子创建 + nonce 复核 + 过期锁「rename 接管」。
  *
  * 用 rename 而不是「读 → unlink」做接管：同一时刻只有一个进程能 rename 成功，

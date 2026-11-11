@@ -230,7 +230,7 @@ async function readTextOrNull(path) {
 }
 
 /**
- * 跨进程互斥（照 `src/runstore.js` 的 `meta.lock` 模式）：`O_EXCL` + nonce 复核 +
+ * 跨进程互斥（本模块自有的最小实现）：`O_EXCL` + nonce 复核 +
  * 过期锁 `rename` 接管。本 helper 不建目录——调用方先确认实例目录存在，
  * 避免对已删除实例的写操作「复活」空目录。
  */
@@ -939,7 +939,7 @@ async function needsLeadingNewline(path) {
 /**
  * 追加一批事件到 `events/<activityId>/<attempt>.jsonl`。
  *
- * seq 口径与 `runstore.appendEvents` 一致：**先分配后写事件**——先在实例锁内把
+ * seq 口径：**先分配后写事件**——先在实例锁内把
  * `lastSeq = lastSeq + N` 原子写进 instance.json，再追加事件行。进程在两步之间被杀
  * 只留下 seq 空洞（读侧允许空洞），绝不重复；文件末尾是半行时先补一个 `\n`，
  * 新事件不会粘进坏行。

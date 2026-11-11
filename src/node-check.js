@@ -11,14 +11,23 @@
 /** 诊断值收敛时的深度 / 键数上限（只用于把非法输入变成可读诊断）。 */
 const DIAG_DEPTH = 3
 const DIAG_KEYS = 16
+/**
+ * 诊断值里单个字符串的上限。非法输入只用来拼错误消息，超长内容没有诊断价值，
+ * 不裁会让一条错误消息被 10k 字符的假值撑爆；实际执行的 `command` 不走这里，
+ * 不会被裁短（见 `normalizeNodeCheck`）。
+ */
+const DIAG_STRING_MAX = 256
 
 /**
  * 把一个任意值收敛成「JSON 可序列化的原始值」：函数、undefined、NaN、BigInt、
- * Symbol、类实例、循环引用、超深嵌套一律返回 undefined（丢弃）。
+ * Symbol、类实例、循环引用、超深嵌套一律返回 undefined（丢弃）；字符串裁到
+ * `DIAG_STRING_MAX`，让诊断消息长度有界。
  */
 function jsonSafeValue(value, depth = 0, seen = new WeakSet()) {
   if (value === null || typeof value === 'boolean') return value
-  if (typeof value === 'string') return value
+  if (typeof value === 'string') {
+    return value.length > DIAG_STRING_MAX ? value.slice(0, DIAG_STRING_MAX) : value
+  }
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
   if (typeof value !== 'object') return undefined
   if (depth >= DIAG_DEPTH || seen.has(value)) return undefined
@@ -128,9 +137,12 @@ function checkShapeMessage(value) {
  *   - **非法配置不会被丢成「未配置」**：字段值原样保留（非 JSON 安全类型保留成
  *     `false` 这类明显非法值），并让 `validateNodeCheck` 能指出具体字段。这样保存
  *     半成品不会被静默当成「没有检查」，启动前校验也拦得住。
+ *   - 诊断值里的字符串最多保留 256 字符（`DIAG_STRING_MAX`）：够定位，又不会让
+ *     错误消息被超长假值撑爆。
  *   - command 超长时**不截短**：截短后再拿去做检查等于执行了另一条命令。
  *
- * 旧版本的 `extras.check` 不会被升级成这里的可执行配置（见 normalizeFlow）。
+ * 旧版本存进 `extras.check` 的值不会被升级成这里的可执行配置——`extras` 与
+ * `node.check` 是两条独立路径，本模块只归一化后者。
  *
  * @param {unknown} raw
  * @returns {{command:string, expectExitCode:unknown, timeoutMs:unknown, reportPath?:unknown, shapeError?:string}|null}

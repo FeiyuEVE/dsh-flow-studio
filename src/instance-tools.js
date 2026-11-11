@@ -579,7 +579,7 @@ function failureHint(status, body, action) {
     return '预览已失效：重新调 action:"prune"（不带 planHash）拿新的 planHash，再执行；不要重发旧 planHash。'
   }
   if (code === 'INSTANCE_WORKTREE_INSTANCE_ACTIVE') {
-    return '实例是 ACTIVE / SUSPENDED：先停止实例（flow_stop 只针对旧运行域，实例用 DELETE /instances/<id>/stop 或面板停止）；force 不能越过这条限制。'
+    return '实例是 ACTIVE / SUSPENDED：先停止实例（`POST /instances/<id>/stop`，模型侧用 `flow_instance_cancel`，面板也可停止）；force 不能越过这条限制。'
   }
   if (code === 'INSTANCE_WORKTREE_PLAN_INVALID') {
     return '执行 prune 必须带预览返回的 planHash；先不带 planHash 调一次（dryRun 默认 true）。'

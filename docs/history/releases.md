@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.13）
+# 版本历史（0.1 → 0.13.14）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -771,3 +771,41 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - usage / 指标的「未知不是零」语义同 0.13.11；证据视图不推算任何分数。
 - 证据报告需要 agent 自己在 `flow_finish_node.documents[]` 里登记；没有登记就是 `missing`，宿主不会替它编。
 - 工具面只覆盖有真实路由支撑的能力：没有 watch、没有定时唤醒、没有自动重试。
+
+## 0.13.14 — 0.13.12 复审收口（收件箱数据面、锁与清理）
+
+0.13.12 的独立复审给出 1 BLOCKER + 9 MAJOR（B1、M1–M9）。本版把它们逐条收口，并更正 0.13.12 段里被这些反例推翻的措辞。
+
+**收件箱数据面**
+
+- **B1（BLOCKER）父目录替换不再能越界写**：Linux 上正文物化固定在**受信父目录 FD** 上——工作区根先 `realpath`，再对 `.flow-studio-inbox`、`<instanceId>` 逐级 `O_DIRECTORY|O_NOFOLLOW` 打开，之后创建 / 校验 / 清理都走 `/proc/self/fd/<fd>/<name>`（等价 `openat`）。父目录在写入期间被换走或换回都不改变落点；写后还要求交付路径的真实 inode 与固定 FD 一致且 `realpath` 落在工作区内。
+- **M2** 完整 JSON 只缺末尾换行的记录不再被当坏尾：锁内、replay / 幂等 / seq 分配之前先修尾——纯空白截掉、合法 JSON 补换行正规化、真正不完整的尾行才转存 `.torn`；追加按 `bytesWritten` 循环补齐短写。
+- **M3** 取消「按 TTL 接管投递权」：120 秒不能证明仍在跑的外发已经结束。领取记录写 `dispatch.owner = {pid, host, bootId, startTime}`，只有能确认旧领取者进程确实不在时才接管；跨主机 / 旧格式 / 读不到 `/proc` 一律保持 in-flight（409，文案说明归属无法确认），接管后写回一律标 `possibleDuplicate:true`，不声称 exactly-once。
+- **M4** 终态收尾改成条件更新：message / reply 都在锁内针对最新记录判断（只把仍 `queued` 的改 `failed`，只把仍 `queued` 且无 dispatch 的回复改 `skipped`）；在飞回复保留领取权让投递方按真实结果写回。
+- **M5** drain 的空队列收尾窗口不再丢唤醒：并发触发改为置 `pending` 并在释放所有权前重新确认队列。
+- **M6** 外发成功但状态写回失败时不再重发：单次 drain 内不重复尝试同一条消息，写回失败尽力落 `failed + deliveryUnknown`（`MESSAGE_DELIVERY_STATE_WRITE_FAILED`）并立即停止 drain。
+
+**锁与清理**
+
+- **M1** codex 每次启动（初始 / 每次 resume / start 失败路径）都登记**进程组**并保留清理责任，`kill(-pgid, 0)` 确认整组消失才算清理完成；`cleanup.disposed` 只在所有进程组确认退出后为 true；新增 `handle.cleanupFinal` 最终清理 Promise，runtime 等它 settle 才释放槽位（超时如实保留占用并给诊断）。
+- **M9** 锁改由宿主进程自己的 fd 持有（helper 只是持锁代理）：helper 单独死亡不再等于失锁；持有期间 helper 退出会让临界区收到 `RESOURCE_LOCK_LOST` 并 fail-closed 中止，第二持有者被内核挡住。同时修掉锁路径上未取消的定时器（锁 13ms 返回却让进程多活 2s）与降级队列忽略 `waitMs`。
+
+**收件箱 GUI**
+
+- **M7** `messageId` 只随「规范化正文 + 目标」签名变化：点当前模式是 no-op，发送期间模式按钮禁用，成功响应仍关联原提交，不会残留草稿二次外发。
+- **M8** 手选的精确目标失效后**不静默改投**其他执行：保留失效状态、要求重选（或显式切「下次激活」）。
+- **N10 残留** 组件卸载 / 实例切换后，迟到的发送结果不再触发全局通知或刷新。
+
+**文档**
+
+- `docs/reference/instance-api.md` 新增「锁与平台」：flock 由宿主 fd 持有、无 flock 平台只保证同进程串行、锁文件常驻不可外部删除、正文与锁文件不做在线自动回收。
+- 收件箱语义补齐「条件更新」「TTL 已取消」「在飞取消语义」「非 Linux 父目录替换残余窗口」。
+- `docs/history/releases.md` 的 0.13.12 段改成与事实一致：哪些当版关闭、哪些是 0.13.14 才收口。
+
+**已知边界**
+- 非 Linux（无 `/proc/self/fd`）缺少 openat / 受信 dirfd 原语，`lstat` 与 `open()` 之间仍存在**无法彻底消除**的父目录替换窗口；这是降级路径，不等价于 Linux 的 FD 固定保证。
+- 跨主机 / 旧格式 / 读不到 `/proc` 的投递归属无法确认时保持 in-flight 并返回 409，当前没有「显式解除」API，需要人工处置。
+- 入站消息没有跨进程 claim：终态收尾只改仍 `queued` 的记录，同进程外发成功后升级为 `injected`；若进程正好在这两步之间崩溃，状态可能显示 `failed` 但实际已送达。
+- drain 的 `pending` 标志是进程内状态，进程崩溃会丢失这次唤醒，只能等下一次触发。
+- M6 若成功写回与补偿写**都**失败，进程内不再重发，但重启后仍可能再试一次（at-least-once）。
+- 没有 util-linux `flock` 的平台（Windows / macOS）跨进程互斥不成立，只保证同进程串行；NFS / SMB 不保证 flock 语义。

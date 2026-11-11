@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.5）
+# 版本历史（0.1 → 0.13.6）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -517,25 +517,25 @@
 
 ## 0.13.5 — 0.13.4 复审修复
 
-codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR + 2 MINOR」。这一版逐条关闭，并把构建校验从「信任产物里的自报哈希」改成「按源码独立重建后逐字节比对」。
+codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR + 2 MINOR」。这一版关闭了其中可复现的部分，并把构建校验从「信任产物里的自报哈希」改成「按源码独立重建后逐字节比对」；随后的复审又指出 6 MAJOR 残留/新增（F1–F6）与 3 MINOR，由 [0.13.6](#0136--http-connector-与-0135-复审修复) 修完。
 
 **客户端（M1–M6、m1）**
 - **实例切换失败要回滚（M1）**：选择 B 但 `readInstance(B)` 失败时，事件归属 / 缓存 / 游标 / marker 整体回滚到 A，不再留下 `activeInstance=A / eventsOwner=B` 的错位；后续对 A 的轮询正常继续。
 - **终态补拉失败不停轮询（M2）**：「实例已终态」与「事件已追平」分开记录，补拉失败或游标不推进时按退避继续重试，只有真正追平才停；同时修掉「打开非终态实例就把 caughtUp 置真、转终态后停轮询」的竞态（M2b 回归）。
 - **预留游标不再当已读游标（M3）**：Host 会先写 `instance.lastSeq` 再追加事件，详情里的 lastSeq 可能超前；现在 `since` 与显示游标只取**实际返回事件**的最大 seq，预留值只作为追平目标，不再永久跳过事件。
 - **异步导入完成后按最新事件重算 marker（M4）**：导入返回时用当前实例归属的最新事件缓存重算，并在视图世代变化时丢弃，不再用调用时捕获的旧 marker 覆盖终态。
-- **导入期间销毁不再复活 Modeler（M5）**：生命周期世代 + `assertAlive` 覆盖所有 await 边界；销毁后禁止回滚重建，`onChange` 也检查 disposed。
+- **导入期间销毁不再复活 Modeler（M5）**：生命周期世代 + `assertAlive` 覆盖主要 await 边界（`saveXML` / `flushProperties` 的 await 后检查在 0.13.6 补齐）；销毁后禁止回滚重建，`onChange` 也检查 disposed。
 - **回滚重建失败进入显式不可用态（M6）**：页面显示恢复失败原因、保存明确报「画布不可用（恢复失败）」，再次导入必须真正重建实例，不再假成功。
 - **m1 测试盲区**：页面测试改为真实递归渲染组件树（`BpmnCanvas` 的 effect 真跑、`chunk.mountEditor/onReady` 真接线、卸载真调 `destroy`），删掉 `canvas.js` 的 `mountOptions` 透传会让 4 组变红。
 
 **构建校验（M7、M8）**
 - `verify-build` 主判据换成**独立重建 + 逐字节比较**：按当前源码在内存里用 esbuild 重建两个客户端包（官方 CSS/字体现场渲染注入，不读工作树里可能陈旧的生成物），与 `lib/` 逐字节比对；不一致直接失败并指出首个不同字节。
 - 输入清单补进 4 份官方 CSS 与 1 个 woff2 字体（共 556 项）；每个产物写入模块清单（`client.js` 17 个模块、`client.bpmn.js` 461 个），verify 用**重建的 metafile** 交叉核对并做模块级泄漏断言。
-- factory 执行移进受限 VM：沙箱内不存在 `process`，`require('process')` 直接抛「未授权的宿主模块」，并带 3s 超时；只有字节 / 元数据 / 模块检查全部通过才执行。
+- factory 执行移进受限 VM：白名单 `require` 拒绝 `process`，并带 3s 超时；只有字节 / 元数据 / 模块检查全部通过才执行（context 原型上的逃逸面在 0.13.6 用独立子进程 + null 原型 realm 封死）。
 - 新增 8 条反例：改官方 CSS、只重算 `inputsHash`、主包夹带真实 `bpmn-js` Modeling bundle、factory `require('process').exit(0)`、直接 `process.exit(0)`、死循环、`constructor('return process')` 逃逸、无 prepack。
 
 **agent 完结门（发布门槛缺口）**
-- 删除 `executeAgent()` 里 `adapter=custom` 与「无注册表 codex」的旧 `runExternalExecutor` 逃生门：agent 节点只能经注册 adapter + `flow_finish_node` 完结；custom / 缺注册表一律零派发 + 明确错误码（`BPMN_AGENT_ADAPTER_UNSUPPORTED` / `BPMN_AGENT_ADAPTER_UNAVAILABLE`）。
+- 删除 `executeAgent()` 里 `adapter=custom` 与「无注册表 codex」的旧 `runExternalExecutor` 逃生门：agent 节点只能经注册 adapter + `flow_finish_node` 完结；custom / 缺注册表一律零派发 + 明确错误码（`BPMN_AGENT_ADAPTER_UNSUPPORTED` / `BPMN_AGENT_ADAPTER_UNAVAILABLE`）。「成功结果只认完结门受理记录」的边界在 0.13.6 收紧（F5）。
 
 **容器验收**
 - 新增 `scripts/e2e-bpmn.sh`：打包 → 装进 `dsh-testbed-bpmn` → 重启容器内 dsh（带一次性插件令牌）→ health / 画布 chunk 字节一致 / 定义 / 实例 / 人工任务 / 事件 / 鉴权 / 宿主隔离全链路断言，实测连续 3 次通过（详见 [测试台 cookbook](../cookbook/run-container-testbed.md)）。
@@ -546,3 +546,40 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 终态补拉是「有界循环 + 退避的长期重试」：若 Host 预留 seq 永远不落盘，页面会持续显示明确错误并按退避重试，不会静默停住。
 - 主包仍含旧 React Flow（退役在 0.14.0），所以构建校验对主包只硬禁 BPMN 栈、对 chunk 硬禁 `@xyflow`。
 - m1 的页面测试用自建渲染器（真实组件函数 + effect 调度），不是 react-dom 的真实 reconciliation；真实浏览器覆盖在 `client-bpmn.browser.test.mjs`。
+
+## 0.13.6 — HTTP connector 与 0.13.5 复审修复
+
+这一版加 **HTTP connector**（BPMN serviceTask 真的能调外部 HTTP），同时把 0.13.5 复审里剩下的 6 MAJOR + 3 MINOR 修完。
+
+### HTTP connector（新能力）
+
+- **配置**：仍是 `bpmn:ServiceTask` + `fs:node nodeType="http"`；`fs:http` 支持 `method / url / headers / body / timeoutMs / retries / authRef / networkPolicyId / maxResponseBytes / acceptStatuses / idempotency{Mode,Header}`。数据映射只认 `zeebe:ioMapping`（`inputParameters` / `outputParameters`），旧的 `fs:http.inputMapping/outputMapping` 不再支持、混用时明确报错。
+- **目标策略**：「校验即连接」——URL 先拒绝 userinfo / 非 http(s)，DNS 的所有解析结果都分类（loopback / 私网 / link-local / metadata / ULA / CGNAT / IPv4-mapped 等），任一被禁就整次拒绝；返回的 `lookup` 只吐已验证地址并直接交给 `node:http(s).request`，连接时不会二次解析。默认只允许 HTTPS 公网；内网 / 明文测试台要显式配置 `allowedHosts` / `allowedCidrs` / `allowInsecureOrigins`。3xx 一律拒绝（不做重定向）。
+- **限额与重试**：请求体 256 KiB；响应默认 1 MiB、硬上限 5 MiB（原始字节与解压后字节都计数，超限立即中断）；默认不重试，显式最多 3 次，只覆盖瞬时网络错误与 429/502/503/504，退避与 `Retry-After` 受整体 deadline 约束；有副作用的方法只有在配置幂等键（remote-key）时才允许重试。
+- **幂等与恢复**：幂等键由 `instanceId + elementId + executionId + method + url` 生成，同一次执行的所有重试共享，循环重新激活换 execution 就换键。发送前先落盘调用记录（`<instanceId>/connector/`，原子写），成功结果在返回引擎前落盘；重启时已成功结果直接复用、不再请求远端，「已发送但结果不明」记 `HTTP_OUTCOME_UNKNOWN` 且不自动重发。
+- **失败语义**：connector 错误写 `ACTIVE + lastError + error 事件`，不产生 `activity/end`、不走出向连线；不会把实例判成失败。
+- **密钥**：`authRef` 只从宿主解析（环境变量 `FLOW_STUDIO_HTTP_AUTH_<REF>` 或注入的 resolver），XML / 变量 / 事件 / 错误文本 / 日志都不出现密钥；在 `fs:http.headers` 里手写 authorization / cookie / token 之类会被拒绝。
+- **面板**：http 节点新增 `authRef / networkPolicyId / maxResponseBytes / acceptStatuses / 幂等模式与头`，输入 / 输出映射改成一行一个 `source → target`，写进 `zeebe:ioMapping`。
+
+### 0.13.5 复审修复（F1–F6、f1–f3）
+
+- **F1 实例回滚基线**：回滚改用「最后一次完整提交的实例状态」，连续选 B / C 失败也不会再让事件归属停在未提交的实例上；A 的轮询与游标恢复正常。
+- **F2 导入串行化**：编辑器的「模式切换 + 导入」串行进同一个队列并带单调 token；过期请求在触碰真实模型前就放弃，已开始的导入之后由最新请求覆盖，迟到导入不再改写当前实例的模型。
+- **F3 不可用态**：`setViewerMode()` 失败会销毁半成品并记下不可用原因；页面在任意成功恢复入口（打开定义 / 导入 / 草稿恢复 / applyView）统一把画布恢复 ready，不再出现「已恢复但保存仍禁用」。
+- **F4 factory 隔离**：注册与 factory 检查移到**独立子进程**，realm 用 null 原型 + 禁 codegen + 不传入任何宿主对象；属性读取、序列化和错误格式化都在受限范围内执行，父进程只认带完成标记的结构化结果（不认退出码）。`globalThis.constructor.constructor('return process')` 等 11 条逃逸路径全部不可达，无限 getter 被超时中止。
+- **F5 完结门只认受理记录**：agent 成功结果只来自 `await gate.result`；适配器先 abort 再自报 `ok/record` 一律判 `BPMN_ABORTED`，自报内容不进入返回值。
+- **F6 容器脚本前置校验**：`scripts/e2e-bpmn.sh` 在安装 / 杀进程之前先核对容器身份、端口映射、PID/NET namespace 隔离、挂载不越界、监听进程身份、日志 token 登录 303；任一不符直接失败且不动任何东西。容器内没有在跑实例时走 **bootstrap**（由脚本启动 dsh 并证明端口归属，不 kill）；证据目录按运行隔离（`.tmp/e2e-bpmn/<runId>/`）并加锁。
+- **f1 输入清单自校验**：逐条比对声明与磁盘的 `{bytes, sha256}`，并要求声明集合与独立重建的输入集合完全一致。
+- **f2 生命周期**：`saveXML` / `flushProperties` 在 await 后检查生命周期，已销毁的控制器不再返回成功。
+- **f3 发布口径**：0.13.4 / 0.13.5 段落里超出证据的表述已按复审结论收窄。
+
+### 测试与验收
+
+- `npm test` 51 个套件、1251 组全过；真浏览器 35 组 / 249 条断言全过。
+- `scripts/e2e-bpmn.sh` 在 `dsh-testbed-bpmn` 上实跑通过（含 bootstrap 与「已有实例」两条前置路径），断言 health / 画布 chunk 字节一致 / 定义 / 实例 / 人工任务 / 事件 / 鉴权 / 宿主隔离。
+
+**已知边界**
+- 宿主凭据目前只有环境变量与注入 resolver，没有 GUI 凭据管理 / 加密存储 / OAuth 刷新；`networkPolicyId` 由宿主策略表映射，没有 UI 编辑。
+- 「旧的 `fs:http.inputMapping/outputMapping` 与 `zeebe:ioMapping` 混用」是在运行到该节点时拒绝，不是保存期门禁。
+- 幂等键与调用记录的保护是进程级；同进程 runner 有实例表保护，跨进程并发恢复仍可能各发一次。
+- 主包仍含旧 React Flow（0.14.0 退役）；构建校验对主包只硬禁 BPMN 栈、对 chunk 硬禁 `@xyflow`。

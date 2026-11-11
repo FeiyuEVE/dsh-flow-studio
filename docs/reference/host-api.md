@@ -2,6 +2,8 @@
 
 插件在 Host 侧注册单条 `prefix` 路由 `/api/flow-studio`，客户端同源 fetch 调用；模型工具是同一套能力在会话里的入口。
 
+BPMN 实例域（`/definitions`、`/instances`、`/instance-worktrees`）的当前路由与字段见 [实例域接口](instance-api.md)；本页只列旧运行域（`/flows`、`/runs`）。
+
 ## 鉴权
 
 **与 `/api` 同口径**：插件路由虽然绕过了 webserver 的 `/api` 通用鉴权（最长前缀优先），但每个 handler 入口都会调宿主 `ctx.get('connection')?.requestRejection(req)`，把判定权交回宿主（401 / 403 与 `/api` 一致；拿不到该服务时 **fail-closed 503**，绝不放行）。

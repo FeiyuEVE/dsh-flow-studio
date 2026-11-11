@@ -11,6 +11,7 @@
 | 往运行中的流程发消息，或理解「一个节点一个会话」 | [收件箱与节点会话](guide/inbox-and-sessions.md) |
 | 看指标、打开日志抽屉、导出 run、分清两种闹钟 | [可观测性](guide/observability.md) |
 | 查 HTTP 路由、模型工具、令牌与安全开关 | [Host 接口](reference/host-api.md) |
+| 查 BPMN 定义 / 实例域的路由、收件箱、worktree 与 connector 字段 | [实例域接口](reference/instance-api.md) |
 | 查流程 JSON 与 run 目录/元数据字段 | [数据模型](reference/data-model.md) |
 | 查事件信封、kind 列表、用量四桶与聚合入口 | [运行日志](reference/run-log.md) |
 | 用容器测试台验收一次改动 | [容器测试台](cookbook/run-container-testbed.md) |
@@ -33,6 +34,7 @@
 | [guide/inbox-and-sessions.md](guide/inbox-and-sessions.md) | 外部消息怎么进流程、一个节点一个会话、回复通道 | 接流程的 agent / 集成方 |
 | [guide/observability.md](guide/observability.md) | 指标口径、日志抽屉、导出、节点闹钟与 run 级 supervision 的差别 | 盯运行的人 |
 | [reference/host-api.md](reference/host-api.md) | `/api/flow-studio` 路由、模型工具、鉴权、环境变量与安全开关 | 集成方 / 运维 |
+| [reference/instance-api.md](reference/instance-api.md) | BPMN 定义 / 实例域路由、实例状态、收件箱、worktree、connector 与实例工具 | 集成方 / 排障 |
 | [reference/data-model.md](reference/data-model.md) | 流程 JSON、校验分级、run 目录与 `run.json` 字段、worktree 布局 | 集成方 / 排障 |
 | [reference/run-log.md](reference/run-log.md) | 事件契约的入口与速查；契约正文在 [design/05-run-log.md](design/05-run-log.md) | 集成方 / 排障 |
 | [history/releases.md](history/releases.md) | 0.1 → 0.13.3 逐版本变化（README 不再承载历史） | 升级 / 回溯的人 |

@@ -7,6 +7,7 @@
 >
 > 实现：`src/bpmn-runtime.js`（路由 / 事件桥 / 懒恢复 / 服务处理器）、
 > `src/bpmn-runner.js`（引擎适配）、`src/definition-store.js` / `src/instance-store.js`（存储）。
+> 当前路由与字段的契约参考见 [实例域接口](../reference/instance-api.md)；本册只保留设计记录，不维护第二份字段表。
 > 计划与红线见 [0.13 计划](../plan/0.13-bpmn引擎与适配器.md) §2 / §3 / §10。
 
 ## 1 目标与非目标

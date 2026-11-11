@@ -18,7 +18,7 @@
 
 ## 2 身份与事件
 
-指标只从实例事件流、实例事实、connector 记录、资源记录派生。事件信封（`seq` / `at` / `elementId` / `activityId`）的字段契约归 [10 · BPMN 实例 API](10-bpmn-instance-api.md#38-get-instancesidevents)；下表只定义**指标如何消费这些字段**。新增的 agent 遥测事件由适配器观测、`agent-execute` 在**任何结局**（成功 / 超时 / 取消 / 未 finish）收尾时写入：
+指标只从实例事件流、实例事实、connector 记录、资源记录派生。公共事件信封（`seq` / `at` / `elementId` / `activityId`）的字段契约归 [10 · BPMN 实例 API](10-bpmn-instance-api.md#38-get-instancesidevents)；下表定义的是本阶段新增的 **agent 遥测事件 type 与指标消费方式**（这些事件没有旧域对应物）。新增遥测由适配器观测、`agent-execute` 在**任何结局**（成功 / 超时 / 取消 / 未 finish）收尾时写入：
 
 | 事件 `type` | 关键字段 | 含义 |
 |---|---|---|

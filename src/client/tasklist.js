@@ -291,7 +291,8 @@ export function InstanceList(props = {}) {
  * 右侧实例区：列表 + 选中实例详情 + 人工待办。
  *
  * props: `instances`、`activeInstance`、`activeInstanceId`、`tasks`、`submittingKeys`、
- * `busy`、`onSelectInstance(id)`、`onRefresh()`、`onStop(id)`、`onCompleteTask(task, input)`。
+ * `busy`、`onSelectInstance(id)`、`onRefresh()`、`onStop(id)`、`onSuspend(id)`、
+ * `onResume(id)`、`onCompleteTask(task, input)`。
  */
 export function InstancePanel(props = {}) {
   const active = isObject(props.activeInstance) ? props.activeInstance : null
@@ -302,6 +303,8 @@ export function InstancePanel(props = {}) {
   const onSelectInstance = typeof props.onSelectInstance === 'function' ? props.onSelectInstance : () => {}
   const onRefresh = typeof props.onRefresh === 'function' ? props.onRefresh : () => {}
   const onStop = typeof props.onStop === 'function' ? props.onStop : () => {}
+  const onSuspend = typeof props.onSuspend === 'function' ? props.onSuspend : () => {}
+  const onResume = typeof props.onResume === 'function' ? props.onResume : () => {}
   const onCompleteTask = typeof props.onCompleteTask === 'function' ? props.onCompleteTask : () => {}
   const error = instanceErrorOf(active)
   const status = active && typeof active.status === 'string' ? active.status : ''
@@ -352,11 +355,28 @@ export function InstancePanel(props = {}) {
         h('strong', null, '执行错误'),
         h('p', null, error))
       : null,
-    status === 'ACTIVE'
+    // 挂起不是终态：这里只提示「当前不推进」，恢复入口就在下面（0.14.3）。
+    status === 'SUSPENDED'
+      ? h('p', { className: 'fs-instance-hint', 'data-instance-suspended': 'true' },
+        '实例已挂起：不推进、不派发活动；恢复后才能继续完成人工待办。')
+      : null,
+    status === 'ACTIVE' || status === 'SUSPENDED'
       ? h('div', { className: 'fs-instance-actions' },
+        status === 'ACTIVE'
+          ? h('button', {
+            type: 'button', className: 'fs-btn sm primary', onClick: () => onSuspend(active.id), disabled: busy,
+            'data-action': 'suspend-instance',
+            title: '挂起实例（POST /instances/<id>/suspend）：该实例没有在飞活动时才成功',
+          }, '挂起实例')
+          : h('button', {
+            type: 'button', className: 'fs-btn sm primary', onClick: () => onResume(active.id), disabled: busy,
+            'data-action': 'resume-instance',
+            title: '恢复实例（POST /instances/<id>/resume）：回到活跃状态，但不会主动推进',
+          }, '恢复实例'),
         h('button', {
           type: 'button', className: 'fs-btn sm danger', onClick: () => onStop(active.id), disabled: busy,
-          title: '中止实例（POST /instances/<id>/stop）',
+          'data-action': 'stop-instance',
+          title: '中止实例（POST /instances/<id>/stop）：挂起期间也可直接停止',
         }, '停止实例'))
       : null,
     h('h4', { className: 'fs-task-title' }, '人工待办'),

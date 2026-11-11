@@ -193,6 +193,11 @@ export const CSS = `
 }
 .fs-instance-error strong{display:block;font-size:12px}
 .fs-instance-error p{margin:2px 0 0;word-break:break-word}
+.fs-instance-hint{
+  margin:0;padding:6px 8px;border-radius:var(--dsw-radius-sm);font-size:12px;line-height:18px;
+  color:var(--fs-r2-warn);border:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 35%, transparent);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 7%, var(--dsw-alias-bg-base));
+}
 .fs-instance-actions{display:flex;gap:6px;flex-wrap:wrap}
 .fs-task-title{margin:2px 0 0;font-size:13px;line-height:20px}
 .fs-task-empty{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}

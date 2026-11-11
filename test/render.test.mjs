@@ -62,7 +62,8 @@ const {
 } = await import('../src/client/page.js')
 const {
   InstancePanel, PENDING_TASKS_EMPTY_TEXT, TaskList, errorTextOf, instanceErrorOf,
-  instanceStatusText, normalizeTasks, parseTaskPayload, pendingTaskCount, taskKey, taskSubmitBody,
+  instanceStatusText, instanceStatusTone, normalizeTasks, parseTaskPayload, pendingTaskCount, taskKey,
+  taskSubmitBody,
 } = await import('../src/client/tasklist.js')
 const {
   InstanceEventDrawer, eventRows, focusBpmnElement, mergeInstanceEvents,
@@ -288,6 +289,74 @@ check('实例状态：只使用 ACTIVE / COMPLETED / SUSPENDED / CANCELED，未�
     tasks: instance.pendingTasks,
   }))
   assert.ok(waiting.includes('等待人工 1'), '待办通过 pendingTasks 展示')
+})
+
+check('实例挂起 / 恢复入口：ACTIVE 挂起、SUSPENDED 恢复、终态都不给、busy 全禁用', () => {
+  assert.equal(instanceStatusText('SUSPENDED'), '已挂起')
+  assert.equal(instanceStatusTone('SUSPENDED'), 'warn', '挂起不是终态，用 warn 档而不是 success/error')
+
+  const buttonTag = (html, action) => {
+    const match = html.match(new RegExp(`<button[^>]*data-action="${action}"[^>]*>`))
+    return match === null ? '' : match[0]
+  }
+
+  // ACTIVE：挂起 + 停止；没有恢复。
+  const active = render(React.createElement(InstancePanel, {
+    instances: [instance],
+    activeInstance: { ...instance, lastError: null },
+    tasks: instance.pendingTasks,
+  }))
+  assert.ok(buttonTag(active, 'suspend-instance') !== '', 'ACTIVE 必须有「挂起实例」')
+  assert.ok(active.includes('挂起实例'))
+  assert.ok(active.includes('/instances/&lt;id&gt;/suspend'), '挂起按钮 title 必须写清 POST 路径')
+  assert.ok(buttonTag(active, 'stop-instance') !== '', 'ACTIVE 仍需「停止实例」')
+  assert.ok(buttonTag(active, 'resume-instance') === '', 'ACTIVE 不能出现「恢复实例」')
+
+  // SUSPENDED：恢复 + 停止；没有挂起；详情明显标出「已挂起」。
+  const suspendedInstance = { ...instance, status: 'SUSPENDED', lastError: null }
+  const suspended = render(React.createElement(InstancePanel, {
+    instances: [suspendedInstance],
+    activeInstance: suspendedInstance,
+    tasks: instance.pendingTasks,
+  }))
+  assert.ok(buttonTag(suspended, 'resume-instance') !== '', 'SUSPENDED 必须有「恢复实例」')
+  assert.ok(suspended.includes('恢复实例'))
+  assert.ok(suspended.includes('/instances/&lt;id&gt;/resume'), '恢复按钮 title 必须写清 POST 路径')
+  assert.ok(buttonTag(suspended, 'stop-instance') !== '', '挂起期间仍要允许「停止实例」')
+  assert.ok(buttonTag(suspended, 'suspend-instance') === '', 'SUSPENDED 不能再「挂起实例」')
+  assert.ok(suspended.includes('已挂起'))
+  assert.ok(suspended.includes('data-instance-suspended="true"'), '挂起态要有明确提示')
+  assert.ok(!suspended.includes('data-instance-error="true"'), '挂起不是错误')
+
+  // 终态：COMPLETED / CANCELED 两个操作都不出现（停止也没有）。
+  for (const status of ['COMPLETED', 'CANCELED']) {
+    const terminal = render(React.createElement(InstancePanel, {
+      instances: [{ ...instance, status }],
+      activeInstance: { ...instance, status, pendingTasks: [], lastError: null },
+      tasks: [],
+    }))
+    for (const action of ['suspend-instance', 'resume-instance', 'stop-instance']) {
+      assert.ok(buttonTag(terminal, action) === '', `${status} 不能有 ${action}`)
+    }
+  }
+
+  // busy：当前状态可用的按钮全部 disabled。
+  const busyActive = render(React.createElement(InstancePanel, {
+    instances: [instance],
+    activeInstance: { ...instance, lastError: null },
+    tasks: instance.pendingTasks,
+    busy: true,
+  }))
+  assert.match(buttonTag(busyActive, 'suspend-instance'), /disabled=""/, 'busy 时挂起按钮必须禁用')
+  assert.match(buttonTag(busyActive, 'stop-instance'), /disabled=""/, 'busy 时停止按钮必须禁用')
+  const busySuspended = render(React.createElement(InstancePanel, {
+    instances: [suspendedInstance],
+    activeInstance: suspendedInstance,
+    tasks: instance.pendingTasks,
+    busy: true,
+  }))
+  assert.match(buttonTag(busySuspended, 'resume-instance'), /disabled=""/, 'busy 时恢复按钮必须禁用')
+  assert.match(buttonTag(busySuspended, 'stop-instance'), /disabled=""/, 'busy 时停止按钮必须禁用')
 })
 
 check('人工待办：payload / decidedBy / executionId；提交中禁用；JSON 非法不提交', () => {

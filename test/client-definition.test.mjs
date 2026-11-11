@@ -15,7 +15,8 @@ import assert from 'node:assert/strict'
 import { parseBpmn } from '../src/bpmn-parse.js'
 import {
   api, definitionPath, definitionsPath, instanceDefinitionPath, instanceEventsPath, instancePath,
-  instanceTasksPath, instancesPath, completeTaskPath, stopInstancePath,
+  instanceTasksPath, instancesPath, completeTaskPath, resumeInstancePath, stopInstancePath,
+  suspendInstancePath,
 } from '../src/client/api.js'
 import { createDefinitionState } from '../src/client/definition-state.js'
 import { createEditRevision, createSaveQueue } from '../src/client/bpmn-state.js'
@@ -123,6 +124,8 @@ await check('新 API 路径：definitions / instances 契约，不再拼旧 /flo
   eq(instanceTasksPath('i1'), '/instances/i1/tasks')
   eq(completeTaskPath('i1', 'task/a'), '/instances/i1/tasks/task%2Fa/complete')
   eq(stopInstancePath('i1'), '/instances/i1/stop')
+  eq(suspendInstancePath('i1'), '/instances/i1/suspend')
+  eq(resumeInstancePath('i1'), '/instances/i1/resume')
   eq(instanceDefinitionPath('i1'), '/instances/i1/definition')
 })
 

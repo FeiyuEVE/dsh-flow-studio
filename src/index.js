@@ -28,7 +28,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
-import { createBpmnRuntime, isBpmnEnabled } from './bpmn-runtime.js'
+import { createBpmnRuntime } from './bpmn-runtime.js'
 import { normalizeExecutor } from './executor.js'
 import { NODE_KIND, normalizeFlow, normalizeNodeCheck, validateFlow, validateNodeCheck } from './model.js'
 import { compileFlowFiles, readFlowDir, writeFlowDir } from './flowdir.js'
@@ -1281,8 +1281,7 @@ async function route(req, res, env) {
     const exposePaths = authz.ok || isLoopbackRequest(req)
     const authState = inspectAuth()
     const rootsConfig = parseWorkspaceRoots()
-    // 0.13.0 灰度开关：关着时只回 enabled:false，绝不创建运行时 / 不碰新目录。
-    const bpmnHealth = isBpmnEnabled() ? await bpmnRuntimeFor(env).health() : { enabled: false }
+    const bpmnHealth = await bpmnRuntimeFor(env).health()
     sendJson(res, 200, {
       ok: true,
       ...(exposePaths ? { dir: env.dir, runsDir: env.runsRoot } : {}),
@@ -1315,17 +1314,9 @@ async function route(req, res, env) {
     return
   }
 
-  // 0.13.0：BPMN 定义域 / 实例域（灰度开关 FLOW_STUDIO_BPMN，默认关）。
-  // 鉴权 / 只读令牌 / 同源校验已在 route() 开头统一完成，这里只做开关与分发。
+  // 0.13：BPMN 定义域 / 实例域。
+  // 鉴权 / 只读令牌 / 同源校验已在 route() 开头统一完成，这里只做分发。
   if (parts[0] === 'definitions' || parts[0] === 'instances') {
-    if (!isBpmnEnabled()) {
-      sendJson(res, 404, {
-        ok: false,
-        code: 'BPMN_DISABLED',
-        hint: '设置 FLOW_STUDIO_BPMN=1 启用',
-      })
-      return
-    }
     const runtime = bpmnRuntimeFor(env)
     const body = req.method === 'GET' ? undefined : await readBody(req)
     const result = await runtime.handle({

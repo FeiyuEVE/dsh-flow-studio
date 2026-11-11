@@ -1,8 +1,8 @@
-# 10 · BPMN 实例 API（0.13.0，灰度默认关）
+# 10 · BPMN 实例 API（0.13）
 
 > 本册定义 0.13.0 第一阶段交付的 **headless 引擎 + 定义/实例 HTTP API**：
 > `bpmn-engine@26.0.6` 跑单实例，模板域（`definitions/`）与运行域（`instances/`）隔离，
-> `FLOW_STUDIO_BPMN` 默认关。画布（bpmn.io）、dsh AgentAdapter、http connector、
+> 新路由常开（没有灰度开关：旧路径不合规就替换，不做兼容双轨）。画布（bpmn.io）、dsh AgentAdapter、http connector、
 > 新审计口径都不在本阶段。
 >
 > 实现：`src/bpmn-runtime.js`（路由 / 事件桥 / 懒恢复 / 服务处理器）、
@@ -58,8 +58,7 @@ $DSH_HOME/flow-studio/
 
 所有路由都在 `/api/flow-studio` 下，鉴权 / 只读令牌 / 同源校验走 `route()` 开头现有逻辑：
 只读令牌只能 GET；`complete` / `stop` 是写操作。开关关着时 `definitions` 与 `instances`
-一律 `404 {ok:false, code:'BPMN_DISABLED', hint:'设置 FLOW_STUDIO_BPMN=1 启用'}`，
-老路由一行不动。
+老路由在画布替换（0.13.3）之前暂时保留，替换后删除。
 
 | 方法 | 路径 | 作用 | 成功状态 |
 |---|---|---|---|
@@ -262,17 +261,16 @@ pending ──start──▶ running ──wait──▶ waiting ──signal─
   事件流是观测面，不能因为 agent 输出大就让实例失败。
 - 0.13.0 **不写** `task/wait` 事件：人工任务等待就是 `activity/wait`，避免同一事实两条记录。
 
-## 6 灰度开关与 health
+## 6 环境变量与 health
 
 | 环境变量 | 默认 | 作用 |
 |---|---|---|
-| `FLOW_STUDIO_BPMN` | `0` | `1` = 启用 definitions/instances 路由与新引擎；其它值一律关 |
 | `FLOW_STUDIO_BPMN_MAX_ACTIVE` | `100` | 活跃实例 LRU 上限（透传 runner `maxActiveInstances`） |
 | `FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS` | 不设 | 单活动超时；不设则只受 run 时限 / signal 控制 |
 
 开关关着：
 
-- `GET/POST /definitions`、`/instances*` 一律 404 `BPMN_DISABLED`；
+
 - `GET /health` 只回 `bpmn: { enabled: false }`，**不创建运行时、不建新目录**；
 - 老 `/flows`、`/runs`、`/health` 等行为不变。
 
@@ -329,8 +327,8 @@ pending ──start──▶ running ──wait──▶ waiting ──signal─
 
 | 状态 | 典型 code | 场景 |
 |---|---|---|
-| 400 | `BPMN_DISABLED`? 否（404） / `BPMN_XML_INVALID` / `BPMN_DEFINITION_ID_INVALID` / `BPMN_BODY_INVALID` / `BPMN_VERSION_INVALID` / `BPMN_PAYLOAD_INVALID` / `INSTANCE_INVALID_ID` | 入参或 XML 不合法 |
-| 404 | `BPMN_DISABLED` / `DEFINITION_NOT_FOUND` / `DEFINITION_VERSION_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND` / `BPMN_ROUTE_NOT_FOUND` | 开关关着 / 资源不存在 |
+| 400 | `BPMN_XML_INVALID` / `BPMN_DEFINITION_ID_INVALID` / `BPMN_BODY_INVALID` / `BPMN_VERSION_INVALID` / `BPMN_PAYLOAD_INVALID` / `INSTANCE_INVALID_ID` | 入参或 XML 不合法 |
+| 404 | `DEFINITION_NOT_FOUND` / `DEFINITION_VERSION_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND` / `BPMN_ROUTE_NOT_FOUND` | 开关关着 / 资源不存在 |
 | 405 | `BPMN_METHOD_NOT_ALLOWED` | 方法不匹配 |
 | 409 | `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_FAILED` / `BPMN_INSTANCE_NOT_RECOVERABLE` / `DEFINITION_VERSION_IMMUTABLE` / `DEFINITION_STALE` / `INSTANCE_VERSION_CONFLICT` | 版本/并发/状态冲突 |
 | 500 | `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED` / `BPMN_DEFINITION_INVALID` / `INSTANCE_CORRUPT` | 落盘或数据损坏（不静默） |

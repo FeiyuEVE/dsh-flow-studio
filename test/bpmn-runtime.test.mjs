@@ -227,35 +227,49 @@ function countType(events, type) {
 
 try {
   // -------------------------------------------------------------------------
-  // 1. 灰度开关默认关：新路由 404 + BPMN_DISABLED，老路由不受影响
+  // 1. 新路由常开（没有灰度开关）：/definitions、/instances 直接可用；health 报现算计数
   // -------------------------------------------------------------------------
-  await check('开关关闭：/definitions 与 /instances 404 + BPMN_DISABLED，/health 与 /flows 正常', async home => {
-    process.env.FLOW_STUDIO_BPMN = '0'
+  await check('新路由常开：/definitions 与 /instances 直接可用，health.bpmn 带现算计数', async home => {
     const route = { handler: createHandler(makeEnv(home)) }
 
-    for (const path of ['/definitions', '/instances']) {
-      const res = await call(route, 'GET', `${API}${path}`)
-      eq(res.status, 404, `${path} 关闭时必须 404`)
-      eq(res.json.code, 'BPMN_DISABLED', `${path} 关闭时必须带 BPMN_DISABLED`)
-      ok(typeof res.json.hint === 'string' && res.json.hint.includes('FLOW_STUDIO_BPMN=1'), 'hint 告诉怎么开')
-    }
+    const defs = await call(route, 'GET', `${API}/definitions`)
+    eq(defs.status, 200, '/definitions 必须直接可用（没有开关）')
+    eq(defs.json.ok, true)
+    ok(Array.isArray(defs.json.definitions), 'definitions 是数组')
+
+    const insts = await call(route, 'GET', `${API}/instances`)
+    eq(insts.status, 200, '/instances 必须直接可用')
+    ok(Array.isArray(insts.json.instances), 'instances 是数组')
 
     const health = await call(route, 'GET', `${API}/health`)
-    eq(health.status, 200, 'health 不受开关影响')
-    deep(health.json.bpmn, { enabled: false }, '关着时 health 只回 enabled:false，不创建运行时')
-    eq(health.json.ok, true)
+    eq(health.status, 200)
+    eq(health.json.bpmn.enabled, true, 'health.bpmn.enabled 恒为 true')
+    eq(health.json.bpmn.engine, '26.0.6')
+    eq(health.json.bpmn.definitions, 0, '计数现算')
+    eq(health.json.bpmn.instances, 0, '计数现算')
 
     const flows = await call(route, 'GET', `${API}/flows`)
-    eq(flows.status, 200, '老 /flows 不受影响')
-    ok(Array.isArray(flows.json.flows) && flows.json.flows.length >= 1, '老流程列表照常返回')
-    ok(!existsSync(join(home, 'flow-studio', 'definitions')), '关着时不该创建 definitions/')
+    eq(flows.status, 200, '老 /flows 暂时仍在（画布 0.13.3 之前）')
+  })
+
+  await check('路由里不存在 BPMN_DISABLED / FLOW_STUDIO_BPMN 开关', async home => {
+    const route = { handler: createHandler(makeEnv(home)) }
+    process.env.FLOW_STUDIO_BPMN = '0'
+    try {
+      const res = await call(route, 'GET', `${API}/definitions`)
+      eq(res.status, 200, '把 FLOW_STUDIO_BPMN 设成 0 也不该影响路由（开关已删除）')
+    } finally {
+      delete process.env.FLOW_STUDIO_BPMN
+    }
+    const src = readFileSync(new URL('../src/bpmn-runtime.js', import.meta.url), 'utf8')
+    ok(!src.includes('BPMN_DISABLED'), '源码里不该再有 BPMN_DISABLED')
+    ok(!src.includes('isBpmnEnabled'), '源码里不该再有 isBpmnEnabled')
   })
 
   // -------------------------------------------------------------------------
   // 2. 定义域：版本递增 / 同 XML 新版本 / 坏 XML 400
   // -------------------------------------------------------------------------
   await check('定义域：保存版本、同 XML 再存是新版本、坏 XML 400 且不落盘', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const route = { handler: createHandler(makeEnv(home)) }
 
     const first = await seed(route)
@@ -306,7 +320,6 @@ try {
   // 3. 建实例 → serviceTask → userTask waiting + pendingTasks + 事件
   // -------------------------------------------------------------------------
   await check('实例：跑到 userTask 变 waiting，instance.json 有 pendingTasks，事件流三类齐全', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const calls = []
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor(calls) })) }
     await seed(route)
@@ -366,7 +379,6 @@ try {
   // 4. 完成人工任务 → done + activity/end / flow/taken / process/end
   // -------------------------------------------------------------------------
   await check('人工任务完成：推进到 done，事件流含 activity/end、flow/taken、process/end', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
     await seed(route)
     const instance = await startInstance(route)
@@ -399,7 +411,6 @@ try {
   // 5. 并发 complete：一个成功、一个 409，pendingTasks 不被写坏
   // -------------------------------------------------------------------------
   await check('并发完成：恰好一个成功、另一个 409，pendingTasks 不被写坏', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
     await seed(route)
     const instance = await startInstance(route)
@@ -428,7 +439,6 @@ try {
   // 6. stop：aborted 终态、事件不重复、幂等
   // -------------------------------------------------------------------------
   await check('中止实例：aborted 终态，事件不新增不重复，重复 stop 幂等', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
     await seed(route)
     const instance = await startInstance(route)
@@ -467,7 +477,7 @@ try {
   // 7. 懒恢复（关键可靠性）：丢掉内存注册表后从 state.json 恢复并继续到 done
   // -------------------------------------------------------------------------
   await check('懒恢复：新 runtime 丢掉注册表后 GET 能 recovered:true，并继续 complete 到 done', async home => {
-    const env = { FLOW_STUDIO_BPMN: '1' }
+    const env = {}
     const dir = store.flowsDir(home)
     const fake = makeFakeExecutor()
     const url = new URL('http://localhost/')
@@ -574,7 +584,6 @@ try {
   // 8b. 通过实例验证 dsh adapter：实例 failed，result.error.code 保留真实原因
   // -------------------------------------------------------------------------
   await check('实例里的 dsh adapter：failed + result.error.code = BPMN_AGENT_ADAPTER_UNAVAILABLE', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const calls = []
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor(calls) })) }
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -607,7 +616,6 @@ try {
   // 9. 大输出：事件单条上限 8KB，桥接层必须裁剪而不是让实例失败
   // -------------------------------------------------------------------------
   await check('大输出：activity/end 超过 8KB 时事件被裁剪并标 truncated，实例仍能完成', async home => {
-    process.env.FLOW_STUDIO_BPMN = '1'
     const hugeExecutor = async () => ({
       ok: true,
       text: 'x'.repeat(20000),

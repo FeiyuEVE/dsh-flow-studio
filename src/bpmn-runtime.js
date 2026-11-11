@@ -72,8 +72,6 @@ import { checkRunId } from './runlog.js'
 /** 引擎版本（计划 §10.4 的 health 字段）。 */
 export const BPMN_ENGINE_VERSION = '26.0.6'
 
-/** 灰度开关：`1` = 启用 definitions / instances 路由与新引擎；默认关。 */
-export const BPMN_ENV = 'FLOW_STUDIO_BPMN'
 /** 活跃实例 LRU 上限。 */
 export const BPMN_MAX_ACTIVE_ENV = 'FLOW_STUDIO_BPMN_MAX_ACTIVE'
 /** 单活动超时（毫秒）；不设 = 只受 run 时限 / signal 控制。 */
@@ -137,12 +135,6 @@ function positiveEnvInt(raw, fallback) {
   if (!/^\d+$/.test(text)) return fallback
   const value = Number(text)
   return Number.isSafeInteger(value) && value > 0 ? value : fallback
-}
-
-/** 灰度开关：只有明确的 `1` 才启用，避免 `0` / 空 / 拼错被当成开。 */
-export function isBpmnEnabled(env = process.env) {
-  const raw = env ? env[BPMN_ENV] : undefined
-  return typeof raw === 'string' && raw.trim() === '1'
 }
 
 /** 取 flow-studio 根：传进来的是 `.../flows` 时取父目录，否则原样。 */
@@ -376,12 +368,6 @@ class BpmnRuntime {
    */
   async handle(request = {}) {
     try {
-      if (!isBpmnEnabled(this.env)) {
-        return {
-          status: 404,
-          body: { ok: false, code: 'BPMN_DISABLED', hint: `设置 ${BPMN_ENV}=1 启用` },
-        }
-      }
       if (this._disposed) {
         return { status: 503, body: { ok: false, code: 'BPMN_RUNTIME_DISPOSED', error: 'BPMN 运行时已释放' } }
       }

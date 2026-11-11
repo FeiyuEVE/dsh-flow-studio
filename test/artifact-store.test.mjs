@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
-  mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
+  lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -124,6 +124,45 @@ try {
     await rejectsCode(() => artifacts.read('../../etc/passwd'), ARTIFACT_ERROR.INVALID, '非法 hash INVALID')
     writeFileSync(artifacts.pathOf(stored.sha256), 'tampered')
     await rejectsCode(() => artifacts.read(stored.sha256), ARTIFACT_ERROR.HASH_MISMATCH, '篡改 HASH_MISMATCH')
+  })
+
+  await check('W8 快照完整性：已存在内容必须复核 hash；目标 symlink 拒绝', async sandbox => {
+    const root = join(sandbox, 'artifacts')
+    const artifacts = createArtifactStore({ root })
+    const good = Buffer.from('good')
+    const evil = Buffer.from('evil') // 与 good 同为 4 字节
+    const stored = await artifacts.put(good)
+    const target = artifacts.pathOf(stored.sha256)
+
+    // size 相同、内容不同：不能只看大小复用，必须重算 hash 并原子替换。
+    writeFileSync(target, evil)
+    const sameSize = await artifacts.put(good)
+    deep(sameSize, stored, '同 size 不同内容时返回正确引用')
+    deep(await artifacts.read(stored.sha256), good, '同 size 不同内容被正确快照原子替换')
+
+    // size 不同：同样必须复核并替换。
+    writeFileSync(target, Buffer.from('a much longer corrupt content'))
+    await artifacts.put(good)
+    deep(await artifacts.read(stored.sha256), good, '不同 size 的损坏对象被替换')
+
+    // captureFile 也不能信任同 size 的既有对象。
+    const source = join(sandbox, 'source.md')
+    writeFileSync(source, good)
+    writeFileSync(target, evil)
+    const captured = await artifacts.captureFile(source)
+    eq(captured.sha256, stored.sha256, 'captureFile hash 与内容一致')
+    deep(await artifacts.read(stored.sha256), good, 'captureFile 替换了同 size 的损坏对象')
+
+    // 目标为 symlink：put / captureFile / read 都拒绝，且不改写链接目标。
+    rmSync(target)
+    const outside = join(sandbox, 'outside.bin')
+    writeFileSync(outside, 'outside')
+    symlinkSync(outside, target)
+    await rejectsCode(() => artifacts.put(good), ARTIFACT_ERROR.UNSAFE_TARGET, 'put 拒绝 symlink 目标')
+    await rejectsCode(() => artifacts.captureFile(source), ARTIFACT_ERROR.UNSAFE_TARGET, 'captureFile 拒绝 symlink 目标')
+    await rejectsCode(() => artifacts.read(stored.sha256), ARTIFACT_ERROR.UNSAFE_TARGET, 'read 拒绝 symlink 目标')
+    eq(readFileSync(outside, 'utf8'), 'outside', 'symlink 指向的文件没有被改写')
+    eq(lstatSync(target).isSymbolicLink(), true, 'symlink 本身仍然保留（没有被 rename 覆盖）')
   })
 
   await check('contentRef 解析与路径穿越防护', async sandbox => {

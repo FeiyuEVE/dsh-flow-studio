@@ -46,6 +46,17 @@ async function rejectsCode(fn, code, message) {
   }, message)
 }
 
+const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
+
+async function waitUntil(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await sleep(10)
+  }
+  return false
+}
+
 async function check(name, fn) {
   const home = mkdtempSync(join(repoRoot, '.tmp', 'resources-'))
   try {
@@ -130,6 +141,51 @@ try {
     const value = await resources.withResourceLock(lock, async () => 'done', { waitMs: 500 })
     eq(value, 'done', '正常拿到锁执行')
     ok(!existsSync(lock), '执行结束后锁被释放')
+  })
+
+  await check('W7 锁：活持有者不被 TTL 抢占；旧持有者 release 不删继任锁', async home => {
+    const lock = join(home, 'owned.lock')
+    let releaseHolder = null
+    const holder = resources.withResourceLock(lock, async () => {
+      await new Promise(resolveHold => { releaseHolder = resolveHold })
+      return 'A'
+    }, { ttlMs: 60, waitMs: 1000 })
+    ok(await waitUntil(() => existsSync(lock)), '持有者已建锁文件')
+    // 超过 TTL 后仍不能被第二个持有者抢占（pid 还活着）。
+    await sleep(120)
+    await rejectsCode(
+      () => resources.withResourceLock(lock, async () => 'B', { ttlMs: 60, waitMs: 80 }),
+      resources.RESOURCE_ERROR.LOCK_TIMEOUT,
+      '活持有者不被 TTL 抢占',
+    )
+    ok(existsSync(lock), 'A 的锁文件仍在')
+
+    // 模拟继任者：A 还没 release 时锁文件被 B 接管（同 inode 覆盖 + 新 owner token）。
+    writeFileSync(lock, `${JSON.stringify({
+      v: resources.RESOURCE_LOCK_VERSION,
+      owner: 'successor-token',
+      pid: process.pid,
+      at: new Date().toISOString(),
+    })}\n`)
+    releaseHolder()
+    eq(await holder, 'A', '旧持有者任务正常结束')
+    ok(existsSync(lock), '旧持有者 release 没有删掉继任锁')
+    eq(JSON.parse(readFileSync(lock, 'utf8')).owner, 'successor-token', '继任锁内容未被改')
+    rmSync(lock)
+
+    // 明确 stale 判定：pid 不存在 → 可以被接管。
+    writeFileSync(lock, `${JSON.stringify({
+      v: resources.RESOURCE_LOCK_VERSION,
+      owner: 'dead-token',
+      pid: 999999,
+      at: new Date(Date.now() - 60_000).toISOString(),
+    })}\n`)
+    eq(
+      await resources.withResourceLock(lock, async () => 'C', { ttlMs: 60_000, waitMs: 1000 }),
+      'C',
+      'pid 不存在的 stale 锁可被接管',
+    )
+    ok(!existsSync(lock), '接管者释放后锁文件消失')
   })
 
   await check('资源事件：独立 resourceSeq / since 过滤 / 终态实例仍可写（执行事件仍封口）', async home => {

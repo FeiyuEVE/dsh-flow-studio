@@ -23,6 +23,8 @@ export const ARTIFACT_ERROR = Object.freeze({
   NOT_FOUND: 'ARTIFACT_NOT_FOUND',
   HASH_MISMATCH: 'ARTIFACT_HASH_MISMATCH',
   CAPTURE_FAILED: 'ARTIFACT_CAPTURE_FAILED',
+  /** 存储目标是符号链接 / 非普通文件：拒绝跟随、拒绝写入（review-0137 W8）。 */
+  UNSAFE_TARGET: 'ARTIFACT_UNSAFE_TARGET',
 })
 
 /** 64 位小写十六进制摘要（对外唯一合法寻址键）。 */
@@ -73,6 +75,14 @@ function isPlainObject(value) {
 
 async function ensureDir(dir) {
   await fsp.mkdir(dir, { recursive: true, mode: DIR_MODE })
+  // 存储根不能是符号链接：否则所有 hash 寻址都跟着链接跑到别处。
+  const info = await fsp.lstat(dir)
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw artifactError(ARTIFACT_ERROR.UNSAFE_TARGET, `artifact 存储根必须是真实目录（不是符号链接）：${dir}`, {
+      path: dir,
+      reason: info.isSymbolicLink() ? 'symlink-root' : 'not-directory',
+    })
+  }
   await fsp.chmod(dir, DIR_MODE).catch(() => {})
 }
 
@@ -101,6 +111,89 @@ export function createArtifactStore(options = {}) {
   const chunkBytes = Number.isSafeInteger(options.chunkBytes) && options.chunkBytes > 0
     ? options.chunkBytes
     : DEFAULT_CHUNK_BYTES
+  const nofollowFlag = fsConstants.O_NOFOLLOW ?? 0
+
+  function unsafeTarget(path, reason, extra = {}) {
+    return artifactError(
+      ARTIFACT_ERROR.UNSAFE_TARGET,
+      `产物存储目标是符号链接 / 非普通文件，拒绝操作（${reason}）：${path}`,
+      { path, reason, ...extra },
+    )
+  }
+
+  /** 存储根存在时必须是真实目录（不是 symlink）。 */
+  async function assertSafeRoot() {
+    let info
+    try {
+      info = await fsp.lstat(root)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return
+      throw error
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw unsafeTarget(root, info.isSymbolicLink() ? 'symlink-root' : 'not-directory')
+    }
+  }
+
+  /**
+   * 打开一个已存在的快照：先 lstat 拒绝 symlink / 非普通文件，再用 O_NOFOLLOW 打开，
+   * 句柄 fstat 复核类型与大小（不跟随链接，也不对未知大小文件整读）。
+   *
+   * @returns {Promise<{handle:any, info:any}|null>} 不存在返回 null
+   */
+  async function openExisting(target) {
+    let linkInfo
+    try {
+      linkInfo = await fsp.lstat(target)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null
+      throw error
+    }
+    if (linkInfo.isSymbolicLink()) throw unsafeTarget(target, 'symlink')
+    if (!linkInfo.isFile()) throw unsafeTarget(target, 'not-regular-file')
+    let handle
+    try {
+      handle = await fsp.open(target, fsConstants.O_RDONLY | nofollowFlag)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null
+      if (error && (error.code === 'ELOOP' || error.code === 'EMLINK')) throw unsafeTarget(target, 'symlink')
+      throw error
+    }
+    try {
+      const info = await handle.stat()
+      if (!info.isFile()) throw unsafeTarget(target, 'not-regular-file')
+      if (info.size > maxBytes) {
+        throw artifactError(ARTIFACT_ERROR.TOO_LARGE, `产物 ${info.size} 字节超过 ${maxBytes} 字节上限`, {
+          path: target,
+        })
+      }
+      return { handle, info }
+    } catch (error) {
+      await handle.close().catch(() => {})
+      throw error
+    }
+  }
+
+  /** 已存在的 `<root>/<sha256>` 必须重算 hash 与字节数都一致才可复用。 */
+  async function contentMatches(target, sha256, bytes) {
+    let opened
+    try {
+      opened = await openExisting(target)
+    } catch (error) {
+      // 既有目标大到不可读：按「内容不可信」处理，由调用方原子替换。
+      if (error && error.code === ARTIFACT_ERROR.TOO_LARGE) return false
+      throw error
+    }
+    if (opened === null) return false
+    try {
+      if (opened.info.size !== bytes) return false
+      const content = await opened.handle.readFile()
+      if (content.length !== bytes) return false
+      return createHash('sha256').update(content).digest('hex') === sha256
+    } finally {
+      await opened.handle.close().catch(() => {})
+    }
+  }
 
   function pathOf(sha256) {
     return join(root, normalizeHash(sha256))
@@ -129,19 +222,17 @@ export function createArtifactStore(options = {}) {
     const sha256 = createHash('sha256').update(buffer).digest('hex')
     const target = join(root, sha256)
     await ensureDir(root)
-    try {
-      const existing = await fsp.stat(target)
-      if (existing.isFile() && existing.size === buffer.length) {
-        return { sha256, bytes: buffer.length, contentRef: contentRefFor(sha256) }
-      }
-    } catch (error) {
-      if (!error || error.code !== 'ENOENT') throw error
+    await assertSafeRoot()
+    // 已存在不能只比 size：必须重算 hash 一致才复用（review-0137 W8）。
+    if (await contentMatches(target, sha256, buffer.length)) {
+      return { sha256, bytes: buffer.length, contentRef: contentRefFor(sha256) }
     }
     const tmp = join(root, `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`)
     let renamed = false
     try {
       await fsp.writeFile(tmp, buffer, { mode: FILE_MODE })
       await fsp.chmod(tmp, FILE_MODE).catch(() => {})
+      // 临时文件 + rename 原子替换损坏对象；rename 不会跟随目标 symlink。
       await fsp.rename(tmp, target)
       renamed = true
       return { sha256, bytes: buffer.length, contentRef: contentRefFor(sha256) }
@@ -198,6 +289,7 @@ export function createArtifactStore(options = {}) {
     }
 
     await ensureDir(root)
+    await assertSafeRoot()
     const tmp = join(root, `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`)
     let handle = null
     let out = null
@@ -254,19 +346,15 @@ export function createArtifactStore(options = {}) {
         })
       }
       const sha256 = hash.digest('hex')
+      // 权限落在我们自己新建的临时文件上（不 chmod 已存在目标，避免跟随 symlink）。
+      await out.chmod(FILE_MODE).catch(() => {})
       await out.close()
       out = null
       const target = join(root, sha256)
-      let exists = false
-      try {
-        const info = await fsp.stat(target)
-        exists = info.isFile() && info.size === bytes
-      } catch (error) {
-        if (!error || error.code !== 'ENOENT') throw error
-      }
-      if (!exists) await fsp.rename(tmp, target)
-      else await fsp.unlink(tmp).catch(() => {})
-      await fsp.chmod(target, FILE_MODE).catch(() => {})
+      // 既有对象必须重算 hash 一致才复用；size 相同但内容不同 → 原子替换。
+      const reuse = await contentMatches(target, sha256, bytes)
+      if (reuse) await fsp.unlink(tmp).catch(() => {})
+      else await fsp.rename(tmp, target)
       return { sha256, bytes, contentRef: contentRefFor(sha256) }
     } catch (error) {
       if (error && error.code && String(error.code).startsWith('ARTIFACT_')) throw error
@@ -289,14 +377,17 @@ export function createArtifactStore(options = {}) {
   async function read(sha256) {
     const hash = normalizeHash(sha256)
     const target = join(root, hash)
+    await assertSafeRoot()
+    // 不跟随 symlink、先限制大小再读，最后仍以 hash 校验兜底。
+    const opened = await openExisting(target)
+    if (opened === null) {
+      throw artifactError(ARTIFACT_ERROR.NOT_FOUND, `产物 ${sha256} 不存在`, { sha256 })
+    }
     let content
     try {
-      content = await fsp.readFile(target)
-    } catch (error) {
-      if (error && error.code === 'ENOENT') {
-        throw artifactError(ARTIFACT_ERROR.NOT_FOUND, `产物 ${sha256} 不存在`, { sha256 })
-      }
-      throw error
+      content = await opened.handle.readFile()
+    } finally {
+      await opened.handle.close().catch(() => {})
     }
     const actual = createHash('sha256').update(content).digest('hex')
     if (actual !== hash) {

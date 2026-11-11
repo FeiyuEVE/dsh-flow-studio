@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 
-const { resolveWorkspace } = await import('../src/workspace-policy.js')
+const { defaultGitRunner, resolveWorkspace } = await import('../src/workspace-policy.js')
 const {
   INSTANCE_WORKTREE_ERROR, createInstanceWorktree, createPrunePlan, inspectInstanceWorktree,
   listInstanceWorktrees, planHashOf, pruneInstanceWorktrees, removeInstanceBranch,
@@ -95,6 +95,21 @@ const nonGitRunner = async () => {
   throw error
 }
 
+const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
+
+/** 记录命令序列并真实执行 git；用于断言「回滚没有发出删除命令」。 */
+function recordingRunner(log) {
+  return async (argv, options) => {
+    log.push(argv.join(' '))
+    return await defaultGitRunner(argv, options)
+  }
+}
+
+/** 命令文本里是否包含删除类副作用。 */
+function isDestructive(command) {
+  return /worktree remove|worktree prune|(^|\s)branch\s+-[dD]|update-ref\s+-d|\brm\b/.test(command)
+}
+
 async function setup(sandbox, name = 'repo', { commit = true } = {}) {
   const repo = makeRepo(sandbox, name, { commit })
   const workspace = await resolveWorkspace({ path: repo })
@@ -113,10 +128,40 @@ async function create(context, instanceId, extra = {}) {
   })
 }
 
+/** 写一份**语义完整**的 instance.json（instance-store 会校验全部字段）。 */
+function instanceFixture(instanceId, status) {
+  const at = '2026-11-12T00:00:00.000Z'
+  return {
+    id: instanceId,
+    definitionId: 'flow-fixture',
+    definitionVersion: 1,
+    definitionHash: 'a'.repeat(64),
+    status,
+    variables: {},
+    result: null,
+    artifacts: [],
+    lastError: null,
+    lastAgentOutput: null,
+    pendingTasks: [],
+    revision: 1,
+    eventCount: 0,
+    lastSeq: 0,
+    createdAt: at,
+    updatedAt: at,
+    completedAt: status === 'COMPLETED' || status === 'CANCELED' ? at : null,
+  }
+}
+
 function writeInstanceStatus(instancesRoot, instanceId, status) {
   const dir = join(instancesRoot, instanceId)
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'instance.json'), `${JSON.stringify({ id: instanceId, status })}\n`)
+  writeFileSync(join(dir, 'instance.json'), `${JSON.stringify(instanceFixture(instanceId, status))}\n`)
+}
+
+function writeRawInstance(instancesRoot, instanceId, text) {
+  const dir = join(instancesRoot, instanceId)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'instance.json'), text)
 }
 
 try {
@@ -325,6 +370,189 @@ try {
     git(context.repo, ['merge', '--ff-only', record.branch])
     const merged = await removeInstanceBranch({ record })
     eq(merged.removed, true, '合并后可删')
+  })
+
+  await check('W1 创建失败回滚：并发创建者/已存在目标不被本次回滚删除', async sandbox => {
+    const context = await setup(sandbox)
+    const target = join(context.worktreeRoot, context.workspace.workspaceId, 'i-race')
+    mkdirSync(dirname(target), { recursive: true })
+    const log = []
+    // 探针：初始检查通过后，add 执行前另一个调用创建了目标目录（含用户文件）。
+    const runner = async (argv, options) => {
+      const command = argv.join(' ')
+      log.push(command)
+      if (command.includes('worktree add')) {
+        mkdirSync(target, { recursive: true })
+        writeFileSync(join(target, 'keep.txt'), 'other-owner\n')
+      }
+      return await defaultGitRunner(argv, options)
+    }
+    await rejectsCode(
+      () => create(context, 'i-race', { runner }),
+      INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
+      '目标被并发创建时 add 失败',
+    )
+    ok(existsSync(target), '并发创建的目标目录仍在')
+    eq(readFileSync(join(target, 'keep.txt'), 'utf8'), 'other-owner\n', '目标里的用户文件未被删')
+    const treeDeletes = log.filter(command => /worktree remove|worktree prune/.test(command))
+    deep(treeDeletes, [], '回滚没有删目标树、也没有仓库级 prune')
+    deep(log.filter(command => /branch\s+-[dD]/.test(command)), [], '回滚没有 branch -D')
+    const refDeletes = log.filter(command => command.includes('update-ref -d'))
+    ok(
+      refDeletes.every(command => command.includes('-txn-')),
+      '只删带本次 nonce 的临时分支（不是按前缀猜所有权）',
+    )
+    ok(
+      !log.some(command => command.includes('update-ref -d refs/heads/flow-instance/i-race ')),
+      '没有删除最终分支名',
+    )
+    eq(git(context.repo, ['branch', '--list', 'flow-instance/*']).trim(), '', '没有留下本次分支')
+
+    // 两个真实并发调用：互斥锁让一个成功、另一个在检查阶段明确失败，不会互相回滚。
+    const slowRunner = async (argv, options) => {
+      if (argv.join(' ').includes('worktree add')) await sleep(60)
+      return await defaultGitRunner(argv, options)
+    }
+    const settled = await Promise.allSettled([
+      create(context, 'i-concurrent', { runner: slowRunner }),
+      create(context, 'i-concurrent', { runner: slowRunner }),
+    ])
+    const fulfilled = settled.filter(item => item.status === 'fulfilled')
+    const rejected = settled.filter(item => item.status === 'rejected')
+    eq(fulfilled.length, 1, '并发创建只有一个成功')
+    eq(rejected.length, 1, '另一个在锁内看到目标已存在而失败')
+    eq(rejected[0].reason.code, INSTANCE_WORKTREE_ERROR.CREATE_FAILED, '失败码是 CREATE_FAILED')
+    eq(rejected[0].reason.reason, 'path-exists', '失败原因是 path-exists')
+    const winner = fulfilled[0].value
+    eq((await inspectInstanceWorktree({ record: winner })).state, 'ok', '成功者的树完整可用')
+    ok(existsSync(winner.effectiveRoot), '成功者的目录仍在')
+    eq(git(context.repo, ['rev-parse', '--verify', `refs/heads/${winner.branch}`]).length > 0, true, '成功者的分支仍在')
+  })
+
+  await check('W2 locked worktree：force:false 零 --force；显式 force 才解除保护', async sandbox => {
+    const context = await setup(sandbox)
+    const record = await create(context, 'i-locked')
+    git(context.repo, ['worktree', 'lock', record.effectiveRoot])
+    const log = []
+    const runner = recordingRunner(log)
+    await rejectsCode(
+      () => removeInstanceWorktree({ record, force: false, runner, worktreeRoot: context.worktreeRoot }),
+      INSTANCE_WORKTREE_ERROR.LOCKED,
+      'locked 且 force:false 拒绝删除',
+    )
+    eq(log.some(command => command.includes('--force')), false, '没有自动升级成 --force / --force --force')
+    eq(log.filter(isDestructive).length, 1, '只尝试了一次普通 worktree remove')
+    ok(existsSync(record.effectiveRoot), 'locked 工作树仍在')
+
+    log.length = 0
+    const forced = await removeInstanceWorktree({ record, force: true, runner, worktreeRoot: context.worktreeRoot })
+    eq(forced.removed, true, '显式 force 可以删除 locked 树')
+    ok(log.some(command => command.includes('worktree remove --force --force')), '显式 force 才发出双 force')
+  })
+
+  await check('W3 分支删除：空仓库 / 合并检查异常时零删除；显式 force 才删', async sandbox => {
+    // 空仓库：实例分支后来有提交，但记录没有 baseCommit，不能证明已并入主线。
+    const empty = await setup(sandbox, 'empty-merge', { commit: false })
+    const emptyRecord = await create(empty, 'i-empty-merge')
+    writeFileSync(join(emptyRecord.effectiveRoot, 'work.txt'), 'work\n')
+    git(emptyRecord.effectiveRoot, ['add', '.'])
+    git(emptyRecord.effectiveRoot, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'work'])
+    await removeInstanceWorktree({ record: emptyRecord, worktreeRoot: empty.worktreeRoot })
+    const emptyLog = []
+    const emptyRunner = recordingRunner(emptyLog)
+    const emptyBlocked = await removeInstanceBranch({ record: emptyRecord, runner: emptyRunner })
+    eq(emptyBlocked.removed, false, '空仓库未证明合并 → 不删')
+    eq(emptyBlocked.reason, 'merge-unknown', 'reason=merge-unknown')
+    deep(emptyLog.filter(isDestructive), [], '空仓库零删除命令')
+    ok(git(empty.repo, ['rev-parse', '--verify', `refs/heads/${emptyRecord.branch}`]).length > 0, '承载实例提交的分支仍在')
+
+    // merge-base 异常（128）：同样不能落到 branch -D。
+    const context = await setup(sandbox, 'merge-error')
+    const record = await create(context, 'i-merge-error')
+    writeFileSync(join(record.effectiveRoot, 'work.txt'), 'work\n')
+    git(record.effectiveRoot, ['add', '.'])
+    git(record.effectiveRoot, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'work'])
+    await removeInstanceWorktree({ record, worktreeRoot: context.worktreeRoot })
+    const log = []
+    const runner = async (argv, options) => {
+      const command = argv.join(' ')
+      log.push(command)
+      if (command.includes('merge-base') && command.includes('--is-ancestor')) {
+        const error = new Error('fatal: bad revision')
+        error.status = 128
+        error.exitCode = 128
+        error.stderr = 'fatal: bad revision\n'
+        throw error
+      }
+      return await defaultGitRunner(argv, options)
+    }
+    const blocked = await removeInstanceBranch({ record, runner })
+    eq(blocked.removed, false, '合并检查异常 → 不删')
+    eq(blocked.reason, 'merge-unknown', 'reason=merge-unknown')
+    deep(log.filter(isDestructive), [], '异常时零 branch -D / update-ref -d')
+    ok(git(context.repo, ['rev-parse', '--verify', `refs/heads/${record.branch}`]).length > 0, '分支仍在')
+
+    const forced = await removeInstanceBranch({ record, force: true, runner })
+    eq(forced.removed, true, '显式 force 才允许删除未证明合并的分支')
+    eq(forced.forced, true, '结果标记 forced=true')
+  })
+
+  await check('W6 语义损坏的 instance.json：list 标 unknown，prune 只报告并拒绝执行', async sandbox => {
+    const context = await setup(sandbox)
+    const badJson = await create(context, 'i-bad-json')
+    const emptyJson = await create(context, 'i-empty-json')
+    const unknownStatus = await create(context, 'i-unknown-status')
+    const terminal = await create(context, 'i-terminal')
+    const active = await create(context, 'i-still-active')
+    for (const record of [badJson, emptyJson, unknownStatus, terminal, active]) {
+      await writeResourceRecord({ registryRoot: context.registryRoot, record })
+    }
+    writeRawInstance(context.instancesRoot, 'i-bad-json', '{bad')
+    writeRawInstance(context.instancesRoot, 'i-empty-json', '{}')
+    writeRawInstance(
+      context.instancesRoot,
+      'i-unknown-status',
+      JSON.stringify(instanceFixture('i-unknown-status', 'UNKNOWN')),
+    )
+    writeInstanceStatus(context.instancesRoot, 'i-terminal', 'COMPLETED')
+    writeInstanceStatus(context.instancesRoot, 'i-still-active', 'ACTIVE')
+
+    const listed = await listInstanceWorktrees({
+      worktreeRoot: context.worktreeRoot,
+      registryRoot: context.registryRoot,
+      instancesRoot: context.instancesRoot,
+    })
+    const byId = Object.fromEntries(listed.entries.map(entry => [entry.instanceId, entry]))
+    for (const id of ['i-bad-json', 'i-empty-json', 'i-unknown-status']) {
+      eq(byId[id].instanceState, 'unknown', `${id} 标 unknown`)
+      eq(byId[id].instanceCorrupt, true, `${id} 标 corrupt`)
+    }
+    eq(byId['i-terminal'].instanceState, 'terminal', '合法终态是 terminal')
+
+    const plan = createPrunePlan({ entries: listed.entries })
+    const planned = Object.fromEntries(plan.entries.map(entry => [entry.instanceId, entry]))
+    for (const id of ['i-bad-json', 'i-empty-json', 'i-unknown-status']) {
+      eq(planned[id].action, 'report', `${id} 只报告`)
+      eq(planned[id].reason, 'instance-unknown', `${id} reason=instance-unknown`)
+      eq(planned[id].instanceState, 'unknown', `${id} plan 里显式标 unknown`)
+    }
+    eq(planned['i-terminal'].action, 'remove', '合法终态可删')
+    eq(planned['i-still-active'].action, 'retain', 'ACTIVE 保留')
+
+    const executed = await pruneInstanceWorktrees({ plan, worktreeRoot: context.worktreeRoot })
+    for (const record of [badJson, emptyJson, unknownStatus, active]) {
+      ok(existsSync(record.effectiveRoot), `${record.instanceId} 的树没有被删`)
+    }
+    ok(!existsSync(terminal.effectiveRoot), '合法终态树被删')
+    for (const id of ['i-bad-json', 'i-empty-json', 'i-unknown-status', 'i-still-active']) {
+      ok(executed.skipped.some(item => item.instanceId === id), `${id} 出现在 skipped`)
+    }
+    ok(
+      executed.skipped
+        .filter(item => ['i-bad-json', 'i-empty-json', 'i-unknown-status'].includes(item.instanceId))
+        .every(item => item.reason === 'instance-unknown' && item.executed === false),
+      'unknown 条目执行被拒',
+    )
   })
 
   await check('list + prune：孤儿 / 损坏 / 无所有权目录；planHash 过期失效；无所有权只报告', async sandbox => {

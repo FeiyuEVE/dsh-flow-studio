@@ -349,6 +349,135 @@ export function createBpmnRuntime(options = {}) {
   })
 }
 
+/**
+ * 物理执行生命周期跟踪（review-0137 W4）。
+ *
+ * handler 结束 != agent 进程已退出：`adapter.start()` 还没返回、或迟到句柄的
+ * cancel/dispose 还在后台、或 dispose 抛错 / 报告未清理完成时，本次执行仍占用
+ * 槽位与 `_activeAgents`。只有能确认退出（start 失败不产生进程，或 dispose 完成
+ * 且没有 `cleanup.disposed=false`）才允许释放，自动清理才可能继续。
+ *
+ * 包一层 adapter 而不是改 agent-execute：runtime 侧注入 `adapters` 门面即可同时
+ * 覆盖正常路径、start 阶段 abort 的迟到句柄、以及 dispose 失败路径。
+ */
+function createExecutionLifecycle() {
+  let pending = 0
+  let unresolved = 0
+  const waiters = []
+  /** @type {Map<object, () => void>} handle → settle（只对已返回的句柄计数） */
+  const handleOwners = new Map()
+
+  const notifyIfIdle = () => {
+    if (pending > 0) return
+    const queued = waiters.splice(0)
+    for (const resolveWait of queued) resolveWait()
+  }
+
+  const settle = () => {
+    if (pending > 0) pending -= 1
+    notifyIfIdle()
+  }
+
+  function trackStart(rawAdapter, request) {
+    pending += 1
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      settle()
+    }
+    let started
+    try {
+      started = rawAdapter.start.call(rawAdapter, request)
+    } catch (error) {
+      finish()
+      throw error
+    }
+    const promise = Promise.resolve(started)
+    promise.then(handle => {
+      if (handle && typeof handle === 'object') handleOwners.set(handle, finish)
+      else finish()
+    }, () => finish())
+    return promise
+  }
+
+  function trackDispose(rawAdapter, handle) {
+    let result
+    try {
+      result = rawAdapter.dispose.call(rawAdapter, handle)
+    } catch (error) {
+      // 同步抛错：退出未确认，保留占用（不自动清理工作目录 / 不释放槽位）。
+      unresolved += 1
+      throw error
+    }
+    return Promise.resolve(result).then(value => {
+      const cleanup = handle && typeof handle === 'object' ? handle.cleanup : null
+      if (cleanup && cleanup.disposed === false) {
+        // 适配器如实报告「宿主 dispose 超时、会话可能还活着」：不能当已释放。
+        unresolved += 1
+        return value
+      }
+      const finish = handle && typeof handle === 'object' ? handleOwners.get(handle) : undefined
+      if (typeof finish === 'function') {
+        handleOwners.delete(handle)
+        finish()
+      }
+      return value
+    }, error => {
+      unresolved += 1
+      throw error
+    })
+  }
+
+  function wrap(rawAdapter) {
+    if (!rawAdapter || typeof rawAdapter !== 'object') return rawAdapter
+    const wrapped = Object.create(rawAdapter)
+    // 继承来的方法用原始 adapter 作 this，避免包装对象吞掉适配器内部状态。
+    for (const name of ['probe', 'capabilities']) {
+      if (typeof rawAdapter[name] === 'function') {
+        wrapped[name] = (...args) => rawAdapter[name](...args)
+      }
+    }
+    wrapped.start = request => trackStart(rawAdapter, request)
+    wrapped.cancel = (handle, reason) => (
+      typeof rawAdapter.cancel === 'function'
+        ? rawAdapter.cancel.call(rawAdapter, handle, reason)
+        : Promise.resolve()
+    )
+    wrapped.dispose = handle => (
+      typeof rawAdapter.dispose === 'function'
+        ? trackDispose(rawAdapter, handle)
+        : Promise.resolve(false)
+    )
+    return wrapped
+  }
+
+  return {
+    wrap,
+    adaptersFor(registry) {
+      return {
+        get(id) {
+          const raw = registry.get(id)
+          return raw ? wrap(raw) : undefined
+        },
+        list() {
+          return typeof registry.list === 'function' ? registry.list().map(raw => wrap(raw)) : []
+        },
+      }
+    },
+    idle() {
+      return pending === 0
+    },
+    get unresolved() {
+      return unresolved
+    },
+    whenIdle() {
+      if (pending === 0) return Promise.resolve()
+      return new Promise(resolveIdle => { waiters.push(resolveIdle) })
+    },
+  }
+}
+
 class BpmnRuntime {
   constructor(options) {
     this.ctx = options.ctx
@@ -749,7 +878,7 @@ class BpmnRuntime {
     if (parts.length === 4 && parts[2] === 'worktree' && parts[3] === 'branch') {
       if (method !== 'DELETE') return methodNotAllowed('DELETE')
       if (!id) return invalidInstanceId()
-      return await this._deleteInstanceWorktreeBranch(id)
+      return await this._deleteInstanceWorktreeBranch(id, body)
     }
     if (parts.length === 5 && parts[2] === 'tasks' && parts[4] === 'complete') {
       if (method !== 'POST') return methodNotAllowed('POST')
@@ -1715,7 +1844,7 @@ class BpmnRuntime {
       return workspaceErrorResult(error)
     }
     const branchRemoval = removeBranch
-      ? await this._removeInstanceBranchRecord(state.workspace.worktree)
+      ? await this._removeInstanceBranchRecord(state.workspace.worktree, { force })
       : null
     await this._recordWorktreeRemoval(id, state.workspace, result, branchRemoval)
     if (result.removed === true || result.reason === 'not-found') {
@@ -1743,7 +1872,11 @@ class BpmnRuntime {
     }
   }
 
-  async _deleteInstanceWorktreeBranch(id) {
+  async _deleteInstanceWorktreeBranch(id, body) {
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ force? }' } }
+    }
+    const force = body?.force === true
     const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
     if (instance === null) return instanceNotFound(id)
     if (instance.status === 'ACTIVE' || instance.status === 'SUSPENDED') {
@@ -1764,7 +1897,7 @@ class BpmnRuntime {
         body: { ok: false, code: 'INSTANCE_WORKTREE_NOT_CONFIGURED', error: `实例 ${id} 没有登记 worktree 分支` },
       }
     }
-    const branchRemoval = await this._removeInstanceBranchRecord(state.workspace.worktree)
+    const branchRemoval = await this._removeInstanceBranchRecord(state.workspace.worktree, { force })
     if (branchRemoval.reason === 'not-owned') {
       return {
         status: 409,
@@ -1780,11 +1913,13 @@ class BpmnRuntime {
   }
 
   /** 删记录里的实例分支，并把结果写进资源事件（分支失败不抛）。 */
-  async _removeInstanceBranchRecord(record) {
+  async _removeInstanceBranchRecord(record, options = {}) {
+    const force = options.force === true
     let result
     try {
       result = await removeInstanceBranch({
         record,
+        ...(force ? { force: true } : {}),
         ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
       })
     } catch (error) {
@@ -1797,6 +1932,8 @@ class BpmnRuntime {
       branch: result.branch ?? record.branch ?? null,
       removed: result.removed === true,
       reason: result.reason,
+      // W3：未证明合并时只报告；显式 force 删除要留下授权痕迹。
+      ...(result.forced === true ? { forced: true } : {}),
       ...(result.warning === null || result.warning === undefined ? {} : { warning: result.warning }),
     })
     return result
@@ -1982,12 +2119,14 @@ class BpmnRuntime {
    * 终态清理：`cleanup:"on-terminal-clean"` 只在 agent 进程释放、树干净、产物已保存后执行。
    * 任何失败都只记资源事件，**不改实例状态**。
    */
-  async _maybeTerminalCleanup(instanceId) {
+  async _maybeTerminalCleanup(instanceId, options = {}) {
     const state = await this._workspaceFor(instanceId)
     if (state.error !== null || state.workspace === null) return
     const workspace = state.workspace
     if (workspace.cleanupPolicy !== 'on-terminal-clean' || workspace.worktree === null || workspace.worktree === undefined) return
-    const released = await this._waitAgentsReleased(instanceId, 3000)
+    // 默认等 3s；测试 / 嵌入方可以缩短（判定语义不变：等不到就不清理）。
+    const waitMs = Number.isSafeInteger(options.waitMs) && options.waitMs >= 0 ? options.waitMs : 3000
+    const released = await this._waitAgentsReleased(instanceId, waitMs)
     if (!released) {
       await this._appendResourceEventSafe(instanceId, {
         type: RESOURCE_EVENT.CLEANUP_SKIPPED,
@@ -2295,10 +2434,13 @@ class BpmnRuntime {
       )
     }
     this._activeAgents.set(instanceId, (this._activeAgents.get(instanceId) ?? 0) + 1)
+    // 物理执行生命周期：handler 返回不代表 agent 进程已退出（W4）。
+    const lifecycle = createExecutionLifecycle()
+    const adapters = this.adapters === null ? null : lifecycle.adaptersFor(this.adapters)
     let result
     try {
       result = await executeAgent(element, ctx, {
-        adapters: this.adapters,
+        adapters,
         probeAdapter: this._probeAdapter,
         workspaceRoot,
         workspace,
@@ -2324,10 +2466,16 @@ class BpmnRuntime {
       }
       throw error
     } finally {
-      ticket.release()
-      const remaining = (this._activeAgents.get(instanceId) ?? 1) - 1
-      if (remaining <= 0) this._activeAgents.delete(instanceId)
-      else this._activeAgents.set(instanceId, remaining)
+      const releaseExecution = () => {
+        ticket.release()
+        const remaining = (this._activeAgents.get(instanceId) ?? 1) - 1
+        if (remaining <= 0) this._activeAgents.delete(instanceId)
+        else this._activeAgents.set(instanceId, remaining)
+      }
+      // 槽位 / activeAgents 只在物理执行确认退出后释放；start 未返回、迟到句柄
+      // 未 dispose、dispose 抛错或报告 disposed=false 时保持占用（禁止自动清理）。
+      if (lifecycle.idle()) releaseExecution()
+      else lifecycle.whenIdle().then(releaseExecution, releaseExecution)
     }
     // 成功执行后清掉上一次失败留下的提醒计数（lastError 随后也会被清/覆盖）。
     this._agentReminders.delete(instanceId)

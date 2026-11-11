@@ -19,7 +19,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 
 const {
-  WORKSPACE_ERROR, normalizeAllowlist, normalizeGitUrl, resolveNodeCwd, resolveWorkspace,
+  WORKSPACE_ERROR, normalizeAllowlist, normalizeGitUrl, parseAllowlistConfig, resolveNodeCwd,
+  resolveWorkspace,
 } = await import('../src/workspace-policy.js')
 
 let checks = 0
@@ -101,7 +102,7 @@ try {
     eq(first.identityKind, 'path', '没有 remote 时 identity 用 path')
   })
 
-  await check('allowlist：根内允许、根外 WORKSPACE_NOT_ALLOWED、空列表不限制、非法条目忽略', async sandbox => {
+  await check('allowlist：根内允许、根外拒绝；未配置才不限制，显式空列表默认拒绝（W5）', async sandbox => {
     const repo = makeRepo(sandbox)
     const outside = join(sandbox, 'outside')
     mkdirSync(outside)
@@ -112,9 +113,39 @@ try {
       WORKSPACE_ERROR.NOT_ALLOWED,
       '根外路径被拒绝',
     )
-    const unrestricted = await resolveWorkspace({ path: outside, allowlist: [], runner: nonGitRunner })
-    eq(unrestricted.isGit, false, '空 allowlist 不限制，非 Git 路径返回 isGit=false')
-    deep(normalizeAllowlist(['relative/path', repo]), [repo], '非绝对路径条目被忽略，绝对路径归一')
+
+    // 未配置（undefined / null / 空字符串）才是「不限制」。
+    const unrestricted = await resolveWorkspace({ path: outside, runner: nonGitRunner })
+    eq(unrestricted.isGit, false, '未配置 allowlist 不限制，非 Git 路径返回 isGit=false')
+    eq((await resolveWorkspace({ path: outside, allowlist: '', runner: nonGitRunner })).isGit, false, '空字符串 = 未配置')
+    eq(normalizeAllowlist(undefined), null, '未配置归一为 null（与空数组区分）')
+    eq(normalizeAllowlist(''), null, '空字符串归一为 null')
+
+    // 显式空列表 = 配置了但没有根 = 默认拒绝（review-0137 W5）。
+    deep(normalizeAllowlist([]), [], '显式空数组归一为 []（已配置）')
+    deep(parseAllowlistConfig([]), { configured: true, roots: [], invalid: [] }, '空数组 configured=true')
+    await rejectsCode(
+      () => resolveWorkspace({ path: repo, allowlist: [] }),
+      WORKSPACE_ERROR.NOT_ALLOWED,
+      '显式空 allowlist 默认拒绝',
+    )
+
+    // 非法条目必须 fail closed，而不是过滤后变成「不限制」。
+    for (const bad of [['relative/path'], ['*'], [null], 'relative/path']) {
+      await rejectsCode(
+        () => resolveWorkspace({ path: repo, allowlist: bad }),
+        WORKSPACE_ERROR.POLICY_INVALID,
+        `非法 allowlist ${JSON.stringify(bad)} 明确报错`,
+      )
+      assertions += 1
+      assert.throws(
+        () => normalizeAllowlist(bad),
+        error => error.code === WORKSPACE_ERROR.POLICY_INVALID,
+        `normalizeAllowlist 拒绝 ${JSON.stringify(bad)}`,
+      )
+    }
+    deep(normalizeAllowlist([repo, `${repo}/`]), [repo], '合法绝对路径归一 / 去重')
+    deep(normalizeAllowlist({ roots: [repo] }), [repo], '对象 {roots} 形式可用')
   })
 
   await check('缺失路径 / 非目录：WORKSPACE_MISSING', async sandbox => {

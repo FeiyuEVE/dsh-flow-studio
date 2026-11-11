@@ -61,6 +61,17 @@ async function rejects(fn, predicate, message) {
   await assert.rejects(fn, predicate, message)
 }
 
+const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
+
+async function waitUntil(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await sleep(10)
+  }
+  return false
+}
+
 /** 一个用例一个全新 home；`fn` 负责自己建 handler / runtime。 */
 async function check(name, fn) {
   const home = mkdtempSync(join(repoRoot, '.tmp', 'home-bpmn-'))
@@ -1973,6 +1984,142 @@ try {
       }
     } finally {
       await artifactRuntime.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.5 W4 · 物理执行生命周期：handler 结束 != agent 进程退出
+  // -------------------------------------------------------------------------
+  await check('W4 agent 进程未退出：槽位不释放、worktree 不清理；确认退出后才释放', async home => {
+    const repo = makeGitRepo(home)
+    const url = new URL('http://localhost/')
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(makeFakeAdapter()),
+      workspaceAllowlist: [repo],
+    })
+    try {
+      const saved = await runtime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-w4', name: 'w4', xml: workflowXml('proc-w4') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+      const created = await runtime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-w4', workspace: { path: repo, worktree: { mode: 'on', cleanup: 'on-terminal-clean' } } },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      const id = created.body.id
+      eq(created.body.status, 'ACTIVE', '停在人工任务')
+      const worktreePath = created.body.workspace.effectiveRoot
+      ok(existsSync(worktreePath), 'worktree 已建立')
+
+      // start 一直不返回：模拟 agent 进程还没有退出。
+      let resolveStart = null
+      const hanging = {
+        id: 'dsh',
+        async probe() {
+          return { version: 'stub', helpDigest: 'stub' }
+        },
+        capabilities() {
+          return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' } }
+        },
+        start() {
+          return new Promise(resolveStarted => { resolveStart = resolveStarted })
+        },
+        async cancel() {},
+        async dispose() {},
+      }
+      runtime.adapters = makeFakeAdapters(hanging)
+      const controller = new AbortController()
+      const element = { id: 'agent-direct', node: { adapter: 'dsh' } }
+      const running = runtime._executeAgentFor(id, element, {
+        attempt: 1,
+        executionId: 'exec-w4',
+        signal: controller.signal,
+        variables: {},
+      })
+      ok(await waitUntil(() => runtime._activeAgents.get(id) === 1), 'start 阶段已占用槽位')
+      eq(runtime.executionLimits.active, 1, '执行槽位已占用')
+      controller.abort()
+      await rejects(
+        running,
+        error => error && error.code === 'BPMN_ABORTED',
+        'start 阶段 abort → BPMN_ABORTED',
+      )
+
+      // 关键断言：handler 已结束，但 start 尚未返回 → 物理执行仍在，槽位不释放。
+      eq(runtime._activeAgents.get(id), 1, 'start 未返回时 activeAgents 仍为 1')
+      eq(runtime.executionLimits.active, 1, 'start 未返回时执行槽位不释放')
+      eq(await runtime._waitAgentsReleased(id, 30), false, '清理等待判定为「未释放」')
+
+      // 实例转终态后触发终态清理：应该跳过并保留目录。
+      await instStore.completeInstance(id, 'CANCELED', { instancesRoot: runtime.instancesRoot })
+      await runtime._maybeTerminalCleanup(id, { waitMs: 30 })
+      ok(existsSync(worktreePath), '进程未退出时终态清理不删 worktree')
+      const events = await runtime.handle({ method: 'GET', parts: ['instances', id, 'resource-events'], url })
+      ok(
+        events.body.events.some(event => event.type === 'worktree/cleanup-skipped' && event.reason === 'agent-still-running'),
+        '资源事件记录 agent-still-running',
+      )
+
+      // 迟到的 start 返回句柄 → 后台 cancel+dispose 完成 → 这时才允许释放。
+      resolveStart({ exited: Promise.resolve({ ok: true }) })
+      ok(await waitUntil(() => runtime._activeAgents.get(id) === undefined), '确认退出后才释放 activeAgents')
+      eq(runtime.executionLimits.active, 0, '确认退出后才释放执行槽位')
+
+      // dispose 抛错同样不能当成已退出。
+      const disposeBoom = {
+        id: 'dsh',
+        async probe() {
+          return { version: 'stub', helpDigest: 'stub' }
+        },
+        capabilities() {
+          return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' } }
+        },
+        start() {
+          let resolveExited
+          const exited = new Promise(resolvePromise => { resolveExited = resolvePromise })
+          return {
+            exited,
+            cancel() {
+              resolveExited({ ok: false, code: 'NODE_FINISH_CANCELED' })
+            },
+          }
+        },
+        async cancel(handle) {
+          handle.cancel()
+        },
+        async dispose() {
+          throw new Error('dispose failed: host still alive')
+        },
+      }
+      runtime.adapters = makeFakeAdapters(disposeBoom)
+      const controller2 = new AbortController()
+      const running2 = runtime._executeAgentFor(id, element, {
+        attempt: 2,
+        executionId: 'exec-w4-dispose',
+        signal: controller2.signal,
+        variables: {},
+      })
+      await sleep(20)
+      controller2.abort()
+      await rejects(
+        running2,
+        error => error && error.code === 'BPMN_ABORTED',
+        'dispose 抛错时 handler 仍以 ABORTED 结束',
+      )
+      eq(runtime._activeAgents.get(id), 1, 'dispose 抛错 → 不释放 activeAgents')
+      eq(runtime.executionLimits.active, 1, 'dispose 抛错 → 不释放槽位')
+      await runtime._maybeTerminalCleanup(id, { waitMs: 30 })
+      ok(existsSync(worktreePath), '退出未确认时仍不清理 worktree')
+    } finally {
+      await runtime.dispose()
     }
   })
 

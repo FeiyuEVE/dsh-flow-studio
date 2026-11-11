@@ -38,6 +38,8 @@ export const WORKSPACE_ERROR = Object.freeze({
   CWD_OUTSIDE: 'WORKSPACE_CWD_OUTSIDE',
   UNAVAILABLE: 'WORKSPACE_UNAVAILABLE',
   CORRUPT: 'WORKSPACE_CORRUPT',
+  /** allowlist 配置本身非法（fail closed，不静默降级成「不限制」）。 */
+  POLICY_INVALID: 'WORKSPACE_POLICY_INVALID',
 })
 
 /** workspaceId：12 位小写 hex（sha256(identity) 前缀）。 */
@@ -158,43 +160,102 @@ export function isPathInside(root, target) {
 }
 
 /**
- * allowlist 归一：null / 空数组 = 不限制；字符串按 `path.delimiter`（POSIX `:`）拆。
- * 非绝对路径条目忽略（与旧域 env 解析同口径：错配不升级成「全部允许」）。
+ * allowlist 配置解析：**未配置 = 不限制；配置了但为空 = 默认拒绝**。
+ *
+ * 两种空数组必须分开（review-0137 W5）：
+ *   - `undefined` / `null` / 空字符串 → `configured:false`（宿主没配，不限制）；
+ *   - `[]`、`{roots:[]}`、只含分隔符的字符串 → `configured:true, roots:[]`（默认拒绝）。
+ *
+ * 任何非法条目（非字符串、相对路径、`*`、null…）都 fail closed，报
+ * `WORKSPACE_POLICY_INVALID`——不能因为写错一条配置就把整份边界撤销。
  *
  * @param {string[]|string|{roots?:string[]}|null|undefined} allowlist
- * @returns {string[]} 绝对路径根（去重）
+ * @returns {{configured:boolean, roots:string[], invalid:string[]}}
  */
-export function normalizeAllowlist(allowlist) {
-  const raw = []
-  if (typeof allowlist === 'string') {
-    const delimiter = process.platform === 'win32' ? ';' : ':'
-    raw.push(...allowlist.split(delimiter))
+export function parseAllowlistConfig(allowlist) {
+  const invalid = []
+  let raw = []
+  let configured = true
+  if (allowlist === undefined || allowlist === null) {
+    configured = false
+  } else if (typeof allowlist === 'string') {
+    if (allowlist.trim() === '') {
+      configured = false
+    } else {
+      const delimiter = process.platform === 'win32' ? ';' : ':'
+      raw.push(...allowlist.split(delimiter))
+    }
   } else if (Array.isArray(allowlist)) {
     raw.push(...allowlist)
-  } else if (allowlist && typeof allowlist === 'object' && Array.isArray(allowlist.roots)) {
+  } else if (typeof allowlist === 'object' && Array.isArray(allowlist.roots)) {
     raw.push(...allowlist.roots)
+  } else {
+    throw fail(
+      WORKSPACE_ERROR.POLICY_INVALID,
+      `workspace allowlist 配置非法：只接受绝对路径数组 / 分隔字符串 / {roots:[]}，收到 ${typeof allowlist}`,
+      { allowlist: String(allowlist) },
+    )
   }
   const roots = []
   const seen = new Set()
   for (const entry of raw) {
-    const text = typeof entry === 'string' ? entry.trim() : ''
-    if (text === '' || !isAbsolute(text)) continue
+    if (typeof entry !== 'string') {
+      invalid.push(String(entry))
+      continue
+    }
+    const text = entry.trim()
+    // 分隔符拆出来的空段（Windows/POSIX 都常见）视为「没写」，不算非法条目。
+    if (text === '') continue
+    if (!isAbsolute(text)) {
+      invalid.push(text)
+      continue
+    }
     const canonical = canonicalPath(text)
     if (seen.has(canonical)) continue
     seen.add(canonical)
     roots.push(canonical)
   }
-  return roots
+  if (invalid.length > 0) {
+    throw fail(
+      WORKSPACE_ERROR.POLICY_INVALID,
+      `workspace allowlist 含非法条目（必须是绝对路径）：${invalid.join('、')}`,
+      { allowlist: [...roots], invalid },
+    )
+  }
+  return { configured, roots, invalid }
+}
+
+/**
+ * allowlist 归一：**未配置返回 `null`**（同时区分「配置了但为空」→ `[]`）。
+ * 非法配置直接抛 `WORKSPACE_POLICY_INVALID`，不降级成「不限制」。
+ *
+ * @param {string[]|string|{roots?:string[]}|null|undefined} allowlist
+ * @returns {string[]|null} 绝对路径根（去重）；null = 未配置（不限制）
+ */
+export function normalizeAllowlist(allowlist) {
+  const { configured, roots } = parseAllowlistConfig(allowlist)
+  return configured ? roots : null
 }
 
 function assertAllowed(targetReal, allowlist) {
-  const roots = Array.isArray(allowlist) ? allowlist : normalizeAllowlist(allowlist)
-  if (roots.length === 0) return
-  if (roots.some(root => isPathInside(root, targetReal))) return
+  const config = allowlist && typeof allowlist === 'object' && !Array.isArray(allowlist)
+    && typeof allowlist.configured === 'boolean'
+    ? allowlist
+    : parseAllowlistConfig(allowlist)
+  if (config.configured !== true) return
+  // 显式配置了 allowlist 但没有任何合法根：默认拒绝（不是「不限制」）。
+  if (config.roots.length === 0) {
+    throw fail(
+      WORKSPACE_ERROR.NOT_ALLOWED,
+      `workspace allowlist 已配置但没有可用根，默认拒绝：${targetReal}`,
+      { path: targetReal, allowlist: [] },
+    )
+  }
+  if (config.roots.some(root => isPathInside(root, targetReal))) return
   throw fail(
     WORKSPACE_ERROR.NOT_ALLOWED,
-    `工作区不在宿主允许的根内：${targetReal}（allowlist：${roots.join('、')}）`,
-    { path: targetReal, allowlist: roots },
+    `工作区不在宿主允许的根内：${targetReal}（allowlist：${config.roots.join('、')}）`,
+    { path: targetReal, allowlist: config.roots },
   )
 }
 
@@ -267,7 +328,8 @@ export async function resolveWorkspace(options = {}) {
     throw error
   }
 
-  const allowlist = normalizeAllowlist(options.allowlist)
+  // allowlist 解析放在 realpath 之后、git 之前：非法配置必须 fail closed。
+  const allowlist = parseAllowlistConfig(options.allowlist)
   assertAllowed(realpath, allowlist)
 
   const top = await callGit(runner, ['-C', realpath, 'rev-parse', '--show-toplevel'], realpath)

@@ -19,8 +19,9 @@
  * @module @feiyueve/dsh-flow-studio/instance-resources
  */
 
+import { randomBytes } from 'node:crypto'
 import {
-  chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile,
+  chmod, link, lstat, mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile,
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -182,8 +183,141 @@ async function writeTextAtomic(path, text) {
   }
 }
 
+/** 资源锁内容格式版本。 */
+export const RESOURCE_LOCK_VERSION = 1
+
+/** pid 是否仍存活：ESRCH = 已退出；EPERM = 存在但无权限（按存活处理）。 */
+function pidIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && error.code === 'EPERM')
+  }
+}
+
 /**
- * 跨进程粗粒度锁：`open(lock, 'wx')`；TTL 过期可抢，等待超时报 LOCK_TIMEOUT。
+ * 读锁的持有者事实。
+ *
+ * 新格式是 `{v, owner, pid, at}`：
+ *   - **活进程持有的锁不因 TTL 被抢占**（只有 pid 不存在才算 stale）；
+ *   - 无法识别持有者（旧格式 / 半截写入）才退回 mtime TTL。
+ */
+async function readLockSnapshot(lockPath, ttlMs) {
+  let info
+  try {
+    info = await lstat(lockPath)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+  let text = ''
+  try {
+    text = await readFile(lockPath, 'utf8')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+  }
+  let parsed = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+  let owner = parsed && typeof parsed === 'object' && typeof parsed.owner === 'string' ? parsed.owner : null
+  let pid = parsed && typeof parsed === 'object' && Number.isSafeInteger(parsed.pid) ? parsed.pid : null
+  if (pid === null) {
+    // 兼容旧格式：首行是 pid。
+    const first = text.split('\n')[0].trim()
+    if (/^\d+$/.test(first)) pid = Number(first)
+    if (pid !== null) owner = null
+  }
+  const ageMs = Date.now() - info.mtimeMs
+  const recognized = owner !== null && pid !== null
+  let stale = false
+  let reason = ''
+  if (recognized) {
+    if (!pidIsAlive(pid)) {
+      stale = true
+      reason = 'pid-dead'
+    }
+  } else if (ageMs > ttlMs) {
+    // 无法证明持有者还活着：超过 TTL 的半截 / 旧锁按 stale 处理。
+    stale = true
+    reason = 'unrecognized-ttl'
+  }
+  return { info, owner, pid, recognized, ageMs, stale, reason }
+}
+
+/**
+ * 抢占 stale 锁：先按 inode 复核，再 rename 到私有路径验证 inode。
+ * 如果 rename 到的是别人刚换上的新锁，尽力放回原位，绝不按路径盲删。
+ */
+async function stealStaleLock(lockPath, snapshot) {
+  let current
+  try {
+    current = await lstat(lockPath)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return true
+    return false
+  }
+  if (current.ino !== snapshot.info.ino || current.dev !== snapshot.info.dev) return false
+  const parking = `${lockPath}.stale-${process.pid}-${tmpCounter++}-${randomBytes(4).toString('hex')}`
+  try {
+    await rename(lockPath, parking)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return true
+    return false
+  }
+  let moved
+  try {
+    moved = await lstat(parking)
+  } catch {
+    return true
+  }
+  if (moved.ino !== snapshot.info.ino || moved.dev !== snapshot.info.dev) {
+    // 抢错了对象：用 link 放回（不覆盖新锁），失败就丢弃这份复制。
+    try {
+      await link(parking, lockPath)
+    } catch {
+      // 对方路径已被别的持有者占用：丢弃复制，避免删掉任何人的锁。
+    }
+    await unlink(parking).catch(() => {})
+    return false
+  }
+  await unlink(parking).catch(() => {})
+  return true
+}
+
+/** 只有「inode 未变 + owner token 一致」的持有者才能释放锁。 */
+async function releaseOwnedLock(lockPath, owner, ino, dev) {
+  if (ino === undefined || dev === undefined) return false
+  let info
+  try {
+    info = await lstat(lockPath)
+  } catch {
+    return false
+  }
+  if (info.isSymbolicLink() || info.ino !== ino || info.dev !== dev) return false
+  let parsed = null
+  try {
+    parsed = JSON.parse(await readFile(lockPath, 'utf8'))
+  } catch {
+    return false
+  }
+  if (!parsed || typeof parsed !== 'object' || parsed.owner !== owner) return false
+  await unlink(lockPath).catch(() => {})
+  return true
+}
+
+/**
+ * 跨进程粗粒度锁：`open(lock, 'wx')` + owner token + pid + 心跳。
+ *
+ * - 持有者内容带 `owner`（随机 token）与 `pid`，并周期性 touch mtime 续租；
+ * - **活进程持有的锁不会被 TTL 抢占**；只有 pid 不存在（或无法识别的旧锁超过 TTL）
+ *   才按 stale 处理（review-0137 W7）；
+ * - 释放时比对 inode + owner token：旧持有者不会删掉继任者的锁；
+ * - 等待超时报 LOCK_TIMEOUT。
  *
  * @param {string} lockPath
  * @param {() => Promise<any>} task
@@ -197,21 +331,24 @@ export async function withResourceLock(lockPath, task, options = {}) {
   const waitMs = Number.isSafeInteger(options.waitMs) && options.waitMs > 0 ? options.waitMs : LOCK_WAIT_MS
   await ensureDir(dirname(lockPath))
   const startedAt = Date.now()
+  const owner = `${process.pid}-${randomBytes(8).toString('hex')}`
   for (;;) {
     let handle = null
     try {
       handle = await open(lockPath, 'wx', FILE_MODE)
     } catch (error) {
       if (!error || error.code !== 'EEXIST') throw error
-      let stale = false
-      try {
-        const info = await stat(lockPath)
-        stale = Date.now() - info.mtimeMs > ttlMs
-      } catch {
-        stale = true
-      }
-      if (stale) {
-        await unlink(lockPath).catch(() => {})
+      const snapshot = await readLockSnapshot(lockPath, ttlMs)
+      if (snapshot === null) continue
+      if (snapshot.stale) {
+        const stolen = await stealStaleLock(lockPath, snapshot)
+        // 抢占失败（锁刚被换掉 / 权限问题）也要退避，不能空转成忙等。
+        if (!stolen) {
+          if (Date.now() - startedAt >= waitMs) {
+            throw fail(RESOURCE_ERROR.LOCK_TIMEOUT, `等待资源锁超时（${waitMs}ms）：${lockPath}`, { path: lockPath })
+          }
+          await sleep(20)
+        }
         continue
       }
       if (Date.now() - startedAt >= waitMs) {
@@ -220,12 +357,27 @@ export async function withResourceLock(lockPath, task, options = {}) {
       await sleep(20)
       continue
     }
+    let ino
+    let dev
+    let heartbeat = null
     try {
-      await handle.writeFile(`${process.pid}\n${Date.now()}\n`, 'utf8')
+      const info = await handle.stat()
+      ino = info.ino
+      dev = info.dev
+      await handle.writeFile(
+        `${JSON.stringify({ v: RESOURCE_LOCK_VERSION, owner, pid: process.pid, at: new Date().toISOString() })}\n`,
+        'utf8',
+      )
+      // 心跳：只 touch mtime（不动 token 内容），避免读写内容时出现半截 JSON。
+      heartbeat = setInterval(() => {
+        utimes(lockPath, new Date(), new Date()).catch(() => {})
+      }, Math.max(25, Math.floor(ttlMs / 3)))
+      heartbeat.unref?.()
       return await task()
     } finally {
+      if (heartbeat !== null) clearInterval(heartbeat)
       await handle.close().catch(() => {})
-      await unlink(lockPath).catch(() => {})
+      await releaseOwnedLock(lockPath, owner, ino, dev)
     }
   }
 }

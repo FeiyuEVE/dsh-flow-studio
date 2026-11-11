@@ -16,9 +16,9 @@
  * @module @feiyueve/dsh-flow-studio/instance-worktree
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
-  existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync,
+  existsSync, lstatSync, readdirSync, realpathSync, rmSync,
 } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -30,7 +30,9 @@ import {
   RESOURCE_STATE,
   normalizeResourceRecord,
   scanResourceRecords,
+  withResourceLock,
 } from './instance-resources.js'
+import { readInstance } from './instance-store.js'
 
 /** 分支前缀：只删这个前缀下、且确属本实例的分支。 */
 export const INSTANCE_BRANCH_PREFIX = 'flow-instance/'
@@ -67,11 +69,12 @@ export const INSTANCE_WORKTREE_ERROR = Object.freeze({
 
 const GIT_TIMEOUT_MS = 20 * 1000
 const GIT_MAX_BUFFER = 8 * 1024 * 1024
-const ALREADY_EXISTS_HINT = /already exists|already checked out|is a worktree/i
-const BRANCH_IN_USE_HINT = /already checked out|is already used by worktree/i
-const DIRTY_HINT = /contains modified or untracked files|is dirty|has local changes/i
-const LOCKED_HINT = /is locked|locked working tree/i
-const NOT_REGISTERED_HINT = /is not a working tree|not a valid worktree|is not a worktree/i
+// Git 的报错文案受 locale 影响（本机可能是中文），提示词同时匹配英文与中文。
+const ALREADY_EXISTS_HINT = /already exists|already checked out|is a worktree|已存在|已检出/i
+const BRANCH_IN_USE_HINT = /already checked out|is already used by worktree|已检出|正在被.*使用/i
+const DIRTY_HINT = /contains modified or untracked files|is dirty|has local changes|未提交|修改或未跟踪/i
+const LOCKED_HINT = /is locked|locked working tree|锁定的工作区|锁定/i
+const NOT_REGISTERED_HINT = /is not a working tree|not a valid worktree|is not a worktree|不是工作区|不是工作树/i
 
 /** 带 code 的确定性错误。 */
 export class InstanceWorktreeError extends Error {
@@ -426,70 +429,157 @@ export async function createInstanceWorktree(options = {}) {
   }
 
   const base = await readBaseInfo(git, repositoryRoot, baseRef)
-  const branch = await pickBranch(git, repositoryRoot, instanceId)
   const target = join(worktreeRoot, workspaceId, instanceId)
   assertSafePath({ target, workspaceId, instanceId, worktreeRoot })
 
-  if (existsSync(target)) {
-    throw fail(
-      INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
-      `目标路径已存在，拒绝覆盖：${target}`,
-      { reason: 'path-exists', path: target },
-    )
-  }
-  try {
-    await mkdir(dirname(target), { recursive: true })
-  } catch (error) {
-    throw fail(
-      INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
-      `创建 worktree 父目录失败：${error?.message ?? error}`,
-      { reason: 'mkdir-failed', path: target, cause: error },
-    )
-  }
-
-  const addArgv = base.empty
-    ? ['-C', repositoryRoot, 'worktree', 'add', '--orphan', '-b', branch, target]
-    : ['-C', repositoryRoot, 'worktree', 'add', '-b', branch, target, base.commit]
-  const add = await callGit(git, addArgv, repositoryRoot)
-  if (!add.ok || !existsSync(target)) {
-    const detail = summarize(add.stderr || add.stdout || add.error?.message)
-    // 回滚本次刚建的分支与半成品目录（不碰别人的分支）。
-    await callGit(git, ['-C', repositoryRoot, 'worktree', 'remove', '--force', '--force', target], repositoryRoot)
-    await callGit(git, ['-C', repositoryRoot, 'worktree', 'prune', '--expire', 'now'], repositoryRoot)
+  // 创建是「检查目标不存在 → add」的复合事务：用**跨进程互斥**把检查与创建锁在一起，
+  // 否则两次并发会同时通过检查并互相覆盖/误删（review-0137 W1）。
+  const lockPath = join(worktreeRoot, workspaceId, `.create-${instanceId}.lock`)
+  return await withResourceLock(lockPath, async () => {
+    // 拿到锁后重新核对路径结构：等待锁期间目标可能被换成符号链接。
+    assertSafePath({ target, workspaceId, instanceId, worktreeRoot })
     if (existsSync(target)) {
+      throw fail(
+        INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
+        `目标路径已存在，拒绝覆盖：${target}`,
+        { reason: 'path-exists', path: target },
+      )
+    }
+    const branch = await pickBranch(git, repositoryRoot, instanceId)
+    try {
+      await mkdir(dirname(target), { recursive: true })
+    } catch (error) {
+      throw fail(
+        INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
+        `创建 worktree 父目录失败：${error?.message ?? error}`,
+        { reason: 'mkdir-failed', path: target, cause: error },
+      )
+    }
+
+    // 事务所有权证据：
+    //   - 临时分支名带随机 nonce（只可能由本次调用创建）；
+    //   - add 成功 = 本次创建的树；失败时只认「登记在这个 nonce 分支上的树」；
+    //   - 分支删除前核对 tip 仍是创建时的基点。
+    const tempBranch = `${INSTANCE_BRANCH_PREFIX}${instanceId}-txn-${randomBytes(6).toString('hex')}`
+    const ownership = {
+      tempBranch,
+      branch: null,
+      baseTip: base.commit,
+      worktree: false,
+    }
+    const addArgv = base.empty
+      ? ['-C', repositoryRoot, 'worktree', 'add', '--orphan', '-b', tempBranch, target]
+      : ['-C', repositoryRoot, 'worktree', 'add', '-b', tempBranch, target, base.commit]
+    const add = await callGit(git, addArgv, repositoryRoot)
+    if (!add.ok || !existsSync(target)) {
+      const detail = summarize(add.stderr || add.stdout || add.error?.message)
+      await rollbackCreateTransaction({ git, repositoryRoot, target, ownership })
+      let reason = 'create-failed'
+      if (base.empty) reason = 'empty-repository'
+      else if (ALREADY_EXISTS_HINT.test(detail)) reason = 'path-exists'
+      else if (BRANCH_IN_USE_HINT.test(detail)) reason = 'branch-conflict'
+      throw fail(
+        INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
+        `git worktree add 失败（${reason}）：${detail || '未知错误'}`,
+        { reason, path: target, branch, baseCommit: base.commit, stderr: detail },
+      )
+    }
+
+    ownership.worktree = true
+    ownership.branch = tempBranch
+    // 转正：临时分支 → 最终分支（空仓库分支尚未出生，改 HEAD 的 symbolic ref 即可）。
+    const formalize = base.empty
+      ? await callGit(git, ['-C', target, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`], target)
+      : await callGit(git, ['-C', repositoryRoot, 'branch', '-m', tempBranch, branch], repositoryRoot)
+    if (!formalize.ok) {
+      const detail = summarize(formalize.stderr || formalize.stdout)
+      await rollbackCreateTransaction({ git, repositoryRoot, target, ownership })
+      throw fail(
+        INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
+        `worktree 已创建但无法落到目标分支 ${branch}：${detail || '未知错误'}`,
+        { reason: 'branch-formalize-failed', path: target, branch, baseCommit: base.commit, stderr: detail },
+      )
+    }
+    ownership.tempBranch = null
+    ownership.branch = branch
+
+    const createdAt = now() instanceof Date ? now().toISOString() : new Date().toISOString()
+    return {
+      v: RESOURCE_RECORD_VERSION,
+      instanceId,
+      workspaceId,
+      repositoryRoot,
+      effectiveRoot: target,
+      branch,
+      baseCommit: base.commit,
+      cleanupPolicy,
+      resourceState: RESOURCE_STATE.READY,
+      createdAt,
+    }
+  })
+}
+
+/** 读分支 tip；不存在 / git 失败返回 null。 */
+async function readBranchTip(git, repositoryRoot, branch) {
+  const probe = await callGit(
+    git,
+    ['-C', repositoryRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`],
+    repositoryRoot,
+  )
+  if (!probe.ok) return null
+  const tip = probe.stdout.trim().split(/\s+/)[0]
+  return tip && HEAD_PATTERN.test(tip) ? tip.toLowerCase() : null
+}
+
+/** 目标路径上登记的 worktree 是否正好检出本事务的 nonce 分支。 */
+async function worktreeRegisteredOnBranch(git, repositoryRoot, target, branch) {
+  const listing = await listRepoWorktrees(git, repositoryRoot)
+  if (!listing.ok) return false
+  return listing.entries.some(entry => samePath(entry.path, target) && entry.branch === branch)
+}
+
+/**
+ * 创建失败回滚：**只处理能证明属于本次事务的资源**（review-0137 W1）。
+ *
+ * - 树：add 成功，或登记里明确检出本事务唯一 nonce 分支；
+ * - 分支：名字是本次 nonce 临时分支 / 已转正的最终分支，且 tip 仍等于创建时基点；
+ * - 不调用仓库级 `worktree prune`，不按「路径原先不存在 / 分支前缀匹配」删除任何东西。
+ */
+async function rollbackCreateTransaction({ git, repositoryRoot, target, ownership }) {
+  let ownsTree = ownership.worktree === true
+  if (!ownsTree && typeof ownership.tempBranch === 'string' && ownership.tempBranch !== '') {
+    ownsTree = await worktreeRegisteredOnBranch(git, repositoryRoot, target, ownership.tempBranch)
+  }
+  if (ownsTree) {
+    const remove = await callGit(
+      git,
+      ['-C', repositoryRoot, 'worktree', 'remove', '--force', '--force', target],
+      repositoryRoot,
+    )
+    if (remove.ok && existsSync(target)) {
       try {
-        // 只删本次创建路径；失败就让错误信息带上残留位置。
         rmSyncSafe(target)
       } catch {
-        // 残留位置已在错误里给出。
+        // 残留目录留给错误信息里的路径。
       }
     }
-    if (branch.startsWith(INSTANCE_BRANCH_PREFIX)) {
-      await callGit(git, ['-C', repositoryRoot, 'branch', '-D', branch], repositoryRoot)
-    }
-    let reason = 'create-failed'
-    if (base.empty) reason = 'empty-repository'
-    else if (ALREADY_EXISTS_HINT.test(detail)) reason = 'path-exists'
-    else if (BRANCH_IN_USE_HINT.test(detail)) reason = 'branch-conflict'
-    throw fail(
-      INSTANCE_WORKTREE_ERROR.CREATE_FAILED,
-      `git worktree add 失败（${reason}）：${detail || '未知错误'}`,
-      { reason, path: target, branch, baseCommit: base.commit, stderr: detail },
-    )
   }
-
-  const createdAt = now() instanceof Date ? now().toISOString() : new Date().toISOString()
-  return {
-    v: RESOURCE_RECORD_VERSION,
-    instanceId,
-    workspaceId,
-    repositoryRoot,
-    effectiveRoot: target,
-    branch,
-    baseCommit: base.commit,
-    cleanupPolicy,
-    resourceState: RESOURCE_STATE.READY,
-    createdAt,
+  const candidates = []
+  if (typeof ownership.tempBranch === 'string' && ownership.tempBranch !== '') candidates.push(ownership.tempBranch)
+  if (typeof ownership.branch === 'string' && ownership.branch !== '' && ownership.branch !== ownership.tempBranch) {
+    candidates.push(ownership.branch)
+  }
+  for (const name of candidates) {
+    const tip = await readBranchTip(git, repositoryRoot, name)
+    // 没有可核对 tip（空仓库 unborn 分支）或 tip 已被移动 → 不删。
+    if (tip === null || ownership.baseTip === null || tip !== ownership.baseTip) continue
+    // 树没删掉（remove 失败）时分支仍被登记使用：保留分支，避免留下坏 worktree。
+    if (await worktreeRegisteredOnBranch(git, repositoryRoot, target, name)) continue
+    await callGit(
+      git,
+      ['-C', repositoryRoot, 'update-ref', '-d', `refs/heads/${name}`, tip],
+      repositoryRoot,
+    )
   }
 }
 
@@ -724,7 +814,9 @@ export async function removeInstanceWorktree(options = {}) {
     ['-C', record.repositoryRoot, 'worktree', 'remove', ...(options.force === true ? ['--force'] : []), record.effectiveRoot],
     record.repositoryRoot,
   )
-  if (!remove.ok && (entry.locked || options.force === true)) {
+  // locked 树默认保留：只有调用方**明确** force=true 才允许升级为双 force 解除保护。
+  // 自动终态清理（force:false）不能因为 entry.locked 就自行升级（review-0137 W2）。
+  if (!remove.ok && options.force === true) {
     remove = await callGit(
       git,
       ['-C', record.repositoryRoot, 'worktree', 'remove', '--force', '--force', record.effectiveRoot],
@@ -791,17 +883,24 @@ export async function removeInstanceWorktree(options = {}) {
 /**
  * 只删分支（不碰目录）。规则：
  *   - 记录里的 branch 必须确属本实例、且前缀是 `flow-instance/`；
- *   - 未合并进 `baseCommit` 的分支**不删**，返回 `reason:'unmerged'`（风险要人看）；
+ *   - **只有明确证明已合并进主仓库 HEAD 才删**：`merge-base --is-ancestor` 退出 1、
+ *     空仓库无基点（baseCommit=null）、检查异常（128 / git 不可用）一律按「未证明
+ *     已合并」拒绝；只有显式 `force:true` 才允许删除并标记 `forced:true`
+ *     （review-0137 W3）；
+ *   - 删除用 `update-ref -d <ref> <tip>` 做 compare-and-delete：检查后分支 tip 变了
+ *     就不删；
  *   - 不存在 / 删除失败返回结构化结果，不抛预期失败。
  *
- * @param {{record:object, runner?:Function}} options
- * @returns {Promise<{removed:boolean, branch:string|null, reason:string, warning:string|null}>}
+ * @param {{record:object, force?:boolean, runner?:Function}} options
+ * @returns {Promise<{removed:boolean, branch:string|null, reason:string,
+ *   warning:string|null, forced:boolean}>}
  */
 export async function removeInstanceBranch(options = {}) {
   const record = normalizeRecord(options.record)
   const git = typeof options.runner === 'function' ? options.runner : defaultGitRunner
+  const force = options.force === true
   const branch = record.branch
-  const result = { removed: false, branch, reason: 'not-removed', warning: null }
+  const result = { removed: false, branch, reason: 'not-removed', warning: null, forced: false }
   if (!isOwnedByInstance(branch, record.instanceId)) {
     return {
       ...result,
@@ -816,45 +915,65 @@ export async function removeInstanceBranch(options = {}) {
       warning: `主仓库不存在，无法删除分支 ${branch}：${record.repositoryRoot}`,
     }
   }
-  const exists = await callGit(git, ['-C', record.repositoryRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], record.repositoryRoot)
-  if (!exists.ok) {
+  const tip = await readBranchTip(git, record.repositoryRoot, branch)
+  if (tip === null) {
+    const exists = await callGit(git, ['-C', record.repositoryRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], record.repositoryRoot)
     if (exists.exitCode === null) {
       return { ...result, reason: 'git-unavailable', warning: 'git 不可用，分支未删除' }
     }
     return { ...result, reason: 'not-found', warning: `分支 ${branch} 不存在` }
   }
-  if (record.baseCommit !== null) {
-    // 以主仓库当前 HEAD 判断「已合并」：baseCommit 只记录创建时的基点，主仓库后续
-    // 前进后旧基点不能代表当前主线。
-    const merged = await callGit(
+
+  // 以主仓库当前 HEAD 判断「已合并」：baseCommit 只记录创建时的基点，主仓库后续
+  // 前进后旧基点不能代表当前主线。
+  let merged = null
+  let mergeDetail = ''
+  if (record.baseCommit === null) {
+    mergeDetail = '空仓库没有可核对的合并基点'
+  } else {
+    const probe = await callGit(
       git,
       ['-C', record.repositoryRoot, 'merge-base', '--is-ancestor', branch, 'HEAD'],
       record.repositoryRoot,
     )
-    if (!merged.ok && merged.exitCode === 1) {
-      return {
-        ...result,
-        reason: 'unmerged',
-        warning: `分支 ${branch} 尚未合并进主仓库 HEAD，拒绝删除（需人工确认）`,
-      }
+    if (probe.ok) merged = true
+    else if (probe.exitCode === 1) merged = false
+    else {
+      merged = null
+      mergeDetail = summarize(probe.stderr || probe.stdout) || `git 退出码 ${String(probe.exitCode)}`
     }
-    if (!merged.ok && merged.exitCode === null) {
+    if (probe.exitCode === null && force !== true) {
       return { ...result, reason: 'git-unavailable', warning: 'git 不可用，无法判断分支是否已合并' }
     }
   }
-  const del = await callGit(git, ['-C', record.repositoryRoot, 'branch', '-D', branch], record.repositoryRoot)
+  if (merged !== true && force !== true) {
+    return {
+      ...result,
+      reason: merged === false ? 'unmerged' : 'merge-unknown',
+      warning: merged === false
+        ? `分支 ${branch} 尚未合并进主仓库 HEAD，拒绝删除（需人工确认或显式 force）`
+        : `分支 ${branch} 未证明已合并（${mergeDetail}），拒绝删除（需人工确认或显式 force）`,
+    }
+  }
+
+  // compare-and-delete：只删检查时看到的那个 tip，检查后引用变化就保留。
+  const del = await callGit(
+    git,
+    ['-C', record.repositoryRoot, 'update-ref', '-d', `refs/heads/${branch}`, tip],
+    record.repositoryRoot,
+  )
   if (!del.ok) {
     return {
       ...result,
       reason: 'delete-failed',
-      warning: `分支 ${branch} 删除失败：${summarize(del.stderr || del.stdout) || '未知错误'}`,
+      warning: `分支 ${branch} 删除失败（tip 可能已变化）：${summarize(del.stderr || del.stdout) || '未知错误'}`,
     }
   }
   const after = await callGit(git, ['-C', record.repositoryRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], record.repositoryRoot)
   if (after.ok) {
     return { ...result, reason: 'delete-failed', warning: `分支 ${branch} 删除后仍存在` }
   }
-  return { removed: true, branch, reason: 'removed', warning: null }
+  return { removed: true, branch, reason: 'removed', warning: null, forced: merged !== true }
 }
 
 /** 扫描 `<worktreeRoot>/<workspaceId>/<instanceId>`；返回纯目录事实。 */
@@ -885,25 +1004,51 @@ function scanWorktreeDirs(root) {
   return entries
 }
 
-/** 读实例目录的元数据（只读；损坏单独标记）。 */
-function readInstanceFacts(instancesRoot, instanceId) {
+const TERMINAL_INSTANCE_STATUS = new Set(['COMPLETED', 'CANCELED'])
+const ACTIVE_INSTANCE_STATUS = new Set(['ACTIVE', 'SUSPENDED'])
+
+/**
+ * 读实例目录的元数据（只读）。
+ *
+ * 复用 instance-store 的实例校验：JSON 能解析不代表语义正确。缺字段 / 未知状态 /
+ * id 与目录不一致 / 坏 JSON 一律标记 `instanceCorrupt:true` + `instanceState:'unknown'`，
+ * 让 list 只报告、prune 禁止执行（review-0137 W6）。
+ */
+async function readInstanceFacts(instancesRoot, instanceId) {
   if (typeof instancesRoot !== 'string' || instancesRoot.trim() === '') {
-    return { instanceExists: null, instanceStatus: null, instanceCorrupt: false }
+    return { instanceExists: null, instanceStatus: null, instanceCorrupt: false, instanceState: 'not-configured' }
   }
-  const dir = join(resolve(instancesRoot), instanceId)
-  const file = join(dir, 'instance.json')
-  if (!existsSync(file)) return { instanceExists: false, instanceStatus: null, instanceCorrupt: false }
+  const file = join(resolve(instancesRoot), instanceId, 'instance.json')
+  if (!existsSync(file)) {
+    return { instanceExists: false, instanceStatus: null, instanceCorrupt: false, instanceState: 'missing' }
+  }
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    const status = parsed && typeof parsed.status === 'string' ? parsed.status : null
-    return { instanceExists: true, instanceStatus: status, instanceCorrupt: false }
+    const instance = await readInstance(instanceId, { instancesRoot })
+    if (instance === null) {
+      return { instanceExists: false, instanceStatus: null, instanceCorrupt: false, instanceState: 'missing' }
+    }
+    const status = typeof instance.status === 'string' ? instance.status : null
+    const state = ACTIVE_INSTANCE_STATUS.has(status)
+      ? 'active'
+      : TERMINAL_INSTANCE_STATUS.has(status) ? 'terminal' : 'unknown'
+    return {
+      instanceExists: true,
+      instanceStatus: status,
+      instanceCorrupt: state === 'unknown',
+      instanceState: state,
+    }
   } catch {
-    return { instanceExists: true, instanceStatus: null, instanceCorrupt: true }
+    return { instanceExists: true, instanceStatus: null, instanceCorrupt: true, instanceState: 'unknown' }
   }
 }
 
 function isActiveStatus(status) {
   return status === 'ACTIVE' || status === 'SUSPENDED'
+}
+
+function isUnknownInstanceState(facts) {
+  if (facts.instanceExists === false || facts.instanceExists === null) return false
+  return facts.instanceCorrupt === true || facts.instanceState === 'unknown'
 }
 
 /**
@@ -994,11 +1139,9 @@ export async function listInstanceWorktrees(options = {}) {
 }
 
 async function buildListEntry({ git, dir, record, corrupt, instancesRoot, worktreeRoot, workspaceId }) {
-  const facts = record !== null && typeof dir.instanceId === 'string'
-    ? readInstanceFacts(instancesRoot, dir.instanceId)
-    : (typeof dir.instanceId === 'string'
-      ? readInstanceFacts(instancesRoot, dir.instanceId)
-      : { instanceExists: null, instanceStatus: null, instanceCorrupt: false })
+  const facts = typeof dir.instanceId === 'string'
+    ? await readInstanceFacts(instancesRoot, dir.instanceId)
+    : { instanceExists: null, instanceStatus: null, instanceCorrupt: false, instanceState: 'not-configured' }
   const reasons = []
   let inspected = null
   if (record !== null) {
@@ -1006,7 +1149,7 @@ async function buildListEntry({ git, dir, record, corrupt, instancesRoot, worktr
   }
   if (corrupt !== null) reasons.push('record-corrupt')
   if (facts.instanceExists === false) reasons.push('instance-missing')
-  if (facts.instanceCorrupt) reasons.push('instance-corrupt')
+  if (facts.instanceCorrupt) reasons.push('instance-corrupt', 'instance-unknown')
   if (record !== null && !existsSync(record.effectiveRoot)) reasons.push('directory-missing')
   if (record === null && corrupt === null) reasons.push('unregistered-directory', 'no-ownership-record')
   if (inspected !== null && inspected.state !== 'ok' && inspected.state !== 'missing') {
@@ -1023,6 +1166,7 @@ async function buildListEntry({ git, dir, record, corrupt, instancesRoot, worktr
     instanceExists: facts.instanceExists,
     instanceStatus: facts.instanceStatus,
     instanceCorrupt: facts.instanceCorrupt,
+    instanceState: facts.instanceState,
     directoryExists: record !== null ? existsSync(record.effectiveRoot) : Boolean(dir.path && existsSync(dir.path)),
     inspected,
     registered: inspected === null ? null : inspected.registered,
@@ -1071,6 +1215,14 @@ export function createPrunePlan({ entries, now } = {}) {
   }
   const planned = entries.map(entry => {
     const record = entry && isPlainObject(entry.record) ? entry.record : null
+    const facts = {
+      instanceExists: entry?.instanceExists ?? (entry?.instanceStatus === null ? null : true),
+      instanceStatus: entry?.instanceStatus ?? null,
+      instanceCorrupt: entry?.instanceCorrupt === true,
+      instanceState: typeof entry?.instanceState === 'string'
+        ? entry.instanceState
+        : (entry?.instanceCorrupt === true ? 'unknown' : null),
+    }
     const base = {
       instanceId: entry?.instanceId ?? null,
       workspaceId: entry?.workspaceId ?? null,
@@ -1078,8 +1230,9 @@ export function createPrunePlan({ entries, now } = {}) {
       record: record === null ? null : { ...record },
       branch: record?.branch ?? null,
       baseCommit: record?.baseCommit ?? null,
-      instanceStatus: entry?.instanceStatus ?? null,
-      instanceCorrupt: entry?.instanceCorrupt === true,
+      instanceStatus: facts.instanceStatus,
+      instanceCorrupt: facts.instanceCorrupt,
+      instanceState: facts.instanceState,
       head: entry?.head ?? null,
       dirty: entry?.dirty ?? null,
       registered: entry?.registered ?? null,
@@ -1090,10 +1243,16 @@ export function createPrunePlan({ entries, now } = {}) {
     if (!safeOwnedBranch(record.branch, record.instanceId)) {
       return { ...base, reason: 'branch-not-owned' }
     }
-    // 实例目录损坏 / 列表不完整时 stop prune（只报告，不猜实例是否终态）。
-    if (entry.instanceCorrupt === true) return { ...base, reason: 'instance-corrupt' }
-    if (isActiveStatus(entry.instanceStatus)) {
+    // 实例目录读不出 / 语义损坏 / 未知状态：只报告，prune 执行被拒（W6）。
+    if (isUnknownInstanceState(facts)) {
+      return { ...base, instanceState: 'unknown', reason: 'instance-unknown' }
+    }
+    if (facts.instanceExists === false) {
+      // 实例确实不存在：所有权记录完整、树已登记且干净时才允许清理孤儿。
+    } else if (isActiveStatus(facts.instanceStatus)) {
       return { ...base, action: 'retain', reason: 'instance-active' }
+    } else if (!TERMINAL_INSTANCE_STATUS.has(facts.instanceStatus)) {
+      return { ...base, instanceState: 'unknown', reason: 'instance-unknown' }
     }
     if (entry.directoryExists === false) return { ...base, reason: 'directory-missing' }
     if (entry.registered !== true) return { ...base, reason: 'not-registered' }
@@ -1133,6 +1292,11 @@ export async function pruneInstanceWorktrees(options = {}) {
   for (const entry of plan.entries) {
     if (!isPlainObject(entry) || entry.action !== 'remove') {
       skipped.push({ ...entry, executed: false, reason: entry?.reason ?? 'not-remove' })
+      continue
+    }
+    // 语义损坏 / 未知状态的实例即使 plan 被手工改成 remove 也不执行（W6 双保险）。
+    if (entry.instanceCorrupt === true || entry.instanceState === 'unknown') {
+      skipped.push({ ...entry, executed: false, reason: 'instance-unknown' })
       continue
     }
     const record = isPlainObject(entry.record) ? entry.record : null

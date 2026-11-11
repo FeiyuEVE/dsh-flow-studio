@@ -11,6 +11,8 @@
  * @module @feiyueve/dsh-flow-studio/instance-tools
  */
 
+import { normalizeShortVariables } from './node-finish.js'
+
 /** 单个字符串字段的结果上限（2 KiB）。 */
 const MAX_FIELD_BYTES = 2 * 1024
 /** 数组最多保留的条目数（超出部分用一条说明代替，避免模型上下文被清单撑爆）。 */
@@ -30,12 +32,32 @@ const MAX_MESSAGE_BYTES = 1024 * 1024
 
 const TIMEOUT_WORKTREE_MS = 60_000
 const TIMEOUT_MESSAGE_MS = 30_000
+const TIMEOUT_READ_MS = 30_000
+/** 启动 / 完成任务可能等在飞 agent，超时给足（与 run 的节点时限量级一致）。 */
+const TIMEOUT_RUN_MS = 10 * 60_000
+
+/** 新域状态集合（与 instance-store 的同名契约一致）。 */
+const INSTANCE_STATUSES = ['ACTIVE', 'COMPLETED', 'SUSPENDED', 'CANCELED']
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELED'])
+const INCLUDE_VALUES = ['tasks', 'artifacts', 'lastError']
+const MAX_LIST_LIMIT = 200
+const MAX_EVENT_LIMIT = 200
+const DEFAULT_LIST_LIMIT = 50
+const DEFAULT_EVENT_LIMIT = 50
+/** 单条事件里「结构化正文」的内联上限；超过给 bodyRef，不把大文本塞进模型上下文。 */
+const EVENT_PAYLOAD_BYTES = 1024
+/** definition_get 返回 XML 的上限；超过截断并显式标记（不构造非法 XML 尾注）。 */
+const MAX_DEFINITION_XML_BYTES = 64 * 1024
+/** instance_get 走 GET /instances（纯读，不懒恢复），单次扫描上限与路由一致。 */
+const INSTANCE_SCAN_LIMIT = 1000
+const DEFINITION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
 class ParamError extends Error {
-  constructor(message, hint) {
+  constructor(message, hint, code) {
     super(message)
     this.name = 'ParamError'
     this.hint = hint
+    if (typeof code === 'string') this.code = code
   }
 }
 
@@ -199,6 +221,301 @@ function optionalDocument(args) {
   return value
 }
 
+function requireDefinitionId(args) {
+  const value = optionalString(args, 'definitionId', { max: 64 })
+  if (value === undefined) {
+    throw new ParamError('缺少必填参数 definitionId', '先调 flow_definition_list 找到定义 id；省略时不会猜「最近定义」。')
+  }
+  if (!DEFINITION_ID_PATTERN.test(value)) {
+    throw new ParamError(
+      '参数 definitionId 不合法（只允许字母、数字、点、下划线、连字符，1–64 位，且以字母或数字开头）',
+      '照 flow_definition_list 里的 id 原样传。',
+    )
+  }
+  return value
+}
+
+/** 正整数（整数或纯数字字符串），范围 [min, max]。 */
+function optionalInteger(args, key, { min = 1, max = Number.MAX_SAFE_INTEGER, fallback } = {}) {
+  const value = argsOf(args)[key]
+  if (value === undefined || value === null) return fallback
+  let parsed = value
+  if (typeof parsed === 'string' && /^\d+$/.test(parsed.trim())) parsed = Number(parsed.trim())
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new ParamError(
+      `参数 ${key} 必须是 ${min}–${max} 的整数`,
+      `把 ${key} 改成范围内的整数后重发。`,
+    )
+  }
+  return parsed
+}
+
+/** `version`：≥1 的整数或纯数字字符串（与 POST /instances 的 definitionVersion 同口径）。 */
+function optionalVersion(args) {
+  const value = argsOf(args).version
+  if (value === undefined || value === null) return undefined
+  let parsed = value
+  if (typeof parsed === 'string' && /^\d+$/.test(parsed.trim())) parsed = Number(parsed.trim())
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new ParamError('参数 version 必须是 ≥1 的整数', '省略 version 表示用最新版本；照定义列表里的版本号传。')
+  }
+  return parsed
+}
+
+function requireActivityId(args) {
+  const raw = argsOf(args).activityId
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw new ParamError('缺少必填参数 activityId', '用实例待办里的 activityId（BPMN 元素 id）原样传。')
+  }
+  const value = raw.trim()
+  if (Array.from(value).length > 128) {
+    throw new ParamError('参数 activityId 超过 128 字符', 'activityId 是 BPMN 元素 id，不会这么长；检查是否传错。')
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new ParamError('参数 activityId 不能包含控制字符', '照实例待办里的 activityId 原样传。')
+  }
+  return value
+}
+
+/** `include`：可选数组，只接受 tasks / artifacts / lastError，去重后返回 Set。 */
+function optionalInclude(args) {
+  const value = argsOf(args).include
+  if (value === undefined || value === null) return new Set()
+  if (!Array.isArray(value)) {
+    throw new ParamError('参数 include 必须是数组', `可选值：${INCLUDE_VALUES.join(' / ')}；省略表示不展开。`)
+  }
+  const selected = new Set()
+  for (const item of value) {
+    if (typeof item !== 'string' || !INCLUDE_VALUES.includes(item.trim())) {
+      throw new ParamError(
+        `参数 include 只接受 ${INCLUDE_VALUES.join(' / ')}`,
+        `按需选择；收到 ${JSON.stringify(item)}。`,
+      )
+    }
+    selected.add(item.trim())
+  }
+  return selected
+}
+
+function optionalPayload(args) {
+  const value = argsOf(args).payload
+  if (value === undefined || value === null) return undefined
+  if (!isObject(value)) {
+    throw new ParamError('参数 payload 必须是 JSON 对象', '人工任务输出用 { key: 值 } 对象；路由只接受对象。')
+  }
+  return value
+}
+
+/** 当前会话 id（与旧域工具同口径：主看 agent.session.id，兜底 header.id）。 */
+function sessionIdOf(exec) {
+  const session = exec && exec.agent && exec.agent.session
+  if (!session) return null
+  if (typeof session.id === 'string' && session.id !== '') return session.id
+  const header = session.header
+  if (header && typeof header.id === 'string' && header.id !== '') return header.id
+  return null
+}
+
+/** 按 UTF-8 字节取前缀（不追加说明，用于 XML 这类必须保持原样的正文）。 */
+function headText(text, maxBytes) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  let out = text.slice(0, maxBytes)
+  while (out !== '' && Buffer.byteLength(out, 'utf8') > maxBytes) out = out.slice(0, -1)
+  return out
+}
+
+/** 解析 `workspace` / `worktree` 参数，收敛成路由要的形状。 */
+function parseWorkspaceArgs(args) {
+  const rawWorkspace = argsOf(args).workspace
+  const rawWorktree = argsOf(args).worktree
+  let workspace
+  if (rawWorkspace !== undefined && rawWorkspace !== null) {
+    if (typeof rawWorkspace !== 'string' || rawWorkspace.trim() === '') {
+      throw new ParamError('参数 workspace 必须是绝对路径字符串', '传宿主 allowlist 内的一个绝对路径；不建工作区就省略。')
+    }
+    const path = rawWorkspace.trim()
+    if (!path.startsWith('/') || path.length > 4096) {
+      throw new ParamError('参数 workspace 必须是以 / 开头的绝对路径（≤4096 字符）', '相对路径有歧义，工具不接受；省略 workspace 表示不建 worktree。')
+    }
+    workspace = { path }
+  }
+  let worktree
+  if (rawWorktree !== undefined && rawWorktree !== null) {
+    if (typeof rawWorktree === 'string') {
+      const mode = rawWorktree.trim()
+      if (!['auto', 'on', 'off'].includes(mode)) {
+        throw new ParamError('参数 worktree 只接受 auto / on / off', '直接用 worktree:"auto"；更细的 cleanup / baseRef 用对象形式。')
+      }
+      worktree = { mode }
+    } else if (isObject(rawWorktree)) {
+      worktree = {}
+      if (rawWorktree.mode !== undefined && rawWorktree.mode !== null) {
+        if (!['auto', 'on', 'off'].includes(rawWorktree.mode)) {
+          throw new ParamError('worktree.mode 只接受 auto / on / off', '按 worktree 的说明改正。')
+        }
+        worktree.mode = rawWorktree.mode
+      }
+      if (rawWorktree.cleanup !== undefined && rawWorktree.cleanup !== null) {
+        if (!['retain', 'on-terminal-clean'].includes(rawWorktree.cleanup)) {
+          throw new ParamError('worktree.cleanup 只接受 retain / on-terminal-clean', '默认 retain；需要终态自动清理时用 on-terminal-clean。')
+        }
+        worktree.cleanup = rawWorktree.cleanup
+      }
+      if (rawWorktree.baseRef !== undefined && rawWorktree.baseRef !== null) {
+        if (typeof rawWorktree.baseRef !== 'string' || rawWorktree.baseRef.trim() === ''
+          || rawWorktree.baseRef.length > 200 || rawWorktree.baseRef.startsWith('-')
+          || /\s/.test(rawWorktree.baseRef)) {
+          throw new ParamError('worktree.baseRef 必须是无空白、不以 - 开头的短字符串（≤200）', '默认 HEAD；需要一个分支 / commit 时传原文。')
+        }
+        worktree.baseRef = rawWorktree.baseRef
+      }
+    } else {
+      throw new ParamError('参数 worktree 必须是 auto / on / off 或 {mode, cleanup, baseRef}', '按 C 的启动契约传。')
+    }
+  }
+  if (worktree !== undefined && workspace === undefined) {
+    throw new ParamError('worktree 需要同时给 workspace', 'worktree 只能描述「用哪个工作区建树」；不传 workspace 就省略 worktree。')
+  }
+  return { workspace, worktree }
+}
+
+/** workspace / worktree 的能力探测：缺能力时明确拒绝，绝不静默丢掉参数。 */
+function workspaceSupport(runtime, needsWorktree) {
+  if (typeof runtime.workspaceCapabilities !== 'function') {
+    return { ok: false, missing: needsWorktree ? 'workspace/worktree' : 'workspace' }
+  }
+  let caps
+  try {
+    caps = runtime.workspaceCapabilities()
+  } catch {
+    return { ok: false, missing: needsWorktree ? 'workspace/worktree' : 'workspace' }
+  }
+  if (!isObject(caps) || caps.workspace !== true) {
+    return { ok: false, missing: 'workspace' }
+  }
+  if (needsWorktree && caps.worktree !== true) {
+    return { ok: false, missing: 'workspace/worktree' }
+  }
+  return { ok: true }
+}
+
+// ── 读类工具的结果投影（短字段；长正文给 bodyRef，不返回大文本） ────────────
+
+function versionOfDefinition(version) {
+  if (!isObject(version)) return null
+  return {
+    version: Number.isSafeInteger(version.version) ? version.version : null,
+    hash: version.hash ?? null,
+    createdAt: version.createdAt ?? null,
+    bytes: Number.isSafeInteger(version.bytes) ? version.bytes : null,
+  }
+}
+
+function projectDefinitionSummary(definition) {
+  if (!isObject(definition)) return null
+  return {
+    id: definition.id,
+    name: definition.name ?? '',
+    description: definition.description ?? '',
+    tags: Array.isArray(definition.tags) ? definition.tags : [],
+    createdAt: definition.createdAt ?? null,
+    updatedAt: definition.updatedAt ?? null,
+    versionCount: Number.isSafeInteger(definition.versionCount) ? definition.versionCount : null,
+    latestVersion: Number.isSafeInteger(definition.latestVersion) ? definition.latestVersion : null,
+    latestHash: definition.latestHash ?? null,
+  }
+}
+
+function projectInstanceSummary(instance) {
+  if (!isObject(instance)) return null
+  return {
+    instanceId: instance.id,
+    definitionId: instance.definitionId,
+    definitionVersion: instance.definitionVersion,
+    status: instance.status,
+    startedBy: instance.startedBy ?? null,
+    active: instance.active === true,
+    createdAt: instance.createdAt ?? null,
+    updatedAt: instance.updatedAt ?? null,
+    completedAt: instance.completedAt ?? null,
+    lastSeq: Number.isSafeInteger(instance.lastSeq) ? instance.lastSeq : null,
+    eventCount: Number.isSafeInteger(instance.eventCount) ? instance.eventCount : null,
+    revision: Number.isSafeInteger(instance.revision) ? instance.revision : null,
+    pendingTaskCount: Array.isArray(instance.pendingTasks) ? instance.pendingTasks.length : 0,
+    lastErrorCode: isObject(instance.lastError) ? (instance.lastError.code ?? null) : null,
+  }
+}
+
+function projectEventPayload(value, instanceId, seq) {
+  let serialized
+  try {
+    serialized = JSON.stringify(value)
+  } catch {
+    return { bodyRef: `/instances/${instanceId}/events?since=${Math.max(0, seq - 1)}`, truncated: true }
+  }
+  const bytes = Buffer.byteLength(serialized, 'utf8')
+  if (bytes <= EVENT_PAYLOAD_BYTES) return trimDeep(value)
+  return {
+    bodyRef: `/instances/${instanceId}/events?since=${Math.max(0, seq - 1)}`,
+    bytes,
+    truncated: true,
+    note: '正文超过 1 KiB 不在工具结果里返回；按 bodyRef 读原始事件',
+  }
+}
+
+/** 事件投影：定位字段 + 短错误；output / condition / artifacts 等正文超限只给 bodyRef。 */
+function projectEvent(event, instanceId) {
+  if (!isObject(event)) return null
+  const seq = Number.isSafeInteger(event.seq) ? event.seq : 0
+  const out = {}
+  const scalars = ['seq', 'type', 'at', 'elementId', 'activityId', 'flowId', 'from', 'to',
+    'attempt', 'durationMs', 'status', 'truncated']
+  for (const key of scalars) {
+    const value = event[key]
+    if (value === undefined || value === null) continue
+    if (typeof value === 'string') out[key] = value.length > 256 ? clipText(value, 256) : value
+    else if (typeof value === 'number' || typeof value === 'boolean') out[key] = value
+  }
+  if (isObject(event.error)) {
+    out.error = {
+      code: typeof event.error.code === 'string' ? clipText(event.error.code, 128) : null,
+      message: typeof event.error.message === 'string' ? clipText(event.error.message, 512) : '',
+      ...(typeof event.error.elementId === 'string' ? { elementId: event.error.elementId } : {}),
+      ...(typeof event.error.activityId === 'string' ? { activityId: event.error.activityId } : {}),
+    }
+  }
+  const handled = new Set([...scalars, 'error'])
+  for (const [key, value] of Object.entries(event)) {
+    if (handled.has(key)) continue
+    if (value === undefined || value === null) continue
+    if (typeof value === 'string') {
+      const bytes = Buffer.byteLength(value, 'utf8')
+      if (bytes > EVENT_PAYLOAD_BYTES) {
+        out[key] = {
+          bodyRef: `/instances/${instanceId}/events?since=${Math.max(0, seq - 1)}`,
+          bytes,
+          truncated: true,
+          note: '正文超过 1 KiB 不在工具结果里返回；按 bodyRef 读原始事件',
+        }
+      } else {
+        out[key] = value.length > 256 ? clipText(value, 256) : value
+      }
+    } else if (typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = value
+    } else {
+      out[key] = projectEventPayload(value, instanceId, seq)
+    }
+  }
+  return out
+}
+
+/** 长事件列表只保留最后 N 条？不：按 seq 升序取前 limit 条，并给 nextSince / hasMore。 */
+function sliceEvents(events, limit) {
+  const list = Array.isArray(events) ? events.filter(isObject) : []
+  return { items: list.slice(0, limit), hasMore: list.length > limit }
+}
+
+
 // ── 结果裁剪：长字符串截到 2 KiB（按 UTF-8 字节），数组 / 深度有界 ──────────
 
 function clipText(text, maxBytes = MAX_FIELD_BYTES) {
@@ -285,6 +602,55 @@ function failureHint(status, body, action) {
   if (code === 'MESSAGE_INSTANCE_TERMINAL') {
     return '实例已 COMPLETED / CANCELED：不再受理新入站消息；已受理的回复仍可尝试投递（CANCELED 除外）。'
   }
+  if (code === 'DEFINITION_NOT_FOUND' || code === 'DEFINITION_VERSION_NOT_FOUND') {
+    return '定义 / 版本不存在：先调 flow_definition_list 看可用 id 与 latestVersion；不要猜 id。'
+  }
+  if (code === 'INSTANCE_NOT_FOUND') {
+    return '实例不存在：先调 flow_instance_list 找到 instanceId；实例 id 不能跨存储根猜。'
+  }
+  if (code === 'BPMN_TASK_NOT_FOUND') {
+    return '该活动没有在等待的人工任务：先用 flow_instance_get include:["tasks"] 读当前待办，activityId 必须与待办一致。'
+  }
+  if (code === 'TASK_ALREADY_COMPLETED') {
+    return '同一人工任务只能完成一次；重复提交被拒绝且没有产生新事件。需要继续流程请读实例当前待办。'
+  }
+  if (code === 'BPMN_INSTANCE_TERMINAL' || code === 'INSTANCE_ALREADY_TERMINAL') {
+    return '实例已是终态（COMPLETED / CANCELED）：终态不可逆，不能再取消 / 完成任务；查询仍可读。'
+  }
+  if (code === 'BPMN_INSTANCE_NOT_WAITING' || code === 'BPMN_INSTANCE_BLOCKED' || code === 'BPMN_INSTANCE_STOPPING') {
+    return '实例当前不处于「等待人工任务」：读 flow_instance_get 看 status / pendingTasks / lastError 后再决定，不要重试同一次提交。'
+  }
+  if (code === 'INSTANCE_TERMINAL_IMMUTABLE') {
+    return '实例已被其它请求收成终态，本次写入未被采纳；以读回的状态为准。'
+  }
+  if (code === 'NODE_VARIABLES_INVALID' || code === 'BPMN_VARIABLES_INVALID') {
+    return 'variables 只接受 boolean / number / null / 短字符串：键 ≤32、单串 ≤512 字符、序列化 ≤8 KiB；嵌套对象与数组请改为标量或放到文档。'
+  }
+  if (code === 'BPMN_STARTED_BY_INVALID') {
+    return 'startedBy 只能是不含控制字符的短会话 id（≤200 字符）；工具会从调用方上下文自动填，不要手工伪造。'
+  }
+  if (code === 'WORKSPACE_NOT_ALLOWED') {
+    return 'workspace 不在宿主 FLOW_STUDIO_WORKSPACE_ROOTS 白名单内：换 allowlist 内的绝对路径，或省略 workspace。'
+  }
+  if (code === 'WORKSPACE_MISSING' || code === 'WORKSPACE_INVALID') {
+    return 'workspace 路径不存在 / 不是目录：用宿主机上真实存在的绝对路径；不建工作区就省略。'
+  }
+  if (code === 'WORKSPACE_NOT_GIT' || code === 'INSTANCE_WORKTREE_NOT_GIT') {
+    return 'worktree.mode:"on" 需要 Git 仓库根；非 Git 目录用 mode:"auto"（回退原目录）或省略 worktree。'
+  }
+  if (code === 'WORKSPACE_GIT_UNAVAILABLE' || code === 'INSTANCE_WORKTREE_GIT_UNAVAILABLE') {
+    return '宿主 Git 不可用：这是宿主环境问题，不是参数问题；去掉 worktree 选项重试或让运维确认 git 可用。'
+  }
+  if (code === 'CURSOR_INVALID' || code === 'INSTANCE_CURSOR_INVALID') {
+    return 'cursor 只接受上一页返回的 nextCursor（一个实例 id）；结果集变化后重新从第一页开始。'
+  }
+  if (code === 'BPMN_VERSION_INVALID' || code === 'BPMN_LIMIT_INVALID' || code === 'INSTANCE_FILTER_INVALID') {
+    return '查询 / 启动参数不合法：version ≥1、limit 是正整数、status 只用 ACTIVE / COMPLETED / SUSPENDED / CANCELED。'
+  }
+  if (code === 'BPMN_HANDLER_MISSING' || code === 'BPMN_HANDLER_FAILED') {
+    return '实例启动时 handler / adapter 不可用：实例已建成但停在 ACTIVE + lastError；读 flow_instance_get include:["lastError"] 看原因。'
+  }
+  if (status === 405) return '方法不匹配：工具已按只读 / 写接口分流；这通常意味着 runtime 版本与工具不匹配，报告宿主版本。'
   if (status === 404) return `${action}失败：实例或消息记录不存在，先读取实例详情 / 消息列表确认 id。`
   if (status === 409) return '冲突（409）：实例状态或幂等键已变化；读回最新状态再决定。'
   if (status === 410) return '目标已过期（410）：按 error 原文改用 nextActivation 或当前 live execution。'
@@ -325,37 +691,56 @@ export function createInstanceTools(deps = {}) {
     return { runtime, error: '' }
   }
 
-  /** 发一个 JSON 请求给实例域路由；统一把 Host 错误翻成工具结果。 */
-  async function callRoute(runtime, { method = 'POST', parts, url, body, action }) {
+  /**
+   * 发一个 JSON 请求给实例域路由，返回 `{status, body}` 或 `{error}`。
+   * 不裁剪、不翻译错误：读类工具要自己投影字段。
+   */
+  async function rawRequest(runtime, { method = 'POST', parts, url, body }) {
     let result
     try {
       result = await runtime.handle({ method, parts, url, body })
     } catch (error) {
+      return { error, status: 0, body: null }
+    }
+    const status = result && Number.isInteger(result.status) ? result.status : 0
+    const responseBody = isObject(result && result.body) ? result.body : null
+    return { error: null, status, body: responseBody }
+  }
+
+  /** rawRequest 的失败分流；成功返回 null。 */
+  function routeFailure(raw, action) {
+    if (raw.error) {
       return failure(
-        `调用实例消息接口失败：${error && error.message ? error.message : String(error)}`,
+        `调用实例域接口失败：${raw.error && raw.error.message ? raw.error.message : String(raw.error)}`,
         '这是 Host 侧运行时错误；稍后重试，持续失败就报告。',
         true,
         { action },
       )
     }
-    const status = result && Number.isInteger(result.status) ? result.status : 0
-    const responseBody = isObject(result && result.body) ? result.body : null
-    if (responseBody === null) {
-      return failure('Host 返回了不可读的响应', '检查 BPMN 运行时是否正常；稍后重试。', true, { action, status })
+    if (raw.body === null) {
+      return failure('Host 返回了不可读的响应', '检查 BPMN 运行时是否正常；稍后重试。', true, { action, status: raw.status })
     }
-    if (status < 200 || status >= 300 || responseBody.ok !== true) {
+    if (raw.status < 200 || raw.status >= 300 || raw.body.ok !== true) {
       return failure(
-        typeof responseBody.error === 'string' && responseBody.error !== '' ? responseBody.error : `Host 返回 HTTP ${status}`,
-        failureHint(status, responseBody, action),
-        status >= 500,
+        typeof raw.body.error === 'string' && raw.body.error !== '' ? raw.body.error : `Host 返回 HTTP ${raw.status}`,
+        failureHint(raw.status, raw.body, action),
+        raw.status >= 500,
         {
           action,
-          status,
-          ...(typeof responseBody.code === 'string' ? { code: responseBody.code } : {}),
+          status: raw.status,
+          ...(typeof raw.body.code === 'string' ? { code: raw.body.code } : {}),
         },
       )
     }
-    return trimDeep({ action, status, ...responseBody })
+    return null
+  }
+
+  /** 发一个 JSON 请求给实例域路由；统一把 Host 错误翻成工具结果。 */
+  async function callRoute(runtime, { method = 'POST', parts, url, body, action }) {
+    const raw = await rawRequest(runtime, { method, parts, url, body })
+    const bad = routeFailure(raw, action)
+    if (bad !== null) return bad
+    return trimDeep({ action, status: raw.status, ...raw.body })
   }
 
   const worktreeTool = {
@@ -857,5 +1242,886 @@ export function createInstanceTools(deps = {}) {
     },
   }
 
-  return [worktreeTool, sendMessageTool, replyTool]
+  const definitionListTool = {
+    name: 'flow_definition_list',
+    description:
+      '列出实例域可见的 BPMN 定义（只读 GET /definitions，纯磁盘读取，不启动实例、不建 runner）。'
+      + 'keyword 按 id / name / description / tags 不区分大小写模糊过滤；limit 默认 50、封顶 200。'
+      + '返回短摘要，不含 XML 正文；要看某一版 XML 用 flow_definition_get。',
+    parameters: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: '可选：按 id / name / description / tags 模糊过滤（不区分大小写，≤200 字符）' },
+        limit: { type: 'integer', minimum: 1, maximum: MAX_LIST_LIMIT, description: `最多返回多少条（默认 ${DEFAULT_LIST_LIMIT}，封顶 ${MAX_LIST_LIMIT}）` },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer', description: 'Host 路由返回的 HTTP 语义状态' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          keyword: nullable({ type: 'string' }),
+          definitions: { type: 'array', items: anyJson('定义摘要（id / name / tags / latestVersion / latestHash …）') },
+          count: { type: 'integer' },
+          total: { type: 'integer', description: '过滤后、裁剪前的总数' },
+          hasMore: { type: 'boolean' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const list = Array.isArray(value.definitions) ? value.definitions : []
+        const lines = list.map(item => `- ${item.id}（${item.name || '未命名'}）v${item.latestVersion ?? '?'}${item.tags?.length ? ' · ' + item.tags.join(',') : ''}`)
+        const tail = value.hasMore === true ? `\n…还有 ${Math.max(0, (value.total ?? 0) - list.length)} 个` : ''
+        return [{
+          type: 'text',
+          text: `共 ${value.total ?? list.length} 个定义${value.keyword ? `（keyword=${value.keyword}）` : ''}：\n${lines.join('\n') || '（空）'}${tail}`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let keyword
+      let limit
+      try {
+        keyword = optionalString(args, 'keyword', { max: 200 })
+        limit = optionalInteger(args, 'limit', { max: MAX_LIST_LIMIT, fallback: DEFAULT_LIST_LIMIT })
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const raw = await rawRequest(runtime, {
+        method: 'GET', parts: ['definitions'], url: new URL('http://localhost/'),
+      })
+      const bad = routeFailure(raw, 'definition_list')
+      if (bad !== null) return bad
+      const all = Array.isArray(raw.body.definitions) ? raw.body.definitions.filter(isObject) : []
+      const needle = keyword === undefined ? null : keyword.toLowerCase()
+      const filtered = needle === null
+        ? all
+        : all.filter(item => [item.id, item.name, item.description, ...(Array.isArray(item.tags) ? item.tags : [])]
+          .some(text => typeof text === 'string' && text.toLowerCase().includes(needle)))
+      const definitions = filtered.slice(0, limit).map(projectDefinitionSummary).filter(item => item !== null)
+      return trimDeep({
+        ok: true,
+        action: 'definition_list',
+        httpStatus: raw.status,
+        keyword: keyword ?? null,
+        definitions,
+        count: definitions.length,
+        total: filtered.length,
+        hasMore: filtered.length > limit,
+      })
+    },
+  }
+
+  const definitionGetTool = {
+    name: 'flow_definition_get',
+    description:
+      '读取一份 BPMN 定义（只读 GET /definitions/<id>[?version=]，纯磁盘读取，不启动实例）。'
+      + 'version 省略取 latestVersion。返回元数据 + 该版本 XML（超过 64 KiB 截断并标记 xmlTruncated，'
+      + 'xmlBytes 给真实字节数）；版本不存在时用 flow_definition_list 看可用版本。',
+    parameters: {
+      type: 'object',
+      properties: {
+        definitionId: { type: 'string', description: '定义 id（字母/数字开头，只含字母、数字、点、下划线、连字符，≤64 位）' },
+        version: { type: 'integer', minimum: 1, description: '可选：指定版本号（≥1）；省略取最新版本' },
+      },
+      required: ['definitionId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          definitionId: { type: 'string' },
+          definitionVersion: nullable({ type: 'integer' }),
+          name: nullable({ type: 'string' }),
+          description: nullable({ type: 'string' }),
+          tags: { type: 'array', items: { type: 'string' } },
+          latestVersion: nullable({ type: 'integer' }),
+          latestHash: nullable({ type: 'string' }),
+          hash: nullable({ type: 'string' }),
+          bytes: nullable({ type: 'integer' }),
+          xmlBytes: nullable({ type: 'integer' }),
+          xmlTruncated: { type: 'boolean' },
+          versions: { type: 'array', items: anyJson('版本摘要') },
+          xml: nullable({ type: 'string' }),
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        return [{
+          type: 'text',
+          text: `定义 ${value.definitionId}${value.name ? `（${value.name}）` : ''} `
+            + `v${value.definitionVersion ?? '?'} / latest v${value.latestVersion ?? '?'}，`
+            + `${value.xmlBytes ?? value.bytes ?? '?'} 字节${value.xmlTruncated === true ? '（XML 已按 64 KiB 截断）' : ''}。`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let definitionId
+      let version
+      try {
+        definitionId = requireDefinitionId(args)
+        version = optionalVersion(args)
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const url = new URL('http://localhost/')
+      if (version !== undefined) url.searchParams.set('version', String(version))
+      const raw = await rawRequest(runtime, { method: 'GET', parts: ['definitions', definitionId], url })
+      const bad = routeFailure(raw, 'definition_get')
+      if (bad !== null) return bad
+      const body = raw.body
+      const xml = typeof body.xml === 'string' ? body.xml : null
+      const payload = {
+        ok: true,
+        action: 'definition_get',
+        httpStatus: raw.status,
+        definitionId: body.id ?? definitionId,
+        definitionVersion: Number.isSafeInteger(body.version) ? body.version : null,
+        name: body.name ?? null,
+        description: body.description ?? null,
+        tags: Array.isArray(body.tags) ? body.tags : [],
+        latestVersion: Number.isSafeInteger(body.latestVersion) ? body.latestVersion : null,
+        latestHash: body.latestHash ?? null,
+        hash: body.hash ?? null,
+        bytes: Number.isSafeInteger(body.bytes) ? body.bytes : null,
+        versions: (Array.isArray(body.versions) ? body.versions : []).map(versionOfDefinition).filter(item => item !== null),
+        xml: null,
+        xmlBytes: xml === null ? null : Buffer.byteLength(xml, 'utf8'),
+        xmlTruncated: false,
+      }
+      const trimmed = trimDeep(payload)
+      if (xml !== null) {
+        trimmed.xml = headText(xml, MAX_DEFINITION_XML_BYTES)
+        trimmed.xmlTruncated = trimmed.xmlBytes > MAX_DEFINITION_XML_BYTES
+      }
+      return trimmed
+    },
+  }
+
+  const runTool = {
+    name: 'flow_instance_run',
+    description:
+      '启动一个流程实例（POST /instances）并推到第一个等待点或终态。'
+      + 'variables 只接受 finish 同口径的短标量（≤32 键、单串 ≤512 字符、序列化 ≤8 KiB）；嵌套对象 / 数组直接拒绝。'
+      + 'workspace 是宿主 allowlist 内的绝对路径；worktree 复用 C 的启动契约（auto / on / off，或 {mode, cleanup, baseRef}）。'
+      + '当前 runtime 没有 workspace 能力时明确拒绝（WORKSPACE_POLICY_MISSING），不会静默忽略参数。'
+      + 'startedBy 绑定本次调用的会话，不推断「最近实例」。',
+    parameters: {
+      type: 'object',
+      properties: {
+        definitionId: { type: 'string', description: '定义 id（必填）' },
+        version: { type: 'integer', minimum: 1, description: '可选：定义版本号；省略取最新版本' },
+        variables: {
+          type: 'object',
+          description: '启动变量：只接受 boolean / number / null / 短字符串（≤32 键，单串 ≤512 字符，总量 ≤8 KiB）',
+        },
+        workspace: {
+          type: 'string',
+          description: '可选：工作区绝对路径（宿主 allowlist 校验）；省略表示不建实例工作区',
+        },
+        worktree: {
+          description: '可选：worktree 模式（auto / on / off）或 {mode, cleanup, baseRef}；给 worktree 必须同时给 workspace',
+          oneOf: [
+            { type: 'string', enum: ['auto', 'on', 'off'] },
+            {
+              type: 'object',
+              properties: {
+                mode: { type: 'string', enum: ['auto', 'on', 'off'] },
+                cleanup: { type: 'string', enum: ['retain', 'on-terminal-clean'] },
+                baseRef: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+      required: ['definitionId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instanceId: { type: 'string' },
+          definitionId: { type: 'string' },
+          definitionVersion: nullable({ type: 'integer' }),
+          status: { type: 'string', description: '实例状态（ACTIVE / COMPLETED / SUSPENDED / CANCELED）' },
+          startedBy: nullable({ type: 'string' }, '启动本次实例的调用方会话 id（无会话上下文时为 null）'),
+          pendingTasks: { type: 'array', items: anyJson('人工任务') },
+          lastSeq: nullable({ type: 'integer' }),
+          workspace: anyJson('工作区投影（仅请求带 workspace 时出现）'),
+          startError: anyJson('启动阶段 handler 失败：实例已建成并保持 ACTIVE，原因在这里'),
+          recovered: { type: 'boolean' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const started = value.startedBy === null || value.startedBy === undefined ? '无会话上下文' : value.startedBy
+        return [{
+          type: 'text',
+          text: `实例 ${value.instanceId} 已启动：status=${value.status}，`
+            + `定义 ${value.definitionId}@v${value.definitionVersion ?? '?'}，调用方 ${started}`
+            + `${value.pendingTasks?.length ? `，等待 ${value.pendingTasks.length} 个人工任务` : ''}`
+            + `${value.startError ? `；启动阶段失败：${value.startError.code || value.startError.message || '见 startError'}` : ''}。`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_RUN_MS,
+    async execute(args, exec) {
+      let definitionId
+      let version
+      let variables
+      let workspaceOption
+      try {
+        definitionId = requireDefinitionId(args)
+        version = optionalVersion(args)
+        const rawVariables = argsOf(args).variables
+        if (rawVariables === undefined || rawVariables === null) {
+          variables = {}
+        } else {
+          try {
+            variables = normalizeShortVariables(rawVariables)
+          } catch (error) {
+            throw new ParamError(
+              error && error.message ? error.message : 'variables 不合法',
+              'variables 只接受 boolean / number / null / 短字符串：键 ≤32、单串 ≤512 字符、序列化 ≤8 KiB。',
+              'NODE_VARIABLES_INVALID',
+            )
+          }
+        }
+        workspaceOption = parseWorkspaceArgs(args)
+      } catch (error) {
+        if (error instanceof ParamError) {
+          return failure(error.message, error.hint, false, {
+            ...(typeof error.code === 'string' ? { code: error.code } : {}),
+          })
+        }
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const needsWorktree = workspaceOption.worktree !== undefined
+      if (workspaceOption.workspace !== undefined) {
+        const support = workspaceSupport(runtime, needsWorktree)
+        if (support.ok !== true) {
+          return failure(
+            `当前运行时没有 ${support.missing} 能力：拒绝执行，而不是静默忽略 workspace / worktree`,
+            '去掉 workspace / worktree 让节点使用宿主默认工作区，或升级 / 配置宿主的 workspace 策略后重试。',
+            false,
+            { action: 'run', code: 'WORKSPACE_POLICY_MISSING' },
+          )
+        }
+      }
+      const startedBy = sessionIdOf(exec)
+      const raw = await rawRequest(runtime, {
+        method: 'POST',
+        parts: ['instances'],
+        url: new URL('http://localhost/'),
+        body: {
+          definitionId,
+          ...(version === undefined ? {} : { definitionVersion: version }),
+          variables,
+          ...(startedBy === null ? {} : { startedBy }),
+          ...(workspaceOption.workspace === undefined
+            ? {}
+            : {
+              workspace: {
+                path: workspaceOption.workspace.path,
+                ...(workspaceOption.worktree === undefined ? {} : { worktree: workspaceOption.worktree }),
+              },
+            }),
+        },
+      })
+      const bad = routeFailure(raw, 'run')
+      if (bad !== null) return bad
+      const body = raw.body
+      return trimDeep({
+        ok: true,
+        action: 'run',
+        httpStatus: raw.status,
+        instanceId: body.id,
+        definitionId: body.definitionId,
+        definitionVersion: Number.isSafeInteger(body.definitionVersion) ? body.definitionVersion : null,
+        status: body.status,
+        startedBy: body.startedBy ?? startedBy ?? null,
+        pendingTasks: Array.isArray(body.pendingTasks) ? body.pendingTasks : [],
+        lastSeq: Number.isSafeInteger(body.lastSeq) ? body.lastSeq : null,
+        ...(body.workspace === undefined ? {} : { workspace: body.workspace }),
+        ...(isObject(body.error) ? { startError: body.error } : {}),
+        recovered: body.recovered === true,
+      })
+    },
+  }
+
+  const instanceListTool = {
+    name: 'flow_instance_list',
+    description:
+      '列出流程实例（只读 GET /instances，纯磁盘读取，不恢复 / 不推进任何实例）。'
+      + '可按 definitionId / status 过滤；limit 默认 50、封顶 200；cursor 用上一页返回的 nextCursor，'
+      + '只在该结果集内有效（结果集变化后从第一页重新开始）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        definitionId: { type: 'string', description: '可选：按定义 id 精确过滤' },
+        status: { type: 'string', enum: INSTANCE_STATUSES, description: '可选：按实例状态精确过滤' },
+        limit: { type: 'integer', minimum: 1, maximum: MAX_LIST_LIMIT, description: `每页条数（默认 ${DEFAULT_LIST_LIMIT}，封顶 ${MAX_LIST_LIMIT}）` },
+        cursor: { type: 'string', description: '上一页返回的 nextCursor（一个实例 id）；省略表示第一页' },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instances: { type: 'array', items: anyJson('实例摘要') },
+          count: { type: 'integer' },
+          hasMore: { type: 'boolean' },
+          nextCursor: nullable({ type: 'string' }, '下一页游标；没有更多时为 null'),
+          cursor: nullable({ type: 'string' }),
+          skipped: { type: 'array', items: { type: 'string' }, description: '扫描时读不出、被跳过的实例 id' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const list = Array.isArray(value.instances) ? value.instances : []
+        const lines = list.map(item => `- ${item.instanceId} · ${item.status} · ${item.definitionId}@v${item.definitionVersion ?? '?'}${item.pendingTaskCount > 0 ? ` · 待办 ${item.pendingTaskCount}` : ''}`)
+        return [{
+          type: 'text',
+          text: `共返回 ${value.count ?? list.length} 个实例${value.hasMore === true ? `（还有更多；nextCursor=${value.nextCursor}）` : ''}：\n${lines.join('\n') || '（空）'}`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let definitionId
+      let status
+      let limit
+      let cursor
+      try {
+        definitionId = optionalString(args, 'definitionId', { max: 64 })
+        if (definitionId !== undefined && !DEFINITION_ID_PATTERN.test(definitionId)) {
+          throw new ParamError('参数 definitionId 不合法', '照 flow_definition_list 里的 id 原样传。')
+        }
+        status = optionalEnum(args, 'status', INSTANCE_STATUSES)
+        limit = optionalInteger(args, 'limit', { max: MAX_LIST_LIMIT, fallback: DEFAULT_LIST_LIMIT })
+        cursor = optionalString(args, 'cursor', { max: 64 })
+        if (cursor !== undefined && !INSTANCE_ID_PATTERN.test(cursor)) {
+          throw new ParamError('参数 cursor 必须是上一页返回的 nextCursor（实例 id）', '省略 cursor 从第一页开始。')
+        }
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const url = new URL('http://localhost/')
+      if (definitionId !== undefined) url.searchParams.set('definitionId', definitionId)
+      if (status !== undefined) url.searchParams.set('status', status)
+      // 有 cursor 时要能在同一结果集里定位它；无 cursor 时多取一条用于判断 hasMore。
+      url.searchParams.set('limit', String(cursor === undefined ? Math.min(limit + 1, INSTANCE_SCAN_LIMIT) : INSTANCE_SCAN_LIMIT))
+      const raw = await rawRequest(runtime, { method: 'GET', parts: ['instances'], url })
+      const bad = routeFailure(raw, 'instance_list')
+      if (bad !== null) return bad
+      const all = Array.isArray(raw.body.instances) ? raw.body.instances.filter(isObject) : []
+      let start = 0
+      if (cursor !== undefined) {
+        const index = all.findIndex(item => item.id === cursor)
+        if (index < 0) {
+          return failure(
+            `cursor ${cursor} 不在当前结果集里（结果可能已变化，或已超过单次扫描上限 ${INSTANCE_SCAN_LIMIT}）`,
+            '省略 cursor 从第一页重新列出；cursor 只对上一页返回的 nextCursor 有效。',
+            false,
+            { action: 'instance_list', code: 'CURSOR_INVALID', status: 409 },
+          )
+        }
+        start = index + 1
+      }
+      const page = all.slice(start, start + limit + 1)
+      const hasMore = page.length > limit
+      const instances = page.slice(0, limit).map(projectInstanceSummary).filter(item => item !== null)
+      return trimDeep({
+        ok: true,
+        action: 'instance_list',
+        httpStatus: raw.status,
+        instances,
+        count: instances.length,
+        hasMore,
+        nextCursor: hasMore ? instances[instances.length - 1].instanceId : null,
+        cursor: cursor ?? null,
+        skipped: Array.isArray(raw.body.skipped) ? raw.body.skipped : [],
+      })
+    },
+  }
+
+  const instanceGetTool = {
+    name: 'flow_instance_get',
+    description:
+      '读取一个实例的当前事实（只读 GET /instances，纯磁盘读取：不懒恢复、不创建 runner、不推进实例）。'
+      + 'include 可选 ["tasks","artifacts","lastError"] 展开对应区块；基础结果总带状态 / 变量 / 计数与待办数。'
+      + '单次扫描上限 1000 个实例（与路由一致），超出时用 flow_instance_list 的 cursor 分段确认。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）' },
+        include: {
+          type: 'array',
+          items: { type: 'string', enum: INCLUDE_VALUES },
+          description: '可选展开：tasks（人工待办）/ artifacts（产物引用）/ lastError（最近错误）',
+        },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instanceId: { type: 'string' },
+          definitionId: { type: 'string' },
+          definitionVersion: nullable({ type: 'integer' }),
+          definitionHash: nullable({ type: 'string' }),
+          status: { type: 'string' },
+          startedBy: nullable({ type: 'string' }),
+          variables: anyJson('实例变量（字符串按 2 KiB 裁剪）'),
+          tasks: { type: 'array', items: anyJson('人工待办'), description: '仅 include 含 tasks 时出现' },
+          artifacts: { type: 'array', items: anyJson('产物引用'), description: '仅 include 含 artifacts 时出现' },
+          lastError: anyJson('最近错误；仅 include 含 lastError 时出现'),
+          pendingTaskCount: { type: 'integer' },
+          lastErrorCode: nullable({ type: 'string' }),
+          lastSeq: nullable({ type: 'integer' }),
+          eventCount: nullable({ type: 'integer' }),
+          revision: nullable({ type: 'integer' }),
+          active: { type: 'boolean', description: '当前进程是否登记了该实例的 runner（只读快照）' },
+          createdAt: nullable({ type: 'string' }),
+          updatedAt: nullable({ type: 'string' }),
+          completedAt: nullable({ type: 'string' }),
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const tasks = Array.isArray(value.tasks) ? value.tasks.length : value.pendingTaskCount
+        return [{
+          type: 'text',
+          text: `实例 ${value.instanceId}：status=${value.status}，定义 ${value.definitionId}@v${value.definitionVersion ?? '?'}，`
+            + `待办 ${tasks ?? 0} 个${value.lastErrorCode ? `，最近错误 ${value.lastErrorCode}` : ''}。`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let instanceId
+      let include
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'get')
+        include = optionalInclude(args)
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const url = new URL(`http://localhost/?limit=${INSTANCE_SCAN_LIMIT}`)
+      const raw = await rawRequest(runtime, { method: 'GET', parts: ['instances'], url })
+      const bad = routeFailure(raw, 'instance_get')
+      if (bad !== null) return bad
+      const all = Array.isArray(raw.body.instances) ? raw.body.instances.filter(isObject) : []
+      const instance = all.find(item => item.id === instanceId)
+      if (instance === undefined) {
+        return failure(
+          `实例 ${instanceId} 不存在（或不在单次扫描的 ${INSTANCE_SCAN_LIMIT} 个实例内）`,
+          '先调 flow_instance_list 确认 instanceId；工具不会因为「猜测」去懒恢复任何实例。',
+          false,
+          { action: 'instance_get', code: 'INSTANCE_NOT_FOUND', status: 404 },
+        )
+      }
+      const payload = {
+        ok: true,
+        action: 'instance_get',
+        httpStatus: raw.status,
+        instanceId: instance.id,
+        definitionId: instance.definitionId,
+        definitionVersion: instance.definitionVersion,
+        definitionHash: instance.definitionHash ?? null,
+        status: instance.status,
+        startedBy: instance.startedBy ?? null,
+        variables: isObject(instance.variables) ? instance.variables : {},
+        pendingTaskCount: Array.isArray(instance.pendingTasks) ? instance.pendingTasks.length : 0,
+        lastErrorCode: isObject(instance.lastError) ? (instance.lastError.code ?? null) : null,
+        lastSeq: Number.isSafeInteger(instance.lastSeq) ? instance.lastSeq : null,
+        eventCount: Number.isSafeInteger(instance.eventCount) ? instance.eventCount : null,
+        revision: Number.isSafeInteger(instance.revision) ? instance.revision : null,
+        active: instance.active === true,
+        createdAt: instance.createdAt ?? null,
+        updatedAt: instance.updatedAt ?? null,
+        completedAt: instance.completedAt ?? null,
+      }
+      if (include.has('tasks')) payload.tasks = Array.isArray(instance.pendingTasks) ? instance.pendingTasks : []
+      if (include.has('artifacts')) payload.artifacts = Array.isArray(instance.artifacts) ? instance.artifacts : []
+      if (include.has('lastError')) payload.lastError = isObject(instance.lastError) ? instance.lastError : null
+      return trimDeep(payload)
+    },
+  }
+
+  const instanceEventsTool = {
+    name: 'flow_instance_events',
+    description:
+      '读取实例执行事件（只读 GET /instances/<id>/events?since=，不懒恢复、不创建 runner）。'
+      + 'since 只返回 seq > since 的事件；limit 默认 50、封顶 200。只返回短字段；'
+      + '单条事件里的长正文（output / condition / artifacts 等超过 1 KiB）替换成 bodyRef 与字节数，不塞大文本。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）' },
+        since: { type: 'integer', minimum: 0, description: '可选：只返回 seq > since 的事件（默认 0 = 从最早开始）' },
+        limit: { type: 'integer', minimum: 1, maximum: MAX_EVENT_LIMIT, description: `最多返回多少条（默认 ${DEFAULT_EVENT_LIMIT}，封顶 ${MAX_EVENT_LIMIT}）` },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instanceId: { type: 'string' },
+          events: { type: 'array', items: anyJson('短事件（seq / type / elementId / status；长正文给 bodyRef）') },
+          count: { type: 'integer' },
+          hasMore: { type: 'boolean' },
+          nextSince: nullable({ type: 'integer' }, '下一页起点：最后一条事件的 seq；没有事件时等于请求的 since'),
+          lastSeq: nullable({ type: 'integer' }, '实例当前最大 seq'),
+          since: { type: 'integer' },
+          skipped: { type: 'integer' },
+          shards: { type: 'integer' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        const list = Array.isArray(value.events) ? value.events : []
+        const lines = list.map(item => `- #${item.seq} ${item.type}${item.elementId ? ` · ${item.elementId}` : ''}${item.status ? ` · ${item.status}` : ''}`)
+        return [{
+          type: 'text',
+          text: `事件 ${value.count ?? list.length} 条（lastSeq=${value.lastSeq ?? '?'}${value.hasMore === true ? `；还有更多，nextSince=${value.nextSince}` : ''}）：\n${lines.join('\n') || '（空）'}`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let instanceId
+      let since
+      let limit
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'events')
+        since = optionalInteger(args, 'since', { min: 0, fallback: 0 })
+        limit = optionalInteger(args, 'limit', { max: MAX_EVENT_LIMIT, fallback: DEFAULT_EVENT_LIMIT })
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const url = new URL('http://localhost/')
+      if (since > 0) url.searchParams.set('since', String(since))
+      const raw = await rawRequest(runtime, { method: 'GET', parts: ['instances', instanceId, 'events'], url })
+      const bad = routeFailure(raw, 'instance_events')
+      if (bad !== null) return bad
+      const sliced = sliceEvents(raw.body.events, limit)
+      const events = sliced.items.map(event => projectEvent(event, instanceId)).filter(item => item !== null)
+      const lastSeq = Number.isSafeInteger(raw.body.lastSeq) ? raw.body.lastSeq : since
+      const nextSince = events.length > 0 ? events[events.length - 1].seq : since
+      return {
+        ok: true,
+        action: 'instance_events',
+        httpStatus: raw.status,
+        instanceId,
+        events,
+        count: events.length,
+        hasMore: sliced.hasMore,
+        nextSince: Number.isSafeInteger(nextSince) ? nextSince : since,
+        lastSeq,
+        since,
+        skipped: Number.isSafeInteger(raw.body.skipped) ? raw.body.skipped : 0,
+        shards: Number.isSafeInteger(raw.body.shards) ? raw.body.shards : 0,
+      }
+    },
+  }
+
+  const instanceCancelTool = {
+    name: 'flow_instance_cancel',
+    description:
+      '取消一个非终态实例（POST /instances/<id>/stop）。终态实例（COMPLETED / CANCELED）不重复收口、'
+      + '不产生新事件，工具返回 INSTANCE_ALREADY_TERMINAL。stop 不追加 process/end 等伪造事件。'
+      + 'reason 只作为本次调用的说明随结果回显；路由的 stop 不接受业务原因、不落盘。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）' },
+        reason: { type: 'string', description: '可选：本次取消的说明（≤500 字符，随结果回显）' },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instanceId: { type: 'string' },
+          status: { type: 'string', description: '取消后的实例状态（CANCELED）' },
+          alreadyTerminal: { type: 'boolean' },
+          pendingTasks: { type: 'array', items: anyJson('待办（取消后应为空）') },
+          lastSeq: nullable({ type: 'integer' }),
+          reason: nullable({ type: 'string' }),
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        return [{ type: 'text', text: `实例 ${value.instanceId} 已取消：status=${value.status}。` }]
+      },
+    },
+    timeoutMs: TIMEOUT_READ_MS,
+    async execute(args) {
+      let instanceId
+      let reason
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'cancel')
+        reason = optionalString(args, 'reason', { max: 500 })
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const raw = await rawRequest(runtime, {
+        method: 'POST', parts: ['instances', instanceId, 'stop'], url: new URL('http://localhost/'),
+      })
+      const bad = routeFailure(raw, 'cancel')
+      if (bad !== null) return bad
+      if (raw.body.alreadyTerminal === true) {
+        return failure(
+          `实例 ${instanceId} 已经是终态 ${raw.body.status}：取消被拒绝（没有产生新事件）`,
+          '终态不可逆；查询 / 读事件仍可用，需要新工作请启动新实例。',
+          false,
+          {
+            action: 'cancel',
+            code: 'INSTANCE_ALREADY_TERMINAL',
+            status: 409,
+            instanceId,
+            instanceStatus: raw.body.status ?? null,
+          },
+        )
+      }
+      return trimDeep({
+        ok: true,
+        action: 'cancel',
+        httpStatus: raw.status,
+        instanceId,
+        status: raw.body.status,
+        alreadyTerminal: false,
+        pendingTasks: Array.isArray(raw.body.pendingTasks) ? raw.body.pendingTasks : [],
+        lastSeq: Number.isSafeInteger(raw.body.lastSeq) ? raw.body.lastSeq : null,
+        reason: reason ?? null,
+      })
+    },
+  }
+
+  /**
+   * 失败（404 TASK_NOT_FOUND / 409 终态或非等待）时判断该活动是否已经完成过：
+   * 事件里该 elementId 的最后一条若是 activity/end，则这是重复提交，不是「任务不存在」。
+   * 只读事件文件，不碰 runner。
+   */
+  async function hasCompletedActivity(runtime, instanceId, activityId) {
+    const raw = await rawRequest(runtime, {
+      method: 'GET',
+      parts: ['instances', instanceId, 'events'],
+      url: new URL('http://localhost/'),
+    })
+    if (raw.error || raw.body === null || raw.body.ok !== true) return false
+    const events = Array.isArray(raw.body.events) ? raw.body.events : []
+    let last = null
+    for (const event of events) {
+      if (!isObject(event)) continue
+      if (event.elementId === activityId || event.activityId === activityId) last = event
+    }
+    return last !== null && last.type === 'activity/end'
+  }
+
+  const completeTaskTool = {
+    name: 'flow_instance_complete_task',
+    description:
+      '完成一个等待中的人工任务（POST /instances/<id>/tasks/<activityId>/complete，与 GUI 同一份实现与校验）。'
+      + 'payload 是人工任务输出对象，并入实例 variables。重复完成 → TASK_ALREADY_COMPLETED（不产生新事件）；'
+      + 'activityId 必须与当前待办一致（先用 flow_instance_get include:["tasks"] 读）。'
+      + '实例已终态 / 不在等待时明确失败，不会伪造一次完成。',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）' },
+        activityId: { type: 'string', description: '人工任务的活动 id（BPMN 元素 id，非空 ≤128 字符）' },
+        payload: { type: 'object', description: '可选：人工任务输出（JSON 对象），并入实例 variables' },
+      },
+      required: ['activityId'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          httpStatus: { type: 'integer' },
+          code: { type: 'string' },
+          error: { type: 'string' },
+          hint: { type: 'string' },
+          retryable: { type: 'boolean' },
+          instanceId: { type: 'string' },
+          activityId: { type: 'string' },
+          executionId: nullable({ type: 'string' }),
+          status: { type: 'string', description: '本次完成并推进后的实例状态' },
+          pendingTasks: { type: 'array', items: anyJson('剩余人工待办') },
+          lastSeq: nullable({ type: 'integer' }),
+          decidedBy: nullable({ type: 'string' }),
+          recovered: { type: 'boolean' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render(value) {
+        if (!isObject(value) || value.ok !== true) return renderJson(value)
+        return [{
+          type: 'text',
+          text: `人工任务 ${value.activityId} 已完成：实例 ${value.instanceId} status=${value.status}`
+            + `${value.pendingTasks?.length ? `，还有 ${value.pendingTasks.length} 个待办` : ''}。`,
+        }]
+      },
+    },
+    timeoutMs: TIMEOUT_RUN_MS,
+    async execute(args) {
+      let instanceId
+      let activityId
+      let payload
+      try {
+        instanceId = resolveBoundInstanceId(args, binding, 'complete_task')
+        activityId = requireActivityId(args)
+        payload = optionalPayload(args)
+      } catch (error) {
+        if (error instanceof ParamError) return failure(error.message, error.hint)
+        return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+      }
+      const { runtime, error: runtimeError } = runtimeOrError()
+      if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+      const raw = await rawRequest(runtime, {
+        method: 'POST',
+        parts: ['instances', instanceId, 'tasks', activityId, 'complete'],
+        url: new URL('http://localhost/'),
+        body: payload === undefined ? {} : { payload },
+      })
+      const duplicateCode = raw.body !== null && typeof raw.body.code === 'string' ? raw.body.code : ''
+      if ((raw.status === 404 && duplicateCode === 'BPMN_TASK_NOT_FOUND')
+        || (raw.status === 409 && ['BPMN_INSTANCE_TERMINAL', 'BPMN_INSTANCE_NOT_WAITING', 'BPMN_INSTANCE_STOPPING'].includes(duplicateCode))) {
+        const already = await hasCompletedActivity(runtime, instanceId, activityId)
+        if (already) {
+          return failure(
+            `人工任务 ${activityId} 已经完成过：重复提交被拒绝（没有产生新事件）`,
+            '同一人工任务只能完成一次；读 flow_instance_get include:["tasks"] 看当前待办后再继续。',
+            false,
+            { action: 'complete_task', code: 'TASK_ALREADY_COMPLETED', status: 409, instanceId, activityId },
+          )
+        }
+      }
+      const bad = routeFailure(raw, 'complete_task')
+      if (bad !== null) return bad
+      const body = raw.body
+      return trimDeep({
+        ok: true,
+        action: 'complete_task',
+        httpStatus: raw.status,
+        instanceId,
+        activityId: body.activityId ?? activityId,
+        executionId: body.executionId ?? null,
+        status: body.status,
+        pendingTasks: Array.isArray(body.pendingTasks) ? body.pendingTasks : [],
+        lastSeq: Number.isSafeInteger(body.lastSeq) ? body.lastSeq : null,
+        decidedBy: body.decidedBy ?? null,
+        recovered: body.recovered === true,
+      })
+    },
+  }
+
+  return [
+    worktreeTool,
+    sendMessageTool,
+    replyTool,
+    definitionListTool,
+    definitionGetTool,
+    runTool,
+    instanceListTool,
+    instanceGetTool,
+    instanceEventsTool,
+    instanceCancelTool,
+    completeTaskTool,
+  ]
 }

@@ -127,6 +127,7 @@
 | `definitionId` | string | 是 | 路径 id 规则；非法 400 `INSTANCE_INVALID_ID` |
 | `definitionVersion` | 整数 ≥1 或数字字符串 | 否 | 省略 = 最新版本；非法 400 `BPMN_VERSION_INVALID` |
 | `variables` | object | 否 | 默认 `{}`；非对象 400 `BPMN_VARIABLES_INVALID`，超过 256 KiB 400 `INSTANCE_SHAPE_INVALID` |
+| `startedBy` | string | 否 | 启动实例的调用方会话 id（工具面自动填，≤200、无控制字符）；GUI 不传时落盘为 `null` |
 | `workspace` | object | 否 | 省略 = 不建 worktree，节点用宿主默认工作区；字段见下 |
 
 `workspace` 的形状：
@@ -147,7 +148,7 @@
   "pendingTasks": [{ "activityId": "human1", "elementId": "human1", "name": "人工审批",
                      "since": "…", "executionId": "human1_…" }],
   "lastSeq": 9, "definitionId": "flow-demo", "definitionVersion": 1,
-  "definitionHash": "…", "recovered": false,
+  "definitionHash": "…", "startedBy": "session-…", "recovered": false,
   "workspace": { "mode": "worktree", "workspaceId": "…", "effectiveRoot": "…",
                  "repositoryRoot": "…", "isGit": true, "isLinkedWorktree": false,
                  "cleanupPolicy": "retain",
@@ -163,7 +164,7 @@
 
 | 状态 | code | 触发 |
 |---|---|---|
-| 400 | `BPMN_BODY_INVALID` / `INSTANCE_INVALID_ID` / `BPMN_VERSION_INVALID` / `BPMN_VARIABLES_INVALID` / `BPMN_WORKSPACE_INVALID` | 请求体或字段非法 |
+| 400 | `BPMN_BODY_INVALID` / `INSTANCE_INVALID_ID` / `BPMN_VERSION_INVALID` / `BPMN_VARIABLES_INVALID` / `BPMN_WORKSPACE_INVALID` / `BPMN_STARTED_BY_INVALID` | 请求体或字段非法 |
 | 400 | `WORKSPACE_INVALID` / `WORKSPACE_MISSING` / `WORKSPACE_NOT_GIT` | `workspace.path` 解析失败 |
 | 400 | `BPMN_DEFINITION_INVALID` | 实例快照未通过 BPMN 校验 |
 | 403 | `WORKSPACE_NOT_ALLOWED` | 工作区不在 allowlist |
@@ -187,7 +188,7 @@
 ```json
 { "ok": true,
   "instances": [{ "id": "i-…", "definitionId": "flow-demo", "definitionVersion": 1,
-                  "definitionHash": "…", "status": "ACTIVE", "variables": {},
+                  "definitionHash": "…", "status": "ACTIVE", "startedBy": "session-…", "variables": {},
                   "result": null, "artifacts": [], "lastError": null,
                   "pendingTasks": [], "revision": 4, "eventCount": 9, "lastSeq": 9,
                   "createdAt": "…", "updatedAt": "…", "completedAt": null,
@@ -205,7 +206,7 @@
 
 ```json
 { "ok": true, "id": "i-…", "definitionId": "flow-demo", "definitionVersion": 1,
-  "definitionHash": "…", "status": "ACTIVE", "variables": { "amount": 7 },
+  "definitionHash": "…", "status": "ACTIVE", "startedBy": "session-…", "variables": { "amount": 7 },
   "result": null, "artifacts": [], "lastError": null, "pendingTasks": [{ "…": "…" }],
   "lastSeq": 9, "eventCount": 9, "revision": 18, "createdAt": "…",
   "updatedAt": "…", "completedAt": null, "runnerStatus": "waiting",
@@ -726,19 +727,36 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 ### 模型工具
 
-实例域注册三个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；三者都直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。
+实例域注册十一个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；全部直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。`flow_definition_*` 与 `flow_instance_*` 是 E3 的对话入口；旧运行域的 `flow_*` 工具仍在，0.14.0 才删。
 
 | 工具 | 对应路由 | 参数 | 返回 |
 |---|---|---|---|
 | `flow_instance_worktrees` | `inspect` → `GET /instances/<id>/worktree`；`remove` → `DELETE /instances/<id>/worktree`；`branch` → `DELETE /instances/<id>/worktree/branch`；`list` → `GET /instance-worktrees`；`prune` → `POST /instance-worktrees/prune` | `action`（必填，`inspect` / `remove` / `branch` / `list` / `prune`）、`instanceId`（前三项必填）、`workspaceId`（`list` / `prune`）、`force`、`removeBranch`、`dryRun`、`planHash`、`expectedHead` | 路由响应体 + `action` + `status`；`list` 另加 `worktreeCount` / `orphanCount` / `truncated` |
 | `flow_instance_send_message` | `POST /instances/<id>/messages` | `instanceId`（绑定会话里可省略且不能改）、`messageId`、`target`、`text`、`replyTargetId?` | `duplicate`、`message`、`delivery` |
 | `flow_instance_reply` | `POST /instances/<id>/messages/<messageId>/replies` | `instanceId`（同上）、`messageId`、`replyId?`、`text?`、`document?` | `duplicate`、`reply` |
+| `flow_definition_list` | `GET /definitions` | `keyword?`、`limit?`（默认 50，封顶 200） | `definitions[]`（短摘要，不含 XML）、`total`、`count`、`hasMore` |
+| `flow_definition_get` | `GET /definitions/<id>[?version=]` | `definitionId`、`version?` | 元数据 + `xml`（≤64 KiB；超出 `xmlTruncated:true`，真实字节数在 `xmlBytes`）+ `versions[]` |
+| `flow_instance_run` | `POST /instances` | `definitionId`、`version?`、`variables?`、`workspace?`、`worktree?` | `instanceId`、`definitionId`、`definitionVersion`、`status`、`startedBy`、`pendingTasks`、`lastSeq`、`workspace?`、`startError?` |
+| `flow_instance_list` | `GET /instances` | `definitionId?`、`status?`、`limit?`（默认 50，封顶 200）、`cursor?` | `instances[]`（短摘要）、`hasMore`、`nextCursor`、`skipped[]` |
+| `flow_instance_get` | `GET /instances`（纯读列表，不懒恢复） | `instanceId`（绑定会话可省略且不能改）、`include?`（`tasks` / `artifacts` / `lastError`） | 实例事实 + `include` 展开的区块；基础结果带 `pendingTaskCount` / `lastErrorCode` |
+| `flow_instance_events` | `GET /instances/<id>/events?since=` | `instanceId`（同上）、`since?`、`limit?`（默认 50，封顶 200） | `events[]`（短字段；长正文给 `bodyRef`）、`lastSeq`、`nextSince`、`hasMore`、`skipped`、`shards` |
+| `flow_instance_cancel` | `POST /instances/<id>/stop` | `instanceId`（同上）、`reason?` | `status`（`CANCELED`）、`alreadyTerminal`、`pendingTasks`、`lastSeq`、`reason` |
+| `flow_instance_complete_task` | `POST /instances/<id>/tasks/<activityId>/complete` | `instanceId`（同上）、`activityId`、`payload?` | `activityId`、`executionId`、`status`、`pendingTasks`、`lastSeq`、`decidedBy`、`recovered` |
 
-- 在 agent 节点会话里，工具带 `{instanceId, executionId?, activityId?}` 绑定：省略 `instanceId` 就用绑定实例，显式传成别的实例会被参数校验拒绝（防止跨实例投递）。
+- 在 agent 节点会话里，工具带 `{instanceId, executionId?, activityId?}` 绑定：省略 `instanceId` 就用绑定实例，显式传成别的实例会被参数校验拒绝（防止跨实例投递 / 跨实例取消 / 跨实例完成任务）。
 - `prune` 的执行意图与计划是两件事：省略 `dryRun` 一律按 `true` 预览；只有显式 `dryRun:false` 且带 `planHash` 才执行。
 - `flow_instance_reply` 要求 `text` 与 `document` 至少给一项（与 HTTP 路由一致）；`document` 的 `path` 按实例冻结工作区的相对路径解析。
-- 工具结果有界裁剪：字符串字段 2 KiB、数组 200 项、深度 8；超出的部分用省略说明代替。超时：worktree 工具 60 秒，消息 / 回复工具 30 秒。
-- 失败时工具返回 `{ok:false, error, hint, retryable, code?, status?}`，其中 `status` 是 Host 路由的 HTTP 语义状态；参数错误与 404 / 409 / `PLAN_STALE` 不标 `retryable`。
+- 读类工具是 **GET 语义**：`flow_instance_get` 读 `GET /instances` 的磁盘列表（不调用 `_ensureRunner()`），`flow_instance_events` 读事件文件；查询不会懒恢复、不会创建 runner、不派发工作。`flow_instance_get` 单次扫描上限 1000 个实例（与路由 `limit` 一致）。
+- `flow_instance_run` 的 `variables` 与 `flow_finish_node` 同口径：只接受 boolean / number / null / 短字符串，键 ≤32、单串 ≤512 Unicode 字符、序列化 ≤8 KiB；嵌套对象 / 数组 / 超限直接返回 `NODE_VARIABLES_INVALID`，不发请求。
+- `workspace` 是宿主 allowlist 内的绝对路径；`worktree` 复用 `POST /instances` 的启动契约（`auto` / `on` / `off`，或 `{mode, cleanup, baseRef}`；给 `worktree` 必须同时给 `workspace`）。当前 runtime 没有 workspace / worktree 能力时明确返回 `WORKSPACE_POLICY_MISSING`，不静默忽略参数。
+- `startedBy` 绑定本次调用的会话 id（`exec.agent.session.id`，兜底 `session.header.id`），落盘在 `instance.json`，重启后仍可读；没有会话上下文时为 `null`，不推断「最近一次启动」。
+- 成功结果里 `status` 是**实例状态**，路由的 HTTP 语义状态在 `httpStatus`；失败结果里 `status` 是 HTTP 错误状态（与其它工具一致）。
+- `flow_instance_complete_task` 与 GUI 的 `POST /tasks/<activityId>/complete` 共用同一份实现与校验；重复完成返回 `TASK_ALREADY_COMPLETED` 且不产生新事件。终态实例的 `flow_instance_cancel` 返回 `INSTANCE_ALREADY_TERMINAL`，同样不产生事件；`reason` 只随结果回显，stop 路由不落盘业务原因。
+- `flow_instance_list` 的 `cursor` 是上一页返回的 `nextCursor`（实例 id），只在该结果集内有效；结果集变化或超出单次扫描上限时返回 `CURSOR_INVALID`，从第一页重新开始。
+- `flow_instance_events` 只返回短字段：单条事件里的 `output` / `condition` / `artifacts` 或超长字符串超过 1 KiB 时替换为 `{bodyRef, bytes, truncated}`，`bodyRef` 指向读取原始事件的 `GET /instances/<id>/events?since=` 路径。
+- 不提供 `flow_instance_suspend` / `flow_instance_resume`（引擎没有挂起原语，延后到 E4），也不提供 watch / 定时唤醒 / 自动重试类工具；需要外部触发时由调用方轮询 `flow_instance_events` 或发消息。
+- 工具结果有界裁剪：字符串字段 2 KiB、数组 200 项、深度 8（`flow_definition_get` 的 XML 与 `flow_instance_events` 的短字段投影按各自上限处理）。超时：worktree 工具 60 秒、消息 / 回复 / 读类工具 30 秒、`flow_instance_run` 与 `flow_instance_complete_task` 10 分钟（可能等在飞 agent）。
+- 失败时工具返回 `{ok:false, error, hint, retryable, code?, status?}`；参数错误、404、409、`PLAN_STALE`、`TASK_ALREADY_COMPLETED`、`INSTANCE_ALREADY_TERMINAL`、`CURSOR_INVALID`、`WORKSPACE_POLICY_MISSING` 都不标 `retryable`。
 
 ## 错误码
 
@@ -761,6 +779,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | 400 | `BPMN_SEQ_INVALID` | `since` 不是非负整数 |
 | 400 / 500 | `BPMN_DEFINITION_INVALID` | 实例定义快照未通过 BPMN 校验（启动时 400；懒恢复时 500） |
 | 400 | `BPMN_WORKSPACE_INVALID` | `workspace` 选项形状或取值非法 |
+| 400 | `BPMN_STARTED_BY_INVALID` | `startedBy` 不是短字符串（含控制字符 / 超过 200 字符） |
 | 400 | `BPMN_WORKSPACE_ID_INVALID` | `workspaceId` 不是 12 位小写十六进制 |
 | 400 | `BPMN_EXPECTED_HEAD_INVALID` | `expectedHead` 不是 40–64 位十六进制 |
 | 400 | `WORKSPACE_INVALID` / `WORKSPACE_MISSING` / `WORKSPACE_NOT_GIT` | 工作区解析 / 使用失败（`WORKSPACE_CWD_OUTSIDE` 只出现在节点执行的 `lastError`） |

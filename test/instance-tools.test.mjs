@@ -99,7 +99,7 @@ const OK_BODY = {
 
 function toolOf(runtime) {
   const tools = createInstanceTools({ runtime })
-  eq(tools.length, 3, '实例域工具：worktree + send_message + reply')
+  eq(tools.length, 11, '实例域工具：3 个既有 + E3 的 8 个生命周期工具')
   const worktree = tools.find(tool => tool.name === 'flow_instance_worktrees')
   ok(worktree, '注册了 flow_instance_worktrees')
   return worktree
@@ -112,7 +112,7 @@ try {
     assert.throws(() => createInstanceTools({}), /runtime/)
     assertions += 1
     const runtime = makeRuntime(async () => ({ status: 200, body: { ok: true } }))
-    ok(createInstanceTools({ getRuntime: () => runtime }).length === 3)
+    ok(createInstanceTools({ getRuntime: () => runtime }).length === 11)
   })
 
   await check('参数：缺少 / 非法 action 在调用 runtime 前就失败', async () => {

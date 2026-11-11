@@ -54,6 +54,9 @@ const LOCK_WAIT_MS = 15 * 1000
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/
 const ATTEMPT_FILE = /^(\d+)\.jsonl$/
+/** `startedBy`（调用方会话 id）长度上限：只做定位，不是文件路径。 */
+const MAX_STARTED_BY_CHARS = 200
+const STARTED_BY_CONTROL = /[\u0000-\u001f\u007f]/
 
 /**
  * 实例状态集合（对齐 Camunda 8 口径）。
@@ -462,6 +465,33 @@ function normalizeLastAgentOutput(raw) {
   }
 }
 
+/**
+ * `startedBy`：启动实例的调用方会话 id（E3 工具绑定语义）。
+ *
+ * 只存定位用的短字符串，不是业务变量；老实例没有该字段时是 `null`。
+ * 不接受空串 / 控制字符 / 超过 200 字符的值，避免把任意长文本写进 instance.json。
+ *
+ * @param {unknown} raw
+ * @param {number} [status] 400 = 调用方输入；500 = 磁盘数据损坏
+ * @returns {string|null}
+ */
+function normalizeStartedBy(raw, status = 400) {
+  if (raw === undefined || raw === null) return null
+  const code = status === 500 ? 'INSTANCE_CORRUPT' : 'INSTANCE_SHAPE_INVALID'
+  if (typeof raw !== 'string') {
+    throw new InstanceError(status, code, 'startedBy 必须是字符串或 null', { field: 'startedBy' })
+  }
+  const value = raw.trim()
+  if (value === '') return null
+  if (STARTED_BY_CONTROL.test(value)) {
+    throw new InstanceError(status, code, 'startedBy 不能包含控制字符', { field: 'startedBy' })
+  }
+  if (Array.from(value).length > MAX_STARTED_BY_CHARS) {
+    throw new InstanceError(status, code, `startedBy 超过 ${MAX_STARTED_BY_CHARS} 个字符上限`, { field: 'startedBy' })
+  }
+  return value
+}
+
 /** 磁盘上的 instance.json → 收敛后的对象；任何字段坏掉都按 INSTANCE_CORRUPT 报。 */
 function normalizeInstance(raw, id) {
   if (!isPlainObject(raw)) {
@@ -530,6 +560,7 @@ function normalizeInstance(raw, id) {
   if (raw.lastSeq < raw.eventCount) {
     throw new InstanceError(500, 'INSTANCE_CORRUPT', 'instance.json 的 lastSeq 不能小于 eventCount')
   }
+  const startedBy = normalizeStartedBy(raw.startedBy, 500)
   return {
     id,
     definitionId: raw.definitionId,
@@ -548,6 +579,7 @@ function normalizeInstance(raw, id) {
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
     completedAt: raw.completedAt === undefined ? null : raw.completedAt,
+    startedBy,
     definitionSnapshot: SNAPSHOT_FILE,
   }
 }
@@ -632,7 +664,8 @@ function normalizePatch(patch) {
  * 定义域再改 / 再删都不影响本实例。
  *
  * @param {{definitionId: string, definitionVersion?: number, definitionHash?: string,
- *   variables?: object, home?: string, definitionsRoot?: string, instancesRoot?: string}} input
+ *   variables?: object, startedBy?: string|null, home?: string,
+ *   definitionsRoot?: string, instancesRoot?: string}} input
  * @returns {Promise<object>} 实例元数据（含 id / revision=1 / status='ACTIVE'）
  */
 export async function createInstance(input = {}) {
@@ -646,6 +679,7 @@ export async function createInstance(input = {}) {
   const defsRoot = definitionsRootOf(input)
   const root = instancesRootOf(input)
   const variables = normalizeVariables(input.variables)
+  const startedBy = normalizeStartedBy(input.startedBy)
 
   let definition
   if (input.definitionVersion === undefined || input.definitionVersion === null) {
@@ -718,6 +752,7 @@ export async function createInstance(input = {}) {
         createdAt: now,
         updatedAt: now,
         completedAt: null,
+        startedBy,
         definitionSnapshot: SNAPSHOT_FILE,
       }
       await writeJsonAtomic(join(dir, INSTANCE_FILE), instance)

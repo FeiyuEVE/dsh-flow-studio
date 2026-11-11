@@ -220,6 +220,12 @@ const EVENT_TYPES = Object.freeze([
 /** 只有这两类事件之后才快照（研究 §3 / #137：快照不可裁剪，别在每次事件上取）。 */
 const SNAPSHOT_TRIGGERS = new Set(['activity/wait', 'activity/end'])
 
+/**
+ * handler 通过 `ctx.emit` 即时写事件时，单条事件的落盘上限（与 instance-store 的
+ * 8 KiB 事件上限一致）。超限只保留定位字段并标 `truncated`，不让实例失败。
+ */
+const HANDLER_EVENT_MAX_BYTES = 8192
+
 /** 支持的节点 kind → 生成的 BPMN 元素。unknown 一律拒绝（加载期校验）。 */
 const TAG_BY_KIND = Object.freeze({
   start: 'bpmn:startEvent',
@@ -468,6 +474,21 @@ function readMaxTakes(extensions) {
   return null
 }
 
+/** 把解析器的 `{ input, output }` 映射归一成只含 source/target 的普通对象。 */
+function normalizeIoMapping(raw) {
+  if (!isPlainObject(raw)) return null
+  const parameters = value => (Array.isArray(value) ? value : [])
+    .filter(item => isPlainObject(item))
+    .map(item => ({
+      source: typeof item.source === 'string' ? item.source : null,
+      target: typeof item.target === 'string' ? item.target : null,
+    }))
+  return {
+    input: parameters(raw.input),
+    output: parameters(raw.output),
+  }
+}
+
 /**
  * 校验并归一化解析器给的 `definition`。
  *
@@ -480,7 +501,7 @@ function readMaxTakes(extensions) {
  * @param {unknown} raw
  * @returns {{
  *   id: string, name: string | null, startId: string, endIds: string[],
- *   elements: Array<{ id: string, type: string, name: string | null, kind: string, node: object | null }>,
+ *   elements: Array<{ id: string, type: string, name: string | null, kind: string, node: object | null, ioMapping: object | null }>,
  *   flows: Array<{ id: string, from: string, to: string, condition: { expression: string, language: string } | null, isDefault: boolean, extensions: object[], maxTakes?: number | null }>,
  *   elementById: Map<string, object>, flowById: Map<string, object>, flowsByFrom: Map<string, object[]>,
  *   warnings: string[],
@@ -540,6 +561,8 @@ function normalizeDefinition(raw) {
       name: typeof entry.name === 'string' && entry.name !== '' ? entry.name : null,
       kind,
       node,
+      // zeebe:ioMapping 是 http connector 的输入/输出映射来源；归一化时不能丢。
+      ioMapping: normalizeIoMapping(entry.ioMapping),
     }
     elements.push(element)
     elementById.set(elementId, element)
@@ -2190,6 +2213,9 @@ class BpmnRunner {
       variables: variablesCopy,
       timeoutMs: this.limits.activityWaitMs > 0 ? this.limits.activityWaitMs : null,
       signal,
+      // 受限的即时事件通道：handler 可以在请求过程中写短事件（http/attempt 等）。
+      // 保留类型仍由 runner 自己发；单条上限见 HANDLER_EVENT_MAX_BYTES。
+      emit: event => this._emitHandlerEvent(event, element.id, executionId),
     }
 
     let pending
@@ -2637,16 +2663,35 @@ class BpmnRunner {
     this._safeCall(this.services.onEvent, event)
   }
 
-  /** handler 通过 `events[]` 上报的适配器事件：原样透传，只补 at/elementId/activityId。 */
+  /**
+   * handler 通过 `events[]` / `ctx.emit` 上报的适配器事件：原样透传，只补
+   * at/elementId/activityId。单条超过 8 KiB 时裁成定位字段并标 `truncated`，
+   * 与 instance-store 的事件上限同口径（观测面不能把实例打失败）。
+   */
   _emitHandlerEvent(rawEvent, elementId, executionId) {
     if (this._evicted || this._stopping || this._fatal !== null) return
     if (!isPlainObject(rawEvent) || typeof rawEvent.type !== 'string' || rawEvent.type === '') return
     // 保留类型只能由 runner 发（否则事件流里会出现两条 process/end / 假 error）。
     if (EVENT_TYPES.includes(rawEvent.type)) return
-    const event = { ...rawEvent }
+    let event = { ...rawEvent }
     if (typeof event.at !== 'string' || event.at === '') event.at = nowIso()
     if (event.elementId === undefined) event.elementId = elementId
     if (event.activityId === undefined && executionId !== null) event.activityId = executionId
+    let bytes = 0
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(event), 'utf8')
+    } catch {
+      return
+    }
+    if (bytes > HANDLER_EVENT_MAX_BYTES) {
+      event = {
+        type: event.type,
+        at: event.at,
+        elementId: event.elementId,
+        activityId: event.activityId,
+        truncated: true,
+      }
+    }
     this._safeCall(this.services.onEvent, event)
   }
 

@@ -94,6 +94,14 @@ export const FS_MODDLE_PACKAGE = {
         { name: 'timeoutMs', type: 'Integer', isAttr: true },
         { name: 'retries', type: 'Integer', isAttr: true },
         { name: 'body', type: 'String' },
+        // 0.13.6 connector 的宿主侧引用与有界配置（文件里不写密钥值）。
+        { name: 'authRef', type: 'String', isAttr: true },
+        { name: 'networkPolicyId', type: 'String', isAttr: true },
+        { name: 'maxResponseBytes', type: 'Integer', isAttr: true },
+        { name: 'acceptStatuses', type: 'String', isAttr: true },
+        { name: 'idempotencyMode', type: 'String', isAttr: true },
+        { name: 'idempotencyHeader', type: 'String', isAttr: true },
+        // 已退役：只保留解析兼容，用于在运行时明确拒绝（见 http-connector）。
         { name: 'inputMapping', type: 'String' },
         { name: 'outputMapping', type: 'String' },
       ],

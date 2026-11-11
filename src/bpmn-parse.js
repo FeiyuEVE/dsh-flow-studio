@@ -321,9 +321,52 @@ function buildHttp(fsNode, elementId, warnings) {
     timeoutMs: integerOrNull(http.timeoutMs),
     retries: integerOrNull(http.retries),
     body: stringOrNull(http.body),
+    // 0.13.6：宿主侧引用、目标策略绑定与有界配置（值本身不进 XML）。
+    authRef: stringOrNull(http.authRef),
+    networkPolicyId: stringOrNull(http.networkPolicyId),
+    maxResponseBytes: integerOrNull(http.maxResponseBytes),
+    acceptStatuses: parseAcceptStatuses(http.acceptStatuses, elementId, warnings),
+    idempotency: parseIdempotency(http, elementId, warnings),
+    // 已退役：解析仍保留，供运行时明确拒绝「混用 / 旧配置」。
     inputMapping: stringOrNull(http.inputMapping),
     outputMapping: stringOrNull(http.outputMapping),
   }
+}
+
+/** `fs:http@acceptStatuses`：逗号分隔的状态码；非法项给 warning 并忽略。 */
+function parseAcceptStatuses(raw, elementId, warnings) {
+  const text = stringOrNull(raw)
+  if (text === null || text.trim() === '') return []
+  const values = []
+  for (const part of text.split(',')) {
+    const trimmed = part.trim()
+    if (trimmed === '') continue
+    if (!/^\d{3}$/.test(trimmed) || Number(trimmed) < 100 || Number(trimmed) > 599) {
+      warnings.push({
+        code: 'HTTP_ACCEPT_STATUSES_INVALID',
+        elementId,
+        message: `fs:http@acceptStatuses 里的 ${JSON.stringify(trimmed)} 不是合法 HTTP 状态码，已忽略。`,
+      })
+      continue
+    }
+    values.push(Number(trimmed))
+  }
+  return [...new Set(values)]
+}
+
+/** `fs:http@idempotencyMode/@idempotencyHeader` → 契约里的嵌套对象。 */
+function parseIdempotency(http, elementId, warnings) {
+  const mode = stringOrNull(http.idempotencyMode)?.toLowerCase() ?? 'none'
+  const header = stringOrNull(http.idempotencyHeader)
+  if (mode === 'none' || mode === '') return null
+  if (mode !== 'remote-key') {
+    warnings.push({
+      code: 'HTTP_IDEMPOTENCY_MODE_INVALID',
+      elementId,
+      message: `fs:http@idempotencyMode 只支持 remote-key / none，收到 ${JSON.stringify(mode)}；运行时将拒绝该节点。`,
+    })
+  }
+  return { mode, header }
 }
 
 /** 读取 `<fs:executor>`；env 用 JSON 属性，解析失败时保留 warning。 */

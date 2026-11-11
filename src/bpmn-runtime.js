@@ -67,6 +67,9 @@ import {
 } from './instance-store.js'
 import { parseBpmn } from './bpmn-parse.js'
 import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
+import { createConnectorStore } from './connector-store.js'
+import { executeHttpConnector } from './http-connector.js'
+import { normalizeHttpPolicy } from './http-policy.js'
 import { BPMN_STATE_KIND, BPMN_STATE_VERSION, sha256Hex } from './bpmn-state.js'
 import {
   AGENT_EXECUTE_ERROR, DEFAULT_ADAPTER_ID, admitAdapter, createAdapterProbeCache,
@@ -275,6 +278,9 @@ function runnerErrorStatus(code) {
  *   maxActiveInstances?: number,
  *   adapters?: object,       // AgentAdapter 注册表（createAdapterRegistry()）；缺省时 agent 节点明确失败
  *   workspaceRoot?: string,  // agent 节点的文档相对基准（默认 process.cwd()）
+ *   httpPolicy?: object,     // HTTP connector 的全局目标策略（默认只允许 HTTPS 公网地址）
+ *   httpPolicies?: object,   // 可选：networkPolicyId → 策略覆盖
+ *   httpAuthResolver?: Function, // 可选：authRef → 鉴权 header（缺省读 FLOW_STUDIO_HTTP_AUTH_*）
  * }} [options]
  * @returns {BpmnRuntime}
  */
@@ -291,6 +297,9 @@ export function createBpmnRuntime(options = {}) {
     maxActiveInstances: options.maxActiveInstances,
     adapters: options.adapters,
     workspaceRoot: options.workspaceRoot,
+    httpPolicy: options.httpPolicy,
+    httpPolicies: options.httpPolicies,
+    httpAuthResolver: options.httpAuthResolver,
   })
 }
 
@@ -308,6 +317,12 @@ class BpmnRuntime {
     this.workspaceRoot = typeof options.workspaceRoot === 'string' && options.workspaceRoot.trim() !== ''
       ? resolve(options.workspaceRoot.trim())
       : process.cwd()
+    /** HTTP connector 目标策略：默认只允许 HTTPS 公网地址；测试台靠宿主精确放行。 */
+    this.httpPolicy = normalizeHttpPolicy(options.httpPolicy)
+    /** 可选：`networkPolicyId` → 策略覆盖；与全局策略浅合并。 */
+    this.httpPolicies = isPlainObject(options.httpPolicies) ? options.httpPolicies : {}
+    /** 可选：宿主凭据解析器（authRef → header 对象）；缺省读 FLOW_STUDIO_HTTP_AUTH_*。 */
+    this.httpAuthResolver = typeof options.httpAuthResolver === 'function' ? options.httpAuthResolver : null
     /** 每个 runtime 的 probe 缓存：同一 adapter id 只 probe 一次（成功/失败都缓存）。 */
     this._probeAdapter = createAdapterProbeCache()
 
@@ -1267,7 +1282,7 @@ class BpmnRuntime {
   _servicesFor(instanceId) {
     return {
       executeAgent: (element, ctx) => this._executeAgentFor(instanceId, element, ctx),
-      executeHttp: (element, ctx) => executeHttp(element, ctx),
+      executeHttp: (element, ctx) => this._executeHttpFor(instanceId, element, ctx),
       onEvent: event => this._onRunnerEvent(instanceId, event),
       onTaskWait: () => {},
       onTaskDone: () => {},
@@ -1276,8 +1291,25 @@ class BpmnRuntime {
   }
 
   /**
+   * http 节点 handler 的 runtime 侧包装：为本次实例注入调用记录目录与宿主策略。
+   *
+   * 调用记录放在实例目录下（`<instancesRoot>/<instanceId>/connector/`），与实例状态
+   * 同生命周期；恢复窗口的「成功复用 / 已发送不重发」由 connector-store 保证。
+   */
+  async _executeHttpFor(instanceId, element, ctx) {
+    const store = createConnectorStore({ root: join(this.instancesRoot, instanceId, 'connector') })
+    return await executeHttpConnector(element, ctx, {
+      policy: this.httpPolicy,
+      policies: this.httpPolicies,
+      store,
+      env: this.env,
+      ...(this.httpAuthResolver === null ? {} : { authResolver: this.httpAuthResolver }),
+    })
+  }
+
+  /**
    * agent 节点 handler 的 runtime 侧包装：接适配器注册表 + probe 缓存，并记住
-   * 最后一个成功 agent 节点的 output / 本次 activity 的 summary（11 §5）。
+   * 最后一个成功 agent 节点的输出 / 本次 activity 的 summary（11 §5）。
    *
    * 注意：`executeAgent` 导出函数本身保持无实例状态的纯行为（测试可单独调用）；
    * 与实例相关的收口（变量合并由 runner 做、产物与 result 由本类做）在这里。
@@ -1974,20 +2006,20 @@ export async function executeAgent(element, ctx, options = {}) {
 /**
  * http connector 处理器（签名固定 `(element, ctx)`）。
  *
- * 0.13.0 **不实现真实 HTTP**（0.13.4 才做 fetch + 超时/重试/变量映射/鉴权头脱敏），
- * 抛 `BPMN_HTTP_NOT_IMPLEMENTED` 的结构化错误，避免半成品 fetch 被误认为可用。
+ * 0.13.6 起接到真实 connector：目标策略、受控 DNS、超时/重试/幂等、IO 映射与
+ * 调用记录都由 `http-connector.js` / `http-policy.js` / `connector-store.js` 提供。
+ * 失败抛带 `code` 的 `HttpConnectorError`，runner 会落成 `ACTIVE + lastError`。
+ *
+ * 直接调用（测试 / 嵌入）时必须通过 `options.store` 或 `options.storeRoot` 指定
+ * 调用记录目录；runtime 会按实例目录自动注入。
  *
  * @param {object} element
- * @param {{signal?: AbortSignal}} ctx
- * @returns {Promise<never>}
+ * @param {{signal?: AbortSignal, variables?: object, instanceId?: string, executionId?: string}} ctx
+ * @param {{policy?: object, store?: object, storeRoot?: string, env?: object, authResolver?: Function}} [options]
+ * @returns {Promise<{output: object, status: number, headers: object, events: object[]}>}
  */
-export async function executeHttp(element, ctx) {
-  throwIfAborted(ctx)
-  throw handlerError(
-    'BPMN_HTTP_NOT_IMPLEMENTED',
-    'http connector 在 0.13.4 提供（fetch + 超时/重试/变量映射/鉴权头脱敏）；0.13.0 不执行任何真实 HTTP',
-    { elementId: element?.id ?? null },
-  )
+export async function executeHttp(element, ctx, options = {}) {
+  return executeHttpConnector(element, ctx, options)
 }
 
 /** 导出目录 helper，便于运维/测试核对根位置（与 store 同口径）。 */

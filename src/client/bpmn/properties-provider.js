@@ -16,6 +16,7 @@ import {
   checkEntry,
   conditionEntry,
   httpEntries,
+  ioMappingListGroupProps,
   listTextFieldEntry,
   maxRoundsEntry,
   nodeAdapterEntry,
@@ -155,6 +156,24 @@ function nodeGroups(element, injector) {
       label: translate('HTTP 配置'),
       component: Group,
       entries: httpEntries(),
+    })
+
+    const inputMapping = ioMappingListGroupProps(element, moddle, commandStack, translate, 'input')
+    groups.push({
+      id: 'fs-http-inputs',
+      label: translate('输入映射（zeebe:ioMapping）'),
+      component: ListGroup,
+      items: inputMapping.items,
+      add: inputMapping.add,
+    })
+
+    const outputMapping = ioMappingListGroupProps(element, moddle, commandStack, translate, 'output')
+    groups.push({
+      id: 'fs-http-outputs',
+      label: translate('输出映射（zeebe:ioMapping）'),
+      component: ListGroup,
+      items: outputMapping.items,
+      add: outputMapping.add,
     })
   }
 

@@ -139,6 +139,10 @@ function bpmnRuntimeFor(env) {
       ...(typeof env.bpmnWorkspaceRoot === 'string' && env.bpmnWorkspaceRoot.trim() !== ''
         ? { workspaceRoot: env.bpmnWorkspaceRoot }
         : {}),
+      // HTTP connector 的目标策略：宿主可注入精确的 http 测试台 / 内网 host:port 例外。
+      ...(env.bpmnHttpPolicy && typeof env.bpmnHttpPolicy === 'object' ? { httpPolicy: env.bpmnHttpPolicy } : {}),
+      ...(env.bpmnHttpPolicies && typeof env.bpmnHttpPolicies === 'object' ? { httpPolicies: env.bpmnHttpPolicies } : {}),
+      ...(typeof env.bpmnHttpAuthResolver === 'function' ? { httpAuthResolver: env.bpmnHttpAuthResolver } : {}),
     })
     bpmnRuntimes.set(env, runtime)
   }

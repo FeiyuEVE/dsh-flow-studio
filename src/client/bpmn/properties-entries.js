@@ -24,11 +24,14 @@ import { useService } from 'bpmn-js-properties-panel'
 import { getBusinessObject, is } from 'bpmn-js/lib/util/ModelUtil.js'
 
 import {
+  appendExtensionCommand,
   applyCommands,
+  buildExtensionCommands,
   ensureCheckCommands,
   ensureFsNodeCommands,
   ensureHttpCommands,
   ensureTeamCommands,
+  extensionValues,
   getFsNode,
   getMaxRounds,
   listFromText,
@@ -156,7 +159,7 @@ function NodeTypeSelect(props) {
     getOptions: () => [
       { value: 'human', label: translate('人工（userTask）') },
       { value: 'agent', label: translate('Agent（serviceTask）') },
-      { value: 'http', label: translate('HTTP（serviceTask，connector 未实现）') },
+      { value: 'http', label: translate('HTTP（serviceTask，HTTP connector）') },
     ],
   })
 }
@@ -547,13 +550,40 @@ export function outputListGroupProps(element, moddle, commandStack, translate) {
   return { items, add }
 }
 
-/* ── HTTP 配置（fs:Http；connector 尚未实现） ────────────────────── */
+/* ── HTTP 配置（fs:Http）+ IO 映射（zeebe:ioMapping） ────────────── */
 
-const HTTP_NOTE = '0.13 的 HTTP connector 尚未接通：此处只保存配置，运行到该节点会因缺少 handler 失败。'
+const HTTP_NOTE = 'HTTP connector 已接通：目标默认只允许 HTTPS 公网地址；鉴权值只经 authRef 从宿主配置解析，不要写进 XML。'
+
+const IO_MAPPING_TYPE = 'zeebe:IoMapping'
+const IO_PARAMETER_KEYS = Object.freeze({
+  input: 'inputParameters',
+  output: 'outputParameters',
+})
+const IO_PARAMETER_TYPES = Object.freeze({
+  input: 'zeebe:Input',
+  output: 'zeebe:Output',
+})
 
 function httpOf(element) {
   const fsNode = getFsNode(element)
   return (fsNode && fsNode.http) || null
+}
+
+/** 取 `zeebe:ioMapping`（没有则 null）。 */
+export function ioMappingOf(element) {
+  return extensionValues(element).find(value => value && value.$type === IO_MAPPING_TYPE) || null
+}
+
+/** 确保 `zeebe:ioMapping` 存在；返回命令与容器引用。 */
+function ensureIoMappingCommands(element, moddle) {
+  const existing = ioMappingOf(element)
+  if (existing) return { commands: [], ioMapping: existing }
+  const ioMapping = moddle.create(IO_MAPPING_TYPE, { inputParameters: [], outputParameters: [] })
+  const extension = buildExtensionCommands(element, moddle)
+  return {
+    commands: [...extension.commands, appendExtensionCommand(element, extension.extensionElements, ioMapping)],
+    ioMapping,
+  }
 }
 
 function HttpField(props) {
@@ -583,8 +613,8 @@ function HttpField(props) {
     let normalized = value === undefined || value === null || value === ''
       ? undefined
       : value
-    // 描述符里 timeoutMs/retries 是 Integer，属性面板输入是字符串：这里收窄成数字。
-    if (normalized !== undefined && (field === 'timeoutMs' || field === 'retries')) {
+    // 描述符里 timeoutMs/retries/maxResponseBytes 是 Integer：这里收窄成数字。
+    if (normalized !== undefined && (field === 'timeoutMs' || field === 'retries' || field === 'maxResponseBytes')) {
       normalized = /^-?\d+$/.test(String(normalized).trim())
         ? Number(String(normalized).trim())
         : undefined
@@ -640,13 +670,53 @@ export function httpEntries() {
       field: 'headers',
       rows: 3,
       placeholder: '{"content-type":"application/json"}',
+      description: '鉴权/密钥头禁止写在这里（authorization / cookie / *token* 等）；请用下方 authRef。',
     },
     { id: 'fs-http-body', label: 'Body', component: HttpField, field: 'body', rows: 3 },
     { id: 'fs-http-timeout', label: '超时（毫秒）', component: HttpField, field: 'timeoutMs' },
-    { id: 'fs-http-retries', label: '重试次数', component: HttpField, field: 'retries' },
-    { id: 'fs-http-input', label: '输入映射', component: HttpField, field: 'inputMapping', rows: 2 },
-    { id: 'fs-http-output', label: '输出映射', component: HttpField, field: 'outputMapping', rows: 2 },
+    { id: 'fs-http-retries', label: '重试次数', component: HttpField, field: 'retries', description: '最多 3 次；GET/HEAD 可重试，有副作用的方法需要配置幂等键。' },
+    { id: 'fs-http-auth-ref', label: 'authRef（宿主凭据引用）', component: HttpField, field: 'authRef', placeholder: 'orders-api', description: '只写引用名；密钥值由宿主配置（或注入 authResolver）解析，不落 XML。' },
+    { id: 'fs-http-network-policy', label: 'networkPolicyId（宿主策略）', component: HttpField, field: 'networkPolicyId', description: '可选：引用宿主配置里的目标策略；不填用全局默认策略。' },
+    { id: 'fs-http-max-response', label: '响应上限（字节）', component: HttpField, field: 'maxResponseBytes', description: '默认 1 MiB，宿主硬上限 5 MiB。' },
+    { id: 'fs-http-accept-statuses', label: '额外接受状态码', component: HttpField, field: 'acceptStatuses', placeholder: '409,422', description: '默认只接受 2xx；需要按业务状态码分支时显式列出，再用 FEEL 判断。' },
+    { id: 'fs-http-idempotency-mode', label: '幂等键模式', component: HttpIdempotencyModeField },
+    { id: 'fs-http-idempotency-header', label: '幂等键 Header', component: HttpField, field: 'idempotencyHeader', placeholder: 'Idempotency-Key', description: 'remote-key 模式下必填；同一次 execution 的重试共享同一个键。' },
   ]
+}
+
+function HttpIdempotencyModeField(props) {
+  const { element, id, label } = props
+  const commandStack = useService('commandStack')
+  const moddle = useService('moddle')
+  const translate = useService('translate')
+  const http = httpOf(element)
+  const getValue = () => (http && typeof http.idempotencyMode === 'string' ? http.idempotencyMode : 'none')
+  const setValue = value => {
+    const live = httpOf(element)
+    const liveValue = live && typeof live.idempotencyMode === 'string' ? live.idempotencyMode : 'none'
+    if (liveValue === value) return
+    const commands = []
+    const ensured = ensureFsNodeCommands(element, moddle, defaultNodeType(element))
+    commands.push(...ensured.commands)
+    const ensuredHttp = ensureHttpCommands(element, moddle, ensured.fsNode)
+    commands.push(...ensuredHttp.commands)
+    commands.push(updateCommand(element, ensuredHttp.http, {
+      idempotencyMode: value === 'none' ? undefined : value,
+    }))
+    applyCommands(commandStack, commands)
+  }
+  return SelectEntry({
+    element,
+    id,
+    label: translate(label),
+    description: 'remote-key = 远端明确支持幂等键，允许有副作用的方法自动重试。',
+    getValue,
+    setValue,
+    getOptions: () => [
+      { value: 'none', label: translate('none（不允许自动重试）') },
+      { value: 'remote-key', label: translate('remote-key（远端幂等键）') },
+    ],
+  })
 }
 
 function HttpMethodField(props) {
@@ -689,6 +759,107 @@ function HttpMethodField(props) {
       { value: 'DELETE', label: 'DELETE' },
     ],
   })
+}
+
+/* ── zeebe:ioMapping 参数列表（http 节点的输入 / 输出映射） ──────── */
+
+function IoMappingField(props) {
+  const { element, id, label, direction, index, field, description, placeholder } = props
+  const commandStack = useService('commandStack')
+  const translate = useService('translate')
+  const debounce = useService('debounceInput')
+  const key = IO_PARAMETER_KEYS[direction]
+  const getValue = () => {
+    const ioMapping = ioMappingOf(element)
+    const list = ioMapping && Array.isArray(ioMapping[key]) ? ioMapping[key] : []
+    const parameter = list[index]
+    const raw = parameter && parameter[field]
+    return raw === undefined || raw === null ? '' : String(raw)
+  }
+  const setValue = value => {
+    const ioMapping = ioMappingOf(element)
+    const list = ioMapping && Array.isArray(ioMapping[key]) ? ioMapping[key] : []
+    const parameter = list[index]
+    if (!parameter) return
+    const normalized = value === undefined || value === null || value === '' ? undefined : String(value)
+    const current = parameter[field] === undefined || parameter[field] === null ? undefined : String(parameter[field])
+    if (current === normalized) return
+    applyCommands(commandStack, [updateCommand(element, parameter, { [field]: normalized })])
+  }
+  return TextFieldEntry({
+    element,
+    id,
+    label: translate(label),
+    description,
+    placeholder,
+    debounce,
+    getValue,
+    setValue,
+  })
+}
+
+/**
+ * 生成一个 `zeebe:ioMapping` 参数列表组：一参数一行 source/target。
+ * 输入映射只在本次请求的局部上下文求值；输出映射只写显式短标量。
+ */
+export function ioMappingListGroupProps(element, moddle, commandStack, translate, direction) {
+  const key = IO_PARAMETER_KEYS[direction]
+  const type = IO_PARAMETER_TYPES[direction]
+  const ioMapping = ioMappingOf(element)
+  const parameters = ioMapping && Array.isArray(ioMapping[key]) ? ioMapping[key] : []
+  const prefix = `fs-http-${direction === 'input' ? 'input' : 'output'}`
+  const labelText = direction === 'input' ? '输入参数' : '输出参数'
+
+  const items = parameters.map((parameter, index) => {
+    const source = parameter && parameter.source ? String(parameter.source) : ''
+    const target = parameter && parameter.target ? String(parameter.target) : ''
+    return {
+      id: `${prefix}-${index}`,
+      label: source !== '' || target !== '' ? `${source || '?'} → ${target || '?'}` : `${translate(labelText)} ${index + 1}`,
+      entries: [
+        {
+          id: `${prefix}-${index}-source`,
+          label: 'Source（FEEL）',
+          component: IoMappingField,
+          direction,
+          index,
+          field: 'source',
+          placeholder: direction === 'input' ? '= { orderId: order_id }' : '= response.status',
+          description: 'FEEL 表达式；输入映射只读本次请求的局部上下文，输出映射可用 response.status / response.body / response.headers。',
+        },
+        {
+          id: `${prefix}-${index}-target`,
+          label: 'Target',
+          component: IoMappingField,
+          direction,
+          index,
+          field: 'target',
+          placeholder: direction === 'input' ? 'body / query.name / headers.name' : 'http_status',
+          description: '输入：body、query.<name>、headers.<name>；输出：写回实例变量的短标量键。',
+        },
+      ],
+      autoFocusEntry: `${prefix}-${index}-source`,
+      remove: event => {
+        event.stopPropagation()
+        applyCommands(commandStack, [
+          updateCommand(element, ioMapping, { [key]: parameters.filter((_, i) => i !== index) }),
+        ])
+      },
+    }
+  })
+
+  const add = () => {
+    const commands = []
+    const ensured = ensureIoMappingCommands(element, moddle)
+    commands.push(...ensured.commands)
+    const existing = Array.isArray(ensured.ioMapping[key]) ? ensured.ioMapping[key] : []
+    const parameter = moddle.create(type, {})
+    parameter.$parent = ensured.ioMapping
+    commands.push(updateCommand(element, ensured.ioMapping, { [key]: [...existing, parameter] }))
+    applyCommands(commandStack, commands)
+  }
+
+  return { items, add }
 }
 
 /* ── 连线：conditionExpression + fs:MaxRounds ────────────────────── */

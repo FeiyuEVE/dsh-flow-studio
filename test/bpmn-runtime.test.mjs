@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto'
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs'
+import http from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -698,7 +699,7 @@ try {
   // -------------------------------------------------------------------------
   // 8. handler 边界：无注册表明确失败 / custom 零派发 / http 明确未实现
   // -------------------------------------------------------------------------
-  await check('handler 边界：无注册表明确失败；custom 与 codex 零派发；http 未实现', async () => {
+  await check('handler 边界：无注册表明确失败；custom 与 codex 零派发；http 走受控目标校验', async home => {
     const dshElement = { id: 'agent-dsh', node: { adapter: 'dsh', prompt: 'hi' } }
     const missingAdapter = { id: 'agent-none', node: { prompt: 'hi' } }
     const ctx = { attempt: 1, variables: { a: 1 }, signal: new AbortController().signal }
@@ -711,10 +712,16 @@ try {
       )
     }
 
+    // 0.13.6：http 不再是占位实现；直接调用也必须过目标策略（这里用回环地址证明
+    // 校验发生在任何网络动作之前）。
     await rejects(
-      () => executeHttp({ id: 'http-1', node: { http: { method: 'GET', url: 'https://example.com' } } }, ctx),
-      error => error.code === 'BPMN_HTTP_NOT_IMPLEMENTED',
-      '0.13.4 仍不实现真实 HTTP',
+      () => executeHttp(
+        { id: 'http-1', node: { http: { method: 'GET', url: 'https://127.0.0.1/' } } },
+        ctx,
+        { storeRoot: join(home, 'connector-store') },
+      ),
+      error => error.code === 'HTTP_DESTINATION_BLOCKED',
+      'http 走真实 connector，默认阻断回环地址',
     )
 
     // 回归（本次修复）：custom 不再是 agent 完结路径，executor 桩一次都不能被调用。
@@ -1354,6 +1361,198 @@ try {
     eq(replay.status, 409, '不可恢复实例不能再 complete（不能重放失败前的工作）')
     eq(replay.body.code, 'BPMN_INSTANCE_NOT_RECOVERABLE')
     await runtimeB.dispose()
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.4 0.13.6 HTTP connector：start → http → exclusiveGateway → human → end
+  // -------------------------------------------------------------------------
+  await check('HTTP connector：502→200 重试共享幂等键，网关按映射结果分支到人工', async home => {
+    const requests = []
+    const server = http.createServer((req, res) => {
+      const chunks = []
+      req.on('data', chunk => chunks.push(chunk))
+      req.on('end', () => {
+        requests.push({
+          method: req.method,
+          url: req.url,
+          headers: req.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+        if (requests.length === 1) {
+          res.writeHead(502, { 'content-type': 'text/plain' })
+          res.end('bad gateway')
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req-42' })
+        res.end(JSON.stringify({ accepted: true }))
+      })
+    })
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = server.address().port
+    const secret = 'integration-secret-must-not-leak'
+    const previousAuth = process.env.FLOW_STUDIO_HTTP_AUTH_ORDERS_API
+    process.env.FLOW_STUDIO_HTTP_AUTH_ORDERS_API = secret
+    try {
+      const route = {
+        handler: createHandler(makeEnv(home, {
+          bpmnHttpPolicy: {
+            allowInsecureOrigins: [`fixture.test:${port}`],
+            resolver: async hostname => {
+              if (hostname !== 'fixture.test') throw new Error(`unexpected host ${hostname}`)
+              return [{ address: '127.0.0.1', family: 4 }]
+            },
+            retryBackoffBaseMs: 1,
+            retryBackoffMaxMs: 5,
+          },
+        })),
+      }
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="defs-http" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-http" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="submit" name="提交订单">
+      <bpmn:extensionElements>
+        <fs:node nodeType="http">
+          <fs:http method="POST" url="http://fixture.test:${port}/orders" headers="{&quot;content-type&quot;:&quot;application/json&quot;}" retries="2" timeoutMs="5000" authRef="orders-api" idempotencyMode="remote-key" idempotencyHeader="Idempotency-Key"/>
+        </fs:node>
+        <zeebe:ioMapping>
+          <zeebe:input source="= { orderId: order_id }" target="body"/>
+          <zeebe:output source="= response.status" target="http_status"/>
+          <zeebe:output source="= response.body.accepted" target="accepted"/>
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="gw" default="f_no"/>
+    <bpmn:userTask id="review" name="人工复核"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="submit"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="submit" targetRef="gw"/>
+    <bpmn:sequenceFlow id="f_yes" sourceRef="gw" targetRef="review">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="feel">= accepted = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_no" sourceRef="gw" targetRef="end"/>
+    <bpmn:sequenceFlow id="f_end" sourceRef="review" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+      const saved = await call(route, 'POST', `${API}/definitions`, { id: 'flow-http', name: 'HTTP 集成', xml })
+      eq(saved.status, 201, JSON.stringify(saved.json))
+      const created = await call(route, 'POST', `${API}/instances`, {
+        definitionId: 'flow-http',
+        variables: { order_id: 'o-42' },
+      })
+      eq(created.status, 201, JSON.stringify(created.json))
+      eq(created.json.status, 'ACTIVE', 'http 成功后流程停在人工节点')
+      const instanceId = created.json.id
+
+      // fixture 对账：两次请求（502 → 200），同一幂等键，body 来自局部输入映射。
+      eq(requests.length, 2, '502 后按配置重试一次')
+      eq(requests[0].method, 'POST')
+      eq(requests[0].url, '/orders')
+      eq(requests[0].body, '{"orderId":"o-42"}')
+      eq(requests[1].body, '{"orderId":"o-42"}')
+      ok(typeof requests[0].headers['idempotency-key'] === 'string' && requests[0].headers['idempotency-key'] !== '')
+      eq(requests[1].headers['idempotency-key'], requests[0].headers['idempotency-key'], '重试共享同一个幂等键')
+      eq(requests[0].headers.authorization, `Bearer ${secret}`, 'authRef 从宿主配置解析')
+      eq(requests[0].headers.host, `fixture.test:${port}`, '连接使用已验证地址但保留原 Host')
+
+      const detail = await call(route, 'GET', `${API}/instances/${instanceId}`)
+      eq(detail.status, 200)
+      eq(detail.json.status, 'ACTIVE')
+      eq(detail.json.lastError, null, '成功调用不写 lastError')
+      eq(detail.json.variables.http_status, 200, '输出映射写回状态码')
+      eq(detail.json.variables.accepted, true, '输出映射写回业务字段')
+      eq(detail.json.variables.order_id, 'o-42', '输入映射不覆盖实例变量')
+      const pending = detail.json.pendingTasks
+      eq(pending.length, 1, '网关 accepted=true 分支到人工节点')
+      eq(pending[0].activityId, 'review')
+
+      const events = await call(route, 'GET', `${API}/instances/${instanceId}/events`)
+      const list = events.json.events
+      eq(countType(list, 'http/attempt'), 2, '502 + 200 各一次尝试')
+      eq(countType(list, 'http/result'), 2, '502 的失败尝试与最终 200 各记一条 result')
+      ok(countType(list, 'activity/end') >= 1, 'http 活动完成')
+      const submitEnd = list.find(event => event.type === 'activity/end' && event.elementId === 'submit')
+      ok(submitEnd !== undefined, 'submit 的 activity/end 必须存在')
+      eq(submitEnd.status, 200)
+      deep(submitEnd.output, { http_status: 200, accepted: true }, 'activity/end 只带显式输出映射')
+      const serialized = JSON.stringify(list)
+      ok(!serialized.includes(secret), '事件流里不得出现鉴权值')
+      ok(!serialized.includes('"authorization"'), '事件流里不得出现鉴权头')
+      ok(!list.some(event => event.type === 'process/end'), '流程还没结束（停在人工节点）')
+      const flowIds = list.filter(event => event.type === 'flow/taken').map(event => event.flowId)
+      ok(flowIds.includes('f_yes'), 'accepted=true 走 f_yes 到人工节点')
+      ok(!flowIds.includes('f_no'), '不得走默认边')
+
+      const done = await call(route, 'POST', `${API}/instances/${instanceId}/tasks/review/complete`, {
+        payload: { approved: true },
+      })
+      eq(done.status, 200, JSON.stringify(done.json))
+      eq(done.json.status, 'COMPLETED', '人工完成后流程结束')
+    } finally {
+      if (previousAuth === undefined) delete process.env.FLOW_STUDIO_HTTP_AUTH_ORDERS_API
+      else process.env.FLOW_STUDIO_HTTP_AUTH_ORDERS_API = previousAuth
+      await new Promise(resolveClose => server.close(() => resolveClose()))
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.5 HTTP connector 失败语义：ACTIVE + lastError + error，不走出向连线
+  // -------------------------------------------------------------------------
+  await check('HTTP 失败：实例保持 ACTIVE + lastError + error 事件，不产生 activity/end / process/end', async home => {
+    const server = http.createServer((req, res) => {
+      res.writeHead(500, { 'content-type': 'text/plain' })
+      res.end('boom')
+    })
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = server.address().port
+    try {
+      const route = {
+        handler: createHandler(makeEnv(home, {
+          bpmnHttpPolicy: {
+            allowInsecureOrigins: [`fixture.test:${port}`],
+            resolver: async () => [{ address: '127.0.0.1', family: 4 }],
+            retryBackoffBaseMs: 1,
+          },
+        })),
+      }
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-http-fail" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-http-fail" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="submit">
+      <bpmn:extensionElements>
+        <fs:node nodeType="http"><fs:http method="GET" url="http://fixture.test:${port}/fail" timeoutMs="3000"/></fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="submit"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="submit" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+      const saved = await call(route, 'POST', `${API}/definitions`, { id: 'flow-http-fail', name: 'HTTP 失败', xml })
+      eq(saved.status, 201, JSON.stringify(saved.json))
+      const created = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-http-fail' })
+      eq(created.status, 201, JSON.stringify(created.json))
+      eq(created.json.status, 'ACTIVE', 'handler 失败不得把实例判成 FAILED/STUCK')
+
+      const detail = await call(route, 'GET', `${API}/instances/${created.json.id}`)
+      eq(detail.json.status, 'ACTIVE', 'GET 仍是 ACTIVE')
+      eq(detail.json.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE', 'lastError 保留 connector 的错误码')
+      ok(detail.json.lastError.message.includes('500'), 'lastError 说明远端状态码')
+      deep(detail.json.pendingTasks, [], '失败后没有可继续的待办')
+
+      const events = await call(route, 'GET', `${API}/instances/${created.json.id}/events`)
+      const list = events.json.events
+      ok(list.some(event => event.type === 'error'), 'error 事件必须留痕')
+      ok(!list.some(event => event.type === 'activity/end' && event.elementId === 'submit'), '失败不得产生正常 activity/end')
+      ok(!list.some(event => event.type === 'process/end'), '失败不得产生 process/end')
+      ok(!list.some(event => event.type === 'flow/taken' && event.from === 'submit'), '失败不得走出向连线')
+      const raw = readInstanceJson(home, created.json.id)
+      eq(raw.status, 'ACTIVE', '落盘实例仍是 ACTIVE')
+      eq(raw.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE')
+    } finally {
+      await new Promise(resolveClose => server.close(() => resolveClose()))
+    }
   })
 
   // -------------------------------------------------------------------------

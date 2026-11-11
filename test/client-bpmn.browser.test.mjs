@@ -646,7 +646,7 @@ async function run() {
       A.deepEqual(outputs, [{ name: 'report', kind: 'markdown', required: true }], 'fs:output 属性写回')
     })
 
-    await check('HTTP 节点：fs:Http 配置写回', async () => {
+    await check('HTTP 节点：fs:Http 配置写回 + zeebe:ioMapping 参数列表', async () => {
       await selectById(page, created.http)
       await page.waitForSelector('[data-group-id="group-fs-http"]', { timeout: 5000 })
       await openGroup(page, 'fs-http')
@@ -655,16 +655,47 @@ async function run() {
       await fillField(page, 'fs-http-headers', '{"content-type":"application/json"}')
       await fillField(page, 'fs-http-body', '{"event":"approve"}')
       await fillField(page, 'fs-http-timeout', '2500')
+      await fillField(page, 'fs-http-auth-ref', 'orders-api')
+      await selectField(page, 'fs-http-idempotency-mode', 'remote-key')
+      await fillField(page, 'fs-http-idempotency-header', 'Idempotency-Key')
+
+      // 输入映射：一参数一行 source/target，写入 zeebe:ioMapping（不是旧的
+      // fs:http.inputMapping 文本）。
+      await openGroup(page, 'fs-http-inputs')
+      await page.locator('[data-group-id="group-fs-http-inputs"] .bio-properties-panel-add-entry').click()
+      await page.waitForTimeout(300)
+      await openGroup(page, 'fs-http-inputs')
+      await openListItem(page, 'fs-http-input-0')
+      await fillField(page, 'fs-http-input-0-source', '= { orderId: order_id }')
+      await fillField(page, 'fs-http-input-0-target', 'body')
+
+      await openGroup(page, 'fs-http-outputs')
+      await page.locator('[data-group-id="group-fs-http-outputs"] .bio-properties-panel-add-entry').click()
+      await page.waitForTimeout(300)
+      await openGroup(page, 'fs-http-outputs')
+      await openListItem(page, 'fs-http-output-0')
+      await fillField(page, 'fs-http-output-0-source', '= response.status')
+      await fillField(page, 'fs-http-output-0-target', 'http_status')
+
       const summary = await page.evaluate(() => {
         const element = window.__modeler.get('elementRegistry').get(window.__ids.http)
         const values = element.businessObject.extensionElements.values
         const fsNode = values.find(value => value.$type === 'fs:Node')
+        const ioMapping = values.find(value => value.$type === 'zeebe:IoMapping')
+        const parameters = list => (list || []).map(item => ({ source: item.source, target: item.target }))
         return {
           nodeType: fsNode.nodeType,
           method: fsNode.http && fsNode.http.method,
           url: fsNode.http && fsNode.http.url,
           headers: fsNode.http && fsNode.http.headers,
           timeoutMs: fsNode.http && fsNode.http.timeoutMs,
+          authRef: fsNode.http && fsNode.http.authRef,
+          idempotencyMode: fsNode.http && fsNode.http.idempotencyMode,
+          idempotencyHeader: fsNode.http && fsNode.http.idempotencyHeader,
+          legacyInputMapping: fsNode.http && fsNode.http.inputMapping,
+          legacyOutputMapping: fsNode.http && fsNode.http.outputMapping,
+          input: ioMapping && parameters(ioMapping.inputParameters),
+          output: ioMapping && parameters(ioMapping.outputParameters),
         }
       })
       A.equal(summary.nodeType, 'http', 'HTTP 节点 nodeType=http')
@@ -672,6 +703,19 @@ async function run() {
       A.equal(summary.url, 'https://example.com/hook', 'HTTP url 写回')
       A.equal(summary.headers, '{"content-type":"application/json"}', 'headers 原样保存 JSON 字符串')
       A.equal(summary.timeoutMs, 2500, 'timeoutMs 以整数写回')
+      A.equal(summary.authRef, 'orders-api', 'authRef 只写引用名')
+      A.equal(summary.idempotencyMode, 'remote-key', '幂等键模式写回')
+      A.equal(summary.idempotencyHeader, 'Idempotency-Key', '幂等键 Header 写回')
+      A.equal(summary.legacyInputMapping, undefined, '不再写旧的 fs:http.inputMapping')
+      A.equal(summary.legacyOutputMapping, undefined, '不再写旧的 fs:http.outputMapping')
+      A.deepEqual(summary.input, [{ source: '= { orderId: order_id }', target: 'body' }], '输入映射写入 zeebe:inputParameters')
+      A.deepEqual(summary.output, [{ source: '= response.status', target: 'http_status' }], '输出映射写入 zeebe:outputParameters')
+
+      // 序列化后仍是标准 zeebe:ioMapping（面板不是只改内存对象）。
+      const xml = await page.evaluate(() => window.__editor.saveXML())
+      A.match(xml, /<zeebe:ioMapping>/, '保存的 XML 带 zeebe:ioMapping')
+      A.match(xml, /<zeebe:input source="= \{ orderId: order_id \}" target="body" \/>/, '保存的 XML 带输入参数')
+      A.match(xml, /<zeebe:output source="= response.status" target="http_status" \/>/, '保存的 XML 带输出参数')
     })
 
     await check('画布快捷键：Ctrl+Z / Ctrl+Y；输入框内不触发图操作', async () => {

@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.6）
+# 版本历史（0.1 → 0.13.7）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -549,16 +549,16 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 ## 0.13.6 — HTTP connector 与 0.13.5 复审修复
 
-这一版加 **HTTP connector**（BPMN serviceTask 真的能调外部 HTTP），同时把 0.13.5 复审里剩下的 6 MAJOR + 3 MINOR 修完。
+这一版加 **HTTP connector**（BPMN serviceTask 真的能调外部 HTTP），并修 0.13.5 复审里 6 MAJOR + 3 MINOR 中可复现的部分；随后的复审又指出 8 MAJOR（H1–H5、N1–N3）+ 4 MINOR，由 0.13.7 继续收紧。
 
 ### HTTP connector（新能力）
 
 - **配置**：仍是 `bpmn:ServiceTask` + `fs:node nodeType="http"`；`fs:http` 支持 `method / url / headers / body / timeoutMs / retries / authRef / networkPolicyId / maxResponseBytes / acceptStatuses / idempotency{Mode,Header}`。数据映射只认 `zeebe:ioMapping`（`inputParameters` / `outputParameters`），旧的 `fs:http.inputMapping/outputMapping` 不再支持、混用时明确报错。
-- **目标策略**：「校验即连接」——URL 先拒绝 userinfo / 非 http(s)，DNS 的所有解析结果都分类（loopback / 私网 / link-local / metadata / ULA / CGNAT / IPv4-mapped 等），任一被禁就整次拒绝；返回的 `lookup` 只吐已验证地址并直接交给 `node:http(s).request`，连接时不会二次解析。默认只允许 HTTPS 公网；内网 / 明文测试台要显式配置 `allowedHosts` / `allowedCidrs` / `allowInsecureOrigins`。3xx 一律拒绝（不做重定向）。
+- **目标策略**：「校验即连接」——URL 先拒绝 userinfo / 非 http(s)，DNS 的所有解析结果都分类（loopback / 私网 / link-local / metadata / ULA / CGNAT / IPv4-mapped 等），任一被禁就整次拒绝；返回的 `lookup` 只吐已验证地址并直接交给 `node:http(s).request`，连接时不会二次解析。默认只允许 HTTPS 公网；内网 / 明文测试台要显式配置 `allowedHosts` / `allowedCidrs` / `allowInsecureOrigins`。默认拒绝 3xx（不做重定向；某个状态码可用 `acceptStatuses` 显式接受，例如 304）。
 - **限额与重试**：请求体 256 KiB；响应默认 1 MiB、硬上限 5 MiB（原始字节与解压后字节都计数，超限立即中断）；默认不重试，显式最多 3 次，只覆盖瞬时网络错误与 429/502/503/504，退避与 `Retry-After` 受整体 deadline 约束；有副作用的方法只有在配置幂等键（remote-key）时才允许重试。
-- **幂等与恢复**：幂等键由 `instanceId + elementId + executionId + method + url` 生成，同一次执行的所有重试共享，循环重新激活换 execution 就换键。发送前先落盘调用记录（`<instanceId>/connector/`，原子写），成功结果在返回引擎前落盘；重启时已成功结果直接复用、不再请求远端，「已发送但结果不明」记 `HTTP_OUTCOME_UNKNOWN` 且不自动重发。
+- **幂等与恢复**：幂等键由 `instanceId + elementId + executionId + method + url` 生成，同一次执行的所有重试共享，循环重新激活换 execution 就换键。发送前先落盘调用记录（`<instanceId>/connector/`，原子写），成功结果在返回引擎前落盘；同一引擎快照恢复时已成功结果直接复用、不再请求远端，「已发送但结果不明」记 `HTTP_OUTCOME_UNKNOWN` 且不自动重发；跨快照崩溃恢复的幂等边界由 0.13.7（H5）收紧。
 - **失败语义**：connector 错误写 `ACTIVE + lastError + error 事件`，不产生 `activity/end`、不走出向连线；不会把实例判成失败。
-- **密钥**：`authRef` 只从宿主解析（环境变量 `FLOW_STUDIO_HTTP_AUTH_<REF>` 或注入的 resolver），XML / 变量 / 事件 / 错误文本 / 日志都不出现密钥；在 `fs:http.headers` 里手写 authorization / cookie / token 之类会被拒绝。
+- **密钥**：`authRef` 只从宿主解析（环境变量 `FLOW_STUDIO_HTTP_AUTH_<REF>` 或注入的 resolver），请求侧不会把密钥写进 XML / 变量 / 事件 / 错误文本 / 日志；在 `fs:http.headers` 里手写 authorization / cookie / token 之类会被拒绝。远端把凭据回显到响应体 / 响应头的边界由 0.13.7（H3）收紧。
 - **面板**：http 节点新增 `authRef / networkPolicyId / maxResponseBytes / acceptStatuses / 幂等模式与头`，输入 / 输出映射改成一行一个 `source → target`，写进 `zeebe:ioMapping`。
 
 ### 0.13.5 复审修复（F1–F6、f1–f3）
@@ -581,5 +581,46 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 **已知边界**
 - 宿主凭据目前只有环境变量与注入 resolver，没有 GUI 凭据管理 / 加密存储 / OAuth 刷新；`networkPolicyId` 由宿主策略表映射，没有 UI 编辑。
 - 「旧的 `fs:http.inputMapping/outputMapping` 与 `zeebe:ioMapping` 混用」是在运行到该节点时拒绝，不是保存期门禁。
-- 幂等键与调用记录的保护是进程级；同进程 runner 有实例表保护，跨进程并发恢复仍可能各发一次。
+- 幂等键与调用记录的保护是进程级；同进程 runner 有实例表保护，跨进程并发恢复仍可能各发一次（跨快照恢复窗口见 0.13.7 H5）。
 - 主包仍含旧 React Flow（0.14.0 退役）；构建校验对主包只硬禁 BPMN 栈、对 chunk 硬禁 `@xyflow`。
+
+## 0.13.7 — 实例域 worktree 与 0.13.6 复审修复
+
+这一版加**实例级 Git worktree**（Host 侧），并把 0.13.6 复审的 8 MAJOR（H1–H5、N1–N3）+ 4 MINOR 收口。
+
+### 实例域 worktree（新能力）
+
+- **启动契约**：`POST /instances` 支持 `workspace: { path, worktree: { mode:'auto'|'on'|'off', baseRef?, cleanup:'retain'|'on-terminal-clean' } }`。`auto` 在 Git 仓库建树、非 Git 回退原目录；`on` 建树失败即 400；`off` 用原目录。建树发生在第一个 agent 启动之前。
+- **身份与冻结**：路径 `<worktreeRoot>/<workspaceId>/<instanceId>`，分支 `flow-instance/<instanceId>`（冲突时 `-2…-20`）；创建时把 `baseRef` 冻结成 `baseCommit`，后续节点/循环/重启都用同一份记录。`workspaceId` 取主仓库身份（origin 归一，linked worktree 与主仓库一致）。
+- **运行时一致性**：`agent` 节点 cwd、finish gate 的文档根、消息文件根都来自同一份已解析工作区；worktree 模式下只允许树内相对子目录，绝对路径 / realpath 越界报 `WORKSPACE_CWD_OUTSIDE`；恢复时记录缺失报 `WORKSPACE_UNAVAILABLE`，不静默换回宿主目录。
+- **路由**：`GET /instances/<id>/worktree`、`DELETE /instances/<id>/worktree`（`{force, removeBranch, expectedHead?}`）、`DELETE /instances/<id>/worktree/branch`、`GET /instance-worktrees?workspaceId=`、`POST /instance-worktrees/prune`（默认 `dryRun:true`，执行必须带预览的 `planHash`，状态变化后 409 `PLAN_STALE`）、`GET /instances/<id>/resource-events?since=`。只读接口都在测试里验证过**不启动 runner**。
+- **清理规则**：`ACTIVE`/`SUSPENDED` 一律 409（`force` 不能越过）；`expectedHead` 不符 409；脏树、未合并分支、目录存在但 Git 未登记分别拒绝；`on-terminal-clean` 只在 agent 进程释放、树干净、产物已保存后执行，失败只写资源事件、不改实例状态；没有所有权证据的目录在 prune 里只报告不删。
+- **产物**：按 sha256 寻址的内容快照 `artifacts/<sha256>`，对外仍是 `path + sha256 + bytes`，另加 `executionId/workspaceId/contentRef` 与 `sources[]`（同 path+sha 不重复登记，但保留不同执行来源）。
+- **并发**：`execution-limits` 按「实际 agent 执行」占槽（全局/每工作区上限、排队超时、取消退队），人工等待与挂起不长期占槽。
+- **记录与事件**：所有权记录 `worktree-registry/<workspaceId>/<instanceId>.json`；实例内冻结快照 `instances/<id>/workspace.json`；资源事件 `instances/<id>/resources/events.jsonl`（独立 `resourceSeq`，执行事件流不动）。
+
+### 0.13.6 复审修复
+
+- **H1 特殊地址分类**：本地 NAT64 前缀（`64:ff9b:1::/48`）、site-local（`fec0::/10`）、benchmark/documentation/orchid/`100::/64` 等默认不再算公网；需要用转换前缀时只能在 `nat64Prefixes` 里显式放行，且内嵌 IPv4 仍要分类为公网。
+- **H2 策略严格校验**：`allowInsecureOrigins` 不再接受 `*` 或省略端口；`allowedCidrs` 的前缀必须是合法数字（`10.0.0.0/` 这种空前缀不再变成 `/0`）；`authOrigins` 必须是严格 origin；非法配置在加载时报 `HTTP_POLICY_INVALID`。
+- **H3 凭据回显**：从 `authRef` 解析出的值生成脱敏匹配串（完整值 / scheme 后 token / Basic 解码后的 `user:pass`），白名单响应头命中即 `[redacted]`；输出映射命中直接 `HTTP_RESPONSE_SECRET_LEAK`（不写变量/记录）；`location` 与错误详情递归脱敏；`authRef` 绑定到允许的 origin，跨 origin 使用报 `HTTP_AUTH_ORIGIN_FORBIDDEN` 且零发送。
+- **H4 统一 deadline**：入口即建立 deadline，DNS、凭据解析、`beginInvocation`、`recordAttempt` 都参与超时与取消竞争；每次真正发送前再查一次剩余时间，过期零发送；未发送用 `markNotSent` 回滚，不制造假的 unknown。
+- **H5 恢复幂等**：调用身份改成 `elementId_attempt_N`（attempt 随引擎快照持久化），invocationId、记录键与 `Idempotency-Key` 都基于它；崩溃后恢复同一逻辑激活会复用同一记录与键，不再换键重发。`engineExecutionId` 作为排障元数据保留。
+- **N1 实例事务提交**：打开实例时详情 / 任务 / 事件先放本地事务副本，画布应用成功且选择世代仍有效后才在一个同步块里整组提交；失败或过期一律不提交，只把画布恢复到最后一次已提交视图，过期导入不再改写当前实例模型。
+- **N2 factory 判定隔离**：校验器在不可信代码执行前冻结所需内建函数，判定结果改走原始字符串通道；factory 里改写 `JSON.stringify` 之类不再能伪造「无问题」结果。
+- **N3 e2e 挂载校验**：容器脚本按 `Type/Source/Destination` 三元组校验挂载，拒绝宿主 `HOME` 本身/祖先/`~/.dsh`，拒绝覆盖 `home/profiles/logs/dt/prefix` 的嵌套 bind；用容器内 realpath 校验实际写入路径，并在 `docker cp` / `sed` / `pnpm install` 前复核。
+- **m1 调用记录处置**：新增 `POST /instances/<id>/connector/<recordId>/resolve`（`mark-succeeded|mark-failed|retry`），只改记录 + 追加 `connector/audit.jsonl` 审计，不推进引擎、不伪造 `activity/end`；重复动作幂等。
+- **m2 头部预算**：请求头 64 条 / 单值 8 KiB / 总量 32 KiB，响应头 64 条 / 8 KiB，超限分别报稳定错误码。
+- **m3 `ctx.emit` 世代守卫**：handler 的 emit 捕获创建时世代，`stop()`/LRU dispose 后旧 ctx 不再能追加事件。
+- **m4 发布口径**：0.13.5 / 0.13.6 段落里超出证据的表述已按复审结论收窄。
+
+### 测试与验收
+
+- `npm test` 56 个套件、1299 组全过；真浏览器 35 组 / 249 条断言全过。
+- `scripts/e2e-bpmn.sh` 在 `dsh-testbed-bpmn` 上跑通（0.13.7 版本，含 worktree 相关回归的前置校验）。
+
+**已知边界**
+- worktree 的 GUI 面板与 `flow_instance_worktrees` 模型工具在 0.13.8；当前只能通过 HTTP/GUI 的实例列表看到工作区状态（`GET /instances/<id>/worktree`）。
+- 宿主凭据 / networkPolicy 仍只有环境变量与注入 resolver；worktree 分支不自动 commit/merge/push。
+- H5 的残余窗口：若手工回滚 `state.json` 到更早世代，或同一元素在并行分支同时激活，attempt 可能映射到不同逻辑激活；请求内容不同会以 `HTTP_REQUEST_CONFLICT` 拒绝。H3 只匹配已知凭据值（≥4 字符），不识别再次编码后的回显。
+- 幂等与调用记录保护仍是进程级；跨进程并发恢复未做分布式互斥。

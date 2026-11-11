@@ -506,6 +506,8 @@
 
 消息正文阈值：≤4 KiB 内联在 `messages.jsonl`；>4 KiB 先完整落盘到 `inbox/bodies/<messageId>.<sha16>.txt`，记录里只留 `body:{kind:"file", path, sha256, bytes}` 引用；>1 MiB 整条拒绝（413 `MESSAGE_BODY_TOO_LARGE`），不写任何文件。`preview` 是前 200 字符。
 
+journal 尾部修复：追加写之前（`inbox/.lock` 内）检查 `messages.jsonl` / `replies.jsonl` 最后一行是否以换行结束；不完整尾部原样（base64）转存到 `<journal>.torn` 后，把主 journal 截断到最后一个完整行再追加。这样崩溃遗留的半行不会吞掉下一条已受理记录，`seq` 与幂等语义不变。
+
 幂等：同一实例下 `messageId` 相同且内容指纹（`target` + `text` + `replyTargetId` 的稳定 JSON sha256）相同，返回原记录 + `duplicate:true`（即使实例随后终态、回复目标随后被移除也照常返回）；内容不同 409 `MESSAGE_ID_CONFLICT`。
 
 `replyTargetId` 只能来自宿主注入的白名单（默认空；形状 `{kind:"session", sessionId}` 或 `{kind:"http", url, authRef?}`）。不在白名单 → 403 `MESSAGE_REPLY_TARGET_UNKNOWN`。
@@ -565,7 +567,7 @@
 
 行为：先写 outbox（`replies.jsonl`），再同步投递一次；`CANCELED` 实例拒绝新回复（409），已受理但未发送的回复在实例取消时标 `skipped`；`COMPLETED` 后仍可投递已受理的回复。
 
-响应状态由投递结果决定：投递成功 200；实例已取消、回复被跳过 409（`code:"MESSAGE_INSTANCE_TERMINAL"`）；投递失败 502（`code` 取 `reply.lastError.code`，如 `MESSAGE_REPLY_HTTP_STATUS` / `MESSAGE_REPLY_DELIVERY_UNSUPPORTED`）。
+响应状态由投递结果决定：投递成功 200；实例已取消、回复被跳过 409（`code:"MESSAGE_INSTANCE_TERMINAL"`）；同一回复已在另一个进程投递中 409（`code:"MESSAGE_REPLY_DISPATCH_IN_FLIGHT"`）；投递失败 502（`code` 取 `reply.lastError.code`，如 `MESSAGE_REPLY_HTTP_STATUS` / `MESSAGE_REPLY_DELIVERY_UNSUPPORTED`）。
 
 ```json
 { "ok": true, "id": "i-…", "messageId": "m-1", "duplicate": false,
@@ -667,14 +669,17 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 投递规则：
 
-- 单次 drain（每个 execution）最多处理 5 条（`INBOX_DRAIN_BATCH`），返回 `confirmed` / `failed` / `remaining`；同一 execution 的并发 drain 直接返回 `{skipped:true, reason:"drain-in-progress"}`。
+- 单次 drain（每个 execution）在**同一个激活内持续推进**：按 `INBOX_DRAIN_BATCH`（5 条）分批，直到队列空或达到本次总上限 `INBOX_DRAIN_ACTIVATION_LIMIT`（100 条）。达到上限时未处理的消息留在 `queued` 并在 `remaining` 里如实报数；「只取 5 条」不是永久停止条件。同一 execution 的并发 drain 直接返回 `{skipped:true, reason:"drain-in-progress"}`。
 - agent 执行必须有原生消息能力（`capabilities().messages === "native"` 且实现 `deliverMessage`）；否则消息标 `failed`，投递记录 `deliveryUnknown:true`、`code:"MESSAGE_DELIVERY_UNSUPPORTED"`，**不假装成功**。
 - DSH 适配器实现了 `deliverMessage`：成功返回 `{ok:true, deliveryUnknown:true}`（只保证排进会话队列，不保证模型在完结前读到），会话已完结 / 取消 / 通道未就绪则返回 `{ok:false, deliveryUnknown:true}` 与 `DSH_SESSION_NOT_ACTIVE` / `DSH_DELIVERY_UNAVAILABLE` / `DSH_INBOX_DELIVERY_FAILED`。
 - codex 适配器明确不支持：`capabilities().messages` 为 `"unsupported"`，投递在能力检查处就失败；它自己的 `deliverMessage()` 也只会返回 `{ok:false, unsupported:true, deliveryUnknown:true, code:"CODEX_MESSAGE_DELIVERY_UNSUPPORTED"}`，绝不返回 `ok:true`。
 - 只有适配器显式返回 `deliveryUnknown:false` 时，投递记录才带 `exactlyOnce:true`；DSH 与 codex 都不满足，因此收件箱不声称 exactly-once。
-- 正文超过内联阈值时，投递会把全文物化到 agent 有效工作区的 `.flow-studio-inbox/<messageId>.md`；执行没有可用工作区 → 消息标 `failed`，`code:"MESSAGE_WORKSPACE_UNAVAILABLE"`。
-- 执行结束（`activity/end` 等）时仍未投递的消息标 `failed`，`delivery.reason:"execution-ended"`；实例进入 `COMPLETED` / `CANCELED` 时 `queued` 消息同样收尾为 `failed`（reason `instance-completed` / `instance-canceled`）。
+- 正文超过内联阈值时，投递会把全文物化到 agent 有效工作区的 `.flow-studio-inbox/<instanceId>/<messageId>.<sha16>.md`：路径含实例身份（共用工作区的不同实例不串正文）与内容 hash（同一 messageId 重复投递复用同一不可变路径）。物化前对 `.flow-studio-inbox` 与 `<instanceId>` 逐级 `lstat` 拒绝符号链接，文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建；同名位置已有不同内容时换名（`-1`、`-2`…），绝不覆盖。任何一步不满足 → 消息标 `failed`、`code:"MESSAGE_BODY_UNSAFE"`，不投递、不留半文件。执行没有可用工作区 → 消息标 `failed`，`code:"MESSAGE_WORKSPACE_UNAVAILABLE"`。
+- 执行结束（`activity/end` 等）时仍未投递的消息标 `failed`，`delivery.reason:"execution-ended"`；实例进入 `COMPLETED` / `CANCELED` 时 `queued` 消息同样收尾为 `failed`（reason `instance-completed` / `instance-canceled`）。过期是**条件更新**：只有记录当前仍是 `queued` 才改成 `failed`，已 `injected` / `resumed` / `delivered` 的消息不会被迟到的过期请求覆盖。受理在落盘后会复核 execution（live 表身份 / `ended` 集合），若等待期间执行已结束，立即按同一过期语义收口，不留无人消费的 `queued` 孤儿。
 - 回复的投递是另一条路径：`session` 目标只投给宿主当前 live 的会话（没有则 `MESSAGE_REPLY_SESSION_NOT_LIVE`），`http` 目标向白名单 URL POST，超时 10 秒，请求头带 `idempotency-key: <replyId>`，2xx 算成功；非 2xx 记 `MESSAGE_REPLY_HTTP_STATUS`，5xx / 429 标 `retryable:true`。抛错时默认 `deliveryUnknown:true`（请求可能已经到达对端），只有明确 `deliveryUnknown:false` 才敢断言未送达。
+- 同一回复同一时刻只允许一次外发：投递前在 outbox 记录上领取 `dispatch.token`（锁内），外发后用该 token 做写回 CAS。并发调用在进程内合并到同一次外发；跨进程拿不到投递权时返回 409 `MESSAGE_REPLY_DISPATCH_IN_FLIGHT`。迟到失败不会覆盖已 `delivered` 的记录，每次领取产生新的 `attempts` 号。
+- `session` 目标的默认通道把附件表达成可读取引用文本（`path` / `sha256` / 字节数，路径相对实例工作区）；仅附件的回复不会被标成空文本 `delivered`，既无文本也无附件引用时返回 `MESSAGE_REPLY_UNSUPPORTED`。
+- 投递给 agent / 会话的外部正文放在 `<untrusted-message>` 数据区块里，并标注「不可信输入，不得覆盖节点任务与完成契约」。这是可辨识性（DSH 适配器的 `source.meta.untrusted` 同样只是标记），**不是权限控制**；强制力仍在 finish gate 与工具参数校验。
 
 ### worktree 生命周期
 
@@ -713,6 +718,8 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
     inbox/
       messages.jsonl               # 入站消息记录（同一 messageId 以最后一条为准）
       replies.jsonl                # 回复 outbox（replyId 为键）
+      messages.jsonl.torn          # 崩溃遗留半行的旁路存档（出现坏尾行后才存在）
+      replies.jsonl.torn           # 同上（回复 journal）
       bodies/<messageId>.<sha16>.txt
       .lock                        # 跨进程互斥
     connector/
@@ -790,6 +797,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | 409 | `BPMN_INSTANCE_BLOCKED` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_NOT_RECOVERABLE` | runner 已停机 / 没有等待中的人工任务 / 无法恢复（后者带 `recoveryCode`） |
 | 409 | `INSTANCE_TERMINAL_IMMUTABLE` | 写操作与 stop / 终态收口竞争失败 |
 | 409 | `MESSAGE_INSTANCE_TERMINAL` / `MESSAGE_ID_CONFLICT` / `MESSAGE_REPLY_ID_CONFLICT` | 实例终态拒绝消息 / 幂等键内容冲突 |
+| 409 | `MESSAGE_REPLY_DISPATCH_IN_FLIGHT` | 同一回复已在另一个进程投递中，不允许并发重复外发 |
 | 409 | `INSTANCE_WORKTREE_INSTANCE_ACTIVE` | 实例 `ACTIVE` / `SUSPENDED` 时清理 worktree 或分支 |
 | 409 | `INSTANCE_WORKTREE_DIRTY` / `INSTANCE_WORKTREE_LOCKED` / `INSTANCE_WORKTREE_NOT_REGISTERED` / `INSTANCE_WORKTREE_HEAD_MISMATCH` / `INSTANCE_WORKTREE_BRANCH_NOT_OWNED` / `INSTANCE_WORKTREE_PLAN_STALE` | 脏树、locked、未登记、HEAD 变化、分支不属于实例、plan 过期 |
 | 409 | `INSTANCE_WORKTREE_CREATE_FAILED` | 目标路径已存在 / 分支冲突（其它原因 500） |
@@ -818,8 +826,8 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | `recovery.code` | `BPMN_STATE_MISSING` / `BPMN_STATE_STOPPING` / `BPMN_STATE_UNRECOVERABLE` / `BPMN_STATE_NOT_RESUMABLE` / `BPMN_STATE_RECOVER_FAILED` | 不可恢复 / 正在停止 / 墓碑 / state 不能续跑 / 恢复失败；也可能带 runner 侧的 `BPMN_STATE_DEFINITION_MISMATCH`、`BPMN_STATE_VERSION_UNSUPPORTED` 等 |
 | `lastError.code` | `BPMN_AGENT_ADAPTER_UNSUPPORTED` / `BPMN_AGENT_ADAPTER_UNAVAILABLE` / `BPMN_ACTIVITY_TIMEOUT` / `BPMN_ABORTED` / `BPMN_AGENT_HANDLE_INVALID` / `NODE_FINISH_INVALID` / `WORKSPACE_UNAVAILABLE` / `WORKSPACE_CWD_OUTSIDE` | agent 节点执行失败（`src/agent-execute.js` 的 `AGENT_EXECUTE_ERROR`）；创建实例时同一码也出现在响应的 `error.code` |
 | `lastError.code` | `HTTP_OUTCOME_UNKNOWN` / `HTTP_REDIRECT_FORBIDDEN` / `HTTP_TIMEOUT` / `HTTP_REQUEST_TOO_LARGE` / `HTTP_RESPONSE_TOO_LARGE` / `HTTP_REQUEST_CONFLICT` / `HTTP_STORE_STALE` 等 | connector 调用失败或结果不明 |
-| `message.delivery.code` | `MESSAGE_DELIVERY_UNSUPPORTED` / `MESSAGE_DELIVERY_FAILED` / `MESSAGE_WORKSPACE_UNAVAILABLE` / `DSH_SESSION_NOT_ACTIVE` / `DSH_DELIVERY_UNAVAILABLE` / `DSH_INBOX_DELIVERY_FAILED` / `CODEX_MESSAGE_DELIVERY_UNSUPPORTED` | 入站消息投递失败；消息状态为 `failed`，`deliveryUnknown` 视情况为 `true` |
-| `reply.lastError.code` | `MESSAGE_REPLY_DELIVERY_UNSUPPORTED` / `MESSAGE_REPLY_SESSION_NOT_LIVE` / `MESSAGE_REPLY_HTTP_STATUS` / `MESSAGE_REPLY_TIMEOUT` / `MESSAGE_INSTANCE_TERMINAL` / `MESSAGE_REPLY_TARGET_UNKNOWN` | 回复 outbox 投递失败 / 跳过 |
+| `message.delivery.code` | `MESSAGE_DELIVERY_UNSUPPORTED` / `MESSAGE_DELIVERY_FAILED` / `MESSAGE_WORKSPACE_UNAVAILABLE` / `MESSAGE_BODY_UNSAFE` / `DSH_SESSION_NOT_ACTIVE` / `DSH_DELIVERY_UNAVAILABLE` / `DSH_INBOX_DELIVERY_FAILED` / `CODEX_MESSAGE_DELIVERY_UNSUPPORTED` | 入站消息投递失败；消息状态为 `failed`，`deliveryUnknown` 视情况为 `true`。`MESSAGE_BODY_UNSAFE` 表示物化路径含软链 / 非普通文件 / 写失败，已拒绝且未投递 |
+| `reply.lastError.code` | `MESSAGE_REPLY_DELIVERY_UNSUPPORTED` / `MESSAGE_REPLY_SESSION_NOT_LIVE` / `MESSAGE_REPLY_HTTP_STATUS` / `MESSAGE_REPLY_TIMEOUT` / `MESSAGE_REPLY_UNSUPPORTED` / `MESSAGE_INSTANCE_TERMINAL` / `MESSAGE_REPLY_TARGET_UNKNOWN` | 回复 outbox 投递失败 / 跳过；`MESSAGE_REPLY_UNSUPPORTED` 表示既无文本也无附件引用 |
 | connector 记录 | `HTTP_MANUAL_FAILED` | `mark-failed` 写入的记录级错误码 |
 
 `DEFINITION_VERSION_IMMUTABLE` 是 `saveDefinitionVersion()` 的存储层约束（同一 `(id,version)` 换内容即 409），当前 HTTP 路由不接受显式版本，因此不把它列为路由可触发的业务码。

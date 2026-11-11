@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -241,6 +241,105 @@ await check('重启后 queued 可恢复；损坏半行不阻断后续记录', as
   ok(page.messages.every(item => item.status === 'queued'), 'queued 状态从 journal 恢复')
   const body = await reloaded.readMessageBody(instanceId, 'm-spill')
   eq(body.text.length > 0, true, '落盘正文重启后仍可读')
+})
+
+// 回归 N5：崩溃遗留的尾部半行必须在追加前隔离，否则下一条已受理记录会被整行吞掉。
+await check('journal 尾部半行：锁内转存 .torn + 截断，新记录可读且 seq 连续', async () => {
+  const repairedId = 'i-store-torn'
+  const store = storeAt()
+  const first = await store.acceptMessage({ instanceId: repairedId, messageId: 't-1', target, text: '第一条' })
+  const journal = join(instancesRoot, repairedId, 'inbox', 'messages.jsonl')
+  appendFileSync(journal, '{"messageId":"crashed"', 'utf8')
+  const second = await store.acceptMessage({ instanceId: repairedId, messageId: 't-2', target, text: '第二条' })
+  eq(second.record.seq, 2, '新记录拿到连续 seq')
+  eq((await store.readMessage(repairedId, 't-2'))?.messageId, 't-2', '新记录可读（没被坏尾行吞掉）')
+  eq((await store.listMessages(repairedId)).total, 2)
+  const tornLines = readFileSync(`${journal}.torn`, 'utf8').trim().split('\n')
+  eq(tornLines.length, 1, '坏尾行转存到 .torn 旁路文件')
+  const envelope = JSON.parse(tornLines[0])
+  eq(envelope.journal, 'messages.jsonl')
+  eq(envelope.bytes, Buffer.byteLength('{"messageId":"crashed"', 'utf8'))
+  eq(Buffer.from(envelope.rawBase64, 'base64').toString('utf8'), '{"messageId":"crashed"', '原始字节可恢复')
+  const again = await store.acceptMessage({ instanceId: repairedId, messageId: 't-1', target, text: '第一条' })
+  eq(again.duplicate, true, '原有幂等语义不变')
+  eq(again.record.seq, first.record.seq, '幂等返回原 seq')
+})
+
+// 回归 N7：过期必须是条件更新，已投递消息不会被 execution 结束改成 failed。
+await check('过期条件更新：已投递消息不被 execution 结束改成 failed', async () => {
+  const expireId = 'i-store-expire'
+  const store = storeAt()
+  await store.acceptMessage({ instanceId: expireId, messageId: 'done-1', target, text: '已投递' })
+  await store.acceptMessage({ instanceId: expireId, messageId: 'queued-1', target, text: '未投递' })
+  await store.updateMessage(expireId, 'done-1', { status: 'injected' })
+  const expired = await store.expireQueuedForExecution(expireId, target.executionId, 'execution-ended')
+  eq(expired.length, 1, '只收口仍 queued 的消息')
+  eq(expired[0].messageId, 'queued-1')
+  eq((await store.readMessage(expireId, 'done-1')).status, 'injected', '已投递状态不被覆盖')
+  eq((await store.readMessage(expireId, 'queued-1')).status, 'failed')
+})
+
+// 回归 N6：领取投递权 + token/rev CAS；迟到失败不能覆盖已成功的 delivered。
+await check('回复投递权：claim 独占、写回 CAS、迟到失败不覆盖 delivered', async () => {
+  const claimId = 'i-store-claim'
+  const store = storeAt()
+  await store.acceptReply({ instanceId: claimId, messageId: 'm', replyId: 'r-1', targetId: 'dest', text: 'answer' })
+  const claim = await store.claimReplyDispatch(claimId, 'r-1')
+  eq(claim.claimed, true, '第一条调用链拿到投递权')
+  eq(claim.attempt, 1, '领取即产生新的 attempt 号')
+  const competing = await store.claimReplyDispatch(claimId, 'r-1')
+  eq(competing.claimed, false, '同一时刻只允许一次外发')
+  eq(competing.reason, 'in-progress')
+
+  const success = await store.completeReplyDispatch(claimId, 'r-1', {
+    token: claim.token,
+    status: 'delivered',
+    attempts: claim.attempt,
+    delivery: { kind: 'session', deliveryUnknown: true },
+  })
+  eq(success.updated, true)
+  eq(success.record.status, 'delivered')
+
+  // 迟到的失败结果（旧 token）不能把 delivered 改回 failed。
+  const late = await store.completeReplyDispatch(claimId, 'r-1', {
+    token: claim.token,
+    status: 'failed',
+    attempts: claim.attempt,
+    lastError: { code: 'LATE_FAILURE', message: '迟到的失败' },
+    delivery: { kind: 'session', deliveryUnknown: true },
+  })
+  eq(late.updated, false, '已 delivered 后拒绝迟到失败写回')
+  eq(late.record.status, 'delivered')
+  eq((await store.readReply(claimId, 'r-1')).status, 'delivered')
+
+  // 明确失败后可以重新领取并重试；token 不匹配的写回被拒绝。
+  await store.acceptReply({ instanceId: claimId, messageId: 'm', replyId: 'r-2', targetId: 'dest', text: 'retry' })
+  const claim2 = await store.claimReplyDispatch(claimId, 'r-2')
+  const failed = await store.completeReplyDispatch(claimId, 'r-2', {
+    token: claim2.token,
+    status: 'failed',
+    attempts: claim2.attempt,
+    lastError: { code: 'MESSAGE_REPLY_HTTP_STATUS', message: 'HTTP 500' },
+    delivery: { kind: 'http', deliveryUnknown: true, status: 500 },
+  })
+  eq(failed.updated, true)
+  eq((await store.readReply(claimId, 'r-2')).status, 'failed')
+  const claim3 = await store.claimReplyDispatch(claimId, 'r-2')
+  eq(claim3.claimed, true, '明确失败后允许重试')
+  eq(claim3.attempt, 2, '重试拿到新的 attempt 号')
+  const stale = await store.completeReplyDispatch(claimId, 'r-2', {
+    token: claim2.token,
+    status: 'delivered',
+    attempts: claim2.attempt,
+  })
+  eq(stale.updated, false, '旧 token 不能写回（投递权已被新一次重试接管）')
+  await store.completeReplyDispatch(claimId, 'r-2', {
+    token: claim3.token,
+    status: 'delivered',
+    attempts: claim3.attempt,
+    delivery: { kind: 'http', deliveryUnknown: false, status: 200 },
+  })
+  eq((await store.readReply(claimId, 'r-2')).attempts, 2)
 })
 
 rmSync(home, { recursive: true, force: true })

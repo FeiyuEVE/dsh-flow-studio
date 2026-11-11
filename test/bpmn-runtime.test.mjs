@@ -2923,6 +2923,76 @@ try {
   })
 
   // -------------------------------------------------------------------------
+  // 12c. 默认 session 回复：仅附件也要传递可读取引用，不能标成功却收到空文本
+  // -------------------------------------------------------------------------
+  await check('默认 session 回复：仅附件传递 path/sha256 引用，不静默丢内容', async home => {
+    const { writeWorkspaceSnapshot } = await import('../src/instance-resources.js')
+    const instancesRoot = join(home, 'instances')
+    const instanceId = 'i-doc-reply'
+    const workspace = join(home, 'workspace')
+    mkdirSync(join(instancesRoot, instanceId), { recursive: true })
+    mkdirSync(workspace, { recursive: true })
+    const at = new Date().toISOString()
+    writeFileSync(join(instancesRoot, instanceId, 'instance.json'), JSON.stringify({
+      id: instanceId,
+      definitionId: 'flow-doc',
+      definitionVersion: 1,
+      definitionHash: 'a'.repeat(64),
+      status: 'ACTIVE',
+      variables: {},
+      result: null,
+      artifacts: [],
+      lastError: null,
+      pendingTasks: [],
+      revision: 1,
+      eventCount: 0,
+      lastSeq: 0,
+      createdAt: at,
+      updatedAt: at,
+      completedAt: null,
+      definitionSnapshot: 'definition.bpmn',
+    }), 'utf8')
+    writeFileSync(join(workspace, 'answer.md'), 'report content', 'utf8')
+    await writeWorkspaceSnapshot({ instancesRoot, instanceId, snapshot: { effectiveRoot: workspace } })
+    const received = []
+    const runtime = createBpmnRuntime({
+      dir: home,
+      instancesRoot,
+      // 默认 session 通道（不注入 inboxSessionDeliver）：从 ctx.agents 取 live 会话。
+      ctx: { get: () => ({ get: () => ({ followup: message => received.push(message) }) }) },
+      inboxReplyTargets: { dest: { kind: 'session', sessionId: 's' } },
+    })
+    try {
+      await runtime.inbox.registerExecution({ instanceId, activityId: 'human', executionId: 'e', kind: 'human' })
+      await runtime.inbox.acceptInstanceMessage({
+        instanceId,
+        messageId: 'm',
+        target: { activityId: 'human', executionId: 'e' },
+        text: 'request',
+        replyTargetId: 'dest',
+      })
+      const res = await runtime.handle({
+        method: 'POST',
+        parts: ['instances', instanceId, 'messages', 'm', 'replies'],
+        body: { replyId: 'doc', document: { path: 'answer.md' } },
+      })
+      eq(res.status, 200)
+      eq(res.body.ok, true)
+      eq(res.body.reply.status, 'delivered')
+      eq(received.length, 1)
+      const text = received[0].content[0].text
+      ok(typeof text === 'string' && text.trim() !== '', 'delivered 的正文不能为空')
+      ok(text.includes('answer.md'), '附件 path 进入会话正文（可读取引用）')
+      ok(text.includes(res.body.reply.document.sha256), '附件 sha256 进入会话正文')
+      ok(text.includes(String(res.body.reply.document.bytes)), '附件字节数进入会话正文')
+      eq(received[0].source.meta.untrusted, true, '外部回复在 source.meta 标不可信')
+      eq(received[0].source.flowStudio.documentPath, 'answer.md', '附件 path 也进 provenance')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
   // 13. 防回潮：新域代码不把 failed / blocked 当实例状态字面量
   // -------------------------------------------------------------------------
   await check('防回潮：instance-store / bpmn-runtime 不出现 failed/blocked 实例状态字面量', async () => {

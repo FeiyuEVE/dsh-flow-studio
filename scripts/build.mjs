@@ -56,6 +56,7 @@ export const HOST_MODULES = [
   'node-check.js',
   'definition-store.js',
   'instance-store.js',
+  'instance-owner.js',
   'instance-resources.js',
   'workspace-policy.js',
   'instance-worktree.js',

@@ -485,7 +485,7 @@ await check('挂起 / 恢复：状态与事件同一次写入；终态拒绝；�
   const { instance, dir } = await seed(home, 'flow-suspend-status')
   const suspended = await store.appendInstanceEvents(instance.id, 'process', 1, [
     { type: 'instance/suspended', reason: '维护' },
-  ], { home, status: 'SUSPENDED' })
+  ], { home, status: 'SUSPENDED', expectedStatus: 'ACTIVE' })
   eq(suspended.instance.status, 'SUSPENDED', '状态与事件一起落盘')
   eq(suspended.lastSeq, instance.lastSeq + 1, 'seq 只涨一条')
   const reopened = await store.readInstance(instance.id, { home })
@@ -495,7 +495,7 @@ await check('挂起 / 恢复：状态与事件同一次写入；终态拒绝；�
 
   const resumed = await store.appendInstanceEvents(instance.id, 'process', 1, [
     { type: 'instance/resumed', reason: '完成' },
-  ], { home, status: 'ACTIVE' })
+  ], { home, status: 'ACTIVE', expectedStatus: 'SUSPENDED' })
   eq(resumed.instance.status, 'ACTIVE')
   eq((await store.readInstance(instance.id, { home })).status, 'ACTIVE')
 
@@ -506,11 +506,204 @@ await check('挂起 / 恢复：状态与事件同一次写入；终态拒绝；�
   )
   await store.completeInstance(instance.id, 'CANCELED', { home })
   await rejects(
-    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], { home, status: 'SUSPENDED' }),
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], { home, status: 'SUSPENDED', expectedStatus: 'ACTIVE' }),
     error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
     '终态后不允许再接挂起事件',
   )
   eq(existsSync(join(dir, 'events', 'process', '1.jsonl')), true, '挂起 / 恢复事件分片存在')
+})
+
+await check('0.14.4 SUSPENDED 闸门：普通追加 409 且零字节；生命周期必须 CAS；metaPatch 同次提交', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-gate-0144')
+  const suspended = await store.appendInstanceEvents(instance.id, 'process', 1, [
+    { type: 'instance/suspended', reason: '维护' },
+  ], { home, status: 'SUSPENDED', expectedStatus: 'ACTIVE' })
+  eq(suspended.instance.status, 'SUSPENDED')
+  const before = readFileSync(join(dir, 'instance.json'), 'utf8')
+  const beforeEvents = (await store.readInstanceEvents(instance.id, { home })).length
+
+  // 普通追加：一个字节都不写（instance.json 与事件分片都不变）。
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'activity/wait', at: '2026-11-12T00:00:00.000Z' }], { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
+    'SUSPENDED 下普通追加必须 409 INSTANCE_SUSPENDED',
+  )
+  eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, '被拒绝的追加不改 instance.json')
+  eq((await store.readInstanceEvents(instance.id, { home })).length, beforeEvents, '被拒绝的追加不写事件行')
+  eq(existsSync(join(dir, 'events', 'process', '1.jsonl')), true, '原有挂起分片保持不变')
+
+  // status 必须带 expectedStatus。
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/resumed' }], { home, status: 'ACTIVE' }),
+    error => error.status === 400 && error.code === 'INSTANCE_EXPECTED_STATUS_REQUIRED',
+    '带 status 不带 expectedStatus 必须 400',
+  )
+
+  // 期望状态不符 → 409 INSTANCE_LIFECYCLE_CONFLICT，零写入。
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], {
+      home, status: 'SUSPENDED', expectedStatus: 'ACTIVE',
+    }),
+    error => error.status === 409
+      && error.code === 'INSTANCE_LIFECYCLE_CONFLICT'
+      && error.actualStatus === 'SUSPENDED',
+    'CAS 不符必须 409 INSTANCE_LIFECYCLE_CONFLICT（带 actualStatus）',
+  )
+  eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, 'CAS 冲突不改 instance.json')
+  eq((await store.readInstanceEvents(instance.id, { home })).length, beforeEvents, 'CAS 冲突不写事件')
+
+  // 恢复：事件 + 状态一次提交；metaPatch 也能同时写。
+  const resumed = await store.appendInstanceEvents(instance.id, 'process', 1, [
+    { type: 'instance/resumed', reason: '完成' },
+  ], {
+    home,
+    status: 'ACTIVE',
+    expectedStatus: 'SUSPENDED',
+    metaPatch: {
+      lastError: { code: 'BPMN_RECOVERED', message: '恢复' },
+      pendingTasks: [],
+      executionFailure: null,
+    },
+  })
+  eq(resumed.instance.status, 'ACTIVE')
+  eq(resumed.instance.lastError.code, 'BPMN_RECOVERED', 'metaPatch.lastError 与事件同次落盘')
+  deep(resumed.instance.pendingTasks, [])
+  eq(resumed.instance.revision, suspended.instance.revision + 1, '一次提交只涨一次 revision')
+
+  // metaPatch 白名单：variables 不许混进事件提交。
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'x' }], {
+      home, metaPatch: { variables: { hacked: true } },
+    }),
+    error => error.status === 400 && error.code === 'INSTANCE_PATCH_INVALID',
+    'metaPatch 只允许 lastError / pendingTasks / executionFailure',
+  )
+})
+
+await check('0.14.4 updateInstance / completeInstance / writeInstanceState 的 SUSPENDED 规则', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-suspend-guards')
+  await store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], {
+    home, status: 'SUSPENDED', expectedStatus: 'ACTIVE',
+  })
+  const before = readFileSync(join(dir, 'instance.json'), 'utf8')
+
+  await rejects(
+    () => store.updateInstance(instance.id, { status: 'ACTIVE' }, { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED_IMMUTABLE',
+    'SUSPENDED 下 updateInstance(ACTIVE) 必须 409 INSTANCE_SUSPENDED_IMMUTABLE',
+  )
+  eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, '被拒的状态写不改字节')
+
+  // 从 ACTIVE 直接改成 SUSPENDED：只走生命周期路由。
+  const { instance: other } = await seed(home, 'flow-lifecycle-route')
+  await rejects(
+    () => store.updateInstance(other.id, { status: 'SUSPENDED' }, { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_LIFECYCLE_USE_ROUTE',
+    'updateInstance 不能把 ACTIVE 改成 SUSPENDED',
+  )
+
+  // 受限字段在 SUSPENDED 下允许写（错误事实通道）。
+  const patched = await store.updateInstance(instance.id, {
+    lastError: { code: 'BPMN_ACTIVITY_TIMEOUT', message: '超时' },
+    pendingTasks: [],
+  }, { home })
+  eq(patched.status, 'SUSPENDED', '非 status 字段不改变挂起状态')
+  eq(patched.lastError.code, 'BPMN_ACTIVITY_TIMEOUT')
+
+  await rejects(
+    () => store.completeInstance(instance.id, 'COMPLETED', { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
+    'SUSPENDED 下 completeInstance(COMPLETED) 必须 409 INSTANCE_SUSPENDED',
+  )
+  const canceled = await store.completeInstance(instance.id, 'CANCELED', { home })
+  eq(canceled.status, 'CANCELED', 'SUSPENDED 下 stop（CANCELED）仍可用')
+
+  const { instance: stateInstance } = await seed(home, 'flow-state-suspend')
+  await store.appendInstanceEvents(stateInstance.id, 'process', 1, [{ type: 'instance/suspended' }], {
+    home, status: 'SUSPENDED', expectedStatus: 'ACTIVE',
+  })
+  await rejects(
+    () => store.writeInstanceState(stateInstance.id, { savedAt: 'x', state: { step: 1 } }, { home }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
+    'SUSPENDED 下不得写引擎快照',
+  )
+  await rejects(
+    () => store.writeInstanceState(stateInstance.id, { kind: 'tombstone', engine: null }, {
+      home, allowWhileSuspended: true,
+    }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
+    'allowWhileSuspended 只接受带 unrecoverable 的墓碑形状',
+  )
+  const tombstone = await store.writeInstanceState(stateInstance.id, {
+    v: 2,
+    kind: 'dsh-flow-studio/bpmn-runner-state',
+    unrecoverable: { code: 'BPMN_ACTIVITY_TIMEOUT', message: '超时', at: '2026-11-12T00:00:00.000Z' },
+    engine: null,
+  }, { home, allowWhileSuspended: true })
+  eq(typeof tombstone.savedAt, 'string', '错误墓碑在 SUSPENDED 下允许写')
+})
+
+await check('0.14.4 读快照：watermark 只到可见事件，分配未落盘给 gap；eventsHash 稳定', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-snapshot')
+  const first = await store.appendInstanceEvents(instance.id, 'task-a', 1, [
+    activity(1), activity(2),
+  ], { home })
+  eq(first.lastSeq, 2)
+  const snap = await store.readInstanceSnapshot(instance.id, { home })
+  eq(snap.lastSeq, 2, 'lastSeq 等于可见最大 seq')
+  eq(snap.watermark, 2)
+  eq(snap.gap, null, '没有缺口时 gap 为 null')
+  ok(typeof snap.eventsHash === 'string' && snap.eventsHash.length === 64, 'eventsHash 是 sha256')
+
+  // 制造「元数据 lastSeq=7、可见事件最大 seq=2」的分配窗口：直接改 instance.json。
+  const raw = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'))
+  raw.lastSeq = 7
+  raw.eventCount = 2
+  writeFileSync(join(dir, 'instance.json'), `${JSON.stringify(raw, null, 2)}\n`)
+
+  const gapSnap = await store.readInstanceSnapshot(instance.id, { home })
+  eq(gapSnap.lastSeq, 2, 'lastSeq 不得越过实际可见事件')
+  eq(gapSnap.watermark, 2)
+  eq(gapSnap.gap.allocated, 7)
+  eq(gapSnap.gap.visible, 2)
+  deep(gapSnap.gap.missing, [3, 4, 5, 6, 7], 'missing 列出不可见 seq')
+  eq((await store.readInstanceSnapshot('i-missing', { home })), null, '不存在实例返回 null')
+})
+
+await check('0.14.4 recordExecutionFailure：挂起下写一条 error + lastError + 清空待办 + executionFailure', async ({ home }) => {
+  const { instance } = await seed(home, 'flow-failure-facts')
+  await store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], {
+    home, status: 'SUSPENDED', expectedStatus: 'ACTIVE',
+  })
+  const before = await store.readInstance(instance.id, { home })
+  eq(before.pendingTasks.length, 0)
+
+  const recorded = await store.recordExecutionFailure(instance.id, {
+    home,
+    lastError: { code: 'BPMN_ACTIVITY_TIMEOUT', message: '人工任务超时', activityId: 'exec-1', nodeId: 'human1' },
+    event: { type: 'error', error: { code: 'BPMN_ACTIVITY_TIMEOUT', message: '人工任务超时' }, elementId: 'human1' },
+    activityId: 'process',
+    attempt: 1,
+  })
+  eq(recorded.instance.status, 'SUSPENDED', '错误事实不改变挂起状态')
+  eq(recorded.instance.lastError.code, 'BPMN_ACTIVITY_TIMEOUT')
+  deep(recorded.instance.pendingTasks, [], '失效待办必须清空')
+  eq(recorded.instance.executionFailure.code, 'BPMN_ACTIVITY_TIMEOUT')
+  eq(typeof recorded.instance.executionFailure.at, 'string')
+
+  const events = await store.readInstanceEvents(instance.id, { home })
+  const errors = events.filter(event => event.type === 'error')
+  eq(errors.length, 1, '恰好一条 error 事件')
+  eq(errors[0].error.code, 'BPMN_ACTIVITY_TIMEOUT')
+
+  // 挂起下非 error 事件仍被拒（allowWhileSuspended 只放行错误事实）。
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'activity/start' }], {
+      home, allowWhileSuspended: true,
+    }),
+    error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
+    'allowWhileSuspended 只接受 error 事件',
+  )
 })
 
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

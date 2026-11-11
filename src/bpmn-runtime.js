@@ -42,6 +42,7 @@
  */
 
 import { Buffer } from 'node:buffer'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -64,10 +65,18 @@ import {
   readInstance,
   readInstanceDefinition,
   readInstanceEvents,
+  readInstanceSnapshot,
   readInstanceState,
+  recordExecutionFailure,
   updateInstance,
   writeInstanceState,
 } from './instance-store.js'
+import {
+  claimInstanceOwner,
+  readInstanceOwner,
+  releaseInstanceOwner,
+  selfOwner,
+} from './instance-owner.js'
 import { parseBpmn } from './bpmn-parse.js'
 import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
 import { createConnectorStore } from './connector-store.js'
@@ -331,6 +340,18 @@ function errorText(error) {
 }
 
 /** 把 store / runner 的错误收敛成 HTTP 结果；无法识别的一律 500。 */
+/**
+ * 收口撞上挂起 / 生命周期 CAS 冲突：磁盘事实已经赢了，调用方不再当成写失败。
+ * 与终态保护（`INSTANCE_TERMINAL_IMMUTABLE`）区分：后者仍要按 stop 抢收报给调用方。
+ */
+function isLifecycleSuspendedError(error) {
+  const code = typeof error?.code === 'string' ? error.code : ''
+  return code === 'INSTANCE_SUSPENDED'
+    || code === 'INSTANCE_SUSPENDED_IMMUTABLE'
+    || code === 'INSTANCE_LIFECYCLE_CONFLICT'
+    || code === 'INSTANCE_LIFECYCLE_USE_ROUTE'
+}
+
 function errorResult(error) {
   if (error instanceof BpmnRuntimeError) {
     return { status: error.status, body: error.toPayload() }
@@ -706,14 +727,31 @@ class BpmnRuntime {
     this._suppressWait = new Map()
     /** @type {Map<string, {code: string, message: string}>} runner 失败的结构化原因 */
     this._runnerErrors = new Map()
+    /** 本 runtime 实例的随机 id：区分同进程多个 runtime 的执行所有权。 */
+    this.runtimeId = randomUUID()
     /** @type {Set<string>} 停止闩：置位后该实例的迟到事件与懒恢复一律不再推进 */
     this._stopping = new Set()
     /**
-     * @type {Set<string>} 挂起闩（0.14.3）：置位后不懒恢复、不派发、迟到事件不落盘。
-     * 磁盘上的 `instance.json.status === 'SUSPENDED'` 是权威事实；本集合只覆盖同一进程内
-     * 「挂起 / 恢复」与迟到异步事件交错的窗口。
+     * @type {Map<string, number>} 未完成的事件提交计数（0.14.4）。
+     *
+     * `_onRunnerEvent` 在**同步**入队前 +1，队内任务 `finally` 里 -1。挂起看到 >0
+     * 说明还有事件在排队 / 在写盘，返回 409 BUSY（kind: 'event-queue'），不把「已出队」
+     * 当成「已完成」。
      */
-    this._suspended = new Set()
+    this._pendingEventCommits = new Map()
+    /**
+     * @type {Map<string, number>} 首次 workspace / 定义准备 + 首次启动的临时计数（MAJOR-4）。
+     * 准备期间挂起会打断创建流程，所以 `_createInstance` 从准备开始到首次 start 收口
+     * 期间持有它，`_suspendBusy` 看到 >0 → 409 BUSY（kind: 'preparing'）。
+     */
+    this._preparing = new Map()
+    /** @type {Set<string>} 本 runtime 持有 `owner.json` 的实例（dispose / 终态时释放）。 */
+    this._ownedInstances = new Set()
+    /**
+     * @type {Map<string, object[]>} 被丢弃的迟到事件诊断（有界，最近 20 条 / 实例）。
+     * 挂起后晚到的推进事件不写事件流，但保留「发生过什么」用于排障。
+     */
+    this._eventDiagnostics = new Map()
     /** @type {Map<string, Map<string, {elementId: string|null, executionId: string|null}>>} */
     this._activeAgentActivities = new Map()
     /** @type {Map<string, object>} instanceId → 最后一个成功 agent 节点的 output（process/end 用） */
@@ -936,7 +974,17 @@ class BpmnRuntime {
     this._attempts.clear()
     this._suppressWait.clear()
     this._stopping.clear()
-    this._suspended.clear()
+    this._pendingEventCommits.clear()
+    this._preparing.clear()
+    this._eventDiagnostics.clear()
+    for (const instanceId of [...this._ownedInstances]) {
+      try {
+        await releaseInstanceOwner(instanceId, { instancesRoot: this.instancesRoot, runtimeId: this.runtimeId })
+      } catch {
+        // 释放所有权失败不阻塞 dispose：下一位持有者会看到 stale owner 并自行接管。
+      }
+    }
+    this._ownedInstances.clear()
     this._activeAgentActivities.clear()
     this._runnerErrors.clear()
     this._lastAgentOutputs.clear()
@@ -1377,6 +1425,9 @@ class BpmnRuntime {
     if (!isPlainObject(state?.unrecoverable)) return false
     try {
       await rm(join(this.instancesRoot, instanceId, 'state.json'), { force: true })
+      // 人工处置同时解除「执行失败」恢复禁止标记：墓碑都没了，实例应回到
+      // 「没有可恢复快照」的 BPMN_STATE_MISSING，而不是继续报旧失败码。
+      await updateInstance(instanceId, { executionFailure: null }, { instancesRoot: this.instancesRoot })
     } catch (error) {
       throw new BpmnRuntimeError(
         500,
@@ -1494,6 +1545,19 @@ class BpmnRuntime {
       instancesRoot: this.instancesRoot,
     })
 
+    // MAJOR-4：从 workspace / 定义准备开始一直到首次 start 收口，都算「创建中」。
+    // 这段窗口里挂起会让首次启动被 SUSPENDED 拒绝，而准备又已经完成——实例既没有
+    // runner 也没有可恢复快照，resume 之后永远 BPMN_STATE_MISSING。这里让它 BUSY。
+    this._bumpPreparing(instance.id, 1)
+    try {
+      return await this._finishCreateInstance(instance, workspaceOption, resolvedWorkspace)
+    } finally {
+      this._bumpPreparing(instance.id, -1)
+    }
+  }
+
+  /** `_createInstance` 的准备 → 首次启动收口（执行期间 `_preparing` 计数非 0）。 */
+  async _finishCreateInstance(instance, workspaceOption, resolvedWorkspace) {
     let workspaceRecord = null
     if (workspaceOption !== null) {
       const prepared = await this._prepareInstanceWorkspace(instance.id, workspaceOption, resolvedWorkspace)
@@ -1696,6 +1760,66 @@ class BpmnRuntime {
     this._workspaces.delete(instanceId)
   }
 
+  /** `_preparing` 计数（>0 = 该实例处于首次创建 / 准备窗口）。 */
+  _bumpPreparing(instanceId, delta) {
+    const next = (this._preparing.get(instanceId) ?? 0) + delta
+    if (next > 0) this._preparing.set(instanceId, next)
+    else this._preparing.delete(instanceId)
+  }
+
+  /** `_pendingEventCommits` 计数（>0 = 还有事件在排队 / 在写盘）。 */
+  _bumpPendingEventCommits(instanceId, delta) {
+    const next = (this._pendingEventCommits.get(instanceId) ?? 0) + delta
+    if (next > 0) this._pendingEventCommits.set(instanceId, next)
+    else this._pendingEventCommits.delete(instanceId)
+  }
+
+  /** 登记本 runtime 的执行所有权（写 `owner.json`）。 */
+  async _claimOwner(instanceId) {
+    const claimed = await claimInstanceOwner(instanceId, {
+      instancesRoot: this.instancesRoot,
+      owner: selfOwner(this.runtimeId),
+    })
+    this._ownedInstances.add(instanceId)
+    return claimed
+  }
+
+  /** 只释放自己写的所有权（runtimeId 不匹配不动别人的记录）。 */
+  async _releaseOwner(instanceId) {
+    if (!this._ownedInstances.has(instanceId)) return false
+    this._ownedInstances.delete(instanceId)
+    try {
+      return await releaseInstanceOwner(instanceId, {
+        instancesRoot: this.instancesRoot,
+        runtimeId: this.runtimeId,
+      })
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * owner 是否属于**另一个进程**。
+   *
+   * 同进程内可能有多个 runtime（测试 / 嵌入方）；那不是「另一个执行进程」，
+   * 由 runner 自己的进程内活跃表兜底（`BPMN_INSTANCE_ID_CONFLICT`）。真正的跨进程
+   * 互斥仍由 pid + bootId + starttime 判定。
+   */
+  _isForeignOwner(ownerInfo) {
+    if (ownerInfo === null || ownerInfo.state === 'gone') return false
+    const owner = isPlainObject(ownerInfo.owner) ? ownerInfo.owner : null
+    if (owner !== null && owner.pid === process.pid && ownerInfo.state === 'alive') return false
+    return true
+  }
+
+  /** 记一条被丢弃的迟到事件诊断（有界：每实例最近 20 条）。 */
+  _recordEventDiagnostic(instanceId, entry) {
+    const list = this._eventDiagnostics.get(instanceId) ?? []
+    list.push({ at: new Date().toISOString(), ...entry })
+    while (list.length > 20) list.shift()
+    this._eventDiagnostics.set(instanceId, list)
+  }
+
   /**
    * 读实例定义快照。抽成方法是为了让测试能暂停「异步准备」这一段，
    * 复现 stop 与启动/恢复的竞态（review-0131 #1）；生产路径就是 store 的直读。
@@ -1773,11 +1897,29 @@ class BpmnRuntime {
       })
     }
 
+    // 新实例不应有别的活进程持有执行；有就说明同一个 id 被两个进程同时启动（配置错误）。
+    const createdOwner = await readInstanceOwner(instanceId, { instancesRoot: this.instancesRoot })
+    if (createdOwner !== null && createdOwner.state === 'alive'
+      && createdOwner.owner?.runtimeId !== this.runtimeId) {
+      throw new BpmnRuntimeError(
+        409,
+        'BPMN_INSTANCE_ACTIVE_ELSEWHERE',
+        `实例 ${instanceId} 的执行所有权被另一个进程（pid ${createdOwner.owner?.pid ?? '?'} @ ${createdOwner.owner?.host ?? '?'}）持有，拒绝重复启动`,
+        { instanceId, owner: createdOwner.owner },
+      )
+    }
     const runner = this._newRunner(parsed.definition, snapshot.xml, instanceId, instance.variables, {
       definitionId: instance.definitionId,
       definitionVersion: instance.definitionVersion,
     })
     this._runners.set(instanceId, runner)
+    try {
+      if (createdOwner?.state !== 'alive') await this._claimOwner(instanceId)
+    } catch (error) {
+      this._runners.delete(instanceId)
+      await runner.stop().catch(() => {})
+      throw error
+    }
     let startError = null
     try {
       await runner.start()
@@ -1850,9 +1992,11 @@ class BpmnRuntime {
   }
 
   async _readEvents(id, url) {
-    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
-    if (instance === null) return instanceNotFound(id)
-    const events = await readInstanceEvents(id, { instancesRoot: this.instancesRoot })
+    // MINOR-1：游标只到**实际可见事件**的最大 seq，不拿 instance.lastSeq（已分配水位）
+    // 冒充可消费水位；分配了但事件行还没落盘时显式给出 eventLogGap。
+    const snapshot = await readInstanceSnapshot(id, { instancesRoot: this.instancesRoot })
+    if (snapshot === null) return instanceNotFound(id)
+    const events = snapshot.events
     const sinceRaw = url.searchParams.get('since')
     let filtered = events ?? []
     if (sinceRaw !== null && sinceRaw !== '') {
@@ -1868,9 +2012,11 @@ class BpmnRuntime {
         ok: true,
         id,
         events: filtered,
-        lastSeq: instance.lastSeq,
-        skipped: events?.skipped ?? 0,
-        shards: events?.shards ?? 0,
+        lastSeq: snapshot.lastSeq,
+        ...(snapshot.gap === null ? {} : { eventLogGap: snapshot.gap }),
+        skipped: snapshot.skipped,
+        shards: snapshot.shards,
+        eventsHash: snapshot.eventsHash,
       },
     }
   }
@@ -2469,7 +2615,8 @@ class BpmnRuntime {
         }
       }
       // 0.14.3：挂起期间不允许完成人工任务（挂起不是「暂停等人点按钮」，是不推进）。
-      if (instance.status === 'SUSPENDED' || this._suspended.has(id)) {
+      // 0.14.4：只认磁盘事实（`_suspended` 内存集合已删除，避免跨进程 resume 后闩仍生效）。
+      if (instance.status === 'SUSPENDED') {
         return {
           status: 409,
           body: {
@@ -2605,8 +2752,6 @@ class BpmnRuntime {
 
     // 停止闩：任何新事件 / 懒恢复 / complete 都不能再把实例写回 running。
     this._stopping.add(id)
-    // 挂起闩解除：stop 直接收成终态，不再保留「不派发」语义。
-    this._suspended.delete(id)
     const runner = this._runners.get(id) ?? null
     if (runner !== null) {
       try {
@@ -2635,6 +2780,7 @@ class BpmnRuntime {
       throw error
     }
     await this._maybeTerminalCleanup(id).catch(() => {})
+    await this._releaseOwner(id)
     await this._finalizeInbox(id, 'CANCELED')
     return {
       status: 200,
@@ -2683,7 +2829,7 @@ class BpmnRuntime {
       if (verdict !== null) return verdict
       const busy = await this._suspendBusy(instance)
       if (busy !== null) return busy
-      return await this._commitLifecycleStatus(instance, 'SUSPENDED', 'instance/suspended', parsed.reason, 'suspendedAt')
+      return await this._commitLifecycleStatus(instance, 'SUSPENDED', 'instance/suspended', parsed.reason, 'suspendedAt', 'ACTIVE')
     })
   }
 
@@ -2704,7 +2850,7 @@ class BpmnRuntime {
       if (instance === null) return instanceNotFound(id)
       const verdict = this._lifecycleVerdict(instance, 'resume')
       if (verdict !== null) return verdict
-      return await this._commitLifecycleStatus(instance, 'ACTIVE', 'instance/resumed', parsed.reason, 'resumedAt')
+      return await this._commitLifecycleStatus(instance, 'ACTIVE', 'instance/resumed', parsed.reason, 'resumedAt', 'SUSPENDED')
     })
   }
 
@@ -2781,6 +2927,44 @@ class BpmnRuntime {
     if (runner !== null && runner.status() === BPMN_RUNNER_STATUS.RUNNING && activities.length === 0) {
       activities.push({ kind: 'engine', activityId: null, executionId: null, state: 'running' })
     }
+    // 0.14.4：还有事件在排队 / 写盘 → 不能挂起。不能把「已出队」当成「已完成」：
+    // 计数只在队内任务 finally 里减；否则挂起会插在事件落盘与状态收口之间。
+    const pendingCommits = this._pendingEventCommits.get(id) ?? 0
+    if (pendingCommits > 0) {
+      activities.push({ kind: 'event-queue', pending: pendingCommits, state: 'pending' })
+    }
+    // MAJOR-4：首次创建 / workspace 准备窗口 → 挂起会打断首次启动，必须 BUSY。
+    const preparing = this._preparing.get(id) ?? 0
+    if (preparing > 0) {
+      activities.push({ kind: 'preparing', pending: preparing, state: 'preparing' })
+    }
+    // MAJOR-1：另一个活进程持有执行所有权 → 它才是在推进实例的人，本进程不能替它挂起。
+    let ownerInfo = null
+    try {
+      ownerInfo = await readInstanceOwner(id, { instancesRoot: this.instancesRoot })
+    } catch (error) {
+      activities.push({
+        kind: 'owner',
+        pid: null,
+        host: null,
+        since: null,
+        state: 'unreadable',
+        error: errorText(error),
+      })
+    }
+    if (ownerInfo !== null) {
+      const owner = isPlainObject(ownerInfo.owner) ? ownerInfo.owner : null
+      const mine = owner !== null && owner.runtimeId === this.runtimeId
+      if (!mine && this._isForeignOwner(ownerInfo)) {
+        activities.push({
+          kind: 'owner',
+          pid: Number.isSafeInteger(owner?.pid) ? owner.pid : null,
+          host: typeof owner?.host === 'string' ? owner.host : null,
+          since: typeof owner?.since === 'string' ? owner.since : null,
+          state: ownerInfo.state,
+        })
+      }
+    }
     // HTTP：started / sent / unknown 都是未结算；succeeded / failed 才算结束。
     try {
       const store = createConnectorStore({ root: join(this.instancesRoot, id, 'connector') })
@@ -2810,6 +2994,13 @@ class BpmnRuntime {
       const target = [item.activityId, item.executionId].filter(value => typeof value === 'string' && value !== '').join('/')
       if (item.kind === 'agent') return `agent 活动${target === '' ? '' : ` ${target}`} 正在执行`
       if (item.kind === 'http') return `HTTP 调用${target === '' ? '' : ` ${target}`} 状态 ${item.state}（未结算）`
+      if (item.kind === 'event-queue') return `还有 ${item.pending} 条事件提交未完成`
+      if (item.kind === 'preparing') return '实例仍在首次创建 / 工作区准备窗口'
+      if (item.kind === 'owner') {
+        const who = [item.pid === null ? null : `pid ${item.pid}`, item.host].filter(value => typeof value === 'string' && value !== '').join(' @ ')
+        const when = typeof item.since === 'string' && item.since !== '' ? `，自 ${item.since}` : ''
+        return `另一个活进程${who === '' ? '' : `（${who}）`}持有执行所有权${when}（状态 ${item.state}）`
+      }
       return `runner 正在执行（${item.state}）`
     }).join('；')
     return {
@@ -2827,7 +3018,7 @@ class BpmnRuntime {
    * 生命周期状态 + 事件一次提交：`appendInstanceEvents` 的 `status` 选项在同一次
    * `instance.json` 写入里改状态，事件行随后追加（崩溃只会留下 seq 空洞）。
    */
-  async _commitLifecycleStatus(instance, status, eventType, reason, timeKey) {
+  async _commitLifecycleStatus(instance, status, eventType, reason, timeKey, expectedStatus) {
     const at = new Date().toISOString()
     const event = {
       type: eventType,
@@ -2840,6 +3031,7 @@ class BpmnRuntime {
       appended = await appendInstanceEvents(instance.id, 'process', 1, event, {
         instancesRoot: this.instancesRoot,
         status,
+        expectedStatus,
       })
     } catch (error) {
       if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') {
@@ -2853,10 +3045,40 @@ class BpmnRuntime {
           },
         }
       }
+      // 条件提交失败 = 状态已经被别的请求改过：不能重试，也不能谎报成功。
+      if (error?.code === 'INSTANCE_LIFECYCLE_CONFLICT') {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: error.code,
+            error: error.reason ?? error.message,
+            actualStatus: error.actualStatus ?? null,
+          },
+        }
+      }
+      // MAJOR-5：状态与事件不是一次写盘——状态已提交、事件追加失败时，磁盘才是事实。
+      // 重新读一次：磁盘已是目标状态就按「已提交、事件日志待补」返回 200，不再让调用方
+      // 误以为迁移没发生；事件正文缺失由读侧 eventLogGap 暴露（不重复补写、不伪造）。
+      const current = await readInstance(instance.id, { instancesRoot: this.instancesRoot })
+      if (current !== null && current.status === status) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            id: instance.id,
+            status,
+            reason: reason ?? null,
+            lastSeq: current.lastSeq,
+            [timeKey]: at,
+            committed: true,
+            eventLogPending: true,
+            eventLogError: error?.code ?? error?.message ?? errorText(error),
+          },
+        }
+      }
       throw error
     }
-    if (status === 'SUSPENDED') this._suspended.add(instance.id)
-    else this._suspended.delete(instance.id)
     return {
       status: 200,
       body: {
@@ -2866,6 +3088,8 @@ class BpmnRuntime {
         reason: reason ?? null,
         lastSeq: appended.lastSeq,
         [timeKey]: at,
+        committed: true,
+        eventLogPending: false,
       },
     }
   }
@@ -3305,6 +3529,8 @@ class BpmnRuntime {
    * 任何失败都只记资源事件，**不改实例状态**。
    */
   async _maybeTerminalCleanup(instanceId, options = {}) {
+    // 终态收口：本 runtime 不再持有执行所有权（别的进程写的记录不会被删）。
+    await this._releaseOwner(instanceId)
     const state = await this._workspaceFor(instanceId)
     if (state.error !== null || state.workspace === null) return
     const workspace = state.workspace
@@ -3792,8 +4018,8 @@ class BpmnRuntime {
       }
     }
     // 0.14.3：挂起（SUSPENDED）不是终态，但和终态一样**不得因读而恢复 / 推进**。
-    // 磁盘 status 是权威事实；`_suspended` 覆盖同进程内的交错窗口。
-    if (instance.status === 'SUSPENDED' || this._suspended.has(instance.id)) {
+    // 0.14.4：只认磁盘 status 这一份权威事实（`_suspended` 内存闩已删除）。
+    if (instance.status === 'SUSPENDED') {
       return {
         runner: null,
         recovered: false,
@@ -3814,11 +4040,66 @@ class BpmnRuntime {
         output: { ...instance.lastAgentOutput.output },
       })
     }
+    // ---------------------------------------------------------------
+    // 0.14.4 执行所有权（跨进程）
+    // ---------------------------------------------------------------
+    // 另一个**活着**的 runtime 持有执行时，本进程既不能恢复 runner，也不能派发
+    // （否则同一个实例会有两个执行器）。坏 JSON / 跨主机是 unknown：保守拒绝，
+    // 不把它当成 gone 去抢。
+    const ownerInfo = await readInstanceOwner(instance.id, { instancesRoot: this.instancesRoot })
+    const owner = ownerInfo !== null && isPlainObject(ownerInfo.owner) ? ownerInfo.owner : null
+    const mine = owner !== null && owner.runtimeId === this.runtimeId
+    if (ownerInfo !== null && !mine && this._isForeignOwner(ownerInfo)) {
+      if (ownerInfo.state === 'alive') {
+        return {
+          runner: null,
+          recovered: false,
+          reason: `实例 ${instance.id} 的执行权被另一个活进程持有（pid ${owner.pid} @ ${owner.host}，自 ${owner.since ?? '未知时间'}）：本进程不恢复、不派发`,
+          code: 'BPMN_INSTANCE_ACTIVE_ELSEWHERE',
+          owner,
+        }
+      }
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例 ${instance.id} 的执行所有权记录无法确认（坏 JSON / 跨主机）：为安全起见不恢复、不派发；请人工核对 owner.json`,
+        code: 'BPMN_OWNER_UNKNOWN',
+        owner,
+      }
+    }
+    const ownedByMe = mine && ownerInfo.state === 'alive'
+
     const cached = this._runners.get(instance.id)
     if (cached !== undefined && cached.status() !== 'idle') {
+      // 同一进程内 `_suspended` 闩已删除：谁下一次执行，谁就重新拿回所有权。
+      if (!ownedByMe) await this._claimOwner(instance.id)
       return { runner: cached, recovered: false }
     }
     if (cached !== undefined) this._runners.delete(instance.id)
+
+    // 已确认的执行失败是「恢复禁止标记」：必须在读旧快照 / 重放之前拦下。
+    // 墓碑（state.json）可能还没来得及写，不能把错误事实的可靠性押在第二次写入上。
+    if (isPlainObject(instance.executionFailure)) {
+      // `lastError` 可能是更精确的收口错误（handler 的 cause code），与墓碑同一口径。
+      const code = (typeof instance.lastError?.code === 'string' && instance.lastError.code !== '')
+        ? instance.lastError.code
+        : (typeof instance.executionFailure.code === 'string' && instance.executionFailure.code !== ''
+          ? instance.executionFailure.code
+          : 'BPMN_STATE_UNRECOVERABLE')
+      const message = (typeof instance.lastError?.message === 'string' && instance.lastError.message !== '')
+        ? instance.lastError.message
+        : (typeof instance.executionFailure.message === 'string' ? instance.executionFailure.message : '执行已确认失败')
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例因执行失败已不可恢复（${code}）：${message}。`
+          + '这是已落盘的失败事实，不能自动重放旧执行位置；人工处置：retry / mark-* 只解除 connector 调用记录限制，'
+          + '当前实例仍不能继续；若要移除失败标记与墓碑，请用 POST /instances/<id>/connector/<recordId>/resolve '
+          + '{ action: "clear-tombstone", evidence }，清除后实例不会自动恢复，仍需人工决定是否新建实例。',
+        code,
+        failure: instance.executionFailure,
+      }
+    }
 
     let state
     try {
@@ -3884,6 +4165,13 @@ class BpmnRuntime {
       definitionVersion: snapshot.definitionVersion,
     })
     this._runners.set(instance.id, runner)
+    try {
+      if (!ownedByMe) await this._claimOwner(instance.id)
+    } catch (error) {
+      this._runners.delete(instance.id)
+      await runner.stop().catch(() => {})
+      throw error
+    }
     // recover 会重放一次 activity/wait（runner 坑 g）：按 state 里已知的 executionId 去重。
     const pending = Array.isArray(state?.pendingTasks) ? state.pendingTasks : []
     this._suppressWait.set(instance.id, new Set(
@@ -3968,6 +4256,8 @@ class BpmnRuntime {
     } catch (error) {
       // stop 已经先一步把实例收成终态：晚到的快照不许覆盖，按「stop 赢」静默跳过。
       if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
+      // 挂起先一步提交：晚到的执行快照同样不许覆盖（挂起不写引擎快照）。
+      if (error?.code === 'INSTANCE_SUSPENDED') return
       throw error
     }
   }
@@ -3992,7 +4282,7 @@ class BpmnRuntime {
           at: new Date().toISOString(),
         },
         engine: null,
-      }, { instancesRoot: this.instancesRoot })
+      }, { instancesRoot: this.instancesRoot, allowWhileSuspended: true })
     } catch (error) {
       if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
       throw error
@@ -4012,8 +4302,8 @@ class BpmnRuntime {
     if (TERMINAL_STATUSES.has(instance.status)) return
     // stop 闩生效期间不要再写状态（stop 自己会把实例收成 aborted）。
     if (this._stopping.has(instanceId)) return
-    // 挂起期间任何收口都不得把 status 写回 ACTIVE，也不得改待办。
-    if (instance.status === 'SUSPENDED' || this._suspended.has(instanceId)) return
+    // 挂起期间收口不得改待办 / 变量，更不能把 status 写回 ACTIVE。
+    if (instance.status === 'SUSPENDED') return
 
     const status = runner.status()
     const variables = isPlainObject(runner.variables) && Object.keys(runner.variables).length > 0
@@ -4030,44 +4320,53 @@ class BpmnRuntime {
       }
       : null
 
-    if (status === 'done') {
-      // 11 §5：process/end 时 instance.result 取最后一个成功 agent 节点的 output
-      // （endEvent 不产生输出）。output 在 gate 里已归一化为短变量对象。
-      const result = lastAgentPatch === null ? undefined : { ...lastAgentPatch.lastAgentOutput.output }
-      await completeInstance(instanceId, 'COMPLETED', {
-        instancesRoot: this.instancesRoot,
-        ...(variables === undefined ? {} : { variables }),
-        ...(result === undefined ? {} : { result }),
-      })
-      await this._finalizeInbox(instanceId, 'COMPLETED')
-      this._lastAgentOutputs.delete(instanceId)
-      await this._maybeTerminalCleanup(instanceId).catch(() => {})
-      return
-    }
-    if (status === BPMN_RUNNER_STATUS.BLOCKED) {
-      const lastError = this._lastErrorFor(instanceId, runner.failure())
-      const marked = await this._markInstanceError(instanceId, lastError)
-      // stop 抢先把实例收成终态时不写墓碑（终态实例本来就不会被恢复）。
-      if (marked !== null && !TERMINAL_STATUSES.has(marked.status)) {
-        await this._persistUnrecoverableState(instanceId, lastError)
+    try {
+      if (status === 'done') {
+        // 11 §5：process/end 时 instance.result 取最后一个成功 agent 节点的 output
+        // （endEvent 不产生输出）。output 在 gate 里已归一化为短变量对象。
+        const result = lastAgentPatch === null ? undefined : { ...lastAgentPatch.lastAgentOutput.output }
+        await completeInstance(instanceId, 'COMPLETED', {
+          instancesRoot: this.instancesRoot,
+          ...(variables === undefined ? {} : { variables }),
+          ...(result === undefined ? {} : { result }),
+        })
+        await this._finalizeInbox(instanceId, 'COMPLETED')
+        this._lastAgentOutputs.delete(instanceId)
+        await this._maybeTerminalCleanup(instanceId).catch(() => {})
+        return
       }
-      return
-    }
-    if (status === 'waiting') {
-      await updateInstance(instanceId, {
-        status: 'ACTIVE',
-        pendingTasks: runner.pendingTasks(),
-        ...(variables === undefined ? {} : { variables }),
-        ...(lastAgentPatch === null ? {} : lastAgentPatch),
-      }, { instancesRoot: this.instancesRoot })
-      return
-    }
-    if (status === 'running') {
-      await updateInstance(instanceId, {
-        status: 'ACTIVE',
-        ...(variables === undefined ? {} : { variables }),
-        ...(lastAgentPatch === null ? {} : lastAgentPatch),
-      }, { instancesRoot: this.instancesRoot })
+      if (status === BPMN_RUNNER_STATUS.BLOCKED) {
+        const lastError = this._lastErrorFor(instanceId, runner.failure())
+        const marked = await this._markInstanceError(instanceId, lastError)
+        // stop 抢先把实例收成终态时不写墓碑（终态实例本来就不会被恢复）。
+        if (marked !== null && !TERMINAL_STATUSES.has(marked.status)) {
+          await this._persistUnrecoverableState(instanceId, lastError)
+        }
+        return
+      }
+      if (status === 'waiting') {
+        // 0.14.4：不再写 status:'ACTIVE'——状态迁移只走生命周期路由；这里只更新执行事实。
+        const patch = {
+          pendingTasks: runner.pendingTasks(),
+          ...(variables === undefined ? {} : { variables }),
+          ...(lastAgentPatch === null ? {} : lastAgentPatch),
+        }
+        await updateInstance(instanceId, patch, { instancesRoot: this.instancesRoot })
+        return
+      }
+      if (status === 'running') {
+        const patch = {
+          ...(variables === undefined ? {} : { variables }),
+          ...(lastAgentPatch === null ? {} : lastAgentPatch),
+        }
+        if (Object.keys(patch).length === 0) return
+        await updateInstance(instanceId, patch, { instancesRoot: this.instancesRoot })
+      }
+    } catch (error) {
+      // 收口撞上挂起 / 生命周期切换：磁盘事实优先，不崩、不改写、不丢已有事实。
+      // 其它错误照旧抛给调用方（事件写入失败 / 终态保护等）。
+      if (isLifecycleSuspendedError(error)) return
+      throw error
     }
   }
 
@@ -4089,8 +4388,6 @@ class BpmnRuntime {
     if (!isPlainObject(event) || typeof event.type !== 'string' || event.type === '') return
     // stop 闩之后的迟到事件（abort 前已在飞的调用）一律不落盘：不能给 aborted 实例补事件。
     if (this._stopping.has(instanceId)) return
-    // 挂起闩同理：挂起后不得再派发 / 落盘任何执行事件（也不得把 status 写回 ACTIVE）。
-    if (this._suspended.has(instanceId)) return
     const runner = this._runners.get(instanceId) ?? null
 
     // recover 重放的 wait：同一 executionId 已经落过盘，不再写第二条。
@@ -4138,33 +4435,36 @@ class BpmnRuntime {
       if (summary !== undefined) persistedSource = { ...event, summary }
     }
     const persisted = persistableEvent(persistedSource)
+    // 0.14.4：同步登记「未完成的事件提交」。挂起看到 >0 必须 409，不能把已出队当完成。
+    this._bumpPendingEventCommits(instanceId, 1)
     this._enqueueEvent(instanceId, async () => {
-      // 事件是入队执行的：轮到这里时 stop 可能已经置闩 / 实例可能已终态，
-      // 必须复查，不能把停止前排队的事件晚写到终态实例上。
-      if (this._stopping.has(instanceId)) return
       try {
         if (persisted === null) {
           throw new BpmnRuntimeError(500, 'BPMN_EVENT_UNSERIALIZABLE', `实例 ${instanceId} 的事件 ${event.type} 不能被序列化为 JSON`)
         }
-        await appendInstanceEvents(instanceId, activityId, attempt, persisted, { instancesRoot: this.instancesRoot })
-        if (event.type === 'process/start' || event.type === 'activity/start') {
-          await updateInstance(instanceId, { status: 'ACTIVE' }, { instancesRoot: this.instancesRoot })
-        } else if (event.type === 'activity/wait') {
-          await updateInstance(instanceId, {
-            status: 'ACTIVE',
-            pendingTasks: runner === null ? [] : runner.pendingTasks(),
-          }, { instancesRoot: this.instancesRoot })
-        } else if (event.type === 'activity/end') {
-          // 11 §3 / §5：产物索引由运行时维护，按 path+sha256 去重（重复活动执行不重复追加）。
-          if (Array.isArray(event.artifacts)) {
-            await this._mergeArtifacts(instanceId, event.artifacts)
-          }
-          await updateInstance(instanceId, {
-            status: 'ACTIVE',
-            pendingTasks: runner === null ? [] : runner.pendingTasks(),
-          }, { instancesRoot: this.instancesRoot })
-        } else if (event.type === 'error') {
-          // 出错**不改 status**：实例继续 ACTIVE，只把事实留成 lastError（连同 error 事件）。
+        // 真正写盘前复查磁盘事实：排队期间可能已经 stop / 终态 / 挂起。
+        // 挂起后**不得**再写 status:'ACTIVE'，也不得追加推进事件——任务直接丢弃并记诊断。
+        const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+        if (current === null) {
+          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'instance-missing' })
+          return
+        }
+        if (this._stopping.has(instanceId)) {
+          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'stopping' })
+          return
+        }
+        if (TERMINAL_STATUSES.has(current.status)) {
+          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'terminal', status: current.status })
+          return
+        }
+        if (current.status === 'SUSPENDED' && event.type !== 'error') {
+          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'suspended' })
+          return
+        }
+
+        if (event.type === 'error') {
+          // MAJOR-3：错误事实通道。即使实例已 SUSPENDED，也要把 error 事件、lastError
+          // 和清空后的待办一次写下去（超时不会因为挂起而「没发生过」）。
           const reminders = this._agentReminders.get(instanceId)
           const lastError = {
             code: typeof event.error?.code === 'string' ? event.error.code : 'BPMN_ENGINE_ERROR',
@@ -4173,18 +4473,44 @@ class BpmnRuntime {
             ...(typeof event.elementId === 'string' ? { nodeId: event.elementId } : {}),
             ...(typeof event.activityId === 'string' ? { activityId: event.activityId } : {}),
           }
-          // 失败即停机：待办一并清空（异步失败时可能没有 _syncInstanceStatus 收口）。
-          await updateInstance(instanceId, { lastError, pendingTasks: [] }, { instancesRoot: this.instancesRoot })
-          // 失败事实一旦落盘，旧快照立刻变成不可恢复：不能等下一个请求/收口才处理
-          // （runTimeout 等异步失败可能没有在等的请求）。
+          await recordExecutionFailure(instanceId, {
+            instancesRoot: this.instancesRoot,
+            lastError,
+            event: persisted,
+            activityId,
+            attempt,
+          })
+          // 失败事实一旦落盘，旧快照立刻变成不可恢复（挂起期间也允许写错误墓碑）。
           await this._persistUnrecoverableState(instanceId, lastError)
+          return
+        }
+
+        // 事件和必要的执行事实（pendingTasks）一次提交；不再单独 updateInstance(ACTIVE)。
+        const metaPatch = (event.type === 'activity/wait' || event.type === 'activity/end')
+          ? { pendingTasks: runner === null ? [] : runner.pendingTasks() }
+          : undefined
+        await appendInstanceEvents(instanceId, activityId, attempt, persisted, {
+          instancesRoot: this.instancesRoot,
+          ...(metaPatch === undefined ? {} : { metaPatch }),
+        })
+        if (event.type === 'activity/end' && Array.isArray(event.artifacts)) {
+          // 产物索引仍走 updateInstance（metaPatch 白名单不含 artifacts）；终态 / 挂起
+          // 时 store 会拒绝或本任务已提前丢弃。
+          await this._mergeArtifacts(instanceId, event.artifacts)
         }
         // 终态 / blocked 一律由 `_syncInstanceStatus` 在收口时一次提交：
         // 事件链只负责落盘，不抢先把 status 写死（否则最终 variables 会被终态保护挡住）。
       } catch (error) {
         // 另一个请求先收成终态：晚到事件丢弃，不升级成事件写入失败。
         if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
+        // 挂起先一步提交：store 的 SUSPENDED 闸门是第二道防线，丢弃并记诊断。
+        if (error?.code === 'INSTANCE_SUSPENDED') {
+          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'suspended', code: error.code })
+          return
+        }
         throw error
+      } finally {
+        this._bumpPendingEventCommits(instanceId, -1)
       }
     })
   }

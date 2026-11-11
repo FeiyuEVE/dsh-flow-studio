@@ -7,13 +7,25 @@
  * @module @feiyueve/dsh-flow-studio/client/runtime
  */
 
-/** 注入后的 React 句柄；组件里用 `const { useState } = rt.React` 取钩子。 */
-export const rt = { React: null, h: null }
+/** 注入后的宿主句柄：React、createElement 与模块表（chunk 懒加载用）。 */
+export const rt = { React: null, h: null, require: null }
 
 /** 由 plugin.js 在 factory 内调用，早于任何组件渲染。 */
 export function bindReact(React) {
   rt.React = React
   rt.h = React.createElement
+}
+
+/**
+ * 注入宿主模块表（factory 的 `require` 句柄）。
+ *
+ * 画布壳用它的 `require.async('./client.bpmn.js')` 懒加载 BPMN chunk；句柄只挂在
+ * 运行时、不进 React context，组件在 effect 里读，SSR 阶段不会触发加载。
+ *
+ * @param {(name: string) => any} require 宿主浏览器模块表（含 async 方法）
+ */
+export function bindHostRequire(require) {
+  rt.require = require
 }
 
 /** createElement 的短名，省掉每行 rt.h。 */

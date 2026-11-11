@@ -29,141 +29,28 @@ import zeebeModdlePackage from './zeebe-moddle-vendor.js'
 import { assertFeelSafe, isFeelLanguage } from './bpmn-expr.js'
 import { collectRawExecutionViolations } from './bpmn-policy.js'
 
-/** 我们自己的扩展命名空间：`fs:`（Flow Studio）。 */
-export const FS_NAMESPACE = 'http://feiyueve.dev/schema/bpmn/fs/1.0'
-/** 官方 BPMN 2.0 MODEL 命名空间。 */
-export const BPMN_NAMESPACE = 'http://www.omg.org/spec/BPMN/20100524/MODEL'
-/** 官方 BPMN 2.0 DI 命名空间（转换器生成图时用）。 */
-export const BPMNDI_NAMESPACE = 'http://www.omg.org/spec/BPMN/20100524/DI'
-/** Camunda Zeebe 扩展命名空间。 */
-export const ZEEBE_NAMESPACE = 'http://camunda.org/schema/zeebe/1.0'
+import {
+  BPMN_NAMESPACE,
+  BPMNDI_NAMESPACE,
+  createFsModdlePackage,
+  FS_MODDLE_PACKAGE,
+  FS_NAMESPACE,
+  ZEEBE_NAMESPACE,
+} from './bpmn-moddle.js'
 
-/**
- * `fs:` 的 moddle 描述符。
- *
- * 写法按实测（docs/plan/0.13-研究-bpmn-engine.md §6）：
- * - `superClass: ['Element']`——用 `extends: ['bpmn:BaseElement']` 实测解析不到
- *   `extensionElements` 里的子元素；
- * - `xml.tagAlias: 'lowerCase'`——`fs:Node` → `<fs:node>`、`fs:MaxRounds` → `<fs:maxRounds>`。
- *
- * 字段说明：
- * - `<fs:node nodeType="agent|http" provider="…" adapter="…" skills="a,b" hooks="x,y">`
- * - 子元素：`<fs:prompt>` / `<fs:roleCard>` / `<fs:note>` / `<fs:team>` / `<fs:http>`；
- * - `<fs:team mode="fanout|none"><fs:member id="…" role="…" skills="…"><fs:prompt>…</fs:prompt></fs:member></fs:team>`
- * - `<fs:maxRounds>2</fs:maxRounds>`：挂在回退 `sequenceFlow` 的 `extensionElements` 上，
- *   记录旧模型里目标节点的打回上限。
- */
-export const FS_MODDLE_PACKAGE = {
-  name: 'fs',
-  prefix: 'fs',
-  uri: FS_NAMESPACE,
-  xml: { tagAlias: 'lowerCase' },
-  associations: [],
-  types: [
-    {
-      name: 'Node',
-      superClass: ['Element'],
-      properties: [
-        { name: 'nodeType', type: 'String', isAttr: true },
-        { name: 'provider', type: 'String', isAttr: true },
-        { name: 'adapter', type: 'String', isAttr: true },
-        { name: 'skills', type: 'String', isAttr: true },
-        { name: 'hooks', type: 'String', isAttr: true },
-        { name: 'prompt', type: 'String' },
-        { name: 'roleCard', type: 'String' },
-        { name: 'note', type: 'String' },
-        { name: 'model', type: 'String', isAttr: true },
-        { name: 'agentPreset', type: 'String', isAttr: true },
-        { name: 'team', type: 'Team' },
-        { name: 'http', type: 'Http' },
-        { name: 'executor', type: 'Executor' },
-        { name: 'output', type: 'Output', isMany: true },
-        { name: 'check', type: 'Check' },
-        { name: 'legacy', type: 'Legacy' },
-      ],
-    },
-    {
-      name: 'Team',
-      superClass: ['Element'],
-      properties: [
-        { name: 'mode', type: 'String', isAttr: true },
-        { name: 'member', type: 'Member', isMany: true },
-      ],
-    },
-    {
-      name: 'Member',
-      superClass: ['Element'],
-      properties: [
-        { name: 'id', type: 'String', isAttr: true },
-        { name: 'role', type: 'String', isAttr: true },
-        { name: 'skills', type: 'String', isAttr: true },
-        { name: 'prompt', type: 'String' },
-      ],
-    },
-    {
-      name: 'Http',
-      superClass: ['Element'],
-      properties: [
-        { name: 'method', type: 'String', isAttr: true },
-        { name: 'url', type: 'String', isAttr: true },
-        { name: 'headers', type: 'String', isAttr: true },
-        { name: 'timeoutMs', type: 'Integer', isAttr: true },
-        { name: 'retries', type: 'Integer', isAttr: true },
-        { name: 'body', type: 'String' },
-        { name: 'inputMapping', type: 'String' },
-        { name: 'outputMapping', type: 'String' },
-      ],
-    },
-    {
-      name: 'Executor',
-      superClass: ['Element'],
-      properties: [
-        { name: 'kind', type: 'String', isAttr: true },
-        { name: 'command', type: 'String', isAttr: true },
-        { name: 'cwd', type: 'String', isAttr: true },
-        { name: 'env', type: 'String', isAttr: true },
-        { name: 'timeoutMs', type: 'Integer', isAttr: true },
-        { name: 'schemaPath', type: 'String', isAttr: true },
-      ],
-    },
-    {
-      name: 'Output',
-      superClass: ['Element'],
-      properties: [
-        { name: 'name', type: 'String', isAttr: true },
-        { name: 'kind', type: 'String', isAttr: true },
-        { name: 'required', type: 'Boolean', isAttr: true },
-        // 不是标准的 {name,kind,required} 形状时，用 JSON 原样留档。
-        { name: 'json', type: 'String', isAttr: true },
-        { name: 'text', type: 'String', isBody: true },
-      ],
-    },
-    {
-      name: 'Check',
-      superClass: ['Element'],
-      properties: [{ name: 'json', type: 'String', isBody: true }],
-    },
-    {
-      name: 'Legacy',
-      superClass: ['Element'],
-      properties: [{ name: 'json', type: 'String', isBody: true }],
-    },
-    {
-      name: 'Note',
-      superClass: ['Element'],
-      properties: [{ name: 'text', type: 'String', isBody: true }],
-    },
-    {
-      name: 'MaxRounds',
-      superClass: ['Element'],
-      properties: [{ name: 'value', type: 'Integer', isBody: true }],
-    },
-  ],
+// 兼容既有调用方：命名空间常量与描述符仍从本模块导出，但唯一定义处是 bpmn-moddle.js。
+export {
+  BPMN_NAMESPACE,
+  BPMNDI_NAMESPACE,
+  createFsModdlePackage,
+  FS_MODDLE_PACKAGE,
+  FS_NAMESPACE,
+  ZEEBE_NAMESPACE,
 }
 
 /** 创建一个同时认识 `fs:` 与 `zeebe:` 的 moddle 实例。 */
 export function createBpmnModdle() {
-  return new BpmnModdle({ fs: FS_MODDLE_PACKAGE, zeebe: zeebeModdlePackage })
+  return new BpmnModdle({ fs: createFsModdlePackage(), zeebe: zeebeModdlePackage })
 }
 
 /** 参与归一化模型的 flow node 类型（其余 flowElement 如注解/关联直接忽略）。 */

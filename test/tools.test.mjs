@@ -2257,8 +2257,11 @@ try {
     const apiSource = readFileSync(join(repoRoot, 'src/client/api.js'), 'utf8')
     A.match(apiSource, /startRun: \(id, body\) => request\('POST', `\/runs\/\$\{segment\(id\)\}\/start`, body\)/)
 
-    const canvasSource = readFileSync(join(repoRoot, 'src/client/canvas.js'), 'utf8')
-    A.equal(/api\.(createRun|startRun)\(/.test(canvasSource), false, 'canvas.js 不直接发起运行')
+    // 0.13.3 步骤 2：旧 React Flow 画布移到 canvas-flow.js；两处都不能直接发起运行。
+    for (const canvasFile of ['canvas.js', 'canvas-flow.js']) {
+      const canvasSource = readFileSync(join(repoRoot, 'src/client', canvasFile), 'utf8')
+      A.equal(/api\.(createRun|startRun)\(/.test(canvasSource), false, `${canvasFile} 不直接发起运行`)
+    }
   })
 
   // ── 9.5 G6：主机级开关 / 时限 / 多 run 审查 / worktree 生命周期 ────────

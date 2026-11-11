@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * 构建 lib/：client 走 esbuild 打成单文件，Host 侧模块原样复制。
+ * 构建 lib/：客户端走**两次显式 esbuild**打成两个产物，Host 侧模块原样复制。
  *
- *   src/client/entry.js  -> lib/client.js   （单文件，__ModuleLoader__ 包装）
- *   src/index.js         -> lib/index.js
+ *   src/client/entry.js     -> lib/client.js       （主包，factory 返回 createPlugin）
+ *   src/client/bpmn/entry.js -> lib/client.bpmn.js （chunk，chunk: 'client.bpmn.js'）
+ *   src/index.js            -> lib/index.js
  *   src/model.js         -> lib/model.js     （Host 与 Client 共用）
  *   src/store.js         -> lib/store.js
  *   src/runlog.js        -> lib/runlog.js    （事件契约与聚合，纯函数）
@@ -14,6 +15,7 @@
  *   src/tools.js         -> lib/tools.js     （会话内启停的模型工具）
  *
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
+ * 体积只报数（raw / gzip），不设自设上限；结构错误（缺文件、依赖错位、陈旧产物）仍硬失败。
  *
  * 门禁：lib/ 是 .gitignore 排除的构建产物，包里一个 js 都没有过、也发过陈旧 lib。
  * 所以构建末尾会核对三件事 —— 清单非空、lib/ 的 .js 集合与清单完全一致、每个
@@ -31,6 +33,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { createRequire } from 'node:module'
+import { gzipSync } from 'node:zlib'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -69,6 +72,7 @@ export const HOST_MODULES = [
   'bpmn-moddle-vendor.js',
   'feelin-vendor.js',
   'zeebe-moddle-vendor.js',
+  'bpmn-moddle.js',
   'bpmn-expr.js',
   'bpmn-parse.js',
   'bpmn-convert.js',
@@ -85,7 +89,7 @@ export const HOST_MODULES = [
 ]
 
 /** 由 esbuild 生成、不是从 src 拷贝的产物，同样计入 lib/ 产物清单。 */
-export const GENERATED_MODULES = ['client.js']
+export const GENERATED_MODULES = ['client.js', 'client.bpmn.js']
 
 /** lib/ 下应当存在的全部 .js（Host 模块 + 生成产物）。 */
 export const EXPECTED_LIB_MODULES = [...HOST_MODULES, ...GENERATED_MODULES]
@@ -165,13 +169,13 @@ export async function buildPlugin() {
   const require = createRequire(import.meta.url)
   const { build } = require('esbuild')
 
-  const result = await build({
-    entryPoints: [resolve(root, 'src/client/entry.js')],
-    outfile: resolve(libDir, 'client.js'),
+  /**
+   * 两次产物共用同一套编译配置：都是 closure-factory 里的 CJS bundle，React 由宿主
+   * 模块表提供。主包与 chunk 分开构建、分别包装，不启用会生成第三个匿名共享文件的
+   * ESM splitting —— 宿主只认固定文件名 client.js / client.bpmn.js。
+   */
+  const common = {
     bundle: true,
-    // closure-factory：整个模块图（含 @xyflow/react）都在 factory 体内求值，
-    // 依赖里的 require('react') 才能拿到宿主模块表；format 用 cjs 让 module.exports
-    // 在 factory 内可见，banner/footer 负责包成 __ModuleLoader__ 的注册形状。
     format: 'cjs',
     platform: 'browser',
     target: 'es2022',
@@ -186,31 +190,47 @@ export async function buildPlugin() {
     keepNames: true,
     legalComments: 'none',
     charset: 'utf8',
+    metafile: true,
+    logLevel: 'warning',
+  }
+
+  // 主包：保持既有语义，factory 返回 createPlugin(require)。
+  const mainResult = await build({
+    ...common,
+    entryPoints: [resolve(root, 'src/client/entry.js')],
+    outfile: resolve(libDir, 'client.js'),
     banner: {
-      js: '// Generated from src/client/* via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
+      js: '// Generated from src/client/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
         + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', factory: (require) => {\n'
         + 'var module = { exports: {} }; var exports = module.exports;',
     },
     footer: { js: 'return module.exports.createPlugin(require);\n} });' },
-    metafile: true,
-    logLevel: 'warning',
   })
 
-  const clientSize = statSync(resolve(libDir, 'client.js')).size
-  console.log(`src/client/entry.js -> lib/client.js ${clientSize} bytes`)
-  // 上限证据（2026-11 实测）：把 lib/client.js 填到 428,792 字节后，宿主仍以
-  // HTTP 200 完整下发 428,875 字节（combo 路由 /plugins/??<pkg>/client.js&rev=...）。
-  // 所以 262144 是自设门槛而不是宿主硬上限；这里留 512 KiB 的余量并保留告警。
-  const CLIENT_LIMIT = 524288
-  const CLIENT_WARN = 409600
-  if (clientSize > CLIENT_LIMIT) {
-    console.error(`✗ lib/client.js 超过 ${CLIENT_LIMIT} 字节（${clientSize}），宿主 bundle 与加载耗时都不适合再涨`)
-    process.exit(1)
+  // 画布 chunk：宿主协议要求 chunk 字段为**固定文件名**，且由 `require.async('./client.bpmn.js')` 加载。
+  // factory 返回 chunk 的 exports（后续阶段接入 Modeler / 属性面板）。
+  const chunkResult = await build({
+    ...common,
+    entryPoints: [resolve(root, 'src/client/bpmn/entry.js')],
+    outfile: resolve(libDir, 'client.bpmn.js'),
+    banner: {
+      js: '// Generated from src/client/bpmn/entry.js via `node scripts/build.mjs` (esbuild). Do not edit directly.\n'
+        + 'window.__ModuleLoader__.load({ id: \'@feiyueve/dsh-flow-studio\', chunk: \'client.bpmn.js\', factory: (require) => {\n'
+        + 'var module = { exports: {} }; var exports = module.exports;',
+    },
+    footer: { js: 'return module.exports;\n} });' },
+  })
+
+  /** 只报体积：raw / gzip 都打出来，不再用自设上限硬失败。 */
+  const reportSize = (label, file) => {
+    const data = readFileSync(resolve(libDir, file))
+    const raw = data.length
+    const gzip = gzipSync(data, { level: 9 }).length
+    console.log(`✓ lib/${file} raw=${raw} gzip=${gzip}`)
+    return { raw, gzip }
   }
-  if (clientSize > CLIENT_WARN) {
-    console.warn(`⚠ lib/client.js ${clientSize} 字节，已超过 400 KB 警戒线（上限 ${CLIENT_LIMIT}）`)
-  }
-  console.log(`✓ lib/client.js 在单文件上限（${CLIENT_LIMIT}）内`)
+  const mainSize = reportSize('client', 'client.js')
+  const chunkSize = reportSize('client.bpmn', 'client.bpmn.js')
 
   for (const file of HOST_MODULES) {
     copyFileSync(resolve(root, 'src', file), resolve(libDir, file))
@@ -218,8 +238,9 @@ export async function buildPlugin() {
     console.log(`✓ lib/${file} ${size} bytes`)
   }
 
-  // 构建后做一次最基本的自检：产物里必须含注册 id，否则浏览器端整棵插件图会挂。
+  // 构建后做一次最基本的自检：两个产物必须按宿主协议注册，否则浏览器端整棵插件图会挂。
   const client = readFileSync(resolve(libDir, 'client.js'), 'utf8')
+  const chunk = readFileSync(resolve(libDir, 'client.bpmn.js'), 'utf8')
   if (!client.includes('@feiyueve/dsh-flow-studio')) {
     console.error('✗ lib/client.js 里找不到注册 id @feiyueve/dsh-flow-studio')
     process.exit(1)
@@ -228,12 +249,43 @@ export async function buildPlugin() {
     console.error('✗ lib/client.js 里找不到 __ModuleLoader__ 调用')
     process.exit(1)
   }
-  // React Flow 的类名前缀是「真的打进去了」的最便宜特征；被 tree-shake 掉或外置都会在这里暴露。
-  if (!client.includes('react-flow__')) {
-    console.error('✗ lib/client.js 里找不到 React Flow 特征串 react-flow__')
+  if (!/factory:\s*\(require\)/.test(client) || client.includes("chunk: 'client.bpmn.js'")) {
+    console.error('✗ lib/client.js 的主包注册形状不对（必须只有 factory，不能带 chunk 字段）')
     process.exit(1)
   }
-  console.log('✓ client bundle 含 __ModuleLoader__、正确的注册 id 与 React Flow')
+  if (!chunk.includes('@feiyueve/dsh-flow-studio')) {
+    console.error('✗ lib/client.bpmn.js 里找不到注册 id @feiyueve/dsh-flow-studio')
+    process.exit(1)
+  }
+  if (!chunk.includes("chunk: 'client.bpmn.js'")) {
+    console.error("✗ lib/client.bpmn.js 的注册字段不是 chunk: 'client.bpmn.js'")
+    process.exit(1)
+  }
+  if (!/factory:\s*\(require\)/.test(chunk)) {
+    console.error('✗ lib/client.bpmn.js 缺少 factory')
+    process.exit(1)
+  }
+  // 0.13.3 步骤 2 仍保留旧 React Flow 画布（步骤 7 删除）；被 tree-shake 掉或外置都会在这里暴露。
+  if (!client.includes('react-flow__')) {
+    console.error('✗ lib/client.js 里找不到 React Flow 特征串 react-flow__（步骤 2 尚未退役，应有）')
+    process.exit(1)
+  }
+  console.log('✓ client.js 主包注册形状正确，client.bpmn.js 带 chunk 字段与 factory')
+
+  // 主包依赖图不得包含 bpmn-js / 官方属性面板：它们属于 chunk，不能拖慢每次打开 GUI 的首屏。
+  const mainInputs = Object.keys(mainResult.metafile.inputs)
+  const chunkInputs = Object.keys(chunkResult.metafile.inputs)
+  const heavyInMain = mainInputs.filter(input => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(input))
+  if (heavyInMain.length > 0) {
+    console.error(`✗ 主包依赖图里混进了画布重依赖（应只进 chunk）：\n  ${heavyInMain.join('\n  ')}`)
+    process.exit(1)
+  }
+  const xyflowInChunk = chunkInputs.filter(input => /node_modules\/@xyflow\//.test(input))
+  if (xyflowInChunk.length > 0) {
+    console.error(`✗ 画布 chunk 里混进了 React Flow（旧画布不属于 chunk）：\n  ${xyflowInChunk.join('\n  ')}`)
+    process.exit(1)
+  }
+  console.log(`✓ 主包不含 bpmn-js / @bpmn-io 重依赖；chunk 不含 React Flow`)
 
   // 产物自检：lib/ 里所有相对 import 必须能在 lib/ 内解析。
   // 0.5.0 就是因为漏拷 audit.js / tools.js，插件在容器里直接 404 —— 那次靠 e2e 才发现，
@@ -293,12 +345,15 @@ export async function buildPlugin() {
   }
   console.log(`✓ src ↔ lib 逐字节一致（${HOST_MODULES.length} 个 Host 模块）`)
 
-  // 打包输入清单留个痕，便于核对产物由哪些源文件构成。
-  const inputs = Object.keys(result.metafile.inputs)
+  // 打包输入清单留个痕，便于核对产物由哪些源文件构成；按产物分别记录归属。
+  const inputs = [...new Set([...mainInputs, ...chunkInputs])]
   writeFileSync(resolve(libDir, '.build-inputs.json'), `${JSON.stringify(inputs, null, 2)}\n`)
-  console.log(`✓ 记录了 ${inputs.length} 个打包输入`)
+  writeFileSync(resolve(libDir, '.build-meta.json'), `${JSON.stringify({
+    'client.js': { raw: mainSize.raw, gzip: mainSize.gzip, inputs: mainInputs },
+    'client.bpmn.js': { raw: chunkSize.raw, gzip: chunkSize.gzip, inputs: chunkInputs },
+  }, null, 2)}\n`)
+  console.log(`✓ 记录了 ${inputs.length} 个打包输入（按产物区分写进 lib/.build-meta.json）`)
 }
-
 // 只在被直接执行时构建；被 verify-build.mjs / 测试 import 时保持纯函数，不产生副作用。
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 if (isMain) {

@@ -12,6 +12,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { gzipSync } from 'node:zlib'
 
 import {
   HOST_MODULES,
@@ -53,7 +54,59 @@ for (const item of comparison.mismatches) {
   )
 }
 
-// ③ package.json 的 main 入口必须真的在 lib/ 里（否则装机后 import 直接失败）。
+// ③ 两个生成产物必须按宿主协议注册：主包是 factory，chunk 带固定 chunk 名。
+//    这一步不重建，只核对眼前这份 lib —— 防止「构建脚本改了、产物还是旧形状」。
+const generated = {}
+for (const file of GENERATED_MODULES) {
+  const path = resolve(root, 'lib', file)
+  if (!existsSync(path)) {
+    problems.push(`lib/${file} 缺失（生成产物）`)
+    continue
+  }
+  generated[file] = readFileSync(path, 'utf8')
+}
+const clientSource = generated['client.js']
+if (clientSource !== undefined) {
+  if (!clientSource.includes('@feiyueve/dsh-flow-studio')) problems.push('lib/client.js 缺注册 id')
+  if (!/factory:\s*\(require\)/.test(clientSource)) problems.push('lib/client.js 缺 factory')
+  if (clientSource.includes("chunk: 'client.bpmn.js'")) problems.push('lib/client.js 不应带 chunk 字段（它是主包）')
+}
+const chunkSource = generated['client.bpmn.js']
+if (chunkSource !== undefined) {
+  if (!chunkSource.includes('@feiyueve/dsh-flow-studio')) problems.push('lib/client.bpmn.js 缺注册 id')
+  if (!chunkSource.includes("chunk: 'client.bpmn.js'")) problems.push("lib/client.bpmn.js 的注册字段不是 chunk: 'client.bpmn.js'")
+  if (!/factory:\s*\(require\)/.test(chunkSource)) problems.push('lib/client.bpmn.js 缺 factory')
+}
+
+// ④ 依赖归属：主包不得含 bpmn-js / 官方属性面板，chunk 不得含 React Flow。
+//    优先读构建留下的 .build-meta.json（按产物记录 inputs）；没有 meta 时退回特征串。
+const metaPath = resolve(root, 'lib/.build-meta.json')
+if (existsSync(metaPath)) {
+  let meta = null
+  try {
+    meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+  } catch (error) {
+    problems.push(`lib/.build-meta.json 不是合法 JSON：${error.message}`)
+  }
+  if (meta) {
+    const mainInputs = meta['client.js']?.inputs ?? []
+    const chunkInputs = meta['client.bpmn.js']?.inputs ?? []
+    const heavyInMain = mainInputs.filter(input => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(input))
+    if (heavyInMain.length > 0) problems.push(`主包混入画布重依赖：${heavyInMain.join(', ')}`)
+    const xyflowInChunk = chunkInputs.filter(input => /node_modules\/@xyflow\//.test(input))
+    if (xyflowInChunk.length > 0) problems.push(`画布 chunk 混入 React Flow：${xyflowInChunk.join(', ')}`)
+  }
+}
+
+// ⑤ 体积只报数，不再有自设上限。
+for (const file of GENERATED_MODULES) {
+  const path = resolve(root, 'lib', file)
+  if (!existsSync(path)) continue
+  const data = readFileSync(path)
+  console.log(`  · lib/${file} raw=${data.length} gzip=${gzipSync(data, { level: 9 }).length}`)
+}
+
+// ⑥ package.json 的 main 入口必须真的在 lib/ 里（否则装机后 import 直接失败）。
 const pkgPath = resolve(root, 'package.json')
 if (!existsSync(pkgPath)) {
   problems.push('package.json 缺失')

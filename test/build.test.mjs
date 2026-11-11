@@ -8,9 +8,10 @@
  *   2. 工作树直接 npm publish / npm pack 拿到的是旧 lib（源码改了、lib 没重建）。
  *
  * 做法：在 .tmp/ 下用 `git archive HEAD` 造一份干净检出（不碰工作树里其它 agent 的
- * 未提交改动），只把当前工作树的 scripts/build.mjs、scripts/verify-build.mjs、
- * package.json 覆盖进去，其余保持 HEAD。然后在干净检出里真实跑 `npm pack`，解开
- * tarball 逐项断言 —— 不是检查 package.json 里有没有 "prepack" 字符串。
+ * 未提交改动），然后把当前工作树的 scripts/build.mjs、scripts/verify-build.mjs、
+ * package.json/锁文件、随包资源与**完整 src/** 同步进去（含删除同步：临时检出里
+ * 不保留当前 src 已删除的文件），其余保持 HEAD。然后在干净检出里真实跑 `npm pack`，
+ * 解开 tarball 逐项断言 —— 不是检查 package.json 里有没有 "prepack" 字符串。
  *
  * 反例也当场验：没有 prepack（--ignore-scripts）时 tarball 里 lib/*.js 为 0，
  * 说明上面「数量 == 清单」「逐字节相同」这两条断言确实会拦住漏代码的包。
@@ -32,6 +33,7 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -53,6 +55,10 @@ const A = {
   ok(value, message) {
     assertionCount += 1
     assert.ok(value, message)
+  },
+  deepEqual(actual, expected, message) {
+    assertionCount += 1
+    assert.deepEqual(actual, expected, message)
   },
   match(value, pattern, message) {
     assertionCount += 1
@@ -140,6 +146,41 @@ function listFiles(dir, base = '') {
   return out.sort()
 }
 
+/**
+ * 用当前工作树的目录整体替换临时检出里的同名目录：先复制全部文件，再删除
+ * 目标里「当前源码已没有」的文件与空目录。
+ *
+ * 为什么不能只覆盖新增文件：`git archive HEAD` 的 src/ 是上次提交的旧状态，
+ * 如果本阶段删过模块，只做「复制新增」会让临时检出保留已被删除的旧模块，
+ * npm pack 与字节比对测到的就不是眼前这份源码。
+ *
+ * @param {string} from 当前工作树目录
+ * @param {string} to   临时检出里的目标目录
+ * @param {string} [base] 相对路径前缀（递归用）
+ */
+function syncTree(from, to, base = '') {
+  mkdirSync(to, { recursive: true })
+  const sourceEntries = readdirSync(from, { withFileTypes: true })
+  const sourceNames = new Set(sourceEntries.map(entry => entry.name))
+  for (const entry of sourceEntries) {
+    const srcPath = join(from, entry.name)
+    const destPath = join(to, entry.name)
+    const rel = base === '' ? entry.name : `${base}/${entry.name}`
+    if (entry.isDirectory()) {
+      syncTree(srcPath, destPath, rel)
+      continue
+    }
+    copyFileSync(srcPath, destPath)
+  }
+  for (const entry of readdirSync(to, { withFileTypes: true })) {
+    if (sourceNames.has(entry.name)) continue
+    const stalePath = join(to, entry.name)
+    const rel = base === '' ? entry.name : `${base}/${entry.name}`
+    rmSync(stalePath, { recursive: true, force: true })
+    console.log(`    · 移除临时检出里源码已删除的 ${rel}`)
+  }
+}
+
 const tmpRoot = resolve(repo, '.tmp')
 mkdirSync(tmpRoot, { recursive: true })
 const work = mkdtempSync(join(tmpRoot, 'build-test-'))
@@ -156,7 +197,7 @@ try {
     A.ok(existsSync(join(checkout, 'src/supervise.js')), '干净检出含 src/supervise.js')
     A.ok(!existsSync(join(checkout, 'lib')), '干净检出里没有 lib/（被 .gitignore 排除，只能靠构建生成）')
     A.ok(!existsSync(join(checkout, 'node_modules')), '干净检出里没有 node_modules（不依赖工作树依赖目录）')
-    // 干净检出必须是 HEAD 内容：工作树里 src/supervise.js 正被别的 agent 改，不能混进来。
+    // 同步之前，干净检出必须是 HEAD 内容：当前工作树的未提交改动不能提前混进来。
     const headSupervise = mustRun('git', ['show', 'HEAD:src/supervise.js'], repo, 'git show HEAD:src/supervise.js').stdout
     A.equal(
       readFileSync(join(checkout, 'src/supervise.js'), 'utf8'),
@@ -165,23 +206,55 @@ try {
     )
   })
 
-  await check('把当前工作树的 build 脚本 / package.json 与 src 模块覆盖进干净检出', async () => {
-    for (const rel of ['scripts/build.mjs', 'scripts/verify-build.mjs', 'package.json']) {
-      copyFileSync(join(repo, rel), join(checkout, rel))
+  await check('把当前工作树的 build 脚本 / 清单 / 资源与完整 src 同步进干净检出（含删除同步）', async () => {
+    // 构建脚本、包清单、锁文件与随包资源：这些决定「怎么构建、包里放什么」，
+    // 必须和当前交付一致，不能用 HEAD 里的旧版本。
+    for (const rel of [
+      'scripts/build.mjs',
+      'scripts/verify-build.mjs',
+      'package.json',
+      'package-lock.json',
+      'icon.svg',
+      'cordis.patch.yml',
+      'THIRD-PARTY.md',
+      'LICENSE',
+    ]) {
+      const source = join(repo, rel)
+      if (!existsSync(source)) continue
+      mkdirSync(dirname(join(checkout, rel)), { recursive: true })
+      copyFileSync(source, join(checkout, rel))
       A.ok(existsSync(join(checkout, rel)), `已复制 ${rel}`)
     }
+    // 资源目录（locale）同样整体同步。
+    if (existsSync(join(repo, 'locale'))) syncTree(join(repo, 'locale'), join(checkout, 'locale'))
+
     // 0.11：开发阶段的模块改动 / 新增模块还没进 HEAD（本阶段不 commit），
     // 干净检出必须补上「当前交付的 src」才能证明 npm pack 打包的是眼前这份代码。
-    // supervise.js 这类本阶段未改的文件仍是 HEAD 内容（上一组的断言继续成立）。
-    for (const file of HOST_MODULES) {
-      const source = join(repo, 'src', file)
-      if (!existsSync(source)) continue
-      copyFileSync(source, join(checkout, 'src', file))
+    // 0.13.3：改成整体替换 + 删除同步——只覆盖新增文件会让临时检出遗留 HEAD 里
+    // 已删除的旧模块，测到的不是当前源码。
+    // 先造一个当前 src 里不存在的探针，证明同步真的会删除而不是只覆盖新增文件。
+    const staleProbe = join(checkout, 'src', '__stale_probe__.js')
+    writeFileSync(staleProbe, '// stale module simulated by build.test.mjs\n')
+    A.ok(existsSync(staleProbe), '已放入陈旧模块探针')
+    syncTree(join(repo, 'src'), join(checkout, 'src'))
+    A.ok(!existsSync(staleProbe), '删除同步移除了当前 src 已不存在的模块')
+
+    // 逐文件核对：临时检出的 src/ 必须与当前工作树完全一致（无缺失、无多余）。
+    const repoFiles = listFiles(join(repo, 'src'))
+    const checkoutFiles = listFiles(join(checkout, 'src'))
+    A.deepEqual(checkoutFiles, repoFiles, '临时检出 src/ 文件清单与当前工作树一致（含删除）')
+    for (const rel of repoFiles) {
+      const actual = readFileSync(join(checkout, 'src', rel))
+      const expected = readFileSync(join(repo, 'src', rel))
+      A.ok(actual.equals(expected), `临时检出 src/${rel} 与当前工作树逐字节相同`)
     }
+
     // esbuild 从工作树的 node_modules 解析（符号链接过去，避免干净检出里再装一遍）。
     const repoModules = join(repo, 'node_modules')
     A.ok(existsSync(repoModules), '工作树有 node_modules（esbuild 可用）')
-    symlinkSync(repoModules, join(checkout, 'node_modules'), 'dir')
+    if (!existsSync(join(checkout, 'node_modules'))) {
+      symlinkSync(repoModules, join(checkout, 'node_modules'), 'dir')
+    }
   })
 
   const pkg = JSON.parse(readFileSync(join(checkout, 'package.json'), 'utf8'))
@@ -199,7 +272,28 @@ try {
     for (const file of HOST_MODULES) {
       A.ok(libJs.includes(`lib/${file}`), `tarball 含清单模块 lib/${file}`)
     }
-    A.ok(libJs.includes(`lib/${GENERATED_MODULES[0]}`), `tarball 含生成产物 lib/${GENERATED_MODULES[0]}`)
+    for (const file of GENERATED_MODULES) {
+      A.ok(libJs.includes(`lib/${file}`), `tarball 含生成产物 lib/${file}`)
+    }
+  })
+
+  await check('tarball 里两个产物的元数据存在，且依赖归属无泄漏', async () => {
+    A.ok(files.includes('lib/.build-meta.json'), 'tarball 含 lib/.build-meta.json')
+    const meta = JSON.parse(readFileSync(join(packageDir, 'lib', '.build-meta.json'), 'utf8'))
+    A.ok(meta['client.js'], '元数据含主包')
+    A.ok(meta['client.bpmn.js'], '元数据含 chunk')
+    A.equal(meta['client.js'].raw, readFileSync(join(packageDir, 'lib/client.js')).length, '主包 raw 大小与产物一致')
+    A.equal(meta['client.bpmn.js'].raw, readFileSync(join(packageDir, 'lib/client.bpmn.js')).length, 'chunk raw 大小与产物一致')
+    const mainInputs = meta['client.js'].inputs ?? []
+    const chunkInputs = meta['client.bpmn.js'].inputs ?? []
+    A.ok(
+      !mainInputs.some(input => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(input)),
+      '主包依赖图不含 bpmn-js / diagram-js / 官方属性面板',
+    )
+    A.ok(
+      !chunkInputs.some(input => /node_modules\/@xyflow\//.test(input)),
+      '画布 chunk 依赖图不含 React Flow',
+    )
   })
 
   await check('tarball 里 main 入口存在，且源码 src/ 不进包（lib 只能是构建产物）', async () => {
@@ -213,7 +307,7 @@ try {
     for (const file of HOST_MODULES) {
       const packedFile = readFileSync(join(packageDir, 'lib', file))
       const sourceFile = readFileSync(join(checkout, 'src', file))
-      A.ok(packedFile.equals(sourceFile), `tarball lib/${file} 与 HEAD src/${file} 逐字节相同`)
+      A.ok(packedFile.equals(sourceFile), `tarball lib/${file} 与当前 src/${file} 逐字节相同`)
     }
     const packedSupervise = readFileSync(join(packageDir, 'lib', 'supervise.js'))
     const sourceSupervise = readFileSync(join(checkout, 'src', 'supervise.js'))

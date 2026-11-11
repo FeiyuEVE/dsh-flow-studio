@@ -9,7 +9,7 @@
 
 import { StudioIcon } from './icons.js'
 import { FlowStudioPage } from './page.js'
-import { bindReact } from './runtime.js'
+import { bindHostRequire, bindReact } from './runtime.js'
 
 /** 侧栏 id 与 main 槽 key，两者必须是同一个值。 */
 export const PANEL_ID = 'flow-studio'
@@ -20,6 +20,8 @@ export const PANEL_ID = 'flow-studio'
  */
 export function createPlugin(require) {
   bindReact(require('react'))
+  // 画布壳只在 effect 里用这个句柄 require.async 懒加载 BPMN chunk。
+  bindHostRequire(require)
   return {
     name: 'flow-studio',
     inject: ['slots'],

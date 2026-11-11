@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0"
+  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  id="Definitions_editor_roundtrip"
+  targetNamespace="http://feiyueve.dev/test/editor-roundtrip"
+  exporter="dsh-flow-studio"
+  exporterVersion="0.13.3">
+  <bpmn:process id="Process_editor_roundtrip" name="编辑往返 &amp; 特殊字符“测试”" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="开始 &lt;入口&gt;">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <bpmn:serviceTask id="Task_Agent_Impl" name="Agent 实现：中文 &amp; 'quotes' &quot;双引号&quot;">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:incoming>Flow_reject</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+      <bpmn:extensionElements>
+        <fs:node nodeType="agent" provider="deepseek" adapter="dsh" model="deepseek-chat" agentPreset="implementer" skills="codegraph,web-proxy" hooks="pre,post">
+          <fs:prompt>你是实现者：处理 A &amp; B，不能吞掉 &lt;xml&gt;。</fs:prompt>
+          <fs:roleCard>角色卡：中文标点，emoji ✅，引号“x”。</fs:roleCard>
+          <fs:note>节点备注 &amp; 保留</fs:note>
+          <fs:team mode="fanout">
+            <fs:member id="Member_1" role="接口实现 &amp; 校验" skills="java,sql">
+              <fs:prompt>写接口，保留 &lt;body&gt;</fs:prompt>
+            </fs:member>
+            <fs:member id="Member_2" role="测试" skills="node">
+              <fs:prompt>写测试</fs:prompt>
+            </fs:member>
+          </fs:team>
+          <fs:check>{"kind":"contains","value":"通过 &amp; 完成 &lt;done&gt;"}</fs:check>
+          <fs:output name="result" kind="json" required="true">{"summary":"中文 &amp; special &lt;ok&gt;"}</fs:output>
+          <fs:executor kind="command" command="echo hi" cwd="/path/to/project" env="A=1" timeoutMs="60000" />
+        </fs:node>
+        <zeebe:ioMapping>
+          <zeebe:input source="= topic" target="prompt" />
+          <zeebe:output source="= result" target="out" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+
+    <bpmn:userTask id="Task_Human_Review" name="人工评审（含 &amp; 与 &lt;tag&gt;）">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:outgoing>Flow_3</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_Approve" name="是否通过？" default="Flow_reject">
+      <bpmn:incoming>Flow_3</bpmn:incoming>
+      <bpmn:outgoing>Flow_4</bpmn:outgoing>
+      <bpmn:outgoing>Flow_reject</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:serviceTask id="Task_Http_Notify" name="HTTP 通知 &amp; 回执">
+      <bpmn:incoming>Flow_4</bpmn:incoming>
+      <bpmn:outgoing>Flow_5</bpmn:outgoing>
+      <bpmn:extensionElements>
+        <fs:node nodeType="http">
+          <fs:http method="POST" url="https://example.com/hook?x=1&amp;y=2" headers="{&quot;X-A&quot;:&quot;1&quot;}" timeoutMs="5000" retries="2">
+            <fs:body>{"ok":true,"text":"中文 &amp; &lt;tag&gt;"}</fs:body>
+            <fs:inputMapping>{"topic":"id"}</fs:inputMapping>
+            <fs:outputMapping>{"status":"out"}</fs:outputMapping>
+          </fs:http>
+        </fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="EndEvent_1" name="结束">
+      <bpmn:incoming>Flow_5</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="Task_Agent_Impl" />
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Task_Agent_Impl" targetRef="Task_Human_Review" />
+    <bpmn:sequenceFlow id="Flow_3" sourceRef="Task_Human_Review" targetRef="Gateway_Approve" />
+    <bpmn:sequenceFlow id="Flow_4" name="通过 &amp; 继续" sourceRef="Gateway_Approve" targetRef="Task_Http_Notify">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="feel">= approved &amp;&amp; score &gt; 0.8</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_reject" name="打回" sourceRef="Gateway_Approve" targetRef="Task_Agent_Impl">
+      <bpmn:extensionElements>
+        <fs:maxRounds>2</fs:maxRounds>
+      </bpmn:extensionElements>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_5" sourceRef="Task_Http_Notify" targetRef="EndEvent_1" />
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_editor_roundtrip">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="179" y="219" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Agent_Impl_di" bpmnElement="Task_Agent_Impl">
+        <dc:Bounds x="280" y="197" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Human_Review_di" bpmnElement="Task_Human_Review">
+        <dc:Bounds x="452" y="197" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_Approve_di" bpmnElement="Gateway_Approve" isMarkerVisible="true">
+        <dc:Bounds x="627" y="212" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Http_Notify_di" bpmnElement="Task_Http_Notify">
+        <dc:Bounds x="732" y="197" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_1_di" bpmnElement="EndEvent_1">
+        <dc:Bounds x="904" y="219" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="215" y="237" />
+        <di:waypoint x="280" y="237" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2">
+        <di:waypoint x="400" y="237" />
+        <di:waypoint x="452" y="237" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_3_di" bpmnElement="Flow_3">
+        <di:waypoint x="572" y="237" />
+        <di:waypoint x="627" y="237" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_4_di" bpmnElement="Flow_4">
+        <di:waypoint x="677" y="237" />
+        <di:waypoint x="732" y="237" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_reject_di" bpmnElement="Flow_reject">
+        <di:waypoint x="652" y="262" />
+        <di:waypoint x="652" y="320" />
+        <di:waypoint x="340" y="320" />
+        <di:waypoint x="340" y="277" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_5_di" bpmnElement="Flow_5">
+        <di:waypoint x="852" y="237" />
+        <di:waypoint x="904" y="237" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

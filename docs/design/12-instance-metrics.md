@@ -1,0 +1,122 @@
+# 12 · 实例域运行指标（0.13.10）
+
+> 本册是**实例域运行指标口径的唯一之家**：哪些数字能算、怎么算、什么时候是「未知」、汇总怎么选 cohort。
+> 事件字段与实例 API 的落地位置在 `src/instance-metrics.js` / `src/agent-telemetry.js` / `src/bpmn-runtime.js`；
+> 路由与查询参数归 [Host API · 实例域运行指标](../reference/host-api.md#实例域运行指标01310)。
+> 旧运行域（`/runs`）的指标口径在 [04](04-metrics.md) 与 [05](05-run-log.md)，两者**不互相复用**：实例域按 `executionId` 计时，旧域按节点 attempt 计时。
+
+## 1 目标与非目标
+
+**目标**：回答四个确定性问题——运行了多久、调用了多少、在哪里等待、发生了什么错误。
+
+**非目标**（本阶段明确不做）：
+
+- 不做价格 / 费用推算：没有单价表，也没有按 token 计价的字段；
+- 不做固定阈值「健康判决」：不输出绿 / 黄 / 红，也不替人工判定流程好坏；
+- 不保留「流程完成百分比」：分支与循环下百分比没有唯一分母；只给已执行节点数、当前活动、等待任务；
+- 不把业务变量当流程进度：只有显式标量变量可以作为业务指标展示，并必须标注「业务指标」。
+
+## 2 身份与事件
+
+指标只从实例事件流、实例事实、connector 记录、资源记录派生。公共事件信封（`seq` / `at` / `elementId` / `activityId`）的字段契约归 [10 · BPMN 实例 API](10-bpmn-instance-api.md#38-get-instancesidevents)；下表定义的是本阶段新增的 **agent 遥测事件 type 与指标消费方式**（这些事件没有旧域对应物）。新增遥测由适配器观测、`agent-execute` 在**任何结局**（成功 / 超时 / 取消 / 未 finish）收尾时写入：
+
+| 事件 `type` | 关键字段 | 含义 |
+|---|---|---|
+| `agent/invocation` | `invocationId`、`provider`、`phase`（`start` / `reminder`）、`count?`、`attempt?` | 一次真实启动或提醒续跑轮次；初始轮 `invocationId=<executionId>:invoke-1`，第 N 次提醒续跑 `<executionId>:invoke-rN` |
+| `agent/usage` | `provider`、`callId`、`trust`（`known` / `unknown`）、`usage?`、`reason?`、`invocationId?`、`source?` | 一条模型调用观测；同一 `provider + callId` 后到的事件**替换**前一条 |
+| `agent/reminder` | `count`、`maxFires?` | `turn.stop` 每次实际触发一次提醒（0.13.1 已有事件） |
+| `http/attempt` | `invocationId`、`attempt`、`method`、`origin`、`path` | HTTP connector 真正发出请求前 |
+| `http/result` | `invocationId`、`attempt?`、`status?`、`durationMs?`、`reused?` | 单次 HTTP 尝试的结果 / 复用结果 |
+
+调用身份固定为 **`provider + callId`**：
+
+- `provider` 小写归一（`Dsh` → `dsh`）；无法识别时按 `unknown` 处理，不猜 provider 语义。
+- `callId` 由适配器分配：codex 每轮 `turn.completed` 一个，dsh 每个 `attemptId` 一个。真实的新调用必须有新 `callId`；同一次调用的重复上报是替换，不是第二次调用。
+- `executionId` 是节点计时 / 人工等待 / 消息投递的主键；`attempt`（元素第几次激活）不承担计时职责。
+
+## 3 四桶归一化
+
+四桶固定 `{ input, cacheRead, cacheWrite, output, total }`，`total = input + cacheRead + cacheWrite + output`。**reasoning 是 output 的子集**：只记录 `0 ≤ reasoning ≤ output`，绝不另加进 `total`。
+
+不同 provider 的语义不同，必须先归一：
+
+| provider | 原始字段 | 处理 |
+|---|---|---|
+| codex / OpenAI 风格 | `input_tokens`、`cached_input_tokens`、`cache_write_input_tokens`、`output_tokens` | `input_tokens` **已包含**缓存子集：先拆出 `cacheRead` / `cacheWrite`，再从 `input` 里扣掉；`total` 仍等于原始 `input_tokens + output_tokens` |
+| dsh / DeepSeek TokenUsage | `inputTokens`、`cacheReadTokens`、`cacheWriteTokens`、`outputTokens`（互斥） | 不再拆；`cacheRead` 单独成桶，不能加回 input |
+| 已有四桶的输入 | `input` / `cacheRead` / `cacheWrite` / `output` | 视为已归一，不二次拆分 |
+
+数据矛盾（`cached > input`）时按原始 input 截断（先读后写），守住「四桶之和 === total」这条不变量；坏数值（负数、字符串、NaN）整条 usage 标 `unknown`，不把坏值当 0。
+
+## 4 指标表
+
+| 指标 | JSON 位置 | 口径 | 未知语义 |
+|---|---|---|---|
+| 实例墙钟耗时 | `duration.wallMs` | `createdAt → completedAt`（终态）；`createdAt → asOf`（非终态）。含挂起时间，用 `wallIncludesSuspended:true` 明示 | 时间戳不可解析 → `null` + `invalid-timestamps` |
+| 挂起耗时 | `duration.suspendedMs` | 只算显式 `instance/suspended` → `instance/resumed` 区间；终点按 `completedAt/asOf` 收口；单列，不混入执行耗时 | 只有 `SUSPENDED` 状态、没有区间 → `null` + `suspend-timeline-unavailable`；从未挂起 → `0` |
+| 节点耗时 | `nodes.executions[].durationMs` | 按 `executionId`：`activity/start → activity/end`；事件带 `durationMs` 时以事件为准；循环两次 / 同节点不同 execution 各自独立 | 缺 start 或缺 end → `null` |
+| 节点状态 | `nodes.{completed,errored,canceled,interrupted,running,waiting}` | `activity/end` = completed；`error` 事件 = error；终态实例里未结束的 execution = canceled / interrupted。**不把错误 / 取消 / 中断算成 completed** | 状态只有以上几种，不造 `failed` 实例状态 |
+| 已执行 / 当前活动 | `nodes.executed`、`nodes.active` | 已执行 execution 数、当前 `running/waiting` 的 execution；不输出完成百分比 | 空实例 → `0` / `[]` |
+| 人工等待 | `human.completedWaitMs`、`human.currentWaitMs` | 同一 execution **首次** `activity/wait` → `activity/end` / `cancel` / `asOf`；恢复重放不重置起点；无新事件时按 `asOf` 继续增长 | 没有等待 → `0`；时间戳坏 → 对应项不累加 |
+| 取消 / 中断等待 | `human.canceledWaitMs`、`human.interruptedWaitMs` | 等待没有正常完成时的区间单列，不混进 completed | 同上 |
+| agent 调用次数 | `agent.invocations` | `agent/invocation` 去重计数；提醒续跑计调用、不算新 BPMN attempt | 旧事件流没有调用身份 → `null` + `agent-invocation-unavailable`；真的一次 agent 都没有 → `0` |
+| 模型调用数 | `agent.modelCalls` | 观测到的 `agent/usage` callId 去重数 | 有 agent 但无 usage 观测 → `null` |
+| token | `agent.observedTokens` | 按 callId 去重后四桶求和；`total` 恒等于四桶之和 | 一条 known 都没有 → `null`，**不给 0** |
+| usage 覆盖 | `agent.usageCoverage` | `known` = 有四桶的调用数；`unknown` = 明确未知的调用 / 轮次数 | 有 agent 无 usage → `unknown ≥ 1` + `usage-unavailable` |
+| 四桶覆盖 | `agent.buckets.{seen,missing}` | 真正上报过数值的桶；缺桶是信息，不把缺桶当 0 | 无观测 → 四个桶都 missing |
+| finish_reminder | `finishReminder.fires` | 每次实际触发各计一次（同一 `executionId + count` 去重，防重复落盘） | 没有提醒 → `0` |
+| 未完结执行 | `finishReminder.missingExecutions` | `NODE_FINISH_MISSING` 错误事实 + execution 去重；`lastError` 只补没有 error 事件的同一 execution，不反复扫 `lastError` 累加 | 没有 → `0` |
+| connector 执行成功率 | `connector.successRate` | `succeeded / (succeeded + errored + canceled)`；`inFlight`、`unknown` 单列，不进分母 | 分母为 0 → `null`（不是 0%） |
+| connector attempt 成功率 | `connector.attempts.successRate` | `http/result` 里 2xx 尝试数 / 已观测结果数；attempt 总数另列 | 没有结果样本 → `null` |
+| connector 单次请求延迟 | `connector.latency.request` | `http/result.durationMs` 样本的 `min/p50/p95/max` | 无样本 → `null` |
+| connector 含退避总耗时 | `connector.latency.total` | 调用记录 `createdAt → completedAt` 的样本；含重试退避 | 无样本 → `null`；`totalIncludesBackoff:true` |
+| 数据完整性 | `dataQuality.{skippedEvents,skippedResources,reasons}` | 坏行 / 事件缺口 / 未知 usage 等原因逐条列出；`complete` 由 `throughSeq ≥ lastSeq` 且无跳过决定 | `null` 字段一律配一条 reason，不静默 |
+| 业务指标 | `business.scalars` | 只读实例 `variables` 里的显式标量（number / boolean / 短 string）；`source:"instance.variables"` | 没有标量 → `{}`；不推断完成度 |
+
+`complete` 只表示**事件读取完整性**，不表示业务质量通过；`activity/end` 与 `process/end` 也不表示业务质量通过。
+
+## 5 去重与不双计
+
+1. **usage 按 `provider + callId` 替换**：同一调用重试 / 后到的更完整 usage 覆盖前值；不同 callId 才累加。
+2. **调用事件与 `activity/end.usage` 只取一处**：某个 execution 已有 `agent/usage` 事件时，`activity/end.usage` 一律忽略；只有该 execution 完全没有调用事件时才兜底，并在 `dataQuality.reasons` 记 `legacy-usage-fallback`。
+3. **reminder 每次触发计一次**：`agent/reminder` 是事实；`agent/invocation` 的 reminder 轮次只用于 agent 调用次数，不重复算 token。
+4. **NODE_FINISH_MISSING 按 execution 去重**：重复 `error` 事件、`lastError` 与事件同时存在，都只算一个 execution。
+
+## 6 汇总
+
+`GET /metrics` 的汇总口径：
+
+- **cohort 按实例 `createdAt` 选择**：`from` / `to` 是闭区间，不是事件时间；`definitionId` / `definitionVersion` / `status` 也按实例事实过滤。
+- **遍历全部实例**：运行时直接扫 `instances/` 目录，不用 `listInstances()` 的默认 limit 分页，避免漏计；损坏实例计入 `dataQuality.skippedInstances`。
+- **分位数从样本合并**：每个实例保留延迟原始样本（有上限），汇总时把样本合并后重算 `p50/p95`，**不平均各实例的 p95**。
+- **比率重算不平均**：成功率用汇总后的分子 / 分母重算；没有分母就是 `null`。
+- **未知传播**：任一维度的已观测值求和，但 `null` 实例数单独记 `invocationUnknown` / `modelCallsUnknown` / `wallUnknown`；全部未知时总和为 `null`，不变成 0。
+
+## 7 缓存与读取边界
+
+- 缓存只缓存**事件侧归约**，指纹 = `schemaVersion + lastSeq + revision`（另加 connector 记录指纹与 `resourceSeq`）。事件或实例事实一变，指纹变 → 自动重算；缓存可整体清空并重建，权威永远是事件与实例事实。
+- `asOf` 只参与最终投影（墙钟终点、当前等待、活跃 execution 的 `elapsedMs`），所以**没有新事件时人工等待仍会按 `asOf` 增长**，不会冻结在最后一个事件时间。
+- 两个指标 GET 都是**纯读**：不调用 `_ensureRunner()`、不恢复 runner、不因看页面推进实例。
+- `?asOf=` 是给离线复算 / 测试对账用的确定性入口；不传则用请求时刻。
+
+## 8 与旧域指标的区别
+
+| 维度 | 旧运行域（04 / 05） | 实例域（本册） |
+|---|---|---|
+| 计时主键 | 节点 + `attemptId` | `executionId`（同节点循环两次独立） |
+| 进度 | 节点完成百分比（`progress`） | 已执行节点数 / 当前活动 / 等待任务；**没有百分比** |
+| token 来源 | `model/call` 事件（宿主 `session/event` 归集） | 适配器在调用发生/结束时上报的 `agent/usage`；超时 / 取消 / 未 finish 也保留 |
+| 质量结论 | 审查 findings / 质量总评分 | 不做质量判定；只报事实与完整性 |
+| 成本 | 有独立估算入口 | 不做价格 / 费用推算 |
+| 汇总 | runId 单 run | 按实例 `createdAt` cohort 的跨实例汇总 + `groupBy=day` |
+| 事件流 | `runs/<runId>/*.jsonl` | `instances/<instanceId>/events/`（`seq` 全局单调、终态封口） |
+
+## 9 验收对照
+
+- 循环两次 / 同节点不同 execution：计时和次数独立 → `test/instance-metrics.test.mjs`「节点耗时按 executionId」。
+- 重复 usage 更新 / resume 重放 / 提醒续跑：替换不双计、不漏计 → `test/agent-telemetry.test.mjs` 与 `test/instance-metrics.test.mjs`。
+- 缺 usage / 坏事件 / 截断：明确降完整性，不给伪零 → 同上「未知不是零」与 `dataQuality.reasons`。
+- API 与离线纯函数一致、追加事件后缓存失效、GET 不启动 runner → `test/instance-metrics.test.mjs` 最后一个用例。
+- 无新事件时人工等待继续增长 → `test/instance-metrics.test.mjs`「人工等待」。
+- 汇总分页不漏计、分位数从样本合并 → `test/instance-metrics.test.mjs`「汇总」与运行时 `_allInstanceIds()`。
+- 客户端未知 / 无样本不渲染成 0 → `test/client-metrics.test.mjs`。

@@ -211,6 +211,9 @@ export const DSH_ADAPTER_CAPABILITIES = Object.freeze({
   // 0.13.10：收件箱消息通过 `agent.followup` 投递（新的一轮 / 队列尾部），宿主只能
   // 确认「已交给会话」，不能确认模型一定读过——上层必须显示 deliveryUnknown。
   messages: 'native',
+  // 0.13.10 运行指标：usage 从 `agent/assistant-stream` 的 usage chunk 观测，
+  // 每个 `attemptId` 是一条模型调用（callId 由 sessionId + attemptId 组成）。
+  usage: 'native',
   reminder: Object.freeze({
     mechanism: 'agent.steer',
     maxFires: DEFAULT_FINISH_REMINDER_MAX_FIRES,
@@ -232,6 +235,10 @@ export const DSH_ADAPTER_CAPABILITIES = Object.freeze({
     messages: [
       'agent.followup: @deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts',
     ],
+    usage: [
+      'agent/assistant-stream payload.frame.chunk.type=usage: @deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts',
+      'TokenUsage 四桶互斥(inputTokens/cacheReadTokens/cacheWriteTokens/outputTokens): @deepseek-ai/dsh-llm/lib/types/types.d.ts:167',
+    ],
   }),
 })
 
@@ -248,12 +255,15 @@ export const DSH_ADAPTER_UNPROBED_CAPABILITIES = Object.freeze({
   cancel: FINISH_TOOL_SUPPORT.NATIVE,
   // probe 之前不宣称可投递：没有会话就没有 followup 通道。
   messages: 'unsupported',
+  // probe 之前没有会话，也就没有 usage chunk：如实标 unknown。
+  usage: 'unknown',
   reminder: DSH_ADAPTER_CAPABILITIES.reminder,
   evidence: Object.freeze({
     finishTool: ['probe() 尚未成功：在 probe() 成功前 finishTool 只能是 unsupported'],
     'turn.stop': ['probe() 尚未成功：宿主会话能力未验证'],
     cancel: DSH_ADAPTER_CAPABILITIES.evidence.cancel,
     messages: ['probe() 尚未成功：收件箱投递能力未验证'],
+    usage: ['probe() 尚未成功：没有会话就观测不到 agent/assistant-stream usage'],
   }),
 })
 
@@ -816,6 +826,10 @@ export function createDshAdapter(options = {}) {
         disposed: false,
         cleanup: null,
         handle: null,
+        // 0.13.10 运行指标：attemptId → 原始 TokenUsage（同一 attempt 后到的 usage
+        // 整条替换；callId 稳定，不让重试/多 chunk 变成重复调用）。
+        usageCalls: new Map(),
+        usageLast: null,
       }
 
       const settle = outcome => {
@@ -1087,6 +1101,27 @@ export function createDshAdapter(options = {}) {
         // 会话错误必须让真实原因冒泡，不能被 whenIdle 兜底成 NODE_FINISH_MISSING。
         const offError = agentCtx.on('agent/error', payload => onAgentError(payload))
         if (typeof offError === 'function') st.unlisteners.push(offError)
+        // 0.13.10 运行指标：`assistant/message` 的 usage 先经过 process-local 的
+        // `agent/assistant-stream` 发布；按 attemptId 去重（同一条调用多个 usage
+        // chunk 是替换，不是累加）。中断/取消的调用也可能已有 usage，必须保留。
+        // usage 是可选观测能力：订阅失败不能把节点判失败（否则看指标反而拖垮执行），
+        // 只会让本次调用在指标里如实变成 unknown。
+        let offUsage = null
+        try {
+          offUsage = agentCtx.on('agent/assistant-stream', payload => {
+            const frame = isPlainObject(payload?.frame) ? payload.frame : null
+            if (frame === null || frame.type !== 'chunk') return
+            const chunk = isPlainObject(frame.chunk) ? frame.chunk : null
+            if (chunk === null || chunk.type !== 'usage' || !isPlainObject(chunk.usage)) return
+            if (frame.attemptId === undefined || frame.attemptId === null) return
+            const callId = `${st.sessionId || sessionId}:${String(frame.attemptId)}`
+            st.usageCalls.set(callId, { ...chunk.usage })
+            st.usageLast = { ...chunk.usage }
+          })
+        } catch (error) {
+          log('warn', `flow-studio: 订阅 agent/assistant-stream 失败（usage 将标未知）：${errorText(error)}`)
+        }
+        if (typeof offUsage === 'function') st.unlisteners.push(offUsage)
         // 0.13.10：宿主可把「绑定本实例/执行身份」的收件箱工具注册进这个会话。
         // 未提供时保持旧行为（全局工具仍在宿主 tools 服务里）。
         if (typeof req.registerTools === 'function') {
@@ -1126,6 +1161,20 @@ export function createDshAdapter(options = {}) {
           // DSH 里 agent 的注册身份就是 sessionId（没有独立的 agentId）。
           get agentId() { return st.sessionId },
           get agent() { return st.agent },
+          // 0.13.10 运行指标：最近一次观测到的 TokenUsage（原始四桶，互斥）。
+          get usage() { return st.usageLast === null ? undefined : { ...st.usageLast } },
+          /**
+           * 本次执行观测到的全部模型调用 usage（按 attemptId 去重）。
+           * `agent-execute` 在成功 / 超时 / 取消 / 未 finish 的收尾里都会读它。
+           */
+          usageCalls() {
+            return [...st.usageCalls.entries()].map(([callId, usage]) => ({
+              provider: DSH_ADAPTER_ID,
+              callId,
+              usage: { ...usage },
+              source: 'agent/assistant-stream',
+            }))
+          },
           // dispose 之前为 null；之后是真实清理状态（宿主不返回时 disposed=false、
           // timedOut=true——调用方据此知道「没清完」，不能当成已释放）。
           get cleanup() { return st.cleanup },

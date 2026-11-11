@@ -80,6 +80,20 @@ export const MESSAGE_SUPPORT = Object.freeze({
 })
 
 /**
+ * `capabilities().usage` 的合法取值（0.13.10 运行指标的可选能力扩展）。
+ *
+ * - `native`：适配器能观测到模型调用级 usage，并通过可选的 `handle.usageCalls`
+ *   暴露 `{ provider, callId, usage, source }[]`；宿主据此记录 `agent/usage`；
+ * - `unknown`：没有 usage 观测，运行指标必须把 token 标成未知，绝不给 0。
+ *
+ * **旧适配器不写这个字段时按 `unknown` 处理**，冻结接口不变。
+ */
+export const USAGE_SUPPORT = Object.freeze({
+  NATIVE: 'native',
+  UNKNOWN: 'unknown',
+})
+
+/**
  * `probeAll()` 里**单个适配器**的探测上限（毫秒）。探测会起子进程 / 走 MCP 握手，
  * 任何一个挂住都不能让注册表整体挂住；超时按 `ok:false` 记录（m9）。
  */
@@ -91,6 +105,7 @@ const ADAPTER_METHODS = Object.freeze(['probe', 'capabilities', 'start', 'cancel
 const FINISH_TOOL_LEVELS = new Set(Object.values(FINISH_TOOL_SUPPORT))
 const HOOK_LEVELS = new Set(Object.values(HOOK_SUPPORT))
 const MESSAGE_LEVELS = new Set(Object.values(MESSAGE_SUPPORT))
+const USAGE_LEVELS = new Set(Object.values(USAGE_SUPPORT))
 
 /**
  * 带结构化错误码的适配器错误。
@@ -226,7 +241,32 @@ export function validateAdapter(adapter) {
       { adapterId: adapter.id, field: 'deliverMessage', reason: 'missing-method' },
     )
   }
+  // 0.13.10 可选扩展：缺省 = unknown（不破坏旧适配器）；声明 native 时宿主会读
+  // `handle.usageCalls`，适配器没实现就只会得到「未知」，不会伪造 token。
+  if (caps.usage !== undefined && !USAGE_LEVELS.has(caps.usage)) {
+    throw fail(
+      ADAPTER_ERROR.CAPABILITY_INVALID,
+      `适配器 ${adapter.id} 的 capabilities().usage 必须是 native 或 unknown`
+        + `（收到 ${JSON.stringify(caps.usage)}）`,
+      { adapterId: adapter.id, field: 'usage', value: caps.usage },
+    )
+  }
   return adapter
+}
+
+/**
+ * 读取适配器的 usage 观测档位；缺省 / 非法一律 `unknown`（不可观测不是零）。
+ *
+ * @param {object|null} adapter
+ * @returns {'native'|'unknown'}
+ */
+export function adapterUsageCapability(adapter) {
+  try {
+    const caps = adapter && typeof adapter.capabilities === 'function' ? adapter.capabilities() : null
+    return caps && caps.usage === USAGE_SUPPORT.NATIVE ? USAGE_SUPPORT.NATIVE : USAGE_SUPPORT.UNKNOWN
+  } catch {
+    return USAGE_SUPPORT.UNKNOWN
+  }
 }
 
 /**

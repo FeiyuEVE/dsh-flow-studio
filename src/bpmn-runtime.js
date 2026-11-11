@@ -42,7 +42,7 @@
 
 import { Buffer } from 'node:buffer'
 import { existsSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
+import { readdir, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import {
@@ -70,6 +70,14 @@ import {
 import { parseBpmn } from './bpmn-parse.js'
 import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
 import { createConnectorStore } from './connector-store.js'
+import {
+  aggregateInstanceMetrics,
+  createMetricsCache,
+  finalizeInstanceMetrics,
+  metricsFingerprintFor,
+  parseTimeMs,
+  reduceInstanceMetrics,
+} from './instance-metrics.js'
 import { executeHttpConnector } from './http-connector.js'
 import { normalizeHttpPolicy } from './http-policy.js'
 import { BPMN_STATE_KIND, BPMN_STATE_VERSION, sha256Hex } from './bpmn-state.js'
@@ -595,6 +603,8 @@ class BpmnRuntime {
     this._activeAgents = new Map()
     /** @type {Map<string, {plan: object, createdAt: number}>} prune 预览 plan */
     this._prunePlans = new Map()
+    /** 运行指标的事件侧归约缓存：只绑 lastSeq/revision/schemaVersion（+ connector/资源指纹） */
+    this._metricsCache = createMetricsCache()
     this._disposed = false
   }
 
@@ -740,6 +750,7 @@ class BpmnRuntime {
       if (parts[0] === 'definitions') return await this._handleDefinitions(method, parts, url, body)
       if (parts[0] === 'instances') return await this._handleInstances(method, parts, url, body)
       if (parts[0] === 'instance-worktrees') return await this._handleInstanceWorktrees(method, parts, url, body)
+      if (parts[0] === 'metrics') return await this._handleMetrics(method, parts, url)
       return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
     } catch (error) {
       return errorResult(error)
@@ -987,6 +998,11 @@ class BpmnRuntime {
       if (parts[2] === 'resource-events') {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readResourceEvents(id, url)
+      }
+      if (parts[2] === 'metrics') {
+        // 0.13.10：运行指标是**纯读**——不调 `_ensureRunner()`、不因看页面推进实例。
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readInstanceMetrics(id, url)
       }
       if (parts[2] === 'worktree') {
         if (method === 'GET') return await this._readInstanceWorktree(id)
@@ -1662,6 +1678,162 @@ class BpmnRuntime {
         shards: events?.shards ?? 0,
       },
     }
+  }
+
+  /**
+   * `GET /instances/<id>/metrics[?asOf=ISO]`：单实例运行指标（纯读）。
+   *
+   * - 不调用 `_ensureRunner()`：查看指标不会恢复/推进实例；
+   * - 事件侧归约按 `lastSeq + revision + schemaVersion`（+ connector / 资源指纹）缓存，
+   *   事件或实例事实一变即重算；`asOf` 只参与最终投影，所以「没有新事件时人工等待
+   *   仍按 asOf 增长」不会被缓存冻结；
+   * - `asOf` 可显式传，便于离线纯函数复算与 API 逐字段对账。
+   *
+   * @param {string} id
+   * @param {URL} url
+   * @returns {Promise<{status:number, body:object}>}
+   */
+  async _readInstanceMetrics(id, url) {
+    const asOf = this._metricsAsOf(url)
+    if (asOf.error !== null) return { status: 400, body: { ok: false, code: 'METRICS_AS_OF_INVALID', error: asOf.error } }
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    const reduction = await this._metricsReductionFor(instance)
+    return { status: 200, body: finalizeInstanceMetrics(reduction, asOf.value) }
+  }
+
+  /** `?asOf=`（可选）：非法时间 400，不静默回落到 now。 */
+  _metricsAsOf(url, param = 'asOf') {
+    const raw = url?.searchParams?.get(param)
+    if (raw === null || raw === undefined || raw === '') {
+      return { value: new Date().toISOString(), error: null }
+    }
+    const ms = parseTimeMs(raw)
+    if (ms === null) return { value: null, error: `${param} 必须是可解析的 ISO 时间（收到 ${JSON.stringify(raw)}）` }
+    return { value: new Date(ms).toISOString(), error: null }
+  }
+
+  /**
+   * 读一个实例的全部指标输入并做事件侧归约。connector 目录不存在时返回空记录。
+   */
+  async _metricsReductionFor(instance) {
+    const events = await readInstanceEvents(instance.id, { instancesRoot: this.instancesRoot })
+    const list = events ?? []
+    let connectorRecords = []
+    try {
+      const store = createConnectorStore({ root: join(this.instancesRoot, instance.id, 'connector') })
+      connectorRecords = await store.listInvocations(instance.id)
+    } catch {
+      // connector 目录损坏 / 不存在：指标照算，dataQuality 会从事件侧暴露缺口。
+      connectorRecords = []
+    }
+    let resources = { events: [], skipped: 0, resourceSeq: 0 }
+    try {
+      resources = await readResourceEvents({ instancesRoot: this.instancesRoot, instanceId: instance.id })
+    } catch {
+      resources = { events: [], skipped: 0, resourceSeq: 0 }
+    }
+    const fingerprint = metricsFingerprintFor(instance, {
+      connector: connectorFingerprint(connectorRecords),
+      resources: Number.isInteger(resources.resourceSeq) ? resources.resourceSeq : 0,
+    })
+    const cached = this._metricsCache.get(fingerprint, () => reduceInstanceMetrics({
+      instance,
+      events: list,
+      skippedEvents: events?.skipped ?? 0,
+      connector: connectorRecords,
+      resources,
+      skippedResources: resources.skipped ?? 0,
+    }))
+    return cached.value
+  }
+
+  /**
+   * `GET /metrics?definitionId=&definitionVersion=&from=&to=&status=&groupBy=day[&asOf=ISO]`
+   *
+   * 跨实例汇总：遍历 instances 目录下**全部**实例（不用 `listInstances()` 的默认
+   * limit 分页，避免漏计），按实例 `createdAt` 选 cohort；延迟分位数由各实例的原始
+   * 样本合并后重算，不平均各实例 p95。
+   */
+  async _handleMetrics(method, parts, url) {
+    if (parts.length !== 1) {
+      return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+    }
+    if (method !== 'GET') return methodNotAllowed('GET')
+    const asOf = this._metricsAsOf(url)
+    if (asOf.error !== null) return { status: 400, body: { ok: false, code: 'METRICS_AS_OF_INVALID', error: asOf.error } }
+    const definitionId = url.searchParams.get('definitionId')
+    if (definitionId !== null && definitionId !== '' && !checkRunId(definitionId)) {
+      return { status: 400, body: { ok: false, code: 'METRICS_FILTER_INVALID', error: 'definitionId 非法' } }
+    }
+    const versionRaw = url.searchParams.get('definitionVersion')
+    let definitionVersion = null
+    if (versionRaw !== null && versionRaw !== '') {
+      if (!/^\d+$/.test(versionRaw) || Number(versionRaw) < 1) {
+        return { status: 400, body: { ok: false, code: 'METRICS_FILTER_INVALID', error: 'definitionVersion 必须是 ≥1 的整数' } }
+      }
+      definitionVersion = Number(versionRaw)
+    }
+    const statusRaw = url.searchParams.get('status')
+    if (statusRaw !== null && statusRaw !== '' && !['ACTIVE', 'COMPLETED', 'SUSPENDED', 'CANCELED'].includes(statusRaw.toUpperCase())) {
+      return { status: 400, body: { ok: false, code: 'METRICS_FILTER_INVALID', error: 'status 必须是 ACTIVE / COMPLETED / SUSPENDED / CANCELED 之一' } }
+    }
+    const fromRaw = url.searchParams.get('from')
+    const toRaw = url.searchParams.get('to')
+    for (const [name, raw] of [['from', fromRaw], ['to', toRaw]]) {
+      if (raw !== null && raw !== '' && parseTimeMs(raw) === null) {
+        return { status: 400, body: { ok: false, code: 'METRICS_FILTER_INVALID', error: `${name} 必须是可解析的 ISO 时间` } }
+      }
+    }
+    const groupBy = url.searchParams.get('groupBy')
+    if (groupBy !== null && groupBy !== '' && groupBy !== 'day') {
+      return { status: 400, body: { ok: false, code: 'METRICS_FILTER_INVALID', error: "groupBy 只支持 'day'" } }
+    }
+
+    const entries = []
+    let skippedInstances = 0
+    for (const instanceId of await this._allInstanceIds()) {
+      let instance
+      try {
+        instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+      } catch {
+        skippedInstances += 1
+        continue
+      }
+      if (instance === null) {
+        skippedInstances += 1
+        continue
+      }
+      try {
+        const reduction = await this._metricsReductionFor(instance)
+        entries.push({ instance, metrics: finalizeInstanceMetrics(reduction, asOf.value) })
+      } catch {
+        skippedInstances += 1
+      }
+    }
+    const body = aggregateInstanceMetrics({
+      entries,
+      ...(definitionId === null || definitionId === '' ? {} : { definitionId }),
+      ...(definitionVersion === null ? {} : { definitionVersion }),
+      ...(fromRaw === null || fromRaw === '' ? {} : { from: fromRaw }),
+      ...(toRaw === null || toRaw === '' ? {} : { to: toRaw }),
+      ...(statusRaw === null || statusRaw === '' ? {} : { status: statusRaw.toUpperCase() }),
+      ...(groupBy === null || groupBy === '' ? {} : { groupBy }),
+      generatedAt: asOf.value,
+    })
+    body.totals.dataQuality.skippedInstances += skippedInstances
+    return { status: 200, body }
+  }
+
+  /** 实例目录下全部合法 id（含损坏实例；损坏的由调用方计入 skipped）。 */
+  async _allInstanceIds() {
+    let names = []
+    try {
+      names = await readdir(this.instancesRoot)
+    } catch {
+      return []
+    }
+    return names.filter(name => !name.startsWith('.') && checkRunId(name) !== null)
   }
 
   /**
@@ -3548,6 +3720,16 @@ function workspaceErrorResult(error) {
       ...(error && typeof error.path === 'string' && error.path !== '' ? { path: error.path } : {}),
     },
   }
+}
+
+/** connector 记录指纹：执行级结果的 updatedAt / 数量一变，指标缓存即失效。 */
+function connectorFingerprint(records) {
+  if (!Array.isArray(records) || records.length === 0) return ''
+  let latest = ''
+  for (const record of records) {
+    if (record && typeof record.updatedAt === 'string' && record.updatedAt > latest) latest = record.updatedAt
+  }
+  return `${records.length}:${latest}`
 }
 
 function methodNotAllowed(supported) {

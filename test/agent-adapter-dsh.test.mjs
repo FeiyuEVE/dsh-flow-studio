@@ -618,6 +618,7 @@ await check('能力：未 probe → unsupported；probe 成功 → native；star
   const adapter = makeAdapter(host)
   const before = adapter.capabilities()
   A.equal(before.finishTool, 'unsupported', '未 probe 前不得宣称 native（M1）')
+  A.equal(before.usage, 'unknown', '未 probe 前没有会话，usage 只能是 unknown')
   A.equal(before.hooks['turn.stop'], 'unsupported', '未 probe 前 hook 也不宣称 native')
   A.equal(adapter.id, DSH_ADAPTER_ID)
   A.throws(
@@ -632,6 +633,7 @@ await check('能力：未 probe → unsupported；probe 成功 → native；star
   A.match(probe.helpDigest, /^[0-9a-f]{64}$/)
   A.equal(adapter.capabilities().finishTool, 'native', 'probe 成功后返回 native')
   A.equal(adapter.capabilities().hooks['turn.stop'], 'native')
+  A.equal(adapter.capabilities().usage, 'native', '0.13.10：usage 从 agent/assistant-stream 观测')
   A.equal(assertFinishToolNative(adapter), true)
 
   // 另起一个从未显式 probe 的适配器：start 必须先 probe 再创建会话。

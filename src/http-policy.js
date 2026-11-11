@@ -9,7 +9,8 @@
  *   - **所有** DNS 结果都校验，并返回一个把连接固定到已验证地址的 `lookup`，
  *     避免「校验一次、连接时重新解析」的 DNS 重绑定窗口；
  *   - 关闭重定向（connector 收到 3xx 直接失败，见 http-connector）；
- *   - `authRef` 只从宿主配置解析，XML / 变量 / 事件 / 错误文本 / 日志都不保存密钥值。
+ *   - `authRef` 只从宿主配置解析；XML / 变量 / 事件 / 错误文本 / 日志都不保存密钥值。
+ *     connector 还会对响应头 / 输出映射里的精确凭据值做脱敏或拒绝（见 http-connector）。
  *
  * 本模块不读取文件、不发网络请求（默认 resolver 除外）；`validateDestination()`
  * 的返回值就是 connector 实际连接时使用的地址清单。
@@ -32,7 +33,7 @@ export class HttpPolicyError extends Error {
 /** 允许的方法（与属性面板一致；其他方法明确拒绝，不做「任意动词」透传）。 */
 export const HTTP_METHODS = Object.freeze(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'])
 
-/** 默认 maxResponseBytes / maxRequestBytes / 时限与重试上限。 */
+/** 默认 maxResponseBytes / maxRequestBytes / 时限、重试与 header 预算。 */
 export const HTTP_LIMITS = Object.freeze({
   maxRequestBytes: 256 * 1024,
   defaultResponseBytes: 1024 * 1024,
@@ -42,6 +43,12 @@ export const HTTP_LIMITS = Object.freeze({
   maxRetries: 3,
   retryBackoffBaseMs: 200,
   retryBackoffMaxMs: 2_000,
+  // m2：header 也需要独立预算（正文限额不覆盖 header）。这些是硬上限，宿主配置不能放大。
+  maxRequestHeaderCount: 64,
+  maxRequestHeaderValueBytes: 8 * 1024,
+  maxRequestHeaderBytes: 32 * 1024,
+  maxResponseHeaderCount: 64,
+  maxResponseHeaderBytes: 8 * 1024,
 })
 
 /** 云 metadata 的常见 IPv4 地址（link-local 之外的显式补充）。 */
@@ -80,27 +87,215 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function stringList(value) {
-  if (typeof value === 'string') return value.trim() === '' ? [] : [value.trim()]
-  if (!Array.isArray(value)) return []
-  return value
-    .filter(item => typeof item === 'string' && item.trim() !== '')
-    .map(item => item.trim())
-}
-
 function positiveInt(value, fallback, max) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback
   const integer = Math.floor(value)
   return max !== undefined ? Math.min(integer, max) : integer
 }
 
+/* ── 宿主策略的严格校验（H2）────────────────────────────────────── */
+
+function policyInvalid(message, details) {
+  return new HttpPolicyError('HTTP_POLICY_INVALID', message, details)
+}
+
+/** 规范化 origin：协议 + 小写主机 + 显式端口（与 connector 的 validated.origin 同口径）。 */
+function canonicalOriginOf(url) {
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const port = url.port !== ''
+    ? Number(url.port)
+    : (url.protocol === 'https:' ? 443 : 80)
+  const hostText = host.includes(':') ? `[${host}]` : host
+  return `${url.protocol}//${hostText}:${port}`
+}
+
 /**
- * 归一化宿主传入的策略对象。未知键忽略，非法值回落到安全默认值。
+ * 例外项严格解析：`host:port` / `[IPv6]:port`。
  *
- * 例外配置（都要求宿主显式写死，不接受通配符）：
- *   - `allowInsecureOrigins`: ['host:port', 'host']，同时放行 http 与私网判定；
- *   - `allowedHosts`: ['host:port', 'host']，允许 https 访问私网/回环地址；
+ * H2 契约：**端口必须显式**（1–65535），接受 `*` 或省略端口都会静默扩大安全边界，
+ * 因此这里直接拒绝，而不是回落到「任意端口」。
+ *
+ * @returns {{ host: string, port: number }}
+ */
+function parseStrictHostRule(rule, field) {
+  if (typeof rule !== 'string') {
+    throw policyInvalid(`${field} 的每一项都必须是字符串（host:port）。`, { field })
+  }
+  const text = rule.trim()
+  if (text === '') throw policyInvalid(`${field} 不允许空字符串。`, { field })
+  if (text.includes('*')) {
+    throw policyInvalid(`${field} 不接受通配符：请逐项写死 host:port。`, { field, rule: text })
+  }
+
+  let host
+  let portText
+  if (text.startsWith('[')) {
+    const end = text.indexOf(']')
+    if (end < 0) throw policyInvalid(`${field} 的 IPv6 例外必须写成 [地址]:端口。`, { field, rule: text })
+    host = text.slice(1, end)
+    const rest = text.slice(end + 1)
+    if (!rest.startsWith(':')) {
+      throw policyInvalid(`${field} 的例外必须显式写端口（[地址]:端口），省略端口不再表示任意端口。`, { field, rule: text })
+    }
+    portText = rest.slice(1)
+    if (parseIPv6(host) === null) {
+      throw policyInvalid(`${field} 的 IPv6 地址不合法：${text}。`, { field, rule: text })
+    }
+  } else {
+    if ((text.match(/:/g) ?? []).length > 1) {
+      throw policyInvalid(`${field} 的 IPv6 例外必须写方括号（[地址]:端口）。`, { field, rule: text })
+    }
+    const colon = text.lastIndexOf(':')
+    if (colon <= 0) {
+      throw policyInvalid(`${field} 的例外必须显式写端口（host:port），省略端口不再表示任意端口。`, { field, rule: text })
+    }
+    host = text.slice(0, colon)
+    portText = text.slice(colon + 1)
+    if (/^[0-9.]+$/.test(host) && parseIPv4(host) === null) {
+      throw policyInvalid(`${field} 的主机不是合法 IPv4：${text}。`, { field, rule: text })
+    }
+    if (!/^[a-z0-9._-]+$/i.test(host)) {
+      throw policyInvalid(`${field} 的主机名不合法：${text}。`, { field, rule: text })
+    }
+  }
+  if (!/^\d{1,5}$/.test(portText)) {
+    throw policyInvalid(`${field} 的端口必须是 1–65535 的十进制整数：${text}。`, { field, rule: text })
+  }
+  const port = Number(portText)
+  if (port < 1 || port > 65535) {
+    throw policyInvalid(`${field} 的端口必须在 1–65535 之间：${text}。`, { field, rule: text })
+  }
+  const lowerHost = host.toLowerCase()
+  return { host: lowerHost, port }
+}
+
+function normalizeHostRules(raw, field) {
+  if (raw === undefined || raw === null) return []
+  const list = typeof raw === 'string' ? [raw] : raw
+  if (!Array.isArray(list)) {
+    throw policyInvalid(`${field} 必须是字符串数组（host:port）。`, { field })
+  }
+  return list.map(rule => {
+    const parsed = parseStrictHostRule(rule, field)
+    const hostText = parsed.host.includes(':') ? `[${parsed.host}]` : parsed.host
+    return `${hostText}:${parsed.port}`
+  })
+}
+
+/** CIDR 例外严格解析：前缀必须是非空十进制数字，网络地址必须合法。 */
+function normalizeCidrRules(raw, field) {
+  if (raw === undefined || raw === null) return []
+  const list = typeof raw === 'string' ? [raw] : raw
+  if (!Array.isArray(list)) {
+    throw policyInvalid(`${field} 必须是字符串数组（IPv4/IPv6 CIDR）。`, { field })
+  }
+  return list.map(rule => {
+    if (typeof rule !== 'string') {
+      throw policyInvalid(`${field} 的每一项都必须是字符串（CIDR）。`, { field })
+    }
+    const text = rule.trim()
+    if (text === '' || text.includes('*')) {
+      throw policyInvalid(`${field} 不接受空串或通配符：${JSON.stringify(text)}。`, { field, rule: text })
+    }
+    const slash = text.lastIndexOf('/')
+    if (slash <= 0) {
+      throw policyInvalid(`${field} 的 CIDR 缺少 /前缀长度：${text}。`, { field, rule: text })
+    }
+    const networkText = text.slice(0, slash).trim()
+    const prefixText = text.slice(slash + 1).trim()
+    if (!/^\d{1,3}$/.test(prefixText)) {
+      // H2 的实测反例：Number('') === 0 会把 10.0.0.0/ 静默变成 /0（放行一切）。
+      throw policyInvalid(`${field} 的 CIDR 前缀长度必须是非空十进制数字：${text}。`, { field, rule: text })
+    }
+    const prefix = Number(prefixText)
+    const family = networkText.includes(':') ? 6 : 4
+    const max = family === 4 ? 32 : 128
+    if (prefix < 0 || prefix > max) {
+      throw policyInvalid(`${field} 的 CIDR 前缀长度必须在 0–${max} 之间：${text}。`, { field, rule: text })
+    }
+    const network = family === 4 ? parseIPv4(networkText) : parseIPv6(networkText)
+    if (network === null) {
+      throw policyInvalid(`${field} 的网络地址不合法：${text}。`, { field, rule: text })
+    }
+    return `${networkText}/${prefix}`
+  })
+}
+
+/**
+ * 本地 NAT64 前缀（RFC 8215）显式配置：只接受 `64:ff9b:1::/48` 的子前缀，
+ * 且前缀长度 32–96（IPv4 映射在内嵌的低 32 位）。默认列表为空 = 全部阻断。
+ */
+function normalizeNat64Prefixes(raw) {
+  const field = 'nat64Prefixes'
+  return normalizeCidrRules(raw, field).map(rule => {
+    const [networkText, prefixText] = rule.split('/')
+    const family = networkText.includes(':') ? 6 : 4
+    const prefix = Number(prefixText)
+    if (family !== 6 || prefix < 32 || prefix > 96 || !addressInCidr(networkText, '64:ff9b:1::/48')) {
+      throw policyInvalid(
+        'nat64Prefixes 只接受 64:ff9b:1::/48 内、前缀长度 32–96 的本地 NAT64 前缀；其他转换前缀不支持。',
+        { field, rule },
+      )
+    }
+    return rule
+  })
+}
+
+/** authRef → 允许的目标 origin 列表（H3：凭据不能跟着被改写的 URL 去别的 origin）。 */
+function normalizeAuthOrigins(raw) {
+  const field = 'authOrigins'
+  if (raw === undefined || raw === null) return {}
+  if (!isPlainObject(raw)) {
+    throw policyInvalid(`${field} 必须是 { authRef: ['https://host:port'] } 对象。`, { field })
+  }
+  const output = {}
+  for (const [authRef, list] of Object.entries(raw)) {
+    if (typeof authRef !== 'string' || authRef.trim() === '' || authRef.length > 128) {
+      throw policyInvalid(`${field} 的键必须是非空 authRef（≤128 字符）。`, { field })
+    }
+    const items = typeof list === 'string' ? [list] : list
+    if (!Array.isArray(items) || items.length === 0) {
+      throw policyInvalid(`${field}[${authRef}] 必须是非空 origin 数组。`, { field, authRef })
+    }
+    const origins = items.map(item => {
+      if (typeof item !== 'string' || item.trim() === '') {
+        throw policyInvalid(`${field}[${authRef}] 的每一项都必须是 origin 字符串。`, { field, authRef })
+      }
+      if (item.includes('*')) {
+        throw policyInvalid(`${field}[${authRef}] 不接受通配符 origin。`, { field, authRef })
+      }
+      let url
+      try {
+        url = new URL(item.trim())
+      } catch {
+        throw policyInvalid(`${field}[${authRef}] 的 origin 不是合法 URL：${item}。`, { field, authRef })
+      }
+      if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+        throw policyInvalid(`${field}[${authRef}] 的 origin 只允许 http(s)。`, { field, authRef })
+      }
+      if (url.username !== '' || url.password !== '') {
+        throw policyInvalid(`${field}[${authRef}] 的 origin 不允许包含 userinfo。`, { field, authRef })
+      }
+      if ((url.pathname !== '' && url.pathname !== '/') || url.search !== '' || url.hash !== '') {
+        throw policyInvalid(`${field}[${authRef}] 只能写 origin（协议 + 主机 + 端口），不能带路径 / 查询 / 片段。`, { field, authRef })
+      }
+      return canonicalOriginOf(url)
+    })
+    output[authRef.trim()] = [...new Set(origins)]
+  }
+  return output
+}
+
+/**
+ * 归一化宿主传入的策略对象。未知键忽略；**非法 / 会扩权的值直接报
+ * `HTTP_POLICY_INVALID`**，不再静默回落（H2）。
+ *
+ * 例外配置（都要求宿主显式写死，不接受通配符、不接受省略端口）：
+ *   - `allowInsecureOrigins`: ['host:port', '[v6]:port']，同时放行 http 与私网判定；
+ *   - `allowedHosts`: ['host:port']，允许 https 访问私网/回环地址；
  *   - `allowedCidrs`: ['10.0.0.0/8', '2001:db8::/32']，按**已解析地址**放行；
+ *   - `nat64Prefixes`: ['64:ff9b:1::/48']，显式启用本地 NAT64；内嵌 IPv4 仍必须是公网；
+ *   - `authOrigins`: { authRef: ['https://host:port'] }，把凭据绑定到允许的目标 origin；
  *   - `allowMetadata`: true 才允许 metadata 地址（默认 false，通常不该开）。
  *
  * `resolver(hostname) -> [{address, family}] | string[]` 只给测试/嵌入方注入；
@@ -108,10 +303,13 @@ function positiveInt(value, fallback, max) {
  */
 export function normalizeHttpPolicy(raw = {}) {
   const source = isPlainObject(raw) ? raw : {}
+  const maxTimeoutMs = positiveInt(source.maxTimeoutMs, HTTP_LIMITS.maxTimeoutMs)
   return {
-    allowInsecureOrigins: stringList(source.allowInsecureOrigins),
-    allowedHosts: stringList(source.allowedHosts),
-    allowedCidrs: stringList(source.allowedCidrs),
+    allowInsecureOrigins: normalizeHostRules(source.allowInsecureOrigins, 'allowInsecureOrigins'),
+    allowedHosts: normalizeHostRules(source.allowedHosts, 'allowedHosts'),
+    allowedCidrs: normalizeCidrRules(source.allowedCidrs, 'allowedCidrs'),
+    nat64Prefixes: normalizeNat64Prefixes(source.nat64Prefixes),
+    authOrigins: normalizeAuthOrigins(source.authOrigins),
     allowMetadata: source.allowMetadata === true,
     allowRedirects: false,
     maxRequestBytes: positiveInt(source.maxRequestBytes, HTTP_LIMITS.maxRequestBytes),
@@ -125,8 +323,9 @@ export function normalizeHttpPolicy(raw = {}) {
       HTTP_LIMITS.hardResponseBytes,
       HTTP_LIMITS.hardResponseBytes,
     ),
-    defaultTimeoutMs: positiveInt(source.defaultTimeoutMs, HTTP_LIMITS.defaultTimeoutMs),
-    maxTimeoutMs: positiveInt(source.maxTimeoutMs, HTTP_LIMITS.maxTimeoutMs),
+    // 默认时限不能超过宿主配置的上限（避免一个宽泛默认值绕过 maxTimeoutMs）。
+    defaultTimeoutMs: Math.min(positiveInt(source.defaultTimeoutMs, HTTP_LIMITS.defaultTimeoutMs), maxTimeoutMs),
+    maxTimeoutMs,
     maxRetries: Math.min(positiveInt(source.maxRetries, HTTP_LIMITS.maxRetries), HTTP_LIMITS.maxRetries),
     retryBackoffBaseMs: positiveInt(source.retryBackoffBaseMs, HTTP_LIMITS.retryBackoffBaseMs),
     retryBackoffMaxMs: positiveInt(source.retryBackoffMaxMs, HTTP_LIMITS.retryBackoffMaxMs),
@@ -136,31 +335,35 @@ export function normalizeHttpPolicy(raw = {}) {
   }
 }
 
-/** `host` / `host:port` 例外项解析；没有端口表示「任意端口」。 */
+/** `host` / `host:port` 例外项解析（输入已由 normalize 严格校验）。 */
 function parseHostRule(rule) {
   if (typeof rule !== 'string' || rule.trim() === '') return null
   const text = rule.trim().toLowerCase()
-  // IPv6 字面量：[::1]:8443 或 ::1
+  // IPv6 字面量：[::1]:8443
   if (text.startsWith('[')) {
     const end = text.indexOf(']')
-    if (end < 0) return { host: text, port: null }
+    if (end < 0) return null
     const host = text.slice(1, end)
     const rest = text.slice(end + 1)
-    const port = rest.startsWith(':') && /^\d+$/.test(rest.slice(1)) ? Number(rest.slice(1)) : null
+    if (!rest.startsWith(':')) return null
+    const port = /^\d+$/.test(rest.slice(1)) ? Number(rest.slice(1)) : null
+    if (port === null) return null
     return { host, port }
   }
   const lastColon = text.lastIndexOf(':')
-  if (lastColon > 0 && /^\d+$/.test(text.slice(lastColon + 1)) && text.indexOf(':') === lastColon) {
-    return { host: text.slice(0, lastColon), port: Number(text.slice(lastColon + 1)) }
-  }
-  return { host: text, port: null }
+  if (lastColon <= 0) return null
+  const port = /^\d+$/.test(text.slice(lastColon + 1)) ? Number(text.slice(lastColon + 1)) : null
+  if (port === null) return null
+  return { host: text.slice(0, lastColon), port }
 }
 
 function hostMatchesRule(host, port, rule) {
   const parsed = parseHostRule(rule)
   if (!parsed) return false
-  if (parsed.host !== host && parsed.host !== '*') return false
-  return parsed.port === null || parsed.port === port
+  // H2：不接受通配符主机（`*` 已在 normalize 阶段拒绝，这里再兜一层）。
+  if (parsed.host === '*') return false
+  if (parsed.host !== host) return false
+  return parsed.port === port
 }
 
 /* ── IP 解析 / 分类 ─────────────────────────────────────────────── */
@@ -252,21 +455,36 @@ function parseIPv6(text) {
   return bytes
 }
 
+/** IPv6 地址低 32 位按 IPv4 分类（NAT64 / 6to4 / IPv4-compatible 的内嵌地址）。 */
+function embeddedIPv4Kind(bytes) {
+  return classifyIPv4(bytes.slice(12, 16))
+}
+
+function embeddedIPv4Text(bytes) {
+  return bytes.slice(12, 16).join('.')
+}
+
 function classifyIPv6(bytes) {
   if (bytes.every(byte => byte === 0)) return 'unspecified'
   if (bytes.slice(0, 15).every(byte => byte === 0) && bytes[15] === 1) return 'loopback'
 
-  const embeddedV4 = suffix => classifyIPv4(bytes.slice(12, 16))
-
   // IPv4-mapped ::ffff:a.b.c.d
   if (bytes.slice(0, 10).every(byte => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
-    return embeddedV4()
+    return embeddedIPv4Kind(bytes)
   }
-  // NAT64 64:ff9b::/96
+  // NAT64 64:ff9b::/96（well-known prefix）：内嵌 IPv4 直接进入分类。
   if (bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b
     && bytes.slice(4, 12).every(byte => byte === 0)) {
-    return embeddedV4()
+    return embeddedIPv4Kind(bytes)
   }
+  // 本地 NAT64 64:ff9b:1::/48（RFC 8215）：默认不是公网；显式配置 nat64Prefixes 才放行，
+  // 且内嵌 IPv4 仍须是公网地址（见 isAddressAllowed）。
+  if (bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b
+    && bytes[4] === 0x00 && bytes[5] === 0x01) {
+    return 'nat64-local'
+  }
+  // IPv4-compatible ::a.b.c.d（已废弃）：按内嵌 IPv4 分类，避免 ::7f00:1 被当成公网。
+  if (bytes.slice(0, 12).every(byte => byte === 0)) return embeddedIPv4Kind(bytes)
   // 6to4 2002::/16
   if (bytes[0] === 0x20 && bytes[1] === 0x02) {
     const v4 = [bytes[2], bytes[3], bytes[4], bytes[5]]
@@ -274,10 +492,23 @@ function classifyIPv6(bytes) {
   }
   // 2001:db8::/32 文档地址
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0d && bytes[3] === 0xb8) return 'documentation'
+  // 2001:2::/48 基准测试地址
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x02) return 'benchmark'
+  // 2001:10::/28 / 2001:20::/28 ORCHID / ORCHIDv2：不可路由的特殊用途。
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00
+    && (bytes[3] === 0x10 || bytes[3] === 0x20)) return 'reserved'
   // 2001::/32 Teredo：隧道内容不可见，按保留地址处理。
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) return 'reserved'
+  // 100::/64 丢弃前缀（RFC 6666）
+  if (bytes[0] === 0x01 && bytes.slice(1, 8).every(byte => byte === 0)) return 'reserved'
+  // 3fff::/20 文档地址（RFC 9637）
+  if (bytes[0] === 0x3f && (bytes[1] & 0xf0) === 0xf0) return 'documentation'
+  // 5f00::/16 SRv6 SID（RFC 9602）
+  if (bytes[0] === 0x5f && bytes[1] === 0x00) return 'reserved'
   // fc00::/7 唯一本地地址
   if ((bytes[0] & 0xfe) === 0xfc) return 'private'
+  // fec0::/10 站点本地地址（RFC 3879 已废弃，仍属特殊用途）
+  if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0xc0) return 'site-local'
   // fe80::/10 链路本地
   if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return 'link-local'
   // ff00::/8 组播
@@ -294,13 +525,16 @@ export function classifyAddress(address) {
   return null
 }
 
-/** 地址是否落在 CIDR 内（支持 IPv4 / IPv6）。 */
+/** 地址是否落在 CIDR 内（支持 IPv4 / IPv6）。前缀长度必须是**非空十进制数字**。 */
 export function addressInCidr(address, cidr) {
   if (typeof cidr !== 'string') return false
   const slash = cidr.lastIndexOf('/')
   if (slash <= 0) return false
   const networkText = cidr.slice(0, slash).trim()
-  const prefix = Number(cidr.slice(slash + 1))
+  const prefixText = cidr.slice(slash + 1).trim()
+  // H2：Number('') === 0 会把 `10.0.0.0/` 静默变成 /0（匹配一切），必须显式拒绝。
+  if (!/^\d{1,3}$/.test(prefixText)) return false
+  const prefix = Number(prefixText)
   const family = networkText.includes(':') ? 6 : 4
   if (!Number.isInteger(prefix) || prefix < 0 || prefix > (family === 4 ? 32 : 128)) return false
   const network = family === 4 ? parseIPv4(networkText) : parseIPv6(networkText)
@@ -340,10 +574,24 @@ function normalizeAddressList(raw) {
   return output
 }
 
-/** 地址是否被例外规则放行（metadata 例外必须 allowMetadata=true）。 */
+/**
+ * 地址是否被例外规则放行（metadata 例外必须 allowMetadata=true）。
+ *
+ * `nat64-local` 是 64:ff9b:1::/48 本地转换前缀：默认阻断；只有宿主显式配置了覆盖它的
+ * `nat64Prefixes`，并且低 32 位内嵌的 IPv4 本身分类为公网时才放行。这样即使部署了
+ * 转换路由，也不能用本地 NAT64 地址绕过私网 / metadata 分类。
+ */
 function isAddressAllowed(address, kind, host, port, policy) {
   if (kind === 'public') return true
   if (kind === 'metadata') return policy.allowMetadata === true
+  if (kind === 'nat64-local') {
+    const covered = policy.nat64Prefixes.some(cidr => addressInCidr(address, cidr))
+    if (!covered) return false
+    const v6 = parseIPv6(address)
+    if (v6 === null) return false
+    const embedded = classifyAddress(embeddedIPv4Text(v6))
+    return embedded !== null && embedded.kind === 'public'
+  }
   const hostException = policy.allowedHosts.some(rule => hostMatchesRule(host, port, rule))
     || policy.allowInsecureOrigins.some(rule => hostMatchesRule(host, port, rule))
   if (hostException) return true

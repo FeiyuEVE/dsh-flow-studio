@@ -15,6 +15,8 @@
  *       * 有 attempts 但没有成功结果（远端可能已处理、本地不知道）→ 返回
  *         outcomeUnknown，由 connector 报 `HTTP_OUTCOME_UNKNOWN`，**不自动重发**；
  *       * 只有 started 且 attempts=0（请求一定没发出）→ 允许重新发送。
+ *   - 人工处置：`resolveInvocation()` 支持 mark-succeeded / mark-failed / retry，
+ *     只改记录与追加 `audit.jsonl`，不推进引擎、不伪造活动完成。
  *
  * 写文件用 tmp + fsync + rename，避免断电后留下半截 JSON 被当成事实。
  *
@@ -56,6 +58,104 @@ function requireHash(value) {
     })
   }
   return value
+}
+
+/** 可选定位字段：缺省 / null → null；非法 → 明确报错。 */
+function optionalId(value, field) {
+  if (value === undefined || value === null || value === '') return null
+  return requireId(value, field)
+}
+
+/** 人工处置允许的动作；未知动作直接拒绝（不做「猜意图」）。 */
+const RESOLVE_ACTIONS = new Set(['mark-succeeded', 'mark-failed', 'retry'])
+const MAX_EVIDENCE_CHARS = 2000
+const MAX_RESOLUTION_RESULT_BYTES = 64 * 1024
+
+function requireEvidence(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', '人工处置必须带非空 evidence（远端对账依据 / 工单号）。', {
+      field: 'evidence',
+    })
+  }
+  const text = value.trim()
+  if (text.length > MAX_EVIDENCE_CHARS) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', `evidence 不能超过 ${MAX_EVIDENCE_CHARS} 字符。`, {
+      field: 'evidence',
+    })
+  }
+  return text
+}
+
+function requireOperator(value) {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'operator 必须是非空字符串（或省略）。', { field: 'operator' })
+  }
+  const text = value.trim()
+  if (text.length > 128) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'operator 不能超过 128 字符。', { field: 'operator' })
+  }
+  return text
+}
+
+/** 人工补录的 succeeded 结果：只保留短元信息，体积有界。 */
+function normalizeManualResult(raw) {
+  if (raw === undefined || raw === null) {
+    return { status: 0, headers: {}, output: {}, manual: true }
+  }
+  if (!isPlainObject(raw)) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'result 必须是 { status?, headers?, output? } 对象。', {
+      field: 'result',
+    })
+  }
+  const status = raw.status === undefined
+    ? 0
+    : (Number.isSafeInteger(raw.status) && raw.status >= 0 && raw.status <= 599 ? raw.status : null)
+  if (status === null) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'result.status 必须是 0–599 的整数。', { field: 'result.status' })
+  }
+  if (raw.headers !== undefined && raw.headers !== null && !isPlainObject(raw.headers)) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'result.headers 必须是对象。', { field: 'result.headers' })
+  }
+  if (raw.output !== undefined && raw.output !== null && !isPlainObject(raw.output)) {
+    throw new ConnectorStoreError('HTTP_RESOLVE_INVALID', 'result.output 必须是对象。', { field: 'result.output' })
+  }
+  const result = {
+    status,
+    headers: isPlainObject(raw.headers) ? { ...raw.headers } : {},
+    output: isPlainObject(raw.output) ? { ...raw.output } : {},
+    manual: true,
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(result), 'utf8')
+  if (bytes > MAX_RESOLUTION_RESULT_BYTES) {
+    throw new ConnectorStoreError(
+      'HTTP_RESOLVE_INVALID',
+      `人工补录结果 ${bytes} 字节超过上限 ${MAX_RESOLUTION_RESULT_BYTES} 字节。`,
+      { field: 'result', bytes, limit: MAX_RESOLUTION_RESULT_BYTES },
+    )
+  }
+  return result
+}
+
+/** 追加一条审计记录（JSONL，追加写 + 尽力 fsync）；失败必须显式报出。 */
+async function appendAudit(root, entry) {
+  await fsp.mkdir(root, { recursive: true, mode: 0o700 })
+  const path = join(root, 'audit.jsonl')
+  let handle = null
+  try {
+    handle = await fsp.open(path, 'a', 0o600)
+    await handle.writeFile(`${JSON.stringify(entry)}\n`, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = null
+  } catch (error) {
+    if (handle !== null) await handle.close().catch(() => {})
+    throw new ConnectorStoreError(
+      'HTTP_STORE_WRITE_FAILED',
+      `写入 HTTP connector 处置审计失败：${error && error.code ? error.code : '未知错误'}`,
+      { path },
+    )
+  }
 }
 
 function keyOf(input) {
@@ -184,6 +284,11 @@ export function createConnectorStore(options = {}) {
       ? null
       : String(input.idempotencyKey)
     const invocationId = requireId(input.invocationId ?? `${key.executionId}-inv`, 'invocationId')
+    // H5：随记录持久化可复现的激活身份（审计 / 排障用；记录键仍由 executionId 决定）。
+    const activationAttempt = Number.isSafeInteger(input.activationAttempt) && input.activationAttempt > 0
+      ? input.activationAttempt
+      : null
+    const engineExecutionId = optionalId(input.engineExecutionId, 'engineExecutionId')
     const path = pathFor(key.digest)
 
     return withLock(key.digest, async () => {
@@ -222,6 +327,8 @@ export function createConnectorStore(options = {}) {
           error: null,
           idempotencyKey,
           invocationId,
+          ...(activationAttempt === null ? {} : { activationAttempt }),
+          ...(engineExecutionId === null ? {} : { engineExecutionId }),
           updatedAt: nowIso(),
         }
         await writeJsonAtomic(path, restarted)
@@ -237,6 +344,8 @@ export function createConnectorStore(options = {}) {
         invocationId,
         requestHash,
         idempotencyKey,
+        ...(activationAttempt === null ? {} : { activationAttempt }),
+        ...(engineExecutionId === null ? {} : { engineExecutionId }),
         state: 'started',
         attempts: 0,
         result: null,
@@ -329,6 +438,204 @@ export function createConnectorStore(options = {}) {
     })
   }
 
+  /**
+   * 请求**没有真正发出**时把记录回滚成可安全重开的状态（H4）：
+   * `attempts=0` + state=started，重启后 `beginInvocation` 会当作 fresh。
+   * 与 `markOutcomeUnknown` 的区别是语义：这里确定远端没收到任何请求。
+   */
+  async function markNotSent(input = {}, reason = null) {
+    const key = keyOf(input)
+    const path = pathFor(key.digest)
+    return withLock(key.digest, async () => {
+      const existing = await readJson(path)
+      if (existing === null) return null
+      const updated = {
+        ...existing,
+        state: 'started',
+        attempts: 0,
+        result: null,
+        error: {
+          code: 'HTTP_NOT_SENT',
+          message: typeof reason === 'string' && reason !== ''
+            ? reason
+            : '请求在发送前被取消 / 超时；远端没有收到请求。',
+        },
+        updatedAt: nowIso(),
+      }
+      await writeJsonAtomic(path, updated)
+      return updated
+    })
+  }
+
+  /** 列出本目录下的全部合法调用记录（按 updatedAt 倒序，排障 / 处置查找用）。 */
+  async function listInvocations(instanceId) {
+    const expected = requireId(instanceId, 'instanceId')
+    let names
+    try {
+      names = await fsp.readdir(root)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return []
+      throw new ConnectorStoreError(
+        'HTTP_STORE_READ_FAILED',
+        `读取 HTTP 调用记录目录失败：${error && error.code ? error.code : '未知错误'}`,
+        { path: root },
+      )
+    }
+    const records = []
+    for (const name of names) {
+      if (!name.endsWith('.json') || name.startsWith('.')) continue
+      const record = await readJson(join(root, name))
+      if (record === null || record.instanceId !== expected) continue
+      records.push(record)
+    }
+    records.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+    return records
+  }
+
+  /**
+   * 按「业务可见 id」找一条记录：`executionId`（稳定激活键）、`invocationId`、
+   * 或引擎原始 `engineExecutionId` 都可以（人工从事件 / 日志里拿到哪个都能定位）。
+   */
+  async function findInvocation(instanceId, id) {
+    const wanted = requireId(id, 'executionId')
+    const records = await listInvocations(instanceId)
+    return records.find(record => record.executionId === wanted
+      || record.invocationId === wanted
+      || record.engineExecutionId === wanted) ?? null
+  }
+
+  /**
+   * 人工处置调用记录（m1）。**只改记录，不推进引擎、不伪造 activity/end**：
+   *   - `mark-succeeded`：补录远端已确认成功（可带 result；缺省 status=0）；
+   *   - `mark-failed`：确认远端失败 / 放弃；
+   *   - `retry`：仅对未成功记录重置为 attempts=0，允许下一次同激活重放重新发送。
+   *
+   * 同一个动作对已处于目标状态的记录是幂等的（不重复写记录、不追加审计）。
+   * 所有真实变更都追加 `audit.jsonl`（append-only，含 evidence / operator / 前后状态）。
+   */
+  async function resolveInvocation(input = {}, resolution = {}) {
+    const key = keyOf(input)
+    const path = pathFor(key.digest)
+    const action = typeof resolution.action === 'string' ? resolution.action.trim().toLowerCase() : ''
+    if (!RESOLVE_ACTIONS.has(action)) {
+      throw new ConnectorStoreError(
+        'HTTP_RESOLVE_INVALID',
+        `处置动作必须是 mark-succeeded / mark-failed / retry（收到 ${JSON.stringify(action)}）。`,
+        { field: 'action' },
+      )
+    }
+    const evidence = requireEvidence(resolution.evidence)
+    const operator = requireOperator(resolution.operator)
+    const manualResult = action === 'mark-succeeded'
+      ? normalizeManualResult(resolution.result)
+      : null
+    return withLock(key.digest, async () => {
+      const existing = await readJson(path)
+      if (existing === null) {
+        throw new ConnectorStoreError(
+          'HTTP_INVOCATION_NOT_FOUND',
+          `没有找到调用记录 ${key.executionId}（实例 ${key.instanceId} 的 connector 目录）。`,
+          { instanceId: key.instanceId, executionId: key.executionId },
+        )
+      }
+      const previousState = existing.state ?? 'unknown'
+      const previousAction = typeof existing.resolution?.action === 'string' ? existing.resolution.action : null
+      let idempotent = false
+      let next = existing
+      if (action === 'mark-succeeded') {
+        idempotent = existing.state === 'succeeded'
+        if (!idempotent) {
+          next = {
+            ...existing,
+            state: 'succeeded',
+            result: manualResult,
+            error: null,
+            updatedAt: nowIso(),
+            completedAt: nowIso(),
+          }
+        }
+      } else if (action === 'mark-failed') {
+        idempotent = existing.state === 'failed' && existing.error?.code === 'HTTP_MANUAL_FAILED'
+        if (!idempotent) {
+          next = {
+            ...existing,
+            state: 'failed',
+            error: { code: 'HTTP_MANUAL_FAILED', message: evidence },
+            updatedAt: nowIso(),
+            completedAt: nowIso(),
+          }
+        }
+      } else {
+        // retry：已成功 / 已确认失败且记录本身已是可重开状态时才幂等；其他情况要求显式重置。
+        if (existing.state === 'succeeded') {
+          throw new ConnectorStoreError(
+            'HTTP_RESOLVE_CONFLICT',
+            '这条调用记录已经是 succeeded；retry 会重发已成功的副作用，必须改用 mark-failed 明确放弃或新建实例。',
+            { executionId: key.executionId },
+          )
+        }
+        idempotent = existing.state === 'started' && (existing.attempts ?? 0) === 0
+        if (!idempotent) {
+          next = {
+            ...existing,
+            state: 'started',
+            attempts: 0,
+            result: null,
+            error: null,
+            retryAuthorizedAt: nowIso(),
+            updatedAt: nowIso(),
+          }
+        }
+      }
+      if (idempotent) {
+        return {
+          idempotent: true,
+          record: existing,
+          audit: isPlainObject(existing.resolution?.lastAudit) ? existing.resolution.lastAudit : null,
+        }
+      }
+      const at = nowIso()
+      const audit = {
+        v: 1,
+        auditId: randomBytes(8).toString('hex'),
+        at,
+        instanceId: key.instanceId,
+        elementId: key.elementId,
+        executionId: key.executionId,
+        invocationId: typeof existing.invocationId === 'string' ? existing.invocationId : null,
+        action,
+        evidence,
+        operator: operator ?? 'operator',
+        fromState: previousState,
+        toState: next.state,
+        idempotent: false,
+        ...(previousAction === null ? {} : { previousAction }),
+      }
+      const history = Array.isArray(existing.resolution?.history) ? existing.resolution.history : []
+      next.resolution = {
+        action,
+        evidence,
+        operator: audit.operator,
+        at,
+        lastAuditId: audit.auditId,
+        lastAudit: audit,
+        history: [...history, {
+          auditId: audit.auditId,
+          action,
+          evidence,
+          operator: audit.operator,
+          at,
+          fromState: previousState,
+          toState: next.state,
+        }].slice(-20),
+      }
+      await writeJsonAtomic(path, next)
+      await appendAudit(root, audit)
+      return { idempotent: false, record: next, audit }
+    })
+  }
+
+
   /** 只读：按 execution 身份取记录（测试 / 排障）。 */
   async function readInvocation(input = {}) {
     const { record } = await readByKey(input)
@@ -342,6 +649,10 @@ export function createConnectorStore(options = {}) {
     recordAttempt,
     commitResult,
     markOutcomeUnknown,
+    markNotSent,
+    listInvocations,
+    findInvocation,
+    resolveInvocation,
     readInvocation,
   }
 }

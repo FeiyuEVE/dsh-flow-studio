@@ -756,7 +756,129 @@ class BpmnRuntime {
       if (!id) return invalidInstanceId()
       return await this._completeTask(id, parts[3], body)
     }
+    // m1：HTTP connector 调用记录的人工处置入口。只改记录，不推进引擎、不伪造活动完成。
+    if (parts.length === 5 && parts[2] === 'connector' && parts[4] === 'resolve') {
+      if (method !== 'POST') return methodNotAllowed('POST')
+      if (!id) return invalidInstanceId()
+      return await this._resolveConnectorInvocation(id, parts[3], body)
+    }
     return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+  }
+
+  /**
+   * `POST /instances/<id>/connector/<recordId>/resolve`：
+   * `{ action: 'mark-succeeded' | 'mark-failed' | 'retry', evidence, operator?, result? }`。
+   *
+   * 安全边界：
+   *   - 只操作 connector 调用记录，**不调用 runner / 不写 activity/end / 不改实例状态**；
+   *     实例保持 ACTIVE（或它原本的状态）语义，避免用「处置」伪造一次成功执行；
+   *   - 终态实例 / 正在停止的实例拒绝处置；
+   *   - evidence 必填，所有真实变更追加 `connector/audit.jsonl`；重复动作幂等；
+   *   - retry 只把记录重置为 attempts=0，不自动重发；是否重跑仍由上层受控推进决定。
+   */
+  async _resolveConnectorInvocation(instanceId, recordId, body) {
+    const wanted = typeof recordId === 'string' ? recordId.trim() : ''
+    if (wanted === '' || wanted.length > 256 || !/^[A-Za-z0-9._-]+$/.test(wanted)) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          code: 'HTTP_RESOLVE_INVALID',
+          error: 'connector 记录 id 必须是 1–256 个安全字符（记录 executionId / invocationId / 引擎 executionId）。',
+        },
+      }
+    }
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'HTTP_RESOLVE_INVALID', error: '请求体必须是 JSON 对象：{ action, evidence, operator?, result? }' },
+      }
+    }
+    const input = isPlainObject(body) ? body : {}
+    return await this._withInstance(instanceId, async () => {
+      const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(instanceId)
+      if (this._stopping.has(instanceId)) {
+        return {
+          status: 409,
+          body: { ok: false, code: 'BPMN_INSTANCE_STOPPING', error: `实例 ${instanceId} 正在停止，不能处置 connector 调用记录` },
+        }
+      }
+      if (TERMINAL_STATUSES.has(instance.status)) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_TERMINAL',
+            error: `实例 ${instanceId} 已结束（${instance.status}），不能再处置 connector 调用记录`,
+          },
+        }
+      }
+      const store = createConnectorStore({ root: join(this.instancesRoot, instanceId, 'connector') })
+      let record
+      try {
+        record = await store.findInvocation(instanceId, wanted)
+      } catch (error) {
+        const result = errorResult(error)
+        return { status: result.status, body: { ...result.body, id: instanceId } }
+      }
+      if (record === null) {
+        return {
+          status: 404,
+          body: {
+            ok: false,
+            code: 'HTTP_INVOCATION_NOT_FOUND',
+            error: `实例 ${instanceId} 没有找到 connector 记录 ${wanted}`,
+            id: instanceId,
+          },
+        }
+      }
+      let resolved
+      try {
+        resolved = await store.resolveInvocation({
+          instanceId: record.instanceId,
+          elementId: record.elementId,
+          executionId: record.executionId,
+        }, {
+          action: input.action,
+          evidence: input.evidence,
+          operator: input.operator,
+          result: input.result,
+        })
+      } catch (error) {
+        if (error?.code === 'HTTP_RESOLVE_INVALID') {
+          return { status: 400, body: { ok: false, code: error.code, error: error.message, id: instanceId } }
+        }
+        if (error?.code === 'HTTP_RESOLVE_CONFLICT') {
+          return { status: 409, body: { ok: false, code: error.code, error: error.message, id: instanceId } }
+        }
+        if (error?.code === 'HTTP_INVOCATION_NOT_FOUND') {
+          return { status: 404, body: { ok: false, code: error.code, error: error.message, id: instanceId } }
+        }
+        throw error
+      }
+      const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? instance
+      const audit = resolved.audit
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id: instanceId,
+          status: current.status,
+          executionId: record.executionId,
+          invocationId: typeof record.invocationId === 'string' ? record.invocationId : null,
+          engineExecutionId: typeof record.engineExecutionId === 'string' ? record.engineExecutionId : null,
+          action: typeof input.action === 'string' ? input.action.trim().toLowerCase() : null,
+          idempotent: resolved.idempotent === true,
+          auditId: isPlainObject(audit) && typeof audit.auditId === 'string' ? audit.auditId : null,
+          record: resolved.record,
+          lastSeq: current.lastSeq,
+          pendingTasks: current.pendingTasks ?? [],
+          lastError: current.lastError ?? null,
+          note: '处置只更新 connector 调用记录与审计，不重放引擎活动、不伪造 activity/end；实例状态保持现状。',
+        },
+      }
+    })
   }
 
   async _listInstances(url) {

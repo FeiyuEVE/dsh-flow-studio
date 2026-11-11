@@ -111,6 +111,11 @@ function makeContext(overrides = {}) {
   }
 }
 
+/** H5 起记录键使用稳定激活身份（elementId + ctx.attempt），不再是随机 executionId。 */
+function invocationIdentity(attempt = 1) {
+  return { instanceId: 'i-test', elementId: 'call', executionId: `call_attempt_${attempt}` }
+}
+
 function elementOf(httpConfig, ioMapping = { input: [], output: [] }) {
   return {
     id: 'call',
@@ -184,7 +189,7 @@ await check('成功：POST + 输入/输出映射，事件成对，实例变量�
     A.equal(results.length, 1)
     A.equal(results[0].status, 200)
 
-    const record = await store.readInvocation({ instanceId: 'i-test', elementId: 'call', executionId: 'call_execution_1' })
+    const record = await store.readInvocation(invocationIdentity())
     A.equal(record.state, 'succeeded', '成功结果在返回引擎前落盘')
     A.equal(record.attempts, 1)
   } finally {
@@ -260,7 +265,7 @@ await check('无幂等键的 POST 超时：不自动重发，报 HTTP_TIMEOUT', 
       '超时必须明确失败',
     )
     A.equal(fixture.requests.length, 1, '有副作用且无幂等键 → 超时不重发')
-    const record = await store.readInvocation({ instanceId: 'i-test', elementId: 'call', executionId: 'call_execution_1' })
+    const record = await store.readInvocation(invocationIdentity())
     A.equal(record.state, 'failed')
     A.equal(record.error.code, 'HTTP_TIMEOUT')
   } finally {
@@ -490,7 +495,7 @@ await check('取消：迟到响应不得推动流程，记录标成结果不明'
     controller.abort()
     await rejects(pending, 'HTTP_CANCELED', '取消必须显式失败')
     A.equal(fixture.requests.length, 1, '取消后不重试')
-    const record = await store.readInvocation({ instanceId: 'i-test', elementId: 'call', executionId: 'call_execution_1' })
+    const record = await store.readInvocation(invocationIdentity())
     A.equal(record.state, 'unknown', '已发送但结果不明 → unknown')
     A.equal(record.error.code, 'HTTP_OUTCOME_UNKNOWN')
     A.equal(eventsOfType(ctx.events, 'http/result').length, 0, '取消后不得产生成功结果事件')
@@ -650,7 +655,7 @@ await check('重试耗尽：502 最终失败，活动不产出成功结果', asy
       '重试耗尽必须明确失败',
     )
     A.equal(fixture.requests.length, 2, '1 次重试 = 2 个请求')
-    const record = await store.readInvocation({ instanceId: 'i-test', elementId: 'call', executionId: 'call_execution_1' })
+    const record = await store.readInvocation(invocationIdentity())
     A.equal(record.state, 'failed')
     A.equal(record.attempts, 2)
   } finally {
@@ -730,5 +735,307 @@ await check('networkPolicyId + authResolver：宿主策略按节点引用，凭�
     await fixture.close()
   }
 })
+
+const sleep = ms => new Promise(resolveWait => setTimeout(resolveWait, ms))
+
+await check('H3：响应回显凭据 → 输出映射明确拒绝，记录 / 事件 / 错误都不含凭据值', async ({ root }) => {
+  const secret = 'SYNTHETIC_SECRET'
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'x-request-id': `Bearer ${secret}`,
+      location: `https://echo.example/?token=${secret}`,
+    })
+    res.end(JSON.stringify({ leaked: `Bearer ${secret}` }))
+  })
+  try {
+    const store = createConnectorStore({ root: join(root, 'store') })
+    const ctx = makeContext()
+    let thrown = null
+    try {
+      await executeHttpConnector(
+        elementOf(
+          { method: 'GET', url: `http://127.0.0.1:${fixture.port}/echo`, authRef: 'echo', timeoutMs: 3000 },
+          { input: [], output: [{ source: '= response.body.leaked', target: 'leaked' }] },
+        ),
+        ctx,
+        {
+          policy: policyFor(fixture.port),
+          store,
+          env: { FLOW_STUDIO_HTTP_AUTH_ECHO: secret },
+        },
+      )
+    } catch (error) {
+      thrown = error
+    }
+    A.ok(thrown !== null, '回显凭据必须失败')
+    A.equal(thrown.code, 'HTTP_RESPONSE_SECRET_LEAK')
+    A.ok(!JSON.stringify({ code: thrown.code, message: thrown.message, details: thrown.details }).includes(secret), '错误对象不含凭据值')
+    A.equal(fixture.requests.length, 1)
+    A.equal(fixture.requests[0].headers.authorization, `Bearer ${secret}`, '请求头本身仍带凭据')
+    A.ok(!JSON.stringify(ctx.events).includes(secret), '事件流不含凭据值')
+    A.deepEqual(ctx.variables, {}, '实例变量不被写入（output 在返回前已被拒绝）')
+    const record = await store.readInvocation(invocationIdentity())
+    A.equal(record.state, 'failed')
+    A.equal(record.error.code, 'HTTP_RESPONSE_SECRET_LEAK')
+    const recordText = JSON.stringify(record)
+    A.ok(!recordText.includes(secret), '调用记录不含凭据值')
+  } finally {
+    await fixture.close()
+  }
+})
+
+await check('H3：允许列表响应头 / location 错误详情脱敏，落盘记录不含凭据值', async ({ root }) => {
+  const secret = 'SYNTHETIC_SECRET'
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'x-request-id': `Bearer ${secret}`,
+    })
+    res.end('{"ok":true}')
+  })
+  try {
+    const store = createConnectorStore({ root: join(root, 'store') })
+    const result = await executeHttpConnector(
+      elementOf({ method: 'GET', url: `http://127.0.0.1:${fixture.port}/ok`, authRef: 'echo', timeoutMs: 3000 }),
+      makeContext(),
+      { policy: policyFor(fixture.port), store, env: { FLOW_STUDIO_HTTP_AUTH_ECHO: secret } },
+    )
+    A.equal(result.status, 200)
+    A.equal(result.headers['x-request-id'], '[redacted]', '白名单头名称不等于值安全：回显值必须脱敏')
+    A.ok(!JSON.stringify(result).includes(secret), '返回结果不含凭据值')
+    const record = await store.readInvocation(invocationIdentity())
+    A.equal(record.state, 'succeeded')
+    A.ok(!JSON.stringify(record).includes(secret), '落盘记录不含凭据值')
+  } finally {
+    await fixture.close()
+  }
+
+  const redirect = await startFixture((req, res) => {
+    res.writeHead(302, { location: `https://evil.example/?token=${secret}` })
+    res.end()
+  })
+  try {
+    const store = createConnectorStore({ root: join(root, 'store-redirect') })
+    let thrown = null
+    try {
+      await executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://127.0.0.1:${redirect.port}/go`, authRef: 'echo', timeoutMs: 3000 }),
+        makeContext(),
+        { policy: policyFor(redirect.port), store, env: { FLOW_STUDIO_HTTP_AUTH_ECHO: secret } },
+      )
+    } catch (error) {
+      thrown = error
+    }
+    A.ok(thrown !== null)
+    A.equal(thrown.code, 'HTTP_REDIRECT_FORBIDDEN')
+    A.ok(!JSON.stringify({ message: thrown.message, details: thrown.details }).includes(secret), '重定向错误详情不得回显凭据值')
+    const record = await store.readInvocation(invocationIdentity())
+    A.ok(!JSON.stringify(record).includes(secret), '失败记录不含凭据值')
+  } finally {
+    await redirect.close()
+  }
+})
+
+await check('H3：authRef 可绑定允许的目标 origin', async ({ root }) => {
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  try {
+    const store = createConnectorStore({ root: join(root, 'store') })
+    const element = elementOf({
+      method: 'GET',
+      url: `http://127.0.0.1:${fixture.port}/bound`,
+      authRef: 'echo',
+      timeoutMs: 3000,
+    })
+    await rejects(
+      executeHttpConnector(element, makeContext(), {
+        policy: policyFor(fixture.port, { authOrigins: { echo: ['https://api.example.com:443'] } }),
+        store,
+        env: { FLOW_STUDIO_HTTP_AUTH_ECHO: 'bound-secret' },
+      }),
+      'HTTP_AUTH_ORIGIN_FORBIDDEN',
+      '凭据绑定到其他 origin 时必须拒绝',
+    )
+    A.equal(fixture.requests.length, 0, '绑定失败零请求')
+
+    const allowed = await executeHttpConnector(element, makeContext(), {
+      policy: policyFor(fixture.port, { authOrigins: { echo: [`http://127.0.0.1:${fixture.port}`] } }),
+      store: createConnectorStore({ root: join(root, 'store-ok') }),
+      env: { FLOW_STUDIO_HTTP_AUTH_ECHO: 'bound-secret' },
+    })
+    A.equal(allowed.status, 200)
+    A.equal(fixture.requests.length, 1)
+  } finally {
+    await fixture.close()
+  }
+})
+
+await check('H4：DNS / auth resolver / 调用记录等待参与统一 deadline，过期零发送', async ({ root }) => {
+  const hostPolicy = extra => ({ allowInsecureOrigins: [`fixture.test:${fixture.port}`], retryBackoffBaseMs: 1, ...extra })
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  try {
+    // 1) 慢 DNS：修复前 deadline 在 DNS 之后才建立，会超时后仍成功发送。
+    const startedDns = Date.now()
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://fixture.test:${fixture.port}/dns`, timeoutMs: 50 }),
+        makeContext(),
+        {
+          policy: hostPolicy( {
+            resolver: async () => { await sleep(200); return [{ address: '127.0.0.1', family: 4 }] },
+          }),
+          store: createConnectorStore({ root: join(root, 'store-dns') }),
+        },
+      ),
+      'HTTP_TIMEOUT',
+      '慢 DNS 必须被整体 deadline 截断',
+    )
+    A.ok(Date.now() - startedDns < 160, `慢 DNS 必须按 50ms deadline 结束（实测 ${Date.now() - startedDns}ms）`)
+    A.equal(fixture.requests.length, 0, 'DNS 超时后零发送')
+
+    // 2) 慢 auth resolver。
+    const startedAuth = Date.now()
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://fixture.test:${fixture.port}/auth`, authRef: 'slow', timeoutMs: 50 }),
+        makeContext(),
+        {
+          policy: hostPolicy( { resolver: async () => [{ address: '127.0.0.1', family: 4 }] }),
+          store: createConnectorStore({ root: join(root, 'store-auth') }),
+          authResolver: async () => { await sleep(200); return { Authorization: 'Bearer slow' } },
+        },
+      ),
+      'HTTP_TIMEOUT',
+      '慢 auth resolver 必须被整体 deadline 截断',
+    )
+    A.ok(Date.now() - startedAuth < 160, `慢 auth resolver 必须按 50ms deadline 结束（实测 ${Date.now() - startedAuth}ms）`)
+    A.equal(fixture.requests.length, 0, '凭据解析超时后零发送')
+
+    // 3) DNS 挂起期间 abort：调用必须结束，不能一直挂着。
+    const controller = new AbortController()
+    const startedAbort = Date.now()
+    const pending = executeHttpConnector(
+      elementOf({ method: 'GET', url: `http://fixture.test:${fixture.port}/hang`, timeoutMs: 3000 }),
+      makeContext({ signal: controller.signal }),
+      { policy: hostPolicy( { resolver: () => new Promise(() => {}) }), store: createConnectorStore({ root: join(root, 'store-abort') }) },
+    )
+    setTimeout(() => controller.abort(), 30)
+    await rejects(pending, 'HTTP_CANCELED', 'DNS 挂起期间 abort 必须让调用结束')
+    A.ok(Date.now() - startedAbort < 160, `abort 后调用必须尽快结束（实测 ${Date.now() - startedAbort}ms）`)
+    A.equal(fixture.requests.length, 0, 'abort 后零发送')
+
+    // 4) 慢 recordAttempt：修复前记录写完还会用剩余 1ms 去发送；现在零发送。
+    const real = createConnectorStore({ root: join(root, 'store-attempt') })
+    const slowStore = {
+      ...real,
+      recordAttempt: async (...args) => { await sleep(300); return real.recordAttempt(...args) },
+    }
+    const startedStore = Date.now()
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://fixture.test:${fixture.port}/store`, timeoutMs: 100 }),
+        makeContext(),
+        { policy: hostPolicy( { resolver: async () => [{ address: '127.0.0.1', family: 4 }] }), store: slowStore },
+      ),
+      'HTTP_TIMEOUT',
+      '慢 recordAttempt 必须被整体 deadline 截断',
+    )
+    A.ok(Date.now() - startedStore < 250, `慢 recordAttempt 必须按 100ms deadline 结束（实测 ${Date.now() - startedStore}ms）`)
+    A.equal(fixture.requests.length, 0, 'recordAttempt 超时后零发送')
+  } finally {
+    await fixture.close()
+  }
+})
+
+await check('m2：请求头 / 响应头显式预算，1 MiB 请求头到不了 transport', async ({ root }) => {
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  try {
+    const store = createConnectorStore({ root: join(root, 'store') })
+    const elementWithHeaders = headers => elementOf({
+      method: 'GET',
+      url: `http://127.0.0.1:${fixture.port}/headers`,
+      headers,
+      timeoutMs: 3000,
+    })
+    await rejects(
+      executeHttpConnector(elementWithHeaders({ 'x-big': 'a'.repeat(1024 * 1024) }), makeContext(), { policy: policyFor(fixture.port), store }),
+      'HTTP_HEADER_TOO_LARGE',
+      '单个 1 MiB header 必须拒绝',
+    )
+    A.equal(fixture.requests.length, 0, '超限 header 零请求')
+
+    const many = {}
+    for (let index = 0; index < 65; index += 1) many[`x-h-${index}`] = 'v'
+    await rejects(
+      executeHttpConnector(elementWithHeaders(many), makeContext(), { policy: policyFor(fixture.port), store }),
+      'HTTP_HEADER_COUNT_EXCEEDED',
+      'header 数量上限 64',
+    )
+    A.equal(fixture.requests.length, 0)
+
+    const total = {}
+    for (let index = 0; index < 5; index += 1) total[`x-t-${index}`] = 'a'.repeat(7 * 1024)
+    await rejects(
+      executeHttpConnector(elementWithHeaders(total), makeContext(), { policy: policyFor(fixture.port), store }),
+      'HTTP_REQUEST_HEADERS_TOO_LARGE',
+      'header 总量上限 32 KiB',
+    )
+    A.equal(fixture.requests.length, 0)
+  } finally {
+    await fixture.close()
+  }
+
+  // 响应头数量 / 总量兜底（Node 解析器默认 16 KiB 之内，专门触发我们自己的上限）。
+  const countFixture = await startFixture((req, res) => {
+    const headers = { 'content-type': 'application/json' }
+    for (let index = 0; index < 70; index += 1) headers[`x-r-${index}`] = 'v'
+    res.writeHead(200, headers)
+    res.end('{"ok":true}')
+  })
+  try {
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://127.0.0.1:${countFixture.port}/many-headers`, timeoutMs: 3000 }),
+        makeContext(),
+        { policy: policyFor(countFixture.port), store: createConnectorStore({ root: join(root, 'store-r1') }) },
+      ),
+      'HTTP_RESPONSE_HEADERS_TOO_LARGE',
+      '响应头数量上限 64',
+    )
+    A.equal(countFixture.requests.length, 1)
+  } finally {
+    await countFixture.close()
+  }
+
+  const bytesFixture = await startFixture((req, res) => {
+    const headers = { 'content-type': 'application/json' }
+    for (let index = 0; index < 30; index += 1) headers[`x-b-${index}`] = 'a'.repeat(400)
+    res.writeHead(200, headers)
+    res.end('{"ok":true}')
+  })
+  try {
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://127.0.0.1:${bytesFixture.port}/big-headers`, timeoutMs: 3000 }),
+        makeContext(),
+        { policy: policyFor(bytesFixture.port), store: createConnectorStore({ root: join(root, 'store-r2') }) },
+      ),
+      'HTTP_RESPONSE_HEADERS_TOO_LARGE',
+      '响应头总量上限 8 KiB',
+    )
+  } finally {
+    await bytesFixture.close()
+  }
+})
+
 
 console.log(`\nhttp-connector: ${checks} 组 / ${assertions} 条断言通过`)

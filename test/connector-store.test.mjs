@@ -203,4 +203,109 @@ await check('原子写：记录 JSON 完整（不残留半截文件）', async (
   A.equal(error.code, 'X')
 })
 
+await check('m1 处置：mark-succeeded 补录 + 幂等 + 审计 + 冲突保护', async (root) => {
+  const store = createConnectorStore({ root })
+  await store.beginInvocation(baseInput({ engineExecutionId: 'submit_execution_1', activationAttempt: 1 }))
+  await store.recordAttempt(IDENTITY, { attempt: 1 })
+  await store.commitResult(IDENTITY, {
+    state: 'failed',
+    error: { code: 'HTTP_STATUS_NOT_ACCEPTABLE', message: '远端 500' },
+  })
+
+  await rejects(
+    store.resolveInvocation(IDENTITY, { action: 'mark-succeeded' }),
+    'HTTP_RESOLVE_INVALID',
+    '没有 evidence 的处置必须拒绝',
+  )
+  const resolved = await store.resolveInvocation(IDENTITY, {
+    action: 'mark-succeeded',
+    evidence: '远端工单 #42 确认已入账',
+    operator: 'ops-1',
+    result: { status: 201, headers: { 'content-type': 'application/json' }, output: { accepted: true } },
+  })
+  A.equal(resolved.idempotent, false)
+  A.equal(resolved.record.state, 'succeeded')
+  A.deepEqual(resolved.record.result.output, { accepted: true })
+  A.equal(resolved.record.result.manual, true, '人工补录结果带 manual 标记')
+  A.equal(typeof resolved.audit.auditId, 'string')
+  A.equal(resolved.audit.action, 'mark-succeeded')
+  A.equal(resolved.audit.fromState, 'failed')
+
+  const auditText = readFileSync(join(root, 'audit.jsonl'), 'utf8')
+  const auditLines = auditText.trim().split('\n').map(line => JSON.parse(line))
+  A.equal(auditLines.length, 1, '审计追加一条 JSONL')
+  A.equal(auditLines[0].auditId, resolved.audit.auditId)
+  A.equal(auditLines[0].evidence, '远端工单 #42 确认已入账')
+  A.equal(auditLines[0].operator, 'ops-1')
+  A.equal(auditLines[0].fromState, 'failed')
+  A.equal(auditLines[0].toState, 'succeeded')
+
+  const twice = await store.resolveInvocation(IDENTITY, {
+    action: 'mark-succeeded',
+    evidence: '重复提交',
+    operator: 'ops-1',
+  })
+  A.equal(twice.idempotent, true, '同一动作重复提交必须幂等')
+  A.equal(twice.record.state, 'succeeded')
+  A.equal(twice.record.result.output.accepted, true, '幂等重复不覆盖第一次补录的结果')
+  A.equal(readFileSync(join(root, 'audit.jsonl'), 'utf8').trim().split('\n').length, 1, '幂等重复不追加审计')
+
+  await rejects(
+    store.resolveInvocation(IDENTITY, { action: 'retry', evidence: '想重发' }),
+    'HTTP_RESOLVE_CONFLICT',
+    '已成功的记录不能 retry（会重发副作用）',
+  )
+})
+
+await check('m1 处置：mark-failed / retry（重置为零发送）与可定位 id', async (root) => {
+  const store = createConnectorStore({ root })
+  await store.beginInvocation(baseInput({ engineExecutionId: 'submit_execution_1', activationAttempt: 1 }))
+  await store.recordAttempt(IDENTITY, { attempt: 2 })
+  await store.markOutcomeUnknown(IDENTITY, '发送后进程退出')
+
+  const foundByEngineId = await store.findInvocation('i-demo', 'submit_execution_1')
+  A.ok(foundByEngineId !== null, '可以用引擎 executionId 定位记录')
+  A.equal(foundByEngineId.executionId, 'submit_execution_1')
+  const foundByInvocationId = await store.findInvocation('i-demo', 'inv-1')
+  A.equal(foundByInvocationId?.executionId, foundByEngineId.executionId, '可以用 invocationId 定位记录')
+  A.equal(await store.findInvocation('i-demo', 'missing'), null)
+
+  const retried = await store.resolveInvocation(IDENTITY, {
+    action: 'retry',
+    evidence: '确认远端未处理，允许受控重试',
+    operator: 'ops-2',
+  })
+  A.equal(retried.record.state, 'started')
+  A.equal(retried.record.attempts, 0)
+  A.equal(retried.record.error, null)
+  A.equal(retried.record.retryAuthorizedAt !== undefined, true, '保留受控重试授权时间')
+  const reopened = await store.beginInvocation(baseInput({ engineExecutionId: 'submit_execution_1', activationAttempt: 1 }))
+  A.equal(reopened.status, 'fresh', 'retry 之后同一激活可以安全重开')
+
+  await store.recordAttempt(IDENTITY, { attempt: 1 })
+  const failed = await store.resolveInvocation(IDENTITY, {
+    action: 'mark-failed',
+    evidence: '远端确认请求被拒绝（400）',
+  })
+  A.equal(failed.record.state, 'failed')
+  A.equal(failed.record.error.code, 'HTTP_MANUAL_FAILED')
+  const failedTwice = await store.resolveInvocation(IDENTITY, { action: 'mark-failed', evidence: '再次确认' })
+  A.equal(failedTwice.idempotent, true, 'mark-failed 重复提交幂等')
+  const auditLines = readFileSync(join(root, 'audit.jsonl'), 'utf8').trim().split('\n')
+  A.equal(auditLines.length, 2, '只有两次真实变更写审计（retry + mark-failed）')
+})
+
+await check('markNotSent：发送前超时回滚为可安全重开，不制造假 unknown', async (root) => {
+  const store = createConnectorStore({ root })
+  await store.beginInvocation(baseInput())
+  await store.recordAttempt(IDENTITY, { attempt: 1 })
+  const marked = await store.markNotSent(IDENTITY, '整体时限在发送前到期；请求未发出。')
+  A.equal(marked.state, 'started')
+  A.equal(marked.attempts, 0)
+  A.equal(marked.error.code, 'HTTP_NOT_SENT')
+  const reopened = await store.beginInvocation(baseInput())
+  A.equal(reopened.status, 'fresh', '确认没发出的记录允许重开')
+})
+
+
 console.log(`\nconnector-store: ${checks} 组 / ${assertions} 条断言通过`)

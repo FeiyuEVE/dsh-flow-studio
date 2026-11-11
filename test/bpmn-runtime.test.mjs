@@ -18,7 +18,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
 import http from 'node:http'
 import { dirname, join, resolve } from 'node:path'
@@ -1966,6 +1966,284 @@ try {
       }
     } finally {
       await artifactRuntime.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.6 H5 · 崩溃恢复：同一逻辑激活必须复用同一 invocation / 幂等键
+  // -------------------------------------------------------------------------
+  await check('H5：恢复旧快照后重放 HTTP 活动复用同一调用记录，不产生第二次请求', async home => {
+    const requests = []
+    const server = http.createServer((req, res) => {
+      requests.push({ headers: req.headers })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"accepted":true}')
+    })
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = server.address().port
+    const httpPolicy = {
+      allowInsecureOrigins: [`fixture.test:${port}`],
+      resolver: async () => [{ address: '127.0.0.1', family: 4 }],
+    }
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-h5" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-h5" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="approve"/>
+    <bpmn:serviceTask id="submit">
+      <bpmn:extensionElements>
+        <fs:node nodeType="http"><fs:http method="POST" url="http://fixture.test:${port}/orders" timeoutMs="5000" idempotencyMode="remote-key" idempotencyHeader="Idempotency-Key"/></fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="review"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="approve"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="approve" targetRef="submit"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="submit" targetRef="review"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="review" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const dir = store.flowsDir(home)
+    const url = new URL('http://localhost/')
+    let runtime = createBpmnRuntime({ dir, env: {}, adapters: null, httpPolicy })
+    try {
+      let res = await runtime.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-h5', name: 'H5', xml } })
+      eq(res.status, 201, JSON.stringify(res.body))
+      res = await runtime.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-h5' } })
+      eq(res.status, 201, JSON.stringify(res.body))
+      const instanceId = res.body.id
+      const instanceDir = join(home, 'flow-studio', 'instances', instanceId)
+      const connectorDir = join(instanceDir, 'connector')
+      const stateBefore = readFileSync(join(instanceDir, 'state.json'))
+      const instanceBefore = readFileSync(join(instanceDir, 'instance.json'))
+
+      // 模拟「HTTP 已成功落盘调用记录，但引擎新快照尚未写入时崩溃」：跳过 state 落盘。
+      runtime._persistState = async () => {}
+      res = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'approve', 'complete'], url, body: { payload: {} },
+      })
+      eq(res.status, 200, JSON.stringify(res.body))
+      eq(requests.length, 1, '第一次审批完成后发送一次 HTTP')
+      const firstKey = requests[0].headers['idempotency-key']
+      ok(typeof firstKey === 'string' && firstKey !== '', '第一次请求带幂等键')
+      const recordsAfterFirst = readdirSync(connectorDir).filter(name => name.endsWith('.json') && !name.startsWith('.'))
+      eq(recordsAfterFirst.length, 1, '第一次成功后只有 1 条调用记录')
+      const firstRecord = JSON.parse(readFileSync(join(connectorDir, recordsAfterFirst[0]), 'utf8'))
+      eq(firstRecord.state, 'succeeded')
+      eq(firstRecord.executionId, 'submit_attempt_1', '记录键使用稳定激活身份（elementId + ctx.attempt）')
+      ok(String(firstRecord.engineExecutionId).startsWith('submit_'), '记录保留引擎随机 executionId 便于排障')
+      eq(firstRecord.idempotencyKey, firstKey)
+
+      // 崩溃：丢弃新快照，恢复旧引擎状态与旧实例元数据（保留 connector 记录）。
+      await runtime.dispose()
+      writeFileSync(join(instanceDir, 'state.json'), stateBefore)
+      writeFileSync(join(instanceDir, 'instance.json'), instanceBefore)
+
+      runtime = createBpmnRuntime({ dir, env: {}, adapters: null, httpPolicy })
+      res = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'approve', 'complete'], url, body: { payload: {} },
+      })
+      eq(res.status, 200, JSON.stringify(res.body))
+      eq(res.body.status, 'ACTIVE')
+      eq(res.body.pendingTasks.length, 1)
+      eq(res.body.pendingTasks[0].activityId, 'review', '恢复重放后仍推进到下一人工任务')
+      eq(requests.length, 1, '恢复重放必须复用成功记录，绝不产生第二次请求')
+      const recordsAfterReplay = readdirSync(connectorDir).filter(name => name.endsWith('.json') && !name.startsWith('.'))
+      eq(recordsAfterReplay.length, 1, '恢复后仍只有 1 条 succeeded 记录')
+      const replayRecord = JSON.parse(readFileSync(join(connectorDir, recordsAfterReplay[0]), 'utf8'))
+      eq(replayRecord.state, 'succeeded')
+      eq(replayRecord.idempotencyKey, firstKey, '恢复重放引用同一幂等键')
+      const events = (await instStore.readInstanceEvents(instanceId, { instancesRoot: join(home, 'flow-studio', 'instances') })) ?? []
+      ok(
+        events.some(event => event.type === 'http/result' && event.reused === true),
+        '恢复重放的 http/result 事件标记 reused=true',
+      )
+    } finally {
+      await runtime.dispose()
+      await new Promise(resolveClose => server.close(() => resolveClose()))
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.7 H3 · 远端回显凭据时：变量 / 事件 / 调用记录都不出现该值
+  // -------------------------------------------------------------------------
+  await check('H3：响应体回显 Authorization → HTTP_RESPONSE_SECRET_LEAK，变量与事件不含凭据值', async home => {
+    const secret = 'SYNTHETIC_RUNTIME_SECRET'
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ leaked: `Bearer ${secret}` }))
+    })
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = server.address().port
+    const previousAuth = process.env.FLOW_STUDIO_HTTP_AUTH_ECHO_API
+    process.env.FLOW_STUDIO_HTTP_AUTH_ECHO_API = secret
+    try {
+      const route = {
+        handler: createHandler(makeEnv(home, {
+          bpmnHttpPolicy: {
+            allowInsecureOrigins: [`fixture.test:${port}`],
+            resolver: async () => [{ address: '127.0.0.1', family: 4 }],
+          },
+        })),
+      }
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-h3" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-h3" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="submit">
+      <bpmn:extensionElements>
+        <fs:node nodeType="http"><fs:http method="GET" url="http://fixture.test:${port}/echo" authRef="echo-api" timeoutMs="3000"/></fs:node>
+        <zeebe:ioMapping><zeebe:output source="= response.body.leaked" target="leaked"/></zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="submit"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="submit" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+      let res = await call(route, 'POST', `${API}/definitions`, { id: 'flow-h3', name: 'H3', xml })
+      eq(res.status, 201, JSON.stringify(res.json))
+      res = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-h3' })
+      eq(res.status, 201, JSON.stringify(res.json))
+      const instanceId = res.json.id
+      eq(res.json.status, 'ACTIVE', '泄漏被拒绝后实例保持 ACTIVE')
+      const detail = await call(route, 'GET', `${API}/instances/${instanceId}`)
+      eq(detail.status, 200)
+      eq(detail.json.lastError.code, 'HTTP_RESPONSE_SECRET_LEAK')
+      ok(!JSON.stringify(detail.json.variables).includes(secret), '实例变量不含凭据值')
+      eq(detail.json.variables.leaked, undefined, '输出映射没有写入变量')
+      const events = await call(route, 'GET', `${API}/instances/${instanceId}/events`)
+      ok(!JSON.stringify(events.json.events).includes(secret), '事件流不含凭据值')
+      const instanceDir = join(home, 'flow-studio', 'instances', instanceId, 'connector')
+      const recordText = readdirSync(instanceDir)
+        .filter(name => name.endsWith('.json') && !name.startsWith('.'))
+        .map(name => readFileSync(join(instanceDir, name), 'utf8'))
+        .join('\n')
+      ok(recordText !== '', '必须留下失败调用记录')
+      ok(!recordText.includes(secret), '调用记录不含凭据值')
+    } finally {
+      if (previousAuth === undefined) delete process.env.FLOW_STUDIO_HTTP_AUTH_ECHO_API
+      else process.env.FLOW_STUDIO_HTTP_AUTH_ECHO_API = previousAuth
+      await new Promise(resolveClose => server.close(() => resolveClose()))
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.8 m1 · connector 调用记录人工处置：鉴权 / 幂等 / 审计 / 实例保持 ACTIVE
+  // -------------------------------------------------------------------------
+  await check('m1：connector resolve 路由鉴权、幂等、审计，处置后实例仍 ACTIVE 且不伪造活动', async home => {
+    const server = http.createServer((req, res) => {
+      res.writeHead(500, { 'content-type': 'text/plain' })
+      res.end('boom')
+    })
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = server.address().port
+    const token = 'k1-connector-token-16chars'
+    const previousToken = process.env.FLOW_STUDIO_TOKEN
+    process.env.FLOW_STUDIO_TOKEN = token
+    try {
+      const route = {
+        handler: createHandler(makeEnv(home, {
+          bpmnHttpPolicy: {
+            allowInsecureOrigins: [`fixture.test:${port}`],
+            resolver: async () => [{ address: '127.0.0.1', family: 4 }],
+          },
+        })),
+      }
+      const auth = { authorization: `Bearer ${token}` }
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-m1" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-m1" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="submit">
+      <bpmn:extensionElements>
+        <fs:node nodeType="http"><fs:http method="GET" url="http://fixture.test:${port}/fail" timeoutMs="3000"/></fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="submit"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="submit" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+      let res = await call(route, 'POST', `${API}/definitions`, { id: 'flow-m1', name: 'm1', xml }, auth)
+      eq(res.status, 201, JSON.stringify(res.json))
+      res = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-m1' }, auth)
+      eq(res.status, 201, JSON.stringify(res.json))
+      const instanceId = res.json.id
+      eq(res.json.status, 'ACTIVE')
+      const detailBefore = await call(route, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
+      eq(detailBefore.json.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE')
+      const eventsBefore = await call(route, 'GET', `${API}/instances/${instanceId}/events`, undefined, auth)
+      const eventCountBefore = eventsBefore.json.events.length
+
+      const connectorDir = join(home, 'flow-studio', 'instances', instanceId, 'connector')
+      const recordName = readdirSync(connectorDir).find(name => name.endsWith('.json') && !name.startsWith('.'))
+      ok(typeof recordName === 'string', '失败调用必须留下记录')
+      const record = JSON.parse(readFileSync(join(connectorDir, recordName), 'utf8'))
+      eq(record.executionId, 'submit_attempt_1')
+      eq(record.state, 'failed')
+      const resolveUrl = `${API}/instances/${instanceId}/connector/${record.executionId}/resolve`
+
+      // 鉴权：缺 token / 错 token 都拒绝（路由在统一的 /instances 鉴权之后）。
+      res = await call(route, 'POST', resolveUrl, { action: 'mark-succeeded', evidence: 'x' })
+      eq(res.status, 401, '缺少 Bearer token 必须 401')
+      res = await call(route, 'POST', resolveUrl, { action: 'mark-succeeded', evidence: 'x' }, { authorization: 'Bearer wrong-token-value' })
+      eq(res.status, 401, '错误 token 必须 401')
+
+      // 参数校验。
+      res = await call(route, 'POST', resolveUrl, { action: 'mark-succeeded' }, auth)
+      eq(res.status, 400, '缺 evidence 必须 400')
+      eq(res.json.code, 'HTTP_RESOLVE_INVALID')
+      res = await call(route, 'POST', `${API}/instances/${instanceId}/connector/nope/resolve`, {
+        action: 'mark-succeeded', evidence: 'x',
+      }, auth)
+      eq(res.status, 404)
+      eq(res.json.code, 'HTTP_INVOCATION_NOT_FOUND')
+
+      // 正常处置：只改记录 + 审计，实例仍 ACTIVE，绝不补 activity/end 或 process/end。
+      res = await call(route, 'POST', resolveUrl, {
+        action: 'mark-succeeded',
+        evidence: '远端工单 #42 确认已入账',
+        operator: 'ops-k1',
+        result: { status: 200, headers: { 'content-type': 'application/json' }, output: { accepted: true } },
+      }, auth)
+      eq(res.status, 200, JSON.stringify(res.json))
+      eq(res.json.ok, true)
+      eq(res.json.status, 'ACTIVE')
+      eq(res.json.idempotent, false)
+      ok(typeof res.json.auditId === 'string' && res.json.auditId !== '')
+      eq(res.json.record.state, 'succeeded')
+      eq(res.json.record.result.manual, true)
+      const detailAfter = await call(route, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
+      eq(detailAfter.json.status, 'ACTIVE', '处置后实例仍保持 ACTIVE 语义')
+      eq(detailAfter.json.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE', '处置不改写 lastError（不伪造已恢复）')
+      const eventsAfter = await call(route, 'GET', `${API}/instances/${instanceId}/events`, undefined, auth)
+      eq(eventsAfter.json.events.length, eventCountBefore, '处置不追加 activity/end 等引擎事件')
+      ok(!eventsAfter.json.events.some(event => event.type === 'process/end'), '处置不得伪造流程结束')
+
+      const auditLines = readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      eq(auditLines.length, 1, '审计追加一条')
+      eq(auditLines[0].action, 'mark-succeeded')
+      eq(auditLines[0].evidence, '远端工单 #42 确认已入账')
+      eq(auditLines[0].operator, 'ops-k1')
+      eq(auditLines[0].executionId, record.executionId)
+      eq(auditLines[0].idempotent, false)
+
+      // 幂等：同一动作重复提交不再改记录、不再追加审计。
+      res = await call(route, 'POST', resolveUrl, {
+        action: 'mark-succeeded',
+        evidence: '重复提交',
+        operator: 'ops-k1',
+      }, auth)
+      eq(res.status, 200)
+      eq(res.json.idempotent, true)
+      eq(readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').length, 1)
+      const detailFinal = await call(route, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
+      eq(detailFinal.json.status, 'ACTIVE')
+    } finally {
+      if (previousToken === undefined) delete process.env.FLOW_STUDIO_TOKEN
+      else process.env.FLOW_STUDIO_TOKEN = previousToken
+      await new Promise(resolveClose => server.close(() => resolveClose()))
     }
   })
 

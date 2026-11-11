@@ -57,6 +57,14 @@ async function rejects(promise, code, message) {
   })
 }
 
+function policyThrows(fn, message) {
+  assertions += 1
+  assert.throws(fn, (error) => {
+    assert.equal(error.code, 'HTTP_POLICY_INVALID', `${message}（实际 code=${error.code}，message=${error.message}）`)
+    return true
+  })
+}
+
 const PUBLIC_V4 = '93.184.216.34'
 const PUBLIC_V6 = '2606:2800:220:1:248:1893:25c8:1946'
 
@@ -257,6 +265,80 @@ await check('addressInCidr / classifyAddress：IPv4 与 IPv6 边界', async () =
   A.deepEqual(classifyAddress('::ffff:7f00:1'), { family: 6, kind: 'loopback' }, 'IPv4-mapped 回环')
   A.deepEqual(classifyAddress('64:ff9b::a00:1'), { family: 6, kind: 'private' }, 'NAT64 内嵌私网')
   A.equal(classifyAddress('not-an-ip'), null)
+})
+
+await check('H1：本地 NAT64 / site-local / 其他特殊用途前缀默认不是公网', async () => {
+  A.deepEqual(classifyAddress('64:ff9b:1::a00:1'), { family: 6, kind: 'nat64-local' }, 'RFC 8215 本地转换前缀')
+  A.deepEqual(classifyAddress('fec0::1'), { family: 6, kind: 'site-local' }, 'fec0::/10 站点本地')
+  A.deepEqual(classifyAddress('::7f00:1'), { family: 6, kind: 'loopback' }, 'IPv4-compatible 回环不得当公网')
+  A.deepEqual(classifyAddress('2001:2::1'), { family: 6, kind: 'benchmark' })
+  A.deepEqual(classifyAddress('3fff::1'), { family: 6, kind: 'documentation' })
+  A.deepEqual(classifyAddress('5f00::1'), { family: 6, kind: 'reserved' })
+  A.deepEqual(classifyAddress('64:ff9b::5db8:d822'), { family: 6, kind: 'public' }, 'well-known NAT64 内嵌公网地址仍可用')
+
+  for (const address of ['64:ff9b:1::a00:1', 'fec0::1', '2001:2::1', '3fff::1', '5f00::1']) {
+    await rejects(
+      validateDestination(`https://[${address}]/`),
+      'HTTP_DESTINATION_BLOCKED',
+      `${address} 默认必须阻断`,
+    )
+  }
+  // 显式启用本地 NAT64 后，内嵌 IPv4 仍必须本身是公网；私网 / 回环不能借转换前缀绕过。
+  await rejects(
+    validateDestination('https://[64:ff9b:1::5db8:d822]/'),
+    'HTTP_DESTINATION_BLOCKED',
+    '未配置 nat64Prefixes 时本地转换前缀整体阻断',
+  )
+  await rejects(
+    validateDestination('https://[64:ff9b:1::a00:1]/', { nat64Prefixes: ['64:ff9b:1::/48'] }),
+    'HTTP_DESTINATION_BLOCKED',
+    '显式启用后内嵌私网 IPv4 仍阻断',
+  )
+  const allowed = await validateDestination(
+    'https://[64:ff9b:1::5db8:d822]/',
+    { nat64Prefixes: ['64:ff9b:1::/48'] },
+  )
+  A.equal(allowed.ok, true, '显式启用且内嵌公网 IPv4 才允许')
+  A.equal(allowed.addresses[0].address, '64:ff9b:1::5db8:d822')
+  policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: ['2002::/16'] }), 'nat64Prefixes 只接受 64:ff9b:1::/48 子前缀')
+  policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: ['64:ff9b:1::/24'] }), 'nat64Prefixes 前缀长度必须 32–96')
+})
+
+await check('H2：非法 / 通配符 / 空前缀策略配置加载即报错，不静默扩权', async () => {
+  policyThrows(() => normalizeHttpPolicy({ allowInsecureOrigins: ['*'] }), 'allowInsecureOrigins 不接受通配符')
+  policyThrows(() => normalizeHttpPolicy({ allowInsecureOrigins: ['127.0.0.1'] }), 'allowInsecureOrigins 必须显式端口')
+  policyThrows(() => normalizeHttpPolicy({ allowedHosts: ['*:443'] }), 'allowedHosts 不接受通配符主机')
+  policyThrows(() => normalizeHttpPolicy({ allowedHosts: ['internal.example:0'] }), '端口必须 1–65535')
+  policyThrows(() => normalizeHttpPolicy({ allowedCidrs: ['10.0.0.0/'] }), 'CIDR 前缀不能为空')
+  policyThrows(() => normalizeHttpPolicy({ allowedCidrs: ['10.0.0.0/33'] }), 'IPv4 前缀长度上限 32')
+  policyThrows(() => normalizeHttpPolicy({ allowedCidrs: ['not-an-ip/8'] }), 'CIDR 网络地址必须合法')
+  policyThrows(() => normalizeHttpPolicy({ allowedCidrs: ['10.0.0.0/8*'] }), 'CIDR 不接受通配符')
+  policyThrows(
+    () => normalizeHttpPolicy({ authOrigins: { api: ['https://api.example.com/path'] } }),
+    'authOrigins 只能写 origin，不能带路径',
+  )
+
+  // 两个实测反例：修复前 `*` 与 `10.0.0.0/` 都能放行任意目标；现在整次校验直接失败。
+  await rejects(
+    validateDestination('http://127.0.0.1:9999/x', { allowInsecureOrigins: ['*'] }),
+    'HTTP_POLICY_INVALID',
+    '通配符不能把回环明文目标放行',
+  )
+  await rejects(
+    validateDestination('https://192.168.1.2/', { allowedCidrs: ['10.0.0.0/'] }),
+    'HTTP_POLICY_INVALID',
+    '空前缀 CIDR 不能变成 /0 放行一切',
+  )
+
+  const normalized = normalizeHttpPolicy({
+    allowInsecureOrigins: ['127.0.0.1:18080'],
+    allowedHosts: ['[::1]:8443'],
+    allowedCidrs: ['10.0.0.0/8'],
+    authOrigins: { api: ['https://api.example.com'] },
+  })
+  A.deepEqual(normalized.allowInsecureOrigins, ['127.0.0.1:18080'], '合法配置保持精确 host:port')
+  A.deepEqual(normalized.allowedHosts, ['[::1]:8443'], 'IPv6 例外保留方括号')
+  A.deepEqual(normalized.authOrigins.api, ['https://api.example.com:443'], 'authOrigins 归一化成显式端口')
 })
 
 await check('authRef：缺失 / 非法明确报错，值时不出现在错误里', async () => {

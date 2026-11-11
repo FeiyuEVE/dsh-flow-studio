@@ -12,7 +12,9 @@
  *     因而得到新键；
  *   - 调用记录先落盘再发请求、成功结果落盘后才回调引擎；恢复窗口见 connector-store；
  *   - 输入映射只在局部上下文求值，输出只合并显式映射的短标量（复用 finish 变量预算）；
- *   - 密钥 / 鉴权头值不进 XML、变量、事件、错误文本与日志。
+ *   - 密钥 / 鉴权头值不进 XML、变量、事件、错误文本与日志；响应头里的精确凭据值会被
+ *     脱敏成 `[redacted]`，输出映射若回显凭据值则整次失败（`HTTP_RESPONSE_SECRET_LEAK`）。
+ *     该过滤是「已知凭据值的精确匹配」，不承诺识别经过变换（如再次编码）的形态。
  *
  * 返回 `{ output, status, headers, events }`：`output` 只含显式输出映射，`headers`
  * 只含白名单里的响应头。失败抛带 `code` 的 `HttpConnectorError`，由 bpmn-runner /
@@ -31,6 +33,7 @@ import { evaluateFeel } from './bpmn-expr.js'
 import { createConnectorStore, ConnectorStoreError } from './connector-store.js'
 import { NodeFinishError, validateFinishArgs } from './node-finish.js'
 import {
+  HTTP_LIMITS,
   HTTP_METHODS,
   HttpPolicyError,
   isSecretHeaderName,
@@ -115,6 +118,181 @@ function toHttpConnectorError(error) {
   return new HttpConnectorError('HTTP_INTERNAL_ERROR', 'HTTP connector 内部错误（详情已省略，避免泄露请求内容）。')
 }
 
+/* ── 凭据值过滤（H3）────────────────────────────────────────────── */
+
+const REDACTED = '[redacted]'
+/** 太短的值容易误伤正常响应（例如 token='abc'）；小于该长度不做回显匹配。 */
+const MIN_SECRET_NEEDLE = 4
+
+/**
+ * 从已解析的鉴权 header 里提取「绝不允许出现在响应 / 输出 / 落盘记录」的值。
+ *
+ * 同时覆盖完整 header 值、scheme 后的 token、Basic 的 base64 与被解码的 user:pass，
+ * 因为远端回显可能只回显其中一种形态。
+ */
+function secretNeedles(headers) {
+  const needles = new Set()
+  const add = value => {
+    const text = typeof value === 'string' ? value.trim() : ''
+    if (text.length >= MIN_SECRET_NEEDLE) needles.add(text)
+  }
+  for (const rawValue of Object.values(headers ?? {})) {
+    // authRef resolver 返回的 header 全部视为凭据（不依赖 header 名是否命中敏感名单），
+    // 因为值是宿主凭据、XML 无法写入；调用方只会把这个对象传进来。
+    const value = String(rawValue)
+    add(value)
+    const match = /^([A-Za-z]+)\s+(.+)$/.exec(value)
+    if (match === null) continue
+    add(match[2])
+    if (match[1].toLowerCase() === 'basic') {
+      try {
+        add(Buffer.from(match[2], 'base64').toString('utf8'))
+      } catch {
+        // 非法 base64：忽略解码形态，完整值仍然在 needles 里。
+      }
+    }
+  }
+  // 长值优先替换，避免短 needle 先把长值切碎。
+  return [...needles].sort((a, b) => b.length - a.length)
+}
+
+function containsNeedle(value, needles) {
+  if (needles.length === 0) return false
+  const text = typeof value === 'string' ? value : String(value)
+  return needles.some(needle => text.includes(needle))
+}
+
+function redactNeedleText(text, needles) {
+  if (typeof text !== 'string' || needles.length === 0) return text
+  let output = text
+  for (const needle of needles) output = output.split(needle).join(REDACTED)
+  return output
+}
+
+/** 允许白名单里的响应头也要做值脱敏：头名称白名单不等于值安全。 */
+function redactNeedleValue(value, needles) {
+  return containsNeedle(value, needles) ? REDACTED : value
+}
+
+/* ── header 预算（m2）──────────────────────────────────────────── */
+
+function headerEntryBytes(name, value) {
+  return Buffer.byteLength(name, 'utf8') + Buffer.byteLength(String(value), 'utf8') + 4
+}
+
+/**
+ * 请求 header 预算：数量 / 单值 / 总量三道显式上限。
+ * 超过时在请求发出前拒绝（正文预算不覆盖 header）。
+ */
+function assertRequestHeaderBudget(headers) {
+  const entries = Object.entries(headers)
+  if (entries.length > HTTP_LIMITS.maxRequestHeaderCount) {
+    throw new HttpConnectorError(
+      'HTTP_HEADER_COUNT_EXCEEDED',
+      `请求头数量 ${entries.length} 超过上限 ${HTTP_LIMITS.maxRequestHeaderCount} 个。`,
+      { count: entries.length, limit: HTTP_LIMITS.maxRequestHeaderCount },
+    )
+  }
+  let total = 0
+  for (const [name, value] of entries) {
+    const valueBytes = Buffer.byteLength(String(value), 'utf8')
+    if (valueBytes > HTTP_LIMITS.maxRequestHeaderValueBytes) {
+      throw new HttpConnectorError(
+        'HTTP_HEADER_TOO_LARGE',
+        `请求头 ${name} 的值 ${valueBytes} 字节超过单头上限 ${HTTP_LIMITS.maxRequestHeaderValueBytes} 字节。`,
+        { header: name, bytes: valueBytes, limit: HTTP_LIMITS.maxRequestHeaderValueBytes },
+      )
+    }
+    total += headerEntryBytes(name, value)
+  }
+  if (total > HTTP_LIMITS.maxRequestHeaderBytes) {
+    throw new HttpConnectorError(
+      'HTTP_REQUEST_HEADERS_TOO_LARGE',
+      `请求头总量 ${total} 字节超过上限 ${HTTP_LIMITS.maxRequestHeaderBytes} 字节。`,
+      { bytes: total, limit: HTTP_LIMITS.maxRequestHeaderBytes },
+    )
+  }
+}
+
+/**
+ * 响应 header 预算：Node 解析器本身有默认上限，这里再加一层与版本无关的兜底，
+ * 并把「头太多 / 总量太大」变成稳定的 connector 错误码（而不是解析器内部错误）。
+ */
+function assertResponseHeaderBudget(rawHeaders) {
+  const entries = Object.entries(rawHeaders ?? {})
+  if (entries.length > HTTP_LIMITS.maxResponseHeaderCount) {
+    throw new HttpConnectorError(
+      'HTTP_RESPONSE_HEADERS_TOO_LARGE',
+      `响应头数量 ${entries.length} 超过上限 ${HTTP_LIMITS.maxResponseHeaderCount} 个。`,
+      { count: entries.length, limit: HTTP_LIMITS.maxResponseHeaderCount },
+    )
+  }
+  let total = 0
+  for (const [name, value] of entries) {
+    const text = Array.isArray(value) ? value.join(', ') : String(value)
+    total += headerEntryBytes(name, text)
+    if (total > HTTP_LIMITS.maxResponseHeaderBytes) {
+      throw new HttpConnectorError(
+        'HTTP_RESPONSE_HEADERS_TOO_LARGE',
+        `响应头总量超过上限 ${HTTP_LIMITS.maxResponseHeaderBytes} 字节。`,
+        { limit: HTTP_LIMITS.maxResponseHeaderBytes },
+      )
+    }
+  }
+}
+
+/* ── 统一截止时间（H4）────────────────────────────────────────── */
+
+function deadlineError(timeoutMs, stage) {
+  return new HttpConnectorError(
+    'HTTP_TIMEOUT',
+    `HTTP 调用超过整体时限 ${timeoutMs}ms（${stage}阶段已过期，未发送请求）。`,
+    { timeoutMs, stage },
+  )
+}
+
+function canceledError(stage) {
+  return new HttpConnectorError('HTTP_CANCELED', `HTTP 调用在${stage}阶段被取消，未发送请求。`, { stage })
+}
+
+/**
+ * 让准备阶段的异步操作参与同一个 deadline / abort 竞争。
+ *
+ * 准备阶段包括：auth resolver、DNS/目标校验、调用记录 begin/recordAttempt。
+ * 底层 Promise 可能仍在跑（例如系统 DNS），但它不会被用于发送请求。
+ */
+function withinDeadline(promise, options) {
+  const { deadlineAt, timeoutMs, signal, stage } = options
+  const remaining = deadlineAt - Date.now()
+  if (remaining <= 0) return Promise.reject(deadlineError(timeoutMs, stage))
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort)
+      }
+    }
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve(value)
+    }
+    const timer = setTimeout(() => finish(deadlineError(timeoutMs, stage)), remaining)
+    const onAbort = () => finish(canceledError(stage))
+    if (signal) {
+      if (signal.aborted === true) {
+        finish(canceledError(stage))
+        return
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    Promise.resolve(promise).then(value => finish(null, value), error => finish(error))
+  })
+}
+
 /** 把宿主 parse 出来的 headers 对象/字符串归一化成小写 key 的字符串 map。 */
 function parseRequestHeaders(raw) {
   let source = raw
@@ -134,6 +312,11 @@ function parseRequestHeaders(raw) {
   const headers = {}
   for (const [name, value] of Object.entries(source)) {
     if (typeof name !== 'string' || name.trim() === '') continue
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
+      throw new HttpConnectorError('HTTP_HEADERS_INVALID', `header 名 ${JSON.stringify(name)} 不是合法的 HTTP header token。`, {
+        header: name,
+      })
+    }
     if (isSecretHeaderName(name)) {
       throw new HttpConnectorError(
         'HTTP_HEADER_SECRET_FORBIDDEN',
@@ -331,7 +514,7 @@ function serializeMappedBody(value) {
 }
 
 /** 输出映射：在局部响应上下文求值，只产出短标量；预算复用 finish 变量口径。 */
-function applyOutputMappings(mappings, response, variables, elementId) {
+function applyOutputMappings(mappings, response, variables, elementId, secrets = []) {
   if (mappings.length === 0) return {}
   const context = {
     ...variables,
@@ -361,7 +544,17 @@ function applyOutputMappings(mappings, response, variables, elementId) {
         { index, target, causeCode: evaluated.error?.code ?? null },
       )
     }
-    output[target] = scalarForMapping(evaluated.value, index, target)
+    const value = scalarForMapping(evaluated.value, index, target)
+    // H3：远端把 Authorization 回显进响应体时，映射结果会进变量 / 事件 / 落盘记录。
+    // 这里明确拒绝，而不是把凭据值写进实例状态。
+    if (containsNeedle(value, secrets)) {
+      throw new HttpConnectorError(
+        'HTTP_RESPONSE_SECRET_LEAK',
+        `输出映射第 ${index + 1} 条（target=${target}）的响应内容包含鉴权凭据值，已拒绝写入变量与调用记录。`,
+        { index, target, elementId },
+      )
+    }
+    output[target] = value
   }
   try {
     return validateFinishArgs({ variables: output, documents: [], summary: 'http' }).variables
@@ -377,14 +570,15 @@ function applyOutputMappings(mappings, response, variables, elementId) {
   }
 }
 
-/** 结果里可以回传的响应头（白名单 + 小写）。 */
-function allowedResponseHeaders(raw) {
+/** 结果里可以回传的响应头（白名单 + 小写 + 凭据值脱敏）。 */
+function allowedResponseHeaders(raw, needles = []) {
   const output = {}
   for (const [name, value] of Object.entries(raw ?? {})) {
     const lower = name.toLowerCase()
     if (!RESPONSE_HEADER_ALLOWLIST.has(lower)) continue
-    if (Array.isArray(value)) output[lower] = value.join(', ')
-    else if (value !== undefined) output[lower] = String(value)
+    const text = Array.isArray(value) ? value.join(', ') : (value !== undefined ? String(value) : undefined)
+    if (text === undefined) continue
+    output[lower] = redactNeedleValue(text, needles)
   }
   return output
 }
@@ -419,7 +613,7 @@ async function sleepUntil(ms, ctx) {
  * 返回 `{ status, headers, body, rawBytes, decodedBytes }`；超限 / 重定向已在此层拒绝。
  */
 function performRequest(options) {
-  const { method, url, headers, bodyText, validated, deadline, ctx } = options
+  const { method, url, headers, bodyText, validated, deadline, ctx, timeoutMs, secrets } = options
   return new Promise((resolve, reject) => {
     let settled = false
     let timer = null
@@ -456,6 +650,13 @@ function performRequest(options) {
       ctx.signal.addEventListener('abort', onAbort, { once: true })
     }
 
+    // H4：真正发送前再复查一次剩余时间；过期必须零发送（不能靠 1ms 计时器兜底）。
+    const beforeSend = deadline - Date.now()
+    if (beforeSend <= 0) {
+      finish(deadlineError(timeoutMs, '请求发送'))
+      return
+    }
+
     const transport = url.protocol === 'https:' ? httpsRequest : httpRequest
     const requestOptions = {
       method,
@@ -487,6 +688,7 @@ function performRequest(options) {
           ctx,
           deadline,
           limitBytes: options.limitBytes,
+          secrets,
           finish,
           onAbort,
           isSettled: () => settled,
@@ -541,7 +743,17 @@ function readResponse(response, context) {
   const { method, url, ctx, deadline, finish, isSettled } = context
   const status = Number(response.statusCode ?? 0)
   const rawHeaders = isPlainObject(response.headers) ? response.headers : {}
-  const headers = allowedResponseHeaders(rawHeaders)
+  const secrets = Array.isArray(context.secrets) ? context.secrets : []
+  let headers
+  try {
+    // m2：响应头也有显式预算（Node 解析器上限之外再兜一层稳定错误码）。
+    assertResponseHeaderBudget(rawHeaders)
+    headers = allowedResponseHeaders(rawHeaders, secrets)
+  } catch (error) {
+    finish(error)
+    response.destroy(error)
+    return
+  }
   const rawDeclared = Number(rawHeaders['content-length'])
   const declaredLength = Number.isFinite(rawDeclared) && rawDeclared >= 0 ? rawDeclared : null
   const contentEncoding = String(rawHeaders['content-encoding'] ?? '').trim().toLowerCase()
@@ -763,7 +975,7 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   }
   const elementId = typeof element.id === 'string' && element.id !== '' ? element.id : 'http'
   const instanceId = typeof ctx.instanceId === 'string' && ctx.instanceId !== '' ? ctx.instanceId : 'local'
-  const executionId = typeof ctx.executionId === 'string' && ctx.executionId !== ''
+  const engineExecutionId = typeof ctx.executionId === 'string' && ctx.executionId !== ''
     ? ctx.executionId
     : `${elementId}_execution_1`
   const variables = isPlainObject(ctx.variables) ? ctx.variables : {}
@@ -773,7 +985,12 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   const selectedPolicy = policyId !== '' && isPlainObject(options.policies) && isPlainObject(options.policies[policyId])
     ? { ...(isPlainObject(options.policy) ? options.policy : {}), ...options.policies[policyId] }
     : (options.policy ?? {})
-  const policy = normalizeHttpPolicy(selectedPolicy)
+  let policy
+  try {
+    policy = normalizeHttpPolicy(selectedPolicy)
+  } catch (error) {
+    throw toHttpConnectorError(error)
+  }
   let store = options.store
   if (!store) {
     try {
@@ -805,33 +1022,55 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     throw new HttpConnectorError('HTTP_URL_INVALID', 'http 节点的 url 不是合法 URL。')
   }
 
+  // H4：统一截止时间在入口就建立（auth resolver / DNS / store 等待 / 发送全部参与）。
+  const timeoutMs = Number.isSafeInteger(http.timeoutMs) && http.timeoutMs > 0
+    ? Math.min(http.timeoutMs, policy.maxTimeoutMs)
+    : policy.defaultTimeoutMs
+  const deadlineAt = Date.now() + timeoutMs
+  const deadlineOptions = stage => ({ deadlineAt, timeoutMs, signal: ctx.signal, stage })
+
+  // H5：调用记录身份必须跨崩溃恢复可复现。
+  // `executionId` 由引擎每次活动执行随机生成（恢复重放会变），不能作为幂等键；
+  // `ctx.attempt` 是随引擎快照持久化的「本实例第几次进入该节点」，从旧快照重放同一
+  // 次逻辑激活时值不变，循环的第二次激活才会递增。两者一起构成稳定激活身份。
+  const attemptNumber = Number.isSafeInteger(ctx.attempt) && ctx.attempt > 0 ? ctx.attempt : null
+  const activationKey = attemptNumber === null
+    ? engineExecutionId
+    : `${elementId.slice(0, 200)}_attempt_${attemptNumber}`
+
   const input = applyInputMappings(io.input, variables)
   for (const [name, value] of Object.entries(input.query)) url.searchParams.set(name, String(value))
 
   const headers = parseRequestHeaders(http.headers)
   Object.assign(headers, input.headers)
 
-  // 凭据：只从宿主解析，错误信息不包含值。
-  if (typeof http.authRef === 'string' && http.authRef.trim() !== '') {
+  // 凭据：只从宿主解析，错误信息不包含值；H4：解析也受统一 deadline / abort 约束。
+  const authRef = typeof http.authRef === 'string' && http.authRef.trim() !== '' ? http.authRef.trim() : null
+  let secrets = []
+  if (authRef !== null) {
     let authHeaders
     try {
-      authHeaders = await resolveAuthRef(http.authRef.trim(), {
-        env: options.env ?? policy.env ?? process.env,
-        resolve: options.authResolver ?? policy.authResolver,
-      })
+      authHeaders = await withinDeadline(
+        resolveAuthRef(authRef, {
+          env: options.env ?? policy.env ?? process.env,
+          resolve: options.authResolver ?? policy.authResolver,
+        }),
+        deadlineOptions('凭据解析'),
+      )
     } catch (error) {
       throw toHttpConnectorError(error)
     }
     Object.assign(headers, authHeaders)
+    secrets = secretNeedles(authHeaders)
   }
 
   const idempotency = normalizeIdempotency(http)
-  const identityDigest = sha256(`${instanceId}\0${elementId}\0${executionId}`)
+  const identityDigest = sha256(`${instanceId}\0${elementId}\0${activationKey}`)
   const invocationId = `inv-${identityDigest.slice(0, 16)}`
   let idempotencyKey = null
   if (idempotency !== null) {
-    // 同一次 execution 的所有重试共享该键；循环再次激活会得到新的 executionId → 新键。
-    idempotencyKey = `fs-${sha256(`${instanceId}\0${elementId}\0${executionId}\0${method}\0${url.href}`).slice(0, 40)}`
+    // 同一个逻辑激活（含崩溃恢复重放）的所有尝试共享该键；循环的下一轮激活换键。
+    idempotencyKey = `fs-${sha256(`${instanceId}\0${elementId}\0${activationKey}\0${method}\0${url.href}`).slice(0, 40)}`
     headers[idempotency.header.toLowerCase()] = idempotencyKey
   }
 
@@ -864,12 +1103,28 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   if (headers.accept === undefined) headers.accept = 'application/json, text/plain, */*'
   headers['user-agent'] = headers['user-agent'] ?? 'dsh-flow-studio-http-connector/0.13.6'
 
+  // m2：请求头预算在请求发出前显式检查（含 auth / 幂等键 / content-length 等全部 header）。
+  assertRequestHeaderBudget(headers)
+
   // 目标校验放在 body/headers 定稿后、发送前；校验结果里的 lookup 直接用于连接。
+  // H4：DNS 属于准备阶段，必须与 deadline / abort 竞争。
   let validated
   try {
-    validated = await validateDestination(url.href, policy)
+    validated = await withinDeadline(validateDestination(url.href, policy), deadlineOptions('目标校验 / DNS'))
   } catch (error) {
     throw toHttpConnectorError(error)
+  }
+
+  // H3：authRef 可绑定到允许的目标 origin；即使 XML 里的 url 被改写，凭据也不会跟过去。
+  if (authRef !== null) {
+    const bound = policy.authOrigins[authRef]
+    if (Array.isArray(bound) && bound.length > 0 && !bound.includes(validated.origin)) {
+      throw new HttpConnectorError(
+        'HTTP_AUTH_ORIGIN_FORBIDDEN',
+        `authRef「${authRef}」只允许发往 ${bound.join(' / ')}，当前目标是 ${validated.origin}；已拒绝，未发送请求。`,
+        { authRef, origin: validated.origin, allowedOrigins: [...bound], invocationId },
+      )
+    }
   }
 
   const acceptStatuses = normalizeAcceptStatuses(http.acceptStatuses)
@@ -880,10 +1135,6 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   const sideEffectRetryAllowed = idempotencyKey !== null
   const effectiveRetries = retriableMethod || sideEffectRetryAllowed ? configuredRetries : 0
   const maxAttempts = 1 + effectiveRetries
-  const timeoutMs = Number.isSafeInteger(http.timeoutMs) && http.timeoutMs > 0
-    ? Math.min(http.timeoutMs, policy.maxTimeoutMs)
-    : policy.defaultTimeoutMs
-  const deadline = Date.now() + timeoutMs
   const configuredLimit = Number.isSafeInteger(http.maxResponseBytes) && http.maxResponseBytes > 0
     ? http.maxResponseBytes
     : policy.defaultResponseBytes
@@ -897,22 +1148,25 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     bodyHash: sha256(bodyText),
   }))
 
-  const identity = { instanceId, elementId, executionId }
+  const identity = { instanceId, elementId, executionId: activationKey }
+  if (deadlineAt - Date.now() <= 0) throw deadlineError(timeoutMs, '调用记录写入')
   let begun
   try {
-    begun = await store.beginInvocation({
+    begun = await withinDeadline(store.beginInvocation({
       ...identity,
+      activationAttempt: attemptNumber,
+      engineExecutionId,
       requestHash,
       idempotencyKey,
       invocationId,
-    })
+    }), deadlineOptions('调用记录写入'))
   } catch (error) {
     throw toHttpConnectorError(error)
   }
 
   if (begun.status === 'reuse') {
     const result = begun.result
-    emitHttpEvent(ctx, elementId, executionId, {
+    emitHttpEvent(ctx, elementId, engineExecutionId, {
       type: 'http/result',
       invocationId,
       status: result.status,
@@ -929,27 +1183,38 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   if (begun.status === 'unknown') {
     throw new HttpConnectorError(
       'HTTP_OUTCOME_UNKNOWN',
-      '上次 HTTP 调用已发送但结果未落盘；为避免重复副作用，重启后不自动重发，请人工核对远端状态。',
-      { invocationId, idempotencyKey },
+      '上次 HTTP 调用已发送但结果未落盘；为避免重复副作用，重启后不自动重发，请人工核对远端状态后经 connector 处置入口处理。',
+      { invocationId, executionId: activationKey, idempotencyKey },
     )
   }
 
   let lastError = null
+  /** 本次调用是否至少有一次请求真正进入了传输层（用于决定 unknown / not-sent）。 */
+  let sentAny = false
   for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo += 1) {
     ensureNotAborted(ctx)
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      lastError = new HttpConnectorError('HTTP_TIMEOUT', `HTTP 调用超过整体时限 ${timeoutMs}ms（重试也已用尽）。`, {
-        timeoutMs,
-      })
+    if (deadlineAt - Date.now() <= 0) {
+      lastError = deadlineError(timeoutMs, '调用记录写入')
       break
     }
     try {
-      await store.recordAttempt(identity, { attempt: attemptNo, at: new Date().toISOString() })
+      await withinDeadline(
+        store.recordAttempt(identity, { attempt: attemptNo, at: new Date().toISOString() }),
+        deadlineOptions('调用记录写入'),
+      )
     } catch (error) {
       throw toHttpConnectorError(error)
     }
-    emitHttpEvent(ctx, elementId, executionId, {
+    // H4：recordAttempt 之后必须再次复查；过期必须零发送。
+    if (deadlineAt - Date.now() <= 0) {
+      const expired = deadlineError(timeoutMs, '请求发送')
+      if (sentAny === false) {
+        await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+      }
+      lastError = expired
+      break
+    }
+    emitHttpEvent(ctx, elementId, engineExecutionId, {
       type: 'http/attempt',
       invocationId,
       attempt: attemptNo,
@@ -961,6 +1226,7 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     })
 
     const startedAt = Date.now()
+    let attemptSent = true
     let response
     try {
       response = await performRequest({
@@ -969,22 +1235,28 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
         headers,
         bodyText,
         validated,
-        deadline,
+        deadline: deadlineAt,
         ctx,
         limitBytes,
+        timeoutMs,
+        secrets,
       })
     } catch (error) {
+      const failure = toHttpConnectorError(error)
+      // performRequest 在真正写 socket 之前复查到过期：这次尝试零发送。
+      if (failure.code === 'HTTP_TIMEOUT' && failure.details?.stage === '请求发送') attemptSent = false
+      if (attemptSent) sentAny = true
       if (isAbortError(ctx, error)) {
         // 已发送但结果不明：记录为 unknown，重启后不自动重发。
-        await store.markOutcomeUnknown(identity, 'HTTP 调用在等待结果时被取消。').catch(() => {})
+        if (sentAny) await store.markOutcomeUnknown(identity, 'HTTP 调用在等待结果时被取消。').catch(() => {})
+        else await store.markNotSent?.(identity, 'HTTP 调用在发送前被取消；请求未发出。').catch(() => {})
         throw new HttpConnectorError('HTTP_CANCELED', 'HTTP 调用已取消，迟到响应不得推动流程。', { invocationId })
       }
-      const failure = toHttpConnectorError(error)
-      lastError = failure
+      lastError = sanitizeError(failure, secrets)
       const transient = failure.details?.transient === true || failure.code === 'HTTP_TIMEOUT'
       if (attemptNo < maxAttempts && transient) {
         const wait = backoffMs(policy, attemptNo, null)
-        if (Date.now() + wait < deadline) {
+        if (Date.now() + wait < deadlineAt) {
           try {
             await sleepUntil(wait, ctx)
           } catch (errorCancel) {
@@ -994,22 +1266,28 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
           continue
         }
       }
+      if (sentAny === false) {
+        // 从未发出：回滚成「未发送」，重启后允许安全重开（不制造假的 unknown）。
+        await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+        throw lastError
+      }
       await store.commitResult(identity, {
         state: 'failed',
-        error: { code: failure.code, message: failure.message },
+        error: { code: lastError.code, message: lastError.message },
       }).catch(() => {})
-      throw failure
+      throw lastError
     }
+    sentAny = true
 
     // 校验之后再次检查取消：响应已经到达，但流程可能已经被 stop/suspend。
     ensureNotAborted(ctx)
 
     if (response.redirect === true) {
-      const error = new HttpConnectorError(
+      const error = sanitizeError(new HttpConnectorError(
         'HTTP_REDIRECT_FORBIDDEN',
         `目标返回 ${response.status} 重定向；首版不允许跟随（避免每一跳重新校验与跨 origin 转发凭据）。`,
-        { status: response.status, location: response.headers.location ?? null },
-      )
+        { status: response.status, location: redactNeedleText(response.headers.location ?? '', secrets) || null },
+      ), secrets)
       await store.commitResult(identity, { state: 'failed', error: { code: error.code, message: error.message } }).catch(() => {})
       throw error
     }
@@ -1018,8 +1296,8 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       const retryable = TRANSIENT_STATUS.has(response.status)
       if (attemptNo < maxAttempts && retryable) {
         const wait = backoffMs(policy, attemptNo, retryAfterMs(response.headers))
-        if (Date.now() + wait < deadline) {
-          emitHttpEvent(ctx, elementId, executionId, {
+        if (Date.now() + wait < deadlineAt) {
+          emitHttpEvent(ctx, elementId, engineExecutionId, {
             type: 'http/result',
             invocationId,
             attempt: attemptNo,
@@ -1048,7 +1326,7 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
 
     let output
     try {
-      output = applyOutputMappings(io.output, response, variables, elementId)
+      output = applyOutputMappings(io.output, response, variables, elementId, secrets)
     } catch (error) {
       const failure = toHttpConnectorError(error)
       await store.commitResult(identity, {
@@ -1069,7 +1347,7 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     } catch (error) {
       throw toHttpConnectorError(error)
     }
-    emitHttpEvent(ctx, elementId, executionId, {
+    emitHttpEvent(ctx, elementId, engineExecutionId, {
       type: 'http/result',
       invocationId,
       attempt: attemptNo,
@@ -1086,7 +1364,11 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     }
   }
 
-  const failure = lastError ?? new HttpConnectorError('HTTP_TIMEOUT', 'HTTP 调用在整体时限内没有完成。', { timeoutMs })
+  const failure = lastError ?? deadlineError(timeoutMs, '请求发送')
+  if (sentAny === false) {
+    await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+    throw failure
+  }
   await store.commitResult(identity, {
     state: 'failed',
     error: { code: failure.code, message: failure.message },
@@ -1094,6 +1376,21 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
   throw failure
 }
 
+/** 错误文本 / details 里的凭据值同样要脱敏（H3：错误也是持久化 / 返回值边界）。 */
+function sanitizeError(error, secrets) {
+  if (!(error instanceof HttpConnectorError) || secrets.length === 0) return error
+  return new HttpConnectorError(error.code, redactNeedleText(error.message, secrets), redactDeep(error.details, secrets))
+}
+
+function redactDeep(value, secrets) {
+  if (secrets.length === 0) return value
+  if (typeof value === 'string') return redactNeedleText(value, secrets)
+  if (Array.isArray(value)) return value.map(item => redactDeep(item, secrets))
+  if (isPlainObject(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactDeep(item, secrets)]))
+  }
+  return value
+}
 /** 供 runtime / 测试核对：只暴露白名单响应头与脱敏后的配置。 */
 export function describeHttpNode(element) {
   const http = isPlainObject(element?.node?.http) ? element.node.http : {}

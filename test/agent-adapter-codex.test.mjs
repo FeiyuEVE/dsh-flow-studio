@@ -70,7 +70,7 @@ mkdirSync(stateDir, { recursive: true })
 
 /** 假 codex：模拟 `--version` / `features` / `mcp list` / `exec` / `exec resume`。 */
 const FAKE_CODEX_SOURCE = `#!/usr/bin/env node
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -178,7 +178,7 @@ writeFileSync(join(stateDir, 'invocations', process.pid + '.json'), JSON.stringi
 
 out({ type: 'thread.started', thread_id: threadId })
 
-const skipMcp = mode === 'no-mcp'
+const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn'
 let transport = null
 let client = null
 if (!skipMcp) {
@@ -344,6 +344,25 @@ if (mode === 'leak-deep') {
 if (mode === 'no-mcp') {
   mkdirSync(stateDir, { recursive: true })
   writeFileSync(join(stateDir, 'started'), String(process.pid))
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+if (mode === 'descendant') {
+  // review-0141 M1：resume 正常提交后退出，但留下一个同进程组的后代（模拟 MCP / 工具后代）。
+  if (isResume) {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    child.unref()
+    writeFileSync(join(stateDir, 'descendant.pid'), String(child.pid))
+    await callTool()
+  }
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'no-mcp-stubborn') {
+  // review-0141 M1：握手期进程忽略 SIGTERM，只有 SIGKILL 能收掉。
+  process.on('SIGTERM', () => {})
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(join(stateDir, 'stubborn.pid'), String(process.pid))
   setInterval(() => {}, 1000)
   await new Promise(() => {})
 }
@@ -1065,6 +1084,67 @@ async function main() {
       A.equal(await waitForDead(resumePid), true, '测试收尾：resume 已退出')
       A.equal(await waitUntil(() => handle.cleanup.disposed === true, 2_000), true,
         '所有被跟踪进程退出后才更新 disposed=true')
+    })
+
+    await check('M1 resume 自然退出不丢进程组：后代必须回收，disposed 不能在有活后代时为 true', async () => {
+      resetState()
+      const workspace = freshWorkspace('resume-descendant')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'descendant' },
+        reminderLimit: 1,
+        postFinishGraceMs: 60_000,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '后代残留节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(await waitForFile(join(stateDir, 'descendant.pid')), true, 'resume 已拉起后代')
+      const descendantPid = Number(readFileSync(join(stateDir, 'descendant.pid'), 'utf8'))
+      A.equal(handle.cleanup.disposed, false, '后代仍存活时 cleanup.disposed 必须如实为 false')
+      A.deepEqual(handle.cleanup.pending, ['resume'], 'pending 列出 resume 进程组')
+      await adapter.dispose(handle)
+      const final = await handle.cleanupFinal
+      A.equal(final.disposed, true, '最终清理 Promise 报告 disposed=true')
+      A.equal(handle.cleanup.disposed, true, '整组确认消失后才 disposed=true')
+      A.equal(await waitForDead(descendantPid), true, 'resume 组的后代（MCP / 工具）被回收')
+    })
+
+    await check('M1 握手失败也完成物理清理：忽略 SIGTERM 时 start 不返回活进程', async () => {
+      resetState()
+      const workspace = freshWorkspace('handshake-stubborn')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'no-mcp-stubborn' },
+        helloTimeoutMs: 300,
+        killTimeoutMs: 150,
+      })
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          element: { id: 'agent-1', name: '握手失败节点' },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+          reminder: { onFire: () => {} },
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'start 必须失败')
+      A.equal(failure.code, 'NODE_FINISH_TOOL_UNAVAILABLE', '失败码保持 NODE_FINISH_TOOL_UNAVAILABLE')
+      A.equal(await waitForFile(join(stateDir, 'stubborn.pid')), true, '假 codex 已启动并忽略 SIGTERM')
+      const pid = Number(readFileSync(join(stateDir, 'stubborn.pid'), 'utf8'))
+      A.equal(pidAlive(pid), false, 'start 抛错时进程必须已物理退出（不能只等逻辑 exited）')
+      A.ok(failure.cleanup && typeof failure.cleanup === 'object', 'start 失败错误带物理清理信号')
+      A.equal(failure.cleanup.disposed, true, '物理清理完成：cleanup.disposed=true')
+      A.ok(failure.cleanupFinal && typeof failure.cleanupFinal.then === 'function', '带独立的最终清理 Promise')
+      A.equal((await failure.cleanupFinal).disposed, true, '最终清理 Promise 同样报告完成')
     })
 
     await check('M4：凭据 / socket 路径不进 handle.events / lastMessage / stdoutTail', async () => {

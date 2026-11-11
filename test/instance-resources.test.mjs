@@ -406,6 +406,190 @@ await withResourceLock(lockPath, async () => {
     assert.throws(() => resources.workspaceDirFor(base, '../etc'), error => error.code === resources.RESOURCE_ERROR.INVALID_ID)
   })
 
+  // review-0141 M9：helper 单独死亡后，临界区必须感知失锁。
+  const findLockHelper = () => {
+    if (process.platform !== 'linux') return null
+    let pids = []
+    try {
+      pids = readFileSync(`/proc/${process.pid}/task/${process.pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean)
+    } catch {
+      return null
+    }
+    for (const pid of pids) {
+      try {
+        if (readFileSync(`/proc/${pid}/cmdline`, 'utf8').startsWith('cat\0')) return Number(pid)
+      } catch {
+        // 已退出
+      }
+    }
+    return null
+  }
+
+  async function runContender(home, lock, waitMs) {
+    const script = join(home, `contender-${Math.random().toString(16).slice(2)}.mjs`)
+    writeFileSync(script, `
+import { withResourceLock } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+let payload
+try {
+  await withResourceLock(process.argv[2], async () => { payload = { entered: true } }, { waitMs: Number(process.argv[3]) })
+} catch (error) {
+  payload = { entered: false, code: error && error.code }
+}
+process.stdout.write(JSON.stringify(payload) + '\\n')
+`)
+    return await new Promise((resolveRun, rejectRun) => {
+      const child = spawn(process.execPath, [script, lock, String(waitMs)], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = ''
+      child.stdout.on('data', chunk => { stdout += String(chunk) })
+      child.once('error', rejectRun)
+      child.once('exit', code => {
+        if (code !== 0) {
+          rejectRun(new Error(`contender exit ${code}`))
+          return
+        }
+        try {
+          resolveRun(JSON.parse(stdout.trim()))
+        } catch (error) {
+          rejectRun(error)
+        }
+      })
+    })
+  }
+
+  await check('M9 helper 单独死亡：宿主感知失锁、临界区中止，第二持有者不能同时进入', async home => {
+    if (findLockHelper === null || process.platform !== 'linux') {
+      skips += 1
+      console.log('    ↷ SKIP 非 Linux / 无法枚举 helper 子进程')
+      return
+    }
+    const lock = join(home, 'lost.lock')
+    const observed = { helper: null, aborted: false, assertHeldError: null, contender: null }
+    await rejectsCode(
+      () => resources.withResourceLock(lock, async context => {
+        observed.helper = findLockHelper()
+        ok(observed.helper !== null, '找到 helper（cat）子进程')
+        process.kill(observed.helper, 'SIGKILL')
+        observed.aborted = await waitUntil(() => context.signal.aborted === true, 2_000)
+        ok(observed.aborted, '宿主临界区通过 AbortSignal 感知失锁')
+        try {
+          context.assertHeld()
+        } catch (error) {
+          observed.assertHeldError = error && error.code
+        }
+        eq(observed.assertHeldError, resources.RESOURCE_ERROR.LOCK_LOST, 'assertHeld() 抛 RESOURCE_LOCK_LOST')
+        // 宿主仍在临界区（还没释放宿主 fd）：独立进程的第二个持有者必须排队超时。
+        observed.contender = await runContender(home, lock, 150)
+        return 'unreachable'
+      }),
+      resources.RESOURCE_ERROR.LOCK_LOST,
+      '失锁的临界区不能报告成功',
+    )
+    eq(observed.contender.entered, false, '第二持有者没有进入临界区')
+    eq(observed.contender.code, resources.RESOURCE_ERROR.LOCK_TIMEOUT, '第二持有者按超时失败')
+  })
+
+  await check('M9 同步回调：helper 死亡后，后续写入同步被拒（不依赖 exit 事件）', async home => {
+    if (process.platform !== 'linux') {
+      skips += 1
+      console.log('    ↷ SKIP 非 Linux 无法做同步僵尸态探针')
+      return
+    }
+    const lock = join(home, 'lost-sync.lock')
+    let assertHeldError = null
+    let rejectedAfterMs = null
+    await rejectsCode(
+      () => resources.withResourceLock(lock, context => {
+        const helper = findLockHelper()
+        ok(helper !== null, '找到 helper（cat）子进程')
+        process.kill(helper, 'SIGKILL')
+        const startedAt = Date.now()
+        // 同步忙等：事件循环被占住，只有 assertHeld() 的同步探针能发现 helper 已死。
+        while (Date.now() - startedAt < 500) {
+          try {
+            context.assertHeld()
+          } catch (error) {
+            assertHeldError = error && error.code
+            rejectedAfterMs = Date.now() - startedAt
+            break
+          }
+        }
+        return 'unreachable'
+      }),
+      resources.RESOURCE_ERROR.LOCK_LOST,
+      '同步回调也不能在 helper 已死后继续写',
+    )
+    eq(assertHeldError, resources.RESOURCE_ERROR.LOCK_LOST, '同步 assertHeld() 拒绝后续写入')
+    ok(rejectedAfterMs !== null && rejectedAfterMs < 400, `同步探针在 ${rejectedAfterMs}ms 内拒绝`)
+  })
+
+  await check('M9 正常释放不遗留定时器：锁 13ms 返回，进程不应被 sleep(2000) 拖住', async home => {
+    const lock = join(home, 'timer.lock')
+    const script = join(home, 'timer-holder.mjs')
+    writeFileSync(script, `
+import { withResourceLock } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+const startedAt = Date.now()
+await withResourceLock(process.argv[2], async () => {})
+process.stdout.write(JSON.stringify({ lockMs: Date.now() - startedAt }) + '\\n')
+`)
+    const startedAt = Date.now()
+    await new Promise((resolveRun, rejectRun) => {
+      const child = spawn(process.execPath, [script, lock], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = ''
+      child.stdout.on('data', chunk => { stdout += String(chunk) })
+      child.once('error', rejectRun)
+      child.once('exit', code => (code === 0 ? resolveRun(stdout) : rejectRun(new Error(`timer holder exit ${code}`))))
+    })
+    const elapsed = Date.now() - startedAt
+    ok(elapsed < 1_500, `进程在 ${elapsed}ms 内退出（旧实现会多活约 2000ms）`)
+  })
+
+  await check('M9 无 flock 降级：进程内队列尊重 waitMs（不会超时后仍进入）', async home => {
+    const lock = join(home, 'degraded.lock')
+    const script = join(home, 'degraded.mjs')
+    writeFileSync(script, `
+import { withResourceLock, resourceLockBackend } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+const lock = process.argv[2]
+let release
+const gate = new Promise(resolveGate => { release = resolveGate })
+const holder = withResourceLock(lock, async () => { await gate })
+await new Promise(resolveSleep => setTimeout(resolveSleep, 80))
+const startedAt = Date.now()
+let result
+try {
+  await withResourceLock(lock, async () => { result = { entered: true } }, { waitMs: 40 })
+} catch (error) {
+  result = { entered: false, code: error && error.code, elapsed: Date.now() - startedAt }
+}
+release()
+await holder
+process.stdout.write(JSON.stringify({ backend: resourceLockBackend(), ...result }) + '\\n')
+`)
+    const result = await new Promise((resolveRun, rejectRun) => {
+      const child = spawn(process.execPath, [script, lock], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, FLOW_STUDIO_FLOCK_BIN: join(home, 'no-such-flock-binary') },
+      })
+      let stdout = ''
+      child.stdout.on('data', chunk => { stdout += String(chunk) })
+      child.once('error', rejectRun)
+      child.once('exit', code => {
+        if (code !== 0) {
+          rejectRun(new Error(`degraded exit ${code}`))
+          return
+        }
+        try {
+          resolveRun(JSON.parse(stdout.trim()))
+        } catch (error) {
+          rejectRun(error)
+        }
+      })
+    })
+    eq(result.backend, 'process', '无 flock 时明确降级为进程内队列')
+    eq(result.entered, false, '超过 waitMs 不进入临界区')
+    eq(result.code, resources.RESOURCE_ERROR.LOCK_TIMEOUT, 'waitMs 超时返回 RESOURCE_LOCK_TIMEOUT')
+    ok(result.elapsed < 200, `在 waitMs 附近返回（实际 ${result.elapsed}ms），不再忽略 waitMs`)
+  })
+
   console.log('instance-resources.test.mjs')
   console.log(`${checks} 组通过（${assertions} 条断言）${skips > 0 ? `，${skips} 组 SKIP` : ''}`)
 } catch (error) {

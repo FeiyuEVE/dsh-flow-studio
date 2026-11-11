@@ -375,6 +375,7 @@ export function createBpmnRuntime(options = {}) {
     artifactRoot: options.artifactRoot,
     workspaceAllowlist: options.workspaceAllowlist,
     executionLimits: options.executionLimits,
+    cleanupFinalWaitMs: options.cleanupFinalWaitMs,
     worktreeRunner: options.worktreeRunner,
     inboxReplyTargets: options.inboxReplyTargets,
     inboxHttpPolicy: options.inboxHttpPolicy,
@@ -394,12 +395,55 @@ export function createBpmnRuntime(options = {}) {
  * 包一层 adapter 而不是改 agent-execute：runtime 侧注入 `adapters` 门面即可同时
  * 覆盖正常路径、start 阶段 abort 的迟到句柄、以及 dispose 失败路径。
  */
-function createExecutionLifecycle() {
+const DEFAULT_CLEANUP_FINAL_WAIT_MS = 30_000
+
+/**
+ * 等适配器的**最终清理 Promise**（review-0141 M1 ③）。
+ *
+ * 旧实现只读一次 `handle.cleanup` 快照：dispose 返回时 `disposed:false`，之后进程组
+ * 才退出也不会释放槽位。适配器若暴露 `cleanupFinal`（start 失败时挂在错误对象上），
+ * 这里等它 settle 再决定；没有该 Promise 时退回快照语义（兼容其它适配器）。
+ *
+ * @returns {Promise<{disposed:boolean, reason?:string, [key:string]:any}|null>}
+ */
+function awaitFinalCleanup(source, label, timeoutMs) {
+  if (!source || typeof source !== 'object') return Promise.resolve(null)
+  const final = source.cleanupFinal
+  if (!final || typeof final.then !== 'function') {
+    return Promise.resolve(source.cleanup && typeof source.cleanup === 'object' ? source.cleanup : null)
+  }
+  return new Promise(resolveWait => {
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveWait(value)
+    }
+    const timer = setTimeout(() => finish({
+      disposed: false,
+      finalCleanupTimedOut: true,
+      reason: `${label}的最终清理未在 ${timeoutMs}ms 内 settle`,
+    }), timeoutMs)
+    Promise.resolve(final).then(
+      value => finish(value && typeof value === 'object' ? value : { disposed: true }),
+      error => finish({
+        disposed: false,
+        reason: `${label}的最终清理失败：${error && error.message ? error.message : String(error)}`,
+      }),
+    )
+  })
+}
+
+function createExecutionLifecycle(options = {}) {
   let pending = 0
   let unresolved = 0
   const waiters = []
   /** @type {Map<object, () => void>} handle → settle（只对已返回的句柄计数） */
   const handleOwners = new Map()
+  const cleanupFinalWaitMs = Number.isSafeInteger(options.cleanupFinalWaitMs) && options.cleanupFinalWaitMs >= 0
+    ? options.cleanupFinalWaitMs
+    : DEFAULT_CLEANUP_FINAL_WAIT_MS
 
   const notifyIfIdle = () => {
     if (pending > 0) return
@@ -410,6 +454,14 @@ function createExecutionLifecycle() {
   const settle = () => {
     if (pending > 0) pending -= 1
     notifyIfIdle()
+  }
+
+  const releaseHandle = handle => {
+    const finish = handle && typeof handle === 'object' ? handleOwners.get(handle) : undefined
+    if (typeof finish === 'function') {
+      handleOwners.delete(handle)
+      finish()
+    }
   }
 
   function trackStart(rawAdapter, request) {
@@ -431,7 +483,18 @@ function createExecutionLifecycle() {
     promise.then(handle => {
       if (handle && typeof handle === 'object') handleOwners.set(handle, finish)
       else finish()
-    }, () => finish())
+    }, error => {
+      // start 失败没有句柄：错误对象上可能挂着 cleanupFinal（codex 的物理清理信号）。
+      // 等它 settle 再释放占用；未确认清理（disposed:false）按 unresolved 记诊断。
+      const finishAfterFinal = final => {
+        if (final && final.disposed === false) unresolved += 1
+        finish()
+      }
+      awaitFinalCleanup(error, 'start 失败', cleanupFinalWaitMs).then(finishAfterFinal, () => {
+        unresolved += 1
+        finish()
+      })
+    })
     return promise
   }
 
@@ -444,18 +507,22 @@ function createExecutionLifecycle() {
       unresolved += 1
       throw error
     }
-    return Promise.resolve(result).then(value => {
-      const cleanup = handle && typeof handle === 'object' ? handle.cleanup : null
-      if (cleanup && cleanup.disposed === false) {
-        // 适配器如实报告「宿主 dispose 超时、会话可能还活着」：不能当已释放。
+    return Promise.resolve(result).then(async value => {
+      const final = await awaitFinalCleanup(handle, 'dispose', cleanupFinalWaitMs)
+      if (final && final.disposed === false) {
+        // 适配器如实报告「进程组还没确认退出」：不能当已释放。
         unresolved += 1
+        // 独立的最终 Promise 之后再变成 disposed:true（迟到的物理退出）时，
+        // 仍然要释放占用——这正是旧实现「只读一次快照」的遗留缺口。
+        const stillPending = handle && typeof handle === 'object' ? handle.cleanupFinal : null
+        if (stillPending && typeof stillPending.then === 'function') {
+          Promise.resolve(stillPending).then(late => {
+            if (late && late.disposed === true) releaseHandle(handle)
+          }, () => {})
+        }
         return value
       }
-      const finish = handle && typeof handle === 'object' ? handleOwners.get(handle) : undefined
-      if (typeof finish === 'function') {
-        handleOwners.delete(handle)
-        finish()
-      }
+      releaseHandle(handle)
       return value
     }, error => {
       unresolved += 1
@@ -563,6 +630,10 @@ class BpmnRuntime {
       ...(isPlainObject(options.executionLimits) ? options.executionLimits : {}),
       env: this.env,
     })
+    /** 等适配器「最终清理 Promise」的上限（M1 ③）；超时按未确认清理处理。 */
+    this.cleanupFinalWaitMs = Number.isSafeInteger(options.cleanupFinalWaitMs) && options.cleanupFinalWaitMs >= 0
+      ? options.cleanupFinalWaitMs
+      : undefined
     /** 可注入 Git runner（测试 / 嵌入方）；缺省由各模块的 execFile 包装。 */
     this.gitRunner = typeof options.worktreeRunner === 'function' ? options.worktreeRunner : undefined
     /** 收件箱回复白名单：只有宿主维护的 id 能被消息 / 模型引用。 */
@@ -3264,7 +3335,7 @@ class BpmnRuntime {
     }
     this._activeAgents.set(instanceId, (this._activeAgents.get(instanceId) ?? 0) + 1)
     // 物理执行生命周期：handler 返回不代表 agent 进程已退出（W4）。
-    const lifecycle = createExecutionLifecycle()
+    const lifecycle = createExecutionLifecycle({ cleanupFinalWaitMs: this.cleanupFinalWaitMs })
     const adapters = this.adapters === null ? null : lifecycle.adaptersFor(this.adapters)
     let result
     try {

@@ -2243,6 +2243,91 @@ try {
     }
   })
 
+  await check('M1 最终清理 Promise：settle 前不释放槽位，settle 后才释放', async home => {
+    const repo = makeGitRepo(home)
+    let finalSettledAt = 0
+    const adapter = makeFakeAdapter(async request => {
+      const submitted = await request.finishGate.submit({
+        variables: { ok: true },
+        documents: [],
+        summary: 'late-final',
+      })
+      const cleanupFinal = new Promise(resolveFinal => {
+        setTimeout(() => {
+          finalSettledAt = Date.now()
+          resolveFinal({ disposed: true })
+        }, 150).unref?.()
+      })
+      return {
+        exited: Promise.resolve({ ok: true, record: submitted.record }),
+        cleanup: { disposed: false, reason: '进程组仍在退出' },
+        cleanupFinal,
+      }
+    })
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(adapter),
+      workspaceRoot: repo,
+      cleanupFinalWaitMs: 2_000,
+    })
+    try {
+      const id = 'i-m1-final'
+      const startedAt = Date.now()
+      await runtime._executeAgentFor(id, { id: 'agent-m1-final', node: { adapter: 'dsh' } }, {
+        attempt: 1,
+        executionId: 'exec-m1-final',
+        variables: {},
+      })
+      ok(finalSettledAt > 0, '最终清理 Promise 已执行')
+      ok(Date.now() - startedAt >= 120, 'dispose 等到最终清理 settle 才返回')
+      eq(runtime._activeAgents.get(id), undefined, 'settle 后释放 activeAgents')
+      eq(runtime.executionLimits.active, 0, 'settle 后释放执行槽位')
+      ok(!runtime._executionBusy(id), 'settle 后 _executionBusy 为 false')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('M1 最终清理超时：如实保留占用并给出超时诊断', async home => {
+    const repo = makeGitRepo(home)
+    const adapter = makeFakeAdapter(async request => {
+      const submitted = await request.finishGate.submit({
+        variables: { ok: true },
+        documents: [],
+        summary: 'never-final',
+      })
+      return {
+        exited: Promise.resolve({ ok: true, record: submitted.record }),
+        cleanup: { disposed: false, reason: '进程组仍在退出' },
+        // 永不 settle：runtime 必须按 cleanupFinalWaitMs 有界放弃并保留占用。
+        cleanupFinal: new Promise(() => {}),
+      }
+    })
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(adapter),
+      workspaceRoot: repo,
+      cleanupFinalWaitMs: 100,
+    })
+    try {
+      const id = 'i-m1-timeout'
+      const startedAt = Date.now()
+      await runtime._executeAgentFor(id, { id: 'agent-m1-timeout', node: { adapter: 'dsh' } }, {
+        attempt: 1,
+        executionId: 'exec-m1-timeout',
+        variables: {},
+      })
+      ok(Date.now() - startedAt >= 80, '等满 cleanupFinalWaitMs 才放弃')
+      eq(runtime._activeAgents.get(id), 1, '超时未确认清理：activeAgents 保持占用')
+      eq(runtime.executionLimits.active, 1, '超时未确认清理：执行槽位保持占用')
+      ok(runtime._executionBusy(id), '超时未确认清理：_executionBusy 仍为 true')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   await check('F1 创建后元数据失败回滚：零仓库级 prune，移走 / 替换的目标不被删', async home => {
     const repo = makeGitRepo(home)
     const commands = []

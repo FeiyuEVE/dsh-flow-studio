@@ -629,6 +629,21 @@ function failureHint(status, body, action) {
   if (code === 'BPMN_INSTANCE_NOT_WAITING' || code === 'BPMN_INSTANCE_BLOCKED' || code === 'BPMN_INSTANCE_STOPPING') {
     return '实例当前不处于「等待人工任务」：读 flow_instance_get 看 status / pendingTasks / lastError 后再决定，不要重试同一次提交。'
   }
+  if (code === 'INSTANCE_SUSPEND_BUSY') {
+    return '实例还有未结束的活动（agent / HTTP）：挂起只能在无在飞活动时进行；等活动结束（HTTP 未结算先按 connector 记录处置）后再挂起，不要并发硬试。'
+  }
+  if (code === 'INSTANCE_ALREADY_SUSPENDED') {
+    return '实例已经是 SUSPENDED：不要重复挂起（没有产生新事件）；要恢复推进请用 flow_instance_resume。'
+  }
+  if (code === 'INSTANCE_NOT_SUSPENDED') {
+    return '实例当前不是 SUSPENDED：只有挂起中的实例才能恢复；先 flow_instance_suspend（或读 flow_instance_get 确认状态）。'
+  }
+  if (code === 'INSTANCE_SUSPENDED') {
+    return '实例已挂起（SUSPENDED）：挂起期间不能完成人工任务、也不自动推进；先 flow_instance_resume，再完成 / 发消息。'
+  }
+  if (code === 'BPMN_REASON_INVALID') {
+    return 'reason 只接受不含控制字符的短字符串（≤200 字符）；省略表示不写原因。'
+  }
   if (code === 'INSTANCE_TERMINAL_IMMUTABLE') {
     return '实例已被其它请求收成终态，本次写入未被采纳；以读回的状态为准。'
   }
@@ -2120,6 +2135,129 @@ export function createInstanceTools(deps = {}) {
     },
   }
 
+  /**
+   * 挂起 / 恢复共用实现（0.14.3）：只做参数校验 + 调 `POST /instances/<id>/suspend|resume`
+   * + 错误映射，业务语义（无在飞活动才能挂起、恢复不主动跑）全部在 runtime。
+   */
+  function lifecycleTool(spec) {
+    return {
+      name: spec.name,
+      description: spec.description,
+      parameters: {
+        type: 'object',
+        properties: {
+          instanceId: { type: 'string', description: '实例 id；agent 会话里的工具已绑定本实例时可省略（不能改成别的实例）' },
+          reason: { type: 'string', description: '可选：本次操作的说明（≤200 字符，写进 instance/suspended|resumed 事件）' },
+        },
+        required: [],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'string' },
+            httpStatus: { type: 'integer' },
+            code: { type: 'string' },
+            error: { type: 'string' },
+            hint: { type: 'string' },
+            retryable: { type: 'boolean' },
+            instanceId: { type: 'string' },
+            status: { type: 'string', description: spec.statusDescription },
+            reason: nullable({ type: 'string' }),
+            lastSeq: nullable({ type: 'integer' }),
+            activities: { type: 'array', items: anyJson('未结束的活动（仅 INSTANCE_SUSPEND_BUSY）') },
+            [spec.timeKey]: nullable({ type: 'string' }),
+          },
+          required: ['ok'],
+          additionalProperties: true,
+        },
+        render(value) {
+          if (!isObject(value) || value.ok !== true) return renderJson(value)
+          return [{
+            type: 'text',
+            text: `实例 ${value.instanceId} ${spec.doneText}：status=${value.status}${value.reason ? `，原因「${value.reason}」` : ''}。`,
+          }]
+        },
+      },
+      timeoutMs: TIMEOUT_READ_MS,
+      async execute(args) {
+        let instanceId
+        let reason
+        try {
+          instanceId = resolveBoundInstanceId(args, binding, spec.action)
+          reason = optionalString(args, 'reason', { max: 200 })
+        } catch (error) {
+          if (error instanceof ParamError) return failure(error.message, error.hint)
+          return failure('读取参数失败：' + (error && error.message ? error.message : String(error)), '按参数说明改正后重发。')
+        }
+        const { runtime, error: runtimeError } = runtimeOrError()
+        if (runtime === null) return failure(runtimeError, '确认宿主启用了实例域（BPMN 运行时）后重试。')
+        const raw = await rawRequest(runtime, {
+          method: 'POST',
+          parts: ['instances', instanceId, spec.routeSegment],
+          url: new URL('http://localhost/'),
+          body: reason === undefined ? {} : { reason },
+        })
+        if (raw.body !== null && raw.body.code === 'INSTANCE_SUSPEND_BUSY') {
+          return failure(
+            typeof raw.body.error === 'string' && raw.body.error !== '' ? raw.body.error : '实例还有未结束的活动，不能挂起',
+            failureHint(raw.status, raw.body, spec.action),
+            false,
+            {
+              action: spec.action,
+              status: raw.status,
+              code: 'INSTANCE_SUSPEND_BUSY',
+              instanceId,
+              activities: Array.isArray(raw.body.activities) ? raw.body.activities : [],
+            },
+          )
+        }
+        const bad = routeFailure(raw, spec.action)
+        if (bad !== null) return bad
+        return trimDeep({
+          ok: true,
+          action: spec.action,
+          httpStatus: raw.status,
+          instanceId,
+          status: raw.body.status,
+          reason: raw.body.reason ?? reason ?? null,
+          lastSeq: Number.isSafeInteger(raw.body.lastSeq) ? raw.body.lastSeq : null,
+          [spec.timeKey]: raw.body[spec.timeKey] ?? null,
+        })
+      },
+    }
+  }
+
+  const suspendTool = lifecycleTool({
+    name: 'flow_instance_suspend',
+    action: 'suspend',
+    routeSegment: 'suspend',
+    timeKey: 'suspendedAt',
+    doneText: '已挂起',
+    statusDescription: '挂起后的实例状态（SUSPENDED）',
+    description:
+      '挂起一个没有在飞活动的实例（POST /instances/<id>/suspend，quiesce 式软挂起）。'
+      + '只允许 ACTIVE 且没有正在执行的 agent / HTTP 活动；否则 409 INSTANCE_SUSPEND_BUSY 并返回 activities[]。'
+      + '挂起后不杀 runner、不推进、不派发；complete 返回 409 INSTANCE_SUSPENDED，入站消息受理但排队，'
+      + 'GET 不会因为读而懒恢复。重复挂起 → INSTANCE_ALREADY_SUSPENDED；终态 → BPMN_INSTANCE_TERMINAL。'
+      + 'reason 写进 instance/suspended 事件（≤200 字符）。',
+  })
+
+  const resumeTool = lifecycleTool({
+    name: 'flow_instance_resume',
+    action: 'resume',
+    routeSegment: 'resume',
+    timeKey: 'resumedAt',
+    doneText: '已恢复',
+    statusDescription: '恢复后的实例状态（ACTIVE）',
+    description:
+      '恢复一个 SUSPENDED 实例（POST /instances/<id>/resume）：状态回 ACTIVE + 写 instance/resumed 事件，'
+      + '**不主动跑**；下一次 complete / 消息投递沿用既有懒恢复。'
+      + '只有 SUSPENDED 能恢复，否则 409 INSTANCE_NOT_SUSPENDED；终态 → BPMN_INSTANCE_TERMINAL。'
+      + 'reason 写进 instance/resumed 事件（≤200 字符）。',
+  })
+
   return [
     worktreeTool,
     sendMessageTool,
@@ -2132,5 +2270,7 @@ export function createInstanceTools(deps = {}) {
     instanceEventsTool,
     instanceCancelTool,
     completeTaskTool,
+    suspendTool,
+    resumeTool,
   ]
 }

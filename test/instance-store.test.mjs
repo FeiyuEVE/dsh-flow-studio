@@ -481,4 +481,36 @@ await check('artifacts[]：默认空、可更新、终态拒写；坏形状 400'
   )
 })
 
+await check('挂起 / 恢复：状态与事件同一次写入；终态拒绝；非法 status 400', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-suspend-status')
+  const suspended = await store.appendInstanceEvents(instance.id, 'process', 1, [
+    { type: 'instance/suspended', reason: '维护' },
+  ], { home, status: 'SUSPENDED' })
+  eq(suspended.instance.status, 'SUSPENDED', '状态与事件一起落盘')
+  eq(suspended.lastSeq, instance.lastSeq + 1, 'seq 只涨一条')
+  const reopened = await store.readInstance(instance.id, { home })
+  eq(reopened.status, 'SUSPENDED')
+  eq(reopened.lastSeq, instance.lastSeq + 1, '事件分配后 instance.json 的 lastSeq 同步')
+  deep(reopened.pendingTasks, [], '存储层不清待办（由 runtime 决定保留）')
+
+  const resumed = await store.appendInstanceEvents(instance.id, 'process', 1, [
+    { type: 'instance/resumed', reason: '完成' },
+  ], { home, status: 'ACTIVE' })
+  eq(resumed.instance.status, 'ACTIVE')
+  eq((await store.readInstance(instance.id, { home })).status, 'ACTIVE')
+
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'x' }], { home, status: 'COMPLETED' }),
+    error => error.status === 400 && error.code === 'INSTANCE_STATUS_INVALID',
+    '终态不能走 append 的 status 选项',
+  )
+  await store.completeInstance(instance.id, 'CANCELED', { home })
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], { home, status: 'SUSPENDED' }),
+    error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+    '终态后不允许再接挂起事件',
+  )
+  eq(existsSync(join(dir, 'events', 'process', '1.jsonl')), true, '挂起 / 恢复事件分片存在')
+})
+
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

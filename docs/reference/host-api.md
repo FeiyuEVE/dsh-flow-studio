@@ -54,7 +54,7 @@
 
 ## 模型工具
 
-会话里可用的 `flow_*` 工具共 **11 个**，全部属于实例域；旧 `flow_list` / `flow_start` / `flow_watch` / `flow_stop` / `flow_restart` / `flow_supervise` / `flow_send_message` / `flow_reply` / `flow_node_reject` / `flow_compile` / `flow_decompile` / `flow_worktrees` 已删除。工具定义与参数在 `src/instance-tools.js`，逐项说明在 [实例域接口 · 模型工具](instance-api.md#模型工具)。
+会话里可用的 `flow_*` 工具共 **13 个**，全部属于实例域；旧 `flow_list` / `flow_start` / `flow_watch` / `flow_stop` / `flow_restart` / `flow_supervise` / `flow_send_message` / `flow_reply` / `flow_node_reject` / `flow_compile` / `flow_decompile` / `flow_worktrees` 已删除。工具定义与参数在 `src/instance-tools.js`，逐项说明在 [实例域接口 · 模型工具](instance-api.md#模型工具)。
 
 | 工具 | 作用 |
 |---|---|
@@ -63,10 +63,11 @@
 | `flow_instance_list` / `flow_instance_get` / `flow_instance_events` | 列 / 读实例与增量事件 |
 | `flow_instance_cancel` | 取消实例（`ACTIVE` → `CANCELED`） |
 | `flow_instance_complete_task` | 完成人工待办 |
+| `flow_instance_suspend` / `flow_instance_resume` | 挂起 / 恢复实例（quiesce 式；恢复不主动推进） |
 | `flow_instance_worktrees` | 实例 worktree 的 list / inspect / remove / branch / prune |
 | `flow_instance_send_message` / `flow_instance_reply` | 实例收件箱发消息 / 回复来源 |
 
-agent 节点会话里另有 `flow_finish_node`：由 AgentAdapter（dsh 会话级工具 / codex MCP server）提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 11 个工具之一，见 [finish 工具](../design/11-node-finish-tool.md)。
+agent 节点会话里另有 `flow_finish_node`：由 AgentAdapter（dsh 会话级工具 / codex MCP server）提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 13 个工具之一，见 [finish 工具](../design/11-node-finish-tool.md)。
 
 ## 环境变量
 

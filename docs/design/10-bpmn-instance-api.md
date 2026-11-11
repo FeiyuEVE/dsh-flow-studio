@@ -232,10 +232,12 @@ $DSH_HOME/flow-studio/
 |---|---|
 | `ACTIVE` | 活着：正在跑、停在人工任务、或出错后停住等人处理，**都是 ACTIVE** |
 | `COMPLETED` | 走到结束事件、正常完成 |
-| `SUSPENDED` | 被挂起（本轮只保留取值，suspend/resume 操作后续再加） |
-| `CANCELED` | 被取消（`POST /instances/<id>/stop`） |
+| `SUSPENDED` | 被 `POST /instances/<id>/suspend` 挂起：没有在飞活动，不推进、不派发；`POST /instances/<id>/resume` 回到 `ACTIVE` |
+| `CANCELED` | 被取消（`POST /instances/<id>/stop`，`SUSPENDED` 上同样可用） |
 
 - **没有 `failed`，也没有 `blocked`/「卡住」状态**。用户口径（2026-11-11）：卡住不具备通用性，属于业务自己判别，引擎不做这个状态。
+- `SUSPENDED` 的进入条件（0.14.3，quiesce 式软挂起）：实例 `ACTIVE`、且没有在飞活动——`_executionBusy()` 为假、没有在跑 agent、connector 记录里没有 `started` / `sent` / `unknown`（runner 正在执行也算在飞）。任一未结算 → 409 `INSTANCE_SUSPEND_BUSY`，不改状态、不写事件。挂起写 `instance/suspended`（含 `reason`），保留 `pendingTasks`，不杀 runner、不重放；之后 `_ensureRunner()` 跳过、`complete` 409 `INSTANCE_SUSPENDED`、入站消息排队、`GET` 不因读而恢复。
+- `SUSPENDED` 的离开条件：`POST /instances/<id>/resume` 置回 `ACTIVE` + 写 `instance/resumed`（不主动跑，下一次推进沿用懒恢复）；`POST /instances/<id>/stop` 直接收成 `CANCELED`。终态不可逆，`COMPLETED` / `CANCELED` 上挂起 / 恢复一律 409。
 - `running` / `waiting` 不是状态：它们是 runner 的内部执行态，不写进 `instance.json.status`；「在等人」用 `ACTIVE` + `pendingTasks` 非空表达。
 - 引擎内部出错（条件求值错、活动/整轮超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏）时：`status` **保持 `ACTIVE` 不变**，同时写 `lastError{code,message,nodeId?,activityId?,retries?}` 并发 `error` 事件；是否重试/终止/继续，由业务或人决定，引擎不替它判「卡住」。
 - 终态只有 `COMPLETED` 与 `CANCELED`。
@@ -264,6 +266,8 @@ runner 内部执行态（不对外当实例状态）：
 | `activity/wait` | runner | `at, elementId, activityId` | 事件 + 实例 waiting + `pendingTasks` |
 | `flow/taken` | runner | `at, flowId, from, to, condition:{expression,value}\|null` | 事件（不含状态写入） |
 | `process/end` | runner | `at, elementId, activityId` | 事件 + `status=COMPLETED` |
+| `instance/suspended` | runtime（挂起路由） | `at, status:"SUSPENDED", reason?` | 事件 + `status=SUSPENDED`（与事件在同一次 `instance.json` 写入里提交） |
+| `instance/resumed` | runtime（恢复路由） | `at, status:"ACTIVE", reason?` | 事件 + `status=ACTIVE`（恢复不推进、不派发） |
 | `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + 实例 `lastError`（**status 仍是 ACTIVE**） |
 | `agent/log` 等 | handler `events[]` | handler 自定义 | 原样透传（runner 禁止保留类型） |
 
@@ -307,14 +311,18 @@ runner 内部执行态（不对外当实例状态）：
 请求碰到一个不在内存里的实例时（`GET /instances/<id>`、`/tasks`、`complete` 等；`GET /instances/<id>/definition` 只读快照，**不触发恢复**）：
 
 1. 读 `instance.json`；终态 → **不恢复**，返回 `recovered:false` + 终态原因。
-2. 读 `state.json`；缺失/空 → 返回 `recovered:false` + `BPMN_STATE_MISSING` 原因
+2. `status:"SUSPENDED"` → **不恢复**，返回 `recovered:false` + `BPMN_STATE_SUSPENDED`、`runnerStatus:null`；
+   `pendingTasks` 仍按磁盘事实返回。读挂起实例不会创建 runner，更不会推进（0.14.3）。
+3. 读 `state.json`；缺失/空 → 返回 `recovered:false` + `BPMN_STATE_MISSING` 原因
    （GET 200；写操作 409 `BPMN_INSTANCE_NOT_RECOVERABLE`）。
-3. 读实例自己的 `definition.bpmn`，重新 `parseBpmn` 得到 definition；
+4. 读实例自己的 `definition.bpmn`，重新 `parseBpmn` 得到 definition；
    快照损坏 → 500，不拿定义域的最新版来冒充。
-4. 新建 `createBpmnRunner({definition, xml, instanceId, services, …})` 并 `recover(state)`；
+5. 新建 `createBpmnRunner({definition, xml, instanceId, services, …})` 并 `recover(state)`；
    `state` 不是 `running/stopped` → `BPMN_STATE_NOT_RESUMABLE`，返回不可恢复原因。
-5. 恢复成功后：事件流、`pendingTasks`、变量、状态都回到磁盘上的事实；
+6. 恢复成功后：事件流、`pendingTasks`、变量、状态都回到磁盘上的事实；
    `recovered:true` 只表示**本次请求**重建了 runner；后续请求命中内存注册表返回 `false`。
+
+`resume` 只改状态 + 写事件，**不建 runner**；恢复后的第一次 `complete` / `GET` 推进才走上面的懒恢复。
 
 关键细节：
 

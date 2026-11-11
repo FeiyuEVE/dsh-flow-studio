@@ -8,7 +8,7 @@
 2. **启动实例**：`flow_instance_run` 传 `definitionId`（可选 `version`、`variables`、`workspace`、`worktree`）。实例启动后返回 `id` 与 `status`。
 3. **看进展**：`flow_instance_get` 看状态 / 待办 / `lastError`；`flow_instance_events` 按 `since=seq` 增量拉事件。
 4. **人工环节**：`flow_instance_get` 返回 `pendingTasks[]`；用 `flow_instance_complete_task` 提交 `activityId` + `payload` 后实例继续流转。
-5. **收尾 / 干预**：`flow_instance_cancel` 中止实例；`flow_instance_worktrees` 查看 / 清理 worktree；收件箱用 `flow_instance_send_message` / `flow_instance_reply`。
+5. **收尾 / 干预**：`flow_instance_cancel` 中止实例；没有在飞活动时用 `flow_instance_suspend` 挂起、`flow_instance_resume` 恢复（恢复不主动推进）；`flow_instance_worktrees` 查看 / 清理 worktree；收件箱用 `flow_instance_send_message` / `flow_instance_reply`。
 
 ## 工具一览
 
@@ -22,13 +22,15 @@
 | `flow_instance_events` | 增量事件（`since` 游标） |
 | `flow_instance_cancel` | 取消 `ACTIVE` 实例 |
 | `flow_instance_complete_task` | 完成人工待办 |
+| `flow_instance_suspend` | 挂起实例（仅限无在飞活动的 `ACTIVE` 实例） |
+| `flow_instance_resume` | 恢复挂起实例（不主动推进） |
 | `flow_instance_worktrees` | 实例 worktree 的 list / inspect / remove / branch / prune |
 | `flow_instance_send_message` | 往实例收件箱发消息 |
 | `flow_instance_reply` | 回复「把消息发进实例的来源」 |
 
 参数与返回字段的完整契约见 [实例域接口 · 模型工具](../reference/instance-api.md#模型工具)。
 
-agent 节点会话里另有一个 `flow_finish_node`：由当前 adapter 提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 11 个工具之一。
+agent 节点会话里另有一个 `flow_finish_node`：由当前 adapter 提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 13 个工具之一。
 
 ## 工作区与 worktree
 

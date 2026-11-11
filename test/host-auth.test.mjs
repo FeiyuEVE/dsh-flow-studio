@@ -8,7 +8,7 @@
  *   - 跨站 Origin 拒绝、同源放行；
  *   - 原始 URL 的路径防线（空段 / `..`）回 400，不落到存储层；
  *   - 旧 `/flows`、`/runs`、`/worktrees` 在**认证通过**后一律 404（无认证仍 401）；
- *   - 模型工具注册集合恰好 11 个实例域工具，旧运行域工具名一个都不出现；
+ *   - 模型工具注册集合恰好 13 个实例域工具，旧运行域工具名一个都不出现；
  *   - `/health` 只报新域能力（bpmn / adapters / workspaceAllowlist），不再有 engine/stub/run 字段。
  *
  * 不启动 dsh：伪造最小 ctx，把 createHandler 直接喂 req/res。
@@ -161,13 +161,13 @@ function call(route, method, url, body, headers = {}) {
 const FULL_TOKEN = 'fs-full-token-0123456789abcdef'
 const READ_TOKEN = 'fs-read-token-0123456789abcdef'
 
-await check('apply()：注册一条 /api/flow-studio 前缀路由，并注册恰好 11 个实例域工具', async () => {
+await check('apply()：注册一条 /api/flow-studio 前缀路由，并注册恰好 13 个实例域工具', async () => {
   const ctx = makeCtx({ tools: true })
   apply(ctx)
   eq(ctx.routes.length, 1)
   eq(ctx.routes[0].kind, 'prefix')
   eq(ctx.routes[0].path, API)
-  eq(ctx.registered.length, 11, '模型工具注册总数应为 11')
+  eq(ctx.registered.length, 13, '模型工具注册总数应为 13')
   deep(ctx.registered.slice().sort(), [
     'flow_definition_get',
     'flow_definition_list',
@@ -177,10 +177,12 @@ await check('apply()：注册一条 /api/flow-studio 前缀路由，并注册恰
     'flow_instance_get',
     'flow_instance_list',
     'flow_instance_reply',
+    'flow_instance_resume',
     'flow_instance_run',
     'flow_instance_send_message',
+    'flow_instance_suspend',
     'flow_instance_worktrees',
-  ], '注册集合必须恰好是新域 11 个工具')
+  ], '注册集合必须恰好是新域 13 个工具')
   for (const legacy of [
     'flow_list', 'flow_compile', 'flow_decompile', 'flow_worktrees',
     'flow_start', 'flow_watch', 'flow_stop', 'flow_restart', 'flow_supervise',
@@ -369,10 +371,10 @@ await check('旧路由退役：认证通过后 /flows、/runs、/worktrees 一�
   }
 })
 
-await check('模型工具工厂：createInstanceTools 仍是 11 个（不依赖 apply）', async () => {
+await check('模型工具工厂：createInstanceTools 是 13 个（不依赖 apply）', async () => {
   const tools = createInstanceTools({ getRuntime: () => ({ handle: async () => ({ status: 200, body: { ok: true } }) }) })
-  eq(tools.length, 11)
-  eq(new Set(tools.map(tool => tool.name)).size, 11, '工具名不得重复')
+  eq(tools.length, 13)
+  eq(new Set(tools.map(tool => tool.name)).size, 13, '工具名不得重复')
 })
 
 rmSync(home, { recursive: true, force: true })

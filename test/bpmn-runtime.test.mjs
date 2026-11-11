@@ -35,6 +35,7 @@ const { createHandler } = await import('../src/index.js')
 const { createInstanceTools } = await import('../src/instance-tools.js')
 const instStore = await import('../src/instance-store.js')
 const { createBpmnRunner } = await import('../src/bpmn-runner.js')
+const { createConnectorStore } = await import('../src/connector-store.js')
 const { resolveWorkspace, defaultGitRunner } = await import('../src/workspace-policy.js')
 
 let checks = 0
@@ -673,6 +674,353 @@ try {
     eq(again.status, 200)
     eq(again.json.alreadyTerminal, true)
     eq(again.json.status, 'CANCELED')
+  })
+
+  // -------------------------------------------------------------------------
+  // 6.1 E4（0.14.3）：quiesce 式挂起 / 恢复
+  // -------------------------------------------------------------------------
+
+  /** 建 definition + 跑到 human1 等待点的实例；返回 {runtime, instanceId, task}。 */
+  async function setupWaitingInstance(home, env = {}, adapters = makeFakeAdapters()) {
+    const runtime = createBpmnRuntime({ dir: join(home, 'flow-studio'), env, adapters })
+    const url = new URL('http://localhost/')
+    let res = await runtime.handle({
+      method: 'POST',
+      parts: ['definitions'],
+      url,
+      body: { id: 'flow-demo', name: '演示流程', xml: workflowXml('proc-suspend') },
+    })
+    eq(res.status, 201, JSON.stringify(res.body))
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-demo', variables: { amount: 7 } },
+    })
+    eq(res.status, 201, JSON.stringify(res.body))
+    return { runtime, url, instanceId: res.body.id, instance: res.body, task: res.body.pendingTasks[0] }
+  }
+
+  async function readEvents(runtime, url, instanceId) {
+    const res = await runtime.handle({ method: 'GET', parts: ['instances', instanceId, 'events'], url })
+    eq(res.status, 200, JSON.stringify(res.body))
+    return res.body
+  }
+
+  await check('E4 挂起：wait 点 → SUSPENDED + 事件；complete 409；消息排队；读不推进', async home => {
+    const { runtime, url, instanceId, task } = await setupWaitingInstance(home)
+    const seqBefore = (await readEvents(runtime, url, instanceId)).lastSeq
+
+    // reason 契约：非字符串 / 超 200 字符在路由层 400，且零事件。
+    let res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: 7 },
+    })
+    eq(res.status, 400, JSON.stringify(res.body))
+    eq(res.body.code, 'BPMN_REASON_INVALID')
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: '长'.repeat(201) },
+    })
+    eq(res.status, 400, JSON.stringify(res.body))
+    eq(res.body.code, 'BPMN_REASON_INVALID')
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seqBefore, 'reason 非法不能写事件')
+
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: '窗口维护' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'SUSPENDED')
+    eq(res.body.reason, '窗口维护')
+    ok(res.body.lastSeq > seqBefore, '挂起必须写一条事件')
+
+    const raw = readInstanceJson(home, instanceId)
+    eq(raw.status, 'SUSPENDED', 'instance.json 必须落成 SUSPENDED')
+    eq(raw.pendingTasks.length, 1, '挂起不清人工待办（恢复后还能完成）')
+    eq(raw.completedAt, null, '挂起不是终态')
+
+    let events = await readEvents(runtime, url, instanceId)
+    const suspended = events.events.filter(event => event.type === 'instance/suspended')
+    eq(suspended.length, 1, '挂起事件只能有一条')
+    eq(suspended[0].reason, '窗口维护', 'reason 必须回显进事件')
+    const seqAtSuspend = events.lastSeq
+
+    // 挂起期间完成人工任务：409 INSTANCE_SUSPENDED，且零事件。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'tasks', 'human1', 'complete'],
+      url,
+      body: { payload: { approved: true } },
+    })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_SUSPENDED')
+    events = await readEvents(runtime, url, instanceId)
+    eq(events.lastSeq, seqAtSuspend, '拒绝完成不能产生事件')
+    eq(readInstanceJson(home, instanceId).status, 'SUSPENDED', '拒绝完成后仍是 SUSPENDED')
+
+    // 入站消息沿用 D 的 SUSPENDED 语义：受理并排队，不投递。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'messages'],
+      url,
+      body: {
+        messageId: 'm-suspended',
+        target: { activityId: 'human1', executionId: task.executionId },
+        text: '挂起期间的讨论',
+      },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.message.status, 'queued', '挂起期间消息只能排队')
+    eq(res.body.delivery.deferred, true, '投递必须明确标 deferred')
+    eq(res.body.delivery.reason, 'instance-suspended')
+
+    // 读不推进：换一个没有内存 runner 的 runtime，GET / GET tasks 都不得懒恢复。
+    await runtime.dispose()
+    const runtimeB = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters() })
+    const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId], url })
+    eq(detail.status, 200, JSON.stringify(detail.body))
+    eq(detail.body.status, 'SUSPENDED')
+    eq(detail.body.runnerStatus, null, '挂起实例不得因读而创建 runner')
+    eq(detail.body.recovery.code, 'BPMN_STATE_SUSPENDED')
+    eq(detail.body.pendingTasks.length, 1, '待办仍可读')
+    eq(runtimeB._runners.size, 0, 'GET 不得把 SUSPENDED 实例加进 _runners')
+    const tasks = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId, 'tasks'], url })
+    eq(tasks.status, 200)
+    eq(tasks.body.status, 'SUSPENDED')
+    eq(runtimeB._runners.size, 0, 'GET /tasks 也不得懒恢复')
+    const eventsAfterRead = await readEvents(runtimeB, url, instanceId)
+    eq(eventsAfterRead.lastSeq, seqAtSuspend, '读不能推进事件流')
+    eq(countType(eventsAfterRead.events, 'activity/wait'), 1, '读不能重放 wait')
+    await runtimeB.dispose()
+  })
+
+  await check('E4 恢复：ACTIVE + 事件，恢复不主动跑；之后 complete 推进到 COMPLETED', async home => {
+    const { runtime, url, instanceId, task } = await setupWaitingInstance(home)
+    let res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: '部署切换' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    const seqAtSuspend = (await readEvents(runtime, url, instanceId)).lastSeq
+
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: { reason: '切换完成' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'ACTIVE')
+    eq(res.body.reason, '切换完成')
+    eq(res.body.lastSeq, seqAtSuspend + 1, '恢复只写一条 instance/resumed 事件')
+    eq(readInstanceJson(home, instanceId).status, 'ACTIVE')
+
+    let events = await readEvents(runtime, url, instanceId)
+    const resumed = events.events.filter(event => event.type === 'instance/resumed')
+    eq(resumed.length, 1)
+    eq(resumed[0].reason, '切换完成')
+    eq(events.lastSeq, seqAtSuspend + 1, '恢复不主动推进（不多写 activity/end / process/end）')
+    eq(countType(events.events, 'process/end'), 0)
+
+    // 恢复后人工任务可完成，且不会重放已完成的节点。
+    res = await runtime.handle({
+      method: 'POST',
+      parts: ['instances', instanceId, 'tasks', 'human1', 'complete'],
+      url,
+      body: { payload: { approved: true }, decidedBy: 'e4-resume' },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'COMPLETED')
+    events = await readEvents(runtime, url, instanceId)
+    eq(countType(events.events, 'activity/wait'), 1, '恢复后 complete 不能重放 wait')
+    eq(countType(events.events, 'process/end'), 1)
+    eq(countType(events.events, 'instance/suspended'), 1)
+    eq(countType(events.events, 'instance/resumed'), 1)
+    eq(readInstanceJson(home, instanceId).variables.approved, true)
+  })
+
+  await check('E4 在飞 agent：挂起 409 INSTANCE_SUSPEND_BUSY，状态与事件不变', async home => {
+    const slow = makeSlowMessageAdapter()
+    const runtime = createBpmnRuntime({
+      dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters(slow),
+    })
+    const url = new URL('http://localhost/')
+    let res = await runtime.handle({
+      method: 'POST',
+      parts: ['definitions'],
+      url,
+      body: { id: 'flow-demo', name: '演示流程', xml: workflowXml('proc-busy') },
+    })
+    eq(res.status, 201, JSON.stringify(res.body))
+    // 创建请求会卡在慢 agent 里，所以不 await；从列表拿 instance id。
+    const creating = runtime.handle({
+      method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-demo' },
+    })
+    eq(await waitUntil(() => slow.calls.length > 0, 3000), true, 'agent 已开始执行')
+    const listed = await runtime.handle({ method: 'GET', parts: ['instances'], url })
+    const instanceId = listed.body.instances[0].id
+    eq(await waitUntil(() => runtime._executionBusy(instanceId), 3000), true, '_executionBusy 已置位')
+    const seqBefore = (await readEvents(runtime, url, instanceId)).lastSeq
+
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: '抢挂' },
+    })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_SUSPEND_BUSY')
+    ok(typeof res.body.error === 'string' && res.body.error.includes('agent'), '409 必须可读地说出在飞活动')
+    ok(Array.isArray(res.body.activities) && res.body.activities.length > 0, 'activities[] 列出未结束活动')
+    eq(res.body.activities[0].kind, 'agent')
+    eq(readInstanceJson(home, instanceId).status, 'ACTIVE', '忙时挂起不能改状态')
+    const busyEvents = await readEvents(runtime, url, instanceId)
+    eq(countType(busyEvents.events, 'instance/suspended'), 0, '忙时挂起不能写挂起事件')
+    eq(countType(busyEvents.events, 'instance/resumed'), 0, '忙时挂起不能写恢复事件')
+    ok(busyEvents.lastSeq >= seqBefore, '在飞活动自己的事件可以继续落盘（挂起没有额外写事件）')
+
+    await slow.finish()
+    const created = await creating
+    eq(created.status, 201, JSON.stringify(created.body))
+    eq(created.body.status, 'ACTIVE', 'agent 结束后停在人工任务')
+    eq(runtime._executionBusy(instanceId), false)
+  })
+
+  await check('E4 未结算 HTTP：挂起 409 INSTANCE_SUSPEND_BUSY 并点名调用记录', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    const store = createConnectorStore({
+      root: join(home, 'flow-studio', 'instances', instanceId, 'connector'),
+    })
+    const key = { instanceId, elementId: 'call1', executionId: 'call1_attempt_1' }
+    await store.beginInvocation({ ...key, invocationId: 'inv-call1', requestHash: 'a'.repeat(64) })
+    const seqBefore = (await readEvents(runtime, url, instanceId)).lastSeq
+
+    let res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: '抢挂' },
+    })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_SUSPEND_BUSY')
+    const httpActivity = res.body.activities.find(item => item.kind === 'http')
+    ok(httpActivity, 'activities[] 必须点名未结算的 HTTP 调用')
+    eq(httpActivity.activityId, 'call1')
+    eq(httpActivity.executionId, 'call1_attempt_1')
+    eq(httpActivity.state, 'started')
+    eq(readInstanceJson(home, instanceId).status, 'ACTIVE')
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seqBefore, '忙时挂起不能产生事件')
+
+    // 结算（succeeded）后不再算在飞，可以挂起。
+    await store.commitResult(key, { state: 'succeeded', result: { status: 200, headers: {}, output: {} } })
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'SUSPENDED')
+  })
+
+  await check('E4 终态 / 未挂起 / 重复挂起：各自 409 且零事件', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+
+    // 未挂起就恢复。
+    let seq = (await readEvents(runtime, url, instanceId)).lastSeq
+    let res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_NOT_SUSPENDED')
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seq, '未挂起恢复不产生事件')
+
+    // 重复挂起。
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 200, JSON.stringify(res.body))
+    seq = (await readEvents(runtime, url, instanceId)).lastSeq
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_ALREADY_SUSPENDED')
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seq, '重复挂起不产生事件')
+
+    // 恢复并完成 → 终态；终态上挂起 / 恢复都 409 且零事件。
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+    eq(res.status, 200)
+    res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'COMPLETED')
+    seq = (await readEvents(runtime, url, instanceId)).lastSeq
+    for (const action of ['suspend', 'resume']) {
+      res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, action], url, body: {} })
+      eq(res.status, 409, `${action} 在终态上必须 409`)
+      eq(res.body.code, 'BPMN_INSTANCE_TERMINAL')
+    }
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seq, '终态上的拒绝不产生事件')
+  })
+
+  await check('E4 重启后仍是 SUSPENDED：不自动恢复、不推进；恢复后可继续', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    let res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 200, JSON.stringify(res.body))
+    const seqAtSuspend = (await readEvents(runtime, url, instanceId)).lastSeq
+    await runtime.dispose()
+
+    // 新 runtime：SUSPENDED 不是终态，但绝不能自动恢复。
+    const runtimeB = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters() })
+    const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId], url })
+    eq(detail.status, 200, JSON.stringify(detail.body))
+    eq(detail.body.status, 'SUSPENDED')
+    eq(detail.body.recovery.code, 'BPMN_STATE_SUSPENDED')
+    eq(runtimeB._runners.size, 0)
+    await sleep(50)
+    eq((await readEvents(runtimeB, url, instanceId)).lastSeq, seqAtSuspend, '重启后不得自己往前跑')
+
+    res = await runtimeB.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: { reason: '重启后恢复' } })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'ACTIVE')
+    eq(runtimeB._runners.size, 0, 'resume 本身不建 runner')
+    res = await runtimeB.handle({
+      method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: { approved: true } },
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'COMPLETED')
+    const events = await readEvents(runtimeB, url, instanceId)
+    eq(countType(events.events, 'activity/wait'), 1, '恢复后 complete 不重放 wait')
+    eq(countType(events.events, 'process/end'), 1)
+    await runtimeB.dispose()
+  })
+
+  await check('E4 SUSPENDED 上 stop 仍可用；终态不可逆', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    let res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 200, JSON.stringify(res.body))
+    const seqAtSuspend = (await readEvents(runtime, url, instanceId)).lastSeq
+
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'stop'], url })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(res.body.status, 'CANCELED')
+    eq(res.body.alreadyTerminal, false)
+    eq(readInstanceJson(home, instanceId).status, 'CANCELED')
+    const seqAfterStop = (await readEvents(runtime, url, instanceId)).lastSeq
+    eq(seqAfterStop, seqAtSuspend, 'stop 不追加伪造事件')
+
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+    eq(res.status, 409)
+    eq(res.body.code, 'BPMN_INSTANCE_TERMINAL')
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 409)
+    eq(res.body.code, 'BPMN_INSTANCE_TERMINAL')
+    eq((await readEvents(runtime, url, instanceId)).lastSeq, seqAfterStop, '终态不可逆且零事件')
+  })
+
+  await check('E4 指标：挂起区间 ≥ N，wallMs 继续增长', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    const before = await runtime.handle({ method: 'GET', parts: ['instances', instanceId, 'metrics'], url })
+    eq(before.status, 200, JSON.stringify(before.body))
+    eq(before.body.duration.suspendedMs, 0, '从未挂起时挂起耗时为 0')
+    const wallBefore = before.body.duration.wallMs
+
+    const res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {} })
+    eq(res.status, 200, JSON.stringify(res.body))
+    const sleepMs = 120
+    await sleep(sleepMs)
+
+    const during = await runtime.handle({ method: 'GET', parts: ['instances', instanceId, 'metrics'], url })
+    eq(during.status, 200, JSON.stringify(during.body))
+    eq(during.body.status, 'SUSPENDED')
+    ok(during.body.duration.suspendedMs >= 100, `挂起区间应 ≥100ms（实际 ${during.body.duration.suspendedMs}）`)
+    ok(during.body.duration.wallMs > wallBefore, '挂起期间墙钟继续增长（含挂起时间）')
+
+    // 恢复后区间收口；再读时挂起耗时不再无限增长。
+    await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+    const suspendedClosed = (await runtime.handle({
+      method: 'GET', parts: ['instances', instanceId, 'metrics'], url,
+    })).body.duration.suspendedMs
+    await sleep(60)
+    const after = (await runtime.handle({ method: 'GET', parts: ['instances', instanceId, 'metrics'], url })).body
+    eq(after.duration.suspendedMs, suspendedClosed, '恢复后挂起区间不再增长')
+    ok(after.duration.wallMs > during.body.duration.wallMs, '恢复后墙钟继续增长')
   })
 
   // -------------------------------------------------------------------------

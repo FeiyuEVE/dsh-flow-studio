@@ -647,7 +647,7 @@ export function apply(ctx) {
   // 面板与 /api 路由照常可用——不能因为缺少工具注册表让插件装不上。
   const toolsSvc = (typeof ctx.get === 'function' && ctx.get('tools')) || ctx.tools
   if (toolsSvc && typeof toolsSvc.register === 'function') {
-    // 0.14.0：只剩实例域工具（11 个）；旧运行域工具已随旧引擎删除。
+    // 0.14.0：只剩实例域工具；0.14.3 加 suspend / resume 后共 13 个，旧运行域工具已随旧引擎删除。
     const instanceTools = createInstanceTools({ getRuntime: () => bpmnRuntimeFor(bpmnEnv) })
     ctx.effect(() => {
       const disposers = instanceTools.map(tool => toolsSvc.register(tool))

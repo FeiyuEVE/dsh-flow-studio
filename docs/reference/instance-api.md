@@ -8,7 +8,7 @@
 
 鉴权、同源校验与令牌档位是 Host 层统一的一套：宿主 `connection.requestRejection` 先判 401 / 403（拿不到该服务时 fail-closed 503 `AUTH_SERVICE_UNAVAILABLE`），随后判同源，再进插件自己的令牌闸。这些判定不在 `src/bpmn-runtime.js` 里，而由 `src/index.js` 的 `route()` 在分发前统一完成；口径见 [Host 接口 · 鉴权](host-api.md#鉴权)，本页不复制。
 
-只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复，可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 的 GET 只读磁盘或收件箱，不创建 runner。
+只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复（`SUSPENDED` 除外：挂起实例的读只返回磁盘事实，不创建 runner），可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 的 GET 只读磁盘或收件箱，不创建 runner。
 
 请求体上限 2 MiB，达到即 413；原始路径出现空段或 `.` / `..` 段在进路由前就 400。成功响应一律是 `{ok:true, …}` 信封；业务失败一般是 `{ok:false, code, error}`，不过鉴权 / 同源 / 请求体解析这类入口级拒绝可能只有 `{ok:false, error}`（与 [Host 接口](host-api.md) 同口径）。部分失败额外带 `hint`、`recoveryCode`、`tasks` 等定位字段。
 
@@ -29,6 +29,8 @@
 | GET | `/instances/<id>/tasks` | 200 | 当前待办人工任务 |
 | POST | `/instances/<id>/tasks/<activityId>/complete` | 200 | 完成人工任务 |
 | POST | `/instances/<id>/stop` | 200 | 中止实例 |
+| POST | `/instances/<id>/suspend` | 200 | 挂起实例（quiesce 式软挂起） |
+| POST | `/instances/<id>/resume` | 200 | 恢复挂起实例（不主动推进） |
 | GET | `/instances/<id>/metrics` | 200 | 单实例运行指标 |
 | GET | `/metrics` | 200 | 跨实例指标汇总 |
 | GET | `/instances/<id>/evidence` | 200 | 实例业务证据（claims / findings / 引用核对） |
@@ -44,7 +46,7 @@
 | POST | `/instances/<id>/messages/<messageId>/replies` | 200 / 409 / 502 | 写入并投递一条回复 |
 | POST | `/instances/<id>/connector/<recordId>/resolve` | 200 | 人工处置一条 connector 调用记录 |
 
-当前没有删除实例、挂起 / 恢复实例、列出回复 outbox、或读取 connector 调用记录的 HTTP 路由；对应能力只通过上表这些入口暴露。
+当前没有删除实例、列出回复 outbox、或读取 connector 调用记录的 HTTP 路由；对应能力只通过上表这些入口暴露。挂起 / 恢复是 0.14.3 新增的两条写路由（见 [挂起 / 恢复](#挂起与恢复)）。
 
 ## 定义域
 
@@ -214,7 +216,7 @@
   "recovered": true }
 ```
 
-`runnerStatus` 是 runner 内部执行态（`idle` / `running` / `waiting` / `done` / `blocked`），不是实例状态；没有 runner 时为 `null`。`recovered:true` 只表示本次请求重新建了 runner。终态或不可恢复时仍返回 200，`recovered:false` 并带 `recovery.reason`（可能带 `recovery.code`）。
+`runnerStatus` 是 runner 内部执行态（`idle` / `running` / `waiting` / `done` / `blocked`），不是实例状态；没有 runner 时为 `null`。`recovered:true` 只表示本次请求重新建了 runner。终态、不可恢复或 `SUSPENDED` 时仍返回 200，`recovered:false` 并带 `recovery.reason`（可能带 `recovery.code`；挂起是 `BPMN_STATE_SUSPENDED`）。
 
 失败：400 `BPMN_INSTANCE_ID_INVALID`，404 `INSTANCE_NOT_FOUND`，500 `BPMN_STATE_READ_FAILED` / `INSTANCE_CORRUPT` / `BPMN_DEFINITION_INVALID` / `BPMN_STATE_WRITE_FAILED`。
 
@@ -252,7 +254,7 @@
 
 实现：`src/bpmn-runtime.js` 的 `_readTasks()`。
 
-内存里有 runner 时以 `runner.pendingTasks()` 为准，否则以 `instance.json.pendingTasks` 为准；实例非终态且内存无 runner 时会尝试懒恢复。响应：
+内存里有 runner 时以 `runner.pendingTasks()` 为准，否则以 `instance.json.pendingTasks` 为准；实例非终态且内存无 runner 时会尝试懒恢复（`SUSPENDED` 除外：挂起实例只返回磁盘待办，不创建 runner）。响应：
 
 ```json
 { "ok": true, "id": "i-…", "status": "ACTIVE",
@@ -281,7 +283,7 @@
   "decidedBy": "alice", "recovered": false }
 ```
 
-返回时实例已经跑到下一个等待点或终态。失败：404 `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND`，409 `BPMN_INSTANCE_STOPPING` / `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_NOT_RECOVERABLE`（带 `recoveryCode`）/ `BPMN_INSTANCE_BLOCKED` / `BPMN_INSTANCE_NOT_WAITING` / `INSTANCE_TERMINAL_IMMUTABLE`，500 `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED`。
+返回时实例已经跑到下一个等待点或终态。失败：404 `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND`，409 `BPMN_INSTANCE_STOPPING` / `BPMN_INSTANCE_TERMINAL` / `INSTANCE_SUSPENDED`（实例已挂起，先 resume）/ `BPMN_INSTANCE_NOT_RECOVERABLE`（带 `recoveryCode`）/ `BPMN_INSTANCE_BLOCKED` / `BPMN_INSTANCE_NOT_WAITING` / `INSTANCE_TERMINAL_IMMUTABLE`，500 `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED`。
 
 ### `POST /instances/<id>/stop`
 
@@ -295,6 +297,45 @@
 ```
 
 终止时同时收尾收件箱：未投递的入站消息标 `failed`，未发送的回复标 `skipped`（见 [收件箱状态机](#收件箱状态机)；该收尾在 `COMPLETED` 时也会发生，但已受理的回复在 `COMPLETED` 后仍可投递）。失败：400 `BPMN_INSTANCE_ID_INVALID`，404 `INSTANCE_NOT_FOUND`，500 落盘失败。
+
+### 挂起与恢复
+
+实现：`src/bpmn-runtime.js` 的 `_suspendInstance()` / `_resumeInstance()`；状态与事件由 `src/instance-store.js` 的 `appendInstanceEvents(..., {status})` 在同一次 `instance.json` 写入里提交。
+
+0.14.3 的挂起是 **quiesce 式软挂起**（路线 1）：`bpmn-engine@26` 没有 pause 原语，所以挂起不碰引擎，只在**没有在飞活动**时改状态并写事件；不做「状态写 SUSPENDED、活动照跑」的半挂起。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `reason` | string | 否 | 短说明（≤200 字符、不含控制字符），原样写进 `instance/suspended` / `instance/resumed` 事件；省略 / 空串 → `null` |
+
+挂起成功（200）：
+
+```json
+{ "ok": true, "id": "i-…", "status": "SUSPENDED", "reason": "窗口维护",
+  "lastSeq": 13, "suspendedAt": "2026-11-12T00:00:00.000Z" }
+```
+
+恢复成功（200）：`{ "ok": true, "id", "status": "ACTIVE", "reason", "lastSeq", "resumedAt" }`。
+
+语义：
+
+- **挂起前置**：实例必须是 `ACTIVE`；有在飞活动时返回 409 `INSTANCE_SUSPEND_BUSY`，响应带 `activities[]`（`kind` 为 `agent` / `http` / `engine`，HTTP 记录还带 `state` 与 `attempts`），可读原因说明哪些活动没结束。`_executionBusy()`、在飞 agent、connector 记录状态 `started` / `sent` / `unknown` 都算未结算；connector 记录读不出来按未结算处理（不把「无法确认」说成可以安全挂起）。判定在实例写锁外先做一次，避免排在慢 agent / HTTP 请求后面变成「活动结束后才挂起」。
+- **挂起动作**：状态置 `SUSPENDED` + 写 `instance/suspended` 事件（同一把实例锁、同一次状态写入），`pendingTasks` 保留；不杀 runner、不推进、不重放，之后**不得再派发活动**。
+- **挂起期间**：`GET /instances/<id>`、`GET /instances/<id>/tasks` 仍返回 200 与 `pendingTasks`，但 `_ensureRunner()` 直接跳过（`recovery.code:"BPMN_STATE_SUSPENDED"`、`runnerStatus:null`），读不会懒恢复 / 推进；`POST /tasks/<activityId>/complete` → 409 `INSTANCE_SUSPENDED`；入站消息沿用 [收件箱状态机](#收件箱状态机) 的 SUSPENDED 语义——受理并 `queued`，`delivery:{deferred:true, reason:"instance-suspended"}`，不投递；`stop` 仍可用，直接收成 `CANCELED`（终态不可逆）。
+- **恢复**：只允许 `SUSPENDED` → `ACTIVE`，写 `instance/resumed` 事件；**不主动跑**（不建 / 不恢复 runner）。恢复后人工任务可完成、消息可继续投递；下一次推进沿用既有懒恢复，不重放已完成节点。
+
+失败：
+
+| 状态 | code | 触发 |
+|---|---|---|
+| 400 | `BPMN_BODY_INVALID` / `BPMN_REASON_INVALID` | 请求体不是对象 / `reason` 不是短字符串（含控制字符或超过 200 字符） |
+| 404 | `INSTANCE_NOT_FOUND` | 实例不存在 |
+| 409 | `INSTANCE_SUSPEND_BUSY` | 还有未结算的 agent / HTTP 活动（带 `activities[]`） |
+| 409 | `INSTANCE_ALREADY_SUSPENDED` | 对已 `SUSPENDED` 的实例再次挂起 |
+| 409 | `INSTANCE_NOT_SUSPENDED` | 对非 `SUSPENDED` 实例恢复 |
+| 409 | `BPMN_INSTANCE_TERMINAL` | 实例已 `COMPLETED` / `CANCELED`（终态不可挂起 / 恢复） |
+| 409 | `BPMN_INSTANCE_STOPPING` | stop 已置停止闩、但实例还没收成终态 |
+| 500 | `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED` | 状态或事件落盘失败 |
 
 ## 运行指标
 
@@ -699,7 +740,7 @@ journal 尾部修复：追加写之前（`inbox/.lock` 内）检查 `messages.js
 |---|---|
 | `ACTIVE` | 活着：正在跑、停在人工任务、或出错后停住等人处理 |
 | `COMPLETED` | 走到结束事件，正常完成 |
-| `SUSPENDED` | 挂起。当前没有 suspend / resume 路由，没有任何代码路径会写入这个值 |
+| `SUSPENDED` | 被 `POST /instances/<id>/suspend` 挂起：没有在飞活动、不推进、不派发；`POST /instances/<id>/resume` 回到 `ACTIVE`（见 [挂起 / 恢复](#挂起与恢复)） |
 | `CANCELED` | 被 `POST /instances/<id>/stop` 取消，或创建阶段工作区建立失败被收口 |
 
 没有 `failed`、没有 `blocked`。引擎执行出错（条件求值错、活动超时、handler 失败、adapter 不可用、connector 不知结果等）时 `status` 保持 `ACTIVE`，只写 `lastError{code,message,nodeId?,activityId?,retries?,reminders?}` 并发一条 `error` 事件；是否重试、终止或继续由人 / 业务决定。终态只有 `COMPLETED` 与 `CANCELED`，终态不可逆：之后任何状态 / 变量 / 任务 / `lastError` 写入都被拒绝。
@@ -711,11 +752,12 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 `GET /instances/<id>`、`GET /instances/<id>/tasks` 与写操作 `complete` 在内存里没有该实例的 runner 且实例非终态时，会按磁盘懒恢复：
 
 1. 读 `instance.json`；终态 → 不恢复，返回 `recovered:false` + 终态原因。
-2. 读 `state.json`；缺失 / 空 → `recovery.code:"BPMN_STATE_MISSING"`（GET 仍 200；写操作 409 `BPMN_INSTANCE_NOT_RECOVERABLE`）。
-3. `state.json` 带 `unrecoverable` 墓碑 → 不恢复，`recovery.code` 取墓碑里的错误码（缺省 `BPMN_STATE_UNRECOVERABLE`）；这是执行失败停机时写下的快照，防止重启后重放失败前的工作。
-4. 读实例自己的 `definition.bpmn` 并重新解析；快照损坏 → 500，不拿定义域的最新版冒充。
-5. `runner.recover(state)`；state 不可反序列化 / 版本不符 / 定义不一致 → `recovered:false` + 具体恢复码，并写 `lastError`；不把实例判成 failed。
-6. 恢复成功后，事件流、`pendingTasks`、变量与状态都回到磁盘上的事实；`recovered:true` 只代表本次请求重建了 runner。
+2. `status:"SUSPENDED"` → **不恢复、不推进**，返回 `recovered:false` + `recovery.code:"BPMN_STATE_SUSPENDED"`、`runnerStatus:null`；`pendingTasks` 仍按磁盘事实返回。`GET` 不会因为读而创建 runner。
+3. 读 `state.json`；缺失 / 空 → `recovery.code:"BPMN_STATE_MISSING"`（GET 仍 200；写操作 409 `BPMN_INSTANCE_NOT_RECOVERABLE`）。
+4. `state.json` 带 `unrecoverable` 墓碑 → 不恢复，`recovery.code` 取墓碑里的错误码（缺省 `BPMN_STATE_UNRECOVERABLE`）；这是执行失败停机时写下的快照，防止重启后重放失败前的工作。
+5. 读实例自己的 `definition.bpmn` 并重新解析；快照损坏 → 500，不拿定义域的最新版冒充。
+6. `runner.recover(state)`；state 不可反序列化 / 版本不符 / 定义不一致 → `recovered:false` + 具体恢复码，并写 `lastError`；不把实例判成 failed。
+7. 恢复成功后，事件流、`pendingTasks`、变量与状态都回到磁盘上的事实；`recovered:true` 只代表本次请求重建了 runner。
 
 `clear-tombstone` 只删除墓碑快照，不恢复引擎；删除后同一实例的懒恢复会变成 `BPMN_STATE_MISSING`，仍不能自动继续，需要新建实例。
 
@@ -739,6 +781,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 投递规则：
 
+- 实例 `SUSPENDED` 时：新消息仍受理并落盘为 `queued`，但**不投递**，响应 `delivery:{deferred:true, reason:"instance-suspended"}`；挂起期间 `deliverQueued` 直接跳过该实例。恢复后新消息 / 下一次投递触发会继续消费队列；恢复本身不主动外发消息。
 - 单次 drain（每个 execution）在**同一个激活内持续推进**：按 `INBOX_DRAIN_BATCH`（5 条）分批，直到队列空或达到本次总上限 `INBOX_DRAIN_ACTIVATION_LIMIT`（100 条）。达到上限时未处理的消息留在 `queued` 并在 `remaining` 里如实报数；「只取 5 条」不是永久停止条件。同一 execution 的并发 drain 不丢弃唤醒：后来者返回 `{skipped:true, pending:true, reason:"drain-in-progress"}` 并在运行中的 drain 上置待处理标志；正在跑的 drain 在释放所有权前（队列空 / 达到上限时）重新确认队列并再消费一轮，因此「旧 drain 读到空快照 → 新消息受理 → 旧 drain 退出」不会留下永久 `queued`。
 - agent 执行必须有原生消息能力（`capabilities().messages === "native"` 且实现 `deliverMessage`）；否则消息标 `failed`，投递记录 `deliveryUnknown:true`、`code:"MESSAGE_DELIVERY_UNSUPPORTED"`，**不假装成功**。
 - DSH 适配器实现了 `deliverMessage`：成功返回 `{ok:true, deliveryUnknown:true}`（只保证排进会话队列，不保证模型在完结前读到），会话已完结 / 取消 / 通道未就绪则返回 `{ok:false, deliveryUnknown:true}` 与 `DSH_SESSION_NOT_ACTIVE` / `DSH_DELIVERY_UNAVAILABLE` / `DSH_INBOX_DELIVERY_FAILED`。
@@ -816,7 +859,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 ### 模型工具
 
-实例域注册十一个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；全部直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。旧运行域的 `flow_*` 工具已在 0.14.0 删除，不再注册。
+实例域注册十三个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；全部直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。旧运行域的 `flow_*` 工具已在 0.14.0 删除，不再注册。
 
 | 工具 | 对应路由 | 参数 | 返回 |
 |---|---|---|---|
@@ -831,6 +874,8 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | `flow_instance_events` | `GET /instances/<id>/events?since=` | `instanceId`（同上）、`since?`、`limit?`（默认 50，封顶 200） | `events[]`（短字段；长正文给 `bodyRef`）、`lastSeq`、`nextSince`、`hasMore`、`skipped`、`shards` |
 | `flow_instance_cancel` | `POST /instances/<id>/stop` | `instanceId`（同上）、`reason?` | `status`（`CANCELED`）、`alreadyTerminal`、`pendingTasks`、`lastSeq`、`reason` |
 | `flow_instance_complete_task` | `POST /instances/<id>/tasks/<activityId>/complete` | `instanceId`（同上）、`activityId`、`payload?` | `activityId`、`executionId`、`status`、`pendingTasks`、`lastSeq`、`decidedBy`、`recovered` |
+| `flow_instance_suspend` | `POST /instances/<id>/suspend` | `instanceId`（同上）、`reason?`（≤200） | `status`（`SUSPENDED`）、`reason`、`lastSeq`、`suspendedAt`；409 时 `code` + `activities[]`（`INSTANCE_SUSPEND_BUSY`） |
+| `flow_instance_resume` | `POST /instances/<id>/resume` | `instanceId`（同上）、`reason?`（≤200） | `status`（`ACTIVE`）、`reason`、`lastSeq`、`resumedAt` |
 
 - 在 agent 节点会话里，工具带 `{instanceId, executionId?, activityId?}` 绑定：省略 `instanceId` 就用绑定实例，显式传成别的实例会被参数校验拒绝（防止跨实例投递 / 跨实例取消 / 跨实例完成任务）。
 - `prune` 的执行意图与计划是两件事：省略 `dryRun` 一律按 `true` 预览；只有显式 `dryRun:false` 且带 `planHash` 才执行。
@@ -843,7 +888,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 - `flow_instance_complete_task` 与 GUI 的 `POST /tasks/<activityId>/complete` 共用同一份实现与校验；重复完成返回 `TASK_ALREADY_COMPLETED` 且不产生新事件。终态实例的 `flow_instance_cancel` 返回 `INSTANCE_ALREADY_TERMINAL`，同样不产生事件；`reason` 只随结果回显，stop 路由不落盘业务原因。
 - `flow_instance_list` 的 `cursor` 是上一页返回的 `nextCursor`（实例 id），只在该结果集内有效；结果集变化或超出单次扫描上限时返回 `CURSOR_INVALID`，从第一页重新开始。
 - `flow_instance_events` 只返回短字段：单条事件里的 `output` / `condition` / `artifacts` 或超长字符串超过 1 KiB 时替换为 `{bodyRef, bytes, truncated}`，`bodyRef` 指向读取原始事件的 `GET /instances/<id>/events?since=` 路径。
-- 不提供 `flow_instance_suspend` / `flow_instance_resume`（引擎没有挂起原语，延后到 E4），也不提供 watch / 定时唤醒 / 自动重试类工具；需要外部触发时由调用方轮询 `flow_instance_events` 或发消息。
+- `flow_instance_suspend` / `flow_instance_resume` 与路由同一份实现：挂起只在无在飞活动时成功（`INSTANCE_SUSPEND_BUSY` 带 `activities[]`），挂起期间 `flow_instance_complete_task` 返回 `INSTANCE_SUSPENDED`；恢复不主动跑。两者 `reason` 上限 200 字符（与路由一致），重复挂起 / 未挂起恢复分别映射 `INSTANCE_ALREADY_SUSPENDED` / `INSTANCE_NOT_SUSPENDED` 并带中文 hint。不提供 watch / 定时唤醒 / 自动重试类工具；需要外部触发时由调用方轮询 `flow_instance_events` 或发消息。
 - 工具结果有界裁剪：字符串字段 2 KiB、数组 200 项、深度 8（`flow_definition_get` 的 XML 与 `flow_instance_events` 的短字段投影按各自上限处理）。超时：worktree 工具 60 秒、消息 / 回复 / 读类工具 30 秒、`flow_instance_run` 与 `flow_instance_complete_task` 10 分钟（可能等在飞 agent）。
 - 失败时工具返回 `{ok:false, error, hint, retryable, code?, status?}`；参数错误、404、409、`PLAN_STALE`、`TASK_ALREADY_COMPLETED`、`INSTANCE_ALREADY_TERMINAL`、`CURSOR_INVALID`、`WORKSPACE_POLICY_MISSING` 都不标 `retryable`。
 
@@ -865,6 +910,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | 400 | `BPMN_INSTANCE_ID_INVALID` | 路径里的实例 id 非法 |
 | 400 | `BPMN_ACTIVITY_ID_INVALID` | 路径里的 `activityId` 为空或超 128 字符 |
 | 400 | `BPMN_PAYLOAD_INVALID` | 人工任务 `payload` 不是对象 |
+| 400 | `BPMN_REASON_INVALID` | 挂起 / 恢复的 `reason` 不是 ≤200 字符的短字符串（含控制字符） |
 | 400 | `BPMN_SEQ_INVALID` | `since` 不是非负整数 |
 | 400 / 500 | `BPMN_DEFINITION_INVALID` | 实例定义快照未通过 BPMN 校验（启动时 400；懒恢复时 500） |
 | 400 | `BPMN_WORKSPACE_INVALID` | `workspace` 选项形状或取值非法 |
@@ -895,6 +941,9 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 | 409 | `DEFINITION_LOCK_TIMEOUT` | 定义目录锁等待超时 |
 | 409 | `WORKSPACE_UNAVAILABLE` / `WORKSPACE_CORRUPT` | 工作区快照缺失 / 损坏（不静默回退宿主目录） |
 | 409 | `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_STOPPING` | 实例已终态 / 正在停止 |
+| 409 | `INSTANCE_SUSPEND_BUSY` | 挂起时有未结算的 agent / HTTP 活动（响应带 `activities[]`） |
+| 409 | `INSTANCE_ALREADY_SUSPENDED` / `INSTANCE_NOT_SUSPENDED` | 重复挂起 / 对非 `SUSPENDED` 实例恢复 |
+| 409 | `INSTANCE_SUSPENDED` | 实例已挂起时完成任务（先 resume） |
 | 409 | `BPMN_INSTANCE_BLOCKED` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_NOT_RECOVERABLE` | runner 已停机 / 没有等待中的人工任务 / 无法恢复（后者带 `recoveryCode`） |
 | 409 | `INSTANCE_TERMINAL_IMMUTABLE` | 写操作与 stop / 终态收口竞争失败 |
 | 409 | `MESSAGE_INSTANCE_TERMINAL` / `MESSAGE_ID_CONFLICT` / `MESSAGE_REPLY_ID_CONFLICT` | 实例终态拒绝消息 / 幂等键内容冲突 |
@@ -924,7 +973,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 | 位置 | code | 含义 |
 |---|---|---|
-| `recovery.code` | `BPMN_STATE_MISSING` / `BPMN_STATE_STOPPING` / `BPMN_STATE_UNRECOVERABLE` / `BPMN_STATE_NOT_RESUMABLE` / `BPMN_STATE_RECOVER_FAILED` | 不可恢复 / 正在停止 / 墓碑 / state 不能续跑 / 恢复失败；也可能带 runner 侧的 `BPMN_STATE_DEFINITION_MISMATCH`、`BPMN_STATE_VERSION_UNSUPPORTED` 等 |
+| `recovery.code` | `BPMN_STATE_MISSING` / `BPMN_STATE_STOPPING` / `BPMN_STATE_SUSPENDED` / `BPMN_STATE_UNRECOVERABLE` / `BPMN_STATE_NOT_RESUMABLE` / `BPMN_STATE_RECOVER_FAILED` | 不可恢复 / 正在停止 / 已挂起（读不恢复）/ 墓碑 / state 不能续跑 / 恢复失败；也可能带 runner 侧的 `BPMN_STATE_DEFINITION_MISMATCH`、`BPMN_STATE_VERSION_UNSUPPORTED` 等 |
 | `lastError.code` | `BPMN_AGENT_ADAPTER_UNSUPPORTED` / `BPMN_AGENT_ADAPTER_UNAVAILABLE` / `BPMN_ACTIVITY_TIMEOUT` / `BPMN_ABORTED` / `BPMN_AGENT_HANDLE_INVALID` / `NODE_FINISH_INVALID` / `WORKSPACE_UNAVAILABLE` / `WORKSPACE_CWD_OUTSIDE` | agent 节点执行失败（`src/agent-execute.js` 的 `AGENT_EXECUTE_ERROR`）；创建实例时同一码也出现在响应的 `error.code` |
 | `lastError.code` | `HTTP_OUTCOME_UNKNOWN` / `HTTP_REDIRECT_FORBIDDEN` / `HTTP_TIMEOUT` / `HTTP_REQUEST_TOO_LARGE` / `HTTP_RESPONSE_TOO_LARGE` / `HTTP_REQUEST_CONFLICT` / `HTTP_STORE_STALE` 等 | connector 调用失败或结果不明 |
 | `message.delivery.code` | `MESSAGE_DELIVERY_UNSUPPORTED` / `MESSAGE_DELIVERY_FAILED` / `MESSAGE_WORKSPACE_UNAVAILABLE` / `MESSAGE_BODY_UNSAFE` / `MESSAGE_DELIVERY_STATE_WRITE_FAILED` / `DSH_SESSION_NOT_ACTIVE` / `DSH_DELIVERY_UNAVAILABLE` / `DSH_INBOX_DELIVERY_FAILED` / `CODEX_MESSAGE_DELIVERY_UNSUPPORTED` | 入站消息投递失败；消息状态为 `failed`，`deliveryUnknown` 视情况为 `true`。`MESSAGE_BODY_UNSAFE` 表示物化路径含软链 / 非普通文件 / 父目录被替换 / 写失败，已拒绝且未投递。`MESSAGE_DELIVERY_STATE_WRITE_FAILED` 表示适配器已接收但成功状态写不回 journal：`deliveryUnknown:true`（**可能已投递**），不自动重发 |

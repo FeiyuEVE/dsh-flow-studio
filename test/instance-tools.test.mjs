@@ -99,11 +99,12 @@ const OK_BODY = {
 
 function toolOf(runtime) {
   const tools = createInstanceTools({ runtime })
-  eq(tools.length, 11, '实例域工具：3 个既有 + E3 的 8 个生命周期工具')
+  eq(tools.length, 13, '实例域工具：11 个既有 + E4 的挂起 / 恢复 2 个')
   const worktree = tools.find(tool => tool.name === 'flow_instance_worktrees')
   ok(worktree, '注册了 flow_instance_worktrees')
   return worktree
 }
+
 
 try {
   console.log('instance-tools')
@@ -112,7 +113,7 @@ try {
     assert.throws(() => createInstanceTools({}), /runtime/)
     assertions += 1
     const runtime = makeRuntime(async () => ({ status: 200, body: { ok: true } }))
-    ok(createInstanceTools({ getRuntime: () => runtime }).length === 11)
+    ok(createInstanceTools({ getRuntime: () => runtime }).length === 13)
   })
 
   await check('参数：缺少 / 非法 action 在调用 runtime 前就失败', async () => {
@@ -398,6 +399,116 @@ try {
     } finally {
       await runtime.dispose()
     }
+  })
+
+  await check('E4 suspend / resume：注册、参数校验、路由映射与会话绑定', async () => {
+    const calls = []
+    const runtime = makeRuntime(async request => {
+      calls.push(request)
+      const suspend = request.parts[2] === 'suspend'
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id: 'i-1',
+          status: suspend ? 'SUSPENDED' : 'ACTIVE',
+          reason: request.body && request.body.reason !== undefined ? request.body.reason : null,
+          lastSeq: 12,
+          ...(suspend ? { suspendedAt: '2026-11-12T00:00:00.000Z' } : { resumedAt: '2026-11-12T00:00:01.000Z' }),
+        },
+      }
+    })
+    const tools = createInstanceTools({ runtime })
+    eq(tools.length, 13)
+    const suspendTool = tools.find(tool => tool.name === 'flow_instance_suspend')
+    const resumeTool = tools.find(tool => tool.name === 'flow_instance_resume')
+    ok(suspendTool, '注册了 flow_instance_suspend')
+    ok(resumeTool, '注册了 flow_instance_resume')
+
+    const suspended = await suspendTool.execute({ instanceId: 'i-1', reason: '窗口维护' })
+    eq(suspended.ok, true, JSON.stringify(suspended))
+    eq(suspended.action, 'suspend')
+    eq(suspended.status, 'SUSPENDED')
+    eq(suspended.reason, '窗口维护')
+    eq(suspended.lastSeq, 12)
+    eq(suspended.suspendedAt, '2026-11-12T00:00:00.000Z')
+    deep(calls[0].parts, ['instances', 'i-1', 'suspend'])
+    eq(calls[0].method, 'POST')
+    deep(calls[0].body, { reason: '窗口维护' })
+
+    const resumed = await resumeTool.execute({ instanceId: 'i-1' })
+    eq(resumed.ok, true, JSON.stringify(resumed))
+    eq(resumed.status, 'ACTIVE')
+    deep(calls[1].parts, ['instances', 'i-1', 'resume'])
+    deep(calls[1].body, {}, '省略 reason 时只发空对象')
+
+    // 参数错误在本地拒绝，不发请求。
+    const badId = await suspendTool.execute({ instanceId: '../etc/passwd' })
+    eq(badId.ok, false)
+    ok(/instanceId 不合法/.test(badId.error))
+    const longReason = await suspendTool.execute({ instanceId: 'i-1', reason: '长'.repeat(201) })
+    eq(longReason.ok, false)
+    ok(/200/.test(longReason.error))
+    eq(calls.length, 2, '本地参数错误不发请求')
+
+    // 绑定会话：省略 instanceId 用绑定值，显式改成别的实例被本地拒绝。
+    const boundTools = createInstanceTools({ runtime, binding: { instanceId: 'i-bound' } })
+    const boundSuspend = boundTools.find(tool => tool.name === 'flow_instance_suspend')
+    const bound = await boundSuspend.execute({})
+    eq(bound.ok, true)
+    deep(calls[2].parts, ['instances', 'i-bound', 'suspend'])
+    const cross = await boundSuspend.execute({ instanceId: 'i-other' })
+    eq(cross.ok, false)
+    ok(/不能通过改 instanceId/.test(cross.error))
+    eq(calls.length, 3, '跨实例参数不发请求')
+  })
+
+  await check('E4 suspend：INSTANCE_SUSPEND_BUSY 保留 activities[] 与可读 hint', async () => {
+    const runtime = makeRuntime(async () => ({
+      status: 409,
+      body: {
+        ok: false,
+        code: 'INSTANCE_SUSPEND_BUSY',
+        error: '实例 i-1 还有未结束的活动，不能挂起：agent 活动 agent1 正在执行。等活动结束后再挂起。',
+        activities: [{ kind: 'agent', activityId: 'agent1', executionId: 'agent1_1', state: 'running' }],
+      },
+    }))
+    const tool = createInstanceTools({ runtime }).find(item => item.name === 'flow_instance_suspend')
+    const result = await tool.execute({ instanceId: 'i-1' })
+    eq(result.ok, false)
+    eq(result.status, 409)
+    eq(result.code, 'INSTANCE_SUSPEND_BUSY')
+    eq(result.retryable, false)
+    eq(result.activities.length, 1)
+    eq(result.activities[0].kind, 'agent')
+    ok(/未结束的活动/.test(result.error))
+    ok(result.hint.includes('等活动结束'))
+  })
+
+  await check('E4 resume / complete_task：SUSPENDED 状态错误码映射到中文 hint', async () => {
+    const runtime = makeRuntime(async request => {
+      if (request.parts[2] === 'resume') {
+        return {
+          status: 409,
+          body: { ok: false, code: 'INSTANCE_NOT_SUSPENDED', error: '实例 i-1 当前状态是 ACTIVE，只有 SUSPENDED 才能恢复' },
+        }
+      }
+      return {
+        status: 409,
+        body: { ok: false, code: 'INSTANCE_SUSPENDED', error: '实例 i-1 已挂起（SUSPENDED），挂起期间不能完成人工任务' },
+      }
+    })
+    const tools = createInstanceTools({ runtime })
+    const resume = await tools.find(tool => tool.name === 'flow_instance_resume').execute({ instanceId: 'i-1' })
+    eq(resume.ok, false)
+    eq(resume.code, 'INSTANCE_NOT_SUSPENDED')
+    ok(resume.hint.includes('SUSPENDED') || resume.hint.includes('挂起'))
+
+    const done = await tools.find(tool => tool.name === 'flow_instance_complete_task')
+      .execute({ instanceId: 'i-1', activityId: 'human1' })
+    eq(done.ok, false)
+    eq(done.code, 'INSTANCE_SUSPENDED')
+    ok(done.hint.includes('flow_instance_resume'), '挂起时完成任务的 hint 指向 resume')
   })
 
   await check('apply()：没有 tools 服务时跳过注册，路由照常挂载', () => {

@@ -222,13 +222,14 @@ try {
   await seed(runtime, 'flow-two', agentThenHumanXml(), 'agent→人工')
   const tools = toolsFor(runtime)
 
-  await check('注册 11 个实例域工具（3 个既有 + 8 个 E3）', () => {
+  await check('注册 13 个实例域工具（11 个既有 + E4 的挂起 / 恢复）', () => {
     const names = tools.map(tool => tool.name).sort()
     deep(names, [
       'flow_definition_get', 'flow_definition_list',
       'flow_instance_cancel', 'flow_instance_complete_task', 'flow_instance_events',
       'flow_instance_get', 'flow_instance_list', 'flow_instance_reply',
-      'flow_instance_run', 'flow_instance_send_message', 'flow_instance_worktrees',
+      'flow_instance_resume', 'flow_instance_run', 'flow_instance_send_message',
+      'flow_instance_suspend', 'flow_instance_worktrees',
     ])
   })
 

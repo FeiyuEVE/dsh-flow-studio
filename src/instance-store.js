@@ -62,7 +62,8 @@ const STARTED_BY_CONTROL = /[\u0000-\u001f\u007f]/
  *
  * - `ACTIVE`：活着——正在跑、停在人工任务、或出错后停住，**都是 ACTIVE**；
  * - `COMPLETED` / `CANCELED`：仅有的两个终态（正常结束 / 被 stop 取消）；
- * - `SUSPENDED`：保留取值（暂无 suspend 操作）。
+ * - `SUSPENDED`：quiesce 式挂起——没有在飞活动时由 `POST /instances/<id>/suspend`
+ *   置位，不杀 runner、不推进、不派发；`resume` 回到 `ACTIVE`，下一次推进沿用懒恢复。
  *
  * 没有 failed / blocked：引擎出错时 status 保持 ACTIVE，把事实写进 `lastError`。
  */
@@ -948,7 +949,9 @@ async function needsLeadingNewline(path) {
  * @param {string} activityId
  * @param {number} attempt
  * @param {object|object[]} rawEvents 单条或数组
- * @param {{ home?: string, instancesRoot?: string }} [options]
+ * @param {{ home?: string, instancesRoot?: string, status?: 'ACTIVE'|'SUSPENDED' }} [options]
+ *   `status`：与事件在同一把实例锁、同一次 `instance.json` 写入里提交（挂起 / 恢复用）。
+ *   先分配 seq 再写事件行的崩溃语义不变：实例状态已切换、事件可能缺一条，读侧按 seq 空洞处理。
  * @returns {Promise<{instanceId: string, activityId: string, attempt: number,
  *   firstSeq: number, lastSeq: number, events: object[], instance: object}>}
  */
@@ -973,6 +976,16 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
     if (!isPlainObject(list[index])) {
       throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `events[${index}] 必须是对象`, { field: `events[${index}]` })
     }
+  }
+  // 事件 + 状态同一次的写入只服务生命周期切换（挂起 / 恢复）：终态仍走 completeInstance。
+  const nextStatus = options.status === undefined || options.status === null ? null : options.status
+  if (nextStatus !== null && nextStatus !== 'ACTIVE' && nextStatus !== 'SUSPENDED') {
+    throw new InstanceError(
+      400,
+      'INSTANCE_STATUS_INVALID',
+      'appendInstanceEvents 的 status 只能是 ACTIVE / SUSPENDED（终态走 completeInstance）',
+      { field: 'status' },
+    )
   }
   await requireInstanceDir(loc)
 
@@ -1010,6 +1023,8 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
     const now = new Date().toISOString()
     const next = normalizeInstance({
       ...current,
+      // 挂起 / 恢复：状态与事件一起提交，避免「状态已 SUSPENDED、事件还没落盘」的中间态。
+      ...(nextStatus === null ? {} : { status: nextStatus, completedAt: null }),
       eventCount: current.eventCount + list.length,
       lastSeq,
       revision: current.revision + 1,

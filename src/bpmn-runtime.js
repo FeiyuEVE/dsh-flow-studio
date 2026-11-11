@@ -153,6 +153,44 @@ export const DEFAULT_MAX_ACTIVE_INSTANCES = 100
  */
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELED'])
 
+/** connector 记录里算「未结算」的状态（挂起前必须等它们结束或人工处置）。 */
+const UNSETTLED_CONNECTOR_STATES = new Set(['started', 'sent', 'unknown'])
+
+/**
+ * 解析 `POST /instances/<id>/suspend|resume` 的请求体：只认 `{reason?}`。
+ * `reason` 是短说明（≤200 字符，不含控制字符），原样写进 `instance/suspended|resumed` 事件。
+ */
+function parseLifecycleBody(body, label) {
+  if (body !== undefined && body !== null && !isPlainObject(body)) {
+    return {
+      reason: null,
+      error: {
+        status: 400,
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: `${label}的请求体必须是 JSON 对象：{ reason? }` },
+      },
+    }
+  }
+  const raw = isPlainObject(body) ? body.reason : undefined
+  if (raw === undefined || raw === null) return { reason: null, error: null }
+  if (typeof raw !== 'string') {
+    return {
+      reason: null,
+      error: { status: 400, body: { ok: false, code: 'BPMN_REASON_INVALID', error: `${label}的 reason 必须是字符串` } },
+    }
+  }
+  const reason = raw.trim()
+  if (reason.length > 200 || /[\u0000-\u001f\u007f]/.test(reason)) {
+    return {
+      reason: null,
+      error: {
+        status: 400,
+        body: { ok: false, code: 'BPMN_REASON_INVALID', error: `${label}的 reason 必须是不含控制字符的短字符串（≤200 字符）` },
+      },
+    }
+  }
+  return { reason: reason === '' ? null : reason, error: null }
+}
+
 /**
  * 运行时错误：`status` 给 HTTP，`code` 是稳定业务码，`reason` 是中文可读原因。
  *
@@ -670,6 +708,14 @@ class BpmnRuntime {
     this._runnerErrors = new Map()
     /** @type {Set<string>} 停止闩：置位后该实例的迟到事件与懒恢复一律不再推进 */
     this._stopping = new Set()
+    /**
+     * @type {Set<string>} 挂起闩（0.14.3）：置位后不懒恢复、不派发、迟到事件不落盘。
+     * 磁盘上的 `instance.json.status === 'SUSPENDED'` 是权威事实；本集合只覆盖同一进程内
+     * 「挂起 / 恢复」与迟到异步事件交错的窗口。
+     */
+    this._suspended = new Set()
+    /** @type {Map<string, Map<string, {elementId: string|null, executionId: string|null}>>} */
+    this._activeAgentActivities = new Map()
     /** @type {Map<string, object>} instanceId → 最后一个成功 agent 节点的 output（process/end 用） */
     this._lastAgentOutputs = new Map()
     /** @type {Map<string, string>} `instanceId\\0executionId` → agent 节点 summary（activity/end 用） */
@@ -890,6 +936,8 @@ class BpmnRuntime {
     this._attempts.clear()
     this._suppressWait.clear()
     this._stopping.clear()
+    this._suspended.clear()
+    this._activeAgentActivities.clear()
     this._runnerErrors.clear()
     this._lastAgentOutputs.clear()
     this._agentSummaries.clear()
@@ -1133,6 +1181,14 @@ class BpmnRuntime {
       if (parts[2] === 'stop') {
         if (method !== 'POST') return methodNotAllowed('POST')
         return await this._stopInstance(id)
+      }
+      if (parts[2] === 'suspend') {
+        if (method !== 'POST') return methodNotAllowed('POST')
+        return await this._suspendInstance(id, body)
+      }
+      if (parts[2] === 'resume') {
+        if (method !== 'POST') return methodNotAllowed('POST')
+        return await this._resumeInstance(id, body)
       }
       return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
     }
@@ -2412,6 +2468,17 @@ class BpmnRuntime {
           },
         }
       }
+      // 0.14.3：挂起期间不允许完成人工任务（挂起不是「暂停等人点按钮」，是不推进）。
+      if (instance.status === 'SUSPENDED' || this._suspended.has(id)) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'INSTANCE_SUSPENDED',
+            error: `实例 ${id} 已挂起（SUSPENDED），挂起期间不能完成人工任务；先 POST /instances/${id}/resume 再完成`,
+          },
+        }
+      }
       const ensured = await this._ensureRunner(instance)
       if (ensured.runner === null) {
         return {
@@ -2538,6 +2605,8 @@ class BpmnRuntime {
 
     // 停止闩：任何新事件 / 懒恢复 / complete 都不能再把实例写回 running。
     this._stopping.add(id)
+    // 挂起闩解除：stop 直接收成终态，不再保留「不派发」语义。
+    this._suspended.delete(id)
     const runner = this._runners.get(id) ?? null
     if (runner !== null) {
       try {
@@ -2576,6 +2645,227 @@ class BpmnRuntime {
         alreadyTerminal: false,
         pendingTasks: after.pendingTasks,
         lastSeq: after.lastSeq,
+      },
+    }
+  }
+
+  /**
+   * `POST /instances/<id>/suspend`：**quiesce 式软挂起**（0.14.3，路线 1）。
+   *
+   * `bpmn-engine@26` 没有 pause 原语，所以这里不碰引擎：
+   *   - 只在实例 `ACTIVE` 且**没有在飞活动**（agent / HTTP / runner 正在执行）时允许；
+   *   - 状态置 `SUSPENDED` + 写 `instance/suspended` 事件（含 `reason`），一次提交；
+   *   - 不杀 runner、不推进、不重放；挂起后 `_ensureRunner` 直接跳过，
+   *     `complete` 409 `INSTANCE_SUSPENDED`，入站消息排队；
+   *   - 有在飞活动时 409 `INSTANCE_SUSPEND_BUSY`，`activities[]` 列出未结束的活动。
+   *
+   * 在飞判定必须在实例写锁**之外**先做一次：正在跑的 agent / HTTP 请求会持锁到活动
+   * 结束，排在锁后面等于「等活动结束再挂起」，与用户看到的「有活动在跑」不符。
+   *
+   * @param {string} id
+   * @param {object} [body] `{ reason? }`
+   */
+  async _suspendInstance(id, body) {
+    const parsed = parseLifecycleBody(body, '挂起')
+    if (parsed.error !== null) return parsed.error
+
+    const pre = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (pre === null) return instanceNotFound(id)
+    const preVerdict = this._lifecycleVerdict(pre, 'suspend')
+    if (preVerdict !== null) return preVerdict
+    const preBusy = await this._suspendBusy(pre)
+    if (preBusy !== null) return preBusy
+
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      const verdict = this._lifecycleVerdict(instance, 'suspend')
+      if (verdict !== null) return verdict
+      const busy = await this._suspendBusy(instance)
+      if (busy !== null) return busy
+      return await this._commitLifecycleStatus(instance, 'SUSPENDED', 'instance/suspended', parsed.reason, 'suspendedAt')
+    })
+  }
+
+  /**
+   * `POST /instances/<id>/resume`：把 `SUSPENDED` 改回 `ACTIVE` + 写 `instance/resumed`。
+   *
+   * **不主动跑**：不创建 / 不恢复 runner，不派发活动；下一次 `complete` / 消息投递 /
+   * `GET` 推进时沿用既有懒恢复。挂起区间由 E1 指标按两条事件收口。
+   *
+   * @param {string} id
+   * @param {object} [body] `{ reason? }`
+   */
+  async _resumeInstance(id, body) {
+    const parsed = parseLifecycleBody(body, '恢复')
+    if (parsed.error !== null) return parsed.error
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      const verdict = this._lifecycleVerdict(instance, 'resume')
+      if (verdict !== null) return verdict
+      return await this._commitLifecycleStatus(instance, 'ACTIVE', 'instance/resumed', parsed.reason, 'resumedAt')
+    })
+  }
+
+  /** 挂起 / 恢复的实例状态前置判定（终态沿用既有 `BPMN_INSTANCE_TERMINAL`）。 */
+  _lifecycleVerdict(instance, action) {
+    const id = instance.id
+    // 终态优先于停止闩：stop 已收口后闩仍会留到进程结束，但可读的原因应该是「终态不可逆」。
+    if (TERMINAL_STATUSES.has(instance.status)) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'BPMN_INSTANCE_TERMINAL',
+          error: `实例 ${id} 已结束（${instance.status}），不能${action === 'suspend' ? '挂起' : '恢复'}`,
+        },
+      }
+    }
+    if (this._stopping.has(id)) {
+      return {
+        status: 409,
+        body: { ok: false, code: 'BPMN_INSTANCE_STOPPING', error: `实例 ${id} 正在停止，不能${action === 'suspend' ? '挂起' : '恢复'}` },
+      }
+    }
+    if (action === 'suspend' && instance.status === 'SUSPENDED') {
+      return {
+        status: 409,
+        body: { ok: false, code: 'INSTANCE_ALREADY_SUSPENDED', error: `实例 ${id} 已处于 SUSPENDED，不能重复挂起（没有产生新事件）` },
+      }
+    }
+    if (action === 'resume' && instance.status !== 'SUSPENDED') {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_NOT_SUSPENDED',
+          error: `实例 ${id} 当前状态是 ${instance.status}，只有 SUSPENDED 才能恢复（没有产生新事件）`,
+        },
+      }
+    }
+    if (action === 'suspend' && instance.status !== 'ACTIVE') {
+      return {
+        status: 409,
+        body: { ok: false, code: 'INSTANCE_NOT_ACTIVE', error: `实例 ${id} 当前状态是 ${instance.status}，只有 ACTIVE 才能挂起` },
+      }
+    }
+    return null
+  }
+
+  /**
+   * 有在飞活动时返回 409 `INSTANCE_SUSPEND_BUSY`（读不到 connector 记录时按未结算处理，
+   * 不把「无法确认」说成「可以安全挂起」）。没有在飞活动返回 `null`。
+   */
+  async _suspendBusy(instance) {
+    const id = instance.id
+    const activities = []
+    const activeAgents = this._activeAgentActivities.get(id)
+    if (this._executionBusy(id)) {
+      if (activeAgents !== undefined && activeAgents.size > 0) {
+        for (const item of activeAgents.values()) {
+          activities.push({
+            kind: 'agent',
+            activityId: item.elementId ?? null,
+            executionId: item.executionId ?? null,
+            state: 'running',
+          })
+        }
+      } else {
+        activities.push({ kind: 'agent', activityId: null, executionId: null, state: 'running' })
+      }
+    }
+    // runner 正在执行（非 agent / HTTP handler 的同步推进）：也在飞，但它通常只在
+    // 持有实例锁的请求里出现；这里只用于锁内复核与给出可读原因。
+    const runner = this._runners.get(id) ?? null
+    if (runner !== null && runner.status() === BPMN_RUNNER_STATUS.RUNNING && activities.length === 0) {
+      activities.push({ kind: 'engine', activityId: null, executionId: null, state: 'running' })
+    }
+    // HTTP：started / sent / unknown 都是未结算；succeeded / failed 才算结束。
+    try {
+      const store = createConnectorStore({ root: join(this.instancesRoot, id, 'connector') })
+      const records = await store.listInvocations(id)
+      for (const record of records) {
+        if (!UNSETTLED_CONNECTOR_STATES.has(record.state)) continue
+        activities.push({
+          kind: 'http',
+          activityId: typeof record.elementId === 'string' ? record.elementId : null,
+          executionId: typeof record.executionId === 'string' ? record.executionId : null,
+          state: record.state,
+          attempts: Number.isSafeInteger(record.attempts) ? record.attempts : null,
+        })
+      }
+    } catch (error) {
+      activities.push({
+        kind: 'http',
+        activityId: null,
+        executionId: null,
+        state: 'unreadable',
+        error: errorText(error),
+      })
+    }
+    if (activities.length === 0) return null
+
+    const describe = activities.map(item => {
+      const target = [item.activityId, item.executionId].filter(value => typeof value === 'string' && value !== '').join('/')
+      if (item.kind === 'agent') return `agent 活动${target === '' ? '' : ` ${target}`} 正在执行`
+      if (item.kind === 'http') return `HTTP 调用${target === '' ? '' : ` ${target}`} 状态 ${item.state}（未结算）`
+      return `runner 正在执行（${item.state}）`
+    }).join('；')
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        code: 'INSTANCE_SUSPEND_BUSY',
+        error: `实例 ${id} 还有未结束的活动，不能挂起：${describe}。等活动结束（或按 connector 处置）后再挂起。`,
+        activities,
+      },
+    }
+  }
+
+  /**
+   * 生命周期状态 + 事件一次提交：`appendInstanceEvents` 的 `status` 选项在同一次
+   * `instance.json` 写入里改状态，事件行随后追加（崩溃只会留下 seq 空洞）。
+   */
+  async _commitLifecycleStatus(instance, status, eventType, reason, timeKey) {
+    const at = new Date().toISOString()
+    const event = {
+      type: eventType,
+      at,
+      status,
+      ...(reason === null ? {} : { reason }),
+    }
+    let appended
+    try {
+      appended = await appendInstanceEvents(instance.id, 'process', 1, event, {
+        instancesRoot: this.instancesRoot,
+        status,
+      })
+    } catch (error) {
+      if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') {
+        const current = await readInstance(instance.id, { instancesRoot: this.instancesRoot })
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_TERMINAL',
+            error: `实例 ${instance.id} 已被其它请求收成终态 ${current?.status ?? ''}，本次${status === 'SUSPENDED' ? '挂起' : '恢复'}未被采纳`,
+          },
+        }
+      }
+      throw error
+    }
+    if (status === 'SUSPENDED') this._suspended.add(instance.id)
+    else this._suspended.delete(instance.id)
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        id: instance.id,
+        status,
+        reason: reason ?? null,
+        lastSeq: appended.lastSeq,
+        [timeKey]: at,
       },
     }
   }
@@ -3337,6 +3627,16 @@ class BpmnRuntime {
       )
     }
     this._activeAgents.set(instanceId, (this._activeAgents.get(instanceId) ?? 0) + 1)
+    // 在飞活动的定位信息（挂起 409 的可读原因用）；计数仍以 `_activeAgents` 为准。
+    const agentKey = typeof ctx?.executionId === 'string' && ctx.executionId !== ''
+      ? ctx.executionId
+      : `${element?.id ?? 'agent'}:${this._activeAgents.get(instanceId)}`
+    const agentActivities = this._activeAgentActivities.get(instanceId) ?? new Map()
+    agentActivities.set(agentKey, {
+      elementId: typeof element?.id === 'string' && element.id !== '' ? element.id : null,
+      executionId: typeof ctx?.executionId === 'string' && ctx.executionId !== '' ? ctx.executionId : null,
+    })
+    this._activeAgentActivities.set(instanceId, agentActivities)
     // 物理执行生命周期：handler 返回不代表 agent 进程已退出（W4）。
     const lifecycle = createExecutionLifecycle({ cleanupFinalWaitMs: this.cleanupFinalWaitMs })
     const adapters = this.adapters === null ? null : lifecycle.adaptersFor(this.adapters)
@@ -3400,6 +3700,8 @@ class BpmnRuntime {
       }
       const releaseExecution = () => {
         ticket.release()
+        agentActivities.delete(agentKey)
+        if (agentActivities.size === 0) this._activeAgentActivities.delete(instanceId)
         const remaining = (this._activeAgents.get(instanceId) ?? 1) - 1
         if (remaining <= 0) this._activeAgents.delete(instanceId)
         else this._activeAgents.set(instanceId, remaining)
@@ -3487,6 +3789,16 @@ class BpmnRuntime {
         recovered: false,
         reason: '实例正在停止（stop 已置停止闩）',
         code: 'BPMN_STATE_STOPPING',
+      }
+    }
+    // 0.14.3：挂起（SUSPENDED）不是终态，但和终态一样**不得因读而恢复 / 推进**。
+    // 磁盘 status 是权威事实；`_suspended` 覆盖同进程内的交错窗口。
+    if (instance.status === 'SUSPENDED' || this._suspended.has(instance.id)) {
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例 ${instance.id} 已挂起（SUSPENDED）：挂起期间不懒恢复、不派发活动；先 resume 再推进`,
+        code: 'BPMN_STATE_SUSPENDED',
       }
     }
     // 恢复「最后一个成功 agent 输出 + 来源节点」（review-0131 #4）：它随 instance.json
@@ -3700,6 +4012,8 @@ class BpmnRuntime {
     if (TERMINAL_STATUSES.has(instance.status)) return
     // stop 闩生效期间不要再写状态（stop 自己会把实例收成 aborted）。
     if (this._stopping.has(instanceId)) return
+    // 挂起期间任何收口都不得把 status 写回 ACTIVE，也不得改待办。
+    if (instance.status === 'SUSPENDED' || this._suspended.has(instanceId)) return
 
     const status = runner.status()
     const variables = isPlainObject(runner.variables) && Object.keys(runner.variables).length > 0
@@ -3775,6 +4089,8 @@ class BpmnRuntime {
     if (!isPlainObject(event) || typeof event.type !== 'string' || event.type === '') return
     // stop 闩之后的迟到事件（abort 前已在飞的调用）一律不落盘：不能给 aborted 实例补事件。
     if (this._stopping.has(instanceId)) return
+    // 挂起闩同理：挂起后不得再派发 / 落盘任何执行事件（也不得把 status 写回 ACTIVE）。
+    if (this._suspended.has(instanceId)) return
     const runner = this._runners.get(instanceId) ?? null
 
     // recover 重放的 wait：同一 executionId 已经落过盘，不再写第二条。

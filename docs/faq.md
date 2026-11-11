@@ -36,6 +36,6 @@ BPMN 2.0 提供了可执行语义（网关、边界事件、子流程、userTask
 
 ## 怎么在会话里启动实例？
 
-用 11 个实例域工具里的 `flow_definition_list` / `flow_instance_run` / `flow_instance_get` / `flow_instance_events` / `flow_instance_complete_task` / `flow_instance_cancel` 等；旧 `flow_start` / `flow_watch` / `flow_stop` 已删除。
+用 13 个实例域工具里的 `flow_definition_list` / `flow_instance_run` / `flow_instance_get` / `flow_instance_events` / `flow_instance_complete_task` / `flow_instance_cancel` 等；旧 `flow_start` / `flow_watch` / `flow_stop` 已删除。
 
 [会话驱动](guide/session-driven.md)、[Host 接口 · 模型工具](reference/host-api.md#模型工具)。

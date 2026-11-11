@@ -63,7 +63,18 @@ $DSH_HOME/flow-studio/instances/<id>/
 |---|---|---|---|
 | `dsh` | 子 agent 会话注册模型工具 `flow_finish_node`（`agents.create` 的 `setup` 里 `agentCtx.tools.register`，会话级可见） | 工具 handler 记一次完成；`agent/turn-stopping` 时未完成 → `agent.steer(提醒)` 唤醒（native）；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`，`hooks['turn.stop']: native` |
 | `codex` | 插件自带 MCP stdio server 暴露同名工具，`codex exec` 配置 `mcp_servers` 指向它 | 工具调用记完成；原生 `Stop` hook（0.167+）注入提醒（native）；无 hook 能力时用 `codex exec resume <session>` 重发提醒（emulated，进程级）；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测 MCP），`hooks['turn.stop']: native/emulated` |
+| `claude` | 同一个插件自带 MCP stdio server，`claude -p` 用本次进程的 `--mcp-config <0600 文件>` + `--strict-mcp-config` 加载它；凭据只在该文件与子进程 env 里 | 工具调用记完成；默认 `claude -p --resume <session-id>` 进程级续跑（emulated，与 native Stop hook 共用同一个提醒计数）；**握手之后 CLI 自己给出终态错误（认证失败 / result `is_error` / 非零退出码）→ `CLAUDE_PROVIDER_ERROR`，不消耗提醒预算**；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测参数面 + 桥自检），`hooks['turn.stop']: native/emulated`，`usage: native`（调用走 `claude-usage-ledger`，`result.usage` 是范围级结算快照） |
 | 其它/旧版 | 无 | admission 拒绝 | `finishTool: unsupported` |
+
+**证据层次（0.14.5 N1，别把这三层混为一谈）**
+
+| 层次 | 做什么 | 归谁 | Claude 当前状态 |
+|---|---|---|---|
+| ① 参数探测 | `claude --version` / `--help`，用**唯一参数要求表**核对 `-p` / `--output-format` / `--verbose` / `--mcp-config` / `--strict-mcp-config` / `--permission-mode` / `--allowedTools`（或 `--allowed-tools`）/ `--resume` | `probe()`，缺任一项直接拒绝 | 已用假 CLI 夹具验证探测与拒绝逻辑 |
+| ② 桥自检 | `verifyFinishBridge()`：官方 MCP SDK 跑一次**我们自己的** stdio server（initialize / tools.list / tools.call） | `probe()`（`selfTest`） | 已验（真实 MCP 往返） |
+| ③ 真实 CLI 握手 + finish | 真实 `claude -p` 是否拉起本插件的 MCP server、模型是否真的调用 `flow_finish_node` | `scripts/claude-smoke.mjs`（有 CLI 的机器） | **未验证**：本机没有 claude CLI，smoke 明确 `skipped:true`，不代表通过 |
+
+> **真实 Claude CLI 未验证。** 当前证据来自合成 stream-json、真实子进程、真实 MCP/gate 往返；真实 CLI 的 stream-json 版本差异、`--resume` 的用量范围、native Stop hook 的装载与时序、以及 Windows 清理行为都还没有实测。协议或作用域不符合预期时，适配器保留诊断并把相关指标降级为部分观测或未知，不推测完成或完整用量。
 
 工具调用与活动生命周期的关系：`executeAgent` **不返回**直到工具被调用（或失败/超时/取消）。因此 runner 的活动超时照常生效，超时 → `BPMN_ACTIVITY_TIMEOUT`，同时 abort 会话。
 

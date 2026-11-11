@@ -23,7 +23,8 @@
 | 事件 `type` | 关键字段 | 含义 |
 |---|---|---|
 | `agent/invocation` | `invocationId`、`provider`、`phase`（`start` / `reminder`）、`count?`、`attempt?` | 一次真实启动或提醒续跑轮次；初始轮 `invocationId=<executionId>:invoke-1`，第 N 次提醒续跑 `<executionId>:invoke-rN` |
-| `agent/usage` | `provider`、`callId`、`trust`（`known` / `unknown`）、`usage?`、`reason?`、`invocationId?`、`source?` | 一条模型调用观测；同一 `provider + callId` 后到的事件**替换**前一条 |
+| `agent/usage` | `provider`、`callId`、`trust`（`known` / `unknown`）、`usage?`、`reason?`、`invocationId?`、`source?`、`observedBuckets?`、`provisional?`、`synthetic?` | 一条模型调用观测；同一 `provider + callId` 后到的事件**替换**前一条 |
+| `agent/usage-snapshot` | `provider`、`snapshotId`、`scope`（`invocation` / `session-cumulative` / `unknown`）、`usage`、`observedBuckets`、`invocationId?`、`sessionScopeId?`、`agentScope?`、`provenance` | **范围级结算**（如 Claude `result.usage`）：不是一次模型调用、不增加 `modelCalls`；同一 `snapshotId` 取最新。resume 后范围不可证明时 `scope=unknown`，指标只能标未知，不按数值猜 sum / max |
 | `agent/reminder` | `count`、`maxFires?` | `turn.stop` 每次实际触发一次提醒（0.13.1 已有事件） |
 | `http/attempt` | `invocationId`、`attempt`、`method`、`origin`、`path` | HTTP connector 真正发出请求前 |
 | `http/result` | `invocationId`、`attempt?`、`status?`、`durationMs?`、`reused?` | 单次 HTTP 尝试的结果 / 复用结果 |
@@ -31,7 +32,9 @@
 调用身份固定为 **`provider + callId`**：
 
 - `provider` 小写归一（`Dsh` → `dsh`）；无法识别时按 `unknown` 处理，不猜 provider 语义。
-- `callId` 由适配器分配：codex 每轮 `turn.completed` 一个，dsh 每个 `attemptId` 一个。真实的新调用必须有新 `callId`；同一次调用的重复上报是替换，不是第二次调用。
+- `callId` 由适配器分配：codex 每轮 `turn.completed` 一个，dsh 每个 `attemptId` 一个；Claude 由 `claude-usage-ledger.js` 给出稳定身份 `claude-message-v1:<sha256(session|agentScope|message.id)>`（同一 `message.id` 的并行工具块是**同一个**模型响应，重复上报替换而不相加；没有 `message.id` 时标 `synthetic`，不伪造确定调用数）。真实的新调用必须有新 `callId`；同一次调用的重复上报是替换，不是第二次调用。
+- **调用与结算分开**：调用记录只描述模型响应与已观测桶；`result.usage` 这类范围级累计值走 `agent/usage-snapshot`，不塞进调用列表（否则会虚增 `modelCalls` 或制造错误归属）。同一范围、同一桶只选一个来源：有效结算快照覆盖该范围对应桶，没有结算桶时才用去重后的 assistant 观测。
+- **快照必须自证范围**：`provenance.realCliVerified` 只有真实 CLI 实测才允许为 `true`；Claude 账本当前固定写 `false`（**真实 Claude CLI 未验证**，见 design/09 的证据层次），快照的作用域不因此被当作已知。
 - `executionId` 是节点计时 / 人工等待 / 消息投递的主键；`attempt`（元素第几次激活）不承担计时职责。
 
 ## 3 四桶归一化
@@ -44,7 +47,7 @@
 |---|---|---|
 | codex / OpenAI 风格 | `input_tokens`、`cached_input_tokens`、`cache_write_input_tokens`、`output_tokens` | `input_tokens` **已包含**缓存子集：先拆出 `cacheRead` / `cacheWrite`，再从 `input` 里扣掉；`total` 仍等于原始 `input_tokens + output_tokens` |
 | dsh / DeepSeek TokenUsage | `inputTokens`、`cacheReadTokens`、`cacheWriteTokens`、`outputTokens`（互斥） | 不再拆；`cacheRead` 单独成桶，不能加回 input |
-| claude / Anthropic 风格 | `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`（互斥） | 与 dsh 同口径，不拆 input；适配器在边界补 `cache_write_input_tokens` 别名供四桶识别（0.14.2 G） |
+| claude / Anthropic 风格 | `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`（互斥） | 与 dsh 同口径，不拆 input；`claude-usage-ledger.js`（0.14.5）解释调用身份与结算作用域，适配器不再自己按事件计数、也不再把 `result.usage` 当第 N 次调用 |
 | 已有四桶的输入 | `input` / `cacheRead` / `cacheWrite` / `output` | 视为已归一，不二次拆分 |
 
 数据矛盾（`cached > input`）时按原始 input 截断（先读后写），守住「四桶之和 === total」这条不变量；坏数值（负数、字符串、NaN）整条 usage 标 `unknown`，不把坏值当 0。

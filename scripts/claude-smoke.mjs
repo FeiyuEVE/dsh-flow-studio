@@ -21,12 +21,13 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, promises as fsp } from 'node:fs'
+import { mkdirSync, promises as fsp } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createClaudeAdapter } from '../src/agent-adapter-claude.js'
 import { createFinishGate } from '../src/node-finish.js'
+import { discoverClaudeCli } from './claude-cli-discovery.mjs'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SMOKE_TIMEOUT_MS = (() => {
@@ -39,18 +40,9 @@ function emit(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`)
 }
 
+/** CLI 发现走共享 helper（CLAUDE_BIN 优先 → PATH 搜索并校验可执行，m6）。 */
 function findClaudeBin() {
-  const candidates = [
-    process.env.CLAUDE_BIN,
-    '/home/feiyueve/.local/bin/claude',
-    '/usr/local/bin/claude',
-    '/usr/bin/claude',
-    '/opt/homebrew/bin/claude',
-  ].filter(Boolean)
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate
-  }
-  return null
+  return discoverClaudeCli()
 }
 
 /** 给 Promise 加超时；超时返回 `{timedOut:true}`，不抛。 */
@@ -90,14 +82,18 @@ function errorText(error) {
 }
 
 async function main() {
-  const claudeBin = findClaudeBin()
+  const discovered = findClaudeBin()
+  const claudeBin = discovered.found ? discovered.bin : null
   if (claudeBin === null) {
     emit({
       ok: true,
       skipped: true,
       adapter: 'claude',
       reason: 'claude-not-installed',
-      message: '本机没有 claude CLI：真实通道 smoke 未运行（单元测试不能替代真实验收）',
+      // m6：把「查过哪些路径、为什么不算」一起打出来；skipped 只代表没找到 CLI。
+      attempts: discovered.attempts,
+      message: '本机没有 claude CLI（CLAUDE_BIN 与 PATH 都没有可执行文件）：'
+        + '真实通道 smoke 未运行（单元测试不能替代真实验收）',
     })
     return 0
   }
@@ -179,6 +175,7 @@ async function main() {
       skipped: false,
       adapter: 'claude',
       claudeBin,
+      claudeBinSource: discovered.source,
       version: probe.version,
       helpDigest: probe.helpDigest,
       capabilities: {
@@ -209,6 +206,7 @@ async function main() {
       skipped: false,
       adapter: 'claude',
       claudeBin,
+      claudeBinSource: discovered.source,
       reason: error && typeof error.code === 'string' ? error.code : 'smoke-failed',
       message: errorText(error),
       durationMs: Date.now() - startedAt,

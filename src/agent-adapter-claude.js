@@ -20,10 +20,24 @@
  *   - 非交互调用：`claude -p <prompt> --output-format stream-json --verbose`
  *     （官方要求 print + stream-json 配 `--verbose`）。`stream-json` 只用于运行事件、
  *     session id 与 usage；完结判定不看它；
- *   - usage：**每条 `assistant` 事件 = 一次模型调用 = 一条 callId**（source=`assistant`），
- *     交给 `handle.usageCalls()`，与 codex / dsh 同形状供 agent-telemetry 归一化。
- *     `result.usage` 是会话累计值（续跑会带上历史），只在整次执行**一条 usage 都没观测到**
- *     时兜底一次（source=`result`），避免续跑双计；
+ *   - usage：**协议语义交给 `claude-usage-ledger.js`**（0.14.5 M1 / M2）。适配器只做最小
+ *     接线：`assistant` 事件 → `ledger.recordAssistant(event)`（同一 `message.id` 是同一个
+ *     模型响应，重复上报替换而不是相加）；`result` 事件 → `ledger.recordResult(event, {
+ *     invocationId, resumed })` 产出一份**结算快照**（resume 后范围不可证明时 scope=unknown，
+ *     不猜 sum / max）。`handle.usageCalls()` / `handle.usageSnapshots()` 直接暴露账本的
+ *     两份事实，适配器不再自己维护递增 callId、也不再把累计值拼进调用列表；
+ *   - stdout 分帧（0.14.5 M3）：每个子进程（初始 / 每次 resume / probe）独立
+ *     `createUtf8LineReader` + `attachProcessStreams`：UTF-8 跨块安全、EOF flush、超长行
+ *     整行丢弃并诊断、协议缓冲与展示 tail 分离；退出结算**等 stdout 排空**（有界，
+ *     超时标 `outputIncomplete`）；
+ *   - 进程组（0.14.5 M5 / m1）：统一走 `createProcessGroupSupervisor`——完成宽限到期后
+ *     TERM → 等 `killTimeoutMs` → KILL → 确认整组消失；`postFinishGraceMs=0` 只跳过宽限
+ *     等待，不跳过升级；组长先退但后代忽略 TERM 时继续升级；
+ *   - 退出分类（0.14.5 M6）：① gate 已受理 → 完成；② 取消 → 取消；③ 无受理记录时，
+ *     握手前失败 → `NODE_FINISH_TOOL_UNAVAILABLE`（带原原因），握手后 CLI 明确终态错误
+ *     → 稳定错误码 `CLAUDE_PROVIDER_ERROR`（脱敏 code / subtype / message，**不消耗提醒
+ *     预算**）；④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；⑤ 预算耗尽才是
+ *     `NODE_FINISH_MISSING`；
  *   - 沙箱 / 权限：Claude Code 没有 codex `-s` 那种 OS 沙箱；本适配器默认
  *     `--permission-mode acceptEdits`（允许写文件 / 只读命令，其它 shell 命令会被拒绝），
  *     可用 `settings.permissionMode` 显式改成 `auto` / `dontAsk` / `bypassPermissions` 等。
@@ -56,16 +70,28 @@
  * 官方参考：<https://code.claude.com/docs/en/headless>、
  * <https://code.claude.com/docs/en/hooks>、<https://code.claude.com/docs/en/cli-reference>。
  *
+ * ## 证据层次（文档 / capabilities evidence 必须区分，0.14.5 N1）
+ *
+ *   1. **参数探测**：`claude --version` / `claude --help` 的版本与参数面；
+ *   2. **桥自检**：`verifyFinishBridge()` 用官方 MCP SDK 跑一次我们**自己**的 stdio
+ *      server（initialize / tools.list / tools.call），证明桥这一侧可用；
+ *   3. **真实 CLI 握手 + finish**：真实 `claude -p` 是否拉起本插件的 MCP server、模型是否
+ *      真的调用 `flow_finish_node`。**本机没有 claude CLI，第 3 层未验证**，只有
+ *      `scripts/claude-smoke.mjs` 在有 CLI 的机器上能给出结论。
+ *
  * @module @feiyueve/dsh-flow-studio/agent-adapter-claude
  */
 
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, promises as fsp, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
+import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
+import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
+import { createClaudeUsageLedger } from './claude-usage-ledger.js'
 import {
   FINISH_CHANNEL_ENV,
   FINISH_REMINDER_TEXT,
@@ -112,6 +138,105 @@ export const CLAUDE_PERMISSION_MODES = Object.freeze([
 
 const PERMISSION_MODE_SET = new Set(CLAUDE_PERMISSION_MODES)
 const MODEL_PATTERN = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
+
+/**
+ * 稳定的 provider 错误码：**握手之后** CLI 自己给出的终态错误（认证失败 / result
+ * `is_error` / 非零退出码）。它不是「没有调用 finish」，所以不消耗提醒预算。
+ */
+export const CLAUDE_PROVIDER_ERROR_CODE = 'CLAUDE_PROVIDER_ERROR'
+
+/** stream-json 单行上限（原始字节）；600 KiB 的合法事件必须原样通过。 */
+const CLAUDE_MAX_LINE_BYTES = 8 * 1024 * 1024
+/** 展示用 stdout tail 上限。 */
+const CLAUDE_STDOUT_TAIL_BYTES = 64 * 1024
+/** 展示用 stderr tail 上限。 */
+const CLAUDE_STDERR_TAIL_BYTES = 8 * 1024
+/** 子进程退出后等 stdout 排空的上限（有界；超时标 outputIncomplete）。 */
+const CLAUDE_DRAIN_TIMEOUT_MS = 5_000
+/** 保留的流诊断条数（诊断缓存可以裁，计量账本不能）。 */
+const MAX_STREAM_DIAGNOSTICS = 50
+/** 保留的协议事件条数（与旧行为一致）。 */
+const MAX_PROTOCOL_EVENTS = 200
+/** 错误文本脱敏后的字符上限。 */
+const MAX_ERROR_TEXT = 200
+
+/**
+ * **唯一的 CLI 参数要求表**（0.14.5 m4）：probe 拒绝、start 零派发、capabilities
+ * evidence 三处共用这一份。缺失的必需参数不允许「静默省略却仍声称严格隔离」。
+ */
+const CLAUDE_REQUIRED_FLAGS = Object.freeze([
+  { key: 'print', argv: '--print', need: '非交互 -p' },
+  { key: 'outputFormat', argv: '--output-format', need: 'stream-json 运行事件' },
+  { key: 'verbose', argv: '--verbose', need: 'print + stream-json 官方要求 --verbose' },
+  { key: 'mcpConfig', argv: '--mcp-config', need: '加载本次 MCP 配置' },
+  { key: 'strictMcpConfig', argv: '--strict-mcp-config', need: '只加载本次 MCP 配置（严格隔离声明的前提）' },
+  { key: 'permissionMode', argv: '--permission-mode', need: '显式权限档位' },
+  { key: 'allowedTools', argv: '--allowedTools', need: '预授权完结工具' },
+  { key: 'resume', argv: '--resume', need: 'emulated 提醒续跑' },
+])
+
+/** 原生 Stop hook 额外要求的参数（只在 `stopHook:"native"` 时进入要求表）。 */
+const CLAUDE_NATIVE_HOOK_FLAG = Object.freeze({ key: 'settings', argv: '--settings', need: '注入原生 Stop hook' })
+
+/** 按提醒机制返回本次启动真正需要 CLI 认识的参数表。 */
+function requiredFlagEntries(stopHook) {
+  return stopHook === 'native'
+    ? [...CLAUDE_REQUIRED_FLAGS, CLAUDE_NATIVE_HOOK_FLAG]
+    : [...CLAUDE_REQUIRED_FLAGS]
+}
+
+/** `--help` 里是否确认了某个参数（allowedTools 可能是别名字符串）。 */
+function flagPresent(flags, key) {
+  const value = flags && typeof flags === 'object' ? flags[key] : undefined
+  if (key === 'allowedTools') return value === true || typeof value === 'string'
+  return value === true
+}
+
+/**
+ * 归一化 probe 结果里的参数面。
+ *
+ * 真 probe 一定同时给 `flags` 与顶层布尔；但注入的 `probeResult`（测试 / 上层缓存）
+ * 可能只有顶层字段（0.14.2 形状）。这里把两者合并成同一份「实际确认到的参数」，
+ * 参数要求表仍然只查这一份——缺失就是缺失，不猜。
+ */
+function probeFlagsOf(probeValue) {
+  const raw = isPlainObject(probeValue && probeValue.flags) ? probeValue.flags : {}
+  const probe = isPlainObject(probeValue) ? probeValue : {}
+  const pick = (key, legacy) => {
+    if (key === 'allowedTools') {
+      if (typeof raw.allowedTools === 'string' && raw.allowedTools !== '') return raw.allowedTools
+      if (raw.allowedTools === true) return '--allowedTools'
+      return false
+    }
+    if (raw[key] === true) return true
+    return legacy === true
+  }
+  return {
+    print: pick('print', probe.printMode),
+    outputFormat: pick('outputFormat', probe.outputFormat),
+    mcpConfig: pick('mcpConfig', probe.mcpConfig),
+    strictMcpConfig: pick('strictMcpConfig', probe.strictMcpConfig),
+    settings: pick('settings', probe.settingsFlag),
+    resume: pick('resume', probe.resume),
+    sessionId: pick('sessionId', probe.sessionIdFlag),
+    permissionMode: pick('permissionMode', probe.permissionModeFlag),
+    permissionPrompts: pick('permissionPrompts'),
+    allowedTools: pick('allowedTools'),
+    model: pick('model'),
+    verbose: pick('verbose'),
+  }
+}
+
+/** 缺失的必需参数 key 列表。 */
+function missingRequiredFlags(flags, entries) {
+  return entries.filter(entry => !flagPresent(flags, entry.key)).map(entry => entry.key)
+}
+
+/** 实际要拼进 argv 的 `--allowedTools` 别名（probe 确认了哪个就用哪个）。 */
+function resolveAllowedToolsFlag(flags) {
+  const value = flags && typeof flags === 'object' ? flags.allowedTools : undefined
+  return value === '--allowed-tools' ? '--allowed-tools' : '--allowedTools'
+}
 
 /** 解析出的最低主版本：1.x 的 `--mcp-config` / `-p` 行为与本适配器假设不同。 */
 const CLAUDE_MIN_MAJOR = 2
@@ -329,29 +454,50 @@ function normalizeChoice(value, allowed, fallback, field) {
 /**
  * 跑一次 claude 子命令（probe 用），带超时；失败收敛成结果对象，不抛异常。
  * 子进程环境同样走白名单，并叠加 `options.env`（测试 / 特殊接线）。
+ *
+ * 0.14.5 M3：probe 的 stdout/stderr 也走共享分帧 helper——UTF-8 跨块安全、EOF flush、
+ * 超长行不裁剪成半截；只有 `drained`（有界）之后才结算。
  */
 function runOnce(command, args, options = {}) {
   return new Promise(resolvePromise => {
-    let stdout = ''
-    let stderr = ''
+    const lines = []
     let settled = false
     let timer = null
-    let child
+    let child = null
+    let streams = null
     const finish = result => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      try {
+        streams?.dispose()
+      } catch {
+        // 忽略
+      }
       resolvePromise(result)
     }
+    const reader = createUtf8LineReader({
+      maxLineBytes: CLAUDE_MAX_LINE_BYTES,
+      // 只保留需要解析的行（--version / --help 不会超过 4000 行）。
+      onLine: line => {
+        if (lines.length < 4_000) lines.push(line)
+      },
+    })
     try {
       child = spawn(command, args, {
         env: buildChildEnv([isPlainObject(options.env) ? options.env : {}]),
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
-      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout, stderr })
+      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout: '', stderr: '' })
       return
     }
+    streams = attachProcessStreams(child, {
+      stdoutReader: reader,
+      stdoutTailBytes: CLAUDE_STDOUT_TAIL_BYTES,
+      stderrTailBytes: CLAUDE_STDERR_TAIL_BYTES,
+      drainTimeoutMs: CLAUDE_DRAIN_TIMEOUT_MS,
+    })
     const limit = options.timeoutMs || 20_000
     timer = setTimeout(() => {
       try {
@@ -359,20 +505,28 @@ function runOnce(command, args, options = {}) {
       } catch {
         // ignore
       }
-      finish({ ok: false, code: 'TIMEOUT', stdout, stderr })
+      finish({ ok: false, code: 'TIMEOUT', stdout: lines.join('\n'), stderr: streams.stderrTail() })
     }, limit)
     timer.unref?.()
-    child.stdout?.on('data', chunk => {
-      if (stdout.length < 2 * 1024 * 1024) stdout += chunk
-    })
-    child.stderr?.on('data', chunk => {
-      if (stderr.length < 256 * 1024) stderr += chunk
-    })
     child.on('error', error => {
-      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout, stderr })
+      finish({
+        ok: false,
+        code: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+        stdout: lines.join('\n'),
+        stderr: streams.stderrTail(),
+      })
     })
     child.on('exit', (code, signal) => {
-      finish({ ok: code === 0, code: code === null ? 'SIGNAL' : String(code), signal, stdout, stderr })
+      // 结算前先等 stdout 排空（有界）：最后一个事件可能晚于 exit 到达。
+      Promise.resolve(streams.drained).then(() => {
+        finish({
+          ok: code === 0,
+          code: code === null ? 'SIGNAL' : String(code),
+          signal,
+          stdout: lines.join('\n'),
+          stderr: streams.stderrTail(),
+        })
+      })
     })
   })
 }
@@ -488,7 +642,10 @@ function buildStopHookSettings({ hookScriptPath }) {
  * 拼一次 `claude -p` 的 argv。
  *
  * prompt 紧跟 `-p`（官方示例形状）；`--output-format stream-json` 必须配 `--verbose`。
- * 可选参数只在 probe 确认 CLI 认识时才加，避免旧版本把整次启动打成 unknown-option。
+ *
+ * 0.14.5 m4：必需参数**一律拼上**——`start()` 会先用同一份参数要求表核对 probe 结果，
+ * 缺失的参数在那里就拒绝启动，不会走到这里「静默省略却仍声明严格隔离」。`--allowedTools`
+ * 使用 probe 实际确认的别名（老版本只认 `--allowed-tools`）。
  *
  * @param {object} input
  * @returns {string[]}
@@ -498,20 +655,20 @@ function buildClaudeArgs({
 }) {
   const args = ['-p', prompt]
   args.push('--output-format', 'stream-json')
-  if (flags.verbose !== false) args.push('--verbose')
+  args.push('--verbose')
   args.push('--mcp-config', mcpConfigPath)
-  if (flags.strictMcpConfig !== false) args.push('--strict-mcp-config')
-  if (flags.permissionMode !== false) args.push('--permission-mode', permissionMode)
+  args.push('--strict-mcp-config')
+  args.push('--permission-mode', permissionMode)
   if (settingsPath) args.push('--settings', settingsPath)
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId)
-  } else if (sessionId && flags.sessionId === true) {
+  } else if (sessionId && flags && flags.sessionId === true) {
     args.push('--session-id', sessionId)
   }
   if (model) args.push('--model', model)
-  if (flags.allowedTools !== false) args.push('--allowedTools', CLAUDE_FINISH_MCP_TOOL_NAME)
+  args.push(resolveAllowedToolsFlag(flags), CLAUDE_FINISH_MCP_TOOL_NAME)
   // 无人可答权限询问：不让 -p 卡在一个不会有人回答的提示上。旧版本不认识就别加。
-  if (flags.permissionPrompts === true) args.push('--permission-prompts', 'none')
+  if (flags && flags.permissionPrompts === true) args.push('--permission-prompts', 'none')
   return args
 }
 
@@ -565,7 +722,7 @@ export function createClaudeAdapter(options = {}) {
     permissionMode: normalizeChoice(options.permissionMode, PERMISSION_MODE_SET, 'acceptEdits', 'permissionMode'),
     model: typeof options.model === 'string' && options.model.trim() !== '' ? options.model.trim() : undefined,
     agentOptions: isPlainObject(options.agentOptions) ? options.agentOptions : undefined,
-    // 测试 / 故障注入：替换真实进程回收实现。生产不传，走下面的 killTree。
+    // 测试 / 故障注入：替换真实进程组回收实现（透传给共享 supervisor）。
     killImpl: typeof options.killImpl === 'function' ? options.killImpl : null,
     env: isPlainObject(options.env) ? options.env : {},
     selfTest: options.selfTest !== false,
@@ -607,7 +764,10 @@ export function createClaudeAdapter(options = {}) {
       sessionId: /--session-id\b/.test(text),
       permissionMode: /--permission-mode\b/.test(text),
       permissionPrompts: /--permission-prompts\b/.test(text),
-      allowedTools: /(--allowedTools|--allowed-tools)\b/.test(text),
+      // m4：记录实际识别到的别名，argv 用同一个（老版本只有 --allowed-tools）。
+      allowedTools: /--allowedTools\b/.test(text)
+        ? '--allowedTools'
+        : (/--allowed-tools\b/.test(text) ? '--allowed-tools' : false),
       model: /--model\b/.test(text),
       verbose: /--verbose\b/.test(text),
     }
@@ -655,14 +815,15 @@ export function createClaudeAdapter(options = {}) {
       )
     }
     const flags = parseHelpFlags(help.stdout || help.stderr)
-    const missing = ['print', 'outputFormat', 'mcpConfig', 'resume']
-      .filter(name => flags[name] !== true)
+    // m4：唯一参数要求表；缺失任何必需参数都拒绝宣称可用，start 也不会静默省略。
+    const requiredFlags = requiredFlagEntries(settings.stopHook)
+    const missing = missingRequiredFlags(flags, requiredFlags)
     if (missing.length > 0) {
       throw probeInvalid(
         'cli-flags-missing',
         `claude --help 缺少本适配器必需的参数（${missing.join(' / ')}）：`
-          + '无法按 11 §1.6 提供原生 flow_finish_node',
-        { missing },
+          + '无法按 11 §1.6 提供原生 flow_finish_node，也不能声称严格隔离 / 预授权',
+        { missing, required: requiredFlags.map(entry => entry.key) },
       )
     }
 
@@ -701,6 +862,10 @@ export function createClaudeAdapter(options = {}) {
       version: version.raw,
       helpDigest: sha256(`${help.stdout}\n${help.stderr}`).slice(0, 40),
       flags,
+      // 0.14.5 m4：把要求表与「实际确认到的参数」一起带出去，start / capabilities 共用。
+      requiredFlags: requiredFlags.map(entry => entry.key),
+      missingFlags: [],
+      allowedToolsFlag: resolveAllowedToolsFlag(flags),
       printMode: flags.print,
       outputFormat: flags.outputFormat,
       mcpConfig,
@@ -772,10 +937,15 @@ export function createClaudeAdapter(options = {}) {
    */
   function capabilities() {
     const probeValue = readProbeCache()
+    const flags = probeFlagsOf(probeValue)
+    // m4：参数面按**实际探测结果**判定；缺任何一个必需参数（verbose / strict MCP /
+    // permission-mode / allowedTools …）都不再宣称 native 与严格隔离。
+    const missingFlags = missingRequiredFlags(flags, requiredFlagEntries(settings.stopHook))
     const cliOk = Boolean(probeValue
       && probeValue.printMode === true
       && probeValue.outputFormat === true
-      && probeValue.mcpConfig === true)
+      && probeValue.mcpConfig === true
+      && missingFlags.length === 0)
     const bridgeOk = Boolean(probeValue && !(probeValue.bridge && probeValue.bridge.ok === false))
     const finishTool = cliOk && bridgeOk ? 'native' : 'unsupported'
     const hookLevel = resolveHookLevel(probeValue)
@@ -791,14 +961,38 @@ export function createClaudeAdapter(options = {}) {
         finishTool: CLAUDE_FINISH_TOOL_EVIDENCE,
         'turn.stop': hooksContinueEvidence(probeValue, hookLevel),
         messages: ['claude -p 没有可去重的轮次中投递通道：capabilities().messages=unsupported'],
-        usage: ['stream-json 的 assistant 事件 message.usage（input / cache_creation / cache_read / output 互斥）'
-          + '；result.usage 是会话累计值，只在整次执行没有 assistant usage 时兜底一次'],
+        parameters: parametersEvidence(flags, missingFlags),
+        usage: ['assistant 事件 message.usage（input / cache_creation / cache_read / output 互斥）→'
+          + ' claude-usage-ledger 按稳定 message.id 去重（一处调用一条记录）',
+        'result.usage 是**范围级结算快照**（agent/usage-snapshot，scope=invocation / '
+          + 'session-cumulative / unknown）；不当作新增调用，也不把累计值相加'],
         permissionMode: `--permission-mode ${settings.permissionMode}`
           + '（Claude Code 没有 codex -s 的 OS 沙箱；默认不 bypassPermissions）',
         userConfig: CLAUDE_USER_CONFIG_EVIDENCE,
+        evidenceLayers: ['① 参数探测：claude --version / --help',
+          '② 桥自检：verifyFinishBridge（我们自己的 MCP stdio server 往返）',
+          '③ 真实 CLI 握手 + finish：本机未验证，见 scripts/claude-smoke.mjs'],
         realChannel: CLAUDE_UNVERIFIED_EVIDENCE,
       },
     }
+  }
+
+  /** m4：把「参数探测」这一层的结论如实写出来（缺参数时降级，不假装严格隔离）。 */
+  function parametersEvidence(flags, missingFlags) {
+    const entries = requiredFlagEntries(settings.stopHook)
+    const missing = Array.isArray(missingFlags) ? missingFlags : missingRequiredFlags(flags, entries)
+    if (missing.length > 0) {
+      const labels = missing.map(key => {
+        const entry = entries.find(item => item.key === key)
+        return entry ? entry.argv : key
+      })
+      return `参数探测：claude --help 未确认 ${labels.join(' / ')}；`
+        + '适配器不声称严格隔离 / 预授权，start 零派发'
+    }
+    const confirmed = entries.map(entry =>
+      (entry.key === 'allowedTools' ? resolveAllowedToolsFlag(flags) : entry.argv))
+    return `参数探测：probe 从 claude --help 确认 ${confirmed.join(' / ')}；`
+      + 'argv 与要求表同源，没有静默省略'
   }
 
   /**
@@ -826,7 +1020,61 @@ export function createClaudeAdapter(options = {}) {
       + '（按 unsupported 如实声明，不假装能提醒）'
   }
 
+  /**
+   * 启动一次 Claude 活动（0.14.5 M3 / M4 / M5 / M6 / m1 / m4 / m5）。
+   *
+   * 结构：
+   *   1. 入口校验（预 abort、gate 形状、工作区）——零资源，不建目录；
+   *   2. probe + **唯一参数要求表**（m4/m5）：不可用统一抛 TOOL_UNAVAILABLE；
+   *   3. 从创建 runDir 起登记资源（`createResourceRegistry`），参数构造 / spawn
+   *      （含同步异常）/ 握手全部在 protect 范围内（M4）；
+   *   4. 启动成功后返回 handle，退出结算交给 `runSettlement`（等排空，M3/M6）。
+   *
+   * 任何启动失败都走 `cleanupAfterStartFailure`：abort gate、杀掉已登记的进程组
+   * （TERM → KILL 整组确认）、关闭 channel、删除 runDir，并把 `cleanup` /
+   * `cleanupFinal` 挂到错误对象上。
+   */
   async function start(request) {
+    try {
+      return await startAttempt(request)
+    } catch (error) {
+      throw asStartFailure(error)
+    }
+  }
+
+  /**
+   * m5：`start()` 的可用性错误统一成 `NODE_FINISH_TOOL_UNAVAILABLE`（原 code 放
+   * `details.cause`）；参数非法（ADAPTER_INVALID）、预取消（NODE_FINISH_CANCELED）
+   * 保持原分类。probe 自己保留 `ADAPTER_PROBE_INVALID`。
+   */
+  function asStartFailure(error) {
+    if (!(error instanceof ClaudeAdapterError)) return error
+    if (error.code === ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE) return error
+    if (error.code === 'NODE_FINISH_CANCELED') return error
+    if (error.code !== ADAPTER_ERROR.PROBE_INVALID) return error
+    const reason = error.details && typeof error.details.reason === 'string'
+      ? error.details.reason
+      : 'probe-failed'
+    const wrapped = new ClaudeAdapterError(
+      ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+      `Claude 适配器不可用（probe: ${reason}）：${error.message}`,
+      {
+        adapterId: CLAUDE_ADAPTER_ID,
+        field: 'probe',
+        reason,
+        cause: error.code,
+        causeReason: reason,
+        ...(error.details && Array.isArray(error.details.missing)
+          ? { missing: [...error.details.missing] }
+          : {}),
+      },
+    )
+    if (error.cleanup) wrapped.cleanup = error.cleanup
+    if (error.cleanupFinal) wrapped.cleanupFinal = error.cleanupFinal
+    return wrapped
+  }
+
+  async function startAttempt(request) {
     const { element, ctx, finishGate, reminder } = request || {}
     const workspaceRoot = typeof request?.workspaceRoot === 'string' && request.workspaceRoot !== ''
       ? request.workspaceRoot
@@ -882,8 +1130,27 @@ export function createClaudeAdapter(options = {}) {
       )
     }
 
-    // probe 之后才决定能不能启动：不可用 CLI 抛 PROBE_INVALID，绝不先 spawn。
+    // probe 之后才决定能不能启动：probe 自己抛 PROBE_INVALID，start 包装成 TOOL_UNAVAILABLE。
     const probeValue = await probe()
+    const probeFlags = probeFlagsOf(probeValue)
+    const requiredFlags = requiredFlagEntries(settings.stopHook)
+    const missingFlags = missingRequiredFlags(probeFlags, requiredFlags)
+    if (missingFlags.length > 0) {
+      // m4：缺必需参数时就**不派发**——不静默省略 --verbose / --strict-mcp-config /
+      // --permission-mode / --allowedTools，也不声称严格隔离。
+      throw new ClaudeAdapterError(
+        ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        `claude --help 没有确认本适配器必需的参数（${missingFlags.join(' / ')}）：`
+          + '不静默省略，拒绝启动（零派发）',
+        {
+          adapterId: CLAUDE_ADAPTER_ID,
+          field: 'probe',
+          reason: 'cli-flags-missing',
+          cause: ADAPTER_ERROR.PROBE_INVALID,
+          missing: missingFlags,
+        },
+      )
+    }
     const caps = capabilities()
     if (caps.finishTool !== 'native') {
       throw new ClaudeAdapterError(
@@ -892,11 +1159,11 @@ export function createClaudeAdapter(options = {}) {
         {
           adapterId: CLAUDE_ADAPTER_ID,
           reason: probeValue ? 'finish-tool-not-native' : 'probe-failed',
+          cause: ADAPTER_ERROR.PROBE_INVALID,
           nodeId: element && element.id,
         },
       )
     }
-    const flags = isPlainObject(probeValue.flags) ? probeValue.flags : {}
     const hookLevel = caps.hooks['turn.stop']
     const useHook = hookLevel === 'native'
     if (useHook && probeValue.settingsFlag !== true) {
@@ -909,453 +1176,67 @@ export function createClaudeAdapter(options = {}) {
         { adapterId: CLAUDE_ADAPTER_ID, field: 'stopHook', reason: 'settings-flag-missing' },
       )
     }
+    const flags = probeFlags
     const resumeSupported = probeValue.resume === true
-    const model = resolveNodeModel(settings, runnerCtx, element)
-    const prompt = buildClaudeNodePrompt({ element, ctx: runnerCtx, workspaceRoot: workspace })
 
+    /**
+     * 与 `agent-execute` 对齐的调用身份（usageSnapshots / usageCalls 用）。
+     *
+     * executor 的 `invocationId` 是 `${executionId}:invoke-1`（提醒续跑是
+     * `${executionId}:invoke-r<count>`）；`executionId` 优先取 `ctx.executionId`，
+     * 缺失时按 `instance:<nodeId>:<attempt>` 兜底。适配器用同一个 id，指标层才能把
+     * 调用 / 结算快照与 `agent/invocation` 事件归到同一范围（否则覆盖率被误判 unknown）。
+     */
+    const attempt = Number.isSafeInteger(runnerCtx.attempt) && runnerCtx.attempt >= 1
+      ? runnerCtx.attempt
+      : 1
+    const nodeId = nonEmptyTrimmedString(element && element.id) || '(agent)'
+    const executionId = nonEmptyTrimmedString(runnerCtx.executionId)
+      || `${nonEmptyTrimmedString(runnerCtx.instanceId) || 'instance'}:${nodeId}:${attempt}`
+
+    // ---- 资源所有权从 runDir 开始（M4）：失败一律 cleanup ----
     ensurePrivateDir(settings.tmpRoot)
-    const runDir = ensurePrivateDir(await fsp.mkdtemp(join(settings.tmpRoot, 'fs-claude-')))
-    const mcpConfigPath = join(runDir, MCP_CONFIG_NAME)
-    let hookScriptPath = null
-    let settingsPath = null
-    let channel
-    let state
-    let fireReminder = () => {}
+    const resources = createResourceRegistry()
+    const supervisor = createProcessGroupSupervisor({
+      // 完成宽限由下面的 graceTimer 实现：取消必须立刻 TERM，不能被完成宽限拖住。
+      // graceMs=0 仍然执行完整的 TERM → KILL 升级（M5）。
+      graceMs: 0,
+      killTimeoutMs: settings.killTimeoutMs,
+      ...(settings.killImpl ? { killImpl: settings.killImpl } : {}),
+    })
 
-    try {
-      state = {
-        canceled: false,
-        cancelReason: null,
-        channelFailed: false,
-        gateSettled: false,
-        reminders: 0,
-        sessionId: undefined,
-        sessionIdHint: undefined,
-        record: undefined,
-        lastMessage: undefined,
-        usage: undefined,
-        // 0.13.10 / 0.14.2 运行指标：每条 assistant 事件一条调用记录。
-        usageCalls: [],
-        usageCallSeq: 0,
-        resultUsageRecorded: false,
-        resultSubtype: undefined,
-        resultIsError: false,
-        numTurns: undefined,
-        totalCostUsd: undefined,
-        mcpServers: undefined,
-        mcpServerErrors: undefined,
-        assistantError: undefined,
-        exitCode: undefined,
-        signal: undefined,
-        spawnError: null,
-        stdoutTail: '',
-        stderrTail: '',
-        events: [],
-      }
-      channel = await createFinishChannel({
-        gate: finishGate,
-        dir: runDir,
-        maxReminders: settings.reminderLimit,
-        onReminder: info => {
-          state.reminders = Math.max(state.reminders, info.count)
-          fireReminder(info)
-        },
-        onReject: () => {
-          state.channelFailed = true
-        },
-      })
-      // MCP 配置：凭据只在这个 0600 文件与 claude 子进程 env 里出现，不进 argv / 提示词。
-      const mcpConfig = buildMcpConfig({ serverPath: SERVER_PATH, env: channel.env })
-      writeFileSync(mcpConfigPath, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 })
-      if (process.platform !== 'win32') chmodSync(mcpConfigPath, 0o600)
-      if (useHook) {
-        hookScriptPath = join(runDir, HOOK_SCRIPT_NAME)
-        writeFileSync(hookScriptPath, HOOK_SCRIPT_SOURCE, { mode: 0o600 })
-        if (process.platform !== 'win32') chmodSync(hookScriptPath, 0o600)
-        settingsPath = join(runDir, SETTINGS_NAME)
-        writeFileSync(settingsPath, `${JSON.stringify(buildStopHookSettings({ hookScriptPath }), null, 2)}\n`, {
-          mode: 0o600,
-        })
-        if (process.platform !== 'win32') chmodSync(settingsPath, 0o600)
-      }
-    } catch (error) {
-      if (channel) await channel.close().catch(() => {})
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
-      throw error
-    }
-
-    /** 提醒回调只通知一次，异常不影响流程。 */
-    const emitReminder = info => {
-      try {
-        if (reminder && typeof reminder.onFire === 'function') {
-          reminder.onFire({
-            count: info.count,
-            maxFires: info.maxFires !== undefined ? info.maxFires : settings.reminderLimit,
-            ...(state.sessionId ? { sessionId: state.sessionId } : {}),
-          })
-        } else if (typeof reminder === 'function') {
-          reminder({
-            count: info.count,
-            maxFires: info.maxFires !== undefined ? info.maxFires : settings.reminderLimit,
-            ...(state.sessionId ? { sessionId: state.sessionId } : {}),
-          })
-        }
-      } catch {
-        // 回调异常不能改变节点完结判定。
-      }
-    }
-    fireReminder = emitReminder
-
-    // ctx.signal 用来在活动超时时收掉进程组（runner 的取消路径）。
+    let runDir = ''
+    let channel = null
+    let state = null
+    let handle = null
+    let ledger = null
+    let signalListener = null
     let handleRef = null
     let pendingAbort = false
-    let signalListener = null
-    if (runnerCtx.signal && typeof runnerCtx.signal.addEventListener === 'function') {
-      signalListener = () => {
-        if (handleRef) cancelHandle(handleRef, 'ctx.signal').catch(() => {})
-        else pendingAbort = true
-      }
-      runnerCtx.signal.addEventListener('abort', signalListener, { once: true })
-      if (runnerCtx.signal.aborted === true) pendingAbort = true
-    }
-    const removeSignalListener = () => {
-      if (signalListener && runnerCtx.signal && typeof runnerCtx.signal.removeEventListener === 'function') {
-        try {
-          runnerCtx.signal.removeEventListener('abort', signalListener)
-        } catch {
-          // ignore
-        }
-      }
-      signalListener = null
-    }
-
-    let child = null
-    let resumeChild = null
-    let exitedResolve
+    let startFailureCleanup = null
+    let exitedResolve = null
     let exitedDone = false
     let graceTimer = null
-    let forceKillTimer = null
     let disposeDone = false
     let cancelPromise = null
-    let cancelSignalResolve
-    let spawnFailureResolve
-    let earlyExitResolve
+    let cancelSignalResolve = null
+    let spawnFailureResolve = null
+    let earlyExitResolve = null
 
+    const spawnedProcesses = []
+    /** callId → invocationId（适配器侧按进程登记，用于与快照 / agent/invocation 对齐）。 */
+    const callInvocationIds = new Map()
     const cancelSignal = new Promise(resolveCancel => { cancelSignalResolve = resolveCancel })
     const spawnFailure = new Promise(resolveSpawn => { spawnFailureResolve = resolveSpawn })
     const earlyExit = new Promise(resolveExit => { earlyExitResolve = resolveExit })
-    const exited = new Promise(resolveExited => {
-      exitedResolve = resolveExited
+    const exited = new Promise(resolveExitedPromise => { exitedResolve = resolveExitedPromise })
+
+    const sleepUnref = ms => new Promise(resolveSleep => {
+      const timer = setTimeout(resolveSleep, ms)
+      timer.unref?.()
     })
 
-    const resolveExited = value => {
-      if (exitedDone) return
-      exitedDone = true
-      clearTimeout(graceTimer)
-      graceTimer = null
-      clearTimeout(forceKillTimer)
-      forceKillTimer = null
-      removeSignalListener()
-      exitedResolve({
-        // init 事件可能晚于 exit 被解析：显式 --session-id 生成的值同样是稳定 key。
-        sessionId: state.sessionId || state.sessionIdHint,
-        reminders: state.reminders,
-        ...value,
-      })
-    }
-
-    /**
-     * 导出前脱敏：本 execution 的凭据、socket 路径与 runDir 都替换成占位符。
-     * 深度超过 8 层的子树一律替换成占位符——**绝不返回原对象**。
-     */
-    const redactText = text => {
-      let output = typeof text === 'string' ? text : String(text)
-      const secrets = [channel.credential, channel.socketPath, runDir]
-      for (const secret of secrets) {
-        if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')
-      }
-      return output
-    }
-    const redactValue = (value, depth = 0) => {
-      if (typeof value === 'string') return redactText(value)
-      const tooDeep = depth > 8
-      if (Array.isArray(value)) {
-        return tooDeep ? '[redacted:depth]' : value.map(item => redactValue(item, depth + 1))
-      }
-      if (isPlainObject(value)) {
-        if (tooDeep) return '[redacted:depth]'
-        const output = {}
-        for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
-        return output
-      }
-      return value
-    }
-
-    /**
-     * 杀掉 claude 的整个进程树。
-     *
-     * POSIX：负 pid 杀进程组（claude 会拉起 node-finish-mcp.js 子进程）。
-     * Windows：没有 POSIX 进程组，用 `taskkill /T /F` 连子进程一起回收。
-     */
-    const killTree = (signal, target) => {
-      if (typeof settings.killImpl === 'function') {
-        try {
-          settings.killImpl(signal, target || child)
-        } catch {
-          // 注入实现自己负责；这里只保证调用点不炸。
-        }
-        return
-      }
-      const pid = target && target.pid ? target.pid : child && child.pid
-      if (!pid) return
-      if (process.platform === 'win32') {
-        try {
-          spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true })
-        } catch {
-          try {
-            (target || child)?.kill?.()
-          } catch {
-            // 已经退出
-          }
-        }
-        return
-      }
-      try {
-        process.kill(-pid, signal)
-      } catch {
-        try {
-          (target || child)?.kill?.(signal)
-        } catch {
-          // 已经退出
-        }
-      }
-    }
-
-    /** 进程是否仍在运行（exitCode / signalCode 都为空才算活着）。 */
-    const childRunning = target => Boolean(target && target.pid
-      && target.exitCode === null && target.signalCode === null)
-
-    /** 完结后宽限清理的默认目标：**当前活跃执行进程**（初始或最近一次 resume）。 */
-    const activeKillTarget = () => (childRunning(resumeChild) ? resumeChild : child)
-    const killActiveTree = signal => killTree(signal, activeKillTarget())
-
-    /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
-    const abortGate = reason => {
-      try {
-        if (typeof finishGate.abort !== 'function' || finishGate.settled()) return false
-        return finishGate.abort(reason) !== false
-      } catch {
-        return false
-      }
-    }
-
-    const resolveFromGate = async () => {
-      try {
-        const record = await finishGate.result
-        state.record = record
-        resolveExited({ ok: true, code: 'OK', record })
-      } catch (error) {
-        resolveExited({
-          ok: false,
-          code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_ABORTED',
-          message: error && typeof error.message === 'string' ? error.message : '节点完成等待被中止',
-        })
-      }
-    }
-
-    /**
-     * agent 停下但没调工具：MISSING。先 abort 闸门，保证之后的迟到 submit
-     * 得到 `NODE_ALREADY_SETTLED`，而不是把已经失败的节点又 settle 成一份 record。
-     */
-    const finishWithoutTool = () => {
-      if (state.channelFailed) {
-        abortGate('channel-failed')
-        resolveExited({
-          ok: false,
-          code: 'NODE_FINISH_CHANNEL_FAILED',
-          message: '完成通道不可用（凭据 / IPC 失败），节点没有完结',
-        })
-        return
-      }
-      abortGate('finish-tool-missing')
-      resolveExited({
-        ok: false,
-        code: 'NODE_FINISH_MISSING',
-        message: 'agent 停下但没有调用 flow_finish_node，节点没有完结',
-        reminders: state.reminders,
-        ...(state.sessionId ? { sessionId: state.sessionId } : {}),
-      })
-    }
-
-    const scheduleGraceKill = () => {
-      if (state.gateSettled || exitedDone) return
-      state.gateSettled = true
-      if (settings.postFinishGraceMs === 0) {
-        killActiveTree('SIGTERM')
-        return
-      }
-      graceTimer = setTimeout(() => {
-        graceTimer = null
-        killActiveTree('SIGTERM')
-        setTimeout(() => killActiveTree('SIGKILL'), settings.killTimeoutMs).unref?.()
-      }, settings.postFinishGraceMs)
-      graceTimer.unref?.()
-    }
-
-    // 工具一提交成功（或闸门被 abort）就准备收尾：先让 claude 把工具结果带回给模型，
-    // 再在宽限期后收进程组。
-    finishGate.result.then(() => scheduleGraceKill(), () => scheduleGraceKill())
-
-    /**
-     * record 一条 usage（provider + callId，同 codex 形状）。
-     *
-     * Claude / Anthropic 的缓存桶叫 `cache_creation_input_tokens` / `cache_read_input_tokens`，
-     * 与 agent-telemetry 的四桶别名不完全同名；这里在适配器边界补一个
-     * `cache_write_input_tokens` 别名（四桶互斥，不拆 input，绝不双计）。
-     */
-    const recordUsage = (rawUsage, source) => {
-      if (!isPlainObject(rawUsage)) return
-      const usage = { ...rawUsage }
-      if (typeof usage.cache_write_input_tokens !== 'number'
-        && typeof usage.cache_creation_input_tokens === 'number') {
-        usage.cache_write_input_tokens = usage.cache_creation_input_tokens
-      }
-      state.usage = { ...usage }
-      state.usageCallSeq += 1
-      const session = state.sessionId || state.sessionIdHint || 'claude'
-      state.usageCalls.push({
-        provider: CLAUDE_ADAPTER_ID,
-        callId: `${session}:call-${state.usageCallSeq}`,
-        usage: { ...usage },
-        source,
-      })
-      if (state.usageCalls.length > 200) state.usageCalls.splice(0, state.usageCalls.length - 200)
-    }
-
-    /** 从 assistant 消息里取文本（content 是 block 数组或字符串）。 */
-    const assistantText = message => {
-      if (!isPlainObject(message)) return ''
-      if (typeof message === 'string') return message
-      const content = message.content
-      if (typeof content === 'string') return content
-      if (!Array.isArray(content)) return ''
-      return content
-        .filter(block => isPlainObject(block) && block.type === 'text' && typeof block.text === 'string')
-        .map(block => block.text)
-        .join('\n')
-    }
-
-    const lineBuffer = { text: '' }
-    const parseStdout = chunk => {
-      const text = String(chunk)
-      state.stdoutTail = (state.stdoutTail + text).slice(-64 * 1024)
-      lineBuffer.text += text
-      let newline
-      while ((newline = lineBuffer.text.indexOf('\n')) >= 0) {
-        const line = lineBuffer.text.slice(0, newline).trim()
-        lineBuffer.text = lineBuffer.text.slice(newline + 1)
-        if (line === '') continue
-        let event
-        try {
-          event = JSON.parse(line)
-        } catch {
-          continue
-        }
-        if (!isPlainObject(event)) continue
-        if (state.events.length < 200) state.events.push(event)
-        if (typeof event.session_id === 'string' && event.session_id !== '') {
-          state.sessionId = event.session_id
-        }
-        if (event.type === 'system' && event.subtype === 'init') {
-          if (Array.isArray(event.mcp_servers)) {
-            state.mcpServers = event.mcp_servers
-              .filter(entry => isPlainObject(entry) && typeof entry.name === 'string')
-              .map(entry => ({ name: entry.name, status: typeof entry.status === 'string' ? entry.status : undefined }))
-              .slice(0, 32)
-          }
-          if (Array.isArray(event.mcp_server_errors)) {
-            state.mcpServerErrors = event.mcp_server_errors
-              .filter(entry => isPlainObject(entry) && typeof entry.name === 'string')
-              .map(entry => ({ name: entry.name, message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : undefined }))
-              .slice(0, 32)
-          }
-        } else if (event.type === 'assistant') {
-          if (isPlainObject(event.message)) {
-            // 每次 assistant 事件就是一次模型调用：callId 一条一条给。
-            if (isPlainObject(event.message.usage)) recordUsage(event.message.usage, 'assistant')
-            const textValue = assistantText(event.message)
-            if (textValue !== '') state.lastMessage = textValue.slice(0, 2_000)
-          }
-          if (typeof event.error === 'string' && event.error !== '') state.assistantError = event.error
-        } else if (event.type === 'result') {
-          state.resultSubtype = typeof event.subtype === 'string' ? event.subtype : undefined
-          state.resultIsError = event.is_error === true
-          if (Number.isSafeInteger(event.num_turns)) state.numTurns = event.num_turns
-          if (typeof event.total_cost_usd === 'number') state.totalCostUsd = event.total_cost_usd
-          if (typeof event.result === 'string' && event.result.trim() !== '') {
-            state.lastMessage = event.result.slice(0, 2_000)
-          }
-          // result.usage 是会话累计值（续跑会带上历史）。只有整次执行一条 assistant
-          // usage 都没观测到时才兜底一次，避免双计。
-          if (!state.resultUsageRecorded && state.usageCalls.length === 0 && isPlainObject(event.usage)) {
-            state.resultUsageRecorded = true
-            recordUsage(event.usage, 'result')
-          }
-        }
-      }
-      if (lineBuffer.text.length > 512 * 1024) lineBuffer.text = lineBuffer.text.slice(-256 * 1024)
-    }
-
-    const attach = target => {
-      target.stdout?.on('data', parseStdout)
-      target.stderr?.on('data', chunk => {
-        state.stderrTail = (state.stderrTail + String(chunk)).slice(-8 * 1024)
-      })
-      target.on('error', error => {
-        state.spawnError = error
-      })
-      return target
-    }
-
-    /**
-     * 每个 spawn（初始 / 每次 resume / start 失败路径）都登记一份**进程组清理责任**。
-     * 组长退出不等于进程组清空：claude 会拉起 MCP server，后代可能比组长活得久。
-     * 记录只有 `kill(-pgid, 0)` 探针确认整组消失后才算清理完成。
-     */
-    const trackedGroups = new Set()
-    const groupAlive = record => {
-      if (!record.exitConfirmed) return true
-      if (record.pid === null || process.platform === 'win32') return false
-      try {
-        process.kill(-record.pid, 0)
-        return true
-      } catch (error) {
-        return Boolean(error && error.code === 'EPERM')
-      }
-    }
-    const pendingGroups = () => {
-      const pending = []
-      for (const record of trackedGroups) {
-        if (groupAlive(record)) pending.push(record)
-        else trackedGroups.delete(record)
-      }
-      return pending
-    }
-    const cleanupSnapshot = () => {
-      const pending = pendingGroups()
-      if (pending.length === 0) return { disposed: true }
-      return {
-        disposed: false,
-        pending: pending.map(record => record.kind),
-        processes: pending.map(record => ({ kind: record.kind, pid: record.pid })),
-        reason: `仍有 ${pending.length} 个 claude 进程组未确认退出（${pending.map(record => record.kind).join(' / ')}）`,
-      }
-    }
-
-    /**
-     * 独立的**最终清理 Promise**：只有所有被跟踪进程组确认消失才 resolve disposed:true。
-     */
-    const FINAL_CLEANUP_WATCH_MS = Math.min(60_000, Math.max(5_000, settings.killTimeoutMs * 2 + 2_000))
+    const finalCleanupWatchMs = Math.min(60_000, Math.max(5_000, settings.killTimeoutMs * 2 + 2_000))
     let finalCleanupSettled = false
     let resolveFinalCleanup = null
     const cleanupFinal = new Promise(resolveFinal => { resolveFinalCleanup = resolveFinal })
@@ -1364,15 +1245,50 @@ export function createClaudeAdapter(options = {}) {
       finalCleanupSettled = true
       resolveFinalCleanup(value)
     }
-    const sleepUnref = ms => new Promise(resolveSleep => {
-      const timer = setTimeout(resolveSleep, ms)
-      timer.unref?.()
-    })
+
+    /**
+     * 进程组清理快照：`handle.cleanup` 的语义与 0.14.2 一致——**只回答进程组**是否
+     * 确认消失（channel / runDir / listener 归句柄生命周期，dispose 时才释放）。
+     * 完整释放口径见 `releaseSnapshot()`（`cleanupFinal` 用）。
+     */
+    const cleanupSnapshot = () => {
+      const groupSnapshot = supervisor.snapshot()
+      const pendingGroups = groupSnapshot.groups.filter(entry => entry.alive || entry.pending)
+      const resourceSnapshot = resources.snapshot()
+      const release = {
+        released: resourceSnapshot.pending.length === 0,
+        pending: resourceSnapshot.pending.map(entry => entry.kind),
+      }
+      if (pendingGroups.length === 0) return { disposed: true, resources: release }
+      return {
+        disposed: false,
+        pending: pendingGroups.map(entry => entry.label || `process:${entry.pid}`),
+        processes: pendingGroups.map(entry => ({ kind: entry.label, pid: entry.pid, alive: entry.alive })),
+        resources: release,
+        reason: `仍有 ${pendingGroups.length} 个 claude 进程组未确认退出`,
+      }
+    }
+
+    /** 完整释放快照：进程组 + 资源登记表都清空才算 disposed（cleanupFinal / 启动失败）。 */
+    const releaseSnapshot = () => {
+      const groups = cleanupSnapshot()
+      const resourceSnapshot = resources.snapshot()
+      const pendingResources = resourceSnapshot.pending
+      if (groups.disposed === true && pendingResources.length === 0) return { disposed: true }
+      return {
+        ...groups,
+        disposed: false,
+        pendingResources: pendingResources.map(entry => entry.kind),
+        reason: `${groups.disposed === true ? '进程组已消失' : groups.reason}`
+          + `；${pendingResources.length} 项资源未释放`,
+      }
+    }
+
     const watchFinalCleanup = () => {
       ;(async () => {
-        const deadline = Date.now() + FINAL_CLEANUP_WATCH_MS
+        const deadline = Date.now() + finalCleanupWatchMs
         for (;;) {
-          const snapshot = cleanupSnapshot()
+          const snapshot = releaseSnapshot()
           if (snapshot.disposed === true) {
             settleFinalCleanup(snapshot)
             return
@@ -1382,7 +1298,7 @@ export function createClaudeAdapter(options = {}) {
             settleFinalCleanup({
               ...snapshot,
               timedOut: true,
-              reason: `${snapshot.reason}；最终清理等待 ${FINAL_CLEANUP_WATCH_MS}ms 超时`,
+              reason: `${snapshot.reason}；最终清理等待 ${finalCleanupWatchMs}ms 超时`,
             })
             return
           }
@@ -1396,104 +1312,585 @@ export function createClaudeAdapter(options = {}) {
       })
     }
 
-    const trackGroup = (spawned, kind) => {
-      const record = {
-        kind,
-        child: spawned,
-        pid: spawned.pid ?? null,
-        exitConfirmed: false,
-      }
-      spawned.once('exit', () => {
-        record.exitConfirmed = true
-        if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', spawned)
-      })
-      spawned.once('error', () => {
-        if (!spawned.pid) record.exitConfirmed = true
-      })
-      trackedGroups.add(record)
-      return record
-    }
-
-    /** 有界等待所有被跟踪进程组（含组长已退出、后代仍活着的组）消失。 */
-    const waitTrackedGroupsGone = async timeoutMs => {
-      const deadline = Date.now() + Math.max(0, timeoutMs)
-      for (;;) {
-        if (pendingGroups().length === 0) return true
-        const remaining = deadline - Date.now()
-        if (remaining <= 0) return false
-        await sleep(Math.min(remaining, 50))
+    /** 启动失败时的闸门收口（不依赖 try 块里后定义的闭包，避免 TDZ）。 */
+    const abortGateForFailure = reason => {
+      try {
+        if (typeof finishGate.abort !== 'function' || finishGate.settled()) return false
+        return finishGate.abort(reason) !== false
+      } catch {
+        return false
       }
     }
 
-    const killAllTrackedGroups = signal => {
-      for (const record of trackedGroups) {
-        if (record.pid) killTree(signal, record.child)
+    /**
+     * 启动失败清理（M4）：从 runDir 创建那一刻起就可用——abort gate、整组确认退出、
+     * 关 channel、删 runDir，并把结果挂到错误对象的 `cleanup` / `cleanupFinal` 上。
+     */
+    const cleanupAfterStartFailure = async () => {
+      if (state) state.startFailed = true
+      abortGateForFailure('start-failed')
+      await terminateAllGroups('start-failed')
+      await supervisor.disposeAll().catch(() => {})
+      for (const proc of spawnedProcesses) {
+        try {
+          proc.streams.dispose()
+        } catch {
+          // ignore
+        }
       }
+      await resources.disposeAll()
+      const snapshot = releaseSnapshot()
+      watchFinalCleanup()
+      return snapshot
     }
 
-    const spawnClaude = (args, kind) => {
-      const env = buildChildEnv([settings.env, channel.env])
-      const spawned = spawn(settings.claudeBin, args, {
-        cwd: workspace,
-        env,
-        detached: process.platform !== 'win32',
-        stdio: ['ignore', 'pipe', 'pipe'],
+    /** 收掉全部被跟踪进程组：宽限（外部控制）→ TERM → KILL → 整组确认。 */
+    const terminateAllGroups = async reason => {
+      const results = []
+      for (const proc of spawnedProcesses) {
+        if (!proc.group) continue
+        try {
+          results.push(await supervisor.terminateGroup(proc.group, reason))
+        } catch {
+          results.push({ gone: false })
+        }
+      }
+      return results
+    }
+
+    try {
+      runDir = ensurePrivateDir(await fsp.mkdtemp(join(settings.tmpRoot, 'fs-claude-')))
+      resources.add('run-dir', () => fsp.rm(runDir, { recursive: true, force: true }))
+      // 从这里开始任何失败都走统一清理（含参数构造 / 同步 spawn / 握手）。
+      startFailureCleanup = cleanupAfterStartFailure
+
+      const mcpConfigPath = join(runDir, MCP_CONFIG_NAME)
+
+      // 提醒回调只通知一次，异常不影响流程。
+      const emitReminder = info => {
+        try {
+          if (reminder && typeof reminder.onFire === 'function') {
+            reminder.onFire({
+              count: info.count,
+              maxFires: info.maxFires !== undefined ? info.maxFires : settings.reminderLimit,
+              ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+            })
+          } else if (typeof reminder === 'function') {
+            reminder({
+              count: info.count,
+              maxFires: info.maxFires !== undefined ? info.maxFires : settings.reminderLimit,
+              ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+            })
+          }
+        } catch {
+          // 回调异常不能改变节点完结判定。
+        }
+      }
+
+      state = {
+        canceled: false,
+        cancelReason: null,
+        channelFailed: false,
+        gateSettled: false,
+        reminders: 0,
+        sessionId: undefined,
+        sessionIdHint: undefined,
+        record: undefined,
+        lastMessage: undefined,
+        usage: undefined,
+        resultSubtype: undefined,
+        resultIsError: false,
+        numTurns: undefined,
+        totalCostUsd: undefined,
+        mcpServers: undefined,
+        mcpServerErrors: undefined,
+        assistantError: undefined,
+        exitCode: undefined,
+        signal: undefined,
+        spawnError: null,
+        events: [],
+        // 0.14.5 M3 / M6 诊断（小、有界；与用量账本分开）
+        protocolErrors: 0,
+        droppedLines: 0,
+        streamDiagnostics: [],
+        outputDrained: true,
+        outputIncomplete: false,
+        handshakeRequired: settings.helloTimeoutMs > 0,
+        handshakeOk: settings.helloTimeoutMs > 0 ? false : null,
+        startFailed: false,
+        terminalError: null,
+        invocation: {
+          kind: null,
+          invocationId: null,
+          resumed: false,
+          exitCode: undefined,
+          signal: undefined,
+          resultSubtype: undefined,
+          resultIsError: false,
+        },
+      }
+
+      channel = await createFinishChannel({
+        gate: finishGate,
+        dir: runDir,
+        maxReminders: settings.reminderLimit,
+        onReminder: info => {
+          state.reminders = Math.max(state.reminders, info.count)
+          emitReminder(info)
+        },
+        onReject: () => {
+          state.channelFailed = true
+        },
       })
-      trackGroup(spawned, kind)
-      return attach(spawned)
-    }
+      resources.add('finish-channel', () => channel.close())
 
-    const waitExit = target => new Promise(resolveWait => {
-      target.once('exit', (code, signal) => resolveWait({ code, signal }))
-      target.once('error', () => resolveWait({ code: null, signal: null }))
-    })
+      // MCP 配置：凭据只在这个 0600 文件与 claude 子进程 env 里出现，不进 argv / 提示词。
+      const mcpConfig = buildMcpConfig({ serverPath: SERVER_PATH, env: channel.env })
+      writeFileSync(mcpConfigPath, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 })
+      if (process.platform !== 'win32') chmodSync(mcpConfigPath, 0o600)
+      let hookScriptPath = null
+      let settingsPath = null
+      if (useHook) {
+        hookScriptPath = join(runDir, HOOK_SCRIPT_NAME)
+        writeFileSync(hookScriptPath, HOOK_SCRIPT_SOURCE, { mode: 0o600 })
+        if (process.platform !== 'win32') chmodSync(hookScriptPath, 0o600)
+        settingsPath = join(runDir, SETTINGS_NAME)
+        writeFileSync(settingsPath, `${JSON.stringify(buildStopHookSettings({ hookScriptPath }), null, 2)}\n`, {
+          mode: 0o600,
+        })
+        if (process.platform !== 'win32') chmodSync(settingsPath, 0o600)
+      }
 
-    const finishAfterNaturalExit = async () => {
-      if (state.canceled) {
-        abortGate('canceled')
+      /**
+       * 导出前脱敏：本 execution 的凭据、socket 路径与 runDir 都替换成占位符。
+       * 深度超过 8 层的子树一律替换成占位符——**绝不返回原对象**。
+       */
+      const redactText = text => {
+        let output = typeof text === 'string' ? text : String(text)
+        const secrets = [channel.credential, channel.socketPath, runDir]
+        for (const secret of secrets) {
+          if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')
+        }
+        return output
+      }
+      const redactValue = (value, depth = 0) => {
+        if (typeof value === 'string') return redactText(value)
+        const tooDeep = depth > 8
+        if (Array.isArray(value)) {
+          return tooDeep ? '[redacted:depth]' : value.map(item => redactValue(item, depth + 1))
+        }
+        if (isPlainObject(value)) {
+          if (tooDeep) return '[redacted:depth]'
+          const output = {}
+          for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
+          return output
+        }
+        return value
+      }
+      const boundText = (value, limit = MAX_ERROR_TEXT) =>
+        redactText(value === undefined || value === null ? '' : String(value)).slice(0, limit)
+      const streamsTail = (picker, limit) => redactText(
+        spawnedProcesses.map(proc => (proc.streams ? picker(proc.streams) : '')).join('').slice(-limit),
+      )
+
+      /** 小、有界的流诊断（与计量账本分开；计量绝不按诊断上限裁剪）。 */
+      const recordStreamDiagnostic = (diagnostic, source) => {
+        const entry = {
+          kind: typeof diagnostic?.kind === 'string' ? diagnostic.kind.slice(0, 64) : 'stream',
+          ...(source ? { source: String(source).slice(0, 32) } : {}),
+          ...(Number.isSafeInteger(diagnostic?.lineNo) ? { lineNo: diagnostic.lineNo } : {}),
+          ...(Number.isSafeInteger(diagnostic?.bytes) ? { bytes: diagnostic.bytes } : {}),
+          ...(typeof diagnostic?.message === 'string'
+            ? { message: redactText(diagnostic.message).slice(0, 160) }
+            : {}),
+        }
+        if (entry.kind === 'line-too-long') state.droppedLines += 1
+        if (entry.kind === 'drain-timeout' || entry.kind === 'stdout-closed-early') {
+          state.outputIncomplete = true
+        }
+        if (state.streamDiagnostics.length >= MAX_STREAM_DIAGNOSTICS) return
+        state.streamDiagnostics.push(entry)
+      }
+
+      ledger = createClaudeUsageLedger({ provider: CLAUDE_ADAPTER_ID })
+
+      /** 从 current invocation 的 result 事件抽取**脱敏、有界**的终态错误（M6）。 */
+      const recordTerminalError = event => {
+        const firstError = Array.isArray(event.errors) && typeof event.errors[0] === 'string'
+          ? event.errors[0]
+          : null
+        const code = boundText(
+          firstError
+            || state.assistantError
+            || 'cli-result-error',
+          120,
+        )
+        const rawMessage = typeof event.result === 'string' && event.result.trim() !== ''
+          ? event.result
+          : (Array.isArray(event.errors) ? event.errors.join('; ') : '')
+        state.terminalError = {
+          code,
+          subtype: typeof event.subtype === 'string' ? event.subtype.slice(0, 64) : undefined,
+          message: boundText(rawMessage),
+        }
+        state.invocation.resultIsError = true
+      }
+
+      /** 从 assistant 消息里取文本（content 是 block 数组或字符串）。 */
+      const assistantText = message => {
+        if (!isPlainObject(message)) return ''
+        if (typeof message === 'string') return message
+        const content = message.content
+        if (typeof content === 'string') return content
+        if (!Array.isArray(content)) return ''
+        return content
+          .filter(block => isPlainObject(block) && block.type === 'text' && typeof block.text === 'string')
+          .map(block => block.text)
+          .join('\n')
+      }
+
+      /** 一条已完成的协议行（EOF flush / 换行都由 reader 交付）。 */
+      const handleProtocolLine = line => {
+        let event
+        try {
+          event = JSON.parse(line)
+        } catch {
+          state.protocolErrors += 1
+          recordStreamDiagnostic({ kind: 'invalid-json', bytes: Buffer.byteLength(line, 'utf8') }, 'protocol')
+          return
+        }
+        if (!isPlainObject(event)) {
+          state.protocolErrors += 1
+          recordStreamDiagnostic({ kind: 'non-object-json' }, 'protocol')
+          return
+        }
+        if (state.events.length < MAX_PROTOCOL_EVENTS) state.events.push(event)
+        if (typeof event.session_id === 'string' && event.session_id !== '') {
+          state.sessionId = event.session_id
+        }
+        if (event.type === 'system' && event.subtype === 'init') {
+          if (Array.isArray(event.mcp_servers)) {
+            state.mcpServers = event.mcp_servers
+              .filter(entry => isPlainObject(entry) && typeof entry.name === 'string')
+              .map(entry => ({ name: entry.name, status: typeof entry.status === 'string' ? entry.status : undefined }))
+              .slice(0, 32)
+          }
+          if (Array.isArray(event.mcp_server_errors)) {
+            state.mcpServerErrors = event.mcp_server_errors
+              .filter(entry => isPlainObject(entry) && typeof entry.name === 'string')
+              .map(entry => ({
+                name: entry.name,
+                message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : undefined,
+              }))
+              .slice(0, 32)
+          }
+        } else if (event.type === 'assistant') {
+          // M1：调用身份 / 去重由账本负责（同一 message.id 是同一个模型响应）。
+          const recorded = ledger.recordAssistant(event)
+          if (recorded && typeof recorded.callId === 'string' && state.invocation.invocationId) {
+            if (!callInvocationIds.has(recorded.callId)) {
+              callInvocationIds.set(recorded.callId, state.invocation.invocationId)
+            }
+          }
+          if (isPlainObject(event.message)) {
+            if (isPlainObject(event.message.usage)) {
+              const usage = { ...event.message.usage }
+              if (typeof usage.cache_write_input_tokens !== 'number'
+                && typeof usage.cache_creation_input_tokens === 'number') {
+                usage.cache_write_input_tokens = usage.cache_creation_input_tokens
+              }
+              state.usage = usage
+            }
+            const textValue = assistantText(event.message)
+            if (textValue !== '') state.lastMessage = textValue.slice(0, 2_000)
+          }
+          if (typeof event.error === 'string' && event.error !== '') {
+            state.assistantError = boundText(event.error, 160)
+          }
+        } else if (event.type === 'result') {
+          state.resultSubtype = typeof event.subtype === 'string' ? event.subtype : undefined
+          state.resultIsError = event.is_error === true
+          state.invocation.resultSubtype = state.resultSubtype
+          state.invocation.resultIsError = state.resultIsError
+          if (Number.isSafeInteger(event.num_turns)) state.numTurns = event.num_turns
+          if (typeof event.total_cost_usd === 'number') state.totalCostUsd = event.total_cost_usd
+          if (typeof event.result === 'string' && event.result.trim() !== '') {
+            state.lastMessage = event.result.slice(0, 2_000)
+          }
+          // M2：result 是**范围级结算快照**，不增加模型调用数；resumed 必须如实传
+          // （传错会让会话累计值被当成 invocation 相加）。
+          ledger.recordResult(event, {
+            ...(state.invocation.invocationId ? { invocationId: state.invocation.invocationId } : {}),
+            resumed: state.invocation.resumed === true,
+          })
+          if (state.resultIsError === true
+            || (typeof event.subtype === 'string' && event.subtype !== 'success')) {
+            recordTerminalError(event)
+          }
+        }
+      }
+
+      /**
+       * spawn 一个 claude 进程（初始 / 每次 resume）并登记：
+       *   - 独立 `createUtf8LineReader` + `attachProcessStreams`（M3）；
+       *   - 进程组 supervisor（M5 / m1）；
+       *   - 资源登记表里的 stream dispose。
+       * 同步 spawn 异常（E2BIG 等）转成 TOOL_UNAVAILABLE，由外层 protect 清理（M4）。
+       */
+      const spawnClaude = (args, kind, invocationId) => {
+        const proc = {
+          kind,
+          invocationId,
+          resumed: kind === 'resume',
+          child: null,
+          group: null,
+          streams: null,
+          exit: null,
+        }
+        state.invocation = {
+          kind,
+          invocationId,
+          resumed: proc.resumed,
+          exitCode: undefined,
+          signal: undefined,
+          resultSubtype: undefined,
+          resultIsError: false,
+        }
+        const reader = createUtf8LineReader({
+          maxLineBytes: CLAUDE_MAX_LINE_BYTES,
+          onLine: line => handleProtocolLine(line),
+          onDiagnostic: diagnostic => recordStreamDiagnostic(diagnostic, kind),
+        })
+        let child
+        try {
+          child = spawn(settings.claudeBin, args, {
+            cwd: workspace,
+            env: buildChildEnv([settings.env, channel.env]),
+            detached: process.platform !== 'win32',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+        } catch (error) {
+          throw new ClaudeAdapterError(
+            ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+            `Claude 进程无法启动（${error && error.code ? error.code : 'SPAWN_FAILED'}）：`
+              + '参数或环境不可用，节点零派发',
+            {
+              adapterId: CLAUDE_ADAPTER_ID,
+              field: 'spawn',
+              reason: 'spawn-failed',
+              cause: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+            },
+          )
+        }
+        proc.child = child
+        proc.streams = attachProcessStreams(child, {
+          stdoutReader: reader,
+          stdoutTailBytes: CLAUDE_STDOUT_TAIL_BYTES,
+          stderrTailBytes: CLAUDE_STDERR_TAIL_BYTES,
+          drainTimeoutMs: CLAUDE_DRAIN_TIMEOUT_MS,
+        })
+        resources.add(`process-${kind}`, () => proc.streams.dispose())
+        if (Number.isSafeInteger(child.pid) && child.pid > 0) {
+          proc.group = supervisor.track(child, { label: `${kind}:${child.pid}` })
+        }
+        proc.exit = new Promise(resolveExit => {
+          let settled = false
+          const settleExit = (code, signal, error) => {
+            if (settled) return
+            settled = true
+            state.exitCode = code
+            state.signal = signal
+            state.invocation.exitCode = code
+            state.invocation.signal = signal
+            resolveExit({ code, signal, error })
+          }
+          child.once('exit', (code, signal) => settleExit(code, signal, null))
+          child.once('error', error => {
+            state.spawnError = error
+            if (!Number.isSafeInteger(child.pid)) settleExit(null, null, error)
+          })
+        })
+        child.once('error', error => {
+          state.spawnError = error
+          spawnFailureResolve?.({
+            code: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+          })
+        })
+        child.once('exit', (code, signal) => {
+          if (!channel.contacted && !state.canceled) earlyExitResolve?.({ code, signal })
+        })
+        spawnedProcesses.push(proc)
+        return proc
+      }
+
+      /**
+       * 等一个进程结束并**排空 stdout**（M3）。排空是有界的：超时/提前关闭记诊断并标
+       * `outputIncomplete`。排空之后再收掉整组——后代可能继承 stdout，必须先让协议
+       * 数据读完再清理。
+       */
+      const awaitProcessEnd = async proc => {
+        const info = await proc.exit
+        if (info.error) state.spawnError = info.error
+        let drain = { drained: false, timedOut: false }
+        try {
+          drain = await proc.streams.drained
+        } catch {
+          drain = { drained: false, timedOut: false }
+        }
+        if (drain.timedOut === true) {
+          state.outputIncomplete = true
+          recordStreamDiagnostic({ kind: 'drain-timeout', process: proc.kind }, 'stream')
+        } else if (drain.drained !== true && !state.canceled && !disposeDone) {
+          state.outputIncomplete = true
+          recordStreamDiagnostic({ kind: 'stdout-not-drained', process: proc.kind }, 'stream')
+        }
+        state.outputDrained = state.outputDrained && drain.drained === true
+        if (proc.group) {
+          try {
+            await supervisor.terminateGroup(proc.group, 'process-exit')
+          } catch {
+            // 清理失败由 cleanup / cleanupFinal 如实报告，不改业务结局。
+          }
+        }
+        return { ...info, drained: drain.drained === true, outputTimedOut: drain.timedOut === true }
+      }
+
+      /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
+      const abortGate = reason => {
+        try {
+          if (typeof finishGate.abort !== 'function' || finishGate.settled()) return false
+          return finishGate.abort(reason) !== false
+        } catch {
+          return false
+        }
+      }
+
+      /** 终态错误：握手之后 CLI 自己给出的错误（result is_error / 非 success / 非零退出码）。 */
+      const terminalErrorFor = invocation => {
+        if (!invocation) return null
+        if (invocation.resultIsError === true) {
+          return state.terminalError || {
+            code: 'cli-result-error',
+            subtype: invocation.resultSubtype,
+            message: '',
+          }
+        }
+        if (typeof invocation.resultSubtype === 'string' && invocation.resultSubtype !== 'success') {
+          return {
+            code: (state.terminalError && state.terminalError.code) || 'cli-result-error',
+            subtype: invocation.resultSubtype,
+            message: (state.terminalError && state.terminalError.message) || '',
+          }
+        }
+        if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
+          return {
+            code: 'cli-exit-nonzero',
+            subtype: invocation.resultSubtype,
+            message: `claude 以退出码 ${invocation.exitCode} 结束`,
+          }
+        }
+        return null
+      }
+
+      const providerErrorMessage = terminal => {
+        const label = `code=${terminal.code}${terminal.subtype ? `, subtype=${terminal.subtype}` : ''}`
+        return boundText(
+          `Claude CLI 给出终态错误（${label}）${terminal.message ? `：${terminal.message}` : ''}；`
+            + '节点没有完结——这是执行错误，不是「没调用 finish」，不消耗提醒预算',
+          500,
+        )
+      }
+
+      const resolveExited = value => {
+        if (exitedDone) return
+        exitedDone = true
+        if (graceTimer) {
+          clearTimeout(graceTimer)
+          graceTimer = null
+        }
+        if (signalListener && runnerCtx.signal
+          && typeof runnerCtx.signal.removeEventListener === 'function') {
+          try {
+            runnerCtx.signal.removeEventListener('abort', signalListener)
+          } catch {
+            // ignore
+          }
+        }
+        exitedResolve({
+          // init 事件可能晚于 exit 被解析：显式 --session-id 生成的值同样是稳定 key。
+          sessionId: state.sessionId || state.sessionIdHint,
+          reminders: state.reminders,
+          ...value,
+        })
+      }
+
+      const resolveFromGate = async () => {
+        try {
+          const record = await finishGate.result
+          state.record = record
+          resolveExited({ ok: true, code: 'OK', record })
+        } catch (error) {
+          resolveExited({
+            ok: false,
+            code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_ABORTED',
+            message: error && typeof error.message === 'string' ? error.message : '节点完成等待被中止',
+          })
+        }
+      }
+
+      /**
+       * agent 停下但没调工具：MISSING。先 abort 闸门，保证之后的迟到 submit
+       * 得到 `NODE_ALREADY_SETTLED`，而不是把已经失败的节点又 settle 成一份 record。
+       */
+      const finishWithoutTool = () => {
+        if (state.channelFailed) {
+          abortGate('channel-failed')
+          resolveExited({
+            ok: false,
+            code: 'NODE_FINISH_CHANNEL_FAILED',
+            message: '完成通道不可用（凭据 / IPC 失败），节点没有完结',
+          })
+          return
+        }
+        abortGate('finish-tool-missing')
         resolveExited({
           ok: false,
-          code: 'NODE_FINISH_CANCELED',
-          message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
+          code: 'NODE_FINISH_MISSING',
+          message: 'agent 停下但没有调用 flow_finish_node，节点没有完结',
+          reminders: state.reminders,
+          ...(state.sessionId ? { sessionId: state.sessionId } : {}),
         })
-        return
       }
-      if (finishGate.settled()) {
-        await resolveFromGate()
-        return
+
+      /** 完成宽限：到期后整组 TERM → KILL（M5：grace=0 只跳过等待，不跳过升级）。 */
+      const scheduleGraceKill = () => {
+        if (state.gateSettled || exitedDone) return
+        state.gateSettled = true
+        const fire = () => {
+          graceTimer = null
+          terminateAllGroups('post-finish').catch(() => {})
+        }
+        if (settings.postFinishGraceMs === 0) {
+          fire()
+          return
+        }
+        graceTimer = setTimeout(fire, settings.postFinishGraceMs)
+        graceTimer.unref?.()
       }
-      if (state.spawnError && !(child && child.pid)) {
-        abortGate('spawn-failed')
-        resolveExited({
-          ok: false,
-          code: 'NODE_FINISH_CHANNEL_FAILED',
-          message: `Claude 进程启动失败（${state.spawnError.code || 'unknown'}）`,
-        })
-        return
-      }
-      const remaining = settings.reminderLimit - state.reminders
-      // 没有 resume 能力就没有提醒机制：直接 MISSING（capabilities 已如实标 unsupported）。
-      if (!resumeSupported || remaining <= 0 || !state.sessionId) {
-        finishWithoutTool()
-        return
-      }
-      // native hook 没触发（例如 hooks 被用户配置关掉）或本来就走 emulated：进程级续跑。
-      // 提醒次数与 native hook 共用通道的同一个计数器：不会各提醒三次。
-      while (state.reminders < settings.reminderLimit && !state.canceled) {
-        state.reminders += 1
-        emitReminder({ count: state.reminders, maxFires: settings.reminderLimit })
-        resumeChild = spawnClaude(buildClaudeArgs({
-          prompt: FINISH_REMINDER_TEXT,
-          mcpConfigPath,
-          // resume 是 emulated 兜底：不再注入 Stop hook，提醒次数由本循环唯一计数。
-          settingsPath: null,
-          permissionMode: settings.permissionMode,
-          model,
-          resumeSessionId: state.sessionId,
-          flags,
-        }), 'resume')
-        await waitExit(resumeChild)
-        resumeChild = null
+
+      // 工具一提交成功（或闸门被 abort）就准备收尾：先让 claude 把工具结果带回给模型，
+      // 再在宽限期后收进程组。
+      finishGate.result.then(() => scheduleGraceKill(), () => scheduleGraceKill())
+
+      /**
+       * M6 退出分类（顺序固定）：
+       *   ① gate 已受理 → 完成；② 取消 → 取消；
+       *   ③ 无受理记录：握手前失败 → TOOL_UNAVAILABLE（带原原因）；
+       *      握手后明确终态错误 → CLAUDE_PROVIDER_ERROR（不消耗提醒预算）；
+       *   ④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；
+       *   ⑤ 提醒预算耗尽才是 NODE_FINISH_MISSING。
+       */
+      const finishAfterNaturalExit = async () => {
         if (state.canceled) {
           abortGate('canceled')
           resolveExited({
@@ -1507,281 +1904,394 @@ export function createClaudeAdapter(options = {}) {
           await resolveFromGate()
           return
         }
-      }
-      finishWithoutTool()
-    }
-
-    // 初始 session id：probe 确认 CLI 支持 --session-id 时显式指定 UUID，
-    // 这样即使 stream-json 没来得及给出 session_id，续跑也有稳定的 key。
-    const sessionId = randomUUID()
-    state.sessionIdHint = sessionId
-    child = spawnClaude(buildClaudeArgs({
-      prompt,
-      mcpConfigPath,
-      settingsPath,
-      permissionMode: settings.permissionMode,
-      model,
-      sessionId,
-      flags,
-    }), 'initial')
-
-    const mainPid = child.pid
-
-    child.on('error', error => {
-      state.spawnError = error
-      if (!mainPid) {
-        resolveExited({
-          ok: false,
-          code: 'NODE_FINISH_CHANNEL_FAILED',
-          message: `Claude 进程启动失败（${error && error.code ? error.code : 'unknown'}）`,
-        })
-        spawnFailureResolve?.({ code: error && error.code ? String(error.code) : 'SPAWN_FAILED' })
-      }
-    })
-    child.on('exit', (code, signal) => {
-      state.exitCode = code
-      state.signal = signal
-      if (!channel.contacted && !state.canceled) earlyExitResolve?.({ code, signal })
-      finishAfterNaturalExit().catch(error => {
-        resolveExited({
-          ok: false,
-          code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_CHANNEL_FAILED',
-          message: error && error.message ? error.message : 'Claude 收尾失败',
-        })
-      })
-    })
-
-    const handle = {
-      get pid() {
-        return child && child.pid ? child.pid : undefined
-      },
-      get sessionId() {
-        return state.sessionId || state.sessionIdHint
-      },
-      get reminders() {
-        return state.reminders
-      },
-      get record() {
-        return state.record
-      },
-      get lastMessage() {
-        return state.lastMessage === undefined ? undefined : redactText(state.lastMessage)
-      },
-      get usage() {
-        return state.usage
-      },
-      /**
-       * 本次执行观测到的全部模型调用 usage（每条 assistant 事件一个 callId）。
-       * agent-execute 在任何结局收尾时读它：超时 / 取消 / 未 finish 已花的 token
-       * 不能因为没走到 activity/end 就丢失。
-       */
-      usageCalls() {
-        return state.usageCalls.map(call => ({
-          ...call,
-          usage: { ...call.usage },
-        }))
-      },
-      /** 诊断用：每次返回**脱敏后的深拷贝**；完结判定不看这些。 */
-      get events() {
-        return redactValue(state.events)
-      },
-      get stdoutTail() {
-        return redactText(state.stdoutTail)
-      },
-      get stderrTail() {
-        return redactText(state.stderrTail)
-      },
-      get diagnostics() {
-        return redactValue({
-          resultSubtype: state.resultSubtype,
-          resultIsError: state.resultIsError,
-          numTurns: state.numTurns,
-          totalCostUsd: state.totalCostUsd,
-          mcpServers: state.mcpServers,
-          mcpServerErrors: state.mcpServerErrors,
-          exitCode: state.exitCode,
-          signal: state.signal,
-          permissionMode: settings.permissionMode,
-        })
-      },
-      exited,
-      get cleanup() {
-        return cleanupSnapshot()
-      },
-      cleanupFinal,
-      cancel: reason => cancelHandle(handle, reason),
-      dispose: () => disposeHandle(handle),
-    }
-
-    handleRef = handle
-    if (pendingAbort) {
-      cancelHandle(handle, 'ctx.signal').catch(() => {})
-    }
-
-    /**
-     * start 阶段失败也必须等**物理清理**：按进程组有界等待；未确认就如实返回
-     * `disposed:false + reason`（挂到错误对象上供调用方识别）。
-     */
-    const cleanupAfterStartFailure = async () => {
-      killAllTrackedGroups('SIGTERM')
-      let gone = await waitTrackedGroupsGone(settings.killTimeoutMs)
-      if (!gone) {
-        killAllTrackedGroups('SIGKILL')
-        gone = await waitTrackedGroupsGone(1_000)
-      }
-      removeSignalListener()
-      try {
-        await channel.close()
-      } catch {
-        // ignore
-      }
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
-      watchFinalCleanup()
-      return { cleanup: cleanupSnapshot(), cleanupFinal, gone }
-    }
-
-    const attachCleanup = (error, outcome) => {
-      if (error && typeof error === 'object' && outcome) {
-        error.cleanup = outcome.cleanup
-        error.cleanupFinal = outcome.cleanupFinal
-      }
-      return error
-    }
-
-    // 等 MCP server 第一次连上通道：说明 claude 真的把它拉起来了（probe 只验证了自己
-    // 这一侧）。等不到就按「工具通道不可用」失败（不允许静默降级）。
-    if (settings.helloTimeoutMs > 0) {
-      const outcome = await Promise.race([
-        channel.firstContact.then(() => 'contacted').catch(() => 'contact-failed'),
-        new Promise(resolveWait => {
-          const timer = setTimeout(() => resolveWait('timeout'), settings.helloTimeoutMs)
-          timer.unref?.()
-        }),
-        cancelSignal.then(() => 'canceled'),
-        spawnFailure.then(() => 'spawn-failed'),
-        earlyExit.then(() => 'exited'),
-      ])
-      const contacted = outcome === 'contacted'
-      if (!contacted) {
-        if (state.canceled) {
-          abortGate('canceled')
-          const cleanupOutcome = await cleanupAfterStartFailure()
-          throw attachCleanup(new ClaudeAdapterError(
-            'NODE_FINISH_CANCELED',
-            'Claude 活动在 MCP 握手期间被取消（finish.sock 与 runDir 已清理）',
-            { adapterId: CLAUDE_ADAPTER_ID, reason: 'canceled-during-handshake' },
-          ), cleanupOutcome)
+        if (state.startFailed) return
+        if (state.handshakeRequired && state.handshakeOk !== true) {
+          abortGate('cli-unavailable-before-handshake')
+          const cause = state.terminalError || (state.assistantError
+            ? { code: state.assistantError, message: '' }
+            : null)
+          resolveExited({
+            ok: false,
+            code: ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+            message: boundText(
+              `Claude CLI 在 MCP 握手前就不可用（exit=${state.invocation.exitCode === undefined
+                ? 'none'
+                : state.invocation.exitCode}${cause ? `, cli=${cause.code}` : ''}）：`
+                + 'flow_finish_node 没有被加载，节点零完结',
+              500,
+            ),
+            ...(cause ? { error: { code: cause.code, subtype: cause.subtype, message: cause.message } } : {}),
+            reminders: state.reminders,
+          })
+          return
         }
-        if (!finishGate.settled()) {
-          abortGate('mcp-handshake-failed')
+        const terminal = terminalErrorFor(state.invocation)
+        if (terminal) {
+          // 握手后明确终态错误：稳定 provider 错误码，**不再提醒 / 续跑**。
+          abortGate('cli-terminal-error')
+          resolveExited({
+            ok: false,
+            code: CLAUDE_PROVIDER_ERROR_CODE,
+            message: providerErrorMessage(terminal),
+            error: {
+              code: terminal.code,
+              ...(terminal.subtype ? { subtype: terminal.subtype } : {}),
+              ...(terminal.message ? { message: terminal.message } : {}),
+            },
+            reminders: state.reminders,
+          })
+          return
+        }
+        if (state.channelFailed) {
+          finishWithoutTool()
+          return
+        }
+        const remaining = settings.reminderLimit - state.reminders
+        // 没有 resume 能力就没有提醒机制：直接 MISSING（capabilities 已如实标 unsupported）。
+        if (!resumeSupported || remaining <= 0 || !state.sessionId) {
+          finishWithoutTool()
+          return
+        }
+        // native hook 没触发（例如 hooks 被用户配置关掉）或本来就走 emulated：进程级续跑。
+        // 提醒次数与 native hook 共用通道的同一个计数器：不会各提醒三次。
+        while (state.reminders < settings.reminderLimit && !state.canceled) {
+          state.reminders += 1
+          emitReminder({ count: state.reminders, maxFires: settings.reminderLimit })
+          const resumeProc = spawnClaude(buildClaudeArgs({
+            prompt: FINISH_REMINDER_TEXT,
+            mcpConfigPath,
+            // resume 是 emulated 兜底：不再注入 Stop hook，提醒次数由本循环唯一计数。
+            settingsPath: null,
+            permissionMode: settings.permissionMode,
+            model,
+            resumeSessionId: state.sessionId,
+            flags,
+          }), 'resume', `${executionId}:invoke-r${state.reminders}`)
+          await awaitProcessEnd(resumeProc)
+          if (state.canceled) {
+            abortGate('canceled')
+            resolveExited({
+              ok: false,
+              code: 'NODE_FINISH_CANCELED',
+              message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
+            })
+            return
+          }
+          if (finishGate.settled()) {
+            await resolveFromGate()
+            return
+          }
+          const resumeTerminal = terminalErrorFor(state.invocation)
+          if (resumeTerminal) {
+            abortGate('cli-terminal-error')
+            resolveExited({
+              ok: false,
+              code: CLAUDE_PROVIDER_ERROR_CODE,
+              message: providerErrorMessage(resumeTerminal),
+              error: {
+                code: resumeTerminal.code,
+                ...(resumeTerminal.subtype ? { subtype: resumeTerminal.subtype } : {}),
+                ...(resumeTerminal.message ? { message: resumeTerminal.message } : {}),
+              },
+              reminders: state.reminders,
+            })
+            return
+          }
+        }
+        finishWithoutTool()
+      }
+
+      /** 退出结算只从 `start()` 成功之后启动：握手失败由启动路径抛错收口。 */
+      const runSettlement = proc => {
+        ;(async () => {
+          await awaitProcessEnd(proc)
+          await finishAfterNaturalExit()
+        })().catch(error => {
+          resolveExited({
+            ok: false,
+            code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_CHANNEL_FAILED',
+            message: boundText(error && error.message ? error.message : 'Claude 收尾失败', 500),
+          })
+        })
+      }
+
+      /** 取消（幂等）：整组 TERM → KILL，只有整组消失才撤销升级（m1）。 */
+      function cancelHandle(target, reason) {
+        if (!target || typeof target !== 'object') {
+          return Promise.reject(new ClaudeAdapterError(
+            ADAPTER_ERROR.INVALID,
+            'cancel 需要 start() 返回的 handle',
+            { adapterId: CLAUDE_ADAPTER_ID, field: 'handle', reason: 'missing' },
+          ))
+        }
+        if (cancelPromise) return cancelPromise
+        if (exitedDone) return Promise.resolve(exited)
+        cancelPromise = (async () => {
+          if (!state.canceled) {
+            state.canceled = true
+            state.cancelReason = typeof reason === 'string' && reason !== '' ? reason : 'canceled'
+            abortGate(state.cancelReason)
+            cancelSignalResolve?.()
+            // 取消不排空 stdout：先让 stream 收口（避免等 5s 排空期限），再整组升级。
+            for (const proc of spawnedProcesses) {
+              try {
+                proc.streams.dispose()
+              } catch {
+                // ignore
+              }
+            }
+            await terminateAllGroups(state.cancelReason)
+          }
+          await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
+          if (!exitedDone) {
+            await supervisor.disposeAll().catch(() => {})
+            await Promise.race([exited, sleep(1_000)])
+          }
           if (!exitedDone) {
             resolveExited({
               ok: false,
-              code: 'NODE_FINISH_CHANNEL_FAILED',
-              message: outcome === 'spawn-failed'
-                ? `Claude 进程启动失败（${state.spawnError && state.spawnError.code ? state.spawnError.code : 'unknown'}）`
-                : 'Claude 没有启动本插件的 MCP 完成通道（flow_finish_node 不可见），按 11 §1.6 失败',
+              code: 'NODE_FINISH_CANCELED',
+              message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`
+                + '（进程退出未确认，按取消收口）',
             })
           }
-          const cleanupOutcome = await cleanupAfterStartFailure()
-          throw attachCleanup(new ClaudeAdapterError(
-            ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
-            outcome === 'spawn-failed'
-              ? `Claude 进程无法启动（${state.spawnError && state.spawnError.code ? state.spawnError.code : 'unknown'}）`
-              : 'Claude CLI 没有完成 MCP 完成通道握手（flow_finish_node 不可见）',
-            {
-              adapterId: CLAUDE_ADAPTER_ID,
-              reason: outcome === 'spawn-failed'
-                ? 'spawn-failed'
-                : (outcome === 'exited' ? 'exited-before-handshake' : 'mcp-handshake-timeout'),
-              ...(outcome === 'spawn-failed' && state.spawnError && state.spawnError.code
-                ? { cause: state.spawnError.code }
-                : {}),
-            },
-          ), cleanupOutcome)
-        }
+          return exited
+        })().finally(() => {
+          cancelPromise = null
+        })
+        return cancelPromise
       }
-    }
 
-    /**
-     * 取消（幂等，第一次生效）：
-     *   - abort 闸门（未 settled）→ 之后的迟到 submit 得到 `NODE_ALREADY_SETTLED`；
-     *   - 杀进程树；有界等待 `exited`，等不到也自己 resolve `NODE_FINISH_CANCELED`。
-     */
-    function cancelHandle(target, reason) {
-      if (!target || typeof target !== 'object') {
-        return Promise.reject(new ClaudeAdapterError(
-          ADAPTER_ERROR.INVALID,
-          'cancel 需要 start() 返回的 handle',
-          { adapterId: CLAUDE_ADAPTER_ID, field: 'handle', reason: 'missing' },
-        ))
-      }
-      if (cancelPromise) return cancelPromise
-      if (exitedDone) return Promise.resolve(exited)
-      cancelPromise = (async () => {
-        if (!state.canceled) {
-          state.canceled = true
-          state.cancelReason = typeof reason === 'string' && reason !== '' ? reason : 'canceled'
-          abortGate(state.cancelReason)
-          cancelSignalResolve?.()
-          killAllTrackedGroups('SIGTERM')
-          forceKillTimer = setTimeout(() => {
-            forceKillTimer = null
-            killAllTrackedGroups('SIGKILL')
-          }, settings.killTimeoutMs)
-          forceKillTimer.unref?.()
-        }
-        await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
+      async function disposeHandle(target) {
+        if (disposeDone) return
+        disposeDone = true
         if (!exitedDone) {
-          killAllTrackedGroups('SIGKILL')
-          await Promise.race([exited, sleep(1_000)])
+          await cancelHandle(target, 'dispose').catch(() => {})
+        }
+        if (!exitedDone) {
+          await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
         }
         if (!exitedDone) {
           resolveExited({
             ok: false,
             code: 'NODE_FINISH_CANCELED',
-            message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}（进程退出未确认，按取消收口）`,
+            message: 'Claude 句柄释放时仍未确认进程退出，按取消收口',
           })
         }
-        return exited
-      })().finally(() => {
-        cancelPromise = null
-        clearTimeout(forceKillTimer)
-        forceKillTimer = null
+        await supervisor.disposeAll().catch(() => {})
+        for (const proc of spawnedProcesses) {
+          try {
+            proc.streams.dispose()
+          } catch {
+            // ignore
+          }
+        }
+        // 临时 MCP 配置 / hook 设置 / socket 都在 runDir 里，整目录销毁；channel 一并关闭。
+        await resources.disposeAll()
+        if (handleRef) handleRef = null
+        watchFinalCleanup()
+      }
+
+      // ---- 参数构造（模型 / 提示词）也在 protect 范围内（M4） ----
+      const model = resolveNodeModel(settings, runnerCtx, element)
+      const prompt = buildClaudeNodePrompt({ element, ctx: runnerCtx, workspaceRoot: workspace })
+
+      // ctx.signal 用来在活动超时时收掉进程组（runner 的取消路径）。
+      if (runnerCtx.signal && typeof runnerCtx.signal.addEventListener === 'function') {
+        signalListener = () => {
+          if (handleRef) cancelHandle(handleRef, 'ctx.signal').catch(() => {})
+          else pendingAbort = true
+        }
+        runnerCtx.signal.addEventListener('abort', signalListener, { once: true })
+        if (runnerCtx.signal.aborted === true) pendingAbort = true
+      }
+      resources.add('signal-listener', () => {
+        if (signalListener && runnerCtx.signal
+          && typeof runnerCtx.signal.removeEventListener === 'function') {
+          try {
+            runnerCtx.signal.removeEventListener('abort', signalListener)
+          } catch {
+            // ignore
+          }
+        }
+        signalListener = null
       })
-      return cancelPromise
-    }
 
-    async function disposeHandle(target) {
-      if (disposeDone) return
-      disposeDone = true
-      if (!exitedDone) {
-        await cancelHandle(target, 'dispose').catch(() => {})
-      }
-      if (!exitedDone) {
-        await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
-      }
-      if (!exitedDone) {
-        resolveExited({
-          ok: false,
-          code: 'NODE_FINISH_CANCELED',
-          message: 'Claude 句柄释放时仍未确认进程退出，按取消收口',
-        })
-      }
-      killAllTrackedGroups('SIGKILL')
-      await waitTrackedGroupsGone(settings.killTimeoutMs)
-      removeSignalListener()
-      try {
-        await channel.close()
-      } catch {
-        // ignore
-      }
-      // 临时 MCP 配置 / hook 设置 / socket 都在 runDir 里，整目录销毁。
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
-      watchFinalCleanup()
-    }
+      // 初始 session id：probe 确认 CLI 支持 --session-id 时显式指定 UUID，
+      // 这样即使 stream-json 没来得及给出 session_id，续跑也有稳定的 key。
+      const sessionId = randomUUID()
+      state.sessionIdHint = sessionId
+      const initialProc = spawnClaude(buildClaudeArgs({
+        prompt,
+        mcpConfigPath,
+        settingsPath,
+        permissionMode: settings.permissionMode,
+        model,
+        sessionId,
+        flags,
+      }), 'initial', `${executionId}:invoke-1`)
 
-    return handle
+      // 等 MCP server 第一次连上通道：说明 claude 真的把它拉起来了（probe 只验证了自己
+      // 这一侧）。等不到就按「工具通道不可用」失败（不允许静默降级）。
+      if (settings.helloTimeoutMs > 0) {
+        const outcome = await Promise.race([
+          channel.firstContact.then(() => 'contacted').catch(() => 'contact-failed'),
+          new Promise(resolveWait => {
+            const timer = setTimeout(() => resolveWait('timeout'), settings.helloTimeoutMs)
+            timer.unref?.()
+          }),
+          cancelSignal.then(() => 'canceled'),
+          spawnFailure.then(() => 'spawn-failed'),
+          earlyExit.then(() => 'exited'),
+        ])
+        if (outcome === 'contacted' || channel.contacted === true) {
+          state.handshakeOk = true
+        } else {
+          if (state.canceled) {
+            throw new ClaudeAdapterError(
+              'NODE_FINISH_CANCELED',
+              'Claude 活动在 MCP 握手期间被取消（finish.sock 与 runDir 已清理）',
+              { adapterId: CLAUDE_ADAPTER_ID, reason: 'canceled-during-handshake' },
+            )
+          }
+          // 握手前就失败（CS：exit 分支之前先 abort gate 会导致后续误判——这里在
+          // gate 尚未 settle 时统一抛 TOOL_UNAVAILABLE，gate 已 settle 则交给退出结算）。
+          if (!finishGate.settled()) {
+            const cause = state.terminalError
+              || (state.assistantError ? { code: state.assistantError, message: '' } : null)
+            const reason = outcome === 'spawn-failed'
+              ? 'spawn-failed'
+              : (outcome === 'exited' ? 'exited-before-handshake' : 'mcp-handshake-timeout')
+            const exitCode = state.invocation.exitCode
+            const detail = outcome === 'spawn-failed'
+              ? `进程启动失败（${state.spawnError && state.spawnError.code ? state.spawnError.code : 'unknown'}）`
+              : outcome === 'exited'
+                ? `CLI 在握手前退出（exit=${exitCode === undefined ? 'none' : exitCode}${
+                  cause ? `, cli=${cause.code}` : ''}）`
+                : `${settings.helloTimeoutMs}ms 内没有拉起 MCP 完成通道`
+            throw new ClaudeAdapterError(
+              ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+              `Claude CLI 没有建立 flow_finish_node 通道：${detail}`,
+              {
+                adapterId: CLAUDE_ADAPTER_ID,
+                reason,
+                cause: outcome === 'spawn-failed'
+                  ? (state.spawnError && state.spawnError.code ? String(state.spawnError.code) : 'SPAWN_FAILED')
+                  : (exitCode === undefined ? 'NO_EXIT_CODE' : `EXIT_${exitCode}`),
+                ...(exitCode === undefined ? {} : { exitCode }),
+                ...(cause ? { cliError: { code: cause.code, subtype: cause.subtype, message: cause.message } } : {}),
+                ...(outcome === 'timeout' ? { timeoutMs: settings.helloTimeoutMs } : {}),
+              },
+            )
+          }
+        }
+      }
+
+      handle = {
+        get pid() {
+          return initialProc.child && initialProc.child.pid ? initialProc.child.pid : undefined
+        },
+        get sessionId() {
+          return state.sessionId || state.sessionIdHint
+        },
+        get reminders() {
+          return state.reminders
+        },
+        get record() {
+          return state.record
+        },
+        get lastMessage() {
+          return state.lastMessage === undefined ? undefined : redactText(state.lastMessage)
+        },
+        get usage() {
+          return state.usage
+        },
+        /**
+         * 本次执行观测到的全部模型调用（M1/M2 由账本去重与定型）：
+         * 同一 message.id 是同一个调用，重复上报是替换；**不是**每条 assistant 事件一条。
+         * agent-execute 在任何结局收尾时读它。
+         */
+        usageCalls() {
+          return ledger.usageCalls().map(call => ({
+            provider: CLAUDE_ADAPTER_ID,
+            ...call,
+            ...(call.invocationId
+              ? {}
+              : (callInvocationIds.has(call.callId)
+                ? { invocationId: callInvocationIds.get(call.callId) }
+                : {})),
+            usage: call.usage === null ? null : { ...call.usage },
+            observedBuckets: [...call.observedBuckets],
+          }))
+        },
+        /** 范围级结算快照（result.usage）：不增加调用数，交给 agent/usage-snapshot。 */
+        usageSnapshots() {
+          return ledger.snapshots().map(snapshot => ({
+            provider: CLAUDE_ADAPTER_ID,
+            ...snapshot,
+            usage: snapshot.usage === null ? null : { ...snapshot.usage },
+            observedBuckets: [...snapshot.observedBuckets],
+            provenance: { ...snapshot.provenance },
+          }))
+        },
+        /** 诊断用：每次返回**脱敏后的深拷贝**；完结判定不看这些。 */
+        get events() {
+          return redactValue(state.events)
+        },
+        get stdoutTail() {
+          return streamsTail(stream => stream.stdoutTail(), CLAUDE_STDOUT_TAIL_BYTES)
+        },
+        get stderrTail() {
+          return streamsTail(stream => stream.stderrTail(), CLAUDE_STDERR_TAIL_BYTES)
+        },
+        get diagnostics() {
+          return redactValue({
+            resultSubtype: state.resultSubtype,
+            resultIsError: state.resultIsError,
+            numTurns: state.numTurns,
+            totalCostUsd: state.totalCostUsd,
+            mcpServers: state.mcpServers,
+            mcpServerErrors: state.mcpServerErrors,
+            exitCode: state.exitCode,
+            signal: state.signal,
+            permissionMode: settings.permissionMode,
+            handshakeOk: state.handshakeOk,
+            terminalError: state.terminalError ? { ...state.terminalError } : null,
+            protocolErrors: state.protocolErrors,
+            droppedLines: state.droppedLines,
+            outputDrained: state.outputDrained,
+            outputIncomplete: state.outputIncomplete,
+            usageLedger: ledger.stats(),
+            stream: state.streamDiagnostics.slice(-10),
+          })
+        },
+        exited,
+        get cleanup() {
+          return cleanupSnapshot()
+        },
+        cleanupFinal,
+        cancel: reason => cancelHandle(handle, reason),
+        dispose: () => disposeHandle(handle),
+      }
+
+      handleRef = handle
+      if (pendingAbort) {
+        cancelHandle(handle, 'ctx.signal').catch(() => {})
+      }
+      // 只有启动成功之后才进入退出结算（握手失败由上面抛错收口）。
+      runSettlement(initialProc)
+      return handle
+    } catch (error) {
+      // M4：参数构造 / spawn（含同步异常）/ 握手的任何失败都在这里统一清理。
+      if (typeof startFailureCleanup === 'function') {
+        const snapshot = await startFailureCleanup()
+        if (error && typeof error === 'object') {
+          error.cleanup = snapshot
+          error.cleanupFinal = cleanupFinal
+        }
+      }
+      throw error
+    }
   }
 
   const adapter = {

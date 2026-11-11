@@ -29,6 +29,8 @@
 | GET | `/instances/<id>/tasks` | 200 | 当前待办人工任务 |
 | POST | `/instances/<id>/tasks/<activityId>/complete` | 200 | 完成人工任务 |
 | POST | `/instances/<id>/stop` | 200 | 中止实例 |
+| GET | `/instances/<id>/metrics` | 200 | 单实例运行指标 |
+| GET | `/metrics` | 200 | 跨实例指标汇总 |
 | GET | `/instances/<id>/worktree` | 200 | 实例工作区 / worktree 检查结果 |
 | DELETE | `/instances/<id>/worktree` | 200 | 删除实例 worktree（可连带删分支） |
 | DELETE | `/instances/<id>/worktree/branch` | 200 | 只删实例分支 |
@@ -291,6 +293,19 @@
 ```
 
 终止时同时收尾收件箱：未投递的入站消息标 `failed`，未发送的回复标 `skipped`（见 [收件箱状态机](#收件箱状态机)；该收尾在 `COMPLETED` 时也会发生，但已受理的回复在 `COMPLETED` 后仍可投递）。失败：400 `BPMN_INSTANCE_ID_INVALID`，404 `INSTANCE_NOT_FOUND`，500 落盘失败。
+
+## 运行指标
+
+只读接口，**不调用 `_ensureRunner()`**：看指标不会恢复 / 推进实例。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/instances/<id>/metrics` | 单实例指标：墙钟 / 挂起 / 人工等待、agent 调用与 token、finish_reminder、connector、节点执行数 / 当前活动 / 等待任务、数据完整性。`?asOf=ISO` 可选，用于确定性复算；非法时间 400 `METRICS_AS_OF_INVALID`。实例不存在 404 `INSTANCE_NOT_FOUND` |
+| GET | `/metrics` | 跨实例汇总。查询参数 `definitionId`、`definitionVersion`（≥1）、`from` / `to`（按实例 `createdAt` 的闭区间）、`status`（`ACTIVE` / `COMPLETED` / `SUSPENDED` / `CANCELED`）、`groupBy=day`、`asOf`。参数非法 400 `METRICS_FILTER_INVALID` / `METRICS_AS_OF_INVALID` |
+
+口径（未知不是零、按 `callId` 去重、四桶归一化、cohort 与分位数、缓存失效）唯一来源是 [design/12-instance-metrics.md](../design/12-instance-metrics.md)；本表只列入口与参数。
+
+`GET /metrics` 遍历 `instances/` 下全部实例，不用 `listInstances()` 的默认 limit；损坏实例计入 `totals.dataQuality.skippedInstances`，不中断整张汇总。
 
 ## 实例 worktree
 

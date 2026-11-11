@@ -33,8 +33,6 @@ const {
 } = await import('../src/bpmn-runtime.js')
 const { createHandler } = await import('../src/index.js')
 const { createInstanceTools } = await import('../src/instance-tools.js')
-const store = await import('../src/store.js')
-const runstore = await import('../src/runstore.js')
 const instStore = await import('../src/instance-store.js')
 const { createBpmnRunner } = await import('../src/bpmn-runner.js')
 const { resolveWorkspace, defaultGitRunner } = await import('../src/workspace-policy.js')
@@ -199,8 +197,7 @@ function makeSlowMessageAdapter() {
 
 function makeEnv(home, opts = {}) {
   return {
-    dir: store.flowsDir(home),
-    runsRoot: runstore.runsDir(home),
+    dir: join(home, 'flow-studio'),
     ctx: makeCtx(),
     engine: { engineName: 'stub' },
     startOptions: new Map(),
@@ -391,7 +388,7 @@ try {
     eq(health.json.bpmn.instances, 0, '计数现算')
 
     const flows = await call(route, 'GET', `${API}/flows`)
-    eq(flows.status, 200, '老 /flows 暂时仍在（画布 0.13.3 之前）')
+    eq(flows.status, 404, '旧 /flows 已随 0.14.0 退役（认证后 404）')
   })
 
   await check('路由里不存在 BPMN_DISABLED / FLOW_STUDIO_BPMN 开关', async home => {
@@ -683,7 +680,7 @@ try {
   // -------------------------------------------------------------------------
   await check('懒恢复：新 runtime 丢掉注册表后 GET 能 recovered:true，并继续 complete 到 done', async home => {
     const env = {}
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const agents = makeFakeAdapter()
     const fakeAdapters = makeFakeAdapters(agents)
     const url = new URL('http://localhost/')
@@ -745,7 +742,7 @@ try {
   // -------------------------------------------------------------------------
   await check('恢复校验：人工任务 payload 里的 id/activityId 等业务键不影响恢复', async home => {
     const env = {}
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const url = new URL('http://localhost/')
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="http://x">
@@ -969,7 +966,7 @@ try {
   await check('恢复失败：裸快照 / 结构篡改 → 409 + ACTIVE + lastError，不派发 handler', async home => {
     const agents = makeFakeAdapter()
     const fakeAdapters = makeFakeAdapters(agents)
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const env = {}
     const url = new URL('http://localhost/')
     const runtimeA = createBpmnRuntime({ dir, env, adapters: fakeAdapters })
@@ -1184,7 +1181,7 @@ try {
   // -------------------------------------------------------------------------
   await check('启动竞态：定义快照读取期间 stop → 不建 runner、零派发、实例 CANCELED', async home => {
     const agents = makeFakeAdapter()
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const env = {}
     const runtime = createBpmnRuntime({ dir, env, adapters: makeFakeAdapters(agents) })
     const url = new URL('http://localhost/')
@@ -1243,7 +1240,7 @@ try {
   })
 
   await check('恢复竞态：定义快照读取期间 stop → 不建 runner、不重放 agent、实例 CANCELED', async home => {
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const url = new URL('http://localhost/')
     const agentsA = makeFakeAdapter()
     const runtimeA = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters(agentsA) })
@@ -1333,7 +1330,7 @@ try {
     <bpmn:sequenceFlow id="ff2" sourceRef="fh" targetRef="fe"/>
   </bpmn:process>
 </bpmn:definitions>`
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const url = new URL('http://localhost/')
     const runtimeA = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters() })
     let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-f1', name: 'F1', xml } })
@@ -1409,7 +1406,7 @@ try {
   </bpmn:process>
 </bpmn:definitions>`
     const env = {}
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const url = new URL('http://localhost/')
     let calls = 0
     const failingAdapter = makeFakeAdapter(async () => {
@@ -1659,7 +1656,7 @@ try {
     const repo = makeGitRepo(home)
     const url = new URL('http://localhost/')
     const makeRuntime = () => createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(),
     })
@@ -1802,7 +1799,7 @@ try {
   await check('prune：dryRun 预览 / planHash 过期 409 / 无所有权目录只报告', async home => {
     const repo = makeGitRepo(home)
     const url = new URL('http://localhost/')
-    const runtime = createBpmnRuntime({ dir: store.flowsDir(home), env: {}, adapters: makeFakeAdapters() })
+    const runtime = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters() })
     try {
       const saved = await runtime.handle({
         method: 'POST',
@@ -1883,7 +1880,7 @@ try {
     mkdirSync(sub)
     const url = new URL('http://localhost/')
     const plainRuntime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(),
       workspaceAllowlist: [repo],
@@ -1954,7 +1951,7 @@ try {
       return { exited: Promise.resolve({ ok: true, record: submitted.record }) }
     })
     const artifactRuntime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(adapter),
       workspaceAllowlist: [repo],
@@ -2005,7 +2002,7 @@ try {
       // worktree 模式下节点 cwd 越界：零派发，实例 ACTIVE + lastError 码，不回退宿主目录。
       const cwdAdapter = makeFakeAdapter()
       const cwdRuntime = createBpmnRuntime({
-        dir: store.flowsDir(home),
+        dir: join(home, 'flow-studio'),
         env: {},
         adapters: makeFakeAdapters(cwdAdapter),
         workspaceAllowlist: [repo],
@@ -2043,7 +2040,7 @@ try {
     const repo = makeGitRepo(home)
     const url = new URL('http://localhost/')
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(makeFakeAdapter()),
       workspaceAllowlist: [repo],
@@ -2176,7 +2173,7 @@ try {
     const repo = makeGitRepo(home)
     const url = new URL('http://localhost/')
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(),
       workspaceAllowlist: [repo],
@@ -2265,7 +2262,7 @@ try {
       }
     })
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(adapter),
       workspaceRoot: repo,
@@ -2305,7 +2302,7 @@ try {
       }
     })
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(adapter),
       workspaceRoot: repo,
@@ -2346,7 +2343,7 @@ try {
       return result
     }
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(makeFakeAdapter()),
       workspaceAllowlist: [repo],
@@ -2388,7 +2385,7 @@ try {
     const repo = makeGitRepo(home)
     const url = new URL('http://localhost/')
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(makeFakeAdapter()),
       workspaceAllowlist: [repo],
@@ -2483,7 +2480,7 @@ try {
     <bpmn:sequenceFlow id="f4" sourceRef="review" targetRef="end"/>
   </bpmn:process>
 </bpmn:definitions>`
-    const dir = store.flowsDir(home)
+    const dir = join(home, 'flow-studio')
     const url = new URL('http://localhost/')
     let runtime = createBpmnRuntime({ dir, env: {}, adapters: null, httpPolicy })
     try {
@@ -2798,7 +2795,7 @@ try {
     const slow = makeSlowMessageAdapter()
     const sessionCalls = []
     const runtime = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(slow),
       inboxReplyTargets: {
@@ -3037,7 +3034,7 @@ try {
 
     // 只读：新 runtime 读消息 / 正文不启动 runner。
     const runtimeB = createBpmnRuntime({
-      dir: store.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: makeFakeAdapters(),
     })

@@ -73,13 +73,13 @@ npm view @feiyueve/dsh-flow-studio version
 1. 按 [容器测试台](run-container-testbed.md) 起环境，把安装源从本地 tgz 换成私源版本：`dsh plugin --profile web add @feiyueve/dsh-flow-studio@<版本>`。
 2. 核对容器内 `node -p "require('<profile>/node_modules/@feiyueve/dsh-flow-studio/package.json').version"` 等于发布版本。
 3. 逐文件对账：私源 tgz 解出的 `lib/*.js` 与容器内安装产物 byte-for-byte 一致（`sha256sum` 两边对比）。
-4. 跑端到端：`bash scripts/e2e-docker.sh`，看到 `Docker e2e 全部通过`。
-5. 查 `/health`：`version` 是新版本、`engine` 与 `auth` 符合预期。
+4. 跑端到端：`bash scripts/e2e-bpmn.sh`，看到 `BPMN 域容器验收通过`。
+5. 查 `/health`：`version` 是新版本、`bpmn.enabled=true`、`adapters` 含 dsh / codex、`auth` 符合预期。
 
 ## 8. 登记
 
 - 父仓库 `PLUGINS.md`：更新插件行的版本与兼容矩阵（`peerDependencies` 显式列 dsh 版本，禁 `*`）。
-- 如果这版改了事件契约，确认 [design/05](../design/05-run-log.md) 已更新、`reference/run-log.md` 只是链接没有复制。
+- 如果这版改了实例事件 / 指标 / 证据契约，确认 [design/10](../design/10-bpmn-instance-api.md) / [design/12](../design/12-instance-metrics.md) / [design/13](../design/13-instance-evidence.md) 已更新；旧 `design/05` 与 `reference/run-log.md` 不再描述当前行为。
 - 需要时在 `CHANGES.md` 记录对 dsh 核心的本地改造（本插件通常不涉及）。
 
 ## 9. 收尾检查清单
@@ -87,7 +87,7 @@ npm view @feiyueve/dsh-flow-studio version
 - [ ] `package.json` 版本 = 历史段落 = 私源 `npm view` 版本
 - [ ] `node scripts/verify-build.mjs` 三行 ✓
 - [ ] `npm test` 全绿（带 timeout / heap 上限）
-- [ ] `npm pack` 内容清单符合预期（无 `src` / `test` / `scripts`）
+- [ ] `npm pack` 内容清单符合预期（无 `src` / `test` / `scripts`，且 `lib/` 不含旧运行域模块）
 - [ ] 私源装回容器后版本与 sha256 对账一致
 - [ ] 容器 e2e 通过、宿主 `dsh-web` 未被重启
 - [ ] `PLUGINS.md` 已登记

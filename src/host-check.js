@@ -3,20 +3,20 @@
  *
  * 职责边界：
  *   1. 静态命令 → 固定 argv：`sh -c <保存的完整 command>`。整条命令是**一个 argv 元素**，
- *      不 split、不做 `{prompt}` 模板替换、不读 stdin、不插值、不拼 run inputs；
+ *      不 split、不做 `{prompt}` 模板替换、不读 stdin、不插值、不拼运行输入；
  *   2. 起进程 + 有界输出 + 超时 / 取消 / 杀进程组；
  *   3. 报告采集：执行前 fingerprint、执行后要求新建 / 更新、安全打开（O_NOFOLLOW、
  *      非阻塞、fstat 确认普通文件）、有界读（limit+1）、前后 fstat 一致，算 sha256；
- *   4. 返回**已脱敏、有界**的纯数据结果；不写事件、不写 run 目录、不碰存储。
+ *   4. 返回**已脱敏、有界**的纯数据结果；不写事件、不写实例目录、不碰存储。
  *
- * 依赖：`node:child_process` / `node:fs` / `node:path` / `node:crypto`，外加纯函数
- * `model.js` 的配置归一化 / 校验。**不 import** engine / runtime / index / runstore /
- * evidence，也不直接 append 日志或产物。
+ * 依赖：`node:child_process` / `node:fs` / `node:path` / `node:crypto`，外加中性模块
+ * `node-check.js` 的配置归一化 / 校验。**不 import** runtime / index / 存储层，
+ * 也不直接 append 日志或产物。
  *
  * 配置非法时的选择（两种都明确写在契约里，这里选「skipped + HOST_CHECK_INVALID」）：
  *   - `buildHostCheckInvocation`：抛 `Error`，`code='HOST_CHECK_INVALID'`、带 `field`；
  *   - `runHostCheck`：**不抛**，返回 `state='skipped', reasonCode='HOST_CHECK_INVALID'`，
- *     `message` 是中文可行动原因。这样引擎无需在 await 两侧包 try/catch，也不会把
+ *     `message` 是中文可行动原因。这样调用方无需在 await 两侧包 try/catch，也不会把
  *     「配置错」误记成「执行失败」。
  *
  * 结果对象（字段稳定，调用方可以直接持久化执行记录）：
@@ -36,7 +36,7 @@
  * }
  * ```
  * `reportBytes` 是 Buffer 而不是数字：报告采集器只返回「内容 + fingerprint」，
- * 由 Engine / runstore 决定写到哪里；`reportSha256` 永远对这份副本计算。
+ * 由调用方决定写到哪里；`reportSha256` 永远对这份副本计算。
  *
  * 本模块防的是「事件 / 产物自报洗白」，不是同 uid 敌对进程隔离：宿主与模型同 OS 用户，
  * 文件权限不构成安全边界（见 0.11 §7.3）。
@@ -51,7 +51,7 @@ import {
 } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
-import { CHECK_LIMITS, normalizeNodeCheck, validateNodeCheck } from './model.js'
+import { CHECK_LIMITS, normalizeNodeCheck, validateNodeCheck } from './node-check.js'
 
 /** 检查结果三态：pass / fail / skipped（skipped 在聚合里按 unknown 处理）。 */
 export const HOST_CHECK_STATE = Object.freeze({
@@ -87,7 +87,7 @@ const DEFAULT_MAX_REPORT_BYTES = 1024 * 1024
 /** outputTail 的硬上限：16KiB（脱敏后再裁剪）。 */
 const OUTPUT_TAIL_BYTES = 16 * 1024
 
-/** SIGTERM → SIGKILL 的宽限期，与 executor.js 一致。 */
+/** SIGTERM → SIGKILL 的宽限期（与宿主检查的进程组回收口径一致）。 */
 const KILL_GRACE_MS = 250
 
 /** Windows 没有 POSIX 进程组；显式降级并留 orphanWarning。 */

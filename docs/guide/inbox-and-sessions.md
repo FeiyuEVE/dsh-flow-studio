@@ -1,80 +1,64 @@
-# 流程能收外部消息，一个节点只有一个会话
+# 实例能收外部消息，一个节点只有一条执行
 
-外部 agent 或人往流程里发消息，消息从入口节点（需求分析）往下流；节点里的 agent 也能按配置的通道回复。一个节点无论被打回重跑、还是收到新消息，**始终复用同一个会话**。
+外部 agent 或人往**实例**里发消息；消息按目标绑定到某次活动执行，或绑定到某个活动**下一次**激活。节点里的 agent 通过回复 outbox 往白名单目标回消息。消息只承载讨论 / 附件，**不完成节点、不完成人工任务**：agent 节点仍只认 `flow_finish_node`，人工任务仍只认 `complete` 路由。
 
-## 消息怎么进流程
+## 消息怎么进实例
 
-HTTP 收件箱（与 `flow_send_message` 是同一条内部逻辑）：
-
+```http
+POST /api/flow-studio/instances/<instanceId>/messages
+{
+  "messageId": "m-1",
+  "target": { "activityId": "human1", "executionId": "human1_…" },
+  "text": "…",
+  "replyTargetId": "…"
+}
 ```
-POST /api/flow-studio/runs/<runId>/messages
-  { "from": "某个 agent", "text": "…", "nodeId?": "n_dev", "reply": { "kind": "session", "sessionId": "…" } }
-```
 
-目标节点解析顺序：`nodeId` 显式指定（必须是阶段节点）→ run 当前节点 → run 还没开始时取入口节点。
+- `target` 二选一：精确目标 `{activityId, executionId}`，或未来节点 `{activityId, delivery:"nextActivation"}`。
+- 精确目标必须指向仍在 live 表或落盘 `pendingTasks` 里的执行；过期回 410 `MESSAGE_TARGET_EXPIRED`，不会投到同名活动的下一轮。
+- `nextActivation` 只绑定后续**第一次**激活，循环重入不广播。
+- `activityId` 必须存在于实例冻结的定义里，否则 404 `MESSAGE_ACTIVITY_NOT_FOUND`。
+- `messageId` 是幂等键：同 id 同内容返回原记录 + `duplicate:true`；同 id 不同内容 409 `MESSAGE_ID_CONFLICT`。
+- 实例终态（`COMPLETED` / `CANCELED`）拒绝新消息（409）；`SUSPENDED` 可以受理并排队，但延迟投递（`delivery.deferred:true`）。
 
-## 四种投递情形
+正文 ≤4 KiB 内联；>4 KiB 完整落盘到 `instances/<id>/inbox/bodies/`，记录只留 `body` 引用；>1 MiB 整条 413，不写任何文件。
 
-- **节点没启动** → 起一个顶层节点会话把消息带进去。
-- **节点正在跑** → 通过 `agent.followup` 把消息注入到**同一个会话**（上下文注入），不打断当前回合。
-- **节点还没轮到** → 消息入队，引擎推进到该节点时并进提示词；入口消息在后续每个阶段节点都可见（最多 5 条、单条 ≤1200 字头部）。
+## 消息状态
 
-正文超过 1200 字不会丢内容：全文写到 `runs/<runId>/inbox/<messageId>.md`（目录 0700、文件 0600），提示词里只放 1200 字头部，并在下一行给出路径 + 全文字数 + 「必须先用 read 工具读完再作答」的指针。超过 200000 字会返回可读的 400（「正文 N 字超过上限 200000 字，请拆成多条或改用文件」）；落盘失败时消息仍会入库，日志记 `warn`、返回体带 `bodySpillError`，不会静默丢消息。
-- **run 还没开始** → 这条消息就是本次运行的启动输入。
+| 状态 | 含义 |
+|---|---|
+| `queued` | 已持久化受理，等待投递 / 等待下一次激活 |
+| `injected` | 已投给本进程内的活执行 |
+| `resumed` | 已投给恢复出来的冷执行 |
+| `delivered` | 已投给人工任务（只作讨论 / 附件） |
+| `failed` | 投递失败，或执行结束 / 实例终态导致过期 |
 
-## 一个节点一个会话
+回复 outbox 状态：`queued` / `delivered` / `failed` / `skipped`（`skipped` 只在实例取消时出现）。
 
-`runs/<runId>/sessions.json` 记着 `nodeId → { sessionId, createdAt, lastUsedAt, agentOptions? }`（`agentOptions` 是创建时实际使用的模型对，resume 优先复用它；旧文件没有该字段时回退宿主默认），二次激活（打回重跑 / 收到新消息）复用同一会话：活的走 `agents.get`，冷的或被压缩过的走 `agents.resume`，不再新开会话。run 结束或停止时统一 `dispose()` 句柄，**不删日志、不删会话文件**（仍可从列表点开 / `resume`）。
-
-运行日志抽屉的节点详情 / 事件 ref 行可以「打开节点会话」（无宿主跳转能力时复制会话 id）；run 级「打开发起会话」在抽屉顶部。节点里的 agent 用 `flow_reply` 回消息（工具按会话反查 run / node，不用手填 id）；别的 agent 用 `flow_send_message` 往流程里发消息。运行中可以 `POST /runs/<id>/inbox` 动态改回复目标，`GET /runs/<id>/messages` 看收件箱。
+投递是否 exactly-once **不由收件箱声称**：只有适配器显式返回 `deliveryUnknown:false` 才记 `exactlyOnce:true`；dsh 与 codex 都不满足。
 
 ## 回复通道
 
-默认只记进运行日志；要真的回出去得配置：
+`POST /instances/<id>/messages/<messageId>/replies`：
 
-| `reply.kind` | 行为 |
+| 字段 | 说明 |
 |---|---|
-| `session` | 发回指定会话（`agents.get`/`resume` + `followup`，正文带 `[flow:… · 节点名]` 来源标记） |
-| `http` | `POST` 到外部给的 URL（`Bearer` 取自配置的环境变量），body `{runId,nodeId,messageId,text}` |
-| `none` / 未配置 | 只写 `message/out` 事件，工具返回「没有外部回复通道」 |
+| `replyId` | 幂等键；省略时按内容确定性生成 |
+| `targetId` | 回复目标 id；省略时用消息的 `replyTargetId` |
+| `text` | 回复正文 |
+| `document` | `{path, sha256?}`：实例冻结工作区内的普通文件，≤1 MiB |
 
-对外通道的安全约束：`tokenEnv` 只认 `FLOW_STUDIO_REPLY_TOKEN_*` 形式的专用环境变量名（只写变量名，不落盘），URL 只允许 https 或回环地址上的 http，令牌在日志 / 错误里打码。`POST /runs/<id>/events` 只收观测类事件，不能拿它伪造节点执行。
+回复目标**只能来自宿主注入的白名单**：请求里出现 `url` / `sessionId` / `session` / `target` 任一字段直接 400 `MESSAGE_REPLY_TARGET_ARBITRARY`。`session` 目标只投给宿主当前 live 的会话；`http` 目标向白名单 URL POST，超时 10 秒，带 `idempotency-key`，2xx 算成功。投递失败 502，实例已取消 / 回复被跳过 409，并发投递 409 `MESSAGE_REPLY_DISPATCH_IN_FLIGHT`。
 
-## 节点会话是顶层会话
+## 一个节点一条执行
 
-v0.7 起节点主管会话走 `ctx.agents.create`，是**顶层会话**：session header 里没有 `parentSession` / `origin`，`delegationDepth: 0`，所以 Web 侧栏能看到、能点开接管。`team` 节点的成员才是主管委派出的子会话（header 带 `parentSession` / `origin:'subagent'`）。
+实例域没有「节点会话表」这一层：每次活动激活有独立的 `executionId`；DSH adapter 为它创建 / 恢复一个顶层会话，codex adapter 为它起一个受限 CLI 执行并挂了 MCP 完成通道。消息的目标是**执行**（`activityId + executionId`），因此不会把消息投给同名活动的下一轮。
 
-判断是否顶层**看 session header，不看 `roots()`**——`resume` 之后 agent 在运行时也是 root，但持久化血缘不变。run 收尾的 `dispose()` 只关句柄、不删日志，会话仍在列表（`agentAvailable:false`）、磁盘文件仍在、之后仍可 `resume`。只 `create` 不跑 turn 的 `blank` 会话 API 有、Web 侧栏看不到；节点会话一定会跑 turn，不受影响。
-
-为什么要这样：节点会话要能被人类点开接管、被外部消息二次激活，如果挂成子 agent，会话列表里就找不到，`resume` 语义也绑在父会话生命周期上。设计与否决记录见 [design/07 §3](../design/07-runtime-0.7.md)。
+agent 节点完结只有一条路：调用 `flow_finish_node`，提交变量、文档引用与 summary。超时 / 未调用按 `NODE_FINISH_MISSING` 失败，不伪造完成。
 
 ## 相关契约
 
-- 收件箱事件（`message/in` / `message/out`）的字段与有界截断：[运行日志](../reference/run-log.md)
-- `POST /runs/<id>/messages`、`POST /runs/<id>/inbox`、`GET /runs/<id>/messages` 的参数：[Host 接口](../reference/host-api.md#收件箱与回复通道)
-- 会话、收件箱与 worktree 的落盘文件：[数据模型](../reference/data-model.md#run-落盘布局)
-
-## 节点会话的 agent preset 与工具面（0.9.2）
-
-节点会话是**顶层会话**，但顶层 ≠ 自带完整工具。0.2.2 宿主对没有
-`meta.agentPreset` 的程序化会话给的是几乎没工具的裸组合（`working_directory` /
-`memory_recall` 之类），所以引擎现在**永远显式**传 preset：
-
-`node.agentPreset` > 本次 start 覆盖 > 引擎配置 > 流程级默认 > `standard`。
-
-- **只写 `meta.agentPreset` 不会挂组合**：组合在 `agents.create` / `agents.resume`
-  的 `setup` 回调里装配。引擎优先走 `sessionController.composeAgent`（与 Web 同一条
-  路径），其次只挂 `agentPresets.mount`；两个服务都没有时只 warn，不静默假装挂上；
-- `standard` 是 web profile 里带完整工具面（bash / 文件读写 / subagent）的那套；
-  当前 profile 没有 `standard` 时，引擎兜底会退回宿主默认 preset，来源记为
-  `default-fallback`（显式配置的 preset 不存在则直接报 400，不降级）；
-- 节点 / 流程的 preset id 只做安全字符校验，真实存在性由宿主 registry 判断
-  （插件注册的 `digital-human` / `specialist` 也能用）；
-- 生效值与来源写进 `node/start.data.agentPreset` / `agentPresetSource` 与
-  `run.json.agentPreset`，排障时先看这里——「节点改不了代码」通常就是 preset 丢了。
-
-新建的节点会话还有一条**预热轮**：引擎先发一句「只回 ok」的消息，正式任务从第二轮开始。这样做是为了绕开首轮精简插件——它会把新会话第一轮的工具面裁到 `bash` + `str_replace_editor`，团队主管那一轮里就没有 `subagent` 可派了。预热轮只在新建会话时出现，打回重跑不会再发。
-
-另外，有出向 reject 边的阶段节点会额外拿到 `flow_node_reject` 工具（等价于
-verdict=reject）；没有出向 reject 边的节点不会注册它。详见
-[Host 接口](../reference/host-api.md#阶段节点的打回工具flow_node_reject)。
+- 收件箱路由与全部错误码：[实例域接口 · 收件箱](../reference/instance-api.md#收件箱)
+- 消息状态机与投递规则：[design/10 · 收件箱状态机](../design/10-bpmn-instance-api.md)
+- 完结门与 finish 工具：[design/11](../design/11-node-finish-tool.md)
+- 落盘文件：[数据模型](../reference/data-model.md#实例)

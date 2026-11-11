@@ -446,7 +446,6 @@ await check('路径安全校验拒绝绝对路径 / .. / 反斜杠', () => {
 // 7. HTTP 路由：纯读、404、400
 // ---------------------------------------------------------------------------
 const { createBpmnRuntime } = await import('../src/bpmn-runtime.js')
-const storeModule = await import('../src/store.js')
 
 function makeFakeAdapter(writeReport) {
   return {
@@ -515,7 +514,7 @@ await check('GET /instances/<id>/evidence 纯读：hash 一致、快照优先、
       ]
     })
     const makeRuntime = () => createBpmnRuntime({
-      dir: storeModule.flowsDir(home),
+      dir: join(home, 'flow-studio'),
       env: {},
       adapters: adaptersFor(adapter),
     })

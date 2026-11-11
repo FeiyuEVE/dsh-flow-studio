@@ -60,10 +60,8 @@ function positiveIntOr(value, fallback) {
 /**
  * 文本脱敏（0.11 R3）。
  *
- * **与 `src/engine.js` 的 `redactArguments` 同源**：下面四条规则逐字复用，改动任一
- * 规则时必须同步两侧，避免「engine 日志已脱敏、executor 错误链仍漏 token」的分叉。
- * （不直接 import engine：engine 依赖 fs / runlog，executor 与 host-check 都需要保持
- * Host 侧窄依赖，反向 import 会形成环。）
+ * 保持纯函数：host-check 等调用方都需要它不依赖 fs / 存储层，反向 import 会形成环。
+ * 规则 4 与旧执行链曾保持同口径；旧链退役后这里只维护这一份。
  *
  * 覆盖：
  *   1. `Authorization: Bearer <token>`；

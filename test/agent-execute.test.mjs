@@ -35,11 +35,11 @@ import {
   AGENT_EXECUTE_ERROR, admitAdapter, createAdapterProbeCache, resolveAgentTimeoutMs, runAgentNode,
 } from '../src/agent-execute.js'
 import { executeAgent, createBpmnRuntime } from '../src/bpmn-runtime.js'
-import { flowsDir } from '../src/store.js'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
-const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'agent-execute-'))
+// 前缀刻意短：agent 执行会创建 unix socket，路径总长必须留在 sockaddr_un 的 108 字节以内。
+const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'ae-'))
 
 let checks = 0
 let asserts = 0
@@ -928,7 +928,7 @@ function workflowXml({
 const API = []
 
 async function makeRuntime(adapters, workspace, extraEnv = {}) {
-  const dir = flowsDir(workspace)
+  const dir = join(workspace, 'flow-studio')
   const runtime = createBpmnRuntime({
     dir,
     env: { ...extraEnv },

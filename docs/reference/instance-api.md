@@ -1,14 +1,14 @@
 # 实例域接口
 
-本页是 BPMN 定义域（`definitions/`）与实例域（`instances/`）的 HTTP 路由、参数、响应字段与当前行为契约，也是这些事实的唯一参考页。实现分布在 `src/bpmn-runtime.js`（路由 / 懒恢复 / 服务处理器）、`src/definition-store.js`、`src/instance-store.js`、`src/instance-inbox.js`、`src/instance-message-store.js`、`src/instance-worktree.js`、`src/connector-store.js`、`src/http-connector.js` 与 `src/instance-evidence.js`。设计记录与阶段边界见 [design/10](../design/10-bpmn-instance-api.md)、[design/13](../design/13-instance-evidence.md)；旧运行域（`/flows`、`/runs`）的路由见 [Host 接口](host-api.md)。
+本页是 BPMN 定义域（`definitions/`）与实例域（`instances/`）的 HTTP 路由、参数、响应字段与当前行为契约，也是这些事实的唯一参考页。实现分布在 `src/bpmn-runtime.js`（路由 / 懒恢复 / 服务处理器）、`src/definition-store.js`、`src/instance-store.js`、`src/instance-inbox.js`、`src/instance-message-store.js`、`src/instance-worktree.js`、`src/connector-store.js`、`src/http-connector.js` 与 `src/instance-evidence.js`。设计记录与阶段边界见 [design/10](../design/10-bpmn-instance-api.md)、[design/13](../design/13-instance-evidence.md)。0.14.0 起旧运行域（`/flows`、`/runs`、`/worktrees`）已删除，已认证请求返回 404；本页是当前运行域的唯一路由参考。
 
 ## 前缀与鉴权
 
-所有路由都挂在 `/api/flow-studio` 下，由一条 prefix 路由分发（`src/index.js`）。`definitions`、`instances`、`instance-worktrees` 三个第一段进入本页描述的 BPMN 处理器；同前缀下的 `/flows`、`/runs`、`/health` 等仍由旧运行域处理，本页不涉及。在 BPMN 处理器内部，未知子路径返回 404 `BPMN_ROUTE_NOT_FOUND`，方法不匹配返回 405 `BPMN_METHOD_NOT_ALLOWED`。
+所有路由都挂在 `/api/flow-studio` 下，由一条 prefix 路由分发（`src/index.js`）。`definitions`、`instances`、`instance-worktrees`、`metrics` 四个第一段进入本页描述的 BPMN 处理器；`/health` 与 `/skills` 由 Host 层处理。旧 `/flows`、`/runs`、`/worktrees` 已删除：通过鉴权后返回 404，不做兼容跳转。在 BPMN 处理器内部，未知子路径返回 404 `BPMN_ROUTE_NOT_FOUND`，方法不匹配返回 405 `BPMN_METHOD_NOT_ALLOWED`。
 
-鉴权、同源校验与令牌档位与旧运行域是同一套：宿主 `connection.requestRejection` 先判 401 / 403（拿不到该服务时 fail-closed 503 `AUTH_SERVICE_UNAVAILABLE`），随后判同源，再进插件自己的令牌闸。这些判定不在 `src/bpmn-runtime.js` 里，而由 `src/index.js` 的 `route()` 在分发前统一完成；口径见 [Host 接口 · 鉴权](host-api.md#鉴权)，本页不复制。
+鉴权、同源校验与令牌档位是 Host 层统一的一套：宿主 `connection.requestRejection` 先判 401 / 403（拿不到该服务时 fail-closed 503 `AUTH_SERVICE_UNAVAILABLE`），随后判同源，再进插件自己的令牌闸。这些判定不在 `src/bpmn-runtime.js` 里，而由 `src/index.js` 的 `route()` 在分发前统一完成；口径见 [Host 接口 · 鉴权](host-api.md#鉴权)，本页不复制。
 
-只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`，与请求落到哪个域无关。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复，可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 的 GET 只读磁盘或收件箱，不创建 runner。
+只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复，可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 的 GET 只读磁盘或收件箱，不创建 runner。
 
 请求体上限 2 MiB，达到即 413；原始路径出现空段或 `.` / `..` 段在进路由前就 400。成功响应一律是 `{ok:true, …}` 信封；业务失败一般是 `{ok:false, code, error}`，不过鉴权 / 同源 / 请求体解析这类入口级拒绝可能只有 `{ok:false, error}`（与 [Host 接口](host-api.md) 同口径）。部分失败额外带 `hint`、`recoveryCode`、`tasks` 等定位字段。
 
@@ -815,7 +815,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 ### 模型工具
 
-实例域注册十一个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；全部直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。`flow_definition_*` 与 `flow_instance_*` 是 E3 的对话入口；旧运行域的 `flow_*` 工具仍在，0.14.0 才删。
+实例域注册十一个会话工具，参数与返回以 `src/instance-tools.js` 的 schema 为准；全部直接调用上表的 HTTP 处理器（同一个 runtime 实例），因此字段与业务码与本页一致。旧运行域的 `flow_*` 工具已在 0.14.0 删除，不再注册。
 
 | 工具 | 对应路由 | 参数 | 返回 |
 |---|---|---|---|
@@ -935,6 +935,6 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 ## 延伸阅读
 
 - 设计记录与阶段边界：[design/10 · BPMN 实例 API](../design/10-bpmn-instance-api.md)
-- 旧运行域的路由、鉴权与安全开关：[Host 接口](host-api.md)
-- 流程 / run 的落盘布局与字段：[数据模型](data-model.md)
+- Host 层鉴权与安全开关：[Host 接口](host-api.md)
+- 定义 / 实例的落盘布局与字段：[数据模型](data-model.md)
 - 实例事件 kind 与分片规则：[design/10 §5](../design/10-bpmn-instance-api.md#5-事件-kind-表)

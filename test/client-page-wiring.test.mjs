@@ -1933,6 +1933,47 @@ await check('m1 真实渲染 BpmnCanvas：mountOptions 透传 / hostRequire 合�
   })
 })
 
+await check('F 旧域退役：页面默认 client 的网络请求没有 /flows、/runs', async () => {
+  const originalFetch = globalThis.fetch
+  const requested = []
+  globalThis.fetch = async (url, init) => {
+    requested.push(String(url))
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        void init
+        return {
+          ok: true,
+          definitions: [],
+          instances: [],
+          metrics: { instances: 0 },
+          worktrees: [],
+          orphans: [],
+        }
+      },
+    }
+  }
+  try {
+    // 不注入 apiClient：页面走 src/client/api.js 的真实 fetch 通道。
+    const mounted = await mountPage({ client: undefined, props: {} })
+    await settle(mounted.probe)
+    ok(requested.length > 0, '页面挂载后必须发出至少一次网络请求（定义 / 实例列表）')
+    for (const url of requested) {
+      ok(!/\/flows(?:[/?#]|$)/.test(url), `不得再请求旧 /flows：${url}`)
+      ok(!/\/runs(?:[/?#]|$)/.test(url), `不得再请求旧 /runs：${url}`)
+      ok(
+        /\/api\/flow-studio\/(?:definitions|instances|instance-worktrees|metrics)(?:[/?#]|$)/.test(url),
+        `只允许新域路由：${url}`,
+      )
+    }
+    mounted.probe.unmount()
+    await settle(mounted.probe)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 if (failures.length > 0) {
   console.log(`\n${checks} 组通过，${failures.length} 组失败（${assertions} 条断言）`)
   process.exitCode = 1

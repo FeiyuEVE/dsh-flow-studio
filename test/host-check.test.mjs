@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * R5（0.11 §7）宿主检查执行器 + 模型层检查配置的自检。
+ * R5（0.11 §7）宿主检查执行器 + 节点检查配置（node-check）的自检。
  *
  * 真子进程（`sh -c` / `sleep` / `node -e`），总时长刻意压在 20s 以内：
  * 超时用例 1s、取消用例 0.1s，其余全是毫秒级命令。
@@ -17,8 +17,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  CHECK_LIMITS, defaultFlow, normalizeFlow, normalizeNodeCheck, validateFlow, validateNodeCheck,
-} from '../src/model.js'
+  CHECK_LIMITS, normalizeNodeCheck, validateNodeCheck,
+} from '../src/node-check.js'
 import {
   HOST_CHECK_REASON, buildHostCheckInvocation, redactSensitiveText, runHostCheck,
 } from '../src/host-check.js'
@@ -646,7 +646,7 @@ await check('非法 check（validate 失败）→ skipped / HOST_CHECK_INVALID�
   assert.match(shape.message, /必须是对象/)
 })
 
-console.log('\nmodel.js')
+console.log('\nnode-check.js')
 
 await check('normalizeNodeCheck 默认值：expectExitCode=0 / timeoutMs=600000', () => {
   assert.equal(normalizeNodeCheck(undefined), null)
@@ -718,76 +718,6 @@ await check('validateNodeCheck 错误定位：field 精确到 check 子字段', 
   assert.equal(validateNodeCheck({ command: 'true', expectExitCode: 256 }).field, 'expectExitCode')
   assert.equal(validateNodeCheck({ command: 'true', timeoutMs: 999 }).field, 'timeoutMs')
   assert.equal(validateNodeCheck({ command: 'true', reportPath: '/abs' }).field, 'reportPath')
-})
-
-await check('normalizeFlow 保留合法 check，且不落进 extras', () => {
-  const flow = defaultFlow()
-  const dev = flow.nodes.find(node => node.id === 'n_dev')
-  dev.check = { command: 'npm test', expectExitCode: 0, timeoutMs: 600000, reportPath: 'reports/unit.json' }
-  const round = normalizeFlow(flow, '兜底')
-  const node = round.nodes.find(item => item.id === 'n_dev')
-  assert.deepEqual(node.check, dev.check)
-  assert.ok(!node.extras || !('check' in node.extras), '合法 check 不能再被收进 extras')
-  // 再走一次保存 → 读回 → 再保存仍然不丢。
-  const again = normalizeFlow(round, '兜底').nodes.find(item => item.id === 'n_dev')
-  assert.deepEqual(again.check, dev.check)
-})
-
-await check('normalizeFlow 保留非法 check（可诊断），validateFlow 报错', () => {
-  const raw = {
-    nodes: [{ id: 'n', kind: 'stage', title: '阶段', x: 0, y: 0, task: '做事', check: { command: '', expectExitCode: 256 } }],
-    edges: [],
-  }
-  const flow = normalizeFlow(raw, '兜底')
-  const node = flow.nodes[0]
-  assert.ok(node.check, '非法 check 不能被静默丢成未配置')
-  assert.equal(node.check.command, '')
-  assert.equal(node.check.expectExitCode, 256, '非法值必须保留，不能被默认值洗白')
-  assert.equal(validateNodeCheck(node.check).ok, false)
-  const report = validateFlow(flow)
-  assert.ok(
-    report.errors.some(item => item.nodeId === 'n' && item.message.includes('check.command')),
-    `validateFlow 应报出 check 字段：${JSON.stringify(report.errors)}`,
-  )
-})
-
-await check('旧 extras.check 不自动升级，但原样保留', () => {
-  const raw = {
-    nodes: [{
-      id: 'n',
-      kind: 'stage',
-      title: '旧流程',
-      x: 0,
-      y: 0,
-      task: '做事',
-      extras: { check: { command: 'rm -rf build' } },
-    }],
-    edges: [],
-  }
-  const flow = normalizeFlow(raw, '兜底')
-  const node = flow.nodes[0]
-  assert.equal(node.check, undefined, 'extras.check 不能被升级成可执行配置')
-  assert.deepEqual(node.extras.check, { command: 'rm -rf build' })
-  const round = normalizeFlow(flow, '兜底').nodes[0]
-  assert.equal(round.check, undefined)
-  assert.deepEqual(round.extras.check, { command: 'rm -rf build' }, '往返保存不能丢掉旧 extras.check')
-})
-
-await check('check 只允许阶段节点：挂在开始/结束节点上 validateFlow 报错', () => {
-  const raw = {
-    nodes: [
-      { id: 's', kind: 'start', title: '开始', x: 0, y: 0, task: 't', check: { command: 'true' } },
-      { id: 'e', kind: 'end', title: '结束', x: 0, y: 0, task: 't' },
-    ],
-    edges: [{ id: 'e1', from: 's', to: 'e', kind: 'next' }],
-  }
-  const flow = normalizeFlow(raw, '兜底')
-  assert.deepEqual(flow.nodes[0].check, { command: 'true', expectExitCode: 0, timeoutMs: 600000 })
-  const report = validateFlow(flow)
-  assert.ok(
-    report.errors.some(item => item.nodeId === 's' && item.message.includes('阶段节点')),
-    `应当拒绝非阶段节点上的 check：${JSON.stringify(report.errors)}`,
-  )
 })
 
 rmSync(root, { recursive: true, force: true })

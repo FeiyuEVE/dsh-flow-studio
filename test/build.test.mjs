@@ -46,6 +46,7 @@ import {
   BUILD_META_FILE,
   GENERATED_MODULES,
   HOST_MODULES,
+  LEGACY_HOST_MODULES,
   EXPECTED_LIB_MODULES,
   FACTORY_CHECK_MARKER,
   collectBuildInputs,
@@ -214,14 +215,14 @@ try {
     mkdirSync(checkout, { recursive: true })
     mustRun('tar', ['-xf', headTar, '-C', checkout], repo, '解包 HEAD')
     A.ok(existsSync(join(checkout, 'package.json')), '干净检出含 package.json')
-    A.ok(existsSync(join(checkout, 'src/supervise.js')), '干净检出含 src/supervise.js')
+    A.ok(existsSync(join(checkout, 'src/index.js')), '干净检出含 src/index.js')
     A.ok(!existsSync(join(checkout, 'lib')), '干净检出里没有 lib/（被 .gitignore 排除，只能靠构建生成）')
     A.ok(!existsSync(join(checkout, 'node_modules')), '干净检出里没有 node_modules（不依赖工作树依赖目录）')
     // 同步之前，干净检出必须是 HEAD 内容：当前工作树的未提交改动不能提前混进来。
-    const headSupervise = mustRun('git', ['show', 'HEAD:src/supervise.js'], repo, 'git show HEAD:src/supervise.js').stdout
+    const headIndex = mustRun('git', ['show', 'HEAD:src/index.js'], repo, 'git show HEAD:src/index.js').stdout
     A.equal(
-      readFileSync(join(checkout, 'src/supervise.js'), 'utf8'),
-      headSupervise,
+      readFileSync(join(checkout, 'src/index.js'), 'utf8'),
+      headIndex,
       '干净检出的 src/ 是 HEAD 内容，不混入工作树未提交改动',
     )
   })
@@ -296,6 +297,10 @@ try {
     for (const file of GENERATED_MODULES) {
       A.ok(libJs.includes(`lib/${file}`), `tarball 含生成产物 lib/${file}`)
     }
+    // 0.14.0 旧运行域退役：包里一个旧模块都不能有（构建清单删了，lib 也不能残留）。
+    for (const file of LEGACY_HOST_MODULES) {
+      A.ok(!libJs.includes(`lib/${file}.js`), `tarball 不应含旧模块 lib/${file}.js`)
+    }
   })
 
   await check('tarball 里两个产物的元数据存在，且依赖归属无泄漏', async () => {
@@ -350,18 +355,18 @@ try {
     A.ok(!files.some(path => path.startsWith('src/')), 'tarball 不含 src/（files 白名单不含源码）')
   })
 
-  await check('tarball 里 lib/supervise.js 与干净检出 src/supervise.js 逐字节相同', async () => {
-    A.ok(files.includes('lib/supervise.js'), '解出的包里含 lib/supervise.js')
+  await check('tarball 里 lib/storage-contract.js 与干净检出 src/storage-contract.js 逐字节相同', async () => {
+    A.ok(files.includes('lib/storage-contract.js'), '解出的包里含 lib/storage-contract.js')
     for (const file of HOST_MODULES) {
       const packedFile = readFileSync(join(packageDir, 'lib', file))
       const sourceFile = readFileSync(join(checkout, 'src', file))
       A.ok(packedFile.equals(sourceFile), `tarball lib/${file} 与当前 src/${file} 逐字节相同`)
     }
-    const packedSupervise = readFileSync(join(packageDir, 'lib', 'supervise.js'))
-    const sourceSupervise = readFileSync(join(checkout, 'src', 'supervise.js'))
+    const packedStorage = readFileSync(join(packageDir, 'lib', 'storage-contract.js'))
+    const sourceStorage = readFileSync(join(checkout, 'src', 'storage-contract.js'))
     console.log(
-      `    · lib/supervise.js ${packedSupervise.length} 字节 sha256=${sha256(packedSupervise)}`
-      + ` · src/supervise.js ${sourceSupervise.length} 字节 sha256=${sha256(sourceSupervise)}`,
+      `    · lib/storage-contract.js ${packedStorage.length} 字节 sha256=${sha256(packedStorage)}`
+      + ` · src/storage-contract.js ${sourceStorage.length} 字节 sha256=${sha256(sourceStorage)}`,
     )
   })
 
@@ -543,14 +548,14 @@ try {
     return result.outputFiles[0].contents.toString('utf8')
   }
 
-  await check('反例一：lib/supervise.js 陈旧时 verify-build 非零退出并点名文件', async () => {
-    const supervisePath = join(libDir, 'supervise.js')
-    const original = readFileSync(supervisePath)
-    appendFileSync(supervisePath, '\n// stale-lib-simulated\n')
+  await check('反例一：lib/storage-contract.js 陈旧时 verify-build 非零退出并点名文件', async () => {
+    const storagePath = join(libDir, 'storage-contract.js')
+    const original = readFileSync(storagePath)
+    appendFileSync(storagePath, '\n// stale-lib-simulated\n')
     const stale = run('node', ['scripts/verify-build.mjs'], checkout)
     A.ok(!stale.ok, '陈旧 lib 让 verify-build 非零退出')
-    A.match(`${stale.stdout}${stale.stderr}`, /lib\/supervise\.js/, '报错里点名陈旧文件 lib/supervise.js')
-    writeFileSync(supervisePath, original)
+    A.match(`${stale.stdout}${stale.stderr}`, /lib\/storage-contract\.js/, '报错里点名陈旧文件 lib/storage-contract.js')
+    writeFileSync(storagePath, original)
   })
 
   await check('反例二：主包 factory 返回 null（源码级改动并重建，字节自洽）必须被打回', async () => {
@@ -585,7 +590,7 @@ try {
     restoreBundles()
   })
 
-  await check('反例五：两个生成产物各自被改动都必须被点名（不能只覆盖 supervise.js）', async () => {
+  await check('反例五：两个生成产物各自被改动都必须被点名（不能只覆盖 storage-contract.js）', async () => {
     for (const file of GENERATED_MODULES) {
       const path = join(libDir, file)
       writeFileSync(path, Buffer.concat([readFileSync(path), Buffer.from('\n')]))

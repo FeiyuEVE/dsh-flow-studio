@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Flow Studio",
-    "description": "Design agent workflows on a drag-and-drop canvas: requirement analysis → solution design → structural design → development → test → code review, with rejection loops back to upstream stages. Every node is an agent role (a single agent, or a lead agent with sub-agents) and can reference skills; flow templates are stored locally."
+    "description": "Model executable BPMN 2.0 agent workflows on a canvas: every service task runs through an agent adapter that must call flow_finish_node, user tasks wait for humans, and each run is an inspectable instance with events, metrics, and evidence. Definitions are versioned and stored locally."
   }
 }

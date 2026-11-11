@@ -1,66 +1,50 @@
 # 产品指南：它解决什么
 
-dsh-flow-studio 是 DeepSeek Harness 的**智能体工作流编排工作室**：在 Web 画布上把一条研发流水线画出来，每个节点配成一个 agent 角色（单个 agent，或主管 + 若干子 agent），节点之间用「正常流转」和「打回」两种线连起来。点「运行」后，它把图编译成执行计划、真的起节点会话跑，并把过程写成事件日志。
+dsh-flow-studio 是 DeepSeek Harness 的 **BPMN 智能体工作流工作室**：在 Web 画布上画一条可执行的 BPMN 流程，把服务任务配成 agent（可带团队）、把人工确认配成 `userTask`；保存成定义版本后「运行」生成实例，引擎按 BPMN 语义推进，事件、指标与证据按实例落盘。
 
-它**不是工作流编辑器，是把一次研发交付摊开在桌面上的作战图**。大多数编排工具（n8n / Dify / Langflow）的隐含前提是「图是自动化的，人只在出错时介入」；这里的前提相反：每个节点是一个 agent 在替你干活，你既要能配它，也要能盯它，还要能在它跑偏时把它打回去。设计理由与取舍见 [设计总案](../DESIGN.md) §1–§5。
+它不是一个只会画图的编辑器：定义是**可执行契约**，实例是**可观察事实**。agent 节点必须调用 `flow_finish_node` 提交结论与证据才能完结；执行失败写进 `lastError`，不伪造状态；每个实例都钉住启动时的定义版本，改定义不会改写历史。
 
 ## 它解决什么
 
-把一句「帮我做个 X」变成一条能盯住的流水线：
-
 ```
-任务输入 → 需求分析 → 方案设计 → 结构设计 → 开发 → 测试 → 代码审查 → 完成
-                ↑           │            │              │        │
-                └──方案打回──┘            │              │        │
-                            └──结构打回───┘              │        │
-                                          └──测试打回────┘        │
-                                                    └──审查打回───┘
+开始 → 需求分析(agent) → 方案设计(agent) → 人工确认(userTask) → 开发(agent) → 结束
 ```
 
-- **每个节点就是一个 agent**：写清「它是什么人」（角色定位）和「它负责什么」（任务），选「单个 agent」还是「主管 + 子 agent」，主从模式下再逐个配子 agent 的分工。出厂模板的六个阶段节点默认就是「主管 + 3 个子 agent」（例如需求分析 = 业务拆解 / 验收条目 / 风险与边界），在检查器里可以把执行方式改回单个 agent。
-- **team 模式的成本要知道**：每个节点会起 1 个主管 + N 个成员会话，跑完整条链的 token 开销显著高于 single（六阶段全 team 时是十几个会话在跑）。先用 single 试跑、分工稳定后再切 team 更划算。
-- **节点可以挂 skill**：从当前 profile 已注册的 skill 里用下拉多选（搜索 + 最多 12 个；例如「怎么开发 Java 服务」这类开发规范），运行时要求节点会话先加载再干活。
-- **节点可以换外部 executor**：`dsh`（默认，走节点会话）/ `codex`（`codex exec --json`）/ `custom`（`sh -c` 模板，用 `{prompt}` / `{schema}` / `{cwd}` 占位）。外部 executor 只允许 single，配置不合法能保存但开不了跑。扩展方式见 [加执行器](../cookbook/add-executor.md)。
-- **打回是图的一部分，不是例外**：一条打回线指向任意上游节点，自动构成循环；每个节点可单独设打回上限。打回线走下方正交航道，虚 = 潜在路径、实 = 这次真的触发了。
-- **运行按工作区分组、并发不设上限**：每个 run 一个引擎实例，同工作区也可以同时跑多个；左栏按 `workspacePath` 分组，`GET /runs?workspaceId=` 可过滤。worktree 由 `engine.start` 决定，建失败如实写 `enabled:false`。
-- **内建 supervision**：`flow_start` 起的 run 默认由 runtime 定时唤醒发起会话复查，不用外部插件，也不用自己挂闹钟；连续 3 次唤醒失败自动降级。
-- **每个节点主管会话都有自审闹钟**：`agents.create` 成功后自动登记（默认 600s / 10 分钟一次，可用 `FLOW_STUDIO_NODE_ALARM_MS` 改），到点按会话状态走 `inject` / `followup` / `resume`，要求节点用 json 代码块回报 `state / progress / summary / members / blockers / verdict`；`state=done` + 合法 verdict 可与 `whenIdle` 竞速提前收口（`node/end.extra.completedBy='self-check'`），连续 3 次投递失败自动停摆。外部 executor 节点没有会话，不挂闹钟。
-- **模板存在本机**：`$DSH_HOME/flow-studio/flows/<id>.json`，换浏览器、换设备都还在。
-
-两种闹钟的差别与指标口径见 [可观测性](observability.md)；run 落盘字段见 [数据模型](../reference/data-model.md)。
+- **定义即 BPMN**：流程是 BPMN 2.0 XML，支持 Zeebe 风格扩展属性（agent 类型、adapter、prompt、team、skills）。XML 导入保留；画布由 BPMN Modeler + 属性面板驱动。
+- **定义版本不可变**：每次保存产生新版本；实例启动时钉住 `definitionVersion + definitionHash` 并复制定义快照。定义改版只影响之后启动的实例。
+- **agent 节点只走适配器 + 完结门**：`dsh` / `codex` 两种 AgentAdapter。节点会话必须调用 `flow_finish_node`；没有调用就失败（`NODE_FINISH_MISSING`），不存在旧 executor 的直出回退。
+- **人工任务**：`userTask` 进入 `pendingTasks`；页面或模型工具完成待办后继续流转。人工等待不是实例状态。
+- **实例状态只有四个**：`ACTIVE` / `COMPLETED` / `SUSPENDED` / `CANCELED`；执行错误用 `lastError` 表达。
+- **运行可观测**：事件按 `seq` 增量拉取；指标与业务证据分别按 [design/12](../design/12-instance-metrics.md)、[design/13](../design/13-instance-evidence.md) 聚合，未知一律不是零。
+- **实例级 worktree**：可选独立 git worktree；支持 inspect / remove / branch / list / prune。
+- **模板存在本机**：`$DSH_HOME/flow-studio/definitions/<id>/`，换浏览器、换设备都还在。
 
 ## 界面
 
 | 区域 | 做什么 |
 |---|---|
-| 左侧 | 流程模板列表：新建 / 打开 / 删除（删除有二次确认；服务器删成功后才清本地草稿，删完可从左栏「撤销」按原 id 写回） |
-| 中间 | 画布：拖动节点、从右侧圆点拖到另一个节点建连线、双击空白处新增节点、裸滚轮缩放（指针锚定）、Shift+滚轮横移、中键/空格拖平移、`Alt` 拖动绕过 4px 吸附；双击空白以外的「全览」把整张图装进视口 |
-| 右侧 | 检查器：选中节点或连线后配置；带「位置与连线」组——X/Y 坐标、四向 4px 微调（Shift 20px）、「连接到…」下拉。节点会话的打开入口 / preset / 可用工具清单在运行日志抽屉的节点详情里 |
-| 底栏 | 节点 / 连线 / 打回统计 + 结构校验结论（点开看逐条问题，可跳转到对应节点）+ 保存状态（含「本地草稿」） |
+| 左侧 | 定义列表：新建 / 打开 / 导入 BPMN XML / 删除；列表显示定义版本摘要 |
+| 中间 | BPMN 画布：拖拽节点、连线、缩放 / 平移；右侧官方属性面板配 agent / 人工任务 / 表单 / connector 等属性 |
+| 右侧 | 实例区：实例列表、详情、人工待办、指标 / 证据 / 收件箱 / worktree 面板 |
+| 底部 | 实例事件抽屉：按 `seq` 增量拉取，可查看每条事件的 kind、时间与摘要 |
 
 ## 画布怎么用
 
-- **连线自动判方向**：目标在下游就建「正常流转」，目标在上游就自动建成「打回」，建完可以在检查器里改。
-- **不用鼠标也能连**：选中节点 → `C` 进入连线待定 → `Tab` / 方向键选目标（状态栏会念「从 X 到 Y」）→ `Enter` 建边 → `Esc` 取消。单字母快捷键只在画布上下文（已选节点、焦点不在输入框）时生效。
-- **保存失败不丢改动**：保存失败或断连时改动落在 `localStorage` 的 `flow-studio:draft:<flowId>`，下次打开会问「恢复 / 丢弃」；保存成功才显示「已保存」，草稿随之清掉。
-- **运行期间锁结构**：拖节点、双击新建、改边一律禁用并显示原因，只有「停止运行」后恢复；运行态只读观察，结构不因状态变化而重排。
-- **「全览」是独立动作**：它不是「适配」的附属，会临时收起左右两栏把整张图装进视口；世界坐标、fit 公式与 LOD 阈值由分册规定（[01 §2.7](../design/01-ia-interaction.md)、[DESIGN §4](../DESIGN.md)），拟合低于 15% 地板时固定 15% 并显示「还有 N 列在视野外」，不假装全纳。
-- **校验不灰置运行按钮**：校验不过时点「运行」会跳到问题列表第一条并定位到节点；真正拦人的是启动门禁（非法流程 400）。校验分级见 [数据模型](../reference/data-model.md)。
+- **建模**：用官方 BPMN 元素（开始 / 结束事件、serviceTask、userTask、网关、子流程、边界事件）组合流程；给 serviceTask 配 `fs:node nodeType="agent"` 与 adapter / prompt / team / skills。
+- **agent 属性**：节点 type=agent 时属性面板出现 adapter、prompt、team、skills、人工确认与变量映射；具体字段以 [实例域接口](../reference/instance-api.md) 与 [design/10](../design/10-bpmn-instance-api.md) 为准。
+- **保存**：保存产生新的定义版本，不做原地覆盖；实例不会因为定义改版而被重写。
+- **运行**：保存后点「运行」创建实例。运行中的实例是只读视图；要看结构就打开对应定义版本。
 
-## 路线图与当前边界
+## 当前边界
 
-已交付：0.3 运行日志与指标、0.4 执行引擎、0.5 会话内启停与健康审计、0.6 流程收件箱、0.7 运行模型（worktree / 顶层会话 / 并发 / 外部 executor / 内建 supervision）、0.8 节点闹钟（结构化自审与提前完成信号）、0.9 状态机内核（XState v5 vendored，转移决策 actor 化）。逐版本细节见 [版本历史](../history/releases.md)。
-
-未排期：
-
-- **实时协同**：保存已经是乐观锁（`version` + 409 + 客户端「覆盖 / 载入服务器版本」两条出口），但还没有多人实时编辑（看不到对方光标 / 没有自动合并），现在靠「刷新后重试」这条底线。
-- **图中图**：一个节点内部再展开成子图（主管带子 agent 的可视化展开）。
-- **独立证据源**：现在「独立复核」靠跨节点引用上游产物；下一步是让宿主自己跑测试 / 规范检查，产物带 `producer=host`（引擎与聚合层已认这个标记，缺的是真正的执行器）。
-- **worktree 管理入口**：0.8.2 已补 HTTP 三端点与 `flow_worktrees` 模型工具；剩余的是把「回收」做成更顺手的日常动作（当前清理顺序与孤儿判定见 [数据模型](../reference/data-model.md)）。
+- 实例状态没有 `failed` / `blocked`：失败是 `lastError`，人工等待是 `pendingTasks`，挂起是 `SUSPENDED`。
+- 不提供旧运行域的 supervision / 节点闹钟 / 打回状态机 / 外部 executor；业务循环用普通 `sequenceFlow` + FEEL 条件建模。
+- 旧 `/flows`、`/runs`、`/worktrees` 路由已删除，已认证请求返回 404；磁盘上的旧数据不再加载。
+- 实时多人协同、图中图、数据库式历史迁移不在当前范围。
 
 ## 延伸阅读
 
-- 在会话里开流程：[会话驱动](session-driven.md)
-- 往流程里发消息：[收件箱与节点会话](inbox-and-sessions.md)
-- 指标与日志：[可观测性](observability.md)
-- 设计与数值：[设计总案](../DESIGN.md)、[01 信息架构与画布交互](../design/01-ia-interaction.md)
+- 实例工具与运行方式：[会话驱动](session-driven.md)
+- 收件箱与节点会话：[收件箱与节点会话](inbox-and-sessions.md)
+- 指标、证据与事件抽屉：[可观测性](observability.md)
+- 契约：[实例域接口](../reference/instance-api.md) · [data-model](../reference/data-model.md) · [design/10](../design/10-bpmn-instance-api.md)

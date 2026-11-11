@@ -11,7 +11,7 @@
  * routes：
  *   GET  /api/flow-studio/health
  *   GET  /api/flow-studio/skills
- *   *    /api/flow-studio/definitions[/<id>[/versions/<n>|/delete]]
+ *   *    /api/flow-studio/definitions[/<id>]
  *   *    /api/flow-studio/instances[/<id>/...]
  *   *    /api/flow-studio/instance-worktrees
  *   *    /api/flow-studio/metrics

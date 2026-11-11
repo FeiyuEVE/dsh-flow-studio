@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.1）
+# 版本历史（0.1 → 0.14.2）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -861,3 +861,30 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 **已知边界**
 - 仍然只认 `DSH_HOME` 与 `homedir()` 两个来源；宿主若改用其它配置项注入家目录，需要同步扩展本函数。
+
+## 0.14.2 — Claude Code 适配器 + 0.14.1 复审小修
+
+**Claude Code 适配器（G）**
+
+- 新增 `src/agent-adapter-claude.js`，实现冻结适配器接口：`probe()` / `capabilities()` / `start()` / `cancel()` / `dispose()`；非交互调用 Claude CLI，工具通道复用 `node-finish-mcp.js` 的每执行可信通道——**真正调用 `flow_finish_node` 才算完结**，退出码、自然语言、「我完成了」都不能完成节点。
+- `capabilities()`：probe 与 MCP 握手通过前 `finishTool:"unsupported"`，握手成功才 `native`；`hooks['turn.stop']` 默认 `emulated`（`--resume` 续跑），显式 `stopHook:'native'` 才标 native 并注明「未经真实 CLI 验收」；`messages:"unsupported"`（收件箱消息按未知投递记，不静默丢弃）；`usage:"native"`，`cache_creation_input_tokens` 归到 cacheWrite（与 input 互斥，不重复加总）。
+- 提醒预算由**单一层**负责：原生 Stop hook 与 resume 共用同一个 3 次计数器，不会各提醒三次。
+- `stream-json` 只用于运行事件、session id 与 usage；超时 / 取消会释放完整进程树与临时 MCP 配置（0700 目录、0600 文件、每 execution 一次性 token），凭据不出现在 argv、事件与日志。
+- 新增 `scripts/claude-smoke.mjs`：真实通道 smoke，三态可辨识（无 CLI → 退出 0 + `skipped:true`；走通 → `skipped:false`；失败 → 退出 1）。
+
+**真实 CLI 通道尚未验收**：本机与容器都没有 `claude` CLI，适配器只用假 CLI 夹具验证了协议与失败语义（15 组 / 238 断言，另有 1 组明确 SKIP）。因此 `capabilities().evidence.realChannel` 如实标注未验证，不能在真实环境里默认当作 native。
+
+**0.14.1 复审小修**
+
+- `node-check.js` 恢复诊断值的 **256 字符上限**（`timeoutMs` / `expectExitCode` 超长时错误消息不会膨胀到上万字符；实际执行的 `command` 不被截短），补差分断言。
+- 文档契约来源纠正：`docs/README.md` 的事件唯一真相源改为 `design/10`；`DESIGN.md` 与 `design/01–08`、`REVIEW.md` 标注为**历史资料（0.14.0 起冻结）**，`docs/AGENTS.md` 的裁决优先级同步限定。
+- 退役后不可用的操作指引修正：定义没有删除路由；`/instance-worktrees` 只有 `GET` 与 `POST .../prune`；停止实例用 `POST /instances/<id>/stop`（工具侧 `flow_instance_cancel`）。
+- 「锁与平台」一节限定范围：讲的是资源锁 / 收件箱锁（flock），定义 / 实例元数据写入锁仍是 `O_EXCL` 锁文件 + nonce + rename。
+- 清理指向已删模块的注释（`bpmn-runtime` / `bpmn-runner` / 两个 store / `index.js` 路由清单）。
+
+**已知边界**
+- Claude 真实通道未验收（见上）；真实 CLI 若与官方文档不符，会在 MCP 握手处失败为 `NODE_FINISH_TOOL_UNAVAILABLE`，不会伪造完结。
+- 默认 `--permission-mode acceptEdits`（不默认 bypassPermissions），需要执行命令的节点要显式配 `permissionMode`。
+- 用户自己的 `~/.claude` settings / CLAUDE.md / hooks 仍会生效（只隔离了 MCP 配置）；用户 Stop hook 可能额外阻止停止，但不改变我们的单层提醒计数。
+- `messages` 能力为 unsupported；Windows 的进程树回收（`taskkill /T /F`）未在 Windows 实测。
+- Claude 的 `result.usage` 是会话累计值：有 assistant usage 时忽略它，只在整次执行没有任何 assistant usage 时兜底一次。

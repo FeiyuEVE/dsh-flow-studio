@@ -2,7 +2,7 @@
  * BPMN 执行器：把 `bpmn-engine` 包成我们能直接用的「单实例执行器」（0.13.0 · 只做引擎适配）。
  *
  * 边界（**只做**引擎适配）：
- *   - 不接 HTTP、不接 Web UI、不读写 `runstore` / `instance-store` / `definitions/`；
+ *   - 不接 HTTP、不接 Web UI、不读写 `instance-store` / `definitions/`（存储由 runtime 负责）；
  *   - 不解析 BPMN XML（`definition` 由解析器给，形状见下）；只在「只有 definition」时
  *     **反向生成**一份最小 BPMN XML 喂给引擎（这是序列化，不是解析）；
  *   - 快照只回给调用方（`getState()` 的返回值），落不落盘、落哪、去抖策略由上层决定。

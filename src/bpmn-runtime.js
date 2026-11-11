@@ -785,7 +785,11 @@ class BpmnRuntime {
       return {
         instance: current,
         error: {
-          code: startError.code ?? 'BPMN_ENGINE_ERROR',
+          // handler 失败时 runner 用包装码 BPMN_HANDLER_FAILED，真正的业务码在 cause 里：
+          // 创建响应必须和落盘的 instance.lastError.code 同一口径（否则调用方看到两个码）。
+          code: (typeof startError?.cause?.code === 'string' && startError.cause.code !== '')
+            ? startError.cause.code
+            : (startError.code ?? 'BPMN_ENGINE_ERROR'),
           message: startError.message,
         },
       }

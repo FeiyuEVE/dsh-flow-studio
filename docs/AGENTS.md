@@ -13,7 +13,7 @@
 | [README.md](README.md)（本文档目录索引） | 文档地图：每份文档一句话职责 + 读者对象 + 推荐阅读顺序 | 任何事实细节 |
 | [guide/](guide/overview.md) | 产品面指南：用户能看到什么、怎么操作、行为是什么 | 路由表、字段级契约、内部实现细节 |
 | [reference/](reference/host-api.md) | 契约：路由、参数、字段、环境变量、错误码、落盘布局 | 教学顺序、设计理由、「为什么这么定」 |
-| [history/releases.md](history/releases.md) | 逐版本变化（0.1 → 0.12.3）：新增、修复、已知边界 | 当前行为（当前行为归 guide / reference） |
+| [history/releases.md](history/releases.md) | 逐版本变化（0.1 → 0.13.1）：新增、修复、已知边界 | 当前行为（当前行为归 guide / reference） |
 | [faq.md](faq.md) | 高频问题的**短答案 + 指向 owner 的链接** | 与 owner 重复的长篇解释 |
 | [cookbook/](cookbook/release.md) | 编号步骤式 how-to，每步带可验证结果 | 设计理由、字段全表 |
 | [postmortem/](postmortem/2026-11-07-oom.md) | 事故记录体例：现象、时间线、根因链、修复、遗留 | 常规教程 |

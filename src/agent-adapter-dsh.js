@@ -892,6 +892,33 @@ export function createDshAdapter(options = {}) {
       }
 
       /**
+       * 会话级错误（模型路由不可用 / provider 鉴权失败等）：真实原因必须冒泡。
+       *
+       * 不订阅它时，`whenIdle` 兜底会把「会话根本没跑起来」记成
+       * `NODE_FINISH_MISSING`（没调工具），把故障掩盖成 agent 行为问题——2026-11-11
+       * 在容器测试台第一次跑 dsh 节点时实际踩到（0.3s、reminders:0）。
+       *
+       * `agent/error` 是终态错误；可重试的单次请求失败走 `agent/request-error`，不在这里拦。
+       */
+      const onAgentError = (payload) => {
+        if (st.settled || st.canceled) return
+        if (finishGate.settled()) return
+        if (!finishGate.settled()) {
+          try {
+            finishGate.abort('agent failed')
+          } catch (error) {
+            log('warn', `flow-studio: finishGate.abort 失败：${errorText(error)}`)
+          }
+        }
+        settle({
+          ok: false,
+          code: 'DSH_AGENT_FAILED',
+          reminders: st.reminders,
+          message: errorText(payload && payload.error !== undefined ? payload.error : 'agent 报错'),
+        })
+      }
+
+      /**
        * setup 在会话**发布之前**执行（`agent/created` 之前），所以工具与监听一定在
        * `followup` 的第一个 step 之前就绪。
        */
@@ -926,6 +953,9 @@ export function createDshAdapter(options = {}) {
         }
         const off = agentCtx.on('agent/turn-stopping', payload => onTurnStopping(payload))
         if (typeof off === 'function') st.unlisteners.push(off)
+        // 会话错误必须让真实原因冒泡，不能被 whenIdle 兜底成 NODE_FINISH_MISSING。
+        const offError = agentCtx.on('agent/error', payload => onAgentError(payload))
+        if (typeof offError === 'function') st.unlisteners.push(offError)
       }
 
       const meta = {}

@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.12.3）
+# 版本历史（0.1 → 0.13.1）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -355,3 +355,126 @@
 - 停机的节点 `node/end.extra.reason` 与 `run/end.reason` 是同一份文案，想区分「谁停的」要看 `run/end.status` 与文案本身，没有单独的 `source` 字段落进事件。
 - `artifact/write.data.placeholder` 只标「像占位符」，不改变证据判定；质量层怎么用这个标记不在本版范围（`src/runlog.js` 的归属判定不读它）。
 - `run.json.tokenCoverage` 在客户端指标区尚未渲染，目前只通过 `GET /runs` / `GET /runs/<id>` 暴露给集成方。
+
+## 0.13.0 — BPMN 引擎与双域存储
+
+这一版换的是**引擎内核与存储域**，不是画布：模板从一份可变的流程 JSON 变成不可变的 BPMN 定义，运行实例从 `runs/` 换成 `instances/`，路由语义从自研的 `next / reject` 换成 `bpmn-engine@26.0.6` 的 BPMN 2.0 子集。老的 `flows/`、`runs/` 与 `src/engine.js` 原样保留（画布 0.13.3 才替换），新路径另开目录，不做兼容双轨。
+
+### 1. 模板域 / 实例域分离
+
+- **布局**：`definitions/<id>/meta.json + <version>.bpmn` 与 `instances/<id>/instance.json + definition.bpmn + state.json + events/<activityId>/<attempt>.jsonl` 平级于老的 `flows/`、`runs/`；两个域不同目录、不同 id 空间、不同生命周期（`docs/design/10-bpmn-instance-api.md` §2）。
+- **定义不可变、可版本化**：同一 `(id, version)` 一旦落盘只接受相同字节（hash 相同即幂等成功），显式版本换内容 → 409 `DEFINITION_VERSION_IMMUTABLE`；目录 0700、文件 0600，`definitions` 根上一把跨进程 `.lock`（`src/definition-store.js:632` 的 `saveDefinitionVersion`）。
+- **实例钉住定义**：启动时冻结 `definitionId + version + hash`，并复制一份 `definition.bpmn` 进实例目录，之后只读自己的快照；定义被改版 / 被删都不影响已启动实例（`src/instance-store.js:584` 的 `createInstance`）。
+- **沿用 0.12 的成熟部分**：append-only 事件分片、`revision` 乐观锁、原子写、终态写保护；`seq` 在实例锁内先分配再追加，跨分片全局单调（允许崩溃空洞，不重复）。
+
+### 2. BPMN 2.0 XML 解析与 FEEL 条件
+
+- **解析器**：`src/bpmn-parse.js` 用 vendored `bpmn-moddle@10.3.1` 加自定义 `fs:` 扩展命名空间，把节点类型、角色提示词、skills、`adapter` 等落成 `fs:node`；解析结果带 `definition.hash`（XML 的 sha256），与定义域入参对账。
+- **只允许一个安全子集**：`src/bpmn-policy.js:22` 的 `ALLOWED_ACTIVITY_TYPES` 只放 `startEvent` / `endEvent` / `serviceTask` / `userTask` / `exclusiveGateway`；条件事件、标准 / 多实例循环、并行 / 包容 / 复杂 / 事件网关、`scriptTask`、子流程 / `callActivity` 在**解析期**就拒，专用错误码 `PARALLEL_GATEWAY_FORBIDDEN` / `INCLUSIVE_GATEWAY_FORBIDDEN` / `BPMN_CONDITIONAL_EVENT_FORBIDDEN` / `BPMN_STANDARD_LOOP_FORBIDDEN`，其余 `BPMN_EXECUTION_UNSUPPORTED`。
+- **条件只走 FEEL**：`src/bpmn-expr.js` 用 vendored `feelin@8.2.0` 求值，自动剥 Camunda 风格的 `=` 前缀；`language="javascript"` 一律拒绝（`bpmn-engine` 内置实现走 `node:vm`，实测可逃逸到 `process`），`process` / `require(` / `constructor` / `this` 命中即拒（先剔除字符串字面量，避免误伤）。测试里有反例锁：`= false` 必须走默认流。
+- **不让内置表达式引擎兜底**：runner 通过 `scripts.getScript` 接管每条带 `conditionExpression` 的连线；内置解析器会把 `= 1 > 2` 当成属性路径，条件静默恒真——这是研究阶段实测出来的红线，不是理论风险。
+
+### 3. `bpmn-engine@26.0.6` 的最小执行面
+
+- **三种元素**：agent 节点 = `bpmn:serviceTask`（handler 是 `executeAgent`）、人工节点 = `bpmn:userTask`、分支 = `bpmn:exclusiveGateway`。人工任务的「完成」= `execution.signal({ id, executionId, payload })`；`pendingTasks[]` 只回答「谁在等人」，没有 assignee / 认领 / 表单 / TTL。
+- **`flow/taken` 取代 `reject/trigger`**：每条实际走过的连线落一条一等事件，带 `flowId / from / to / condition{expression,value}`；旧模板的「打回」迁移成普通反向条件连线，`fs:maxRounds` 只表示「这条连线最多被走 N 次」这个通用上限（`src/bpmn-runner.js:442`）。
+- **活动事件只从 `execute({listener})` 出来**（`engine.on(...)` 收不到），由 runner 统一封装；快照只在 `activity/wait` 与 `activity/end` 之后取（`src/bpmn-runner.js:221`），不做逐事件 `getState()`。
+- **护栏**：活跃实例 LRU（`FLOW_STUDIO_BPMN_MAX_ACTIVE`，默认 100）、单活动 / 整轮双超时、单连线次数上限加循环护栏；LRU 要淘汰一个「还没落过 state」的实例时明确拒绝（503 `BPMN_LRU_EVICT_UNSNAPSHOTTED`），不静默丢实例。
+- **路由**：`/api/flow-studio` 下 10 条定义 / 实例 API（定义列表 / 保存 / 读取，实例创建 / 列表 / 详情 / 事件 / 待办 / 完成 / stop），沿用现有鉴权、只读令牌与同源校验；`/health` 的 `bpmn` 计数每次现算。中途去掉了 `FLOW_STUDIO_BPMN` 灰度开关：新路由常开，不做兼容双轨。
+- **依赖**：`bpmn-engine@26.0.6` 的五个 peer 组件改成直接依赖——pnpm profile 不自动安装传递 peerDependencies，只声明 `bpmn-engine` 会让插件在真实 profile 里 import 失败（容器测试台实测）；`bpmn-moddle` / `feelin` / `zeebe-bpmn-moddle` vendor 进 `src/`。
+
+### 4. 重启恢复：原生 `getState/recover` + 状态信封 v2
+
+- **恢复路径固定**：新建 `Engine` → `recover(state)` → `resume({listener})`；`recover()` 不能喂给运行中的 engine。
+- **信封 v2**（`src/bpmn-state.js:36`）：`kind / instanceId / definitionId / definitionHash / version / processId` 必填，并绑定执行 XML 的 `sourceHash`；裸 `bpmn-engine` 快照与 v1 信封直接拒绝，不迁移、不补 hash。
+- **恢复前先比对执行结构**：从**可信 XML** 用与执行相同的 moddle / serializer 生成结构，与快照里的元素 id / 类型 / 配置、连线端点 / 条件 / 默认流 / 上限 / 出边顺序、start / end 逐项比较；`flowTakes` 必填且与引擎计数强一致，删掉或改坏计数不会让已耗尽的边复活。任一项不符 → `BPMN_STATE_DEFINITION_MISMATCH` / `BPMN_STATE_VERSION_UNSUPPORTED` / `BPMN_STATE_INVALID`，**handler 调用数 0**。
+- **懒恢复**：请求碰到不在内存里的实例才恢复；`recovered:true` 只表示「本次请求重建了 runner」。终态不恢复；`state.json` 缺失时 GET 200 + 可读原因、写操作 409；快照损坏 → 500，不拿定义域的最新版冒充。
+- **恢复点**：运行时在每次操作收口后（wait / end 之后）显式 `getState()` 一次写 `state.json`，runner 的自动快照关掉，避免同一点取两次 7–18 KB 快照。
+
+### 5. 旧 JSON → BPMN 转换器与迁移脚本
+
+- **转换口径**（`src/bpmn-convert.js:789` 的 `convertLegacyFlow`）：`start` / `end` → 对应事件；其余节点 → `serviceTask` + `fs:node nodeType="agent"`，节点全字段进 `fs:node`、无法映射的进 `fs:legacy`；`next` 边 → 普通 `sequenceFlow`，第一条 `next` 设 BPMN `default`，其余不自动编条件、只给 warning；旧 `reject` 边 → 反向条件连线，单条写 `= verdict = "reject"`，多条写成互斥条件并按老引擎 `leftmost` 选默认目标、其余靠 `rejectTarget` 选中，回退上限落 `fs:maxRounds`；同时生成 `bpmndi` 图与分层坐标，bpmn.io 打开就有布局、节点不重叠。
+- **往返是硬门禁**：生成的 XML 必须能被 `parseBpmn()` 重新解析，节点 / 边数一致；测试覆盖 3 节点 + 1 条打回边的 round-trip。
+- **迁移 CLI**（`scripts/migrate-flows-to-bpmn.mjs`）：默认 **dry-run**，只打印计划，`--apply` 才写；每个文件先 `convertLegacyFlow()` 再 `parseBpmn()` 复核，任一步失败 → `skipped`，原文件留在 `flows/` 不归档；保存后回读，要求「meta 记录 hash = parseBpmn 的 definition.hash = sha256(xml)」三者一致，否则 `failed`；同 hash 已是当前版本 → `unchanged`，不重复归档；归档只 rename 不删除，同名冲突退 `*.json.bak-<时间戳>`；写 `migration-report.json`，退出码 0 / 1 / 2 分别表示全部成功、有 skipped 或 failed、参数 / 路径错误。
+
+### 6. 执行白名单、失败停机与实例状态口径（A1/A2 与复审收口）
+
+- **A1 · 条件与恢复入口封闭**：解析期白名单加运行期拒绝型表达式解析器双保险；删除生产入口的 `evaluateCondition` 替换选项（传入即 `BPMN_OPTIONS_INVALID`）；恢复路径先校验身份与结构再 `recover()`。修前可复现：条件 startEvent `= 1 > 2` 照常执行、裸并行网关快照恢复成功并产出两个待办；修后分别得到 `BPMN_CONDITIONAL_EVENT_FORBIDDEN` 与 `BPMN_STATE_VERSION_UNSUPPORTED`，handler 调用 0。
+- **A2 · 超限 / 失败 / 取消立即停机**：用 `elements.SequenceFlow` 注入点包住原 `take`，在发布、计数、推动目标之前统一检查并预占 `flowTakes`（条件边、默认边、无条件边都覆盖）；`_fail` 同步锁定首个终态并 abort 在飞活动，`error` 之后不再出现 `activity/start`；stop 在实例串行队列外置停止闩并发取消信号，慢 complete 挡不住 stop。
+- **复审的 3 BLOCKER + 7 MAJOR**：快照布尔字段只接受真布尔、出边顺序与节点路由标记纳入比较、补偿属性进执行白名单；`start()/recover()` 在异步校验后复核取消代次；恢复绑定 `instanceId` / `sourceHash`；失败停机写「不可恢复」墓碑（实例仍 `ACTIVE + lastError`，但重启 / 淘汰后不再自动恢复旧执行位置，`complete` 明确 409）；交给 handler 的变量改深拷贝；终态写保护覆盖事件追加 / 快照 / 进入终态时的 `pendingTasks` / `artifacts`；stop 与慢 complete 并发时以 409 `INSTANCE_TERMINAL_IMMUTABLE` 收口，不再返回 200 + `ACTIVE` 的假成功；`recover` 的 settle 加有界超时且只认可信 id；`definition-only` 顶层 `maxTakes` 生效（与 `fs:maxRounds` 冲突显式报错）；`instance.json.artifacts` 落库并受终态保护。
+- **状态口径（Camunda 8）**：实例只有 `ACTIVE / COMPLETED / SUSPENDED / CANCELED`（`src/instance-store.js:66`），终态只有 `COMPLETED` 与 `CANCELED`；**没有 `failed`、没有 `blocked`、也没有状态机**——`status` 是普通持久字段，由 runtime 按事件写。中途一度加过 `blocked`，随后整段撤掉：引擎出错（条件错、超时、handler 失败、adapter 不可用、连线超限、循环护栏）时实例**保持 `ACTIVE`**，写 `lastError{code,message,nodeId?,activityId?}` 并发 `error` 事件，是否重试 / 终止由业务或人决定。三个新域文件里 `'failed'` 零命中，runtime / store 无 `'blocked'` 字面量，测试里有防回潮断言。
+
+### 验证
+
+- `npm test` **43 个测试文件 / 1287 组 / 0 失败**（0.13.1 收口后的全量回归，27 个套件显式计数合计 **7467 条断言**；`&&` 链走到第 43 个套件并打印汇总，日志里无失败标记）；0.13.0 新增的 8 个套件是 `definition-store`（9 组 / 74 条）、`instance-store`（14 组 / 154 条）、`bpmn-expr`（11 组 / 54 条）、`bpmn-parse`（23 组 / 129 条）、`bpmn-convert`（11 组 / 200 条）、`bpmn-runner`（43 组 / 451 条）、`bpmn-runtime`（17 组 / 254 条）、`migrate-flows`（11 组 / 154 条）；0.13.0 合入时是 38 个文件；A1/A2 复审期间加入 `node-finish` 后 39 个；0.13.1 再补 4 个，全量 43 个。`npm run build` EXIT 0（`src ↔ lib` 40 个 Host 模块逐字节一致、37 个打包输入、`lib/client.js` 483,806 B）。
+
+### 已知边界
+
+- 未做画布：0.13.3 之前仍是旧的 React Flow 画布，BPMN 定义目前只能由 API 或迁移脚本产生，没有可视化编辑 / 属性面板 / GUI 待办面板。
+- 0.13.0 的 `adapter="dsh"` **明确失败**（`BPMN_AGENT_ADAPTER_UNAVAILABLE`，文案指向 0.13.1），`codex` / `custom` 仍走 `src/executor.js`；HTTP connector 未实现（`BPMN_HTTP_NOT_IMPLEMENTED`，0.13.4）；人工任务只开 HTTP 完成入口。
+- 新实例的事件流**不接老 `audit.js`**：新事件还没有对应的审计判据，0.13.0 不把新事件塞进老审计（口径迁移尚未做，0.13.1 也没做）。
+- 并行 / 包容网关在解析期直接拒绝（上游 #204：并行汇聚 + 成环会提前通过），团队节点只能走节点内 fan-out，不用 BPMN 并行网关。
+- codex 用户全局 `~/.codex/config.toml` 的 hooks / mcp_servers 未隔离（0.13.1 也未做）；真实模型 turn 不在自动化测试里；Windows 清理未实机验证：进程 / 文件清理的 Windows 分支没有实机回归，自动化都在 Linux 上跑。
+
+## 0.13.1 — AgentAdapter 与 flow_finish_node
+
+这一版把 0.13.0 里「明确失败」的 dsh agent 节点接成可用，并把「节点算不算完结」从看输出文本改成**必须调用工具**：agent 节点要完结自己、让流程往后流转，只能通过 `flow_finish_node`。引擎语义不变，交付 5 个测试套件。
+
+### 1. 适配器冻结接口
+
+- **形状**（`src/agent-adapter.js`）：`probe() / capabilities() / start() / cancel() / dispose()` 五个方法，`start()` 返回 `{ exited, sessionId?, agentId?, pid? }`；注册表提供 `register / get / list / probeAll`，`probeAll()` 对单个适配器的探测上限 15s，超时按 `ok:false` 记录，不拖住其它适配器。
+- **能力表**：`capabilities().finishTool` 只有 `native | unsupported` 两档——**不允许 `emulated` 文本解析这种中间态**；`hooks['turn.stop']` 允许 `native | emulated | unsupported`。**未成功 `probe()` 之前只能声明 `unsupported`**：`native` 是实测结论，不是静态声明。
+- **结构化错误**：`ADAPTER_INVALID` / `ADAPTER_DUPLICATE_ID` / `ADAPTER_CAPABILITY_INVALID` / `ADAPTER_PROBE_INVALID` / `NODE_FINISH_TOOL_UNAVAILABLE`，上层按字符串分流，不靠错误类。
+- **比 design/09 B-1 的拟议形状小**：`plan / resume / materialize / events` 不在冻结接口里；`resume` 目前只作为 codex 的提醒兜底，不是接口方法（`docs/design/09-agent-adapter-hooks.md` B-1 已注明以冻结子集为准）。
+
+### 2. DSH 适配器
+
+- **会话级工具**：在 `agents.create()` 的 `setup(agentCtx, agent)` 里 `agentCtx.tools.register(flow_finish_node)`，工具只在**该节点的会话**可见，节点结束随 disposer 回收。
+- **提醒**：`agent/turn-stopping` 时没完结就 `agent.steer(提醒文本)`，默认最多 3 次；每次提醒经 `reminder.onFire` 翻成 handler 事件 `agent/reminder{count,maxFires}`，由 runner 透传，不新增一等事件 kind。
+- **结局**：提醒用尽 → `finishGate.abort` + `exited={ok:false, code:'NODE_FINISH_MISSING', reminders}`，迟到 submit 一律 `NODE_ALREADY_SETTLED`；cancel / abort / dispose 都会 abort 闸门并 `agent.cancel({kind:'parent'})`。
+- **提示词与来源**：节点提示词带 `node.prompt` / `roleCard` / `attempt` / 当前变量；注入消息在宿主里仍是合法 user message，同时带 `source.flowStudio` 供审计识别（`src/agent-adapter-dsh.js:840` 附近）。
+- **宿主 API 全走发行版类型**：`agents.create` / `tools.register` / `agent/turn-stopping` / `agent.steer` 都以发行版 `.d.ts` 行号为证，不 import 未随宿主发布的 `experimental/hook-protocol`。
+
+### 3. Codex 适配器
+
+- **工具通道**：插件自带 MCP stdio server（`src/node-finish-mcp.js`）暴露同名 `flow_finish_node`；`codex exec` 通过**本次进程的** `-c mcp_servers.*` argv 加载它，不拼 shell、不改用户全局 `~/.codex/config.toml`、也不改工作区 `.codex/`。一个 MCP server 只拿一个随机凭据与私有 Unix socket，凭据只映射到内存里那一个 gate，不进 argv / 日志 / 提示词 / 磁盘。
+- **完结只认通道信号**：只以 gate 收到 submit 为准，不解析 stdout 里的工具名，不写完成标记文件，不判「模型说完成了」。
+- **提醒**：默认 `emulated`，用 `codex exec resume <session-id>` 进程级续跑；只有显式 `settings.stopHook === 'native'` 才注入原生 `Stop` hook（`decision:"block" + reason`）并标 `native`。该 native 结论来自手工隔离探测（第二把 Stop 的 stdin 带 `stop_hook_active:true`），**不是 probe 实测**，能力 evidence 里如实写。
+- **模型 / 沙箱 / 审批显式 pin**：`-m <model>`；`exec` 用 `-s <sandbox>` 加 `-c approval_policy="<policy>"`（`codex exec` 没有 `-a` flag），`exec resume` 没有 `-s`，改用 `-c sandbox_mode="<sandbox>"`；默认 `workspace-write` / `never`，可被 `settings.sandbox` / `settings.approvalPolicy` 覆盖。
+- **进程与凭据卫生**：子进程 env 走白名单（不继承宿主整个 `process.env`）；`handle.events / lastMessage / stdoutTail / stderrTail` 导出前把本 execution 的 token、socket 路径、runDir 路径替换成 `[redacted]`；cancel 杀**整个进程组**（含它拉起的 MCP 子进程），Windows 走 `taskkill /T /F /PID`；`dispose()` 用有界 grace 等退出，不 await pending 的 `exited`。
+- **probe**：用 `codex mcp list --json -c mcp_servers.<name>.command=...` 验证 CLI 接受同一份配置形状，顺带验证 `sandbox_mode` / `approval_policy` 被解析；ENOENT 快速失败，总超时生效。
+
+### 4. 完结门（`flow_finish_node`）
+
+`src/node-finish.js` 是**被动**校验层：只做形状 / 上限 / 宿主侧文档校验，不提醒、不计数、不判 `NODE_FINISH_MISSING`（那是适配器 `turn.stop` 的职责）。
+
+- **变量**：键 ≤32；值只允许 `boolean | number | string(≤512 码点) | null`；UTF-8 JSON ≤8192 字节；拒绝 `__proto__` / `constructor` / `prototype` 和任何嵌套对象 / 数组。超限 → `NODE_VARIABLES_INVALID`，整次调用失败，节点不结束。
+- **文档**：≤32 份；`path` 必须是工作区内的相对路径（≤1024 字符，禁绝对路径 / `..` 段 / 反斜杠 / 空段）；`realpath` 必须落在工作区内（防符号链接逃逸）；必须是普通文件且 `nlink === 1`——**硬链接一律拒绝**；≤5 MiB；同一文件句柄分块读 + 前后 `fstat` 一致，sha256 与字节数对得上；`summary` ≤200 码点，超限整次拒绝不静默截断。
+- **一次性**：一次活动只接受一次成功 submit；重复 → `NODE_ALREADY_FINISHED`（同参数重放也不重复写产物）；闸门 abort 后 → `NODE_ALREADY_SETTLED`；校验失败不锁死，修正后可重试。
+- **产物只登记引用**：record 带 `output` / `artifacts[]` / `summary`，文档正文不进 record、不进事件、不进错误信息；错误里只出现工作区相对路径。
+
+### 5. admission：先 probe，再断言 native
+
+- `admit()`（`src/agent-execute.js:164`）先 `probeAdapter(adapter)`，成功后才 `assertFinishToolNative()`；probe 失败（codex 不在 / 未登录 / MCP 握手失败）与 `finishTool !== 'native'` 都收敛成**零派发** + `NODE_FINISH_TOOL_UNAVAILABLE`，不退回「看输出文本猜结论」。
+- **每个 runtime 一份 probe 缓存**：同一 adapter id 只 probe 一次，同一节点的多个活动不重复起子进程；注册表空 / 未知 adapter → `BPMN_AGENT_ADAPTER_UNSUPPORTED`，连 probe 都不跑。
+- 未 probe 的适配器只能声明 `unsupported`——这就是「未 probe 不宣称 native」的实现口径，也是 DSH 适配器在 `start()` 里会自动 probe 一次的原因。
+
+### 6. 运行时接线（A3）
+
+- **生命周期**：runner 的 agent 节点 → adapter → `finishGate` → `handle.exited`；成功只认闸门受理的 record，`activity/end` 带 `output` / `artifacts` / `summary`。
+- **产物合并**：`instance.json.artifacts[]` 由 runtime 合并，去重键固定 `path + sha256`——同一活动重试、多个节点引用同一文件都不重复追加；内容变了（hash 不同）则是新产物；终态实例不再写（`src/bpmn-runtime.js:1606`）。
+- **result 取最后一份 output**：`process/end` 时 `instance.result` 取**最后一个成功 agent 节点的 output**（`endEvent` 不产生输出）；变量只合并短标量，文档正文永远进不了网关条件（`src/bpmn-runtime.js:1472`）。
+- **提醒用尽**：实例 `status` 保持 `ACTIVE`、`lastError.code = 'NODE_FINISH_MISSING'`（带 `reminders`）、发 `error` 事件，**不发 `process/end`**；是否重试 / 终止由业务或人决定。
+- **超时与取消**：活动超时 → 适配器 cancel + dispose，收口为 `BPMN_ACTIVITY_TIMEOUT`；`ctx.signal` abort → `BPMN_ABORTED`；两者都不留 pending 会话，也不把失败写成实例终态。
+
+### 验证
+
+- `npm test` **43 个测试文件 / 1287 组 / 0 失败**（27 个套件显式计数合计 **7467 条断言**；`&&` 链走到第 43 个套件并打印汇总，日志里无失败标记）；本版交付的 5 个套件（`node-finish` 在 A1/A2 复审期间先落地）：`node-finish`（9 组 / 348 条）、`node-finish-mcp`（10 组 / 104 条）、`agent-adapter-dsh`（19 组 / 182 条）、`agent-adapter-codex`（15 组 / 201 条）、`agent-execute`（19 组 / 143 条）；`agent-adapter-codex` 里「真实 codex 0.167 probe」在找不到 CLI 时明确 SKIP 且不计入通过数。`npm run build` EXIT 0（`src ↔ lib` 40 个 Host 模块逐字节一致、37 个打包输入、`lib/client.js` 483,806 B）。
+
+### 已知边界
+
+- 未做画布：0.13.3 之前仍在旧的 React Flow 画布上，BPMN 定义没有可视化编辑 / 属性面板，人工任务只有 HTTP 完成入口、没有 GUI 待办面板。
+- codex 用户全局 `~/.codex/config.toml` 的 hooks / mcp_servers **未隔离**：适配器只用 `-c` 传本次的 MCP 配置，没有独立 `CODEX_HOME`，也没加 `--ignore-user-config`；用户配置里的 hooks / mcp_servers 仍会作用到每个 codex 节点（能力 evidence 里同样如实写）。
+- 真实模型 turn 不在自动化测试里：DSH 适配器用桩会话、codex 适配器用假 CLI 加真 MCP 通道；原生 Stop hook 只有手工隔离探测证据，`settings.stopHook:'native'` 时才启用，probe 不复测。
+- Windows 清理未实机验证：`taskkill /T /F /PID` 与 socket / runDir 清理只在 Linux 自动化里跑过。
+- `claude` 适配器与原生 hook 桥（`tool.pre` 可阻断）在 0.13.2；HTTP connector 在 0.13.4；画布在 0.13.3。

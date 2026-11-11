@@ -422,6 +422,43 @@ await check('maxFires=0：第一次停下立即 MISSING、零 steer', async () =
   await adapter.dispose(handle)
 })
 
+await check('agent/error：真实会话错误冒泡成 DSH_AGENT_FAILED，不被 whenIdle 掩成 MISSING', async () => {
+  // 2026-11-11 容器测试台实测：agent 会话报错（无模型凭据）后 whenIdle 兜底记成
+  // NODE_FINISH_MISSING（0.3s、reminders:0），把故障掩盖成「没调工具」。这里锁住
+  // 「真实错误必须冒泡 + 闸门同时 abort」。
+  const host = createFakeHost()
+  const gate = makeGate(freshWorkspace())
+  const { fired, reminder } = reminderCollector()
+  const adapter = makeAdapter(host)
+  const handle = await adapter.start({
+    element: ELEMENT,
+    ctx: { attempt: 1 },
+    finishGate: gate,
+    workspaceRoot: freshWorkspace(),
+    reminder,
+  })
+
+  const handlers = host.listeners.filter(entry => entry.name === 'agent/error' && !entry.disposed)
+  A.equal(handlers.length, 1, 'setup 里订阅了 agent/error')
+  await handlers[0].fn({
+    agent: host.agent,
+    turn: 1,
+    step: 1,
+    error: new Error('模型路由不可用：no provider configured'),
+  })
+
+  const exited = await handle.exited
+  A.equal(exited.ok, false)
+  A.equal(exited.code, 'DSH_AGENT_FAILED', '不是 NODE_FINISH_MISSING')
+  A.equal(exited.reminders, 0)
+  A.match(String(exited.message), /模型路由不可用/, '真实原因带出来')
+  A.equal(gate.settled(), true, '错误同时 abort 闸门（迟到 submit 一律拒绝）')
+  A.equal(fired.length, 0, '没有提醒')
+
+  host.agent.idle.resolve()
+  await adapter.dispose(handle)
+})
+
 // ---------------------------------------------------------------------------
 // 4. 取消 / abort
 // ---------------------------------------------------------------------------

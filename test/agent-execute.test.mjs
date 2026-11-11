@@ -695,6 +695,8 @@ await check('集成·admission 非 native：零派发 + NODE_FINISH_TOOL_UNAVAIL
   const detail = await readInstance(runtime, created.id)
   A.equal(detail.status, 'ACTIVE', 'admission 拒绝不改实例 status')
   A.equal(detail.lastError.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+  // 创建响应里的 error.code 必须和落盘 lastError 同一口径（不能是 BPMN_HANDLER_FAILED 包装码）。
+  A.equal(created.error?.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE, '创建响应 error.code 与 lastError 一致')
   A.equal(adapter.calls.starts, 0, '零派发')
   A.equal(adapter.calls.probe, 1, 'admission 必须 probe（且失败要留痕）')
 })

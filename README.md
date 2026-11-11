@@ -59,7 +59,7 @@ dsh plugin --profile web add ./dsh-flow-studio
 | 用容器测试台验收一次改动 | [容器测试台](docs/cookbook/run-container-testbed.md) |
 | 发一个版本 | [发版](docs/cookbook/release.md) |
 | 给节点加一种新的外部执行器 | [加执行器](docs/cookbook/add-executor.md) |
-| 0.1 → 0.9 每一版改了什么 | [版本历史](docs/history/releases.md) |
+| 0.1 → 0.13.1 每一版改了什么 | [版本历史](docs/history/releases.md) |
 | 常见问题（会话、worktree、闹钟、为什么自研） | [FAQ](docs/faq.md) |
 | 设计总案与 01–08 分册（数值与裁决） | [设计总案](docs/DESIGN.md) |
 | 文档怎么写、事实放哪一层 | [docs/AGENTS.md](docs/AGENTS.md) |

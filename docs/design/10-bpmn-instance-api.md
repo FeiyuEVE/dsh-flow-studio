@@ -202,7 +202,9 @@ $DSH_HOME/flow-studio/
 - 重复 stop 幂等：200 + `alreadyTerminal:true`，返回当前终态。
 - 错误：400（instanceId 非法）、404（不存在）、500/503（收口失败 / 引擎不可用）。
 
-## 4 实例状态机与 runner 五态换算
+## 4 实例状态（status 字段）与 runner 五态换算
+
+> 新引擎**没有独立状态机**（没有 xstate / `flowmachine` 参与）：`instance.json.status` 只是一个普通持久字段，由 runtime 按事件直接写。下面的图只说明**允许的取值与流转**，不是状态机实现。
 
 实例状态（`instance.json.status`）：
 

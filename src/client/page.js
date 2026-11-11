@@ -52,6 +52,8 @@ export const PAGE_TITLE = '流程编排工作室'
 export const PROPERTY_COMMIT_WAIT_MS = 650
 /** 实例事件轮询间隔（与 logdrawer 的 nextEventPollDelay 共用）。 */
 const INSTANCE_POLL_MS = 2000
+/** 终态前追平事件的补拉上限：Host 游标异常时也不能死循环。 */
+const TERMINAL_EVENT_CATCHUP_LIMIT = 8
 
 /**
  * 生成一个合法的定义 id（新定义 / 导入未命名时用）。
@@ -240,10 +242,16 @@ export function FlowStudioPage(props = {}) {
     ? { kind: 'instance', xml: initialInstanceXml, markers: runtimeMarkersFromEvents(initialEvents) }
     : { kind: 'definition', xml: initialDefinition && typeof initialDefinition.xml === 'string' ? initialDefinition.xml : '', markers: [] })
   const viewSeqRef = useRef(0)
-  const loadSeqRef = useRef(0)
-  const instanceSeqRef = useRef(0)
+  // 视图选择世代：定义与实例**共用**同一个计数器。打开定义 / 打开实例 / 新建 / 导入
+  // 都 +1，让两条加载链上的所有在飞请求一起失效；响应回来先比对世代再落地，
+  // 迟到的实例响应因此不能覆盖后来选择的定义（反之亦然）。
+  const selectSeqRef = useRef(0)
   const eventsRef = useRef(initialEvents.slice())
   const lastSeqRef = useRef(eventCursorOf(initialEvents, initialInstance && initialInstance.lastSeq))
+  // 事件缓存属于哪个实例：切实例时立即清空，绝不复用上一个实例的事件 / 游标。
+  const eventsInstanceRef = useRef(initialInstance && typeof initialInstance.id === 'string'
+    ? initialInstance.id
+    : '')
   const tasksGuardRef = useRef(createTaskCompletionGuard())
   const draftQueueRef = useRef(null)
   const saveInFlightRef = useRef(false)
@@ -357,6 +365,62 @@ export function FlowStudioPage(props = {}) {
     }
   }, [])
 
+  /**
+   * 合并一批实例事件：只追新、按 seq 去重升序，并同步游标 / 画布 marker。
+   * 事件与 lastSeq 都挂在实例级 ref 上，切实例前先清空，绝不回退到上一个实例。
+   *
+   * @returns {number} 合并后的显示游标（已加载事件的最大 seq）
+   */
+  const applyEventBatch = useCallback(payload => {
+    const merged = mergeInstanceEvents(
+      eventsRef.current,
+      payload && Array.isArray(payload.events) ? payload.events : [],
+      { baseSeq: lastSeqRef.current },
+    )
+    const cursor = eventCursorOf(
+      merged.events,
+      Math.max(lastSeqRef.current, payload && Number.isSafeInteger(payload.lastSeq) ? payload.lastSeq : 0),
+    )
+    eventsRef.current = merged.events
+    lastSeqRef.current = cursor
+    setEvents(merged.events)
+    setLastSeq(cursor)
+    setEventError('')
+    syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(merged.events))
+    return cursor
+  }, [])
+
+  /**
+   * 进入终态、停轮询**之前**先追平 `detail.lastSeq`。
+   *
+   * 轮询顺序是先读事件、再读详情，两次请求之间实例可能已经结束：
+   * 详情返回 `COMPLETED,lastSeq=4` 而事件只到 seq=2 时，直接停轮询会让最后的
+   * activity/end、process/end 永远不再读取。这里循环补拉到 displayLastSeq >=
+   * target，并用 `TERMINAL_EVENT_CATCHUP_LIMIT` 防死循环。
+   */
+  const catchUpInstanceEvents = useCallback(async (instanceId, targetSeq, generation) => {
+    const target = Number.isSafeInteger(targetSeq) && targetSeq >= 0 ? targetSeq : 0
+    for (let round = 0; round < TERMINAL_EVENT_CATCHUP_LIMIT && lastSeqRef.current < target; round += 1) {
+      let data
+      try {
+        data = await client.readInstanceEvents(instanceId, nextEventsQuery(lastSeqRef.current))
+      } catch (error) {
+        if (generation === selectSeqRef.current && mountedRef.current) {
+          setEventError('读取实例事件失败：' + failureMessage(error))
+        }
+        return false
+      }
+      // 迟到响应 / 已切走：按世代 + instanceId 丢弃。
+      if (generation !== selectSeqRef.current || !mountedRef.current) return false
+      if (eventsInstanceRef.current !== instanceId) return false
+      const before = lastSeqRef.current
+      applyEventBatch(data)
+      // 游标没有推进：再拉也是同一批，立即收手。
+      if (lastSeqRef.current <= before) return false
+    }
+    return lastSeqRef.current >= target
+  }, [applyEventBatch, client])
+
   /** 画布变更：修订号 + dirty + 去抖草稿（拖动过程不序列化）。 */
   const handleCanvasChange = useCallback(info => {
     if (!info || info.dirty !== true) return
@@ -450,16 +514,18 @@ export function FlowStudioPage(props = {}) {
   /** 打开定义（GET /definitions/<id>）：钉住返回的 version + hash。 */
   const openDefinition = useCallback(async (id, options = {}) => {
     if (typeof id !== 'string' || id === '') return false
-    const seq = ++loadSeqRef.current
+    // 与实例共用同一个选择世代：这次选择让两条链上的所有在飞请求一起失效。
+    const seq = ++selectSeqRef.current
+    setLoadingInstance(false)
     setLoadingDefinition(true)
     setNotice(null)
     setDraftNotice(null)
     try {
       const data = await client.readDefinition(id, options.version ? { version: options.version } : undefined)
-      if (seq !== loadSeqRef.current || !mountedRef.current) return false
+      if (seq !== selectSeqRef.current || !mountedRef.current) return false
       // 响应回来到真正切画布之间，当前画布仍是旧定义：先把这期间的新改动落本地草稿。
       await flushLocalDraft()
-      if (seq !== loadSeqRef.current || !mountedRef.current) return false
+      if (seq !== selectSeqRef.current || !mountedRef.current) return false
       const state = createDefinitionState(data)
       definitionStateRef.current = state
       draftIdRef.current = data.id
@@ -476,7 +542,7 @@ export function FlowStudioPage(props = {}) {
       }
       return true
     } catch (error) {
-      if (seq !== loadSeqRef.current || !mountedRef.current) return false
+      if (seq !== selectSeqRef.current || !mountedRef.current) return false
       setLoadingDefinition(false)
       setNotice({ kind: 'error', text: `打开定义 ${id} 失败：` + failureMessage(error) })
       return false
@@ -484,15 +550,29 @@ export function FlowStudioPage(props = {}) {
   }, [applyCanvasView, client, flushLocalDraft])
 
   /** 打开实例：详情 + 冻结快照 + 待办 + 事件；画布切只读。 */
-  const openInstance = useCallback(async id => {
+  const openInstance = useCallback(async (id, options = {}) => {
     if (typeof id !== 'string' || id === '') return false
+    // 选择世代：实例加载同样让定义链上的在飞请求失效（统一计数器）。
+    const seq = ++selectSeqRef.current
     // 从定义编辑切到实例视图前，先把当前画布的去抖草稿落盘（实例视图不能写定义草稿）。
     if (viewRef.current.kind === 'definition') await flushLocalDraft()
-    const seq = ++instanceSeqRef.current
-    loadSeqRef.current += 1
+    if (seq !== selectSeqRef.current || !mountedRef.current) return false
+    setLoadingDefinition(false)
     setLoadingInstance(true)
-    setNotice(null)
+    // 刷新待办后要保留 404 / 409 的服务端原因，不能被刷新动作立即清掉。
+    if (options.preserveNotice !== true) setNotice(null)
     setEventError('')
+    // 切实例：事件缓存与游标按 instanceId 隔离，先立即清空旧实例的事件。
+    const switched = eventsInstanceRef.current !== id
+    if (switched) {
+      eventsInstanceRef.current = id
+      eventsRef.current = []
+      lastSeqRef.current = 0
+      setEvents([])
+      setLastSeq(0)
+      // 旧实例的运行态 marker 也一并清掉（稍后会按新实例事件重算）。
+      syncRuntimeMarkers(editorRef.current, [])
+    }
     try {
       const [detail, snapshot, tasksPayload, eventsPayload] = await Promise.all([
         client.readInstance(id),
@@ -500,24 +580,29 @@ export function FlowStudioPage(props = {}) {
         client.readInstanceTasks(id).catch(error => ({ __error: error })),
         client.readInstanceEvents(id).catch(error => ({ __error: error })),
       ])
-      if (seq !== instanceSeqRef.current || !mountedRef.current) return false
+      if (seq !== selectSeqRef.current || !mountedRef.current) return false
       setActiveInstance(detail)
       setTasks(normalizeTasks(tasksPayload && !tasksPayload.__error
         ? tasksPayload
         : (detail && detail.pendingTasks)))
-      let mergedEvents = eventsRef.current
       if (eventsPayload && !eventsPayload.__error) {
-        const merged = mergeInstanceEvents([], Array.isArray(eventsPayload.events) ? eventsPayload.events : [], {
+        // 切实例时从空集合开始；同一实例刷新才在已加载事件上增量合并。
+        const base = switched ? [] : eventsRef.current
+        const merged = mergeInstanceEvents(base, Array.isArray(eventsPayload.events) ? eventsPayload.events : [], {
           baseSeq: Number.isSafeInteger(eventsPayload.lastSeq) ? eventsPayload.lastSeq : 0,
         })
-        mergedEvents = merged.events
-        eventsRef.current = mergedEvents
-        lastSeqRef.current = eventCursorOf(mergedEvents, merged.lastSeq)
-        setEvents(mergedEvents)
+        eventsRef.current = merged.events
+        lastSeqRef.current = eventCursorOf(merged.events, merged.lastSeq)
+        setEvents(merged.events)
         setLastSeq(lastSeqRef.current)
-      }
-      if (eventsPayload && eventsPayload.__error) {
+      } else if (eventsPayload && eventsPayload.__error) {
+        // 请求失败：保留空集合 + 错误提示，绝不回退到上一个实例的事件 / 游标。
         setEventError('读取实例事件失败：' + failureMessage(eventsPayload.__error))
+      }
+      // 实例可能在校验事件 / 详情之间已经结束：停轮询前先追平 detail.lastSeq。
+      if (isTerminalStatus(detail && detail.status)) {
+        await catchUpInstanceEvents(id, detail && detail.lastSeq, seq)
+        if (seq !== selectSeqRef.current || !mountedRef.current) return false
       }
       if (snapshot && snapshot.__error) {
         setNotice({ kind: 'error', text: '读取实例定义快照失败：' + failureMessage(snapshot.__error) })
@@ -525,19 +610,19 @@ export function FlowStudioPage(props = {}) {
         await applyCanvasView({
           kind: 'instance',
           xml: snapshot.xml,
-          markers: runtimeMarkersFromEvents(mergedEvents),
+          markers: runtimeMarkersFromEvents(eventsRef.current),
         })
       }
       setDrawerOpen(true)
       setLoadingInstance(false)
       return true
     } catch (error) {
-      if (seq !== instanceSeqRef.current || !mountedRef.current) return false
+      if (seq !== selectSeqRef.current || !mountedRef.current) return false
       setLoadingInstance(false)
       setNotice({ kind: 'error', text: `打开实例 ${id} 失败：` + failureMessage(error) })
       return false
     }
-  }, [applyCanvasView, client, flushLocalDraft])
+  }, [applyCanvasView, catchUpInstanceEvents, client, flushLocalDraft])
 
   /** 保存版本：提交属性输入 → 序列化最新 XML → POST /definitions → 钉版本。 */
   const saveDefinition = useCallback(async () => {
@@ -690,15 +775,18 @@ export function FlowStudioPage(props = {}) {
       const body = taskSubmitBody(task, input)
       await client.completeInstanceTask(instanceId, task.activityId, body)
       if (!mountedRef.current) return true
+      // 刷新本身会清空通知，成功提示必须放在刷新之后写。
+      if (instanceId !== '') await openInstance(instanceId, { preserveNotice: true })
       setNotice({ kind: 'success', text: `人工任务 ${task.activityId} 已完成` })
-      if (instanceId !== '') await openInstance(instanceId)
       await refreshInstances()
       return true
     } catch (error) {
       if (!mountedRef.current) return false
       const plan = completionFailurePlan(error && error.status, error && error.data)
+      // 404 / 409 要刷新待办，但刷新动作不能把服务端原因提示清掉。
+      if (plan.refresh && instanceId !== '') await openInstance(instanceId, { preserveNotice: true })
+      // 最后写原因：刷新过程中的其它通知（例如快照失败）不能盖掉 404/409 原因。
       setNotice({ kind: 'error', text: plan.message })
-      if (plan.refresh && instanceId !== '') await openInstance(instanceId)
       return false
     } finally {
       tasksGuardRef.current.end(key)
@@ -762,7 +850,12 @@ export function FlowStudioPage(props = {}) {
 
   /** 新建：从最小人工模板开始，显式生成定义 id（不覆盖模板 process id）。 */
   const startNewDefinition = useCallback(async ({ definitionName, xml }) => {
+    // 新建也是一次视图选择：让定义 / 实例两条链上的在飞请求一起失效。
+    const selection = ++selectSeqRef.current
+    setLoadingDefinition(false)
+    setLoadingInstance(false)
     await flushLocalDraft()
+    if (selection !== selectSeqRef.current || !mountedRef.current) return false
     const state = createDefinitionState()
     state.markDirty()
     definitionStateRef.current = state
@@ -780,7 +873,11 @@ export function FlowStudioPage(props = {}) {
   }, [applyCanvasView, flushLocalDraft])
 
   const handleOpenDefinition = useCallback(async (id, options) => {
+    // 用户的选择动作一发生就让在飞请求失效：flushLocalDraft 是 await，
+    // 不能给这一刻之前发出的实例响应留落地窗口（openDefinition 会再取新世代）。
+    const selection = ++selectSeqRef.current
     await flushLocalDraft()
+    if (selection !== selectSeqRef.current || !mountedRef.current) return false
     return openDefinition(id, options)
   }, [flushLocalDraft, openDefinition])
 
@@ -812,7 +909,12 @@ export function FlowStudioPage(props = {}) {
       setNotice({ kind: 'warn', text: 'BPMN 画布还没加载完成，稍后再导入。' })
       return false
     }
+    // 导入同样是一次视图选择：让在飞的定义 / 实例请求失效。
+    const selection = ++selectSeqRef.current
+    setLoadingDefinition(false)
+    setLoadingInstance(false)
     await flushLocalDraft()
+    if (selection !== selectSeqRef.current || !mountedRef.current) return false
     const previousView = viewRef.current
     const seq = ++viewSeqRef.current
     try {
@@ -879,25 +981,41 @@ export function FlowStudioPage(props = {}) {
     let failures = 0
     const tick = async () => {
       if (cancelled) return
+      // 本次 tick 开始时的选择世代：追平事件期间用户切走就不能再写状态。
+      const generation = selectSeqRef.current
+      const scheduleNext = () => {
+        if (cancelled) return
+        const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        timer = setTimeout(tick, nextEventPollDelay({ failures, hidden }))
+      }
       try {
         const data = await client.readInstanceEvents(activeInstanceId, nextEventsQuery(lastSeqRef.current))
         if (cancelled || !mountedRef.current) return
-        const merged = mergeInstanceEvents(eventsRef.current, Array.isArray(data.events) ? data.events : [], {
-          baseSeq: lastSeqRef.current,
-        })
-        const cursor = eventCursorOf(merged.events, Math.max(lastSeqRef.current, Number.isSafeInteger(data.lastSeq) ? data.lastSeq : 0))
-        eventsRef.current = merged.events
-        lastSeqRef.current = cursor
-        setEvents(merged.events)
-        setLastSeq(cursor)
-        setEventError('')
-        syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(merged.events))
+        // 已切到别的实例（openInstance 已把事件缓存换成新实例）：旧实例的迟到响应绝不能落地。
+        // 但仍要保留轮询节奏：新实例详情若加载失败、页面退回旧实例，下一次 tick 可以恢复。
+        if (eventsInstanceRef.current !== activeInstanceId) {
+          scheduleNext()
+          return
+        }
+        applyEventBatch(data)
         failures = 0
         const detail = await client.readInstance(activeInstanceId)
         if (cancelled || !mountedRef.current) return
+        if (eventsInstanceRef.current !== activeInstanceId) {
+          scheduleNext()
+          return
+        }
         setActiveInstance(detail)
         if (Array.isArray(detail.pendingTasks)) setTasks(normalizeTasks(detail.pendingTasks))
         if (isTerminalStatus(detail.status)) {
+          // 先追平 detail.lastSeq 再停轮询：否则最后一批 activity/end、process/end 永远读不到。
+          await catchUpInstanceEvents(activeInstanceId, detail.lastSeq, generation)
+          if (!mountedRef.current) return
+          if (generation !== selectSeqRef.current) {
+            // 同一实例被重新选择（刷新）时本次追平已失效；下一轮按新世代继续。
+            scheduleNext()
+            return
+          }
           void refreshInstances()
           return
         }
@@ -907,17 +1025,15 @@ export function FlowStudioPage(props = {}) {
           setEventError('读取实例事件失败：' + failureMessage(error))
         }
       }
-      if (!cancelled) {
-        const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
-        timer = setTimeout(tick, nextEventPollDelay({ failures, hidden }))
-      }
+      scheduleNext()
     }
     timer = setTimeout(tick, INSTANCE_POLL_MS)
     return () => {
       cancelled = true
       if (timer !== null) clearTimeout(timer)
     }
-  }, [activeInstanceId, activeInstance && activeInstance.status, client, refreshInstances, viewKind])
+  }, [activeInstanceId, activeInstance && activeInstance.status, applyEventBatch,
+    catchUpInstanceEvents, client, refreshInstances, viewKind])
 
   // ── 页面隐藏 / 卸载前把最后一版草稿落盘 ──────────────────────────────────
   useEffect(() => {
@@ -1109,6 +1225,9 @@ export function FlowStudioPage(props = {}) {
         title: viewKind === 'instance' ? '实例画布（只读）' : '定义画布',
         className: 'fs-bpmn-canvas-main',
         hostRequire: props.hostRequire,
+        // 关键接线：编辑器创建时捕获这个回调，commandStack.changed 时才会通知页面
+        // 递增修订号 / 标 dirty / 调度本地草稿（0.13.3 审查 BLOCKER-1）。
+        mountOptions: { onChange: handleCanvasChange },
         onReady: handleCanvasReady,
         onError: handleCanvasError,
       })),

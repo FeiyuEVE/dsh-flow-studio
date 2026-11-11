@@ -448,6 +448,10 @@ try {
     eq(crossCancel.ok, false)
     ok(/工具绑定实例/.test(crossCancel.error))
 
+    const crossGet = await byName(boundTools, 'flow_instance_get').execute({ instanceId: chainInstanceId })
+    eq(crossGet.ok, false)
+    ok(/工具绑定实例/.test(crossGet.error))
+
     const unknownTask = await byName(tools, 'flow_instance_complete_task')
       .execute({ instanceId: second.instanceId, activityId: 'no-such-task' })
     eq(unknownTask.ok, false)
@@ -566,6 +570,38 @@ try {
       ok(/since/.test(invalid.error))
     } finally {
       await restarted.dispose()
+    }
+  })
+
+  await check('instance_list：cursor 分页不重不漏，非法 cursor 明确拒绝', async () => {
+    const pagedRuntime = makeRuntime(makeFakeAdapters(makeFakeAdapter()))
+    try {
+      const localTools = toolsFor(pagedRuntime)
+      const runTool = byName(localTools, 'flow_instance_run')
+      const started = []
+      for (let index = 0; index < 2; index += 1) {
+        const created = await runTool.execute({ definitionId: 'flow-chain' }, execWith(`session-page-${index}`))
+        eq(created.ok, true)
+        started.push(created.instanceId)
+      }
+      const listTool = byName(localTools, 'flow_instance_list')
+      const first = await listTool.execute({ status: 'ACTIVE', limit: 1 })
+      eq(first.ok, true)
+      eq(first.count, 1)
+      eq(first.hasMore, true)
+      ok(typeof first.nextCursor === 'string')
+      const second = await listTool.execute({ status: 'ACTIVE', limit: 1, cursor: first.nextCursor })
+      eq(second.ok, true)
+      const ids = [...first.instances, ...second.instances].map(item => item.instanceId)
+      eq(new Set(ids).size, ids.length, '分页不重复')
+      ok(started.every(id => ids.includes(id)), '分页覆盖两个新建实例')
+
+      const invalid = await listTool.execute({ status: 'ACTIVE', cursor: 'i-not-in-page' })
+      eq(invalid.ok, false)
+      eq(invalid.code, 'CURSOR_INVALID')
+      eq(invalid.retryable, false)
+    } finally {
+      await pagedRuntime.dispose()
     }
   })
 

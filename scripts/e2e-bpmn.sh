@@ -323,17 +323,160 @@ GUEST_NET_NS="$(guest_ns net)"
   || die "容器 $CONTAINER 与宿主共用 network namespace（宿主=$HOST_NET_NS，容器=$GUEST_NET_NS）：宿主端口 $PORT 不能证明属于该容器，拒绝继续"
 ok "namespace 隔离：PID（宿主 $HOST_PID_NS / 容器 $GUEST_PID_NS）、NET（宿主 $HOST_NET_NS / 容器 $GUEST_NET_NS）均独立"
 
-# 1c. 挂载：不能把宿主 ~/.dsh 挂进测试台；容器内测试台数据目录也不能与它是同一份。
-HOST_DSH_DIR="$(readlink -f "${HOME:-}/.dsh" 2>/dev/null || true)"
-[ -n "$HOST_DSH_DIR" ] || HOST_DSH_DIR="${HOME:-}/.dsh"
-MOUNT_SOURCES="$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
-while IFS= read -r mount_src; do
-  [ -n "$mount_src" ] || continue
-  case "$mount_src" in
-    "$HOST_DSH_DIR"|"$HOST_DSH_DIR"/*)
-      die "挂载错配：容器 $CONTAINER 挂载了宿主 $HOST_DSH_DIR（实际挂载：$(printf '%s' "$MOUNT_SOURCES" | tr '\n' ' ')）；期望测试台数据目录是容器内独立目录 $GUEST_HOME" ;;
+# 1c. 挂载 / 写入路径：宿主 home（含祖先目录）与宿主 ~/.dsh 都不能进测试台；
+#     容器内真正要写的目录必须落在容器自己的文件系统上，不能经由挂载或符号链接。
+#
+# 只比较 guest home 与宿主 ~/.dsh 的 inode 不够：把宿主 $HOME 挂到别处时 guest
+# home 仍是另一份目录，而 profile 可以是指向宿主 ~/.dsh/profiles/web 的符号链接
+# （复审 N3）。这里同时做三件事：
+#   ① 每一条挂载的 Source 不能是宿主 HOME / 它的祖先 / 宿主 ~/.dsh（含其子孙）；
+#   ② 每一条挂载的 Destination 不能覆盖测试台要写的目录；
+#   ③ 解析 profile、日志、安装目录等的**真实路径**，不能落在任何 bind 挂载下。
+#
+# >>> e2e-bpmn:mount-check —— 这段函数会被 .tmp/e2e-bpmn-selftest 单独抽取做桩演练
+# 规范化宿主路径：不要求目标存在（realpath -m 语义）。
+norm_path() {
+  local input="$1"
+  [ -n "$input" ] || { printf '%s' ''; return 0; }
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$input" 2>/dev/null && return 0
+  fi
+  printf '%s' "$input"
+}
+
+# PATH 是否等于 PREFIX 或位于其下（PREFIX=/ 时覆盖一切绝对路径）。
+path_within() {
+  local prefix="$1" path="$2"
+  [ -n "$prefix" ] && [ -n "$path" ] || return 1
+  [ "$prefix" = "/" ] && return 0
+  [ "$path" = "$prefix" ] && return 0
+  case "$path" in
+    "$prefix"/*) return 0 ;;
   esac
-done <<< "$MOUNT_SOURCES"
+  return 1
+}
+
+# Mounts 三元组：Type / Source / Destination，用 U+001F 分隔。
+# 不能用 tab：tmpfs 的 Source 为空，而 read 对空白 IFS 会折叠连续分隔符，
+# 把「空 Source + 目的地」错位成「Source=目的地」，从而漏掉整条挂载。
+mount_table() {
+  docker inspect -f '{{range .Mounts}}{{.Type}}{{"\u001f"}}{{.Source}}{{"\u001f"}}{{.Destination}}{{"\n"}}{{end}}' \
+    "$CONTAINER" 2>/dev/null || true
+}
+
+# 容器内真实路径：逐级向上找已存在的祖先做 realpath，再把不存在的尾部拼回去。
+guest_realpaths() {
+  docker exec -i -e "E2E_REALPATH_TARGETS=$1" "$CONTAINER" node -e '
+const fs = require("fs")
+const path = require("path")
+const targets = String(process.env.E2E_REALPATH_TARGETS || "").split("\n").filter(Boolean)
+function resolveTarget(target) {
+  let current = target
+  const rest = []
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current)
+      return rest.length === 0 ? real : path.join(real, ...rest.reverse())
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return target
+      rest.push(path.basename(current))
+      current = parent
+    }
+  }
+}
+for (const target of targets) process.stdout.write(target + "\t" + resolveTarget(target) + "\n")
+'
+}
+
+# 校验失败时把全部原因打印到 stdout 并返回 1；调用方负责 die（不会先写容器）。
+verify_mount_isolation() {
+  local host_home host_dsh table problems="" line mtype msrc mdst nsrc target resolved realpaths
+  local sep=$'\x1f'
+  host_home="$(norm_path "${HOME:-}")"
+  host_dsh="$(norm_path "$host_home/.dsh")"
+  table="$(mount_table)"
+
+  while IFS="$sep" read -r mtype msrc mdst; do
+    [ -n "$mdst" ] || continue
+    case "$mdst" in
+      /*) ;;
+      *)
+        problems="$problems
+挂载目的地不是绝对路径：$mtype ${msrc:-<空>} → $mdst"
+        continue ;;
+    esac
+    if [ "$mtype" != "tmpfs" ] && [ -n "$msrc" ]; then
+      nsrc="$(norm_path "$msrc")"
+      # 宿主 home 本身 / 它的祖先 / 宿主 ~/.dsh（及其子孙）一律拒绝。
+      # 注意：宿主 home 下的**其它目录**（例如专门的 dsh-testbed-bpmn/）是
+      # 测试台正常存储，不能一概拒绝；危险的是把 home 整体（或祖先）暴露。
+      if path_within "$nsrc" "$host_home" || path_within "$nsrc" "$host_dsh" \
+        || path_within "$host_dsh" "$nsrc"; then
+        problems="$problems
+挂载源暴露宿主 home / ~/.dsh：$mtype $msrc → $mdst（宿主 home=$host_home，~/.dsh=$host_dsh）"
+      fi
+    fi
+    # 测试台根目录整体的挂载是设计内的；但它内部再 bind 别的宿主目录、或根目录
+    # 之外的 bind 覆盖了写入路径，都必须拒绝（写入会落到另一份宿主存储）。
+    # volume / tmpfs 由容器自己管理，不指向宿主 home，不需要在这里拒绝。
+    if [ "$mtype" = "bind" ] && [ "$mdst" != "$GUEST_ROOT" ]; then
+      local guest_path
+      for guest_path in "$GUEST_HOME" "$GUEST_PROFILE" "$GUEST_LOG" "$GUEST_LOGS" "$GUEST_DT" "$GUEST_PREFIX"; do
+        if path_within "$mdst" "$guest_path"; then
+          problems="$problems
+挂载目的地覆盖测试台写入路径：$mtype ${msrc:-<空>} → $mdst（$guest_path 会写进这个挂载）"
+        fi
+      done
+    fi
+  done <<< "$table"
+
+  realpaths="$(guest_realpaths "$GUEST_HOME
+$GUEST_PROFILE
+$GUEST_LOG
+$GUEST_LOGS
+$GUEST_DT
+$GUEST_PREFIX" 2>/dev/null || true)"
+  if [ -z "$realpaths" ]; then
+    problems="$problems
+读不到容器 $CONTAINER 内测试台路径的真实路径（期望容器内有 node）"
+  else
+    while IFS=$'\t' read -r target resolved; do
+      [ -n "$target" ] || continue
+      if [ -z "$resolved" ]; then
+        problems="$problems
+读不到 $target 的真实路径"
+        continue
+      fi
+      while IFS="$sep" read -r mtype msrc mdst; do
+        [ -n "$mdst" ] || continue
+        [ "$mtype" = "bind" ] || continue
+        path_within "$mdst" "$resolved" || continue
+        # 只有「测试台根目录的挂载 + 真实路径仍在 $GUEST_ROOT 下」是设计内的；
+        # 符号链接把 profile 解析到别的 bind 挂载（例如宿主 home）必须拒绝。
+        if path_within "$mdst" "$GUEST_ROOT" && path_within "$GUEST_ROOT" "$resolved"; then
+          continue
+        fi
+        problems="$problems
+写入路径的真实路径落在 bind 挂载下：$target → $resolved（挂载 $msrc → $mdst）"
+      done <<< "$table"
+    done <<< "$realpaths"
+  fi
+
+  if [ -n "$problems" ]; then
+    printf '%s\n' "$problems"
+    return 1
+  fi
+  return 0
+}
+# <<< e2e-bpmn:mount-check
+
+HOST_HOME_DIR="$(norm_path "${HOME:-}")"
+HOST_DSH_DIR="$(norm_path "$HOST_HOME_DIR/.dsh")"
+MOUNT_REPORT="$(verify_mount_isolation)" \
+  || die "挂载 / 写入路径校验失败（宿主 home=$HOST_HOME_DIR、~/.dsh=$HOST_DSH_DIR 不能被暴露；测试台写入路径必须是容器本地）：
+$MOUNT_REPORT"
+# 再按 inode 做一次最直接的确认：测试台 home 不能就是宿主 ~/.dsh。
 if [ -d "$HOST_DSH_DIR" ]; then
   HOST_DSH_ID="$(stat -Lc '%d:%i' "$HOST_DSH_DIR" 2>/dev/null || true)"
   GUEST_HOME_ID="$(guest_path_id "$GUEST_HOME" || true)"
@@ -343,7 +486,7 @@ if [ -d "$HOST_DSH_DIR" ]; then
     || die "测试台数据目录 $GUEST_HOME 就是宿主 $HOST_DSH_DIR（dev:inode=$GUEST_HOME_ID 相同）：拒绝在宿主 home 上跑测试"
   ok "挂载隔离：测试台 $GUEST_HOME（dev:inode=$GUEST_HOME_ID）不是宿主 $HOST_DSH_DIR（$HOST_DSH_ID）"
 else
-  ok "挂载隔离：宿主 $HOST_DSH_DIR 不存在，容器未挂载它（实际挂载：$(printf '%s' "$MOUNT_SOURCES" | tr '\n' ' ')）"
+  ok "挂载隔离：宿主 $HOST_DSH_DIR 不存在，容器未挂载它（实际挂载：$(printf '%s' "$(mount_table)" | tr '\n' ' ')）"
 fi
 
 # 1d. 监听 3080 的进程：有 → 必须属于该容器且是测试台 dsh；没有 → bootstrap。
@@ -409,6 +552,12 @@ assert_eq "$TGZ_VERSION" "$VERSION" "tgz 版本与仓库 package.json 版本不�
 ok "$(basename "$TGZ")，$(stat -c '%s' "$TGZ") 字节，版本 $TGZ_VERSION"
 
 say "3. 安装进容器 profile（pnpm，非手工解包）"
+# 写入前复核：从这里开始会 docker cp / sed / pnpm install。挂载与真实路径
+# 必须仍然成立，绝不在 profile 可能指向宿主目录时动第一个字节（复审 N3）。
+WRITE_RECHECK="$(verify_mount_isolation)" \
+  || die "写入前挂载复核失败：profile / 日志 / 安装目录可能落到宿主，已拒绝 sed / pnpm install：
+$WRITE_RECHECK"
+ok "写入前复核：profile / 日志 / 安装目录的真实路径仍不在宿主挂载下"
 TGZ_NAME="$(basename "$TGZ")"
 docker cp "$TGZ" "$CONTAINER:$GUEST_DT/" >/dev/null
 dex_sh "sed -i -E 's|\"@feiyueve/dsh-flow-studio\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"@feiyueve/dsh-flow-studio\": \"file:$GUEST_DT/$TGZ_NAME\"|' $GUEST_PROFILE/package.json"
@@ -667,6 +816,13 @@ assert_eq "$DEL_INSTANCE_CODE" "405" "DELETE /instances/$IID 竟然被路由接�
 DEL_DEF_CODE="$(del_code "/definitions/$DEF_ID")"
 assert_eq "$DEL_DEF_CODE" "405" "DELETE /definitions/$DEF_ID 竟然被路由接受（契约已变，请更新本脚本）"
 ok "确认新域无 HTTP DELETE（均 405）——清理走容器内测试台数据目录"
+# 清理也是写操作：数据根的真实路径必须还在测试台 home 下，不能 rm 到挂载源。
+BPMN_BASE_REAL="$(guest_realpaths "$BPMN_BASE" 2>/dev/null | cut -f2 || true)"
+BPMN_BASE_REAL="${BPMN_BASE_REAL%$'\r'}"
+case "$BPMN_BASE_REAL" in
+  "$GUEST_HOME"/*) ;;
+  *) die "BPMN 数据根 $BPMN_BASE 的真实路径 ${BPMN_BASE_REAL:-<空>} 不在测试台 $GUEST_HOME 下，拒绝 rm -rf" ;;
+esac
 dex_sh "rm -rf $BPMN_BASE/instances/$IID $BPMN_BASE/definitions/$DEF_ID"
 assert_code "$(get_api "/instances?definitionId=$DEF_ID" "$EVID/instances-after-cleanup.json")" "清理后 GET /instances 失败" 200
 assert_true "$(jqr "j.instances.every(i=>i.id!=='$IID')" <"$EVID/instances-after-cleanup.json")" "清理后实例列表里仍有 $IID"

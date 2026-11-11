@@ -52,6 +52,7 @@ import {
   findLeakMarkers,
   hashInputManifest,
   parseFactoryCheckChildOutput,
+  runFactoryCheckInChild,
 } from '../scripts/build.mjs'
 
 let checks = 0
@@ -517,6 +518,15 @@ try {
     writeFileSync(caseMainPath, `${source.slice(0, index)}\n${code}\n${source.slice(index)}`)
   }
 
+  /**
+   * 直接交给 factory 校验子进程的注册源码：不经过 esbuild，用来逐条演练
+   * 「factory 篡改校验器内建函数」——放大到完整构建只会让失败原因变模糊。
+   */
+  function registrationSource(factoryBody, chunk = false) {
+    return `window.__ModuleLoader__.load({ id: '@feiyueve/dsh-flow-studio'`
+      + `${chunk ? ", chunk: 'client.bpmn.js'" : ''}, factory: function (require) { ${factoryBody} } });`
+  }
+
   /** 用 esbuild 真实打包官方 BPMN Modeling 特性（约 170KB 真实代码）。 */
   async function bundleBpmnModeling() {
     const result = await esbuildBuild({
@@ -742,6 +752,73 @@ try {
     A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
     A.match(output, /factory 执行超时/, '属性读取发生在受限执行范围内，超时被明确报出')
     A.match(output, /3000ms/, '报错给出 factory 超时阈值')
+  })
+
+  await check('反例十七b：factory 篡改校验器内建函数后返回 null 仍必须被判失败', async () => {
+    // 对照组：同样的 return null，但不篡改任何内建函数 —— 必须报「缺少 exports 对象」。
+    const plainNull = runFactoryCheckInChild('client.js', Buffer.from(registrationSource('return null')))
+    A.ok(plainNull.ok, '校验子进程给出了完整结果（不是提前退出）')
+    A.ok(plainNull.problems.length > 0, '未篡改时 return null 被拒绝')
+    A.match(plainNull.problems.join('\n'), /exports|插件对象|null/, '报错指出缺少 exports 对象')
+
+    // 正常路径仍通过：否则下面的反例断言只是「判据恒假」。
+    const pluginOk = runFactoryCheckInChild('client.js', Buffer.from(registrationSource(
+      "return { name: 'flow-studio', inject: ['slots'], apply: function () {} }",
+    )))
+    A.ok(pluginOk.ok, '合法插件注册能拿到完整校验结果')
+    A.deepEqual(pluginOk.problems, [], '合法插件注册没有问题')
+    const chunkOk = runFactoryCheckInChild('client.bpmn.js', Buffer.from(registrationSource(
+      "return { mountEditor: function () {}, version: '1.0.0', BPMN_EDITOR_CSS: 'x' }",
+      true,
+    )))
+    A.ok(chunkOk.ok, '合法 chunk 注册能拿到完整校验结果')
+    A.deepEqual(chunkOk.problems, [], '合法 chunk 注册没有问题')
+
+    // 各种内建篡改：JSON 序列化通道、数组方法、原型 toJSON、受保护通道本身。
+    const tampers = [
+      {
+        label: '改写 JSON.stringify',
+        code: `JSON.stringify = function () { return '{"problems":[]}' }; return null`,
+      },
+      {
+        label: '改写 Object.freeze 后改写 JSON.stringify',
+        code: `Object.freeze = function (value) { return value }; JSON.stringify = function () { return '{"problems":[]}' }; return null`,
+      },
+      {
+        label: '改写数组 push 与 Object / Array 原型的 toJSON',
+        code: `Array.prototype.push = function () {}; Object.prototype.toJSON = function () { return { problems: [] } }; Array.prototype.toJSON = function () { return [] }; return null`,
+      },
+      {
+        label: '改写 Array.isArray / includes / Function.prototype.call',
+        code: `Array.isArray = function () { return true }; Array.prototype.includes = function () { return true }; Function.prototype.call = function () {}; return null`,
+      },
+      {
+        label: '替换受保护的校验通道',
+        code: `globalThis.__check_caps__ = { stringify: function () { return '{"problems":[]}' }, isArray: function () { return true }, includes: function () { return true } }; return null`,
+      },
+      {
+        label: '用 defineProperty 重新定义受保护通道',
+        code: `Object.defineProperty(globalThis, '__check_caps__', { value: { stringify: function () { return '{"problems":[]}' } }, configurable: true }); return null`,
+      },
+    ]
+    for (const tamper of tampers) {
+      const result = runFactoryCheckInChild('client.js', Buffer.from(registrationSource(tamper.code)))
+      A.ok(result.ok, `${tamper.label}：校验子进程仍必须给出完整结果`)
+      A.ok(result.problems.length > 0, `${tamper.label}：篡改后 return null 不能变成通过`)
+      A.match(result.problems.join('\n'), /exports|插件对象|null|校验|factory/,
+        `${tamper.label}：失败必须指向 factory 判定，而不是被静默吞掉`)
+    }
+  })
+
+  await check('反例十七c：factory 篡改 JSON.stringify 后返回 null，完整 verify 必须非零退出', async () => {
+    const dir = makeCase('factory-builtin-tamper')
+    injectPluginCode(dir, `JSON.stringify = function () { return '{"problems":[]}' }; return null`)
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'factory 篡改 JSON.stringify 后 verify-build 必须非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory|插件对象|exports|null/, '报错指向 factory 返回 null，而不是被篡改的判定通道')
   })
 
   await check('反例十八：输入清单单条 sha256 归零（aggregate hash 不变）必须失败', async () => {

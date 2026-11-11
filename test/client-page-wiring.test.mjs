@@ -20,7 +20,9 @@
  *  8. M3：Host 预留 lastSeq 不推进 `since`，未落盘事件不会永久跳过；
  *  9. M4：异步导入完成时按最新事件缓存重算 marker，旧 marker 不能覆盖终态；
  * 10. M4 交错：导入期间切走视图，迟到的导入结果不能写回 marker；
- * 11. m1：真实渲染 BpmnCanvas，验证 mountOptions 透传与卸载销毁。
+ * 11. m1：真实渲染 BpmnCanvas，验证 mountOptions 透传与卸载销毁；
+ * 12. N1：B 详情成功 / 画布挂起 / 选 C 失败 → 详情、任务、事件、视图整组不提交，
+ *     过期导入不得执行末尾提交。
  *
  * 运行：node test/client-page-wiring.test.mjs
  */
@@ -1520,6 +1522,110 @@ await check('F1 连续选择不同实例失败（B 挂起后选 C）：回滚到
     ok(queriesA.every(item => item.query.since !== 0), '回滚后不能持续请求 since=0')
     ok(detailCalls.filter(id => id === 'i-a').length >= 1, '回滚后轮询必须重新读取 A 的详情')
     eq(timer.pending(), 1, '回滚后必须保留且只保留一个轮询定时器')
+  })
+})
+
+// 15b. N1：提前提交的实例详情必须和任务 / 事件 / 视图一起回滚 ----------------
+
+await check('N1 B 详情成功 + 画布挂起 + 选 C 失败：详情/任务/事件/视图一致回滚到 A', async () => {
+  await withFakeTimers(async timer => {
+    const gate = deferred()
+    const editor = createEditor()
+    editor.importXML = async value => {
+      editor.calls.importXML.push(value)
+      // 只有 B 的画布导入挂起：B 的详情 / 待办 / 事件都已经先返回。
+      if (value === XML_B) await gate.promise
+    }
+    const XML_C = '<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="C"/>'
+    const pendingC = deferred()
+    const pollQueries = []
+    const instanceA = { id: 'i-a', status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }
+    const taskB = {
+      activityId: 'task-b', elementId: 'TB', name: 'B 的待办',
+      since: '2026-11-12T02:00:00.000Z', executionId: 'task-b_exec_1',
+    }
+    const { client } = makeClient({
+      readInstance: async id => {
+        if (id === 'i-c') return pendingC.promise
+        if (id === 'i-b') return { id: 'i-b', status: 'ACTIVE', lastSeq: 4, pendingTasks: [taskB] }
+        return { id: 'i-a', status: 'ACTIVE', lastSeq: 2, pendingTasks: [] }
+      },
+      readInstanceDefinition: async id => ({
+        id,
+        xml: id === 'i-b' ? XML_B : (id === 'i-c' ? XML_C : XML_A),
+      }),
+      readInstanceTasks: async id => ({ id, tasks: id === 'i-b' ? [taskB] : [] }),
+      readInstanceEvents: async (id, query) => {
+        pollQueries.push({ id, query })
+        if (id === 'i-b') {
+          return { id, events: [event(4, 'activity/start', { elementId: 'TB', activityId: 'task-b' })], lastSeq: 4 }
+        }
+        if (id === 'i-a') {
+          return { id, events: [event(2, 'activity/end', { elementId: 'T', status: 'completed' })], lastSeq: 2 }
+        }
+        return { id, events: [], lastSeq: 0 }
+      },
+    })
+    const mounted = await mountPage({
+      client,
+      editor,
+      props: {
+        initialDefinition: definitionA,
+        initialInstance: instanceA,
+        initialInstanceDefinition: { xml: XML_A },
+        initialEvents: [event(1, 'activity/wait', { elementId: 'T', status: 'waiting' })],
+        initialTasks: [],
+      },
+    })
+    const { probe } = mounted
+    const panel = () => findElement(probe.tree, node => node.type === InstancePanel)
+    const select = id => panel().props.onSelectInstance(id)
+
+    // A 已打开：B 的详情、待办、事件都成功，但 B 的画布导入挂起。
+    select('i-b')
+    await settle(probe)
+    eq(panel().props.activeInstance.id, 'i-a', '事务未完成前不能提前显示 B 的详情')
+    deep(panel().props.tasks, [], '事务未完成前不能提前提交 B 的待办')
+    eq(drawerOf(probe).props.instanceId, 'i-a', '事务未完成前事件缓存仍属于 A')
+    deep(drawerOf(probe).props.events.map(item => item.seq), [1], '不能出现 A 的实例 + B 的事件')
+    eq(markerState(editor, 'T'), 'waiting', '事务未完成前画布仍是 A 的状态')
+
+    // 选择 C：C 的详情失败。B 的详情虽然已经返回，但整组不能留下 B 的半提交。
+    select('i-c')
+    await settle(probe)
+    pendingC.reject(new Error('实例 C 详情服务不可用'))
+    await settle(probe)
+
+    eq(panel().props.activeInstance.id, 'i-a', 'C 失败后显示实例必须仍是 A（不能是提前提交的 B）')
+    deep(panel().props.tasks, [], 'C 失败后待办必须仍是 A 的')
+    eq(drawerOf(probe).props.instanceId, 'i-a', 'C 失败后事件缓存归属必须仍是 A')
+    eq(drawerOf(probe).props.lastSeq, 1, 'C 失败后游标必须仍是 A 的位置')
+    deep(drawerOf(probe).props.events.map(item => item.seq), [1], '不能出现 B + A 的混合事件')
+    eq(markerState(editor, 'T'), 'waiting', 'C 失败后画布 marker 必须仍是 A 的')
+    const notice = findElement(probe.tree, node => node.props && node.props['data-notice-kind'] !== undefined)
+    ok(textOf(notice).includes('实例 C 详情服务不可用'), '必须显示当前选择（C）的失败原因')
+
+    // 释放 B 的导入：过期请求不得执行末尾的 baseline commit，也不能覆盖视图。
+    gate.resolve()
+    await settle(probe)
+    eq(panel().props.activeInstance.id, 'i-a', 'B 的迟到导入不能把实例切到 B')
+    deep(panel().props.tasks, [], 'B 的迟到导入不能恢复 B 的待办')
+    eq(drawerOf(probe).props.instanceId, 'i-a', 'B 的迟到导入不能改事件归属')
+    deep(drawerOf(probe).props.events.map(item => item.seq), [1], 'B 的迟到导入不能写入 B 的事件')
+    eq(markerState(editor, 'T'), 'waiting', '迟到导入不能把 marker 写成 B 的状态')
+    ok(editor.calls.importXML.includes(XML_B), 'B 的画布导入确实发出过')
+    eq(editor.calls.importXML[editor.calls.importXML.length - 1], XML_A,
+      '过期导入之后画布必须恢复到最近一次成功提交的 A 视图')
+
+    // 轮询继续按 A 的游标推进，证明基线与事件归属都没有被 B 污染。
+    timer.advance(2000)
+    await settle(probe)
+    eq(panel().props.activeInstance.id, 'i-a')
+    deep(drawerOf(probe).props.events.map(item => item.seq), [1, 2], '回滚后 A 的新事件必须继续应用')
+    eq(markerState(editor, 'T'), 'completed', 'A 的新事件必须继续更新 marker')
+    const queriesA = pollQueries.filter(item => item.id === 'i-a')
+    ok(queriesA.length >= 1, '回滚后必须继续轮询 A')
+    deep(queriesA[queriesA.length - 1].query, { since: 1 }, 'A 的轮询必须从已消费游标继续')
   })
 })
 

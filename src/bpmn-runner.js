@@ -2215,7 +2215,12 @@ class BpmnRunner {
       signal,
       // 受限的即时事件通道：handler 可以在请求过程中写短事件（http/attempt 等）。
       // 保留类型仍由 runner 自己发；单条上限见 HANDLER_EVENT_MAX_BYTES。
-      emit: event => this._emitHandlerEvent(event, element.id, executionId),
+      // 捕获执行世代 + 信号：stop / recover / evict 之后旧 ctx 再 emit 一律丢弃
+      // （复审 m3：stop 返回后 _stopping 会复位，只靠闩挡不住旧 ctx）。
+      emit: event => {
+        if (signal.aborted) return
+        this._emitHandlerEvent(event, element.id, executionId, generation)
+      },
     }
 
     let pending
@@ -2234,7 +2239,7 @@ class BpmnRunner {
         const normalized = normalizeHandlerResult(result)
         if (executionId !== null) this._handlerResults.set(executionId, normalized)
         for (const rawEvent of normalized.events) {
-          this._emitHandlerEvent(rawEvent, element.id, executionId)
+          this._emitHandlerEvent(rawEvent, element.id, executionId, generation)
         }
         finish(null, normalized.output)
       },
@@ -2667,8 +2672,13 @@ class BpmnRunner {
    * handler 通过 `events[]` / `ctx.emit` 上报的适配器事件：原样透传，只补
    * at/elementId/activityId。单条超过 8 KiB 时裁成定位字段并标 `truncated`，
    * 与 instance-store 的事件上限同口径（观测面不能把实例打失败）。
+   *
+   * `generation` 是 handler 拿到 ctx 时的执行代次：stop / recover / evict 之后
+   * 旧 ctx 仍在调用方手里，必须按代次丢弃，不能只看 `_stopping`（它会在 stop
+   * 返回前复位）。
    */
-  _emitHandlerEvent(rawEvent, elementId, executionId) {
+  _emitHandlerEvent(rawEvent, elementId, executionId, generation) {
+    if (typeof generation === 'number' && !this._isLive(generation)) return
     if (this._evicted || this._stopping || this._fatal !== null) return
     if (!isPlainObject(rawEvent) || typeof rawEvent.type !== 'string' || rawEvent.type === '') return
     // 保留类型只能由 runner 发（否则事件流里会出现两条 process/end / 假 error）。

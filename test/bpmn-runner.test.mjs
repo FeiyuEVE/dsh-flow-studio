@@ -1647,6 +1647,78 @@ try {
   })
 
   // -------------------------------------------------------------------------
+  // m3 · 执行世代：stop 之后旧 ctx.emit 不能再产生事件
+  // -------------------------------------------------------------------------
+
+  await check('m3：stop() 之后旧 ctx.emit 不得再产生事件（执行世代守卫）', async () => {
+    const events = []
+    let captured = null
+    let release = null
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-emit-generation' }),
+      services: {
+        executeAgent(element, ctx) {
+          captured = ctx
+          return new Promise((resolve) => {
+            release = () => resolve({ output: { late: true } })
+          })
+        },
+        onEvent(event) { events.push(event) },
+      },
+    }))
+
+    const started = runner.start()
+    for (let index = 0; index < 100 && captured === null; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    A.ok(captured !== null, 'handler 必须拿到 ctx')
+    A.equal(captured.signal.aborted, false, 'stop 之前 ctx.signal 未 abort')
+
+    await runner.stop()
+    A.equal(captured.signal.aborted, true, 'stop 之后旧 ctx.signal 已 abort')
+    const before = events.length
+    // 旧 ctx 仍可用：这是被 stop 作废的世代，事件不能再落进观测面。
+    captured.emit({ type: 'http/result', status: 200, ok: true })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    A.equal(events.length, before, 'stop 返回后旧 ctx.emit 不能新增事件')
+    A.equal(events.some((event) => event.type === 'http/result'), false,
+      '事件流里不能出现 stop 之后的 http/result')
+
+    release()
+    await started.catch(() => {})
+
+    // dispose / LRU 淘汰后，旧 ctx 同样不能再写事件（观测完整性）。
+    const evictEvents = []
+    let evictCtx = null
+    const victim = track(createRunner({
+      definition: makeDefinition({ id: 'def-emit-evict' }),
+      maxActiveInstances: 1,
+      services: {
+        executeAgent(element, ctx) {
+          evictCtx = ctx
+          return { output: {} }
+        },
+        onEvent(event) { evictEvents.push(event) },
+      },
+    }))
+    await victim.start()
+    A.equal(victim.status(), 'waiting', '受害实例停在等待点（已落 state，可淘汰）')
+    const keeper = track(createRunner({
+      definition: makeDefinition({ id: 'def-emit-keeper' }),
+      maxActiveInstances: 1,
+      services: makeRecorder().services(),
+    }))
+    A.equal(victim.status(), 'idle', '创建新实例后受害实例被 LRU 淘汰')
+    const evictBefore = evictEvents.length
+    evictCtx.emit({ type: 'http/result', status: 200, ok: true })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    A.equal(evictEvents.length, evictBefore, 'dispose / 淘汰之后旧 ctx.emit 不能新增事件')
+    A.equal(evictEvents.some((event) => event.type === 'http/result'), false,
+      '淘汰后的事件流里不能出现 http/result')
+    void keeper
+  })
+
+  // -------------------------------------------------------------------------
   // BLOCKER-1 · 快照布尔字段严格归一化 + 出边顺序 + 节点路由标记
   // -------------------------------------------------------------------------
 

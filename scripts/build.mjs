@@ -565,6 +565,21 @@ function factoryCheckChildMain() {
    * 这条路也从根上封死。
    */
   function bootstrap(allowed) {
+    // 在被校验代码（注册源码 / factory）运行之前捕获判定要用的内建函数，放进
+    // 不可写、不可配置、已冻结的全局通道。之后 factory 改写 JSON.stringify /
+    // Array.isArray / Function.prototype.call 或替换这个全局属性，都影响不到
+    // 判定与结果通道（复审 N2）。
+    var caps = Object.create(null)
+    caps.stringify = JSON.stringify
+    caps.isArray = Array.isArray
+    caps.includes = Function.prototype.call.bind(Array.prototype.includes)
+    Object.freeze(caps)
+    Object.defineProperty(globalThis, '__check_caps__', {
+      value: caps,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    })
     globalThis.window = globalThis
     globalThis.console = { log() {}, info() {}, warn() {}, error() {}, debug() {} }
     globalThis.__definition__ = null
@@ -583,19 +598,31 @@ function factoryCheckChildMain() {
   }
 
   /**
-   * 在 realm 内完成全部判定：读注册对象、调 factory、读返回对象属性、序列化。
-   * 宿主只拿到一个 JSON 字符串；无限 getter / 恶意 Proxy 都被同一个 VM 超时覆盖。
-   * 错误格式化也在这里做 —— 绝不让宿主去碰 realm 的 error 对象。
+   * 在 realm 内完成全部判定：读注册对象、调 factory、读返回对象属性。
+   *
+   * 判定与结果通道只用 bootstrap 提前捕获的引用，且**只返回原始字符串**：
+   * `''` = 没有发现问题，非空 = 逐行问题。不在这里做 JSON 序列化，也不把问题
+   * 数组交给任何可被 factory 改写的方法 —— factory 改 JSON.stringify /
+   * Array.prototype.toJSON / 全局 JSON 都伪造不出「通过」（复审 N2）。
+   * 无限 getter / 恶意 Proxy 仍由同一个 VM 超时覆盖。
    */
   function checker(kind) {
+    var caps = globalThis.__check_caps__
+    if (caps === null || typeof caps !== 'object') {
+      return '校验通道缺失（bootstrap 未建立受保护的内建函数引用）'
+    }
+    var problemsText = ''
+    var addProblem = function (message) {
+      problemsText += (problemsText === '' ? '' : '\n') + message
+    }
     var describe = function (error) {
       try {
         if (error !== null && typeof error === 'object' && typeof error.message === 'string') return error.message
       } catch (_) {}
-      try { return String(error) } catch (_) { return '[无法格式化的异常]' }
+      return '无法格式化的异常'
     }
     var safeJson = function (value) {
-      try { return JSON.stringify(value) } catch (_) { return '[不可序列化]' }
+      try { return caps.stringify(value) } catch (_) { return '[不可序列化]' }
     }
     var withHint = function (error, message) {
       try {
@@ -605,84 +632,83 @@ function factoryCheckChildMain() {
       } catch (_) {}
       return message
     }
-    var problems = []
     try {
       var definition = globalThis.__definition__
       if (definition === null || typeof definition !== 'object') {
-        problems.push('没有调用 window.__ModuleLoader__.load（或传入的不是对象）')
-        return JSON.stringify({ problems: problems })
+        addProblem('没有调用 window.__ModuleLoader__.load（或传入的不是对象）')
+        return problemsText
       }
       try {
         if (definition.id !== '@feiyueve/dsh-flow-studio') {
-          problems.push('注册 id 是 ' + safeJson(definition.id) + '，应为 @feiyueve/dsh-flow-studio')
+          addProblem('注册 id 是 ' + safeJson(definition.id) + '，应为 @feiyueve/dsh-flow-studio')
         }
       } catch (error) {
-        problems.push('读取注册 id 失败：' + describe(error))
+        addProblem('读取注册 id 失败：' + describe(error))
       }
       var factory
       try {
         factory = definition.factory
       } catch (error) {
-        problems.push('读取 factory 失败：' + describe(error))
+        addProblem('读取 factory 失败：' + describe(error))
       }
       if (typeof factory !== 'function') {
-        problems.push('factory 不是函数')
-        return JSON.stringify({ problems: problems })
+        addProblem('factory 不是函数')
+        return problemsText
       }
       try {
         if (kind === 'plugin') {
           if ('chunk' in definition) {
-            problems.push('不应带 chunk 字段（它是主包，chunk=' + safeJson(definition.chunk) + '）')
+            addProblem('不应带 chunk 字段（它是主包，chunk=' + safeJson(definition.chunk) + '）')
           }
         } else if (definition.chunk !== 'client.bpmn.js') {
-          problems.push('注册字段不是 chunk: \'client.bpmn.js\'（实际：' + safeJson(definition.chunk) + '）')
+          addProblem('注册字段不是 chunk: \'client.bpmn.js\'（实际：' + safeJson(definition.chunk) + '）')
         }
       } catch (error) {
-        problems.push('读取 chunk 字段失败：' + describe(error))
+        addProblem('读取 chunk 字段失败：' + describe(error))
       }
       var result
       try {
         result = factory(globalThis.__factoryRequire__)
       } catch (error) {
-        problems.push(withHint(error, 'factory 执行失败：' + describe(error)))
-        return JSON.stringify({ problems: problems })
+        addProblem(withHint(error, 'factory 执行失败：' + describe(error)))
+        return problemsText
       }
       if (kind === 'plugin') {
         if (result === null || typeof result !== 'object') {
-          problems.push('factory 返回的不是插件对象（实际：' + safeJson(result) + '）')
-          return JSON.stringify({ problems: problems })
+          addProblem('factory 返回的不是插件对象（实际：' + safeJson(result) + '）')
+          return problemsText
         }
         try {
           if (result.name !== 'flow-studio') {
-            problems.push('返回的插件 name 是 ' + safeJson(result.name) + '，应为 flow-studio')
+            addProblem('返回的插件 name 是 ' + safeJson(result.name) + '，应为 flow-studio')
           }
-          if (typeof result.apply !== 'function') problems.push('返回的插件缺少 apply 方法')
-          if (!Array.isArray(result.inject) || result.inject.includes('slots') === false) {
-            problems.push('返回的插件 inject 不是 [\'slots\']（实际：' + safeJson(result.inject) + '）')
+          if (typeof result.apply !== 'function') addProblem('返回的插件缺少 apply 方法')
+          if (caps.isArray(result.inject) !== true || caps.includes(result.inject, 'slots') !== true) {
+            addProblem('返回的插件 inject 不是 [\'slots\']（实际：' + safeJson(result.inject) + '）')
           }
         } catch (error) {
-          problems.push('检查插件返回值失败：' + describe(error))
+          addProblem('检查插件返回值失败：' + describe(error))
         }
       } else {
         if (result === null || typeof result !== 'object') {
-          problems.push('factory 没有返回 exports 对象（实际：' + safeJson(result) + '）')
-          return JSON.stringify({ problems: problems })
+          addProblem('factory 没有返回 exports 对象（实际：' + safeJson(result) + '）')
+          return problemsText
         }
         try {
-          if (typeof result.mountEditor !== 'function') problems.push('factory 返回的 exports 缺少 mountEditor 函数')
+          if (typeof result.mountEditor !== 'function') addProblem('factory 返回的 exports 缺少 mountEditor 函数')
           if (typeof result.version !== 'string' || result.version === '') {
-            problems.push('factory 返回的 exports 缺少非空 version 字符串')
+            addProblem('factory 返回的 exports 缺少非空 version 字符串')
           }
           if (typeof result.BPMN_EDITOR_CSS !== 'string' || result.BPMN_EDITOR_CSS === '') {
-            problems.push('factory 返回的 exports 缺少 BPMN_EDITOR_CSS 样式字符串')
+            addProblem('factory 返回的 exports 缺少 BPMN_EDITOR_CSS 样式字符串')
           }
         } catch (error) {
-          problems.push('检查 exports 返回值失败：' + describe(error))
+          addProblem('检查 exports 返回值失败：' + describe(error))
         }
       }
-      return JSON.stringify({ problems: problems })
+      return problemsText
     } catch (error) {
-      return JSON.stringify({ problems: ['注册检查异常：' + describe(error)] })
+      return '注册检查异常：' + describe(error)
     }
   }
 
@@ -708,15 +734,16 @@ function factoryCheckChildMain() {
   }
 
   // 产物源码整段包进 realm 内的 try/catch：注册阶段抛错也由 realm 自己格式化。
+  // 注册阶段的错误也只用原始字符串回传：不经过可被注册源码改写的 JSON.stringify。
   const registrationScript = '(function () {\n'
     + 'var describe = function (error) {\n'
     + '  try { if (error !== null && typeof error === "object" && typeof error.message === "string") return error.message } catch (_) {}\n'
-    + '  try { return String(error) } catch (_) { return "[无法格式化的异常]" }\n'
+    + '  return "[无法格式化的异常]"\n'
     + '}\n'
     + 'try {\n'
     + request.source
     + '\n} catch (error) {\n'
-    + 'return JSON.stringify({ error: describe(error) })\n'
+    + 'return describe(error)\n'
     + '}\n'
     + 'return null\n'
     + '})()'
@@ -727,12 +754,7 @@ function factoryCheckChildMain() {
       filename: 'lib/' + request.file,
       timeout: request.registrationTimeoutMs,
     })
-    if (typeof registrationReport === 'string') {
-      const parsed = JSON.parse(registrationReport)
-      if (parsed !== null && typeof parsed === 'object' && typeof parsed.error === 'string') {
-        registrationMessage = parsed.error
-      }
-    }
+    if (typeof registrationReport === 'string') registrationMessage = registrationReport
   } catch (error) {
     if (isTimeout(error)) {
       reply({ problems: ['注册代码求值超时（>' + request.registrationTimeoutMs + 'ms），已中止校验'] })
@@ -761,16 +783,19 @@ function factoryCheckChildMain() {
     return
   }
 
-  let report
-  try {
-    report = JSON.parse(rawReport)
-  } catch {
-    reply({ problems: ['校验结果不是合法 JSON'] })
+  // 校验结果通道只接受原始字符串：'' = 通过，非空 = 逐行问题。
+  // 这里用宿主自己的 split / JSON.stringify 组装输出，realm 里的篡改影响不到。
+  if (typeof rawReport !== 'string') {
+    reply({ problems: ['校验结果通道被篡改：期望原始字符串，实际是 ' + typeof rawReport] })
     return
   }
-  const problems = report !== null && typeof report === 'object' && Array.isArray(report.problems)
-    ? report.problems.filter(item => typeof item === 'string')
-    : ['校验结果缺少 problems 数组']
+  const problems = rawReport === ''
+    ? []
+    : rawReport.split('\n').filter(item => item !== '')
+  if (rawReport !== '' && problems.length === 0) {
+    reply({ problems: ['校验结果通道被篡改：非空结果里没有可读问题'] })
+    return
+  }
   reply({ problems })
 }
 

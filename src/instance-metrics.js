@@ -27,6 +27,8 @@
  * @module @feiyueve/dsh-flow-studio/instance-metrics
  */
 
+import { createHash } from 'node:crypto'
+
 import {
   USAGE_BUCKETS, USAGE_REASON, USAGE_TRUST, createUsageCall, recordUsageCall,
   summarizeUsageCalls, usageCallKey,
@@ -207,6 +209,46 @@ function executionDuration(execution, event) {
 }
 
 /**
+ * 事件集合的内容指纹（0.14.4 MINOR-1）。
+ *
+ * 只取**能反映事件集合变化的最小摘要**：条数 + 最大 seq + 坏行数 +
+ * `(seq|type|at)` 序列的 sha256。不读事件正文、不序列化整条事件，成本与
+ * 「事件条数」线性且常数很小。
+ *
+ * 用途：缓存指纹必须能区分「事件追加失败只写了元数据」与「事件随后被补写」——
+ * 这两种情况下 `instance.lastSeq / revision` 可以完全一样，只靠元数据会命中
+ * 事件正文尚未完成时算出的旧结果。
+ *
+ * @param {object[]} events
+ * @param {number} [skippedEvents]
+ * @returns {string} 稳定字符串（可直接进缓存 key）
+ */
+export function eventsFingerprint(events, skippedEvents = 0) {
+  const list = Array.isArray(events) ? events : []
+  const rows = list.map((value, index) => {
+    const event = isPlainObject(value) ? value : {}
+    return {
+      index,
+      seq: Number.isInteger(event.seq) ? event.seq : -1,
+      type: typeof event.type === 'string' ? event.type : '',
+      at: typeof event.at === 'string' ? event.at : '',
+    }
+  })
+  // 与 reduce 一致：先按 seq、再按原顺序，保证同一集合不同入参顺序得到同一指纹。
+  rows.sort((left, right) => (left.seq - right.seq) || (left.index - right.index))
+  let maxSeq = -1
+  const parts = new Array(rows.length)
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]
+    if (row.seq > maxSeq) maxSeq = row.seq
+    parts[index] = `${row.seq}|${row.type}|${row.at}`
+  }
+  const digest = createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex')
+  const skipped = Number.isSafeInteger(skippedEvents) && skippedEvents > 0 ? skippedEvents : 0
+  return `n${rows.length};m${maxSeq};k${skipped};h${digest}`
+}
+
+/**
  * 事件 + 实例事实 → 可缓存的「事件侧归约」（不含 asOf 相关投影）。
  *
  * 缓存绑定 `lastSeq / revision / schemaVersion`（以及 connector / 资源记录指纹），
@@ -267,6 +309,8 @@ export function reduceInstanceMetrics(input = {}) {
     completedAtMs,
     updatedAtMs,
     lastSeq,
+    /** 事件集合内容指纹（见 {@link eventsFingerprint}）：缓存 key 与跨进程对账都用它。 */
+    eventFingerprint: eventsFingerprint(events, skippedEvents),
     throughSeq: 0,
     skippedEvents,
     skippedResources,
@@ -565,6 +609,13 @@ export function finalizeInstanceMetrics(reduction, asOf = new Date().toISOString
     suspendedValue = null
     addReason(reduction, METRICS_REASON.SUSPEND_TIMELINE_UNAVAILABLE)
   }
+  if (reduction.status === 'ACTIVE' && reduction.suspension.openStartedAtMs !== null) {
+    // 磁盘已经是 ACTIVE，但事件流里最后一条生命周期事件仍是 `instance/suspended`
+    // （缺 resume——典型来源是「恢复的元数据已写、事件追加失败」）。恢复时刻不可知，
+    // 因此整个挂起时长未知：不能把此后到 asOf 的时间继续累计成挂起（MINOR-1）。
+    suspendedValue = null
+    addReason(reduction, METRICS_REASON.SUSPEND_TIMELINE_UNAVAILABLE)
+  }
 
   let completedWaitMs = reduction.human.completedWaitMs + closed.extra.completedWaitMs
   let canceledWaitMs = reduction.human.canceledWaitMs + closed.extra.canceledWaitMs
@@ -823,15 +874,24 @@ export function computeInstanceMetrics(input = {}) {
 /**
  * 事件侧归约缓存：只绑定内容指纹，不绑定 asOf。
  *
- * 同一个指纹（`schemaVersion + lastSeq + revision`，再加 connector / 资源记录指纹）
- * 命中即复用；实例事实或事件一变，指纹变化 → 自动重算。缓存可整体清空且不丢事实：
- * 事件与实例事实才是权威。
+ * 同一个指纹（`schemaVersion + lastSeq + revision + 事件集合指纹`，再加 connector /
+ * 资源记录指纹）命中即复用；实例事实或事件一变，指纹变化 → 自动重算。缓存可整体清空
+ * 且不丢事实：事件与实例事实才是权威。
  *
- * @param {{max?: number}} [options]
+ * 两条「不信任旧结果」的保护（0.14.4 MINOR-1）：
+ *   1. 指纹包含事件集合内容（见 {@link eventsFingerprint}），事件正文被补写而元数据
+ *      没变时 key 也会变（调用方把 `events` 传给 {@link metricsFingerprintFor}）；
+ *   2. 归约自己报告事件日志不完整（`complete === false`：缺已公布 seq / 有坏行）时
+ *      **不写入缓存**——补写之后即使 key 相同也必须重算，不能返回窗口期算出的残缺值。
+ *
+ * @param {{max?: number, cacheable?: (value:any)=>boolean}} [options]
  * @returns {{get: Function, clear: Function, size: number}}
  */
 export function createMetricsCache(options = {}) {
   const max = Number.isSafeInteger(options.max) && options.max > 0 ? options.max : 200
+  const cacheable = typeof options.cacheable === 'function'
+    ? options.cacheable
+    : value => !(isPlainObject(value) && value.complete === false)
   const entries = new Map()
   return {
     get(fingerprint, build) {
@@ -843,6 +903,8 @@ export function createMetricsCache(options = {}) {
         return { value, hit: true, key }
       }
       const value = build()
+      // 残缺结果不缓存：事件被补写后同 key 的请求必须重算，而不是命中旧值。
+      if (!cacheable(value)) return { value, hit: false, key }
       entries.set(key, value)
       while (entries.size > max) entries.delete(entries.keys().next().value)
       return { value, hit: false, key }
@@ -856,13 +918,15 @@ export function createMetricsCache(options = {}) {
   }
 }
 
-/** 缓存指纹的稳定序列化（字段固定，缺省按 0）。 */
+/** 缓存指纹的稳定序列化（字段固定，缺省按 0 / 空串）。 */
 export function metricsCacheKey(input = {}) {
   const source = isPlainObject(input) ? input : {}
   return JSON.stringify({
     schemaVersion: Number.isInteger(source.schemaVersion) ? source.schemaVersion : METRICS_SCHEMA_VERSION,
     lastSeq: Number.isInteger(source.lastSeq) ? source.lastSeq : 0,
     revision: Number.isInteger(source.revision) ? source.revision : 0,
+    // 事件集合内容指纹：元数据没变但事件正文被补写 / 修复 → key 变化。
+    events: typeof source.events === 'string' ? source.events : '',
     connector: typeof source.connector === 'string' ? source.connector : '',
     resources: Number.isInteger(source.resources) ? source.resources : 0,
   })
@@ -1193,14 +1257,22 @@ export function aggregateInstanceMetrics(input = {}) {
   }
 }
 
-/** 给 runtime 用：这次归约对应的缓存指纹（不含 asOf）。 */
+/**
+ * 给 runtime 用：这次归约对应的缓存指纹（不含 asOf）。
+ *
+ * `options.events` 是调用方**已经读出来**的事件集合（runtime 本来就要读它做归约，
+ * 不需要额外读盘）。传了就并入事件内容指纹；不传则退化为纯元数据指纹（旧行为）。
+ */
 export function metricsFingerprintFor(instance, options = {}) {
   return {
     schemaVersion: METRICS_SCHEMA_VERSION,
     lastSeq: Number.isInteger(instance?.lastSeq) ? instance.lastSeq : 0,
     revision: Number.isInteger(instance?.revision) ? instance.revision : 0,
-    connector: typeof options.connector === 'string' ? options.connector : '',
-    resources: Number.isInteger(options.resources) ? options.resources : 0,
+    events: Array.isArray(options?.events)
+      ? eventsFingerprint(options.events, options.skippedEvents)
+      : '',
+    connector: typeof options?.connector === 'string' ? options.connector : '',
+    resources: Number.isInteger(options?.resources) ? options.resources : 0,
   }
 }
 

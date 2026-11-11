@@ -16,7 +16,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
@@ -26,7 +26,8 @@ mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
 
 const {
   METRICS_REASON, METRICS_SCHEMA_VERSION, aggregateInstanceMetrics, computeInstanceMetrics,
-  createMetricsCache, metricsCacheKey, percentileMs, summarizeLatency,
+  createMetricsCache, eventsFingerprint, metricsCacheKey, metricsFingerprintFor, percentileMs,
+  summarizeLatency,
 } = await import('../src/instance-metrics.js')
 const { appendInstanceEvents, readInstance } = await import('../src/instance-store.js')
 const { createBpmnRuntime } = await import('../src/bpmn-runtime.js')
@@ -223,6 +224,81 @@ test('挂起耗时单列：suspend/resume 区间不与执行耗时混算', () =>
     || onlyStatus.duration.suspendedMs === null)
 })
 
+// MINOR-1（0.14.4）：磁盘是 ACTIVE、事件流最后一条生命周期事件却是 suspended
+// （resume 事件追加失败）→ 挂起时长未知，不能继续按 now 累计。
+test('MINOR-1：ACTIVE 但缺 resume 事件 → suspendedMs null + suspend-timeline-unavailable', () => {
+  // lastSeq=2 表示元数据已经公布了 resume 的 seq，但事件正文没写进去（append 失败）。
+  const fact = instanceFact({ status: 'ACTIVE', lastSeq: 2, eventCount: 2 })
+  const events = [event(1, 'instance/suspended', 1_000)]
+  const early = computeInstanceMetrics({ instance: fact, events, asOf: iso(14_000) })
+  const later = computeInstanceMetrics({ instance: fact, events, asOf: iso(120_000) })
+
+  assert.equal(early.status, 'ACTIVE')
+  assert.equal(early.duration.suspendedMs, null, '缺 resume 时挂起时长未知，不是 13s')
+  assert.equal(later.duration.suspendedMs, null, '不能从 13s 继续增长到 119s')
+  assert.ok(
+    early.dataQuality.reasons.includes(METRICS_REASON.SUSPEND_TIMELINE_UNAVAILABLE),
+    '必须明确给出 suspend-timeline-unavailable',
+  )
+  assert.equal(early.complete, false, '事件正文没完成时不是完整结果')
+})
+
+// MINOR-1（0.14.4）：挂起期间允许写「执行失败事实」（error 事件 + lastError），
+// 因此区间内的 error 事件不能结束挂起区间。
+test('MINOR-1：挂起区间内的 error 事件不结束区间', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact({ status: 'ACTIVE', lastSeq: 3, eventCount: 3 }),
+    events: [
+      event(1, 'instance/suspended', 1_000),
+      event(2, 'error', 3_000, { elementId: 'agent1', error: { code: 'BPMN_AGENT_TIMEOUT' } }),
+      event(3, 'instance/resumed', 9_000),
+    ],
+    asOf: iso(20_000),
+  })
+  assert.equal(metrics.duration.suspendedMs, 8_000, '1s→9s，中间的 error 不断开区间')
+  assert.ok(!metrics.dataQuality.reasons.includes(METRICS_REASON.SUSPEND_TIMELINE_UNAVAILABLE))
+})
+
+// MINOR-1（0.14.4）：事件补写时元数据（lastSeq/revision）可以完全不变。缓存指纹必须
+// 包含事件内容；而「事件日志不完整」的归约根本不能进缓存（补写后同 key 也要重算）。
+test('MINOR-1：补写 resume 事件后数值正确；事件内容进指纹，残缺归约不入缓存', () => {
+  const fact = instanceFact({ status: 'ACTIVE', lastSeq: 2, eventCount: 2, revision: 7 })
+  const broken = [event(1, 'instance/suspended', 1_000)]
+  const repaired = [event(1, 'instance/suspended', 1_000), event(2, 'instance/resumed', 9_000)]
+
+  const before = computeInstanceMetrics({ instance: fact, events: broken, asOf: iso(20_000) })
+  assert.equal(before.duration.suspendedMs, null)
+  assert.equal(before.complete, false)
+
+  const cache = createMetricsCache()
+  const brokenKey = metricsFingerprintFor(fact, { events: broken })
+  const first = cache.get(brokenKey, () => before)
+  assert.equal(first.hit, false)
+  assert.equal(cache.size, 0, '残缺归约不写入缓存')
+
+  // 元数据不变，但事件已补写：同 key 请求也必须重算，不能命中窗口期的残缺值。
+  const second = cache.get(brokenKey, () => computeInstanceMetrics({
+    instance: fact,
+    events: repaired,
+    asOf: iso(20_000),
+  }))
+  assert.equal(second.hit, false, '残缺结果不得命中旧缓存')
+  assert.equal(second.value.duration.suspendedMs, 8_000, '补写 resume 后 1s→9s = 8s')
+  assert.equal(second.value.complete, true)
+
+  // 事件内容进入指纹：lastSeq/revision 不变，事件正文一变 key 就变。
+  const repairedKey = metricsFingerprintFor(fact, { events: repaired })
+  assert.notEqual(metricsCacheKey(repairedKey), metricsCacheKey(brokenKey))
+  assert.notEqual(eventsFingerprint(broken), eventsFingerprint(repaired))
+
+  // 完整结果正常进缓存，同 key 第二次命中。
+  const healthy = computeInstanceMetrics({ instance: fact, events: repaired, asOf: iso(20_000) })
+  const a = cache.get(metricsCacheKey(repairedKey), () => healthy)
+  const b = cache.get(metricsCacheKey(repairedKey), () => healthy)
+  assert.equal(a.hit, false)
+  assert.equal(b.hit, true, '完整结果照常缓存')
+})
+
 test('finish_reminder 每次触发各计一次；NODE_FINISH_MISSING 按 execution 去重', () => {
   const metrics = computeInstanceMetrics({
     instance: instanceFact({ lastError: { code: 'NODE_FINISH_MISSING', activityId: 'e1', remenders: 3 } }),
@@ -414,6 +490,60 @@ test('API 与离线纯函数逐字段一致；追加事件后缓存失效；GET 
     assert.equal(summary.body.totals.instances, 2, '默认 listInstances limit 不能漏计')
     assert.equal(summary.body.totals.byStatus.ACTIVE, 2)
     assert.deepEqual(summary.body.groups.map(group => group.key), ['2026-11-12'])
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// MINOR-1（0.14.4）API 侧：事件正文的补写可以**不改变** instance.json 的
+// lastSeq / revision（失败重试只补投影）。此时缓存指纹不变，唯一能阻止旧值的是
+// 「残缺归约不写入缓存」——补写后同指纹请求必须重算并给出正确数值。
+test('MINOR-1：API 侧同指纹重算——补写事件后不再命中窗口期的残缺缓存', async () => {
+  const home = freshHome('backfill-api')
+  const instancesRoot = join(home, 'instances')
+  const id = 'i-metrics-backfill'
+  const dir = join(instancesRoot, id)
+  mkdirSync(dir, { recursive: true })
+  const stale = instanceFact({ id, status: 'ACTIVE', lastSeq: 2, eventCount: 2, revision: 7 })
+  const staleText = `${JSON.stringify(stale, null, 2)}\n`
+  writeFileSync(join(dir, 'instance.json'), staleText, 'utf8')
+  // 先只有 suspend 事件正文：resume 的 seq 2 已在元数据里公布，但正文还没补上。
+  // 直接写 JSONL（不经过 appendInstanceEvents），才能把元数据固定在旧值。
+  const shard = join(dir, 'events', 'process', '1.jsonl')
+  mkdirSync(join(dir, 'events', 'process'), { recursive: true })
+  writeFileSync(shard, `${JSON.stringify({ ...event(1, 'instance/suspended', 1_000) })}\n`, 'utf8')
+
+  const runtime = createBpmnRuntime({
+    dir: join(home, 'flows'),
+    instancesRoot,
+    definitionsRoot: join(home, 'definitions'),
+    env: {},
+  })
+  const request = asOf => ({
+    method: 'GET',
+    parts: ['instances', id, 'metrics'],
+    url: `http://localhost/instances/${id}/metrics?asOf=${encodeURIComponent(asOf)}`,
+  })
+  try {
+    const asOf = iso(20_000)
+    const first = await runtime.handle(request(asOf))
+    assert.equal(first.status, 200, JSON.stringify(first.body))
+    assert.equal(first.body.complete, false)
+    assert.equal(runtime._metricsCache.size, 0, '残缺归约不写入缓存')
+    assert.equal(first.body.duration.suspendedMs, null, '缺 resume 事件 → 未知')
+
+    // 补写 resume 正文（seq 2）；instance.json 仍是同一份旧元数据（lastSeq=2 / revision=7 不变）。
+    appendFileSync(shard, `${JSON.stringify({ ...event(2, 'instance/resumed', 9_000) })}\n`, 'utf8')
+    const instance = await readInstance(id, { instancesRoot })
+    assert.equal(instance.lastSeq, 2, '指纹里的元数据没变')
+    assert.equal(instance.revision, 7)
+
+    const second = await runtime.handle(request(asOf))
+    assert.equal(second.status, 200, JSON.stringify(second.body))
+    assert.equal(second.body.duration.suspendedMs, 8_000, '补写后按 1s→9s 给出正确挂起时长')
+    assert.equal(second.body.complete, true)
+    assert.equal(runtime._metricsCache.size, 1, '完整结果才进缓存')
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })

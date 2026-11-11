@@ -32,6 +32,7 @@ const {
   createBpmnRuntime, executeAgent, executeHttp, BPMN_ENGINE_VERSION,
 } = await import('../src/bpmn-runtime.js')
 const { createHandler } = await import('../src/index.js')
+const { createInstanceTools } = await import('../src/instance-tools.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
 const instStore = await import('../src/instance-store.js')
@@ -1646,6 +1647,12 @@ try {
       eq(listed.status, 200, JSON.stringify(listed.body))
       ok(listed.body.worktrees.some(entry => entry.instanceId === id), '列表能看到实例 worktree')
       eq(runtimeB._runners.size, 0, '列表不启动 runner')
+      // 0.13.8：flow_instance_worktrees 与 HTTP 路由共用 runtime.handle，返回同一份清单。
+      const instanceTool = createInstanceTools({ runtime: runtimeB })[0]
+      const toolList = await instanceTool.execute({ action: 'list' })
+      eq(toolList.ok, true, JSON.stringify(toolList))
+      deep(toolList.worktrees, listed.body.worktrees, '模型工具与路由的一致性')
+      deep(toolList.orphans, listed.body.orphans)
       const getB = await runtimeB.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
       eq(getB.status, 200, JSON.stringify(getB.body))
       eq(runtimeB._runners.size, 0, 'GET worktree 不启动 runner')

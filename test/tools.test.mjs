@@ -2528,29 +2528,31 @@ try {
     A.equal(ctx.routes.length, 1)
   })
 
-  await check('有 tools 服务时注册九个工具，卸载时逆序撤销', () => {
+  await check('有 tools 服务时注册十个工具，卸载时逆序撤销', () => {
     const { ctx, registered, disposed, disposeFns } = makeCtx({ toolsService: true })
     apply(ctx)
     // v0.7 新增 flow_supervise；G6-b 新增 flow_worktrees；v0.9.2 新增 flow_restart
-    //（失败后重启并在原会话续跑）；0.12 目录化新增 flow_compile / flow_decompile，
-    // 所以固定数量从 4 → 5 → 6 → 7 → 9。
-    A.equal(registered.length, 9)
+    //（失败后重启并在原会话续跑）；0.12 目录化新增 flow_compile / flow_decompile；
+    // 0.13.8 新增实例域 flow_instance_worktrees，所以固定数量从 4 → 5 → 6 → 7 → 9 → 10。
+    A.equal(registered.length, 10)
     A.deepEqual(
       registered.map(tool => tool.name).sort(),
       [
-        'flow_compile', 'flow_decompile', 'flow_list', 'flow_restart', 'flow_start',
-        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees',
+        'flow_compile', 'flow_decompile', 'flow_instance_worktrees', 'flow_list',
+        'flow_restart', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch',
+        'flow_worktrees',
       ],
     )
     A.equal(ctx.routes.length, 1)
     A.ok(disposeFns.length >= 1)
-    // 最后一个 effect 就是工具注册；调用它的 disposer 应把九个工具都撤掉。
+    // 最后一个 effect 就是工具注册；调用它的 disposer 应把十个工具都撤掉。
     disposeFns[disposeFns.length - 1]()
     A.deepEqual(
       disposed.slice().sort(),
       [
-        'flow_compile', 'flow_decompile', 'flow_list', 'flow_restart', 'flow_start',
-        'flow_stop', 'flow_supervise', 'flow_watch', 'flow_worktrees',
+        'flow_compile', 'flow_decompile', 'flow_instance_worktrees', 'flow_list',
+        'flow_restart', 'flow_start', 'flow_stop', 'flow_supervise', 'flow_watch',
+        'flow_worktrees',
       ],
     )
   })
@@ -2558,7 +2560,7 @@ try {
   await check('ctx.tools 属性（不走 ctx.get）也能注册', () => {
     const { ctx, registered } = makeCtx({ toolsService: true, useCtxProperty: true })
     apply(ctx)
-    A.equal(registered.length, 9)
+    A.equal(registered.length, 10)
   })
 
   // ── 11.5 engine.start 的 per-start parent（06 §15） ──────────────────

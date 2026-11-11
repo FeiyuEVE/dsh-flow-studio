@@ -38,6 +38,7 @@ import { compileFlowFiles, readFlowDir, writeFlowDir } from './flowdir.js'
 import { checkRunId, isSafeRelPath, renderRunMarkdown, summarize } from './runlog.js'
 import { createRuntime, patchRunJson, readStartOptions, saveSupervision } from './runtime.js'
 import * as worktreeModule from './worktree.js'
+import { createInstanceTools } from './instance-tools.js'
 import {
   CUSTOM_EXECUTOR_ENV, DEFAULT_NODE_TIMEOUT_MS, DEFAULT_RUN_TIMEOUT_MS, MAX_TIMEOUT_MS,
   NODE_TIMEOUT_ENV, RUN_TIMEOUT_ENV, WORKSPACE_ROOTS_ENV,
@@ -2631,18 +2632,21 @@ export function apply(ctx) {
       log('warn', `flow-studio: 清理残留 run / 租约失败：${error.message}`)
     })
 
+  // 0.13.8：HTTP 路由与模型工具共用同一个 env —— `bpmnRuntimeFor` 按 env 缓存 runtime，
+  // 这样 flow_instance_worktrees 的 prune 预览与 HTTP 执行共享同一份 planHash 缓存。
+  const bpmnEnv = {
+    dir,
+    runsRoot,
+    ctx,
+    engine,
+    startOptions,
+    // 0.13.1 A3：agent 节点由 AgentAdapter 执行（dsh / codex）；codex 不可用不影响加载。
+    bpmnAdapters: buildAgentAdapters(ctx, log, join(dirname(dir), '.tmp')),
+  }
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: BASE,
-    handler: createHandler({
-      dir,
-      runsRoot,
-      ctx,
-      engine,
-      startOptions,
-      // 0.13.1 A3：agent 节点由 AgentAdapter 执行（dsh / codex）；codex 不可用不影响加载。
-      bpmnAdapters: buildAgentAdapters(ctx, log, join(dirname(dir), '.tmp')),
-    }),
+    handler: createHandler(bpmnEnv),
   }), 'flow-studio: /api/flow-studio')
 
   // 06 §15：模型工具（会话内启停 + 定时自审）。
@@ -2651,8 +2655,10 @@ export function apply(ctx) {
   const toolsSvc = (typeof ctx.get === 'function' && ctx.get('tools')) || ctx.tools
   if (toolsSvc && typeof toolsSvc.register === 'function') {
     const tools = createFlowTools({ flowsRoot: dir, runsRoot, engine, ctx, log })
+    // 0.13.8：实例域工具与 HTTP 路由走同一个 runtime（懒建，首次执行时才创建）。
+    const instanceTools = createInstanceTools({ getRuntime: () => bpmnRuntimeFor(bpmnEnv) })
     ctx.effect(() => {
-      const disposers = tools.map(tool => toolsSvc.register(tool))
+      const disposers = [...tools, ...instanceTools].map(tool => toolsSvc.register(tool))
       return () => disposers.reverse().forEach(dispose => dispose())
     }, 'flow-studio: 注册模型工具')
   } else {

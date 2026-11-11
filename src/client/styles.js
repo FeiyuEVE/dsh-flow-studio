@@ -1509,6 +1509,63 @@ body[data-ds-dark-theme] .fs-log-event[aria-selected="true"]{
 .fs-event-kind{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fs-event-summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 
+/* ── 右：实例工作区 / worktree 清理（0.13.8）──────────────────── */
+.fs-instance-extras{
+  flex:none;border-top:1px solid var(--dsw-alias-border-l1);
+  max-height:300px;overflow-y:auto;background:var(--dsw-alias-bg-layer-1);
+}
+.fs-wt{display:flex;flex-direction:column;gap:6px;padding:8px 10px 10px;font-size:12px;line-height:18px}
+.fs-wt-head{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.fs-wt-head strong{font-size:13px;line-height:20px}
+.fs-wt-empty{margin:0;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-wt-note{margin:0;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-wt-body{display:flex;flex-direction:column;gap:6px}
+.fs-wt-facts{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 8px;margin:0}
+.fs-wt-facts > div{display:contents}
+.fs-wt-facts dt{color:var(--dsw-alias-label-tertiary)}
+.fs-wt-facts dd{margin:0;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-wt-badges{display:flex;flex-wrap:wrap;gap:4px}
+.fs-wt-reasons{margin:0;padding-left:16px;color:var(--fs-r2-warn);word-break:break-word}
+.fs-wt-blocked{
+  margin:0;padding:4px 6px;color:var(--fs-r2-warn);
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 38%, transparent);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 8%, transparent);
+}
+.fs-wt-actions{display:flex;gap:6px;flex-wrap:wrap}
+.fs-wt-confirm{
+  display:flex;flex-direction:column;gap:6px;padding:6px 8px;
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 6%, transparent);
+}
+.fs-wt-danger{margin:0;color:var(--fs-r2-error);word-break:break-word}
+.fs-wt-check{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary)}
+.fs-wt-error{
+  padding:6px 8px;color:var(--fs-r2-error);
+  border:1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 7%, transparent);
+  word-break:break-word;
+}
+.fs-wt-prune-head{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  border-top:1px solid var(--dsw-alias-border-l1);padding-top:6px;
+}
+.fs-wt-prune{display:flex;flex-direction:column;gap:6px}
+.fs-wt-rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+.fs-wt-row{
+  display:flex;flex-direction:column;gap:0;padding:4px 6px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);
+}
+.fs-wt-row-id{color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-wt-row-meta{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.fs-wt-row-path{color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-wt-plan{display:flex;flex-direction:column;gap:6px}
+.fs-wt-hash{margin:0;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.fs-wt-hash code{font-family:var(--dsw-font-markdown-code-font-family, monospace);font-size:11px}
+
 @media (max-width:980px){
   .fs-instance-panel{width:290px}
   .fs-def-list{width:210px}

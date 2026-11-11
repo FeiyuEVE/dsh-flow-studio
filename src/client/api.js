@@ -271,6 +271,38 @@ export function instanceDefinitionPath(id) {
 }
 
 /**
+ * `GET /instances/<id>/worktree`（0.13.8：实例工作区检查）。
+ * `DELETE` 同一个路径清理工作树，请求体 `{force?, removeBranch?, expectedHead?}`。
+ */
+export function instanceWorktreePath(id) {
+  return `${instancePath(id)}/worktree`
+}
+
+/** `DELETE /instances/<id>/worktree/branch`（只删记录确属本实例的分支）。 */
+export function instanceWorktreeBranchPath(id) {
+  return `${instanceWorktreePath(id)}/branch`
+}
+
+/** `GET /instance-worktrees[?workspaceId=]`（实例资源列表，含 orphan）。 */
+export function instanceWorktreesPath(options = {}) {
+  return withQuery('/instance-worktrees', {
+    workspaceId: options && options.workspaceId,
+  })
+}
+
+/** `POST /instance-worktrees/prune`（默认 dryRun；执行必须带预览的 planHash）。 */
+export function instanceWorktreesPrunePath() {
+  return '/instance-worktrees/prune'
+}
+
+/** `GET /instances/<id>/resource-events[?since=N]`（worktree / 产物资源事件）。 */
+export function instanceResourceEventsPath(id, options = {}) {
+  return withQuery(`${instancePath(id)}/resource-events`, {
+    since: options && options.since,
+  })
+}
+
+/**
  * 0.13.3 主契约：定义 / 实例。页面只用这些方法，不再走「先建 run 再 /start」。
  * 所有方法返回 Host 原样信封（`{ok:true, …}`），失败抛带 `status/code/data` 的 Error。
  */
@@ -291,6 +323,14 @@ export const api = {
   completeInstanceTask: (id, activityId, body) => request('POST', completeTaskPath(id, activityId), body || {}),
   stopInstance: id => request('POST', stopInstancePath(id)),
   readInstanceDefinition: id => request('GET', instanceDefinitionPath(id)),
+
+  // ── 实例工作区（0.13.8）────────────────────────────────────────────────
+  readInstanceWorktree: id => request('GET', instanceWorktreePath(id)),
+  removeInstanceWorktree: (id, body) => request('DELETE', instanceWorktreePath(id), body || {}),
+  removeInstanceWorktreeBranch: id => request('DELETE', instanceWorktreeBranchPath(id)),
+  listInstanceWorktrees: options => request('GET', instanceWorktreesPath(options)),
+  pruneInstanceWorktrees: body => request('POST', instanceWorktreesPrunePath(), body || {}),
+  readInstanceResourceEvents: (id, options) => request('GET', instanceResourceEventsPath(id, options)),
 }
 
 // ---------------------------------------------------------------------------

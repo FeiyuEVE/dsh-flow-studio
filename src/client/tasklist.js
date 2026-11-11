@@ -365,5 +365,10 @@ export function InstancePanel(props = {}) {
       submittingKeys: props.submittingKeys,
       disabled: busy || isTerminalStatus(status),
       onComplete: onCompleteTask,
-    })))
+    })),
+  // 0.13.8：实例工作区面板由 page 注入（组件在 client/instance-worktree.js），
+  // 本组件只负责给它一个固定高度的滚动槽位。
+  props.panelExtras
+    ? h('div', { className: 'fs-instance-extras' }, props.panelExtras)
+    : null)
 }

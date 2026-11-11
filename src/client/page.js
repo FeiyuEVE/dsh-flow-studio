@@ -35,6 +35,7 @@ import { BpmnCanvas } from './canvas.js'
 import { createDefinitionState } from './definition-state.js'
 import { clearDraft, draftDiffers, readDraft, writeDraft, DRAFT_DEBOUNCE_MS, DRAFT_MAX_WAIT_MS } from './drafts.js'
 import { DefinitionList, definitionsFromPayload } from './flowlist.js'
+import { InstanceWorktreePanel } from './instance-worktree.js'
 import {
   InstanceEventDrawer, focusBpmnElement, mergeInstanceEvents, nextEventPollDelay,
 } from './logdrawer.js'
@@ -1483,6 +1484,14 @@ export function FlowStudioPage(props = {}) {
       onRefresh: () => { void refreshInstances() },
       onStop: id => { void stopInstance(id) },
       onCompleteTask: (task, input) => { void completeTask(task, input) },
+      // 0.13.8：工作区 / worktree 检查与清理（面板自己读 worktree，页面只给通知与列表刷新）。
+      panelExtras: h(InstanceWorktreePanel, {
+        client,
+        instanceId: activeInstanceId,
+        instanceStatus: activeInstance ? activeInstance.status : '',
+        notice: (kind, text) => setNotice({ kind, text }),
+        onChanged: () => { void refreshInstances() },
+      }),
     })),
 
   h(InstanceEventDrawer, {

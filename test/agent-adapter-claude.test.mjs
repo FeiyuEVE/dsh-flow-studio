@@ -88,7 +88,15 @@ const argv = process.argv.slice(2)
 const mode = process.env.FAKE_CLAUDE_MODE || 'never'
 const stateDir = process.env.FAKE_CLAUDE_STATE_DIR || '.'
 const fallbackSessionId = process.env.FAKE_CLAUDE_SESSION_ID || '22222222-2222-4222-8222-222222222222'
-const out = obj => process.stdout.write(JSON.stringify(obj) + '\\n')
+const out = obj => {
+  // m3 夹具：SKIP_INIT 模式下所有事件都不带 session_id（模拟 CLI 完全不告诉你 id）。
+  let payload = obj
+  if (process.env.FAKE_CLAUDE_SKIP_INIT === '1' && payload && typeof payload === 'object') {
+    payload = { ...payload }
+    delete payload.session_id
+  }
+  process.stdout.write(JSON.stringify(payload) + '\\n')
+}
 
 if (process.env.FAKE_CLAUDE_HANG === '1') {
   setInterval(() => {}, 1000)

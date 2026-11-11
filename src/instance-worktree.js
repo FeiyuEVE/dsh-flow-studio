@@ -18,7 +18,7 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  existsSync, lstatSync, readdirSync, realpathSync, rmSync,
+  existsSync, lstatSync, readdirSync, realpathSync,
 } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -539,6 +539,23 @@ async function worktreeRegisteredOnBranch(git, repositoryRoot, target, branch) {
 }
 
 /**
+ * 目标目录是不是一棵**真实的** Git worktree（linked worktree 的 `.git` 是文件）。
+ *
+ * 创建失败回滚用它做最后一道证据：只有 Git 登记 + 本事务分支 + 真实 `.git` 标记
+ * 三者同时成立，才允许对该路径执行 `worktree remove`；被移走 / 被普通目录替换的
+ * 目标一律不碰（review-0139 F1）。
+ */
+function isRealWorktreeDir(target) {
+  if (!existsSync(target)) return false
+  try {
+    if (!lstatSync(target).isDirectory()) return false
+  } catch {
+    return false
+  }
+  return existsSync(join(target, '.git'))
+}
+
+/**
  * 创建失败回滚：**只处理能证明属于本次事务的资源**（review-0137 W1）。
  *
  * - 树：add 成功，或登记里明确检出本事务唯一 nonce 分支；
@@ -546,23 +563,21 @@ async function worktreeRegisteredOnBranch(git, repositoryRoot, target, branch) {
  * - 不调用仓库级 `worktree prune`，不按「路径原先不存在 / 分支前缀匹配」删除任何东西。
  */
 async function rollbackCreateTransaction({ git, repositoryRoot, target, ownership }) {
-  let ownsTree = ownership.worktree === true
-  if (!ownsTree && typeof ownership.tempBranch === 'string' && ownership.tempBranch !== '') {
-    ownsTree = await worktreeRegisteredOnBranch(git, repositoryRoot, target, ownership.tempBranch)
-  }
+  const ownedBranch = typeof ownership.tempBranch === 'string' && ownership.tempBranch !== ''
+    ? ownership.tempBranch
+    : ownership.branch
+  // 所有权复核必须在回滚时**重新核对**：add/转正之后目标可能已被移走或替换，
+  // `ownership.worktree=true` 只是历史事实，不能当成当前仍是本次树的证据。
+  const ownsTree = typeof ownedBranch === 'string' && ownedBranch !== ''
+    && await worktreeRegisteredOnBranch(git, repositoryRoot, target, ownedBranch)
+    && isRealWorktreeDir(target)
   if (ownsTree) {
-    const remove = await callGit(
+    // 只按登记 + 真实 worktree 标记删这一棵；不再用 `rm -rf` 兜底（目标可能已被替换）。
+    await callGit(
       git,
       ['-C', repositoryRoot, 'worktree', 'remove', '--force', '--force', target],
       repositoryRoot,
     )
-    if (remove.ok && existsSync(target)) {
-      try {
-        rmSyncSafe(target)
-      } catch {
-        // 残留目录留给错误信息里的路径。
-      }
-    }
   }
   const candidates = []
   if (typeof ownership.tempBranch === 'string' && ownership.tempBranch !== '') candidates.push(ownership.tempBranch)
@@ -583,9 +598,73 @@ async function rollbackCreateTransaction({ git, repositoryRoot, target, ownershi
   }
 }
 
-function rmSyncSafe(target) {
-  // 只删已经过 assertSafePath / Git 登记校验的路径。
-  rmSync(target, { recursive: true, force: true })
+/**
+ * “树已建、后续元数据没落盘”的专用回滚（review-0139 F1）。
+ *
+ * 与 {@link removeInstanceWorktree} 的区别：这里**只**处理创建事务里能证明属于本次
+ * 记录的资源，并且：
+ *   - 目标被移走（路径不存在）→ 一律不动（不动登记、不删分支，避免孤立被移走的树）；
+ *   - 目标被替换（无 `.git` 标记 / 登记分支不符）→ 不动；
+ *   - 不调用仓库级 `worktree prune`，也不做 `rm -rf` 兜底；
+ *   - 分支只在树确实已注销、tip 仍等于创建时基点时才删。
+ *
+ * @param {{record:object, runner?:Function, worktreeRoot?:string}} options
+ * @returns {Promise<{treeRemoved:boolean, branchRemoved:boolean, reason:string}>}
+ */
+export async function rollbackCreatedWorktree(options = {}) {
+  if (!isPlainObject(options)) {
+    throw fail(INSTANCE_WORKTREE_ERROR.INVALID, 'rollbackCreatedWorktree 需要对象参数')
+  }
+  const record = normalizeRecord(options.record)
+  const git = typeof options.runner === 'function' ? options.runner : defaultGitRunner
+  assertSafePath({
+    target: record.effectiveRoot,
+    workspaceId: record.workspaceId,
+    instanceId: record.instanceId,
+    worktreeRoot: options.worktreeRoot,
+  })
+  const result = { treeRemoved: false, branchRemoved: false, reason: 'not-owned' }
+  if (!existsSync(record.repositoryRoot)) {
+    return { ...result, reason: 'repository-missing' }
+  }
+  const listing = await listRepoWorktrees(git, record.repositoryRoot)
+  if (!listing.ok) {
+    return { ...result, reason: 'git-unavailable' }
+  }
+  const entry = listing.entries.find(item => samePath(item.path, record.effectiveRoot)) || null
+  if (!existsSync(record.effectiveRoot)) {
+    return { ...result, reason: 'target-missing', registered: entry !== null }
+  }
+  if (entry === null || entry.branch !== record.branch || !isRealWorktreeDir(record.effectiveRoot)) {
+    // 目标已经被替换成普通目录 / 不是本记录分支：所有权不明确，不删。
+    return { ...result, reason: 'not-owned', registered: entry !== null }
+  }
+  const remove = await callGit(
+    git,
+    ['-C', record.repositoryRoot, 'worktree', 'remove', '--force', '--force', record.effectiveRoot],
+    record.repositoryRoot,
+  )
+  if (!remove.ok) {
+    return {
+      ...result,
+      reason: 'remove-failed',
+      warning: summarize(remove.stderr || remove.stdout),
+    }
+  }
+  result.treeRemoved = true
+  result.reason = 'removed'
+  const tip = await readBranchTip(git, record.repositoryRoot, record.branch)
+  if (tip !== null && record.baseCommit !== null && tip === record.baseCommit) {
+    if (!await worktreeRegisteredOnBranch(git, record.repositoryRoot, record.effectiveRoot, record.branch)) {
+      const del = await callGit(
+        git,
+        ['-C', record.repositoryRoot, 'update-ref', '-d', `refs/heads/${record.branch}`, tip],
+        record.repositoryRoot,
+      )
+      result.branchRemoved = del.ok
+    }
+  }
+  return result
 }
 
 /**
@@ -753,17 +832,16 @@ export async function removeInstanceWorktree(options = {}) {
   }
   const entry = listing.entries.find(item => samePath(item.path, record.effectiveRoot)) || null
 
-  if (!existsSync(record.effectiveRoot)) {
-    await callGit(git, ['-C', record.repositoryRoot, 'worktree', 'prune', '--expire', 'now'], record.repositoryRoot)
+  if (entry === null && !existsSync(record.effectiveRoot)) {
+    // 目录和 Git 登记都不在了：资源已经消失，按 not-found 呈现（不触发任何删除）。
     return {
       removed: false,
       reason: 'not-found',
       path: record.effectiveRoot,
       branch: record.branch,
-      registered: entry !== null,
+      registered: false,
     }
   }
-
   if (entry === null) {
     throw fail(
       INSTANCE_WORKTREE_ERROR.NOT_REGISTERED,
@@ -784,6 +862,26 @@ export async function removeInstanceWorktree(options = {}) {
       `工作树分支 ${entry.branch} 与记录 ${record.branch} 不一致，拒绝删除`,
       { path: record.effectiveRoot, branch: entry.branch, expectedBranch: record.branch },
     )
+  }
+
+  // 目录已经不在了：只注销**已核对过路径 + 分支所有权**的这一条登记。
+  // 不能用仓库级 `worktree prune`（review-0139 F1：prune 会顺带清掉其它缺失路径的
+  // worktree 管理记录）；`git worktree remove <path>` 只作用于这一条登记。
+  if (!existsSync(record.effectiveRoot)) {
+    const unregister = await callGit(
+      git,
+      ['-C', record.repositoryRoot, 'worktree', 'remove', '--force', record.effectiveRoot],
+      record.repositoryRoot,
+    )
+    return {
+      removed: unregister.ok,
+      reason: 'not-found',
+      path: record.effectiveRoot,
+      branch: record.branch,
+      registered: true,
+      registrationRemoved: unregister.ok,
+      ...(unregister.ok ? {} : { warning: summarize(unregister.stderr || unregister.stdout) }),
+    }
   }
 
   if (options.expectedHead !== undefined && options.expectedHead !== null && options.expectedHead !== '') {
@@ -847,29 +945,17 @@ export async function removeInstanceWorktree(options = {}) {
     })
   }
 
-  // Git 注销成功后再清残留目录（例如未跟踪文件残留）；只删已校验路径。
-  if (existsSync(record.effectiveRoot)) {
-    try {
-      rmSyncSafe(record.effectiveRoot)
-    } catch (error) {
-      throw fail(
-        INSTANCE_WORKTREE_ERROR.REMOVE_FAILED,
-        `worktree 已注销但目录清理失败：${error?.message ?? error}`,
-        { path: record.effectiveRoot, reason: 'cleanup-failed', cause: error },
-      )
-    }
-  }
+  // Git 注销成功后**不**再用 `rm -rf` 兜底：路径若在 remove 与这里之间被人重建，
+  // 盲目递归删除会删掉无关资源。Git 自己的 remove（必要时双 force）负责清目录。
+  const leftover = existsSync(record.effectiveRoot)
   const still = await entryForPath(git, record.repositoryRoot, record.effectiveRoot)
   if (still.listed && still.entry !== null) {
-    await callGit(git, ['-C', record.repositoryRoot, 'worktree', 'prune', '--expire', 'now'], record.repositoryRoot)
-    const after = await entryForPath(git, record.repositoryRoot, record.effectiveRoot)
-    if (after.listed && after.entry !== null) {
-      throw fail(
-        INSTANCE_WORKTREE_ERROR.REMOVE_FAILED,
-        `worktree 已删除但 Git 仍登记着它：${record.effectiveRoot}`,
-        { path: record.effectiveRoot, reason: 'still-registered' },
-      )
-    }
+    // 不再用仓库级 prune 清理这一条：范围不可控，可能误清其它缺失路径的 worktree。
+    throw fail(
+      INSTANCE_WORKTREE_ERROR.REMOVE_FAILED,
+      `worktree 已删除但 Git 仍登记着它：${record.effectiveRoot}`,
+      { path: record.effectiveRoot, reason: 'still-registered' },
+    )
   }
   return {
     removed: true,
@@ -877,6 +963,7 @@ export async function removeInstanceWorktree(options = {}) {
     path: record.effectiveRoot,
     branch: record.branch,
     baseCommit: record.baseCommit,
+    ...(leftover ? { leftover: true } : {}),
   }
 }
 
@@ -926,6 +1013,9 @@ export async function removeInstanceBranch(options = {}) {
 
   // 以主仓库当前 HEAD 判断「已合并」：baseCommit 只记录创建时的基点，主仓库后续
   // 前进后旧基点不能代表当前主线。
+  // 关键：合并检查与删除必须针对**同一个提交身份**——检查用捕获到的 `tip`，删除也用
+  // CAS 删除同一个 `tip`。用可变分支名检查会放过 ABA（检查时分支在已合并的 B，
+  // 删除时又回到未合并的 A，review-0139 F2）。
   let merged = null
   let mergeDetail = ''
   if (record.baseCommit === null) {
@@ -933,7 +1023,7 @@ export async function removeInstanceBranch(options = {}) {
   } else {
     const probe = await callGit(
       git,
-      ['-C', record.repositoryRoot, 'merge-base', '--is-ancestor', branch, 'HEAD'],
+      ['-C', record.repositoryRoot, 'merge-base', '--is-ancestor', tip, 'HEAD'],
       record.repositoryRoot,
     )
     if (probe.ok) merged = true

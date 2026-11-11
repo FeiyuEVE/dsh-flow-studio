@@ -465,14 +465,17 @@ $GUEST_PREFIX/bin/dsh" 2>/dev/null || true)"
       while IFS="$sep" read -r mtype msrc mdst; do
         [ -n "$mdst" ] || continue
         [ "$mtype" = "bind" ] || continue
-        path_within "$mdst" "$resolved" || continue
+        # 对**解析后**的写入目录也做双向重叠：挂载既可能是它的祖先，也可能是它的
+        # 子孙（例如 symlink 把 profile 指到 /outside/modules，而另一条 bind 把
+        # /outside/modules/.pnpm 挂回宿主；只判祖先会漏掉子孙）。review-0139 F7。
+        path_within "$mdst" "$resolved" || path_within "$resolved" "$mdst" || continue
         # 只有「测试台根目录的挂载 + 真实路径仍在 $GUEST_ROOT 下」是设计内的；
         # 符号链接把 profile 解析到别的 bind 挂载（例如宿主 home）必须拒绝。
         if path_within "$mdst" "$GUEST_ROOT" && path_within "$GUEST_ROOT" "$resolved"; then
           continue
         fi
         problems="$problems
-写入路径的真实路径落在 bind 挂载下：$target → $resolved（挂载 $msrc → $mdst）"
+写入路径的真实路径与 bind 挂载重叠（祖先或子孙）：$target → $resolved（挂载 $msrc → $mdst）"
       done <<< "$table"
     done <<< "$realpaths"
   fi

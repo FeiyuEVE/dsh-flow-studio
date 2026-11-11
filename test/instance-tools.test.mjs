@@ -221,6 +221,45 @@ try {
     eq(runtime.calls[0].search, '?workspaceId=abcdefabcdef')
   })
 
+  await check('MINOR：数组裁剪后计数仍用裁剪前的真实数量', async () => {
+    const many = Array.from({ length: 250 }, (_, index) => ({
+      instanceId: `i-${index}`, orphan: false, path: `/managed/worktrees/abcdefabcdef/i-${index}`,
+    }))
+    const listRuntime = makeRuntime(async () => ({
+      status: 200,
+      body: {
+        ok: true,
+        worktrees: many,
+        orphans: [{ instanceId: 'i-0' }],
+        corrupt: [],
+        scannedAt: '2026-11-12T00:00:00.000Z',
+      },
+    }))
+    const listTool = toolOf(listRuntime)
+    const listed = await listTool.execute({ action: 'list' })
+    eq(listed.totalWorktrees, 250, '裁剪前总数')
+    eq(listed.orphanCount, 1, '孤儿数来自裁剪前数组')
+    eq(listed.worktrees.length, 201, '展示数组仍是 200 项 + 一条省略提示')
+    const listText = listTool.output.render(listed)[0].text
+    ok(listText.includes('共 250 个'), '文本报告 250（不是 201）')
+    ok(!listText.includes('共 201 个'), '不再把省略提示计作资源')
+
+    const removed = Array.from({ length: 250 }, (_, index) => ({ instanceId: `i-${index}` }))
+    const skipped = Array.from({ length: 210 }, (_, index) => ({ instanceId: `s-${index}` }))
+    const pruneRuntime = makeRuntime(async () => ({
+      status: 200,
+      body: { ok: true, dryRun: false, planHash: 'c'.repeat(64), removed, skipped },
+    }))
+    const pruneTool = toolOf(pruneRuntime)
+    const executed = await pruneTool.execute({ action: 'prune', planHash: 'c'.repeat(64), dryRun: false })
+    eq(executed.removedCount, 250, '删除数用裁剪前数组')
+    eq(executed.skippedCount, 210, '跳过数用裁剪前数组')
+    eq(executed.removed.length, 201, '删除数组被裁剪')
+    eq(executed.skipped.length, 201, '跳过数组被裁剪')
+    const pruneText = pruneTool.output.render(executed)[0].text
+    ok(pruneText.includes('删除 250 个、跳过 210 个'), '文本计数不再多算省略提示')
+  })
+
   await check('prune：默认 dryRun:true 只预览；带 planHash 才执行', async () => {
     const runtime = makeRuntime(async request => ({
       status: 200,

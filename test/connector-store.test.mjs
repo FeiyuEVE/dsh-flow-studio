@@ -59,6 +59,8 @@ const IDENTITY = Object.freeze({
   elementId: 'submit',
   executionId: 'submit_execution_1',
 })
+const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
+
 const REQUEST_HASH = 'a'.repeat(64)
 const OTHER_HASH = 'b'.repeat(64)
 
@@ -361,6 +363,82 @@ await check('R2：人工 retry 推进世代，旧调用迟到的写入不能覆�
     store.recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 1 }),
     'HTTP_STORE_STALE',
     'retry 之后旧世代的迟到 recordAttempt 必须被拒绝',
+  )
+})
+
+await check('F5 旧 fence 不能覆盖另一个 store 的新成功记录', async (root) => {
+  const first = createConnectorStore({ root })
+  const begun = await first.beginInvocation(baseInput())
+  A.equal(begun.record.generation, 1)
+  await first.recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 1 })
+
+  // 旧 store 的 fence 在「已读 generation、尚未落盘」之间暂停，模拟迟到写入。
+  let releaseFence = null
+  let signalPaused = null
+  const fenceGate = new Promise(resolveGate => { releaseFence = resolveGate })
+  const fencePaused = new Promise(resolvePaused => { signalPaused = resolvePaused })
+  let pausedOnce = false
+  const oldStore = createConnectorStore({
+    root,
+    hooks: {
+      beforeWrite: async ({ value }) => {
+        if (pausedOnce) return
+        if (value.generation === 2 && value.state === 'started' && value.attempts === 0) {
+          pausedOnce = true
+          signalPaused()
+          await fenceGate
+        }
+      },
+    },
+  })
+  const fencePromise = oldStore.markNotSent(
+    { ...IDENTITY, generation: 1, fence: true },
+    '旧 fence：请求未发出',
+  )
+  await fencePaused
+
+  // 另一个 store 完成人工 retry、重开新世代并提交成功；与旧 fence 并发。
+  const newer = createConnectorStore({ root })
+  const pipeline = (async () => {
+    const retried = await newer.resolveInvocation(IDENTITY, {
+      action: 'retry',
+      evidence: '人工确认允许重试',
+      operator: 'operator',
+    })
+    const fresh = await newer.beginInvocation(baseInput())
+    await newer.recordAttempt({ ...IDENTITY, generation: fresh.record.generation }, { attempt: 1 })
+    const committed = await newer.commitResult(
+      { ...IDENTITY, generation: fresh.record.generation },
+      { state: 'succeeded', result: { status: 200, headers: {}, output: { ok: true } } },
+    )
+    return { retried, fresh, committed }
+  })()
+  await sleep(100)
+  releaseFence()
+  let fenceError = null
+  try {
+    await fencePromise
+  } catch (error) {
+    fenceError = error
+  }
+  const outcome = await pipeline
+  A.equal(outcome.committed.state, 'succeeded')
+
+  // 不变量：新成功记录必须保持；旧 fence 要么被共享锁串行到成功之前（随后被新世代
+  // 覆盖），要么被 HTTP_STORE_STALE 拒绝——绝不能把 succeeded 覆盖回 started。
+  if (fenceError !== null) A.equal(fenceError.code, 'HTTP_STORE_STALE')
+  const finalRecord = await createConnectorStore({ root }).readInvocation(IDENTITY)
+  A.equal(finalRecord.state, 'succeeded', '新成功记录保持')
+  A.equal(finalRecord.generation, 3)
+  A.deepEqual(finalRecord.result.output, { ok: true })
+  const reopened = await createConnectorStore({ root }).beginInvocation(baseInput())
+  A.equal(reopened.status, 'reuse', '下一次 begin 必须复用成功结果，不能当成 fresh 重发')
+
+  // 真正迟到的旧世代写入仍被拒绝（条件提交的世代校验没有丢）。
+  await rejects(
+    createConnectorStore({ root }).recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 2 }),
+    'HTTP_STORE_STALE',
+    '已成功记录上旧世代 recordAttempt 必须被拒绝',
   )
 })
 

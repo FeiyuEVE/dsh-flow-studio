@@ -59,9 +59,10 @@ function extractMountCheck() {
  * 生成桩脚本并执行。
  *
  * @param {string[]} mounts 每条形如 `type\u001fsource\u001fdestination`
+ * @param {string[]} realpaths 每条形如 `guestTarget=resolved`（桩里模拟 symlink 解析）
  * @returns {{ status: number, output: string, installed: boolean }}
  */
-function runMountCheck(root, mounts) {
+function runMountCheck(root, mounts, realpaths = []) {
   const harness = join(root, 'mount-check.sh')
   const installLog = join(root, 'install.log')
   const script = `#!/usr/bin/env bash
@@ -78,6 +79,21 @@ GUEST_LOG="/testbed/logs/dsh-web.log"
 export HOME="/home/tester"
 INSTALL_LOG="\${INSTALL_LOG:?}"
 
+# 桩：按 STUB_REALPATHS（target=resolved）模拟容器内 realpath / symlink 解析。
+stub_realpath() {
+  local target="\$1" line t r
+  while IFS= read -r line; do
+    [ -n "\$line" ] || continue
+    t="\${line%%=*}"
+    r="\${line#*=}"
+    if [ "\$target" = "\$t" ]; then printf '%s' "\$r"; return; fi
+    case "\$target" in
+      "\$t"/*) printf '%s' "\$r\${target#"$t"}"; return ;;
+    esac
+  done <<< "\${STUB_REALPATHS:-}"
+  printf '%s' "\$target"
+}
+
 # 桩：只实现 verify_mount_isolation 用到的 inspect / exec。
 docker() {
   if [ "\${1:-}" = "inspect" ]; then
@@ -93,7 +109,7 @@ docker() {
     done
     while IFS= read -r target; do
       [ -n "\$target" ] || continue
-      printf '%s\\t%s\\n' "\$target" "\$target"
+      printf '%s\\t%s\\n' "\$target" "\$(stub_realpath "\$target")"
     done <<< "\$targets"
     return 0
   fi
@@ -115,7 +131,12 @@ printf 'pnpm install --no-frozen-lockfile\\n' >> "$INSTALL_LOG"
     output = execFileSync('bash', [harness], {
       cwd: repoRoot,
       encoding: 'utf8',
-      env: { ...process.env, INSTALL_LOG: installLog, STUB_MOUNTS: mounts.map(line => `${line}\n`).join('') },
+      env: {
+        ...process.env,
+        INSTALL_LOG: installLog,
+        STUB_MOUNTS: mounts.map(line => `${line}\n`).join(''),
+        STUB_REALPATHS: realpaths.map(line => `${line}\n`).join(''),
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
   } catch (error) {
@@ -169,9 +190,22 @@ await check('R4：只认可根挂载，嵌套 bind（profile/node_modules、dt/c
         mounts: [mount('bind', '/srv/prefix', '/')],
         pattern: /双向重叠/,
       },
+      {
+        name: 'F7：symlink 解析后的目录与更深 bind 互为子孙',
+        mounts: [
+          mount('bind', '/srv/testbed', '/testbed'),
+          mount('bind', '/srv/host-pnpm-store', '/outside/modules/.pnpm'),
+        ],
+        realpaths: [
+          '/testbed/home/profiles/web=/outside/modules',
+          '/testbed/home/profiles/web/package.json=/outside/modules/package.json',
+          '/testbed/home/profiles/web/node_modules=/outside/modules/node_modules',
+        ],
+        pattern: /重叠（祖先或子孙）/,
+      },
     ]
     for (const item of cases) {
-      const result = runMountCheck(sandbox, item.mounts)
+      const result = runMountCheck(sandbox, item.mounts, item.realpaths || [])
       ok(result.status !== 0, `${item.name}：必须拒绝（实际 exit=${result.status}）`)
       ok(item.pattern.test(result.output), `${item.name}：拒绝原因必须可读（实际：${result.output.trim()}）`)
       eq(result.installed, false, `${item.name}：拒绝后不得执行 pnpm install`)
@@ -183,6 +217,16 @@ await check('R4：只认可根挂载，嵌套 bind（profile/node_modules、dt/c
     eq(accepted.installed, true, '校验通过后才会执行 pnpm install')
     eq(readFileSync(join(sandbox, 'install.log'), 'utf8').trim(), 'pnpm install --no-frozen-lockfile',
       '通过后安装命令只会执行一次')
+
+    // 合法 symlink（解析后仍在 /testbed 下）不能被双向检查误杀。
+    rmSync(join(sandbox, 'install.log'), { force: true })
+    const symlinkInside = runMountCheck(
+      sandbox,
+      [mount('bind', '/srv/testbed', '/testbed')],
+      ['/testbed/home/profiles/web=/testbed/shared/web'],
+    )
+    eq(symlinkInside.status, 0, `根内 symlink 必须接受（实际：${symlinkInside.output.trim()}）`)
+    eq(symlinkInside.installed, true, '根内 symlink 后仍执行安装')
   } finally {
     if (sandbox !== '') rmSync(sandbox, { recursive: true, force: true })
   }

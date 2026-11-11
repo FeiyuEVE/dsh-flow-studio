@@ -21,7 +21,7 @@
 
 import { randomBytes } from 'node:crypto'
 import {
-  chmod, link, lstat, mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile,
+  chmod, lstat, mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile,
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -250,43 +250,104 @@ async function readLockSnapshot(lockPath, ttlMs) {
 }
 
 /**
- * 抢占 stale 锁：先按 inode 复核，再 rename 到私有路径验证 inode。
- * 如果 rename 到的是别人刚换上的新锁，尽力放回原位，绝不按路径盲删。
+ * 抢占 stale 锁：先在**抢占互斥**（`<lock>.steal`）里复核锁 inode，再把同一
+ * inode 的旧锁搬走并删除。
+ *
+ * 旧实现「先 lstat、再 rename、发现搬错就尽量放回」有一个确定的 ABA：
+ * B 读到旧死锁 inode → A 抢占成功并建了新锁 → B 迟到的 rename 把 A 的新锁搬走
+ * → C 在空窗拿锁 → B 发现 inode 不符、放回失败后仍删掉 parking 里的 A 锁
+ * （review-0139 F4：`activeTasks=[A,C]`，A 的锁消失）。
+ *
+ * 现在所有抢占者先串行拿 `<lock>.steal`，再复核“仍是同一 inode 且仍 stale”。
+ * 复核后到 rename 之间不会再有别的抢占者插进来；而锁的当前持有者若还活着，
+ * 复核会直接放弃。搬错（理论上不可达）也**绝不删除** parking，只返回失败。
  */
-async function stealStaleLock(lockPath, snapshot) {
-  let current
+async function stealStaleLock(lockPath, snapshot, ttlMs, hooks) {
+  const guard = await acquireStealGuard(lockPath, ttlMs)
+  if (guard === null) return false
   try {
-    current = await lstat(lockPath)
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return true
-    return false
-  }
-  if (current.ino !== snapshot.info.ino || current.dev !== snapshot.info.dev) return false
-  const parking = `${lockPath}.stale-${process.pid}-${tmpCounter++}-${randomBytes(4).toString('hex')}`
-  try {
-    await rename(lockPath, parking)
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return true
-    return false
-  }
-  let moved
-  try {
-    moved = await lstat(parking)
-  } catch {
-    return true
-  }
-  if (moved.ino !== snapshot.info.ino || moved.dev !== snapshot.info.dev) {
-    // 抢错了对象：用 link 放回（不覆盖新锁），失败就丢弃这份复制。
+    const current = await readLockSnapshot(lockPath, ttlMs)
+    if (current === null) return true
+    if (!current.stale) return false
+    if (current.info.ino !== snapshot.info.ino || current.info.dev !== snapshot.info.dev) return false
+    if (typeof hooks?.beforeStealRemove === 'function') {
+      await hooks.beforeStealRemove({ lockPath })
+    }
+    const parking = `${lockPath}.stale-${process.pid}-${tmpCounter++}-${randomBytes(4).toString('hex')}`
     try {
-      await link(parking, lockPath)
+      await rename(lockPath, parking)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return true
+      return false
+    }
+    let moved
+    try {
+      moved = await lstat(parking)
     } catch {
-      // 对方路径已被别的持有者占用：丢弃复制，避免删掉任何人的锁。
+      return true
+    }
+    if (moved.ino !== snapshot.info.ino || moved.dev !== snapshot.info.dev) {
+      // 复核之后仍搬错：不 link 回去（那会再次移动继任者的锁），也不删除 parking。
+      // 让这份复制留在私有路径上，至少不会破坏当前 lockPath 的互斥。
+      return false
     }
     await unlink(parking).catch(() => {})
-    return false
+    return true
+  } finally {
+    await guard.release()
   }
-  await unlink(parking).catch(() => {})
-  return true
+}
+
+/**
+ * 抢占互斥：`<lock>.steal` 的短临界区，只保护「复核 + 搬走 stale 锁」。
+ * guard 自己带 pid，活进程持有不会被 TTL 抢；崩溃留下的 guard 只有 pid 不存在
+ * 或超过 TTL 才清掉。
+ */
+async function acquireStealGuard(lockPath, ttlMs) {
+  const guardPath = `${lockPath}.steal`
+  const waitMs = Math.max(250, Math.min(ttlMs, 2_000))
+  const deadline = Date.now() + waitMs
+  const owner = `guard-${process.pid}-${randomBytes(6).toString('hex')}`
+  for (;;) {
+    let handle = null
+    try {
+      handle = await open(guardPath, 'wx', FILE_MODE)
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') return null
+      const snapshot = await readLockSnapshot(guardPath, ttlMs)
+      if (snapshot === null) continue
+      if (snapshot.stale) {
+        await unlink(guardPath).catch(() => {})
+        continue
+      }
+      if (Date.now() >= deadline) return null
+      await sleep(2)
+      continue
+    }
+    let ino
+    let dev
+    try {
+      const info = await handle.stat()
+      ino = info.ino
+      dev = info.dev
+      await handle.writeFile(
+        `${JSON.stringify({ v: RESOURCE_LOCK_VERSION, owner, pid: process.pid, at: new Date().toISOString() })}\n`,
+        'utf8',
+      )
+    } finally {
+      await handle.close().catch(() => {})
+    }
+    return {
+      async release() {
+        try {
+          const info = await lstat(guardPath)
+          if (info.ino === ino && info.dev === dev) await unlink(guardPath)
+        } catch {
+          // 已被清掉 / 被替换：不是我们的 guard 就不动。
+        }
+      },
+    }
+  }
 }
 
 /** 只有「inode 未变 + owner token 一致」的持有者才能释放锁。 */
@@ -332,6 +393,7 @@ export async function withResourceLock(lockPath, task, options = {}) {
   await ensureDir(dirname(lockPath))
   const startedAt = Date.now()
   const owner = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const hooks = isPlainObject(options.hooks) ? options.hooks : null
   for (;;) {
     let handle = null
     try {
@@ -341,7 +403,8 @@ export async function withResourceLock(lockPath, task, options = {}) {
       const snapshot = await readLockSnapshot(lockPath, ttlMs)
       if (snapshot === null) continue
       if (snapshot.stale) {
-        const stolen = await stealStaleLock(lockPath, snapshot)
+        if (typeof hooks?.beforeSteal === 'function') await hooks.beforeSteal({ lockPath, snapshot })
+        const stolen = await stealStaleLock(lockPath, snapshot, ttlMs, hooks)
         // 抢占失败（锁刚被换掉 / 权限问题）也要退避，不能空转成忙等。
         if (!stolen) {
           if (Date.now() - startedAt >= waitMs) {

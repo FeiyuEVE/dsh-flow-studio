@@ -279,6 +279,11 @@ export function createInstanceTools(deps = {}) {
           plan: anyJson('action=prune 预览：{ v, createdAt, entries, planHash }'),
           removable: { type: 'integer', description: 'action=prune 预览：计划删除的条目数' },
           reported: { type: 'integer', description: 'action=prune 预览：只报告 / 保留的条目数' },
+          totalWorktrees: { type: 'integer', description: 'action=list：裁剪前的真实工作树总数' },
+          orphanCount: { type: 'integer', description: 'action=list：裁剪前的真实孤儿数' },
+          removedCount: { type: 'integer', description: 'action=prune 执行：裁剪前的真实删除数' },
+          skippedCount: { type: 'integer', description: 'action=prune 执行：裁剪前的真实跳过数' },
+          truncated: { type: 'boolean', description: '结果里的数组是否被裁剪（计数仍用裁剪前总数）' },
           skipped: { type: 'array', description: 'action=prune 执行：跳过的条目（含原因）', items: anyJson('跳过条目') },
         },
         required: ['ok'],
@@ -314,13 +319,17 @@ export function createInstanceTools(deps = {}) {
         }
         if (value.action === 'list') {
           const list = Array.isArray(value.worktrees) ? value.worktrees : []
-          const orphans = Array.isArray(value.orphans) ? value.orphans.length : 0
+          const orphans = Number.isInteger(value.orphanCount)
+            ? value.orphanCount
+            : (Array.isArray(value.orphans) ? value.orphans.length : 0)
           const lines = list.slice(0, 50).map(item => (
             `- ${item.instanceId || '?'}${item.orphan === true ? '（孤儿）' : ''}：${item.path || '(无 path)'}`
               + `${item.instanceStatus ? ' · ' + item.instanceStatus : ''}`
           ))
-          const tail = list.length > 50 ? `\n…还有 ${list.length - 50} 个` : ''
-          return [{ type: 'text', text: `共 ${list.length} 个实例工作树，其中孤儿 ${orphans} 个：\n${lines.join('\n')}${tail}` }]
+          // 计数用裁剪前的真实总数（list 里可能只有 200 项 + 一条省略提示）。
+          const total = Number.isInteger(value.totalWorktrees) ? value.totalWorktrees : list.length
+          const tail = total > 50 ? `\n…还有 ${total - 50} 个` : ''
+          return [{ type: 'text', text: `共 ${total} 个实例工作树，其中孤儿 ${orphans} 个：\n${lines.join('\n')}${tail}` }]
         }
         if (value.dryRun === true) {
           return [{
@@ -329,8 +338,12 @@ export function createInstanceTools(deps = {}) {
               + `planHash=${value.planHash || '?'}。确认后带同一 planHash 且 dryRun:false 再调一次。`,
           }]
         }
-        const removed = Array.isArray(value.removed) ? value.removed.length : 0
-        const skipped = Array.isArray(value.skipped) ? value.skipped.length : 0
+        const removed = Number.isInteger(value.removedCount)
+          ? value.removedCount
+          : (Array.isArray(value.removed) ? value.removed.length : 0)
+        const skipped = Number.isInteger(value.skippedCount)
+          ? value.skippedCount
+          : (Array.isArray(value.skipped) ? value.skipped.length : 0)
         return [{ type: 'text', text: `prune 执行完成：删除 ${removed} 个、跳过 ${skipped} 个。` }]
       },
     },
@@ -444,7 +457,21 @@ export function createInstanceTools(deps = {}) {
           },
         )
       }
-      return trimDeep({ action, status, ...responseBody })
+      // 先在**裁剪前**记下真实数量：trimDeep 会把数组截到 200 项 + 一条省略提示，
+      // 用裁剪后的 length 报数会多算一条（review-0139 MINOR）。
+      const payload = { action, status, ...responseBody }
+      if (action === 'list' && Array.isArray(responseBody.worktrees)) {
+        payload.totalWorktrees = responseBody.worktrees.length
+        payload.orphanCount = Array.isArray(responseBody.orphans) ? responseBody.orphans.length : 0
+        payload.truncated = responseBody.worktrees.length > MAX_ARRAY_ITEMS
+          || payload.orphanCount > MAX_ARRAY_ITEMS
+      }
+      if (action === 'prune' && responseBody.dryRun === false) {
+        payload.removedCount = Array.isArray(responseBody.removed) ? responseBody.removed.length : 0
+        payload.skippedCount = Array.isArray(responseBody.skipped) ? responseBody.skipped.length : 0
+        payload.truncated = payload.removedCount > MAX_ARRAY_ITEMS || payload.skippedCount > MAX_ARRAY_ITEMS
+      }
+      return trimDeep(payload)
     },
   }]
 }

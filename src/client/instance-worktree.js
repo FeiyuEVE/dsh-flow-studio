@@ -512,7 +512,7 @@ function renderInstanceWorktree(context) {
             'data-action': 'worktree-force-option',
             onChange: event => onForce(event && event.target ? event.target.checked : false),
           }),
-          '强制删除（脏树 / 未提交改动）'),
+          '强制删除（脏树 / 未提交改动 / 未合并提交）'),
         h('div', { className: 'fs-wt-actions' },
           h('button', {
             type: 'button', className: 'fs-btn sm danger', disabled: busy,

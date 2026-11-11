@@ -27,8 +27,19 @@ import { createHash, randomBytes } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
+import { withResourceLock } from './instance-resources.js'
+
 const STORE_VERSION = 1
 const MAX_ID_CHARS = 256
+
+/**
+ * 按「存储根 + 记录键」共享的进程内互斥。
+ *
+ * 一个 runtime 会在不同位置各建一个 store（恢复路由 / HTTP handler），它们的锁
+ * 必须共享同一把，否则旧 fence 的「读 generation → 写」可以插到另一个 store 的
+ * 成功提交之后，把 succeeded 覆盖回 started（review-0139 F5）。
+ */
+const sharedStoreLocks = new Map()
 
 /** 结构化存储错误（`code` 供 connector 透传成 lastError.code）。 */
 export class ConnectorStoreError extends Error {
@@ -284,21 +295,31 @@ export function createConnectorStore(options = {}) {
     throw new ConnectorStoreError('HTTP_STORE_UNAVAILABLE', 'HTTP connector 缺少调用记录目录（store.root）。')
   }
   const root = resolve(options.root)
-  /** 同一条记录的文件锁：同一 execution 的重复 begin/attempt 不交叉写。 */
-  const locks = new Map()
+  // 测试 / 故障注入：在真正落盘前暂停（用于复现两个 store 的交错）；生产不传。
+  const beforeWrite = typeof options.hooks?.beforeWrite === 'function' ? options.hooks.beforeWrite : null
+  async function writeRecord(path, value) {
+    if (beforeWrite !== null) await beforeWrite({ path, value })
+    await writeJsonAtomic(path, value)
+  }
 
+  /**
+   * 同一条记录的互斥：进程内共享队列 + 跨进程文件锁。锁覆盖「读 generation →
+   * 条件检查 → 落盘」全过程，避免检查与提交之间被另一个 store / 进程插入。
+   * 文件锁放在 `.locks/` 下，不和记录文件混在一起。
+   */
   async function withLock(digest, task) {
-    const previous = locks.get(digest) ?? Promise.resolve()
+    const key = `${root}\0${digest}`
+    const previous = sharedStoreLocks.get(key) ?? Promise.resolve()
     let release
     const gate = new Promise(resolveGate => { release = resolveGate })
     const tail = previous.then(() => gate)
-    locks.set(digest, tail)
+    sharedStoreLocks.set(key, tail)
     await previous.catch(() => {})
     try {
-      return await task()
+      return await withResourceLock(join(root, '.locks', `${digest}.lock`), task, { waitMs: 15_000 })
     } finally {
       release()
-      if (locks.get(digest) === tail) locks.delete(digest)
+      if (sharedStoreLocks.get(key) === tail) sharedStoreLocks.delete(key)
     }
   }
 
@@ -359,7 +380,7 @@ export function createConnectorStore(options = {}) {
             },
             updatedAt: nowIso(),
           }
-          await writeJsonAtomic(path, updated)
+          await writeRecord(path, updated)
           return { status: 'unknown', record: updated }
         }
         // 只有 started / attempts=0：请求一定没有发出，可以安全重新开始。
@@ -377,7 +398,7 @@ export function createConnectorStore(options = {}) {
           ...(engineExecutionId === null ? {} : { engineExecutionId }),
           updatedAt: nowIso(),
         }
-        await writeJsonAtomic(path, restarted)
+        await writeRecord(path, restarted)
         return { status: 'fresh', record: restarted }
       }
 
@@ -400,7 +421,7 @@ export function createConnectorStore(options = {}) {
         createdAt,
         updatedAt: createdAt,
       }
-      await writeJsonAtomic(path, record)
+      await writeRecord(path, record)
       return { status: 'fresh', record }
     })
   }
@@ -428,7 +449,7 @@ export function createConnectorStore(options = {}) {
         lastAttemptAt: typeof attemptInfo.at === 'string' ? attemptInfo.at : nowIso(),
         updatedAt: nowIso(),
       }
-      await writeJsonAtomic(path, updated)
+      await writeRecord(path, updated)
       return updated
     })
   }
@@ -459,7 +480,7 @@ export function createConnectorStore(options = {}) {
         updatedAt: nowIso(),
         completedAt: nowIso(),
       }
-      await writeJsonAtomic(path, updated)
+      await writeRecord(path, updated)
       return updated
     })
   }
@@ -483,7 +504,7 @@ export function createConnectorStore(options = {}) {
         },
         updatedAt: nowIso(),
       }
-      await writeJsonAtomic(path, updated)
+      await writeRecord(path, updated)
       return updated
     })
   }
@@ -518,7 +539,7 @@ export function createConnectorStore(options = {}) {
         },
         updatedAt: nowIso(),
       }
-      await writeJsonAtomic(path, updated)
+      await writeRecord(path, updated)
       return updated
     })
   }
@@ -705,7 +726,7 @@ export function createConnectorStore(options = {}) {
           toState: next.state,
         }].slice(-20),
       }
-      await writeJsonAtomic(path, next)
+      await writeRecord(path, next)
       await appendAudit(root, audit)
       return { idempotent: false, record: next, audit }
     })

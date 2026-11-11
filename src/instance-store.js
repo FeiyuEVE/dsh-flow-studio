@@ -72,7 +72,7 @@ const STATUS_SET = new Set(INSTANCE_STATUSES)
 const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'CANCELED'])
 const TERMINAL_SET = new Set(TERMINAL_STATUSES)
 /** updateInstance 的字段白名单；定义域字段是钉死的，改它们一律 400。 */
-const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError', 'artifacts', 'lastAgentOutput'])
+const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError', 'executionFailure', 'artifacts', 'lastAgentOutput'])
 /** 人工待办上限：BPMN 0.13.0 一次只会停在少量 userTask 上，100 是异常闸门。 */
 const MAX_PENDING_TASKS = 100
 /** 产物索引上限：instance.json 只存引用（path/hash/bytes），不存正文。 */
@@ -343,6 +343,30 @@ function normalizeLastError(raw) {
   return out
 }
 
+/**
+ * 执行失败事实（`executionFailure`）：`{ code, message, at }`。
+ *
+ * 它是「这次执行已经不能继续」的恢复禁止标记：`_ensureRunner` 在读旧快照前先看它，
+ * 避免墓碑文件尚未写好时重放失败前的工作。与 `lastError` 不同，它是**状态性**的，
+ * 只有成功（重新）执行并清除时才消失。
+ */
+function normalizeExecutionFailure(raw) {
+  if (raw === undefined || raw === null) return null
+  if (!isPlainObject(raw)) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'executionFailure 必须是 JSON 对象或 null', { field: 'executionFailure' })
+  }
+  const code = typeof raw.code === 'string' && raw.code.trim() !== '' ? raw.code.trim() : null
+  if (!code) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'executionFailure.code 必须是非空字符串', { field: 'executionFailure.code' })
+  }
+  const message = typeof raw.message === 'string' ? raw.message : ''
+  const at = isIsoTimestamp(raw.at) ? raw.at : null
+  if (at === null) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'executionFailure.at 必须是 ISO 时间', { field: 'executionFailure.at' })
+  }
+  return { code, message, at }
+}
+
 function normalizeResult(raw) {
   if (raw === undefined) return undefined
   if (raw === null) return null
@@ -548,6 +572,14 @@ function normalizeInstance(raw, id) {
       throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 lastAgentOutput 形状非法：${error?.reason ?? error?.message ?? error}`)
     }
   }
+  let executionFailure = null
+  if (raw.executionFailure !== null && raw.executionFailure !== undefined) {
+    try {
+      executionFailure = normalizeExecutionFailure(raw.executionFailure)
+    } catch (error) {
+      throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 executionFailure 形状非法：${error?.reason ?? error?.message ?? error}`)
+    }
+  }
   if (!Number.isSafeInteger(raw.revision) || raw.revision < 1) {
     throw new InstanceError(500, 'INSTANCE_CORRUPT', 'instance.json 的 revision 必须是 ≥1 的整数')
   }
@@ -572,6 +604,7 @@ function normalizeInstance(raw, id) {
     artifacts,
     lastError,
     lastAgentOutput,
+    executionFailure,
     pendingTasks: normalizePendingTasks(raw.pendingTasks),
     revision: raw.revision,
     eventCount: raw.eventCount,
@@ -650,6 +683,9 @@ function normalizePatch(patch) {
   }
   if (patch.lastError !== undefined) {
     source.lastError = normalizeLastError(patch.lastError)
+  }
+  if (patch.executionFailure !== undefined) {
+    source.executionFailure = normalizeExecutionFailure(patch.executionFailure)
   }
   if (patch.lastAgentOutput !== undefined) {
     source.lastAgentOutput = normalizeLastAgentOutput(patch.lastAgentOutput)
@@ -871,7 +907,8 @@ export async function updateInstance(id, patch = {}, options = {}) {
     }
     const hasChange = source.status !== undefined || source.variables !== undefined
       || source.result !== undefined || source.pendingTasks !== undefined
-      || source.lastError !== undefined || source.artifacts !== undefined
+      || source.lastError !== undefined || source.executionFailure !== undefined
+      || source.artifacts !== undefined
       || source.lastAgentOutput !== undefined
     if (!hasChange) return current
 
@@ -882,6 +919,38 @@ export async function updateInstance(id, patch = {}, options = {}) {
         409,
         'INSTANCE_TERMINAL_IMMUTABLE',
         `实例 ${loc.id} 已是终态 ${current.status}，拒绝任何后续写入（status/variables/result/pendingTasks/lastError）；终态不可逆`,
+        { field: 'status', actualStatus: current.status },
+      )
+    }
+
+    // 0.14.4：磁盘 SUSPENDED 是权威事实。状态迁移只走生命周期路由（suspend/resume）：
+    //   - SUSPENDED 下无条件写 ACTIVE → 拒绝（晚到的收口不能复活挂起）；
+    //   - 把别人改成 SUSPENDED 也不允许走 updateInstance；
+    //   - 其它执行事实（lastError / pendingTasks / artifacts / variables…）允许写，
+    //     错误事实通道要用到它们。
+    if (current.status === 'SUSPENDED') {
+      if (source.status === 'ACTIVE') {
+        throw new InstanceError(
+          409,
+          'INSTANCE_SUSPENDED_IMMUTABLE',
+          `实例 ${loc.id} 已挂起（SUSPENDED），不能用 updateInstance 改成 ACTIVE；请走 POST /instances/${loc.id}/resume`,
+          { field: 'status', actualStatus: current.status },
+        )
+      }
+      if (source.status === 'COMPLETED') {
+        throw new InstanceError(
+          409,
+          'INSTANCE_SUSPENDED',
+          `实例 ${loc.id} 已挂起（SUSPENDED），不能完成；先 resume（挂起期间允许 CANCELED 收口）`,
+          { field: 'status', actualStatus: current.status },
+        )
+      }
+    }
+    if (source.status === 'SUSPENDED' && current.status !== 'SUSPENDED') {
+      throw new InstanceError(
+        409,
+        'INSTANCE_LIFECYCLE_USE_ROUTE',
+        `实例 ${loc.id} 当前是 ${current.status}，不能通过 updateInstance 改成 SUSPENDED；状态迁移只走 POST /instances/${loc.id}/suspend`,
         { field: 'status', actualStatus: current.status },
       )
     }
@@ -910,11 +979,45 @@ export async function updateInstance(id, patch = {}, options = {}) {
     // 进入终态的那次更新已经强制清空 pendingTasks，不允许被 source.pendingTasks 覆盖回来。
     if (source.pendingTasks !== undefined && !enteringTerminal) next.pendingTasks = source.pendingTasks
     if (source.lastError !== undefined) next.lastError = source.lastError
+    if (source.executionFailure !== undefined) next.executionFailure = source.executionFailure
     if (source.lastAgentOutput !== undefined) next.lastAgentOutput = source.lastAgentOutput
     const normalized = normalizeInstance(next, loc.id)
     await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), normalized)
     return normalized
   })
+}
+
+/** `appendInstanceEvents({metaPatch})` 允许携带的执行事实字段（白名单）。 */
+const META_PATCH_KEYS = new Set(['lastError', 'pendingTasks', 'executionFailure'])
+
+/**
+ * 事件同次提交的执行事实补丁：只允许 `lastError` / `pendingTasks` / `executionFailure`。
+ *
+ * 这是「事件 + 必要元数据一次写盘」的唯一入口；不开放 variables / result / artifacts，
+ * 避免把普通执行推进伪装成生命周期提交。
+ */
+function normalizeMetaPatch(raw) {
+  if (raw === undefined || raw === null) return {}
+  if (!isPlainObject(raw)) {
+    throw new InstanceError(400, 'INSTANCE_PATCH_INVALID', 'metaPatch 必须是对象', { field: 'metaPatch' })
+  }
+  const out = {}
+  for (const key of Object.keys(raw)) {
+    if (!META_PATCH_KEYS.has(key)) {
+      throw new InstanceError(
+        400,
+        'INSTANCE_PATCH_INVALID',
+        `metaPatch.${key} 不是允许与事件同次提交的字段（只允许 lastError / pendingTasks / executionFailure）`,
+        { field: `metaPatch.${key}` },
+      )
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'lastError')) out.lastError = normalizeLastError(raw.lastError)
+  if (Object.prototype.hasOwnProperty.call(raw, 'pendingTasks')) out.pendingTasks = normalizePendingTasks(raw.pendingTasks)
+  if (Object.prototype.hasOwnProperty.call(raw, 'executionFailure')) {
+    out.executionFailure = normalizeExecutionFailure(raw.executionFailure)
+  }
+  return out
 }
 
 /** 文件末尾是否缺换行（"半行"）：崩溃 / 写满会在 JSONL 尾部留下没换行的残行。 */
@@ -949,8 +1052,13 @@ async function needsLeadingNewline(path) {
  * @param {string} activityId
  * @param {number} attempt
  * @param {object|object[]} rawEvents 单条或数组
- * @param {{ home?: string, instancesRoot?: string, status?: 'ACTIVE'|'SUSPENDED' }} [options]
- *   `status`：与事件在同一把实例锁、同一次 `instance.json` 写入里提交（挂起 / 恢复用）。
+ * @param {{ home?: string, instancesRoot?: string, status?: 'ACTIVE'|'SUSPENDED',
+ *   expectedStatus?: 'ACTIVE'|'SUSPENDED', metaPatch?: object, allowWhileSuspended?: boolean }} [options]
+ *   `status`：与事件在同一把实例锁、同一次 `instance.json` 写入里提交（挂起 / 恢复用）；
+ *   **必须**同时给 `expectedStatus`（CAS：当前状态不符 → 409 `INSTANCE_LIFECYCLE_CONFLICT`）。
+ *   `metaPatch`：`lastError` / `pendingTasks` / `executionFailure`，与事件同一次写盘。
+ *   `allowWhileSuspended`：只给执行失败事实通道用；SUSPENDED 下只接受 `type: 'error'`。
+ *   普通追加（无 status / metaPatch）在 SUSPENDED 下 409 `INSTANCE_SUSPENDED`，**一个字节都不写**。
  *   先分配 seq 再写事件行的崩溃语义不变：实例状态已切换、事件可能缺一条，读侧按 seq 空洞处理。
  * @returns {Promise<{instanceId: string, activityId: string, attempt: number,
  *   firstSeq: number, lastSeq: number, events: object[], instance: object}>}
@@ -987,6 +1095,28 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
       { field: 'status' },
     )
   }
+  // 0.14.4：生命周期切换必须带期望状态（CAS），否则并发下两个请求会各写一条迁移。
+  const expectedStatusRaw = options.expectedStatus === undefined || options.expectedStatus === null
+    ? null
+    : options.expectedStatus
+  if (nextStatus !== null && expectedStatusRaw === null) {
+    throw new InstanceError(
+      400,
+      'INSTANCE_EXPECTED_STATUS_REQUIRED',
+      'appendInstanceEvents 带 status 时必须同时给 expectedStatus（ACTIVE / SUSPENDED）',
+      { field: 'expectedStatus' },
+    )
+  }
+  if (expectedStatusRaw !== null && expectedStatusRaw !== 'ACTIVE' && expectedStatusRaw !== 'SUSPENDED') {
+    throw new InstanceError(
+      400,
+      'INSTANCE_STATUS_INVALID',
+      'expectedStatus 只能是 ACTIVE / SUSPENDED',
+      { field: 'expectedStatus' },
+    )
+  }
+  const metaPatch = normalizeMetaPatch(options.metaPatch)
+  const allowWhileSuspended = options.allowWhileSuspended === true
   await requireInstanceDir(loc)
 
   return withFileLock(loc.dir, async () => {
@@ -999,6 +1129,30 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
         `实例 ${loc.id} 已是终态 ${current.status}，拒绝追加事件（终态不可逆）`,
         { field: 'events', actualStatus: current.status },
       )
+    }
+    // 生命周期 CAS：状态已经开始/结束于别处时，整批不写。
+    if (expectedStatusRaw !== null && current.status !== expectedStatusRaw) {
+      throw new InstanceError(
+        409,
+        'INSTANCE_LIFECYCLE_CONFLICT',
+        `实例 ${loc.id} 的状态已变化（期望 ${expectedStatusRaw}，当前 ${current.status}），本次生命周期提交未被采纳`,
+        { expectedStatus: expectedStatusRaw, actualStatus: current.status },
+      )
+    }
+    // 0.14.4：挂起期间不得追加执行事件、不得改待办。唯一例外是错误事实通道
+    // （allowWhileSuspended + 事件类型必须是 error）；状态迁移自己的 resume 走 status 分支。
+    if (current.status === 'SUSPENDED' && nextStatus === null) {
+      const onlyErrors = list.every(item => item?.type === 'error')
+      if (!allowWhileSuspended || !onlyErrors) {
+        throw new InstanceError(
+          409,
+          'INSTANCE_SUSPENDED',
+          allowWhileSuspended
+            ? `实例 ${loc.id} 已挂起（SUSPENDED）：挂起期间只允许追加 error 事实，收到 ${list.map(item => item?.type ?? '?').join(' / ')}`
+            : `实例 ${loc.id} 已挂起（SUSPENDED），挂起期间不追加执行事件、不改待办；先 POST /instances/${loc.id}/resume`,
+          { field: 'events', actualStatus: current.status },
+        )
+      }
     }
     if (current.eventCount + list.length > MAX_INSTANCE_EVENTS) {
       throw new InstanceError(400, 'INSTANCE_EVENTS_LIMIT', `单实例事件总数上限 ${MAX_INSTANCE_EVENTS}`, { field: 'events' })
@@ -1025,6 +1179,9 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
       ...current,
       // 挂起 / 恢复：状态与事件一起提交，避免「状态已 SUSPENDED、事件还没落盘」的中间态。
       ...(nextStatus === null ? {} : { status: nextStatus, completedAt: null }),
+      // 执行事实（lastError / pendingTasks / executionFailure）与事件同一次写盘：
+      // 事件桥不再需要「先写事件、再 updateInstance」的第二个提交窗口。
+      ...metaPatch,
       eventCount: current.eventCount + list.length,
       lastSeq,
       revision: current.revision + 1,
@@ -1152,6 +1309,131 @@ export async function readInstanceEvents(id, options = {}) {
   return decorateEvents(events, { skipped, shards })
 }
 
+/**
+ * 「错误墓碑」形状：`{ kind: 'tombstone' | 运行器状态 kind, unrecoverable: {...} }`。
+ *
+ * 0.14.3 的墓碑沿用 `BPMN_STATE_KIND` 信封；两种 kind 都接受，但必须带
+ * `unrecoverable` 对象（没有这个对象就不是墓碑，挂起下照样拒）。
+ */
+function isExecutionTombstone(state) {
+  if (!isPlainObject(state)) return false
+  if (state.kind !== 'tombstone' && state.kind !== 'dsh-flow-studio/bpmn-runner-state') return false
+  return isPlainObject(state.unrecoverable)
+}
+
+/**
+ * 读一份**一致的实例快照**（供读侧游标 / 指标用）。
+ *
+ * 区别于 `readInstance` + `readInstanceEvents` 的两次独立读取：
+ *   - `lastSeq` / `watermark` 只到**实际可见事件的最大 seq**，永远不会大于事件正文；
+ *   - `instance.lastSeq > 可见最大 seq`（分配了 seq、事件行还没落盘 / 半行 / 缺行）时，
+ *     返回 `gap: { allocated, visible, missing }` 而不是抛错；
+ *   - `eventsHash` 是事件内容（seq + type + at + 关键字段）的 sha256，供缓存指纹用。
+ *
+ * @param {string} id
+ * @param {{ home?: string, instancesRoot?: string }} [options]
+ * @returns {Promise<null | {instance: object, events: object[], lastSeq: number,
+ *   watermark: number, eventsHash: string, gap: object|null, skipped: number, shards: number}>}
+ */
+export async function readInstanceSnapshot(id, options = {}) {
+  const instance = await readInstance(id, options)
+  if (instance === null) return null
+  const events = (await readInstanceEvents(id, options)) ?? decorateEvents([])
+  const seqs = []
+  for (const event of events) {
+    if (Number.isSafeInteger(event.seq) && event.seq >= 0) seqs.push(event.seq)
+  }
+  seqs.sort((a, b) => a - b)
+  const watermark = seqs.length === 0 ? 0 : seqs[seqs.length - 1]
+  const visibleSet = new Set(seqs)
+  const missing = []
+  for (let seq = 1; seq <= instance.lastSeq; seq += 1) {
+    if (!visibleSet.has(seq)) missing.push(seq)
+  }
+  const skipped = Number.isSafeInteger(events.skipped) ? events.skipped : 0
+  const gap = instance.lastSeq > watermark || skipped > 0 || missing.length > 0
+    ? {
+      allocated: instance.lastSeq,
+      visible: watermark,
+      ...(missing.length === 0 ? {} : { missing }),
+      ...(skipped === 0 ? {} : { skipped }),
+    }
+    : null
+  return {
+    instance,
+    events,
+    // 游标只到可见事件，避免 since=lastSeq 跳过尚未落盘的事件正文。
+    lastSeq: watermark,
+    watermark,
+    eventsHash: eventsHashOf(events),
+    gap,
+    skipped,
+    shards: Number.isSafeInteger(events.shards) ? events.shards : 0,
+  }
+}
+
+/** 事件内容指纹：只取稳定字段（seq / type / at / 关联 id / error / status）。 */
+function eventsHashOf(events) {
+  const lines = []
+  for (const event of events) {
+    lines.push(JSON.stringify({
+      seq: Number.isSafeInteger(event?.seq) ? event.seq : null,
+      type: typeof event?.type === 'string' ? event.type : null,
+      at: typeof event?.at === 'string' ? event.at : null,
+      activityId: typeof event?.activityId === 'string' ? event.activityId : null,
+      elementId: typeof event?.elementId === 'string' ? event.elementId : null,
+      from: typeof event?.from === 'string' ? event.from : null,
+      to: typeof event?.to === 'string' ? event.to : null,
+      status: typeof event?.status === 'string' ? event.status : null,
+      error: isPlainObject(event?.error) ? event.error : null,
+    }))
+  }
+  return sha256(lines.join('\n'))
+}
+
+/**
+ * 记录一次**已确认发生**的执行失败（MAJOR-3 的事实通道）。
+ *
+ * 一次提交完成三件事，不改 `status`：
+ *   1. 追加一条 `error` 事件（即使实例已 SUSPENDED 也写）；
+ *   2. `metaPatch.lastError` = 本次失败；
+ *   3. `metaPatch.pendingTasks = []`（失效待办必须消失）+ `executionFailure` 恢复禁止标记。
+ *
+ * 挂起期间也允许调用（内部走 `allowWhileSuspended`）；resume 不会清除它，
+ * 只解除挂起，执行能否继续由 `executionFailure` 决定。
+ *
+ * @param {string} id
+ * @param {{ instancesRoot?: string, home?: string, lastError: object,
+ *   event?: object, activityId?: string, attempt?: number }} input
+ */
+export async function recordExecutionFailure(id, input = {}) {
+  const lastError = normalizeLastError(input && input.lastError)
+  if (lastError === null) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'recordExecutionFailure 需要 lastError', { field: 'lastError' })
+  }
+  const at = new Date().toISOString()
+  const executionFailure = { code: lastError.code, message: lastError.message, at }
+  const rawEvent = input && isPlainObject(input.event) ? input.event : {}
+  const event = {
+    ...rawEvent,
+    type: 'error',
+    at: typeof rawEvent.at === 'string' && rawEvent.at !== '' ? rawEvent.at : at,
+    error: isPlainObject(rawEvent.error)
+      ? { ...rawEvent.error }
+      : { code: lastError.code, message: lastError.message },
+  }
+  const activityId = typeof input.activityId === 'string' && input.activityId !== ''
+    ? input.activityId
+    : (typeof lastError.nodeId === 'string' && lastError.nodeId !== '' ? lastError.nodeId : 'process')
+  const attempt = Number.isSafeInteger(input.attempt) && input.attempt >= 1 ? input.attempt : 1
+  const options = { instancesRoot: input.instancesRoot, ...(input.home ? { home: input.home } : {}) }
+  return await appendInstanceEvents(id, activityId, attempt, event, {
+    ...options,
+    metaPatch: { lastError, pendingTasks: [], executionFailure },
+    allowWhileSuspended: true,
+  })
+}
+
 /** state.json 可以是空文件 / 不存在：都按「没有快照」处理。 */
 async function readStateText(loc) {
   let text
@@ -1199,6 +1481,21 @@ export async function writeInstanceState(id, state, options = {}) {
         `实例 ${loc.id} 已是终态 ${current.status}，拒绝覆盖引擎快照（终态不可逆）`,
         { field: 'state', actualStatus: current.status },
       )
+    }
+    // 0.14.4：挂起期间不得写引擎快照；唯一例外是「执行失败事实」通道里的错误墓碑
+    // （执行已经不能继续，墓碑是纯事实，不是执行位置）。
+    if (current.status === 'SUSPENDED') {
+      const allowed = options.allowWhileSuspended === true && isExecutionTombstone(payloadState)
+      if (!allowed) {
+        throw new InstanceError(
+          409,
+          'INSTANCE_SUSPENDED',
+          options.allowWhileSuspended === true
+            ? `实例 ${loc.id} 已挂起（SUSPENDED）：allowWhileSuspended 只接受 { kind: 'tombstone', unrecoverable: {...} } 形状的错误墓碑`
+            : `实例 ${loc.id} 已挂起（SUSPENDED），挂起期间不写引擎快照；先 resume`,
+          { field: 'state', actualStatus: current.status },
+        )
+      }
     }
     await writeTextAtomic(join(loc.dir, STATE_FILE), text)
   })
@@ -1266,6 +1563,15 @@ export async function completeInstance(id, status, options = {}) {
         409,
         'INSTANCE_TERMINAL_IMMUTABLE',
         `实例 ${loc.id} 已经是终态 ${current.status}，不能再改成 ${status}`,
+        { actualStatus: current.status },
+      )
+    }
+    // 挂起期间不能完成（CANCELED 是停止，必须始终可用）。
+    if (current.status === 'SUSPENDED' && status === 'COMPLETED') {
+      throw new InstanceError(
+        409,
+        'INSTANCE_SUSPENDED',
+        `实例 ${loc.id} 已挂起（SUSPENDED），不能完成；先 POST /instances/${loc.id}/resume（挂起期间仍可 stop 成 CANCELED）`,
         { actualStatus: current.status },
       )
     }

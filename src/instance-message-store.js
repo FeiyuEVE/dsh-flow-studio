@@ -26,10 +26,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
-import { hostname } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { withResourceLock } from './instance-resources.js'
+import { HOST_NAME, PROCESS_BOOT_ID, ownerState, selfProcessStartTime } from './instance-owner.js'
 
 /** 内联正文上限（含 4 KiB）。 */
 export const INBOX_INLINE_BODY_LIMIT = 4 * 1024
@@ -48,7 +48,7 @@ export const INBOX_DEFAULT_PAGE_SIZE = 50
  *
  * 自本修复起**不再**用经过的时长推断旧投递已死亡：120 秒并不能证明一个仍然
  * 存活的 `sessionDeliver` / HTTP 请求已经结束，按 TTL 接管会造成跨进程重复外发。
- * 接管判据改成可验证的「旧领取者进程确实不在了」（见 `claimOwnerState()`）；
+ * 接管判据改成可验证的「旧领取者进程确实不在了」（见 `instance-owner.js` 的 `ownerState()`）；
  * 无法确认时保持 in-flight / 结果未知，要求外部显式处理。本常量仅为兼容导出。
  */
 export const INBOX_REPLY_DISPATCH_TTL_MS = 120_000
@@ -159,77 +159,7 @@ function sha256(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
-/** 本进程唯一标记：pid 复用时用它区分「同一个 pid 的另一个进程」。 */
-const PROCESS_BOOT_ID = randomUUID()
-/** 当前主机名：投递权记录只在同一主机上做存活判定（NFS / 共享目录跨主机时不可验证）。 */
-const HOST_NAME = (() => {
-  try {
-    return hostname()
-  } catch {
-    return ''
-  }
-})()
-
-let selfStartTimePromise = null
-
-/** Linux `/proc/<pid>/stat` 的 starttime（字段 22）；其它平台返回 null。 */
-async function linuxProcessStartTime(pid) {
-  if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 0) return null
-  try {
-    const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
-    const closeParen = stat.lastIndexOf(')')
-    if (closeParen < 0) return null
-    // 字段 3 起：state ppid pgrp session ...；starttime 是字段 22 → 下标 19。
-    const fields = stat.slice(closeParen + 1).trim().split(/\s+/)
-    const startTime = fields[19]
-    return typeof startTime === 'string' && startTime !== '' ? startTime : null
-  } catch {
-    return null
-  }
-}
-
-function selfProcessStartTime() {
-  if (selfStartTimePromise === null) selfStartTimePromise = linuxProcessStartTime(process.pid)
-  return selfStartTimePromise
-}
-
-/** pid 是否仍存在（EPERM 表示存在但无权限，按存活处理）。 */
-function processIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return error?.code === 'EPERM'
-  }
-}
-
-/**
- * 判定一条领取记录的主人是否还在：
- *   - `alive`   ：确认仍在（同主机、pid 存活且 starttime 对得上；或就是本进程当前 boot）；
- *   - `gone`    ：确认不在了（pid 不存在；pid 被复用且 starttime 不同；同 pid 但 bootId 不同）；
- *   - `unknown` ：无法确认（跨主机、旧格式没有 owner、读不到 /proc 等）。
- *
- * 只有 `gone` 允许接管；`unknown` 保持 in-flight 并让调用方显式处理，绝不按时间猜。
- */
-async function claimOwnerState(owner) {
-  if (!isPlainObject(owner)) return 'unknown'
-  const pid = owner.pid
-  if (!Number.isSafeInteger(pid) || pid <= 0) return 'unknown'
-  if (typeof owner.host === 'string' && owner.host !== '' && HOST_NAME !== '' && owner.host !== HOST_NAME) {
-    return 'unknown'
-  }
-  if (pid === process.pid && typeof owner.bootId === 'string' && owner.bootId !== '') {
-    return owner.bootId === PROCESS_BOOT_ID ? 'alive' : 'gone'
-  }
-  if (pid === process.pid) return 'alive'
-  if (!processIsAlive(pid)) return 'gone'
-  if (typeof owner.startTime === 'string' && owner.startTime !== '') {
-    const current = await linuxProcessStartTime(pid)
-    if (current !== null && current !== owner.startTime) return 'gone'
-  }
-  return 'alive'
-}
+/** 所有权 / 存活判定的公共实现见 `instance-owner.js`（0.14.4 抽出，行为不变）。 */
 
 /** 消息幂等键：target + 正文 + 回复目标。HTTP 路由与工具共用同一口径。 */
 export function messageContentHash({ target, text, replyTargetId }) {
@@ -1101,7 +1031,7 @@ export function createInstanceMessageStore(options = {}) {
    *
    * - 已 `delivered` / `skipped`：不给投递权；
    * - 已有 `dispatch.token`：只有**能确认旧领取者进程已经不在**时才接管
-   *   （见 `claimOwnerState()`）；确认不了（跨主机 / 旧格式没有 owner）就保持
+   *   （见 `instance-owner.js` 的 `ownerState()`）；确认不了（跨主机 / 旧格式没有 owner）就保持
    *   `in-progress` 并标 `unknown:true`，交给外部显式处理；
    * - 否则写入新的 `dispatch:{token, at, attempt, owner}` 并 `attempts = attempts + 1`。
    *
@@ -1131,7 +1061,7 @@ export function createInstanceMessageStore(options = {}) {
       let recoveredFrom = null
       const current = isPlainObject(existing.dispatch) ? existing.dispatch : null
       if (current !== null && typeof current.token === 'string' && current.token !== '') {
-        const state = await claimOwnerState(current.owner)
+        const state = await ownerState(current.owner)
         if (state !== 'gone') {
           return {
             claimed: false,

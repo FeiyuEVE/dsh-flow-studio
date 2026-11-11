@@ -290,6 +290,21 @@ export function FlowStudioPage(props = {}) {
   const eventsInstanceRef = useRef(initialInstance && typeof initialInstance.id === 'string'
     ? initialInstance.id
     : '')
+  // 「最后一次成功提交的实例状态」：切换失败时唯一的回滚基线（复审 F1）。
+  // 不能拿 eventsInstanceRef（正在加载的 owner）当基线：连续选择 B / C 时它早已
+  // 指向尚未成功打开的实例，回滚会让页面显示 A、事件却按 B 丢弃，旧实例轮询
+  // 从此一直发 `since=0`。这个基线只在 openInstance 成功、或当前归属实例的
+  // 轮询推进时更新；正在加载期间不动。
+  const committedInstanceRef = useRef({
+    owner: eventsInstanceRef.current,
+    events: eventsRef.current,
+    lastSeq: lastSeqRef.current,
+    targetSeq: targetSeqRef.current,
+    caughtUp: eventsCaughtUpRef.current,
+  })
+  // openInstance 在飞计数：加载期间不把半提交状态写进基线。用计数而不是布尔，
+  // 连续选择时旧请求的 finally 不会把仍在加载的新请求误标成「已结束」。
+  const instanceLoadCountRef = useRef(0)
   const tasksGuardRef = useRef(createTaskCompletionGuard())
   const draftQueueRef = useRef(null)
   const saveInFlightRef = useRef(false)
@@ -331,12 +346,40 @@ export function FlowStudioPage(props = {}) {
 
   const activeInstanceId = activeInstance && typeof activeInstance.id === 'string' ? activeInstance.id : ''
 
+  /**
+   * 当前归属实例的事件 / 游标推进后，把「最后成功提交状态」基线一起推进。
+   *
+   * 只在没有实例加载在飞、且当前 owner 就是已提交 owner 时更新：
+   * 加载过程中的半提交状态（owner 已切到 B、事件却还没回来）绝不能进基线。
+   */
+  const syncInstanceBaseline = useCallback(() => {
+    if (instanceLoadCountRef.current > 0) return
+    const baseline = committedInstanceRef.current
+    if (!baseline || baseline.owner !== eventsInstanceRef.current) return
+    baseline.events = eventsRef.current
+    baseline.lastSeq = lastSeqRef.current
+    baseline.targetSeq = targetSeqRef.current
+    baseline.caughtUp = eventsCaughtUpRef.current
+  }, [])
+
+  /** 一次实例选择完整提交后，记录新的回滚基线。 */
+  const commitInstanceBaseline = useCallback(() => {
+    committedInstanceRef.current = {
+      owner: eventsInstanceRef.current,
+      events: eventsRef.current,
+      lastSeq: lastSeqRef.current,
+      targetSeq: targetSeqRef.current,
+      caughtUp: eventsCaughtUpRef.current,
+    }
+  }, [])
+
   /** 同步「事件是否已追平」：ref 供异步路径读，state 驱动轮询 effect 的停/续。 */
   const markCaughtUp = useCallback(value => {
     const next = value === true
     eventsCaughtUpRef.current = next
     setEventsCaughtUp(current => (current === next ? current : next))
-  }, [])
+    syncInstanceBaseline()
+  }, [syncInstanceBaseline])
 
   // ── 本地 XML 草稿：去抖 + maxWait + 乱序丢弃；只写 localStorage，不建服务端版本 ──
   useEffect(() => {
@@ -433,8 +476,9 @@ export function FlowStudioPage(props = {}) {
     setLastSeq(cursor)
     setEventError('')
     syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(merged.events))
+    syncInstanceBaseline()
     return cursor
-  }, [])
+  }, [syncInstanceBaseline])
 
   /**
    * 进入终态、停轮询**之前**先追平 `targetSeq`。
@@ -480,6 +524,30 @@ export function FlowStudioPage(props = {}) {
     scheduleLocalDraft()
   }, [scheduleLocalDraft])
 
+  /**
+   * 把一次视图提交给编辑器。
+   *
+   * 编辑器支持原子 `applyView({ viewer, xml, token })` 时优先用它：模式切换与
+   * 导入在同一队列任务里完成，并按页面视图世代（token）作废过期请求；否则退回
+   * 旧的 `setViewerMode` + `importXML` 两步（测试注入的假编辑器走这条）。
+   *
+   * @returns {Promise<{stale: boolean}>}
+   */
+  const applyEditorView = useCallback(async (editor, { viewer, xml, token }) => {
+    const text = typeof xml === 'string' ? xml : ''
+    if (typeof editor.applyView === 'function') {
+      const result = await editor.applyView({ viewer, xml: text, token })
+      if (result && result.ok === false && result.stale !== true) {
+        throw new Error(result.reason || '画布加载失败')
+      }
+      return { stale: Boolean(result && result.stale) }
+    }
+    if (viewer) await editor.setViewerMode(true)
+    else await editor.setViewerMode(false)
+    if (text.trim() !== '') await editor.importXML(text)
+    return { stale: false }
+  }, [])
+
   /** 把一份 XML / marker 应用到画布；返回是否成功。 */
   const applyCanvasView = useCallback(async view => {
     viewRef.current = view
@@ -487,13 +555,13 @@ export function FlowStudioPage(props = {}) {
     const editor = editorRef.current
     if (!editor) return { ok: false, reason: '画布尚未加载' }
     const seq = ++viewSeqRef.current
+    const viewer = view.kind === 'instance'
+    const xml = typeof view.xml === 'string' ? view.xml : ''
     try {
-      if (view.kind === 'instance') await editor.setViewerMode(true)
-      else await editor.setViewerMode(false)
-      if (seq !== viewSeqRef.current) return { ok: false, reason: '已被新的画布请求取代' }
-      if (typeof view.xml === 'string' && view.xml.trim() !== '') {
-        await editor.importXML(view.xml)
-        if (seq !== viewSeqRef.current) return { ok: false, reason: '已被新的画布请求取代' }
+      // 过期请求在编辑器内部就被丢弃；这里再按页面世代确认一次。
+      const applied = await applyEditorView(editor, { viewer, xml, token: seq })
+      if (applied.stale || seq !== viewSeqRef.current) {
+        return { ok: false, reason: '已被新的画布请求取代' }
       }
       // 导入是异步的：期间轮询可能已经收到终态事件。实例视图必须按**当前归属的
       // 最新事件缓存**重算 marker，不能把调用时捕获的旧 markers 写回（复审 M4）。
@@ -501,6 +569,9 @@ export function FlowStudioPage(props = {}) {
         ? runtimeMarkersFromEvents(eventsRef.current)
         : (Array.isArray(view.markers) ? view.markers : [])
       editor.setRuntimeState(markers)
+      // 成功恢复画布：统一回到 ready（复审 F3）。否则回滚失败后的 error 态
+      // 会一直禁用保存按钮，即使编辑器已经恢复可用。
+      setCanvasStatus('ready')
       return { ok: true }
     } catch (error) {
       const unavailable = editorUnavailableReason(editor)
@@ -514,7 +585,7 @@ export function FlowStudioPage(props = {}) {
       }
       return { ok: false, reason: failureMessage(error), unavailable }
     }
-  }, [])
+  }, [applyEditorView])
 
   const handleCanvasReady = useCallback(async (chunk, editor) => {
     editorRef.current = editor
@@ -620,19 +691,11 @@ export function FlowStudioPage(props = {}) {
     // 刷新待办后要保留 404 / 409 的服务端原因，不能被刷新动作立即清掉。
     if (options.preserveNotice !== true) setNotice(null)
     setEventError('')
-    // 切实例：事件缓存与游标按 instanceId 隔离。切换是一次完整状态转换：先备份
-    // 旧实例的归属与缓存，详情加载失败时必须整体回滚，不能留下
-    // activeInstance=A / eventsOwner=B 的撕裂状态（复审 M1）。
+    // 切实例：事件缓存与游标按 instanceId 隔离。切换时先清空显示，失败后回滚到
+    // **最后一次成功提交的实例状态**（committedInstanceRef），而不是正在加载的
+    // owner —— 否则连续选择 B / C 时回滚基线是未提交的 B（复审 F1）。
     const switched = eventsInstanceRef.current !== id
-    let previous = null
     if (switched) {
-      previous = {
-        owner: eventsInstanceRef.current,
-        events: eventsRef.current,
-        lastSeq: lastSeqRef.current,
-        targetSeq: targetSeqRef.current,
-        caughtUp: eventsCaughtUpRef.current,
-      }
       eventsInstanceRef.current = id
       eventsRef.current = []
       lastSeqRef.current = 0
@@ -643,6 +706,7 @@ export function FlowStudioPage(props = {}) {
       // 旧实例的运行态 marker 也一并清掉（稍后会按新实例事件重算）。
       syncRuntimeMarkers(editorRef.current, [])
     }
+    instanceLoadCountRef.current += 1
     try {
       const [detail, snapshot, tasksPayload, eventsPayload] = await Promise.all([
         client.readInstance(id),
@@ -698,25 +762,28 @@ export function FlowStudioPage(props = {}) {
       }
       setDrawerOpen(true)
       setLoadingInstance(false)
+      // 到这里才是「成功提交」：记录回滚基线。中间任何一步失败都回滚到这个状态。
+      commitInstanceBaseline()
       return true
     } catch (error) {
       if (seq !== selectSeqRef.current || !mountedRef.current) return false
-      // 切换失败：恢复原实例的缓存归属、游标与画布 marker，旧实例轮询继续生效。
-      if (previous !== null) {
-        eventsInstanceRef.current = previous.owner
-        eventsRef.current = previous.events
-        lastSeqRef.current = previous.lastSeq
-        targetSeqRef.current = previous.targetSeq
-        markCaughtUp(previous.caughtUp)
-        setEvents(previous.events)
-        setLastSeq(previous.lastSeq)
-        syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(previous.events))
-      }
+      // 切换失败：回滚到「最后一次成功提交的实例状态」，旧实例轮询继续生效。
+      const baseline = committedInstanceRef.current
+      eventsInstanceRef.current = baseline.owner
+      eventsRef.current = baseline.events
+      lastSeqRef.current = baseline.lastSeq
+      targetSeqRef.current = baseline.targetSeq
+      markCaughtUp(baseline.caughtUp)
+      setEvents(baseline.events)
+      setLastSeq(baseline.lastSeq)
+      syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(baseline.events))
       setLoadingInstance(false)
       setNotice({ kind: 'error', text: `打开实例 ${id} 失败：` + failureMessage(error) })
       return false
+    } finally {
+      instanceLoadCountRef.current = Math.max(0, instanceLoadCountRef.current - 1)
     }
-  }, [applyCanvasView, catchUpInstanceEvents, client, flushLocalDraft, markCaughtUp])
+  }, [applyCanvasView, catchUpInstanceEvents, client, commitInstanceBaseline, flushLocalDraft, markCaughtUp])
 
   /** 保存版本：提交属性输入 → 序列化最新 XML → POST /definitions → 钉版本。 */
   const saveDefinition = useCallback(async () => {
@@ -917,23 +984,23 @@ export function FlowStudioPage(props = {}) {
     if (!record || !editor) return false
     try {
       const seq = ++viewSeqRef.current
-      await editor.setViewerMode(false)
-      if (seq !== viewSeqRef.current) return false
-      await editor.importXML(record.xml)
-      if (seq !== viewSeqRef.current) return false
+      const applied = await applyEditorView(editor, { viewer: false, xml: record.xml, token: seq })
+      if (applied.stale || seq !== viewSeqRef.current) return false
       revisionRef.current.reset()
       revisionRef.current.markChanged()
       definitionStateRef.current.markDirty()
       setDirty(true)
       setSaveStatus('idle')
       setDraftNotice(null)
+      // 恢复草稿同样是一次成功的画布提交：统一把页面恢复到 ready。
+      setCanvasStatus('ready')
       setNotice({ kind: 'success', text: '已恢复本地草稿（尚未保存为服务端版本）' })
       return true
     } catch (error) {
       setNotice({ kind: 'error', text: '恢复本地草稿失败：' + failureMessage(error) })
       return false
     }
-  }, [draftNotice])
+  }, [applyEditorView, draftNotice])
 
   const discardDraft = useCallback(() => {
     if (!draftNotice) return
@@ -1012,10 +1079,10 @@ export function FlowStudioPage(props = {}) {
     const previousView = viewRef.current
     const seq = ++viewSeqRef.current
     try {
-      if (previousView.kind === 'instance') await editor.setViewerMode(false)
-      if (seq !== viewSeqRef.current) return false
-      await editor.importXML(text)
-      if (seq !== viewSeqRef.current) return false
+      // 导入也走原子的「模式 + XML」提交：与在飞的视图请求串行化，
+      // 过期导入在触碰真实模型之前就会被丢弃（复审 F2）。
+      const applied = await applyEditorView(editor, { viewer: false, xml: text, token: seq })
+      if (applied.stale || seq !== viewSeqRef.current) return false
       const state = createDefinitionState()
       state.markDirty()
       definitionStateRef.current = state
@@ -1053,7 +1120,7 @@ export function FlowStudioPage(props = {}) {
       }
       return false
     }
-  }, [applyCanvasView, flushLocalDraft])
+  }, [applyCanvasView, applyEditorView, flushLocalDraft])
 
   const handleRefresh = useCallback(async () => {
     await refreshDefinitions()
@@ -1136,11 +1203,13 @@ export function FlowStudioPage(props = {}) {
         setActiveInstance(detail)
         const targetSeq = detail && Number.isSafeInteger(detail.lastSeq) ? detail.lastSeq : 0
         if (targetSeq > targetSeqRef.current) targetSeqRef.current = targetSeq
+        syncInstanceBaseline()
         if (Array.isArray(detail.pendingTasks)) setTasks(normalizeTasks(detail.pendingTasks))
         if (isTerminalStatus(detail.status)) {
           // 先追平目标游标再停轮询：否则最后一批 activity/end、process/end 永远读不到。
           const target = Math.max(targetSeq, lastSeqRef.current)
           targetSeqRef.current = target
+          syncInstanceBaseline()
           const done = await catchUpInstanceEvents(activeInstanceId, target, generation)
           if (!mountedRef.current) return
           if (generation !== selectSeqRef.current) {
@@ -1175,7 +1244,7 @@ export function FlowStudioPage(props = {}) {
       if (timer !== null) clearTimeout(timer)
     }
   }, [activeInstanceId, activeInstance && activeInstance.status, applyEventBatch,
-    catchUpInstanceEvents, client, eventsCaughtUp, markCaughtUp, refreshInstances, viewKind])
+    catchUpInstanceEvents, client, eventsCaughtUp, markCaughtUp, refreshInstances, syncInstanceBaseline, viewKind])
 
   // ── 页面隐藏 / 卸载前把最后一版草稿落盘 ──────────────────────────────────
   useEffect(() => {

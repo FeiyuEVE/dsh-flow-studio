@@ -12,7 +12,10 @@
  *   7. 重新导入 → 字段保持、dirty 清空、撤销栈清空；
  *   8. 水印存在且未被遮挡；暗色下画布文字/节点可读；窄窗口不横向溢出；
  *   9. 无额外 CSS/字体请求（官方样式与 woff2 已内联）；
- *  10. 实例只读视图（NavigatedViewer）、运行态 marker 不写 XML、destroy 清理。
+ *  10. 实例只读视图（NavigatedViewer）、运行态 marker 不写 XML、destroy 清理；
+ *  11. F2：并发导入按世代串行提交，过期导入不能覆盖真实模型；
+ *  12. F3：模式切换绘制失败清理半成品并记录不可用原因，恢复后必须真正重建；
+ *  13. f2：saveXML / flushProperties 的 await 期间销毁控制器必须失败。
  *
  * 运行（需要先 npm run build）：
  *   node test/client-bpmn.browser.test.mjs
@@ -55,6 +58,28 @@ async function check(name, fn) {
 }
 
 const chunkSource = readFileSync(join(repoRoot, 'lib/client.bpmn.js'), 'utf8')
+
+/**
+ * F2/F3 回归用的两份**合法** BPMN（带 BPMNDiagram / plane / 图元），
+ * process id 可区分真实模型当前归属；两份都能被官方 importXML 正常绘制。
+ */
+function raceXml(tag) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="Definitions_RACE_${tag}" targetNamespace="http://feiyueve.dev/test/race">
+  <bpmn:process id="Process_RACE_${tag}" isExecutable="true">
+    <bpmn:startEvent id="Start_${tag}" />
+    <bpmn:endEvent id="End_${tag}" />
+    <bpmn:sequenceFlow id="Flow_${tag}" sourceRef="Start_${tag}" targetRef="End_${tag}" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_${tag}">
+    <bpmndi:BPMNPlane id="Plane_${tag}" bpmnElement="Process_RACE_${tag}">
+      <bpmndi:BPMNShape id="Shape_Start_${tag}" bpmnElement="Start_${tag}"><dc:Bounds x="120" y="120" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_End_${tag}" bpmnElement="End_${tag}"><dc:Bounds x="320" y="120" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Edge_${tag}" bpmnElement="Flow_${tag}"><di:waypoint x="156" y="138" /><di:waypoint x="320" y="138" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>`
+}
 
 const HARNESS_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -1254,6 +1279,189 @@ async function run() {
       A.equal(result.modelAfterFirst, false, '失败后不能留下半成品实例')
       A.equal(result.secondAgain.ok, true, '解除构造故障后再次导入必须成功')
       A.equal(result.modelAfterSecond, true, '成功导入必须真正重建出模型，不能只写缓存 XML')
+    })
+
+    await check('F2：并发导入按世代串行提交，过期导入不能覆盖真实模型', async () => {
+      await remountEditor(page)
+      const xmlA = raceXml('A')
+      const xmlB = raceXml('B')
+      const result = await page.evaluate(async ({ xmlA: a, xmlB: b }) => {
+        const editor = window.__editor
+        // 真实 NavigatedViewer：导入会真的改写 _definitions / DI / 图元。
+        await editor.setViewerMode(true)
+        const viewer = editor.getModeler()
+        const realImport = viewer.importXML.bind(viewer)
+        let releaseA = null
+        let reachedA = null
+        const gate = new Promise(resolve => { releaseA = resolve })
+        const reached = new Promise(resolve => { reachedA = resolve })
+        // 挂起 A 的实际导入（预检已通过，模型正等着被改写）。
+        viewer.importXML = async xml => {
+          if (xml === a) {
+            reachedA()
+            await gate
+          }
+          return realImport(xml)
+        }
+        const first = editor.importXML(a)
+        await reached
+        // A 还挂在底层 importXML 上时，B 已经发起：真实页面场景里的「切到 B」。
+        const second = editor.importXML(b)
+        await Promise.resolve()
+        releaseA()
+        const settled = await Promise.allSettled([first, second])
+        const model = editor.getModeler()
+        const definitions = model.getDefinitions()
+        const xml = await editor.saveXML()
+        return {
+          first: settled[0].status === 'fulfilled'
+            ? settled[0].value
+            : { error: String((settled[0].reason && settled[0].reason.message) || settled[0].reason) },
+          second: settled[1].status === 'fulfilled'
+            ? settled[1].value
+            : { error: String((settled[1].reason && settled[1].reason.message) || settled[1].reason) },
+          definitionsId: definitions && definitions.id,
+          processIds: definitions && Array.isArray(definitions.rootElements)
+            ? definitions.rootElements.map(element => element.id)
+            : [],
+          xml,
+        }
+      }, { xmlA, xmlB })
+      A.equal(result.definitionsId, 'Definitions_RACE_B', '真实模型的 definitions 必须属于最新导入的 B')
+      A.deepEqual(result.processIds, ['Process_RACE_B'], '过期导入不能把真实 process 覆盖回 A')
+      A.ok(result.xml.includes('Process_RACE_B'), '保存出的 XML 必须属于 B')
+      A.ok(!result.xml.includes('Process_RACE_A'), '保存出的 XML 不能残留过期导入的 A')
+      A.equal(result.first.stale, true, '过期导入必须报告 stale，不能悄悄成功')
+      A.equal(result.second.ok, true, '最新导入必须成功')
+    })
+
+    await check('F3：模式切换绘制失败必须清理半成品并进入不可用态，恢复后同模式重建', async () => {
+      await remountEditor(page)
+      const result = await page.evaluate(async () => {
+        const editor = window.__editor
+        const savedXml = await editor.saveXML()
+        const match = /<bpmn:process id="([^"]+)"/.exec(savedXml)
+        const processId = match ? match[1] : ''
+        // 先建一个真实 viewer，拿到它的原型；后续重建会走同一个类。
+        await editor.setViewerMode(true)
+        const viewer = editor.getModeler()
+        const viewerProto = Object.getPrototypeOf(viewer)
+        const realImport = viewerProto.importXML
+        let armed = true
+        // 绘制故障桩：真实 importXML 在绘制阶段失败（等价于「no plane to display」）。
+        viewerProto.importXML = function (...args) {
+          if (armed) {
+            armed = false
+            throw new Error('no plane to display（绘制故障桩）')
+          }
+          return realImport.apply(this, args)
+        }
+        await editor.setViewerMode(false)
+        const out = {
+          processId,
+          switchError: '',
+          reason: '',
+          modelAlive: true,
+          saveError: '',
+          savedAfterFailure: null,
+        }
+        try {
+          await editor.setViewerMode(true)
+        } catch (error) {
+          out.switchError = String((error && error.message) || error)
+        }
+        out.reason = String(editor.getUnavailableReason() || '')
+        out.modelAlive = editor.getModeler() !== null
+        try {
+          out.savedAfterFailure = await editor.saveXML()
+        } catch (error) {
+          out.saveError = String((error && error.message) || error)
+        }
+        // 故障解除：再次调用同一模式必须真正重建并导入原 XML，而不是假成功。
+        viewerProto.importXML = realImport
+        let second = null
+        let secondError = ''
+        try {
+          second = await editor.setViewerMode(true)
+        } catch (error) {
+          secondError = String((error && error.message) || error)
+        }
+        const model = editor.getModeler()
+        const definitions = model && typeof model.getDefinitions === 'function' ? model.getDefinitions() : null
+        out.second = second
+        out.secondError = secondError
+        out.reasonAfter = String(editor.getUnavailableReason() || '')
+        out.modelAfter = model !== null
+        out.definitionsId = definitions ? definitions.id : ''
+        out.processIds = definitions && Array.isArray(definitions.rootElements)
+          ? definitions.rootElements.map(element => element.id)
+          : []
+        try {
+          out.xmlAfter = await editor.saveXML()
+        } catch (error) {
+          out.saveErrorAfter = String((error && error.message) || error)
+        }
+        return out
+      })
+      A.equal(result.modelAlive, false, '绘制失败后不能留下没有装载 definitions 的半成品实例')
+      A.match(result.saveError, /不可用|已销毁/, '不可用状态下 saveXML 不能返回缓存 XML 冒充成功')
+      A.match(result.switchError, /no plane to display/, '模式切换必须把绘制失败抛给调用方')
+      A.match(result.reason, /no plane to display/, '绘制失败后必须记录不可用原因')
+      A.equal(result.modelAfter, true, '故障解除后同一模式必须真正重建出实例')
+      A.equal(result.reasonAfter, '', '成功重建后不可用原因必须清空')
+      A.equal(result.secondError, '', '恢复后 setViewerMode 必须成功')
+      A.equal(result.second && result.second.ok, true, '恢复后必须返回 ok')
+      A.deepEqual(result.processIds, [result.processId], '重建后的真实模型必须导入原 XML 的 process')
+      A.ok(result.xmlAfter && result.xmlAfter.includes(result.processId), '恢复后保存的 XML 必须属于原定义')
+    })
+
+    await check('f2：saveXML 的 await 期间销毁控制器必须失败', async () => {
+      // 底层 saveXML 挂起 → 销毁 → 释放：不能确认保存成功，也不能更新缓存。
+      await remountEditor(page)
+      const saveResult = await page.evaluate(async () => {
+        const editor = window.__editor
+        const model = editor.getModeler()
+        let release = null
+        const gate = new Promise(resolve => { release = resolve })
+        model.saveXML = async () => {
+          await gate
+          return '<xml>stale-saved</xml>'
+        }
+        const pending = editor.saveXML()
+        await Promise.resolve()
+        editor.destroy()
+        release()
+        let saved = null
+        let saveError = ''
+        try {
+          saved = await pending
+        } catch (error) {
+          saveError = String((error && error.message) || error)
+        }
+        return { saved, saveError, destroyed: editor.isDestroyed() }
+      })
+      A.equal(saveResult.destroyed, true, '控制器必须已销毁')
+      A.equal(saveResult.saved, null, '销毁后 saveXML 不能返回成功 XML')
+      A.match(saveResult.saveError, /已销毁/, '销毁后 saveXML 必须以「画布已销毁」失败')
+    })
+
+    await check('f2：flushProperties 的 await 之后销毁控制器必须失败', async () => {
+      await remountEditor(page)
+      const flushResult = await page.evaluate(async () => {
+        const editor = window.__editor
+        const pending = editor.flushProperties()
+        editor.destroy()
+        let result = null
+        let flushError = ''
+        try {
+          result = await pending
+        } catch (error) {
+          flushError = String((error && error.message) || error)
+        }
+        return { result, flushError }
+      })
+      A.match(flushResult.flushError, /已销毁/, 'flushProperties 的 await 之后必须检查生命周期')
+      A.equal(flushResult.result, null, '销毁后 flushProperties 不能确认属性已提交')
     })
 
     await check('回归 #4：Change element 换成 Service Task 补齐合法 nodeType', async () => {

@@ -1383,7 +1383,226 @@ await check('M6 页面：回滚重建失败显示原因并禁用保存，恢复�
   })
 })
 
-// 15. m1：真实渲染画布壳的接线与卸载 --------------------------------------
+// 15. F1：连续选择失败必须回滚到最后一次成功提交的实例状态 -------------------
+
+/**
+ * F1 基线夹具：A 已成功提交（事件 seq=1）；B/C 的详情请求按调用顺序挂起。
+ * 轮询 A 时返回 seq=2，用来验证回滚后 `since` 从 1 继续、而不是退回 0。
+ */
+async function mountContinuousSelectRace({ ids }) {
+  const instanceA = { id: 'i-a', status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }
+  const pending = new Map()
+  const pollQueries = []
+  const detailCalls = []
+  const { client } = makeClient({
+    readInstance: async id => {
+      detailCalls.push(id)
+      if (ids.includes(id)) {
+        return new Promise((resolve, reject) => {
+          if (!pending.has(id)) pending.set(id, [])
+          pending.get(id).push({ resolve, reject })
+        })
+      }
+      return { id: 'i-a', status: 'ACTIVE', lastSeq: 2, pendingTasks: [] }
+    },
+    readInstanceDefinition: async id => ({ id, xml: id === 'i-a' ? XML_A : XML_B }),
+    readInstanceTasks: async id => ({ id, tasks: [] }),
+    readInstanceEvents: async (id, query) => {
+      pollQueries.push({ id, query })
+      if (id !== 'i-a') return { id, events: [], lastSeq: 0 }
+      return { id, events: [event(2, 'activity/end', { elementId: 'T', status: 'completed' })], lastSeq: 2 }
+    },
+  })
+  const mounted = await mountPage({
+    client,
+    props: {
+      initialDefinition: definitionA,
+      initialInstance: instanceA,
+      initialInstanceDefinition: { xml: XML_A },
+      initialEvents: [event(1, 'activity/wait', { elementId: 'T', status: 'waiting' })],
+      initialTasks: [],
+    },
+  })
+  return { ...mounted, instanceA, pending, pollQueries, detailCalls }
+}
+
+function pendingCall(pending, id, index = 0) {
+  const list = pending.get(id) || []
+  const item = list[index]
+  ok(item && typeof item.reject === 'function', `${id} 的第 ${index + 1} 次详情请求必须已发出`)
+  return item
+}
+
+function assertRolledBackToA(probe, editor, message) {
+  const drawer = drawerOf(probe)
+  eq(drawer.props.instanceId, 'i-a', `${message}：事件缓存归属必须回到 A`)
+  eq(drawer.props.lastSeq, 1, `${message}：游标必须回到 A 最后成功提交的位置`)
+  deep(drawer.props.events.map(item => item.seq), [1], `${message}：A 的事件不能被清空`)
+  const panel = findElement(probe.tree, node => node.type === InstancePanel)
+  eq(panel.props.activeInstance.id, 'i-a', `${message}：显示实例必须仍是 A`)
+  eq(markerState(editor, 'T'), 'waiting', `${message}：画布 marker 必须回到 A 的状态`)
+}
+
+await check('F1 连续两次选择同一实例失败：回滚到最后成功提交的 A，轮询不退回 since=0', async () => {
+  await withFakeTimers(async timer => {
+    const mounted = await mountContinuousSelectRace({ ids: ['i-b'] })
+    const { probe, editor, pending, pollQueries, detailCalls } = mounted
+    const select = id => findElement(probe.tree, node => node.type === InstancePanel).props.onSelectInstance(id)
+
+    // 第一次选 B：详情挂起（owner 已切到未提交的 B）。
+    select('i-b')
+    await settle(probe)
+    // 第二次选 B：owner 已经是 B，不再触发 switched 备份；旧实现因此丢掉回滚基线。
+    select('i-b')
+    await settle(probe)
+    eq((pending.get('i-b') || []).length, 2, '两次选择都必须各自发出详情请求')
+
+    // 先拒绝旧世代的请求，再拒绝当前世代的请求：只有当前失败会触发回滚。
+    pendingCall(pending, 'i-b', 0).reject(new Error('实例详情服务不可用'))
+    await settle(probe)
+    pendingCall(pending, 'i-b', 1).reject(new Error('实例详情服务不可用'))
+    await settle(probe)
+
+    assertRolledBackToA(probe, editor, '第二次选择失败后')
+    const notice = findElement(probe.tree, node => node.props && node.props['data-notice-kind'] !== undefined)
+    ok(textOf(notice).includes('实例详情服务不可用'), '必须显示切换失败原因')
+
+    // 回滚后 A 的轮询必须恢复：请求 i-a?since=1（不是 0），事件 2 落地，详情被重新读取。
+    timer.advance(2000)
+    await settle(probe)
+    const drawer = drawerOf(probe)
+    deep(drawer.props.events.map(item => item.seq), [1, 2], '回滚后 A 的新事件必须继续应用')
+    eq(drawer.props.lastSeq, 2, '回滚后 A 的游标必须随轮询推进')
+    eq(markerState(editor, 'T'), 'completed', '回滚后 A 的新事件必须更新 marker')
+    const queriesA = pollQueries.filter(item => item.id === 'i-a')
+    ok(queriesA.length >= 1, '回滚后必须继续轮询 A')
+    deep(queriesA[queriesA.length - 1].query, { since: 1 }, 'A 的轮询必须从最后成功提交的游标继续')
+    ok(queriesA.every(item => item.query.since !== 0),
+      '回滚后不能持续请求 since=0（否则 A 的事件会被永久丢弃）')
+    ok(detailCalls.filter(id => id === 'i-a').length >= 1, '回滚后轮询必须重新读取 A 的详情')
+    eq(timer.pending(), 1, '回滚后必须保留且只保留一个轮询定时器')
+  })
+})
+
+await check('F1 连续选择不同实例失败（B 挂起后选 C）：回滚到 A，不让 B 成为基线', async () => {
+  await withFakeTimers(async timer => {
+    const mounted = await mountContinuousSelectRace({ ids: ['i-b', 'i-c'] })
+    const { probe, editor, pending, pollQueries, detailCalls } = mounted
+    const select = id => findElement(probe.tree, node => node.type === InstancePanel).props.onSelectInstance(id)
+
+    // A → B（挂起）→ C（挂起）：旧实现会把「尚未成功打开的 B」当成回滚基线。
+    select('i-b')
+    await settle(probe)
+    select('i-c')
+    await settle(probe)
+    eq((pending.get('i-b') || []).length, 1, '选择 B 必须发出详情请求')
+    eq((pending.get('i-c') || []).length, 1, '选择 C 必须发出详情请求')
+
+    // 当前世代（C）失败先回滚；随后 B 的迟到失败必须被世代检查丢掉。
+    pendingCall(pending, 'i-c', 0).reject(new Error('实例 C 详情服务不可用'))
+    await settle(probe)
+    pendingCall(pending, 'i-b', 0).reject(new Error('实例 B 详情服务不可用'))
+    await settle(probe)
+
+    assertRolledBackToA(probe, editor, 'B→C 连续失败后')
+    const notice = findElement(probe.tree, node => node.props && node.props['data-notice-kind'] !== undefined)
+    ok(textOf(notice).includes('实例 C 详情服务不可用'), '必须显示当前选择（C）的失败原因')
+
+    timer.advance(2000)
+    await settle(probe)
+    const drawer = drawerOf(probe)
+    deep(drawer.props.events.map(item => item.seq), [1, 2], '回滚后 A 的新事件必须继续应用')
+    eq(drawer.props.lastSeq, 2, '回滚后 A 的游标必须随轮询推进')
+    eq(markerState(editor, 'T'), 'completed', '回滚后 A 的新事件必须更新 marker')
+    const queriesA = pollQueries.filter(item => item.id === 'i-a')
+    ok(queriesA.length >= 1, '回滚后必须继续轮询 A')
+    deep(queriesA[queriesA.length - 1].query, { since: 1 }, 'A 的轮询必须从最后成功提交的游标继续')
+    ok(queriesA.every(item => item.query.since !== 0), '回滚后不能持续请求 since=0')
+    ok(detailCalls.filter(id => id === 'i-a').length >= 1, '回滚后轮询必须重新读取 A 的详情')
+    eq(timer.pending(), 1, '回滚后必须保留且只保留一个轮询定时器')
+  })
+})
+
+// 16. F3 页面：回滚失败后成功打开定义，必须统一恢复到 ready ------------------
+
+await check('F3 页面：画布 error 后成功打开定义，保存按钮必须恢复可用', async () => {
+  await withFakeTimers(async () => {
+    const editor = createEditor()
+    let failing = true
+    editor.importXML = async value => {
+      editor.calls.importXML.push(value)
+      // 只让「导入新 XML」失败并让恢复重建也失败，页面进入待恢复的 error 态。
+      if (value === XML_B && failing) {
+        const error = new Error('draw failed')
+        error.restoreError = new Error('rebuild failed')
+        throw error
+      }
+    }
+    editor.getUnavailableReason = () => (failing ? 'rebuild failed' : '')
+    const mounted = await mountPage({
+      client: makeClient().client,
+      editor,
+      props: {
+        initialDefinition: definitionA,
+        initialDefinitions: { definitions: [definitionA] },
+      },
+    })
+    const { probe } = mounted
+    eq(actionButton(probe.tree, 'save-definition').props.disabled, false, '初始画布可用')
+
+    const list = findElement(probe.tree, node => node.type === DefinitionList)
+    const file = { name: 'broken.bpmn', text: async () => XML_B }
+    eq(await list.props.onImport(file), false, '恢复失败时导入必须返回失败')
+    await settle(probe)
+    eq(actionButton(probe.tree, 'save-definition').props.disabled, true, '回滚失败后保存必须被禁用')
+
+    // 故障解除后打开已有定义成功：applyCanvasView 成功必须把 canvasStatus 统一恢复 ready。
+    failing = false
+    eq(await findElement(probe.tree, node => node.type === DefinitionList).props.onOpen('flow-a'), true,
+      '故障解除后打开已有定义必须成功')
+    await settle(probe)
+    eq(editor.getUnavailableReason(), '', '编辑器不再报告不可用')
+    eq(actionButton(probe.tree, 'save-definition').props.disabled, false,
+      '成功的画布恢复入口必须把页面一起恢复 ready（保存按钮重新可用）')
+  })
+})
+
+// 17. F2 页面：编辑器支持 applyView 时必须原子提交并传递视图世代 -------------
+
+await check('F2 页面：优先用 editor.applyView({ viewer, xml, token }) 原子提交视图', async () => {
+  await withFakeTimers(async () => {
+    const editor = createEditor()
+    const applied = []
+    editor.applyView = async options => {
+      applied.push({ ...options })
+      return { ok: true, mode: options.viewer ? 'viewer' : 'modeler' }
+    }
+    const mounted = await mountPage({
+      client: makeClient().client,
+      editor,
+      props: {
+        initialDefinition: definitionA,
+        initialDefinitions: { definitions: [definitionA] },
+      },
+    })
+    const { probe } = mounted
+    eq(applied.length, 1, '初始视图必须走一次原子提交')
+    eq(applied[0].viewer, false, '定义视图必须提交 viewer=false')
+    eq(applied[0].xml, XML_A, '原子提交必须带上定义 XML')
+    eq(applied[0].token, 1, 'token 必须是首次视图世代')
+    eq(editor.calls.importXML.length, 0, '走 applyView 时不能再额外调用裸 importXML')
+    eq(editor.calls.viewer.length, 0, '走 applyView 时不能再额外调用裸 setViewerMode')
+
+    const list = findElement(probe.tree, node => node.type === DefinitionList)
+    await list.props.onOpen('flow-a')
+    await settle(probe)
+    eq(applied.length, 2, '打开定义必须再次原子提交')
+    ok(applied[1].token > applied[0].token, '视图世代必须递增：过期导入才能被编辑器丢弃')
+    eq(applied[1].xml, XML_A)
+  })
+})
+
+// 18. m1：真实渲染画布壳的接线与卸载 --------------------------------------
 
 await check('m1 真实渲染 BpmnCanvas：mountOptions 透传 / hostRequire 合并 / 卸载销毁', async () => {
   await withFakeTimers(async () => {

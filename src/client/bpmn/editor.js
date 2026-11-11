@@ -144,6 +144,40 @@ export function mountEditor(container, options = {}) {
     if (disposed || generation !== lifecycle) throw destroyedError()
   }
 
+  // ── 写操作串行化（复审 F2）──────────────────────────────────────────────
+  // 两次并发 `importXML` 会各自修改**同一个真实模型**：先挂起的旧导入释放后
+  // 会把新导入的 definitions 覆盖掉，页面再比对世代也只能丢弃返回值，改不回模型。
+  // 因此所有会写模型的操作（模式切换 + 导入）排进同一条队列，并用单调 token
+  // 标记「最新请求」：旧操作在触碰模型之前发现 token 过期就直接作废。
+  let operationChain = Promise.resolve()
+  let latestOperationToken = 0
+
+  function nextOperationToken() {
+    latestOperationToken += 1
+    return latestOperationToken
+  }
+
+  /** 外部（页面视图世代）传入的 token 只允许把「最新请求」往前推。 */
+  function noteOperationToken(token) {
+    if (Number.isSafeInteger(token) && token > latestOperationToken) latestOperationToken = token
+    return Number.isSafeInteger(token) ? token : nextOperationToken()
+  }
+
+  function staleResult() {
+    return { ok: false, stale: true, reason: '画布操作已被更新的请求取代' }
+  }
+
+  function isStale(token) {
+    return Number.isSafeInteger(token) && token < latestOperationToken
+  }
+
+  function enqueueOperation(task) {
+    const run = operationChain.then(() => task())
+    // 一个失败的操作不能把后面的操作卡死：错误只交给本次调用方。
+    operationChain = run.then(() => undefined, () => undefined)
+    return run
+  }
+
   if (isViewer) wrapper.classList.add('fs-bpmn-editor-viewer')
 
   const moddleExtensions = () => ({
@@ -259,13 +293,17 @@ export function mountEditor(container, options = {}) {
     }
   }
 
-  async function serialize(extra = {}) {
+  async function serialize(extra = {}, generation = lifecycle) {
+    // 生命周期检查要覆盖 await 之后（复审 f2）：销毁后再序列化成功，
+    // 等于向宿主确认一个已经被清空的模型仍然可保存。
+    assertAlive(generation)
     if (!instance) {
       if (unavailableReason !== '') throw new Error('BPMN 画布不可用（恢复失败）：' + unavailableReason)
       throw new Error('BPMN 画布尚未创建')
     }
     if (isViewer) return currentXml || ''
     const result = await instance.saveXML({ format: true, ...extra })
+    assertAlive(generation)
     const xml = typeof result === 'string' ? result : (result && result.xml) || ''
     if (xml) currentXml = xml
     return xml
@@ -324,9 +362,19 @@ export function mountEditor(container, options = {}) {
     }
   }
 
-  async function loadXml(xml, generation) {
+  /**
+   * 把一份 XML 导入当前实例。
+   *
+   * `token` 是写操作世代：一旦被更新的请求超越，就在**触碰模型之前**返回 stale，
+   * 而不是先改模型再让调用方丢弃返回值（复审 F2）。已经开始的 `importXML` 会
+   * 跑完（不能半途拆模型），但随后排队的最新请求会覆盖它。
+   *
+   * @returns {Promise<{ok: boolean, stale?: boolean}>}
+   */
+  async function loadXml(xml, generation, token) {
     const next = String(xml)
     assertAlive(generation)
+    if (isStale(token)) return { ok: false, stale: true }
     if (!instance) {
       // 只有回滚重建失败 / 尚未 ready 才会走到这里：必须真正重新创建实例，
       // 不能把 XML 写进 currentXml 就当成功（复审 M6）。
@@ -338,6 +386,8 @@ export function mountEditor(container, options = {}) {
     // 先独立解析并检查 DI，再触碰当前实例；无 DI 的合法 XML 会在这里被拒绝。
     await assertImportable(next, generation)
     assertAlive(generation)
+    // 预检期间可能有更新的视图请求：此刻放弃还来得及保住当前模型。
+    if (isStale(token)) return { ok: false, stale: true }
     try {
       await instance.importXML(next)
     } catch (error) {
@@ -356,11 +406,14 @@ export function mountEditor(container, options = {}) {
     }
     // importXML 期间被销毁：模型已经不是这台编辑器的，不能再确认成功。
     assertAlive(generation)
+    // 导入已经真实发生：缓存必须跟着模型走（即使本次结果因过期被丢弃）。
     currentXml = next
     unavailableReason = ''
     resetHistory()
     fitViewport()
     applyRuntimeMarkers()
+    if (isStale(token)) return { ok: false, stale: true }
+    return { ok: true }
   }
 
   async function importXML(xml) {
@@ -368,20 +421,27 @@ export function mountEditor(container, options = {}) {
     if (typeof xml !== 'string' || xml.trim() === '') {
       throw new TypeError('importXML(xml) 需要非空 BPMN XML 字符串')
     }
-    const generation = lifecycle
-    try {
-      await loadXml(xml, generation)
-    } catch (error) {
-      // 被销毁时不把「实例已清空」之类的内部错误抛给宿主。
-      if (disposed || generation !== lifecycle) throw destroyedError()
-      throw error
-    }
-    return { ok: true }
+    const token = nextOperationToken()
+    return enqueueOperation(async () => {
+      if (disposed) throw destroyedError()
+      const generation = lifecycle
+      try {
+        const result = await loadXml(xml, generation, token)
+        if (result && result.stale) return staleResult()
+        return { ok: true }
+      } catch (error) {
+        // 被销毁时不把「实例已清空」之类的内部错误抛给宿主。
+        if (disposed || generation !== lifecycle) throw destroyedError()
+        throw error
+      }
+    })
   }
 
   async function saveXML(extra = {}) {
     if (disposed) throw new Error('BPMN 画布已销毁')
-    return serialize(extra)
+    // f2：serialize 内部在底层 saveXML 的 await 之后校验生命周期，
+    // 已销毁的控制器不能返回「保存成功」。
+    return serialize(extra, lifecycle)
   }
 
   function destroyInstance() {
@@ -437,35 +497,92 @@ export function mountEditor(container, options = {}) {
     while (propertiesEl.firstChild) propertiesEl.removeChild(propertiesEl.firstChild)
   }
 
-  async function setViewerMode(enabled) {
-    if (disposed) throw new Error('BPMN 画布已销毁')
+  /**
+   * 切换 Modeler / NavigatedViewer。
+   *
+   * 串行执行，并带写操作 token；失败时**销毁半成品实例并记录不可用原因**
+   * （复审 F3）：否则一个没绘制出图、也没装载 definitions 的实例会继续存在，
+   * 再次调用同一模式还会因为 `next === isViewer && instance` 直接返回假成功。
+   *
+   * @returns {Promise<{ok: boolean, mode: string, stale?: boolean}>}
+   */
+  async function switchMode(enabled, token) {
+    assertAlive(lifecycle)
     const generation = lifecycle
     const next = Boolean(enabled)
+    const modeText = () => (isViewer ? 'viewer' : 'modeler')
+    if (isStale(token)) return { ...staleResult(), mode: modeText() }
     // 模式相同且实例还在：无需重建；实例已经被销毁 / 恢复失败时必须重建。
-    if (next === isViewer && instance) return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }
+    if (next === isViewer && instance && unavailableReason === '') {
+      return { ok: true, mode: modeText() }
+    }
     if (!isViewer) {
       try {
-        await serialize()
+        await serialize(undefined, generation)
       } catch {
         // 空图还没有定义时保持已有 currentXml/undefined
       }
       assertAlive(generation)
+      if (isStale(token)) return { ...staleResult(), mode: modeText() }
     }
     isViewer = next
-    await createInstance(generation)
-    assertAlive(generation)
-    if (currentXml) {
-      await instance.importXML(currentXml)
-    } else if (!isViewer) {
-      await instance.createDiagram()
-      currentXml = await serialize()
+    try {
+      await createInstance(generation)
+      assertAlive(generation)
+      if (currentXml) {
+        await instance.importXML(currentXml)
+      } else if (!isViewer) {
+        await instance.createDiagram()
+        assertAlive(generation)
+        currentXml = await serialize(undefined, generation)
+      }
+      assertAlive(generation)
+    } catch (error) {
+      // 模式切换失败：不能留下半成品实例，也不能让后续调用误以为画布可用。
+      destroyInstance()
+      if (!disposed && generation === lifecycle) unavailableReason = failureMessage(error)
+      throw error
     }
-    assertAlive(generation)
     unavailableReason = ''
     resetHistory()
     fitViewport()
     applyRuntimeMarkers()
-    return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }
+    if (isStale(token)) return { ...staleResult(), mode: modeText() }
+    return { ok: true, mode: modeText() }
+  }
+
+  async function setViewerMode(enabled) {
+    if (disposed) throw new Error('BPMN 画布已销毁')
+    const token = nextOperationToken()
+    return enqueueOperation(() => switchMode(enabled, token))
+  }
+
+  /**
+   * 原子地提交一次「模式 + XML」视图（页面视图世代作为 token）。
+   *
+   * 模式切换和导入在同一个队列任务里完成，避免两次视图请求在
+   * `setViewerMode` / `importXML` 两个 await 之间交错：旧请求的模式切换
+   * 可能排到新请求的导入之后，把新模型又覆盖回旧模型（复审 F2）。
+   */
+  async function applyView(options = {}) {
+    if (disposed) throw new Error('BPMN 画布已销毁')
+    const xml = typeof options.xml === 'string' ? options.xml : ''
+    const token = noteOperationToken(options.token)
+    const viewer = options.viewer === true
+    return enqueueOperation(async () => {
+      if (disposed) throw destroyedError()
+      const generation = lifecycle
+      if (isStale(token)) return staleResult()
+      const switched = await switchMode(viewer, token)
+      assertAlive(generation)
+      if (switched && switched.stale) return staleResult()
+      if (xml.trim() !== '') {
+        const imported = await loadXml(xml, generation, token)
+        assertAlive(generation)
+        if (imported && imported.stale) return staleResult()
+      }
+      return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }
+    })
   }
 
   function setRuntimeState(markers) {
@@ -483,6 +600,7 @@ export function mountEditor(container, options = {}) {
    */
   async function flushProperties() {
     if (disposed || !instance || isViewer) return { ok: false, popupClosed: false }
+    const generation = lifecycle
     let popupClosed = false
     try {
       const popup = instance.get('feelPopup', false)
@@ -495,6 +613,9 @@ export function mountEditor(container, options = {}) {
     }
     // 让 preact 的命令栈/受控组件回调先跑完。
     await Promise.resolve()
+    // f2：最后一个 await 之后仍要确认控制器没有被销毁，否则已销毁的编辑器
+    // 会把「属性已提交」这个结论错误地交给保存流程。
+    assertAlive(generation)
     return { ok: true, popupClosed }
   }
 
@@ -532,6 +653,7 @@ export function mountEditor(container, options = {}) {
       return wrapper
     },
     importXML,
+    applyView,
     saveXML,
     flushProperties,
     setViewerMode,

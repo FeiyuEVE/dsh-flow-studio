@@ -282,6 +282,12 @@ function failureHint(status, body, action) {
   if (code === 'MESSAGE_DELIVERY_UNSUPPORTED') {
     return '适配器没有原生消息投递能力：消息已如实记为 failed + deliveryUnknown，不要假装已读。'
   }
+  if (code === 'MESSAGE_BODY_UNSAFE') {
+    return 'Host 无法把正文安全物化到工作区（路径含符号链接 / 不是普通文件 / 写入失败）：消息已标 failed 且不投递；检查工作区 .flow-studio-inbox 下是否被软链或非普通文件占用，修复后再用新 messageId 发送。'
+  }
+  if (code === 'MESSAGE_REPLY_DISPATCH_IN_FLIGHT') {
+    return '该回复正在另一个进程投递中：不要并发重复外发；等一会用同一 replyId 重试，已 delivered 后重试是幂等的。'
+  }
   if (code === 'MESSAGE_INSTANCE_TERMINAL') {
     return '实例已 COMPLETED / CANCELED：不再受理新入站消息；已受理的回复仍可尝试投递（CANCELED 除外）。'
   }

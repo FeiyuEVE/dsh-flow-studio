@@ -6,6 +6,7 @@
  * inbox/messages.jsonl          入站消息记录（追加写，同一 messageId 以最后一条为准）
  * inbox/replies.jsonl           回复 outbox（同上，replyId 为键）
  * inbox/bodies/<id>.<sha>.txt   超过内联阈值的正文（先完整落盘，再写记录）
+ * inbox/*.jsonl.torn            崩溃遗留半行的旁路存档（追加前自动隔离）
  * inbox/.lock                   跨进程互斥（复用 instance-resources 的锁）
  * ```
  *
@@ -22,10 +23,10 @@
  * @module @feiyueve/dsh-flow-studio/instance-message-store
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 import { withResourceLock } from './instance-resources.js'
 
@@ -41,6 +42,8 @@ export const INBOX_PREVIEW_CHARS = 200
 /** 单页消息上限。 */
 export const INBOX_MAX_PAGE_SIZE = 100
 export const INBOX_DEFAULT_PAGE_SIZE = 50
+/** 回复投递权占用超过这个时长视为崩溃遗留，可被下一次 dispatch 接管。 */
+export const INBOX_REPLY_DISPATCH_TTL_MS = 120_000
 
 /** 入站消息状态。 */
 export const INBOX_MESSAGE_STATUS = Object.freeze({
@@ -214,9 +217,107 @@ async function readJournal(path) {
   return records
 }
 
-/** 追加一条完整记录并 fsync。一次 write 写完整行，避免多段拼出半行。 */
-async function appendJournal(path, record) {
+/** journal 尾部半行旁路文件的后缀；坏尾行原样（base64）转存到这里。 */
+export const INBOX_TORN_TAIL_SUFFIX = '.torn'
+const JOURNAL_TAIL_CHUNK_BYTES = 64 * 1024
+
+/** 从 handle 精确读出 length 字节（`FileHandle.read` 允许短读）。 */
+async function readExact(handle, length, position) {
+  const buffer = Buffer.alloc(length)
+  let offset = 0
+  while (offset < length) {
+    const { bytesRead } = await handle.read(buffer, offset, length - offset, position + offset)
+    if (bytesRead <= 0) break
+    offset += bytesRead
+  }
+  return offset === length ? buffer : buffer.subarray(0, offset)
+}
+
+/** 把坏尾行转存到旁路文件（先落盘 + fsync，成功后才允许截断主 journal）。 */
+async function appendTornTail(path, now, journal, raw) {
+  const envelope = JSON.stringify({
+    v: 1,
+    at: nowIso(now),
+    journal,
+    bytes: raw.length,
+    rawBase64: raw.toString('base64'),
+  })
+  let handle
+  try {
+    await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+    handle = await open(path, 'a', FILE_MODE)
+    await handle.write(`${envelope}\n`, null, 'utf8')
+    await handle.sync()
+  } catch (error) {
+    throw fail(INBOX_STORE_ERROR.WRITE_FAILED, `转存 journal 坏尾行失败（${path}）：${error?.message ?? error}`, {
+      path,
+      reason: 'torn-tail-salvage-failed',
+      cause: error,
+    })
+  } finally {
+    if (handle) await handle.close().catch(() => {})
+  }
+}
+
+/**
+ * 锁内修复 journal 尾部：
+ *   - 文件以 `\n` 结尾（或为空）→ 没有不完整尾部，什么都不做；
+ *   - 否则从文件尾向前找最后一个 `\n`，把其后字节原样转存到 `<journal>.torn`，
+ *     再把主 journal 截断到最后一个完整行并 fsync。
+ *
+ * 这样下一次 append 不会把新记录拼到坏尾行后面（否则整行都会被解析跳过），
+ * 同时坏尾行的原始字节仍可人工恢复。
+ *
+ * @returns {Promise<{repaired: boolean, keptBytes?: number, salvagedBytes?: number}>}
+ */
+export async function repairJournalTail(path, now = () => new Date()) {
+  let handle
+  try {
+    handle = await open(path, 'r+')
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { repaired: false }
+    throw fail(INBOX_STORE_ERROR.WRITE_FAILED, `检查 journal 尾部失败（${path}）：${error?.message ?? error}`, {
+      path,
+      cause: error,
+    })
+  }
+  try {
+    const info = await handle.stat()
+    if (!info.isFile() || info.size === 0) return { repaired: false }
+    let end = info.size
+    let lastNewline = -1
+    while (end > 0) {
+      const start = Math.max(0, end - JOURNAL_TAIL_CHUNK_BYTES)
+      const chunk = await readExact(handle, end - start, start)
+      const index = chunk.lastIndexOf(0x0a)
+      if (index !== -1) {
+        lastNewline = start + index
+        break
+      }
+      if (chunk.length === 0) break
+      end = start
+    }
+    if (lastNewline === info.size - 1) return { repaired: false }
+    const keep = lastNewline === -1 ? 0 : lastNewline + 1
+    const raw = await readExact(handle, info.size - keep, keep)
+    await appendTornTail(`${path}${INBOX_TORN_TAIL_SUFFIX}`, now, basename(path), raw)
+    await handle.truncate(keep)
+    await handle.sync()
+    return { repaired: true, keptBytes: keep, salvagedBytes: raw.length }
+  } finally {
+    await handle.close().catch(() => {})
+  }
+}
+
+/**
+ * 追加一条完整记录并 fsync。一次 write 写完整行，避免多段拼出半行。
+ *
+ * 追加前先修复崩溃遗留的不完整尾部：所有调用方都持有 `inbox/.lock`，所以这次
+ * 检测 / 截断与新记录追加对同一 journal 是串行的。
+ */
+async function appendJournal(path, record, now) {
   await mkdir(dirname(path), { recursive: true, mode: DIR_MODE })
+  await repairJournalTail(path, now)
   const line = `${JSON.stringify(record)}\n`
   let handle
   try {
@@ -396,7 +497,7 @@ export function createInstanceMessageStore(options = {}) {
         rev: 0,
       }
       try {
-        await appendJournal(messages, record)
+        await appendJournal(messages, record, now)
       } catch (error) {
         // 持久化失败不返回成功：本次新建的正文文件一并清掉（不留孤儿半成品）。
         if (created !== null && created.existedBefore !== true) {
@@ -510,7 +611,7 @@ export function createInstanceMessageStore(options = {}) {
         updatedAt: at,
         rev: (existing.rev ?? 0) + 1,
       }
-      await appendJournal(messages, next)
+      await appendJournal(messages, next, now)
       return next
     })
   }
@@ -546,7 +647,7 @@ export function createInstanceMessageStore(options = {}) {
           updatedAt: at,
           rev: (record.rev ?? 0) + 1,
         }
-        await appendJournal(messages, next)
+        await appendJournal(messages, next, now)
         bound.push(next)
       }
       return bound
@@ -567,15 +668,47 @@ export function createInstanceMessageStore(options = {}) {
     })
   }
 
-  /** 该 execution 名下仍 queued 的全量消息（用于 execution 结束时统一过期）。 */
+  /**
+   * 条件更新：只有记录**当前仍是 queued** 时才标 failed 并返回 `{updated:true}`。
+   *
+   * 这是「执行结束 / 实例终态」收口与「正在投递 / 已投递」之间的唯一协调点：
+   * 迟到的过期请求看到 `injected` / `resumed` / `delivered` 就原样返回，绝不把
+   * 已投递的消息改成过期失败。
+   */
+  async function failQueuedMessage(instanceId, messageId, delivery) {
+    const id = requireInstanceId(instanceId)
+    const wanted = requireId(messageId, 'messageId')
+    if (!isPlainObject(delivery)) throw fail(INBOX_STORE_ERROR.INVALID, 'failQueuedMessage 需要对象 delivery')
+    const { messages, lock } = paths(id)
+    return await withResourceLock(lock, async () => {
+      const records = replay(await readJournal(messages), record => record.messageId)
+      const existing = records.find(record => record.messageId === wanted)
+      if (!existing) throw fail(INBOX_STORE_ERROR.NOT_FOUND, `消息 ${wanted} 不存在`, { messageId: wanted })
+      if (existing.status !== INBOX_MESSAGE_STATUS.QUEUED) return { updated: false, record: existing }
+      const at = nowIso(now)
+      const next = {
+        ...existing,
+        status: INBOX_MESSAGE_STATUS.FAILED,
+        delivery,
+        updatedAt: at,
+        rev: (existing.rev ?? 0) + 1,
+      }
+      await appendJournal(messages, next, now)
+      return { updated: true, record: next }
+    })
+  }
+
+  /** 该 execution 名下仍 queued 的全量消息（用于 execution 结束时统一过期，条件更新）。 */
   async function expireQueuedForExecution(instanceId, executionId, reason) {
     const queued = await listQueuedForExecution(instanceId, executionId)
     const out = []
     for (const record of queued) {
-      out.push(await updateMessage(instanceId, record.messageId, {
-        status: INBOX_MESSAGE_STATUS.FAILED,
-        delivery: { kind: 'none', reason, at: nowIso(now) },
-      }))
+      const result = await failQueuedMessage(instanceId, record.messageId, {
+        kind: 'none',
+        reason,
+        at: nowIso(now),
+      })
+      if (result.updated) out.push(result.record)
     }
     return out
   }
@@ -654,7 +787,7 @@ export function createInstanceMessageStore(options = {}) {
         rev: 0,
       }
       try {
-        await appendJournal(replies, record)
+        await appendJournal(replies, record, now)
       } catch (error) {
         if (created !== null && created.existedBefore !== true) {
           await rm(created.target, { force: true }).catch(() => {})
@@ -749,8 +882,106 @@ export function createInstanceMessageStore(options = {}) {
         updatedAt: at,
         rev: (existing.rev ?? 0) + 1,
       }
-      await appendJournal(replies, next)
+      await appendJournal(replies, next, now)
       return next
+    })
+  }
+
+  /**
+   * 领取一条回复的投递权（锁内）。
+   *
+   * - 已 `delivered` / `skipped`：不给投递权；
+   * - 已有未过期的 `dispatch.token`：另一条调用链正在外发，不给投递权；
+   * - 否则写入新的 `dispatch:{token, at, attempt}` 并 `attempts = attempts + 1`。
+   *
+   * 外发本身不持文件锁（网络可能很慢）；靠 token 与 `rev` 把「领取 → 外发 → 写回」
+   * 串成一次可判定归属的尝试。
+   *
+   * @returns {Promise<{claimed: boolean, reason?: string, token?: string, attempt?: number, record: object}>}
+   */
+  async function claimReplyDispatch(instanceId, replyId) {
+    const id = requireInstanceId(instanceId)
+    const wanted = requireId(replyId, 'replyId')
+    const { replies, lock } = paths(id)
+    return await withResourceLock(lock, async () => {
+      const records = replay(await readJournal(replies), record => record.replyId)
+      const existing = records.find(record => record.replyId === wanted)
+      if (!existing) throw fail(INBOX_STORE_ERROR.NOT_FOUND, `回复 ${wanted} 不存在`, { replyId: wanted })
+      if (existing.status === INBOX_REPLY_STATUS.DELIVERED) {
+        return { claimed: false, reason: 'delivered', record: existing }
+      }
+      if (existing.status === INBOX_REPLY_STATUS.SKIPPED) {
+        return { claimed: false, reason: 'skipped', record: existing }
+      }
+      const current = isPlainObject(existing.dispatch) ? existing.dispatch : null
+      if (current !== null && typeof current.token === 'string' && current.token !== '') {
+        const claimedAt = typeof current.at === 'string' ? Date.parse(current.at) : Number.NaN
+        if (Number.isFinite(claimedAt) && now() - claimedAt < INBOX_REPLY_DISPATCH_TTL_MS) {
+          return { claimed: false, reason: 'in-progress', record: existing }
+        }
+      }
+      const token = randomUUID()
+      const attempt = (existing.attempts ?? 0) + 1
+      const at = nowIso(now)
+      const next = {
+        ...existing,
+        dispatch: { token, at, attempt },
+        attempts: attempt,
+        updatedAt: at,
+        rev: (existing.rev ?? 0) + 1,
+      }
+      await appendJournal(replies, next, now)
+      return { claimed: true, token, attempt, record: next }
+    })
+  }
+
+  /**
+   * 用领取时拿到的 token 写回投递结果（锁内 CAS）。
+   *
+   * - token 不匹配（投递权已被接管 / 已清理）：不写，返回当前记录；
+   * - 当前已是 `delivered` 而本次结果是失败：不写，返回 delivered（迟到失败不能
+   *   覆盖已成功的外发）；
+   * - 只有仍持有投递权时才写入本次结果并清掉 `dispatch`，让明确失败可再次重试。
+   *
+   * @returns {Promise<{updated: boolean, reason?: string, record: object}>}
+   */
+  async function completeReplyDispatch(instanceId, replyId, input) {
+    const id = requireInstanceId(instanceId)
+    const wanted = requireId(replyId, 'replyId')
+    if (!isPlainObject(input)) throw fail(INBOX_STORE_ERROR.INVALID, 'completeReplyDispatch 需要对象参数')
+    const token = typeof input.token === 'string' ? input.token : ''
+    if (token === '') throw fail(INBOX_STORE_ERROR.INVALID, 'completeReplyDispatch 需要投递权 token')
+    const status = input.status
+    if (status !== INBOX_REPLY_STATUS.DELIVERED
+      && status !== INBOX_REPLY_STATUS.FAILED
+      && status !== INBOX_REPLY_STATUS.SKIPPED) {
+      throw fail(INBOX_STORE_ERROR.INVALID, `completeReplyDispatch 不支持状态 ${String(status)}`)
+    }
+    const { replies, lock } = paths(id)
+    return await withResourceLock(lock, async () => {
+      const records = replay(await readJournal(replies), record => record.replyId)
+      const existing = records.find(record => record.replyId === wanted)
+      if (!existing) throw fail(INBOX_STORE_ERROR.NOT_FOUND, `回复 ${wanted} 不存在`, { replyId: wanted })
+      if (existing.status === INBOX_REPLY_STATUS.DELIVERED && status !== INBOX_REPLY_STATUS.DELIVERED) {
+        return { updated: false, reason: 'delivered', record: existing }
+      }
+      const current = isPlainObject(existing.dispatch) ? existing.dispatch : null
+      if (current === null || current.token !== token) {
+        return { updated: false, reason: 'claim-lost', record: existing }
+      }
+      const at = nowIso(now)
+      const next = {
+        ...existing,
+        status,
+        attempts: Number.isSafeInteger(input.attempts) && input.attempts >= 0 ? input.attempts : (existing.attempts ?? 0),
+        lastError: isPlainObject(input.lastError) ? input.lastError : null,
+        delivery: isPlainObject(input.delivery) ? input.delivery : existing.delivery ?? null,
+        dispatch: null,
+        updatedAt: at,
+        rev: (existing.rev ?? 0) + 1,
+      }
+      await appendJournal(replies, next, now)
+      return { updated: true, record: next }
     })
   }
 
@@ -764,12 +995,15 @@ export function createInstanceMessageStore(options = {}) {
     updateMessage,
     bindNextActivation,
     listQueuedForExecution,
+    failQueuedMessage,
     expireQueuedForExecution,
     acceptReply,
     readReply,
     listReplies,
     readReplyBody,
     updateReply,
+    claimReplyDispatch,
+    completeReplyDispatch,
   }
 }
 

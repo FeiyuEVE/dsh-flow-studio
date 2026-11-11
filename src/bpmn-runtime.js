@@ -648,7 +648,7 @@ class BpmnRuntime {
     const ctx = this.ctx
     const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : null
     if (!agents || typeof agents.get !== 'function') return null
-    return async ({ sessionId, text, replyId, messageId, instanceId }) => {
+    return async ({ sessionId, text, replyId, messageId, instanceId, document }) => {
       const agent = agents.get(sessionId)
       if (!agent || typeof agent.followup !== 'function') {
         return {
@@ -659,20 +659,47 @@ class BpmnRuntime {
           retryable: true,
         }
       }
+      // 附件不能静默丢：默认 session 通道把附件表达成带 path / sha256 / 字节数的
+      // 可读取引用（相对实例工作区）。没有任何文本也没有附件引用时明确失败。
+      const attachmentParts = isPlainObject(document) && typeof document.path === 'string' && document.path !== ''
+        ? [
+          `[附件] ${document.path}`,
+          typeof document.sha256 === 'string' && document.sha256 !== '' ? `sha256 ${document.sha256}` : '',
+          Number.isSafeInteger(document.bytes) ? `${document.bytes} 字节` : '',
+          '路径相对实例工作区',
+        ].filter(part => part !== '')
+        : []
+      const attachment = attachmentParts.length === 0 ? '' : `\n\n（${attachmentParts.join('；')}）`
+      const body = `${typeof text === 'string' ? text : ''}${attachment}`
+      if (body.trim() === '') {
+        return {
+          ok: false,
+          code: INSTANCE_INBOX_ERROR.REPLY_UNSUPPORTED,
+          error: '回复既没有文本也没有可传递的附件引用，不能标成功',
+          deliveryUnknown: false,
+          retryable: false,
+        }
+      }
       agent.followup({
         id: `flow-reply-${replyId}`,
         role: 'user',
         source: {
           kind: 'user',
+          // 宿主 MessageSourceMap 只认 `user`；用 meta 区分「外部收件箱回复」来源。
+          meta: { untrusted: true, origin: 'flow-studio:inbox-reply', instanceId },
           flowStudio: {
             kind: 'inbox-reply',
             instanceId,
             messageId,
             replyId,
             from: 'flow-studio:inbox',
+            untrusted: true,
+            ...(isPlainObject(document) && typeof document.path === 'string'
+              ? { documentPath: document.path }
+              : {}),
           },
         },
-        content: [{ type: 'text', text }],
+        content: [{ type: 'text', text: body }],
       })
       // followup 只保证排进会话；能否被读不确认。
       return { ok: true, deliveryUnknown: true }
@@ -2011,6 +2038,23 @@ class BpmnRuntime {
         ...(input.document === undefined ? {} : { document: input.document }),
       })
       const dispatched = await this.inbox.dispatchReply({ instanceId: id, replyId: enqueued.reply.replyId })
+      if (dispatched.inFlight === true) {
+        // 另一个进程正持有这条回复的投递权：不并发重复外发，也不把「仍在投递」伪装成失败。
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            id,
+            messageId,
+            duplicate: enqueued.duplicate === true,
+            enqueued: true,
+            delivered: false,
+            reply: dispatched.reply,
+            code: INSTANCE_INBOX_ERROR.REPLY_DISPATCH_IN_FLIGHT,
+            error: `回复 ${enqueued.reply.replyId} 正在另一个进程投递中；不要并发重复外发，稍后用同一 replyId 重试`,
+          },
+        }
+      }
       const reply = dispatched.reply
       const delivered = reply.status === 'delivered'
       const skipped = reply.status === 'skipped'

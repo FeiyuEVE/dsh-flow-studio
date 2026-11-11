@@ -15,6 +15,11 @@
  * adapter 只拿 `record` 的 `output`（短变量）与 `artifacts`（文件引用）去接线。
  * 契约见 `docs/design/11-node-finish-tool.md`。
  *
+ * 闸门是**被动**的：不做「停下来没调工具」的提醒、不计数、不自动失败，也不判定
+ * `NODE_FINISH_MISSING`——那是 adapter 的 `turn.stop` hook（11 §3.1）的职责。
+ * adapter 只需在每轮结束时查一次 `settled()`（`reason()` 可重复查询）来判断本轮
+ * 是否已完结。
+ *
  * record 形状（字段冻结）：
  * ```
  * {
@@ -623,7 +628,7 @@ export function createFinishGate(options) {
     if (state === 'finished' || state === 'running') {
       throw fail(
         NODE_FINISH_ERROR.ALREADY_FINISHED,
-        '本次活动已经成功完成过一次，重复提交被拒绝（幂等，不重复登记产物）',
+        '本次活动已经受理过完成提交（或已完成），重复提交被拒绝（幂等，不重复登记产物）',
         { executionId, nodeId, attempt, reason: 'already-finished' },
       )
     }

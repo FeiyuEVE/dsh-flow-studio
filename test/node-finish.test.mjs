@@ -29,7 +29,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  NODE_FINISH_ERROR, NODE_FINISH_LIMITS, NodeFinishError,
+  NODE_FINISH_ERROR, NODE_FINISH_LIMITS,
   createFinishGate, validateFinishArgs,
 } from '../src/node-finish.js'
 
@@ -207,8 +207,8 @@ try {
   // 2. variables：键数 / 字符数 / 字节数 / 类型 / 危险键
   // -------------------------------------------------------------------------
   await check('变量：32 键 / 512 字符 / 8192 字节边界通过，33 键 / 513 字符 / 8193 字节拒绝', () => {
-    const args = (variables, limits) => ({ variables, documents: [], summary: '' })
-    const variablesArgs = (variables, limits) => validateFinishArgs(args(variables, limits), limits)
+    const args = variables => ({ variables, documents: [], summary: '' })
+    const variablesArgs = (variables, limits) => validateFinishArgs(args(variables), limits)
 
     const keys32 = Object.fromEntries(Array.from({ length: 32 }, (_, index) => [`k${index}`, index]))
     A.equal(Object.keys(variablesArgs(keys32).variables).length, 32, '32 个键是边界内')

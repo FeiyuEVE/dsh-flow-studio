@@ -210,14 +210,17 @@ $DSH_HOME/flow-studio/
 pending ──start──▶ running ──wait──▶ waiting ──signal──▶ running ──┐
                       │                 │                          ├──▶ done
                       │                 └──stop───────────────────▶ aborted
-                      ├──handler/条件/超时/引擎 fatal──────────────▶ failed
+                      ├──可修复问题（条件错/超时/handler 失败/提醒用尽/连线超限）
+                      │        └──────────────────────────────────▶ blocked ──retry──▶ running
+                      ├──引擎不可恢复（状态损坏/定义无法反序列化）──▶ failed
                       └──stop─────────────────────────────────────▶ aborted
 ```
 
 - `pending`：建了实例但 runner 还没启动（`createInstance` 后、start 前）。
 - `running`：引擎正在推进（含 serviceTask handler 在飞）。
 - `waiting`：停在 userTask（或引擎的 wait 状态），`pendingTasks` 非空。
-- `done` / `failed` / `aborted`：终态，不再恢复 runner。
+- `blocked`：**不是 failed**。可修复/可重试的问题（条件求值错、活动超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏）把实例停在这里，带 `blockedReason{code,message,nodeId?,reminders?}`；人可通过 `POST /instances/<id>/retry` 重试当前节点或 `stop` 终止。**用户口径（2026-11-11）：不要随意把流程实例判定为失败。**
+- `done` / `failed` / `aborted`：终态，不再恢复 runner。`failed` 只留给引擎不可恢复的错误（快照/定义无法反序列化、内部结构不一致）。
 
 与 `bpmn-runner` 五态的换算：
 

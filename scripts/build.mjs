@@ -74,6 +74,7 @@ export const HOST_MODULES = [
   'bpmn-convert.js',
   'bpmn-runner.js',
   'bpmn-runtime.js',
+  'node-finish.js',
 ]
 
 /** 由 esbuild 生成、不是从 src 拷贝的产物，同样计入 lib/ 产物清单。 */

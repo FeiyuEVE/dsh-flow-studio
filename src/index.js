@@ -27,6 +27,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createAdapterRegistry } from './agent-adapter.js'
+import { createClaudeAdapter } from './agent-adapter-claude.js'
 import { createCodexAdapter } from './agent-adapter-codex.js'
 import { createDshAdapter } from './agent-adapter-dsh.js'
 import { createBpmnRuntime } from './bpmn-runtime.js'
@@ -66,19 +67,24 @@ const BASE = '/api/flow-studio'
 
 /**
  * AgentAdapter 注册表（0.13.1 A3）：`dsh` 用宿主 agents 服务注册会话级工具；
- * `codex` 用自带 MCP stdio server（codex 没装 / 未登录时 probe 会失败，但**不能**因此
- * 让插件加载失败——不可用只在节点 admission 阶段拒绝那个节点）。
+ * `codex` / `claude` 用自带 MCP stdio server（CLI 没装 / 未登录时 probe 会失败，但
+ * **不能**因此让插件加载失败——不可用只在节点 admission 阶段拒绝那个节点）。
  *
  * 用环境变量 / 外部注入覆盖时以 `env.bpmnAdapters` 为准（测试与嵌入方使用）。
  */
-function buildAgentAdapters(ctx, log, codexTmpRoot) {
+function buildAgentAdapters(ctx, log, adapterTmpRoot) {
   const registry = createAdapterRegistry()
   const factories = [
     ['dsh', () => createDshAdapter({ ctx, log })],
     ['codex', () => createCodexAdapter({
       // 适配器默认把每-execution 私有目录放插件包内的 `.tmp/`；装到只读 profile 时
       // 会失败。这里显式指向 flow-studio 数据根（instances/ 的兄弟目录，必然可写）。
-      ...(typeof codexTmpRoot === 'string' && codexTmpRoot.trim() !== '' ? { tmpRoot: codexTmpRoot } : {}),
+      ...(typeof adapterTmpRoot === 'string' && adapterTmpRoot.trim() !== '' ? { tmpRoot: adapterTmpRoot } : {}),
+    })],
+    // 0.14.2 G：Claude Code 适配器。真实 CLI 通道未在本机验收（无 claude CLI）；
+    // probe 不通过时该 adapter 在 admission 阶段被拒绝，不影响其它 adapter 与面板。
+    ['claude', () => createClaudeAdapter({
+      ...(typeof adapterTmpRoot === 'string' && adapterTmpRoot.trim() !== '' ? { tmpRoot: adapterTmpRoot } : {}),
     })],
   ]
   for (const [id, factory] of factories) {
@@ -609,7 +615,8 @@ export function apply(ctx) {
   const bpmnEnv = {
     dir,
     ctx,
-    // 0.13.1 A3：agent 节点由 AgentAdapter 执行（dsh / codex）；codex 不可用不影响加载。
+    // 0.13.1 A3 / 0.14.2 G：agent 节点由 AgentAdapter 执行（dsh / codex / claude）；
+    // 某个 CLI 不可用不影响插件加载。
     bpmnAdapters: buildAgentAdapters(ctx, log, join(dir, '.tmp')),
   }
   // 插件卸载 / 测试收尾：释放实例运行时（不删 definitions / instances 数据）。

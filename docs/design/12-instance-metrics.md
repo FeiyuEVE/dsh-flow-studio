@@ -44,6 +44,7 @@
 |---|---|---|
 | codex / OpenAI 风格 | `input_tokens`、`cached_input_tokens`、`cache_write_input_tokens`、`output_tokens` | `input_tokens` **已包含**缓存子集：先拆出 `cacheRead` / `cacheWrite`，再从 `input` 里扣掉；`total` 仍等于原始 `input_tokens + output_tokens` |
 | dsh / DeepSeek TokenUsage | `inputTokens`、`cacheReadTokens`、`cacheWriteTokens`、`outputTokens`（互斥） | 不再拆；`cacheRead` 单独成桶，不能加回 input |
+| claude / Anthropic 风格 | `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`（互斥） | 与 dsh 同口径，不拆 input；适配器在边界补 `cache_write_input_tokens` 别名供四桶识别（0.14.2 G） |
 | 已有四桶的输入 | `input` / `cacheRead` / `cacheWrite` / `output` | 视为已归一，不二次拆分 |
 
 数据矛盾（`cached > input`）时按原始 input 截断（先读后写），守住「四桶之和 === total」这条不变量；坏数值（负数、字符串、NaN）整条 usage 标 `unknown`，不把坏值当 0。

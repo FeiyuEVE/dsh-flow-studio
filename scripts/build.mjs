@@ -87,6 +87,7 @@ export const HOST_MODULES = [
   'agent-adapter.js',
   'agent-adapter-dsh.js',
   'agent-adapter-codex.js',
+  'agent-adapter-claude.js',
   'agent-execute.js',
 ]
 

@@ -110,6 +110,7 @@ function NodeAdapterSelect(props) {
       { value: '', label: translate('（未指定，沿用默认）') },
       { value: 'dsh', label: 'DSH' },
       { value: 'codex', label: 'Codex' },
+      { value: 'claude', label: 'Claude Code' },
     ],
   })
 }

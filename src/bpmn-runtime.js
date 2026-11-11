@@ -5,7 +5,7 @@
  * 边界（0.13.0）：
  *   - 只做 headless 引擎 + 定义/实例 API，不碰画布（bpmn.io 在后续阶段）；
  *   - 不重写 `definition-store` / `instance-store`，只调用它们的导出函数；
- *   - agent 节点只走注册过的 AgentAdapter（dsh / codex）+ `flow_finish_node`
+ *   - agent 节点只走注册过的 AgentAdapter（dsh / codex / claude）+ `flow_finish_node`
  *     完结门；`custom` 外部 executor、缺注册表的任何 adapter、http connector
  *     **明确失败**，不伪造成功、不退回解析 CLI 输出（错误码见下）。
  *
@@ -597,7 +597,7 @@ class BpmnRuntime {
     this.instancesRoot = options.instancesRoot
     this.env = options.env
     this.maxActiveInstances = options.maxActiveInstances
-    /** AgentAdapter 注册表（dsh / codex）；缺省时 agent 节点明确失败（不再回退外部 executor）。 */
+    /** AgentAdapter 注册表（dsh / codex / claude）；缺省时 agent 节点明确失败（不再回退外部 executor）。 */
     this.adapters = options.adapters && typeof options.adapters.get === 'function' ? options.adapters : null
     /** agent 节点 documents 的相对基准。 */
     this.workspaceRoot = typeof options.workspaceRoot === 'string' && options.workspaceRoot.trim() !== ''
@@ -4118,7 +4118,7 @@ function throwIfAborted(ctx) {
 /**
  * agent 节点处理器（签名固定 `(element, ctx)`）。
  *
- * `dsh` / `codex` 等**注册过**的 adapter 走 **AgentAdapter + flow_finish_node
+ * `dsh` / `codex` / `claude` 等**注册过**的 adapter 走 **AgentAdapter + flow_finish_node
  * 完结门**（`agent-execute.js`）：
  *
  * 1. `fs:node@adapter` 决定 adapter id（缺失默认 `dsh`；旧 `fs:executor@kind` 兜底）；
@@ -4154,7 +4154,7 @@ export async function executeAgent(element, ctx, options = {}) {
     throw handlerError(
       AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
       'agent adapter「custom」不再受支持：custom 外部 executor 不再是 agent 完结路径；'
-        + '请用注册过的 adapter（dsh/codex），节点必须调用 flow_finish_node',
+        + '请用注册过的 adapter（dsh/codex/claude），节点必须调用 flow_finish_node',
       { adapter: adapterId, elementId: element?.id ?? null },
     )
   }
@@ -4173,7 +4173,7 @@ export async function executeAgent(element, ctx, options = {}) {
     throw handlerError(
       AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
       `不支持的 agent adapter「${adapterId}」：当前 runtime 没有适配器注册表，`
-        + '且 custom 外部 executor 不再是 agent 完结路径；请注册 dsh/codex 适配器，'
+        + '且 custom 外部 executor 不再是 agent 完结路径；请注册 dsh/codex/claude 适配器，'
         + '节点必须调用 flow_finish_node',
       { adapter: adapterId, elementId: element?.id ?? null },
     )

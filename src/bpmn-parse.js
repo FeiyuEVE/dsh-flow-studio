@@ -400,11 +400,11 @@ function buildExecutor(fsNode, elementId, warnings) {
   }
 
   const kind = stringOrNull(executor.kind) || 'dsh'
-  if (kind !== 'dsh' && kind !== 'codex' && kind !== 'custom') {
+  if (kind !== 'dsh' && kind !== 'codex' && kind !== 'claude' && kind !== 'custom') {
     warnings.push({
       code: 'EXECUTOR_KIND_INVALID',
       elementId,
-      message: `fs:executor@kind 不是 dsh/codex/custom：${JSON.stringify(kind)}（原样保留）。`,
+      message: `fs:executor@kind 不是 dsh/codex/claude/custom：${JSON.stringify(kind)}（原样保留）。`,
     })
   }
 

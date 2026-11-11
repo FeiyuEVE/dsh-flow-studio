@@ -1086,6 +1086,11 @@ async function main() {
       A.equal(Number.isSafeInteger(mcpPid) && mcpPid > 0, true)
       A.equal(pidAlive(claudePid), true)
       A.equal(pidAlive(mcpPid), true)
+      // 假 CLI 写出 usage 行与适配器解析之间隔着一拍：满量程串行跑套件时，这里
+      // 直接断言会偶发「解析还没轮到」。有界轮询到事件真的被观测到，断言不变。
+      for (let waited = 0; waited < 2000 && handle.usageCalls().length === 0; waited += 10) {
+        await new Promise(resolveWait => setTimeout(resolveWait, 10))
+      }
       A.equal(handle.usageCalls().length, 1, '取消前已观测到一次 usage')
 
       await adapter.cancel(handle, 'test-cancel')

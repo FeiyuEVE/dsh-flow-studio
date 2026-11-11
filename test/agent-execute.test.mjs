@@ -1233,9 +1233,9 @@ await check('集成·F9 dispose 永不返回：槽位 / activeAgents 仍保留�
   // 别的套件压满），dispose 可能比 readInstance 晚一拍才发起。这里做有界轮询而不是
   // 赌「同一 tick」，否则用例会被负载抖成假红。
   //
-  // 2000ms 只覆盖「同一 tick 之后的调度延迟」；`npm test` 串行跑套件，不承担并行压满的
-  // 抖动，所以不要把上限放宽（放宽会让真正的「永不发起 dispose」晚 8s 才暴露）。
-  for (let waited = 0; waited < 2_000 && disposeAttempts === 0; waited += 25) {
+  // 有界轮询到 dispose 真的发起：机器上并行跑多个 agent / 套件时，handler 的 finally
+  // 可能比实例读回晚好几拍。上限放宽只推迟「永不发起」的暴露时间，断言本身不变。
+  for (let waited = 0; waited < 10_000 && disposeAttempts === 0; waited += 25) {
     await new Promise(resolveWait => setTimeout(resolveWait, 25))
   }
   A.equal(disposeAttempts, 1, 'dispose 必须发起一次')

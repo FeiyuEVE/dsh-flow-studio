@@ -25,7 +25,7 @@
 |---|---|---|
 | GET | `/health` | 版本、鉴权档位、`bpmn` 能力计数（`definitions` / `instances` / `active` / 引擎版本）、已注册 adapter id、workspace 白名单条数、skills 服务是否在位；未鉴权时不返回内部路径 |
 | GET | `/skills` | 当前 profile 已注册的 skill 目录（`ctx.skills.list()`） |
-| * | `/definitions[/…]` | 定义列表 / 读取版本 / 保存新版本 / 删除（受实例引用保护）；完整路由见 [实例域接口](instance-api.md) |
+| * | `/definitions[/…]` | 定义列表 / 读取版本 / 保存新版本；**定义不可删除**（没有删除路由，`DELETE /definitions/<id>` 返回 405）；完整路由见 [实例域接口](instance-api.md) |
 | * | `/instances[/…]` | 实例启动 / 列表 / 详情 / 事件 / 取消 / 人工任务 / 收件箱 / 指标 / 证据；完整路由见 [实例域接口](instance-api.md) |
 | * | `/instance-worktrees[/…]` | 实例 worktree 的 inspect / list / remove / branch / prune |
 | * | `/metrics` | 跨实例指标汇总 |

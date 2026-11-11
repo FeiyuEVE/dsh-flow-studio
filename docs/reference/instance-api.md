@@ -806,6 +806,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 ### 锁与平台
 
+- **适用范围**：本节描述的是**资源锁**（`resources/.lock` 与 worktree 创建等资源临界区）和**收件箱锁**（`inbox/.lock`），它们复用 `instance-resources.js` 的 `flock` 实现。定义 / 实例元数据的写入锁是**另一套**：`definitions/` 根与每个 `instances/<id>/` 下的 `.lock` 由 `definition-store.js` / `instance-store.js` 用 `O_EXCL` 锁文件 + nonce 复核 + 过期 `rename` 接管实现，不是 `flock`；两者的平台降级与错误码不同，不要混为一谈。
 - 跨进程互斥用 util-linux `flock`：锁由**宿主进程自己的 fd** 持有（helper 进程只是持锁代理，fd 3 是同一打开文件描述的副本），因此 helper 单独死亡不等于失锁；持有期间 helper 退出会让临界区收到 `RESOURCE_LOCK_LOST` 并 **fail-closed 中止**，第二持有者在内核层被挡住。
 - 没有 `flock`（或 fd 形式不生效）的平台——Windows、macOS 无 util-linux、部分沙箱——降级为**进程内队列**：只保证同进程串行，**跨进程互斥不成立**；降级路径同样尊重 `waitMs`，超时返回 `RESOURCE_LOCK_TIMEOUT` 且不进入临界区。
 - 锁文件常驻、不删除：它是 inode 锚点，运行期外部 `unlink` / `rename` 锁文件会让两个进程持有不同 inode 的锁，破坏互斥。锁目录应放在本地盘（NFS / SMB 的 flock 语义不保证），并视为 Host 私有目录。

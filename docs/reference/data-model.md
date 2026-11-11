@@ -26,7 +26,7 @@ definitions/<definitionId>/
 - 定义 id 与实例 id 走同一套路径 id 规则：`^[A-Za-z0-9._-]{1,64}$`，不是 `.` / `..`、不以点开头。
 - 每次 `POST /definitions` 产生**新版本**；实例启动时把 `definitionId + definitionVersion + definitionHash` 钉进 `instance.json`，并复制一份 `definition.bpmn` 快照。定义改版不会改写已有实例。
 - 同一 `(id, version)` 换内容会被存储层拒绝（409 `DEFINITION_VERSION_IMMUTABLE`）；当前 HTTP 路由不接受显式版本，版本号由存储层分配。
-- 删除定义默认拒绝被实例引用的定义；`force` 后删除但仍保留实例内的定义快照。
+- 存储层提供 `deleteDefinition`（归档到 `definitions/.deleted/`，默认拒绝被实例引用的定义，`force` 后仍保留实例内的定义快照）；**当前 HTTP 路由不暴露删除入口**，定义不能通过 API 删除。
 
 字段级契约见 [实例域接口 · 定义域](instance-api.md#定义域)。
 

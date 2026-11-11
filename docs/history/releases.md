@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.7）
+# 版本历史（0.1 → 0.13.9）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -586,7 +586,7 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 ## 0.13.7 — 实例域 worktree 与 0.13.6 复审修复
 
-这一版加**实例级 Git worktree**（Host 侧），并把 0.13.6 复审的 8 MAJOR（H1–H5、N1–N3）+ 4 MINOR 收口。
+这一版加**实例级 Git worktree**（Host 侧），并修 0.13.6 复审的 8 MAJOR（H1–H5、N1–N3）+ 4 MINOR 中可复现的部分。随后的复审在 worktree 失败回滚、强制清理、锁与快照上又找到 8 条 MAJOR（W1–W8），并指出 4 条上一轮修复的回归（R1–R4），由 0.13.9 继续收紧——本版的 worktree 清理/回滚语义应视为「可用但未最终封板」。
 
 ### 实例域 worktree（新能力）
 
@@ -601,14 +601,14 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 ### 0.13.6 复审修复
 
-- **H1 特殊地址分类**：本地 NAT64 前缀（`64:ff9b:1::/48`）、site-local（`fec0::/10`）、benchmark/documentation/orchid/`100::/64` 等默认不再算公网；需要用转换前缀时只能在 `nat64Prefixes` 里显式放行，且内嵌 IPv4 仍要分类为公网。
+- **H1 特殊地址分类**：本地 NAT64 前缀（`64:ff9b:1::/48`）、site-local（`fec0::/10`）、benchmark/documentation/orchid/`100::/64` 等默认不再算公网；需要用转换前缀时只能在 `nat64Prefixes` 里显式放行，且内嵌 IPv4 仍要分类为公网。（非 `/96` 前缀的 IPv4 位段提取与 ORCHID `/28` 掩码在 0.13.9 R1 修正。）
 - **H2 策略严格校验**：`allowInsecureOrigins` 不再接受 `*` 或省略端口；`allowedCidrs` 的前缀必须是合法数字（`10.0.0.0/` 这种空前缀不再变成 `/0`）；`authOrigins` 必须是严格 origin；非法配置在加载时报 `HTTP_POLICY_INVALID`。
 - **H3 凭据回显**：从 `authRef` 解析出的值生成脱敏匹配串（完整值 / scheme 后 token / Basic 解码后的 `user:pass`），白名单响应头命中即 `[redacted]`；输出映射命中直接 `HTTP_RESPONSE_SECRET_LEAK`（不写变量/记录）；`location` 与错误详情递归脱敏；`authRef` 绑定到允许的 origin，跨 origin 使用报 `HTTP_AUTH_ORIGIN_FORBIDDEN` 且零发送。
-- **H4 统一 deadline**：入口即建立 deadline，DNS、凭据解析、`beginInvocation`、`recordAttempt` 都参与超时与取消竞争；每次真正发送前再查一次剩余时间，过期零发送；未发送用 `markNotSent` 回滚，不制造假的 unknown。
+- **H4 统一 deadline**：入口即建立 deadline，DNS、凭据解析、`beginInvocation`、`recordAttempt` 都参与超时与取消竞争；每次真正发送前再查一次剩余时间，过期零发送；未发送用 `markNotSent` 回滚，不制造假的 unknown。（迟到存储写入与结果提交的期限在 0.13.9 R2 收紧。）
 - **H5 恢复幂等**：调用身份改成 `elementId_attempt_N`（attempt 随引擎快照持久化），invocationId、记录键与 `Idempotency-Key` 都基于它；崩溃后恢复同一逻辑激活会复用同一记录与键，不再换键重发。`engineExecutionId` 作为排障元数据保留。
 - **N1 实例事务提交**：打开实例时详情 / 任务 / 事件先放本地事务副本，画布应用成功且选择世代仍有效后才在一个同步块里整组提交；失败或过期一律不提交，只把画布恢复到最后一次已提交视图，过期导入不再改写当前实例模型。
 - **N2 factory 判定隔离**：校验器在不可信代码执行前冻结所需内建函数，判定结果改走原始字符串通道；factory 里改写 `JSON.stringify` 之类不再能伪造「无问题」结果。
-- **N3 e2e 挂载校验**：容器脚本按 `Type/Source/Destination` 三元组校验挂载，拒绝宿主 `HOME` 本身/祖先/`~/.dsh`，拒绝覆盖 `home/profiles/logs/dt/prefix` 的嵌套 bind；用容器内 realpath 校验实际写入路径，并在 `docker cp` / `sed` / `pnpm install` 前复核。
+- **N3 e2e 挂载校验**：容器脚本按 `Type/Source/Destination` 三元组校验挂载，拒绝宿主 `HOME` 本身/祖先/`~/.dsh`，拒绝覆盖 `home/profiles/logs/dt/prefix` 的嵌套 bind；用容器内 realpath 校验实际写入路径，并在 `docker cp` / `sed` / `pnpm install` 前复核。（写入子树内部的嵌套 bind 反向检查在 0.13.9 R4 补上。）
 - **m1 调用记录处置**：新增 `POST /instances/<id>/connector/<recordId>/resolve`（`mark-succeeded|mark-failed|retry`），只改记录 + 追加 `connector/audit.jsonl` 审计，不推进引擎、不伪造 `activity/end`；重复动作幂等。
 - **m2 头部预算**：请求头 64 条 / 单值 8 KiB / 总量 32 KiB，响应头 64 条 / 8 KiB，超限分别报稳定错误码。
 - **m3 `ctx.emit` 世代守卫**：handler 的 emit 捕获创建时世代，`stop()`/LRU dispose 后旧 ctx 不再能追加事件。
@@ -624,3 +624,41 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 宿主凭据 / networkPolicy 仍只有环境变量与注入 resolver；worktree 分支不自动 commit/merge/push。
 - H5 的残余窗口：若手工回滚 `state.json` 到更早世代，或同一元素在并行分支同时激活，attempt 可能映射到不同逻辑激活；请求内容不同会以 `HTTP_REQUEST_CONFLICT` 拒绝。H3 只匹配已知凭据值（≥4 字符），不识别再次编码后的回显。
 - 幂等与调用记录保护仍是进程级；跨进程并发恢复未做分布式互斥。
+
+## 0.13.9 — worktree GUI/工具与 0.13.7 复审修复
+
+这一版补齐实例 worktree 的 **GUI 与模型工具**，并把 0.13.7 复审的 12 条 MAJOR（W1–W8、R1–R4）修完；另外修掉一个在整套测试里暴露的 abort 竞态（`start` 永不返回时 handler 会挂死）。
+
+### worktree GUI 与工具（0.13.8 内容）
+
+- **实例面板「工作区」区**：模式（worktree / 原目录 / 未配置）、路径、分支、HEAD、dirty 与可清理性；`ACTIVE`/`SUSPENDED` 时清理按钮禁用并给出原因；危险操作在页面内二次确认（可勾选删分支 / 强制），请求带 `expectedHead`。
+- **全局「工作树清理」**：打开即 list + `dryRun` 预览，展示将删除 / 保留 / 仅报告清单与 `planHash`；确认后才带 `planHash` 执行；409 `PLAN_STALE` 清掉旧预览并提示重新预览。
+- **模型工具** `flow_instance_worktrees({action:'inspect'|'remove'|'branch'|'list'|'prune', instanceId?, workspaceId?, force?, removeBranch?, dryRun?, planHash?, expectedHead?})`：与 HTTP 路由共用同一实现，结果裁剪（长字段 2 KiB / 数组 200 / 深度 8），与 HTTP 共享 runtime 缓存，prune `planHash` 互通。
+
+### 复审修复（W1–W8、R1–R4）
+
+- **W1 创建回滚所有权**：建树全过程加跨进程锁，先建 nonce 临时分支再转正；失败回滚只删「本次 add 成功」或「明确检出本 nonce 分支」的树，分支删除要求 tip 仍等于创建基点，不再发仓库级 prune。
+- **W2 locked 不再自动升级**：只有调用者显式 `force:true` 才会 `--force --force`；locked + `force:false` 返回 `INSTANCE_WORKTREE_LOCKED`，自动终态清理同样不升级。
+- **W3 分支删除 fail-closed**：只有 `merge-base --is-ancestor` 退出 0 才算证明已合并；空仓库 / 检查异常一律按「未证明已合并」拒绝，显式 force 才删（资源事件标 `forced:true`），删除用 `update-ref -d <ref> <old>` 防 tip 变化。
+- **W4 槽位按真实进程退出释放**：runtime 跟踪 adapter 物理执行（start 未返回、迟到句柄未 dispose、dispose 抛错都保持占用），`on-terminal-clean` 等不到释放就跳过并记 `agent-still-running`。
+- **W5 allowlist fail-closed**：非法条目（相对路径 / `*` / 非字符串）报 `WORKSPACE_POLICY_INVALID`；「未配置」与「显式空」语义分开，显式空一律拒绝。
+- **W6 prune 不碰损坏实例**：实例 JSON 读不出 / 状态非法标 `unknown`，plan 里只报告，执行再拦一次。
+- **W7 锁不再误删**：锁内容带 owner token + pid + 心跳；只有 pid 不存在才算 stale，抢占按 inode 复核 + rename 验证，释放要求 owner/inode 一致。
+- **W8 快照按内容校验**：已存在的 `artifacts/<sha256>` 必须重算 sha256 完全一致才复用；写入走临时文件 + rename，目标为 symlink / 非普通文件 / 存储根 symlink 一律拒绝。
+- **R1 NAT64/ORCHID 位段**：`nat64Prefixes` 只接受 `/96`（RFC 6052 下唯一把 IPv4 放低 32 位的长度），其它长度配置直接 `HTTP_POLICY_INVALID`；ORCHID/ORCHIDv2 改按 `/28` 掩码判断。
+- **R2 存储写入世代**：调用记录写入带 generation，迟到写入返回 `HTTP_STORE_STALE`；`recordAttempt` 超时立即在同一记录锁队列排 fence（`markNotSent` 回滚为 `started/attempts=0`），成功 `commitResult` 无宽限、超时明确失败。
+- **R3 选择恢复不再反噬**：在飞选择世代集合登记/注销；旧请求过期后安静退出，恢复只在「没有更新选择在途」时执行；当前事务提前返回也会结束 loading。
+- **R4 嵌套 bind**：容器脚本只认可 `/testbed` 根 bind，根内嵌套 bind 一律拒绝，根外按双向路径重叠判断，并对实际写入叶（profile/package.json、node_modules、prefix/bin/dsh、日志）做 realpath 校验。
+- **m1 墓碑处置**：`resolve` 路由新增 `action:'clear-tombstone'`（必填 evidence，鉴权/审计/幂等沿用），只删墓碑快照、不重放、不伪造事件；错误文案明确 `retry` 只解除记录限制。
+- **abort 竞态**：`ctx.signal` 恰好在「入口检查之后、监听注册之前」abort 时，`start` 永不返回会让 handler 永久挂住；现在注册监听后补一次 `aborted` 复查（新增确定性回归测试）。
+
+### 测试与验收
+
+- `npm test` 59 个套件、1334 组全过；真浏览器 35 组 / 249 断言、worktree 面板 7 组 / 33 断言全过。
+- `scripts/e2e-bpmn.sh` 在 `dsh-testbed-bpmn` 上跑通（0.13.9，含新的挂载隔离前置）。
+
+**已知边界**
+- `nat64Prefixes` 若原来写 `/48` 等长度会在加载时报错（有意的收紧）。
+- `clear-tombstone` 后实例仍没有引擎快照，后续 GET 报 `BPMN_STATE_MISSING`，不能自动续跑。
+- W4 的物理生命周期跟踪是进程内状态，跨宿主重启的孤儿 agent 进程没有持久化所有权证据。
+- 成功 `commitResult` 超时后底层写入可能迟到落成 succeeded；调用方已失败，重试会复用它、不重复发送。

@@ -515,6 +515,9 @@ export async function runAgentNode(options = {}) {
     if (signal && typeof signal.addEventListener === 'function') {
       abortListener = () => resolveAborted({ kind: 'aborted' })
       signal.addEventListener('abort', abortListener, { once: true })
+      // 竞争窗口：abort 可能在「入口已检查」之后、「监听器注册」之前触发——事件已经
+      // 派发完毕，监听器永远收不到。补一次复查，避免 start 永不返回时 handler 挂死。
+      if (signal.aborted) resolveAborted({ kind: 'aborted' })
     }
     const startRacers = [
       Promise.resolve(started).then(

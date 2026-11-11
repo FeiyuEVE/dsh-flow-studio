@@ -300,6 +300,51 @@ await check('成功分支只认受理记录：适配器自报的 record 不覆�
   A.equal(result.output.canary, undefined, '自报 record 的字段不能进入结果')
 })
 
+await check('abort 落在「入口检查之后、监听注册之前」：start 永不返回也必须及时失败（不能挂死）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = {
+    id: 'dsh',
+    async probe() {
+      return { version: 'fake-hang', helpDigest: 'hang' }
+    },
+    capabilities() {
+      return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' } }
+    },
+    start() {
+      return new Promise(() => {})
+    },
+    async cancel() {},
+    async dispose() {},
+  }
+  // 最窄的竞态窗口：入口检查时还没 abort；监听注册的瞬间已经 abort，且事件不再派发。
+  // 旧实现会一直等 start（永不返回）→ handler 挂死；必须补一次 aborted 复查。
+  const signal = {
+    aborted: false,
+    addEventListener() { this.aborted = true },
+    removeEventListener() {},
+  }
+  const pending = executeAgent(elementFor('agent-abort-race'), {
+    attempt: 1,
+    executionId: 'exec-abort-race',
+    variables: {},
+    signal,
+  }, { adapters: registryWith(adapter), workspaceRoot: workspace })
+  let caught = null
+  try {
+    await Promise.race([
+      pending,
+      new Promise((resolveTimeout, rejectTimeout) => setTimeout(
+        () => rejectTimeout(new Error('handler 挂死：abort 竞态没有被唤醒')),
+        2000,
+      )),
+    ])
+  } catch (error) {
+    caught = error
+  }
+  A.ok(caught, '必须失败')
+  A.equal(caught.code, AGENT_EXECUTE_ERROR.ABORTED, `失败码应为 BPMN_ABORTED（实际 ${caught.code}）`)
+})
+
 await check('成功分支只认受理记录：没提交也没 abort 的「自称成功」→ NODE_FINISH_INVALID，不挂住（F5）', async () => {
   const workspace = freshWorkspace()
   const adapter = makeFakeAdapter({

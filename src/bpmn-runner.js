@@ -45,8 +45,9 @@
  *    / `trimActive`；被淘汰的实例**必须已落过 state**，否则抛
  *    `BPMN_LRU_EVICT_UNSNAPSHOTTED`（不静默丢）。
  * 8. 超时：`limits.activityWaitMs` 对单个活动（含 handler）计时（`_armActivityTimer`），
- *    `limits.runTimeoutMs` 对整轮计时（`_armRunTimer`）；两者都发 `error` 事件、让实例
- *    进 `failed`。handler 超时会通过 `ctx.signal`（AbortSignal）+ 回调双保险打断。
+ *    `limits.runTimeoutMs` 对整轮计时（`_armRunTimer`）；两者都发 `error` 事件，实例层
+ *    只写 `lastError`（status 保持 `ACTIVE`），runner 内部转 `blocked`。
+ *    handler 超时会通过 `ctx.signal`（AbortSignal）+ 回调双保险打断。
  * 9. 取消：`stop()` abort 在飞 handler（`_abortAll`）并 `engine.stop()` 停止推进
  *    （`withTimeout` 兜底，避免引擎不响应时把调用方挂死）。
  *
@@ -97,15 +98,15 @@
  *     返回值**由我们给**，内置表达式引擎一次都不会被调用；
  *   - 求值统一走 `bpmn-expr.evaluateFeel(expression, variables)`（组件优先，本模块
  *     不自己实现 FEEL）：`ok:true` 取 `value`；`ok:false` → 抛
- *     `BPMN_CONDITION_INVALID` → `error` 事件 + 实例 `failed`（**不**把非法表达式
+ *     `BPMN_CONDITION_INVALID` → `error` 事件 + 实例 `lastError`（**不**把非法表达式
  *     静默当 false 走去默认流）；
  *   - 结果必须是布尔：`_assertConditionBoolean` 只在 boolean（或 feelin 的
  *     `{value:boolean}` 信封）时放行，其余一律失败；这样 `= false` / `= 1 > 2`
  *     必然不通行，`= 1 + 1 = 2` 必然通行（测试里有回归锚）；
  *   - `${...}` 是引擎内置表达式语法，**一律拒绝**（`BPMN_CONDITION_LANGUAGE_UNSUPPORTED`）：
  *     只要条件表达式还交给引擎，就等于把「恒真」风险放回来；
- *   - `evaluateCondition(expression, ctx)` 可注入（上层 bpmn-expr / 将来的 DSL 用），
- *     可直接返回 `evaluateFeel` 的结果（`{ok,value}` 会被本模块解包）。
+ *   - 条件求值**不可注入**：`options.evaluateCondition` 已移除，传了直接
+ *     `BPMN_OPTIONS_INVALID`（0.13 红线：条件唯一入口是本模块内的 evaluateFeel）。
  *
  * 为什么不照「把条件改写成 `${environment.services.__cond_<flowId>}`」的路线：
  * 那条路线要在**用户给的 XML** 上做字符串改写（或引入 moddle 内存模型），而 XML 模式
@@ -126,19 +127,21 @@
  *    `maxTakes`（只认 ≥1 的显式整数；**不补默认值**——「未设上限」与「上限 N」不同，
  *    转换器已把历史模板的值显式写进 XML）。
  *    判定在「条件成立、即将沿这条边回去」之前：`takes >= maxTakes`（`takes` 是这条边
- *    已经走过的次数）→ `BPMN_FLOW_TAKE_LIMIT`，实例 failed，错误体
- *    `{ flowId, maxTakes, takes }`，文案
+ *    已经走过的次数）→ `BPMN_FLOW_TAKE_LIMIT`，错误体
+ *    `{ flowId, maxTakes, takes, attemptedTake }`，文案
  *    `连线 <flowId> 已被走过 <takes> 次，第 <takes+1> 次超过 fs:maxRounds=<maxTakes> 的连线次数上限`。
- *    → 主判定在 `_evaluateFlowCondition`（复用条件求值的失败通道）；`_onFlowTake` 里还有一次
- *      兜底，覆盖「默认流上带 fs:maxRounds」这种条件求值通道管不到的情况。
+ *    实例 status 保持 `ACTIVE` 并写 `lastError`（实例没有 failed 状态），runner 内部转 `blocked`。
+ *    → 判定在 `_takeSequenceFlow`（`SequenceFlow.take` 的包装点，见 `_createEngine`）：
+ *      **take 之前**先按已走次数预判并预占额度，conditional / default / 无条件边一视同仁；
+ *      `_onFlowTake` 只记录已经走出去的边，不再做兜底判定。
  *    → 历史说明（只是来源，不是引擎特性）：0.13 之前的老引擎有一套「打回上限」，
  *      迁移器把旧流程的驳回边写成一条条件连线 + `fs:maxRounds`；新引擎按通用的
  *      「连线通过次数上限」执行同一条约束，不再有专门的驳回概念（也不关心条件文本
  *      是 `= true` 还是别的 FEEL 表达式）。
  * 2. **通用循环护栏**：同一条连线在单个实例里被 take 的次数上限（默认 1000，
  *    `loopGuardMax` 覆盖，0 = 关）。超限 → `BPMN_LOOP_LIMIT`（带 `flowId` 与 `takes`）。
- *    条件求值通道按「再走一次会不会超」预判（所以 `= true` 的死环在 take 之前就失败），
- *    `_onFlowTake` 再按实际 take 次数兜底（覆盖无条件连线）。
+ *    判定同样在 `_takeSequenceFlow` 的预占阶段：先判 `maxTakes`，再判循环护栏，
+ *    所以 `= true` 的死环也在 take 之前就失败，不会多驱动一次目标节点。
  *
  * 两个计数（`_attempts` / `_flowTakes`）随 `getState()` 信封走（`attempts` / `flowTakes`），
  * 恢复后继续生效——否则在环里恢复一次就能把上限「清零」重来。
@@ -395,7 +398,7 @@ function combineSignals(signals) {
 /**
  * 默认条件求值：`bpmn-expr.evaluateFeel`（组件优先，本模块不自己实现 FEEL）。
  *
- * `ok:false` 一律抛结构化错误（→ `error` 事件 + 实例 failed），**不**降级成 false：
+ * `ok:false` 一律抛结构化错误（→ `error` 事件 + 实例 `lastError`），**不**降级成 false：
  * 非法条件必须暴露，不能静默走默认流。
  *
  * @param {string} expression 表达式原文（可带 `=` 前缀）
@@ -842,7 +845,7 @@ function leastRecentlyUsedKey() {
 /**
  * 把活跃实例裁到上限以内（为新实例腾位置）。
  *
- * 被淘汰者必须 `_canEvict()`：已落过 state，或已到终态（done/failed），或从未启动。
+ * 被淘汰者必须 `_canEvict()`：已落过 state，或已到终态（done/blocked），或从未启动。
  * 否则抛 `BPMN_LRU_EVICT_UNSNAPSHOTTED`，并且**不**动集合里的任何实例。
  */
 function trimActive() {
@@ -905,12 +908,8 @@ function newInstanceId() {
  *   // 这是「防死环」的最后一道保险，和 fs:maxRounds 的连线次数上限互不替代。
  *   loopGuardMax?: number,
  *   shouldSnapshot?: (event: object) => boolean | Promise<boolean>,
- *   // 条件求值注入点：返回 boolean，或直接返回 bpmn-expr 的 `{ ok, value }`（本模块解包）。
- *   // ok:false / 抛错 / 非布尔一律让实例 failed，绝不当作 false 静默走默认流。
- *   evaluateCondition?: (expression: string, ctx: {
- *     flowId: string | null, elementId: string | null, from: string | null, to: string | null,
- *     variables: Record<string, unknown>,
- *   }) => boolean | { ok: boolean, value: unknown } | Promise<boolean | { ok: boolean, value: unknown }>,
+ *   // 定义身份（必填）：state 信封 v2 用它确认「恢复的确实是同一份定义」。
+ *   definitionIdentity: { id: string, version: string | number, hash: string },
  *   maxActiveInstances?: number,
  *   instanceId?: string,
  * }} options
@@ -1335,7 +1334,8 @@ class BpmnRunner {
   /**
    * 停止：abort 在飞 handler + 停止引擎推进（坑 9），并从活跃实例表摘除。
    *
-   * 幂等；不改变 done / failed 终态。停止后 `status()` 是 `idle`。
+   * 幂等；实例层取消（→ `CANCELED`）由 runtime 负责，这里只负责让执行停下。
+   * 停止后 `status()` 是 `idle`。
    *
    * @returns {Promise<void>}
    */
@@ -1651,7 +1651,7 @@ class BpmnRunner {
 
   /**
    * `evaluateFeel()` 的结果形状是 `{ ok, value, error }`：这里解包；`ok:false` 与抛错
-   * 同样处理（→ 实例 blocked，不静默当 false）。
+   * 同样处理（→ 实例写 `lastError`、runner 转 `blocked`，不静默当 false）。
    */
   _normalizeConditionOutcome(value, flowId, expression) {
     if (isPlainObject(value) && typeof value.ok === 'boolean') {
@@ -1718,7 +1718,7 @@ class BpmnRunner {
   }
 
   _onActivityStart(api) {
-    // failed/blocked 之后不得再出现 activity/start（审查实测的回归点）。
+    // blocked 之后不得再出现 activity/start（审查实测的回归点）。
     if (this._evicted || this._stopping || this._fatal !== null) return
     this._sawRun = true
     const content = isPlainObject(api?.content) ? api.content : {}
@@ -2215,7 +2215,7 @@ class BpmnRunner {
       `活动 ${entry.elementId ?? executionId} 超过 ${waitMs}ms 未完成（limits.activityWaitMs）`,
       { elementId: entry.elementId ?? undefined, activityId: executionId, instanceId: this.instanceId, timeoutMs: waitMs }
     )
-    // 先自己判 failed（发 error / 调 onError / 让在等的 Promise 失败），再驱动引擎失败，
+    // 先自己锁死失败态（发 error / 调 onError / 让在等的 Promise 失败），再驱动引擎失败，
     // 这样引擎侧那条错误不会盖掉我们这份更精确的错误。
     this._fail(fatal)
     if (typeof entry.finish === 'function') {
@@ -2224,7 +2224,7 @@ class BpmnRunner {
       try {
         finish(fatal)
       } catch {
-        // 引擎已经收尾时回调可能抛：不影响 failed 终态。
+        // 引擎已经收尾时回调可能抛：不影响已锁定的失败态。
       }
       return
     }

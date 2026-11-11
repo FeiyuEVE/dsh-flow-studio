@@ -12,14 +12,14 @@
  *      重放的 activity/wait 开始、没有 process/start，A 被留在了原地）。
  *   3. FEEL `= false` 必走默认边；`= approved = false` 的假分支也真的会走回退边；
  *      `evaluateCondition` 注入点生效（上层 bpmn-expr 的落点）。
- *   4. agent handler 抛错 → 实例 failed + onError + error 事件。
- *   5. activityWaitMs 超时 → failed（永不 resolve 的 handler；同时 userTask 等待超时）。
+ *   4. agent handler 抛错 → runner 转 blocked + onError + error 事件（实例只写 lastError）。
+ *   5. activityWaitMs 超时 → runner blocked（永不 resolve 的 handler；同时 userTask 等待超时）。
  *   6. LRU：max=1 启两个实例，第一个被淘汰；**未落 state** 时淘汰必须报错（不静默丢）。
  *
  * 另外四组（0.13 的红线锚 + 迁移必须）：
  *   - 快照只在 activity/wait 与 activity/end 之后触发（`shouldSnapshot` 看到的类型集合）；
  *   - 条件求值归本模块（`bpmn-expr.evaluateFeel`）：`= 1 > 2` 不通行、`= 1 + 1 = 2` 通行、
- *     非法表达式 → error + failed、`${...}` 引擎内置语法一律拒绝；
+ *     非法表达式 → error + runner blocked、`${...}` 引擎内置语法一律拒绝；
  *   - 加载期校验：缺 handler / 未知 kind / javascript 条件 / parallelGateway / 默认流条件；
  *   - 连线通过次数上限（`fs:maxRounds` → `maxTakes`）+ 通用循环护栏（`BPMN_LOOP_LIMIT`）：
  *     `= true` 的成环连线必须有上限，否则流程会无限重跑；flow 的 `extensions` 原样保留。
@@ -663,7 +663,7 @@ try {
     A.equal(recorder.flowIds().includes('f_ok'), true)
   })
 
-  await check('条件求值归本模块：`= 1 > 2` 不通行、`= 1 + 1 = 2` 通行、非法表达式 failed、`${...}` 被拒', async () => {
+  await check('条件求值归本模块：`= 1 > 2` 不通行、`= 1 + 1 = 2` 通行、非法表达式转 blocked、`${...}` 被拒', async () => {
     // (a) 运算 + 假结果：`= 1 > 2` 必须不通行。若条件被交给引擎的内置表达式引擎，
     //     它会把这个字符串当非空 → 恒真（这就是本条测试要钉死的回归）。
     {
@@ -690,7 +690,7 @@ try {
       A.deepEqual(back.condition, { expression: '= 1 + 1 = 2', value: true }, 'flow/taken 带 { expression, value }')
     }
 
-    // (c) 非法表达式（`= approved =` 少一个操作数）：必须 error + failed，
+    // (c) 非法表达式（`= approved =` 少一个操作数）：必须 error + runner blocked，
     //     **不能**静默当 false 走去默认流。definition 侧不带条件（条件只在 XML 里），
     //     所以不会被加载期校验提前拦下 —— 走的正是运行期 ok:false 分支。
     {
@@ -994,9 +994,9 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  // 4. handler 抛错 → failed
+  // 4. handler 抛错 → runner blocked（实例 status 保持 ACTIVE，只写 lastError）
   // -------------------------------------------------------------------------
-  await check('handler 抛错：实例 failed + onError + error 事件', async () => {
+  await check('handler 抛错：runner 转 blocked + onError + error 事件（实例不判死）', async () => {
     const recorder = makeRecorder()
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-boom' }),
@@ -1030,9 +1030,9 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  // 5. 活动超时 → failed
+  // 5. 活动超时 → runner blocked
   // -------------------------------------------------------------------------
-  await check('activityWaitMs：handler 永不 resolve → 超时 failed（并 abort ctx.signal）', async () => {
+  await check('activityWaitMs：handler 永不 resolve → 超时转 blocked（并 abort ctx.signal）', async () => {
     const errors = []
     let aborted = false
     const startedAt = Date.now()
@@ -1100,7 +1100,7 @@ try {
     A.equal(runner.failure().code, 'BPMN_ACTIVITY_TIMEOUT', '保留原来的超时错误，不被晚到成功覆盖')
   })
 
-  await check('activityWaitMs：userTask 一直没人完成任务 → 超时 failed', async () => {
+  await check('activityWaitMs：userTask 一直没人完成任务 → 超时转 blocked', async () => {
     const recorder = makeRecorder()
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout-human' }),
@@ -1118,7 +1118,7 @@ try {
     A.equal(errorEvent.elementId, 'n_human')
   })
 
-  await check('runTimeoutMs：整轮跑不完 → failed', async () => {
+  await check('runTimeoutMs：整轮跑不完 → runner blocked', async () => {
     const errors = []
     const runner = track(createRunner({
       definition: makeDefinition({ id: 'def-timeout-run' }),

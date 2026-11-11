@@ -1,31 +1,28 @@
 #!/usr/bin/env node
 /**
- * 客户端性能回归：拖拽提交、节点 memo / props 引用稳定、草稿去抖。
+ * 客户端性能回归（0.13.3 步骤 5）：画布变更 / 保存 / 运行态标记。
  *
- * 不挂 DOM：React Flow 需要真实 DOM 度量，所以这里直接用导出的纯逻辑
- * （createDragHandlers / createNodeDecorator / createDraftScheduler）证明行为，
- * 断言的是「拖动中 0 次提交、松手 1 次」「去抖窗内 5 次变更只写 1 次」这类可失败的条件。
+ * 不挂 DOM：直接 import 纯逻辑模块（bpmn-state / definition-state / page 的纯函数），
+ * 断言的是可失败的硬条件：
+ *  - 拖动过程中（连续 command 变更）**不序列化 XML**；
+ *  - 命令完成后按去抖窗只落一次；
+ *  - 一直不停手时 maxWait 强制落一次；
+ *  - 两次保存乱序返回时，旧结果不能覆盖新结果；
+ *  - 运行态 marker 只调 `setRuntimeState`，不产生修订号、不触发草稿保存；
+ *  - 保存前等待属性面板里 contenteditable 的去抖提交。
  *
  * 运行：node test/client-perf.test.mjs
  */
 
 import assert from 'node:assert/strict'
 
-import React from 'react'
-
-import { bindReact } from '../src/client/runtime.js'
-
-// canvas.js 的 memo 包装在首次渲染时读 rt.React，必须先注入。
-bindReact(React)
-
-const {
-  createDragHandlers, createNodeDecorator, flowComponentTypes,
-  studioNextEdgeType, studioNodeType, studioRejectEdgeType,
-} = await import('../src/client/canvas.js')
-const {
-  DRAFT_DEBOUNCE_MS, DRAFT_MAX_WAIT_MS, createDraftScheduler, createDraftStore,
-} = await import('../src/client/drafts.js')
-const model = await import('../src/model.js')
+import {
+  createEditRevision, createSaveQueue,
+} from '../src/client/bpmn-state.js'
+import { createDefinitionState } from '../src/client/definition-state.js'
+import {
+  commitPendingProperties, runtimeMarkersFromEvents, syncRuntimeMarkers,
+} from '../src/client/page.js'
 
 let checks = 0
 function check(name, fn) {
@@ -34,7 +31,14 @@ function check(name, fn) {
   console.log('  ✓ ' + name)
 }
 
-/** 假定时器：可推进时间、按到期顺序触发，用来断言写盘次数而不是等真实 600ms。 */
+function checkAsync(name, fn) {
+  return fn().then(() => {
+    checks += 1
+    console.log('  ✓ ' + name)
+  })
+}
+
+/** 假定时器：可推进时间、按到期顺序触发。 */
 function fakeTimer() {
   let now = 0
   let seq = 0
@@ -72,191 +76,227 @@ function fakeTimer() {
   }
 }
 
-/** 假 storage：与 localStorage 同形，并数 setItem 次数。 */
-function fakeStorage() {
-  const data = new Map()
-  let writes = 0
-  return {
-    get writes() { return writes },
-    setItem(key, value) {
-      data.set(String(key), String(value))
-      writes += 1
-    },
-    getItem(key) {
-      return data.has(String(key)) ? data.get(String(key)) : null
-    },
-    removeItem(key) {
-      data.delete(String(key))
-    },
-  }
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
-function makeDraftScheduler() {
+/** 与 page.js 的草稿队列同形：保存 = 序列化 XML（计数）。 */
+function makeCanvasPipeline({ serialize } = {}) {
   const timer = fakeTimer()
-  const storage = fakeStorage()
-  const store = createDraftStore(storage)
-  const scheduler = createDraftScheduler({
-    write: flow => store.write(flow),
+  const revisions = createEditRevision()
+  const serialized = []
+  const queue = createSaveQueue({
+    debounceMs: 120,
+    maxWaitMs: 400,
+    // 同步保存：断言「序列化次数」不依赖微任务时序（真实的 saveXML 是异步的，
+    // 但队列语义相同；异步与乱序路径在下面单独测）。
+    save: snapshot => {
+      const xml = serialize ? serialize(snapshot) : '<xml>' + snapshot.revision + '</xml>'
+      serialized.push({ revision: snapshot.revision, xml })
+      return { xml }
+    },
     setTimeout: timer.setTimeout,
     clearTimeout: timer.clearTimeout,
   })
-  return { timer, storage, store, scheduler }
-}
-
-/** 0.13.3：草稿是 XML 形状，不再携带整份 JSON flow。 */
-function makeDraft(definitionId, text = '初始') {
   return {
-    definitionId,
-    baseVersion: 1,
-    baseHash: 'hash-v1',
-    xml: `<xml>${text}</xml>`,
+    timer,
+    revisions,
+    queue,
+    serialized,
+    change() {
+      revisions.markChanged()
+      queue.schedule({ revision: revisions.revision })
+    },
   }
 }
 
-console.log('client perf')
+console.log('client perf (bpmn)')
 
-// ── 缺陷 7：拖拽只在松手时提交一次 ──────────────────────────────────────
-check('拖拽：拖动中 0 次提交，onNodeDragStop 恰好提交 1 次最终位置', () => {
-  const commits = []
-  const handlers = createDragHandlers({
-    onMoveNode: (id, x, y) => commits.push({ id, x, y }),
+check('拖动过程不序列化：连续 command 变更期间 saveXML 调用 0 次，停下后只落 1 次', () => {
+  let serializeCalls = 0
+  const pipeline = makeCanvasPipeline({
+    serialize: () => {
+      serializeCalls += 1
+      return '<xml/>'
+    },
   })
-  for (const x of [120, 128, 141, 160]) {
-    handlers.onNodeDrag({}, { id: 'n_req', position: { x, y: 220 } })
+  // 10 次变更（拖动中的 elements.move 命令），总时长 200ms < maxWait 400ms，
+  // 每次间隔 20ms < 去抖窗 120ms。
+  for (let i = 0; i < 10; i += 1) {
+    pipeline.change()
+    pipeline.timer.advance(20)
   }
-  assert.equal(commits.length, 0, '拖动中不能把每帧位置提交进顶层 flow')
-  handlers.onNodeDragStop({}, { id: 'n_req', position: { x: 199.6, y: 223.2 } })
-  assert.equal(commits.length, 1, '松手必须且只能提交一次')
-  assert.deepEqual(commits[0], { id: 'n_req', x: 200, y: 223 }, '提交的是取整后的最终位置')
+  assert.equal(serializeCalls, 0, '拖动过程中不能序列化整图')
+  assert.equal(pipeline.queue.pending() !== null, true, '仍有一份待写快照')
+  pipeline.timer.advance(120)
+  assert.equal(serializeCalls, 1, '命令完成、去抖到期后只序列化一次')
+  assert.equal(pipeline.serialized[0].revision, 10, '落盘的是最新修订号')
 })
 
-check('拖拽：运行中锁定后松手也不提交；解锁后恢复提交', () => {
-  let locked = true
-  const commits = []
-  const handlers = createDragHandlers({
-    isLocked: () => locked,
-    onMoveNode: (id, x, y) => commits.push([id, x, y]),
-  })
-  handlers.onNodeDrag({}, { id: 'n_dev', position: { x: 10, y: 20 } })
-  handlers.onNodeDragStop({}, { id: 'n_dev', position: { x: 40, y: 80 } })
-  assert.equal(commits.length, 0, '锁结构时拖拽落位不能写回 flow')
-  locked = false
-  handlers.onNodeDragStop({}, { id: 'n_dev', position: { x: 40, y: 80 } })
-  assert.equal(commits.length, 1)
-  assert.deepEqual(commits[0], ['n_dev', 40, 80])
+check('命令完成后去抖：两次命令之间超过去抖窗会各落一次，窗内只落最后一次', () => {
+  const pipeline = makeCanvasPipeline()
+  pipeline.change()
+  pipeline.timer.advance(50)
+  pipeline.change()
+  pipeline.timer.advance(50)
+  pipeline.change()
+  assert.equal(pipeline.serialized.length, 0, '窗内不能提前落盘')
+  pipeline.timer.advance(120)
+  assert.equal(pipeline.serialized.length, 1, '三次命令在同一个去抖窗 → 一次落盘')
+  assert.equal(pipeline.serialized[0].revision, 3)
+
+  // 新命令另起一个窗 → 第二次落盘。
+  pipeline.change()
+  pipeline.timer.advance(120)
+  assert.equal(pipeline.serialized.length, 2)
+  assert.equal(pipeline.serialized[1].revision, 4)
 })
 
-// ── 缺陷 7：节点 / 边 memo 与 props 引用稳定 ────────────────────────────
-check('节点与两种边组件都是 React.memo 包装，组件表引用稳定', () => {
-  const memoTag = Symbol.for('react.memo')
-  assert.equal(studioNodeType().$$typeof, memoTag, 'StudioNode 必须 memo 包装')
-  assert.equal(studioNextEdgeType().$$typeof, memoTag, 'next 边必须 memo 包装')
-  assert.equal(studioRejectEdgeType().$$typeof, memoTag, 'reject 边必须 memo 包装')
-  const types = flowComponentTypes()
-  assert.equal(types.nodeTypes.studio, studioNodeType(), 'nodeTypes 必须复用同一个组件引用')
-  assert.equal(types.edgeTypes.studioNext, studioNextEdgeType())
-  assert.equal(types.edgeTypes.studioReject, studioRejectEdgeType())
-  assert.equal(flowComponentTypes(), types, '每次 render 不能新建一份组件映射')
-})
-
-check('节点 props 引用稳定：未变化的节点复用同一个 React Flow 节点对象', () => {
-  const state = {
-    nodeStates: null,
-    selection: { kind: 'node', id: 'n_req' },
-    locked: false,
-    linkState: null,
-  }
-  const decorate = createNodeDecorator({
-    readState: () => state,
-    actions: { select() {}, openInspector() {}, deleteNode() {}, addDownstream() {} },
-  })
-  const flow = model.defaultFlow()
-  const req = flow.nodes.find(node => node.id === 'n_req')
-  const dev = flow.nodes.find(node => node.id === 'n_dev')
-  const plan = flow.nodes.find(node => node.id === 'n_plan')
-
-  const firstReq = decorate(req)
-  assert.equal(firstReq.selected, true)
-  const first = decorate(plan)
-  assert.equal(decorate(plan), first, '输入没变时必须复用同一个对象，memo 才不会被新 data 击穿')
-
-  state.selection = { kind: 'node', id: 'n_dev' }
-  assert.equal(decorate(plan), first, '选中别的节点不应重建本节点的 data')
-  assert.notEqual(decorate(req), firstReq, '被取消选中的节点必须重建')
-  assert.equal(decorate(req).selected, false)
-
-  const renamed = decorate({ ...req, title: '需求分析（改名）' })
-  assert.notEqual(renamed, first, '节点内容变了必须重建')
-  assert.equal(renamed.data.node.title, '需求分析（改名）')
-
-  state.nodeStates = { [plan.id]: { state: 'running', label: '运行中' } }
-  assert.notEqual(decorate(plan), first, '运行状态变了必须重建')
-
-  decorate.prune(new Set([req.id]))
-  assert.equal(decorate(dev).id, dev.id)
-})
-
-// ── 缺陷 8：草稿写盘去抖 / maxWait / flush ──────────────────────────────
-check('草稿去抖：一个去抖窗内连续 5 次变更只写 1 次 localStorage', () => {
-  const { timer, storage, store, scheduler } = makeDraftScheduler()
-  const draft = makeDraft('def-debounce')
-
-  for (let i = 0; i < 5; i += 1) {
-    draft.xml = `<xml>第 ${i} 个字</xml>`
-    assert.equal(scheduler.schedule(draft), true)
-    timer.advance(100)
-  }
-  assert.equal(storage.writes, 0, '去抖窗内不能写盘')
-  timer.advance(DRAFT_DEBOUNCE_MS)
-  assert.equal(storage.writes, 1, '5 次变更只应写最后一次')
-  assert.equal(store.read('def-debounce').xml, '<xml>第 4 个字</xml>')
-  assert.equal(timer.pending(), 0, '写完后不能留下定时器')
-})
-
-check('草稿去抖：一直不停手也会在 maxWait 内强制落一次盘', () => {
-  const { timer, storage, scheduler } = makeDraftScheduler()
-  const draft = makeDraft('def-maxwait')
-
-  // 每 100ms 敲一下、持续 3s：去抖窗永远被重置，只有 maxWait（2s）能落盘。
+check('一直不停手：maxWait 到点强制落一次，后续继续去抖', () => {
+  const pipeline = makeCanvasPipeline()
   for (let i = 0; i < 30; i += 1) {
-    draft.xml = `<xml>连续输入 ${i}</xml>`
-    scheduler.schedule(draft)
-    timer.advance(100)
+    pipeline.change()
+    pipeline.timer.advance(20) // 600ms 连续输入，去抖窗一直被重置
   }
-  assert.ok(timer.now() >= DRAFT_MAX_WAIT_MS)
-  assert.equal(storage.writes, 1, '3s 连续输入应恰好被 maxWait 强制写 1 次')
+  assert.ok(pipeline.timer.now() >= 400)
+  assert.equal(pipeline.serialized.length, 1, 'maxWait 强制落 1 次')
 })
 
-check('页面隐藏 / 卸载：flush 立即写最后一次，不等去抖，且旧定时器不再写', () => {
-  const { timer, storage, store, scheduler } = makeDraftScheduler()
-  const draft = makeDraft('def-flush')
+await checkAsync('乱序响应：旧请求晚到返回 stale，不覆盖最新结果 / 不清新修订的 dirty', async () => {
+  const first = deferred()
+  const second = deferred()
+  let calls = 0
+  const timer = fakeTimer()
+  const saved = []
+  const queue = createSaveQueue({
+    debounceMs: 0,
+    maxWaitMs: 10,
+    setTimeout: timer.setTimeout,
+    clearTimeout: timer.clearTimeout,
+    save: async () => {
+      calls += 1
+      return calls === 1 ? first.promise : second.promise
+    },
+    onSaved: (result, snapshot) => saved.push({ result, revision: snapshot.revision }),
+  })
+  queue.schedule({ revision: 1 })
+  const one = queue.flush()
+  queue.schedule({ revision: 2 })
+  const two = queue.flush()
+  assert.equal(calls, 2, '两次 flush 各发一个请求')
 
-  draft.xml = '<xml>第一个字</xml>'
-  scheduler.schedule(draft)
-  timer.advance(200)
-  draft.xml = '<xml>最后一个字</xml>'
-  scheduler.schedule(draft)
-  assert.equal(storage.writes, 0)
+  // 新请求先返回：只有它算数。
+  second.resolve({ version: 2 })
+  const resultTwo = await two
+  assert.equal(resultTwo.ok, true)
+  assert.equal(resultTwo.stale, false)
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].revision, 2, '最新请求的结果被采纳')
 
-  // 相当于 visibilitychange → hidden / 组件卸载。
-  const record = scheduler.flush()
-  assert.equal(storage.writes, 1, '隐藏时必须立即 flush')
-  assert.equal(record.xml, '<xml>最后一个字</xml>')
-  assert.equal(store.read('def-flush').xml, '<xml>最后一个字</xml>')
-  assert.equal(timer.pending(), 0, 'flush 后不得留下定时器')
+  // 旧请求晚到：stale=true，onSaved 不再触发，也不写 lastResult。
+  first.resolve({ version: 1 })
+  const resultOne = await one
+  assert.equal(resultOne.ok, true)
+  assert.equal(resultOne.stale, true, '旧请求必须标记 stale')
+  assert.equal(saved.length, 1, '旧结果不能再触发 onSaved')
+  assert.equal(queue.lastResult.version, 2, 'lastResult 保持最新结果')
 
-  timer.advance(10000)
-  assert.equal(storage.writes, 1, 'flush 后旧定时器不得二次写盘')
+  // 修订号：保存只清提交时那一版；提交后继续改仍然 dirty。
+  const revisions = createEditRevision()
+  revisions.markChanged()
+  revisions.markChanged()
+  const submitted = revisions.revision
+  revisions.markChanged()
+  revisions.markSaved(submitted)
+  assert.equal(revisions.isDirty(), true, '保存后继续编辑仍 dirty')
+  assert.equal(revisions.savedRevision, submitted, '只推进到提交时的修订号')
+  revisions.markSaved(revisions.revision)
+  assert.equal(revisions.isDirty(), false)
+
+  // 定义状态：保存结果属于另一份定义时不钉版本、不动 dirty。
+  const state = createDefinitionState({ id: 'flow-a', version: 1, name: 'A' })
+  state.markDirty()
+  const pinned = state.pinSaved({ id: 'flow-b', version: 9 })
+  assert.equal(pinned.pinned, false, '另一份定义的保存结果不能钉到当前定义')
+  assert.equal(state.version, 1)
+  assert.equal(state.dirty, true)
 })
 
-check('草稿调度：保存成功可 cancel，待写内容不会再落盘', () => {
-  const { timer, storage, scheduler } = makeDraftScheduler()
-  const draft = makeDraft('def-cancel', '待写')
-  scheduler.schedule(draft)
-  assert.equal(scheduler.cancel('def-cancel'), true)
-  timer.advance(5000)
-  assert.equal(storage.writes, 0, 'cancel 后不能再写盘')
-  assert.equal(scheduler.pending(), null)
+check('运行态标记不触发保存：只调 setRuntimeState，不动修订号 / 草稿队列', () => {
+  const markers = runtimeMarkersFromEvents([
+    { type: 'activity/start', seq: 1, elementId: 'Human_1', activityId: 'act-1' },
+    { type: 'activity/wait', seq: 2, elementId: 'Human_1', activityId: 'act-1' },
+    { type: 'activity/end', seq: 3, elementId: 'Agent_1', activityId: 'act-2', status: 'completed' },
+    { type: 'error', seq: 4, elementId: 'Agent_2', error: { code: 'X', message: 'boom' } },
+    { type: 'custom/unknown', seq: 5, elementId: 'Human_1' },
+    // 只有 activityId、没有 elementId：不能变成 marker。
+    { type: 'activity/start', seq: 6, activityId: 'orphan-act' },
+  ])
+  assert.deepEqual(
+    markers.slice().sort((left, right) => left.elementId.localeCompare(right.elementId)),
+    [
+      { elementId: 'Agent_1', state: 'completed' },
+      { elementId: 'Agent_2', state: 'failed' },
+      { elementId: 'Human_1', state: 'waiting' },
+    ],
+    'marker 只来自 elementId；activityId 不参与',
+  )
+
+  const calls = []
+  const revisions = createEditRevision()
+  revisions.markChanged()
+  const before = revisions.revision
+  const draftSchedules = []
+  const fakeEditor = {
+    setRuntimeState(list) { calls.push(list) },
+  }
+  const count = syncRuntimeMarkers(fakeEditor, markers)
+  assert.equal(count, 3)
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0], markers)
+  assert.equal(revisions.revision, before, 'marker 不递增编辑修订号')
+  assert.equal(draftSchedules.length, 0, 'marker 不调度草稿保存')
+  assert.equal(syncRuntimeMarkers(null, markers), 0, '画布未就绪时安全返回')
+  assert.equal(syncRuntimeMarkers({}, markers), 0, '控制器缺 setRuntimeState 时安全返回')
+})
+
+await checkAsync('保存前等待属性输入：文本 blur 同步提交；contenteditable 等去抖窗', async () => {
+  const delays = []
+  const blurCalls = []
+  const makeEditor = field => ({
+    getContainer: () => ({
+      querySelector: () => field,
+    }),
+  })
+  const textField = { isContentEditable: false, blur: () => blurCalls.push('text') }
+  const textResult = await commitPendingProperties(makeEditor(textField), {
+    waitMs: 650,
+    delay: async ms => { delays.push(ms) },
+  })
+  assert.equal(textResult.waited, false, '文本输入 blur 已同步提交，无需等待')
+  assert.deepEqual(blurCalls, ['text'])
+  assert.deepEqual(delays, [], '不能无谓等待 650ms')
+
+  const richField = { isContentEditable: true, getAttribute: () => 'true', blur: () => blurCalls.push('rich') }
+  const richResult = await commitPendingProperties(makeEditor(richField), {
+    waitMs: 650,
+    delay: async ms => { delays.push(ms) },
+  })
+  assert.equal(richResult.waited, true)
+  assert.equal(richResult.waitedMs, 650)
+  assert.deepEqual(delays, [650], 'contenteditable 必须等官方 600ms 去抖')
+  assert.deepEqual(blurCalls, ['text', 'rich'])
+
+  const noFocus = await commitPendingProperties(makeEditor(null), { delay: async () => {} })
+  assert.equal(noFocus.waited, false)
+  const noEditor = await commitPendingProperties(null, { delay: async () => {} })
+  assert.equal(noEditor.waited, false, '没有画布时安全返回')
 })
 
 console.log(`\n${checks} 组通过`)

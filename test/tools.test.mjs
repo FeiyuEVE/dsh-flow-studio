@@ -38,14 +38,10 @@ const { defaultFlow } = await import('../src/model.js')
 const { readFlowDir, writeFlowDir } = await import('../src/flowdir.js')
 const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
-// F2：前端的纯逻辑（工作区门禁 / 建 run 与 start 的请求体）在这里一起断言。
-const {
-  createRunBodyFor, isAbsoluteWorkspace, normalizeWorkspace, readStoredWorkspace,
-  runControlState, startFailurePlan, startRunBodyFor, startRunRequest, workspaceBlockReason,
-  writeStoredWorkspace,
-} = await import('../src/client/page.js')
-// F2：HTTP 载荷级断言走真实客户端 api（fetch spy），不是「有传参」这种弱断言。
-// G7：轻量轮询（?light=1）的降级路径也在客户端，这里一并验证「正常时不会回退」。
+// 0.13.3 步骤 5：页面已切到 definitions/instances；旧 workspace 门禁函数随页面移除。
+// 这里只保留「运行前必须钉版本 / 不允许旧运行域」的纯函数与源码级护栏。
+const { runBlockReason } = await import('../src/client/page.js')
+// G7：轻量轮询（?light=1）的降级路径仍在客户端 api 里，这里一并验证「正常时不会回退」。
 const {
   api: clientApi, createLightRunReader, readRunPath,
 } = await import('../src/client/api.js')
@@ -2085,182 +2081,75 @@ try {
     }
   })
 
-  // ── 9.6 F2：画布「开始运行」必须带 workspace ──────────────────────────
-  await check('F2 前端：建 run / start 的请求体都含 workspace；没有工作区返回 null', () => {
-    const flow = { id: 'flow-main', name: '主流程' }
-    A.deepEqual(createRunBodyFor(flow, '本次运行', '/repo/a'), {
-      flowId: 'flow-main', name: '本次运行', workspace: '/repo/a',
-    })
-    A.deepEqual(createRunBodyFor(flow, '', '/repo/a'), {
-      flowId: 'flow-main', name: '主流程', workspace: '/repo/a',
-    })
-    A.equal(createRunBodyFor(flow, '本次运行', ''), null, '没工作区不能构造建 run 请求')
-    A.equal(createRunBodyFor(flow, '本次运行', '   '), null)
-    A.equal(createRunBodyFor(null, '本次运行', '/repo/a'), null)
-
-    A.deepEqual(startRunBodyFor(' /repo/a '), { workspace: '/repo/a' })
-    A.equal(startRunBodyFor(''), null, '没工作区不能构造 start 请求')
-    A.equal(startRunBodyFor('  '), null)
-
-    A.equal(normalizeWorkspace('  /repo/a  '), '/repo/a')
-    A.equal(normalizeWorkspace(42), '')
-    A.equal(isAbsoluteWorkspace('/repo/a'), true)
-    A.equal(isAbsoluteWorkspace('C:\\repo'), true)
-    A.equal(isAbsoluteWorkspace('relative/path'), false)
+  // ── 9.6 F2（0.13.3 步骤 5）：页面运行必须钉 definitionVersion ──────────
+  await check('F2 前端：运行门禁由定义版本决定（dirty / 未保存一律不许运行）', () => {
+    A.equal(runBlockReason({ definitionId: 'flow-main', version: 2, dirty: false }), '')
+    A.match(runBlockReason({ definitionId: 'flow-main', version: 2, dirty: true }), /先保存版本/)
+    A.match(runBlockReason({ definitionId: 'flow-main', version: null, dirty: false }), /没有已保存的版本/)
+    A.match(runBlockReason({ definitionId: '', version: 1, dirty: false }), /还没有保存过定义/)
+    A.match(runBlockReason(null), /还没有选择定义/)
   })
 
-  await check('F2 前端：未选择工作区不允许启动（可读提示 + 按钮禁用 + 不退回默认目录）', () => {
-    const empty = workspaceBlockReason('')
-    A.match(empty, /未选择工作区/)
-    A.match(empty, /无法启动/)
-    A.match(empty, /默认目录/, '必须说明不会退回默认目录')
-    A.match(workspaceBlockReason('   '), /未选择工作区/)
-    A.match(workspaceBlockReason('relative/path'), /绝对路径/)
-    A.equal(workspaceBlockReason('/repo/a'), '')
-
-    const blocked = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: false })
-    A.equal(blocked.startDisabled, true, '没工作区时「运行」必须禁用')
-    A.match(blocked.startTitle, /未选择工作区/)
-    const ready = runControlState({ id: 'r1', status: 'pending' }, { hasFlow: true, hasWorkspace: true })
-    A.equal(ready.startDisabled, false)
-    // 与 m7（运行列表未回）同时成立时，两条原因都要写出来，不能只报一条。
-    const both = runControlState(null, { hasFlow: true, hasWorkspace: false, listReady: false })
-    A.match(both.startTitle, /未选择工作区/)
-    A.match(both.startTitle, /正在读取运行记录/)
-  })
-
-  await check('F2 前端：工作区选择会记住；清空即删除（不会悄悄带出旧目录）', () => {
-    const storage = fakeStorage()
-    A.equal(readStoredWorkspace(storage), '')
-    A.equal(writeStoredWorkspace(storage, '  /repo/a  '), true)
-    A.equal(readStoredWorkspace(storage), '/repo/a')
-    A.equal(storage.raw('dsh-flow-studio.workspace'), '/repo/a')
-    A.equal(writeStoredWorkspace(storage, '   '), true)
-    A.equal(storage.has('dsh-flow-studio.workspace'), false)
-    A.equal(readStoredWorkspace(storage), '')
-    // localStorage 不存在的 SSR 环境：读回空串，不抛错。
-    A.equal(readStoredWorkspace(null), '')
-  })
-
-  await check('F2 前端：startRunRequest 未选工作区时 0 请求；选了就两次请求都带 workspace', async () => {
-    const flow = { id: 'flow-main', name: '主流程' }
-    const calls = { create: [], start: [], delete: [] }
-    const spyApi = {
-      async createRun(body) {
-        calls.create.push(body)
-        return { ok: true, run: { id: 'r-new', flowId: body.flowId, status: 'pending', workspacePath: body.workspace } }
-      },
-      async startRun(id, body) {
-        calls.start.push({ id, body })
-        return { ok: true, run: { id, status: 'running' } }
-      },
-      async deleteRun(id) {
-        calls.delete.push(id)
-        return { ok: true }
-      },
+  await check('F2 前端：页面不再调用旧 /flows /runs，改走 /definitions 与 /instances', () => {
+    const pageSource = readFileSync(join(repoRoot, 'src/client/page.js'), 'utf8')
+    // 旧运行域：页面里一个调用点都不能留（legacyApi 只留给步骤 7 删除）。
+    for (const legacy of [
+      'listFlows', 'createFlow', 'saveFlow', 'deleteFlow', 'listSkills',
+      'listRuns', 'createRun', 'readRun', 'readEvents', 'readSummary',
+      'startRun', 'stopRun', 'restartRun',
+    ]) {
+      A.equal(new RegExp('\\b' + legacy + '\\s*\\(').test(pageSource), false,
+        `page.js 不能调用旧运行域方法 ${legacy}()`)
     }
+    A.match(pageSource, /client\.saveDefinition\(/, '保存必须走 POST /definitions')
+    A.match(pageSource, /client\.createInstance\(payload\.body\)/, '运行必须走 POST /instances')
+    A.match(pageSource, /client\.readInstanceDefinition\(/, '实例画布必须读冻结快照')
+    A.match(pageSource, /runBlockReason\(/, '运行前必须过版本 / dirty 门禁')
 
-    // ① 未选工作区：直接拦下，**一次请求都不能发**。
-    const blocked = await startRunRequest({ api: spyApi, flow, workspace: '' })
-    A.equal(blocked.ok, false)
-    A.match(blocked.error, /未选择工作区/)
-    A.equal(calls.create.length + calls.start.length, 0, '未选工作区不能发任何请求（不靠后端 400 兜底）')
-
-    // ② 选了工作区：建 run 与 start 的真实载荷都含 workspace 字段。
-    const ok = await startRunRequest({ api: spyApi, flow, workspace: ' /repo/a ', runName: '本次运行', runs: [] })
-    A.equal(ok.ok, true)
-    A.deepEqual(calls.create[0], { flowId: 'flow-main', name: '本次运行', workspace: '/repo/a' })
-    A.deepEqual(calls.start[0], { id: 'r-new', body: { workspace: '/repo/a' } })
-
-    // ③ 工作区不一致的 pending run 不复用（否则 start 会退回旧参数）。
-    calls.create.length = 0
-    calls.start.length = 0
-    const mismatch = await startRunRequest({
-      api: spyApi, flow, workspace: '/repo/a',
-      runs: [{ id: 'r-old', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/other' }],
-    })
-    A.equal(mismatch.ok, true)
-    A.equal(calls.create.length, 1, '工作区不一致的 pending run 必须新建')
-    A.equal(calls.start[0].id, 'r-new')
-
-    // ④ 工作区一致的 pending run 才复用（且 start 仍显式带 workspace）。
-    calls.create.length = 0
-    calls.start.length = 0
-    const reused = await startRunRequest({
-      api: spyApi, flow, workspace: '/repo/a',
-      runs: [{ id: 'r-match', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/a' }],
-    })
-    A.equal(reused.ok, true)
-    A.equal(calls.create.length, 0, '同工作区的 pending run 应复用')
-    A.deepEqual(calls.start[0], { id: 'r-match', body: { workspace: '/repo/a' } })
-
-    // ⑤ start 失败时把「本次新建的 run」带回去，供 beginRun 清理幽灵 run。
-    const failingApi = {
-      async createRun() { return { ok: true, run: { id: 'r-ghost', flowId: 'flow-main', status: 'pending' } } },
-      async startRun() {
-        const error = new Error('工作区不可用')
-        error.status = 400
-        throw error
-      },
-    }
-    const failed = await startRunRequest({ api: failingApi, flow, workspace: '/repo/a' })
-    A.equal(failed.ok, false)
-    A.equal(failed.run.id, 'r-ghost')
-    A.equal(failed.createdRun.id, 'r-ghost')
-    A.equal(startFailurePlan('start', failed.error, failed.run, Boolean(failed.createdRun)).deleteRunId, 'r-ghost')
+    // api.js 的新契约方法必须真实存在（页面调用它才有意义）。
+    const apiSource = readFileSync(join(repoRoot, 'src/client/api.js'), 'utf8')
+    A.match(apiSource, /createInstance: body => request\('POST', instancesPath\(\), body \|\| \{\}\)/)
+    A.match(apiSource, /readInstanceDefinition: id => request\('GET', instanceDefinitionPath\(id\)\)/)
+    A.match(apiSource, /saveDefinition: body => request\('POST', definitionsPath\(\), body \|\| \{\}\)/)
   })
 
-  await check('F2 前端：HTTP 层真实载荷（fetch spy）——POST /runs 与 /runs/<id>/start 的 body 都含 workspace', async () => {
-    const flow = { id: 'flow-main', name: '主流程' }
+  await check('F2 前端：HTTP 载荷（fetch spy）——保存 / 运行 / 实例快照的真实 body 与 URL', async () => {
     const calls = []
     const originalFetch = globalThis.fetch
     globalThis.fetch = async (url, init) => {
       calls.push({ url: String(url), init })
-      const data = calls.length === 1
-        ? { ok: true, run: { id: 'r-http', flowId: 'flow-main', status: 'pending', workspacePath: '/repo/a' } }
-        : { ok: true, run: { id: 'r-http', status: 'running' } }
-      return { ok: true, status: calls.length === 1 ? 201 : 202, json: async () => data }
+      const isSave = String(url).endsWith('/definitions')
+      const data = isSave
+        ? { ok: true, id: 'flow-main', version: 3, hash: 'c'.repeat(64), created: true }
+        : (String(url).endsWith('/instances')
+          ? {
+            ok: true, id: 'i-1', status: 'ACTIVE', definitionId: 'flow-main',
+            definitionVersion: 3, definitionHash: 'c'.repeat(64), pendingTasks: [], lastSeq: 1,
+          }
+          : { ok: true, id: 'i-1', definitionId: 'flow-main', definitionVersion: 3, xml: '<xml/>' })
+      return { ok: true, status: isSave ? 201 : 200, json: async () => data }
     }
     try {
-      const outcome = await startRunRequest({ api: clientApi, flow, workspace: '/repo/a', runName: 'HTTP 载荷', runs: [] })
-      A.equal(outcome.ok, true)
-      A.equal(calls.length, 2)
-      A.ok(calls[0].url.endsWith('/runs'), calls[0].url)
+      const saved = await clientApi.saveDefinition({ id: 'flow-main', name: '主流程', xml: '<xml/>' })
+      A.equal(saved.version, 3)
+      A.ok(calls[0].url.endsWith('/definitions'), calls[0].url)
       A.equal(calls[0].init.method, 'POST')
-      A.deepEqual(JSON.parse(calls[0].init.body), {
-        flowId: 'flow-main', name: 'HTTP 载荷', workspace: '/repo/a',
-      }, 'POST /runs 的 body 必须真实包含 workspace')
-      A.ok(calls[1].url.endsWith('/runs/r-http/start'), calls[1].url)
+      A.deepEqual(JSON.parse(calls[0].init.body), { id: 'flow-main', name: '主流程', xml: '<xml/>' })
+
+      const created = await clientApi.createInstance({ definitionId: 'flow-main', definitionVersion: 3, variables: {} })
+      A.equal(created.id, 'i-1')
+      A.ok(calls[1].url.endsWith('/instances'), calls[1].url)
       A.equal(calls[1].init.method, 'POST')
-      A.deepEqual(JSON.parse(calls[1].init.body), { workspace: '/repo/a' },
-        'POST /runs/<id>/start 的 body 必须真实包含 workspace')
+      A.deepEqual(JSON.parse(calls[1].init.body), {
+        definitionId: 'flow-main', definitionVersion: 3, variables: {},
+      }, '运行必须显式带 definitionVersion，不能让 Host 猜最新版')
+
+      const snapshot = await clientApi.readInstanceDefinition('i-1')
+      A.equal(snapshot.xml, '<xml/>')
+      A.ok(calls[2].url.endsWith('/instances/i-1/definition'), calls[2].url)
+      A.equal(calls[2].init.method, 'GET')
     } finally {
       globalThis.fetch = originalFetch
-    }
-  })
-
-  await check('F2 前端：page.js 的两个发起运行调用点都带 workspace（源码级护栏）', () => {
-    const pageSource = readFileSync(join(repoRoot, 'src/client/page.js'), 'utf8')
-    // beginRun 走 startRunRequest（未选工作区的拦截 / 载荷构造都在它里面）。
-    A.match(pageSource, /const outcome = await startRunRequest\(/, 'beginRun 必须走 startRunRequest')
-    A.match(pageSource, /workspaceBlockReason\(workspaceRef\.current\)/, 'beginRun 必须先过工作区门禁')
-    // 建 run：请求体只能由 createRunBodyFor 构造（它保证 workspace 存在，否则返回 null）。
-    A.match(pageSource, /const body = createRunBodyFor\(flow, runName, path\)/, 'POST /runs 的请求体必须带 workspace')
-    A.match(pageSource, /api\.createRun\(body\)/)
-    A.match(pageSource, /if \(!body\) return \{ ok: false, error: workspaceBlockReason\(path\)/, '没有 workspace 不构造请求')
-    // start：同样显式带 workspace（复用的旧 pending run 不依赖建 run 时的参数）。
-    A.match(pageSource, /const startBody = startRunBodyFor\(path\)/, 'POST /runs/<id>/start 必须带 workspace')
-    A.match(pageSource, /api\.startRun\(run\.id, startBody\)/)
-    A.match(pageSource, /workspacePathOf\(item\) === path/, '只复用同工作区的 pending run')
-
-    // api.js 必须把 start 的 body 转发出去，否则页面传了也发不出去（F2 的 HTTP 面）。
-    const apiSource = readFileSync(join(repoRoot, 'src/client/api.js'), 'utf8')
-    A.match(apiSource, /startRun: \(id, body\) => request\('POST', `\/runs\/\$\{segment\(id\)\}\/start`, body\)/)
-
-    // 0.13.3 步骤 2：旧 React Flow 画布移到 canvas-flow.js；两处都不能直接发起运行。
-    for (const canvasFile of ['canvas.js', 'canvas-flow.js']) {
-      const canvasSource = readFileSync(join(repoRoot, 'src/client', canvasFile), 'utf8')
-      A.equal(/api\.(createRun|startRun)\(/.test(canvasSource), false, `${canvasFile} 不直接发起运行`)
     }
   })
 

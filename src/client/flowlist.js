@@ -1,639 +1,197 @@
 /**
- * 左侧导航：流程模板列表 + 运行记录（按工作区分组的只读列表）。
+ * 左侧定义列表（0.13.3 步骤 5）。
  *
- * 运行记录是 v0.7 §4.3 的「按工作区分组」：分组键是 `run.workspacePath`，
- * 没有就归到「未标注工作区」——旧数据整列退化成一个默认分组，不抛错、不白屏。
- * 详情头部只读展示 supervision（§7）与节点自审状态（v0.8 §11.4），不提供开关
- *（开关走模型工具 / HTTP）。
+ * 旧版这里是「流程模板 + 运行记录」双列表；页面切到 BPMN 定义域后只保留
+ * **定义列表**：
+ *
+ * - 列表来自 `GET /definitions`（`{definitions:[…]}`），本地只做形状收敛；
+ * - 每行显示名称 / id / 最新版本 / 版本数，选中行带 `data-active`；
+ * - 新建、导入、从模板新建都由页面注入回调，组件本身不碰 `fetch` / `FileReader`；
+ * - 完全受控、无 hooks：SSR 与真实浏览器渲染同一份结构。
  *
  * @module @feiyueve/dsh-flow-studio/client/flowlist
  */
 
-import { runStatusOf, statusText } from './logdrawer.js'
-import { h, rt } from './runtime.js'
+import { h } from './runtime.js'
 
-/** 没有 workspacePath 的运行统一归到这个分组。 */
-export const UNKNOWN_WORKSPACE = '未标注工作区'
+/** 没有定义时的可操作空态（不是空白）。 */
+export const DEFINITION_LIST_EMPTY_TEXT = '还没有定义：新建、导入，或从模板开始。'
+
+/** 正整数（版本号）或 null。 */
+function positiveInt(value) {
+  if (Number.isSafeInteger(value) && value >= 1) return value
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const parsed = Number(value.trim())
+    if (Number.isSafeInteger(parsed) && parsed >= 1) return parsed
+  }
+  return null
+}
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function text(value) {
-  return typeof value === 'string' ? value : ''
-}
-
-function relativeTime(iso) {
-  const time = Date.parse(iso)
-  if (!Number.isFinite(time)) return ''
-  const diff = Date.now() - time
-  if (diff < 60_000) return '刚刚'
-  if (diff < 3_600_000) return Math.floor(diff / 60_000) + ' 分钟前'
-  if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + ' 小时前'
-  if (diff < 30 * 86_400_000) return Math.floor(diff / 86_400_000) + ' 天前'
-  return new Date(time).toLocaleDateString()
-}
-
-/** 兼容 `{runs}` / `{items}` / `{list}` / `{data:{runs}}` / 裸数组；坏值一律变空数组。 */
-export function extractRunRows(payload) {
-  if (Array.isArray(payload)) return payload.filter(isObject)
-  if (!isObject(payload)) return []
-  for (const key of ['runs', 'items', 'list']) {
-    if (Array.isArray(payload[key])) return payload[key].filter(isObject)
-  }
-  if (isObject(payload.data)) return extractRunRows(payload.data)
-  return []
-}
-
-/** 读 run 的工作区路径：优先 summary 的 `workspacePath`，退回 run.json 的 `workspace.path`。 */
-export function workspacePathOf(run) {
-  const direct = run && typeof run.workspacePath === 'string' ? run.workspacePath.trim() : ''
-  if (direct !== '') return direct
-  const workspace = run && isObject(run.workspace) ? run.workspace : null
-  return workspace && typeof workspace.path === 'string' ? workspace.path.trim() : ''
-}
-
-/** 路径尾巴：取最后 1–2 段（240px 左栏放得下，又能区分同名目录）；空路径 → 未标注。 */
-export function workspaceTail(path) {
-  const raw = typeof path === 'string' ? path.trim() : ''
-  if (raw === '') return UNKNOWN_WORKSPACE
-  const parts = raw.replace(/[\\/]+$/, '').split(/[\\/]+/).filter(Boolean)
-  if (parts.length === 0) return raw
-  return parts.length === 1 ? parts[0] : parts.slice(-2).join('/')
-}
-
-/** 按 workspacePath 分组；保持 run 的原始顺序（Host 已按时间倒序）。 */
-export function groupRunsByWorkspace(runs) {
-  const list = Array.isArray(runs) ? runs.filter(isObject) : []
-  const groups = new Map()
-  for (const run of list) {
-    const path = workspacePathOf(run)
-    if (!groups.has(path)) {
-      groups.set(path, {
-        key: path,
-        path,
-        label: path === '' ? UNKNOWN_WORKSPACE : workspaceTail(path),
-        runs: [],
-      })
-    }
-    groups.get(path).runs.push(run)
-  }
-  return [...groups.values()]
-}
-
-/** 分组是否展开：显式点过的按记录，没点过的第一组默认展开、其余收起。 */
-export function isGroupOpen(toggles, key, index) {
-  return toggles && typeof toggles.has === 'function' && toggles.has(key)
-    ? toggles.get(key) === true
-    : index === 0
-}
-
-/** 切换后的展开表：以「当前实际展开态」为准，第一组默认展开时点一下也能收起。 */
-export function nextGroupToggles(toggles, key, currentlyOpen) {
-  const next = new Map(toggles || [])
-  next.set(key, !currentlyOpen)
-  return next
-}
-
 /**
- * `run.worktree` / `run.worktreeEnabled` → `{ enabled, branch, path, reason }`；
- * 字段缺失一律未启用。G5-c：reason 也要带到 UI（不能只显示「未启用」）。
+ * 归一化一行定义（列表接口 / 详情接口同形，缺字段给安全默认值）。
+ * @param {object} entry
+ * @returns {{id: string, name: string, description: string, latestVersion: number|null,
+ *   latestHash: string, versionCount: number, updatedAt: string}}
  */
-export function worktreeOf(run) {
-  const record = run && isObject(run.worktree) ? run.worktree : null
-  const enabled = Boolean((run && run.worktreeEnabled === true) || (record && record.enabled === true))
-  const branch = record && typeof record.branch === 'string' ? record.branch.trim() : ''
-  const path = record && typeof record.path === 'string' ? record.path.trim() : ''
-  const reason = record && typeof record.reason === 'string' ? record.reason.trim() : ''
-  return { enabled, branch, path, reason }
-}
-
-/**
- * G5-c：sessionMode 的中文词表（top-level / legacy-subagent / injected / stub / unavailable）。
- * 未知值返回「未知（原始值）」——绝不返回空串，否则用户只看到「未启用」却不知道原因。
- */
-export const SESSION_MODE_TEXT = {
-  'top-level': '顶层会话',
-  'legacy-subagent': '旧版子 agent',
-  injected: '注入式会话',
-  stub: '桩引擎',
-  unavailable: '会话不可用',
-}
-
-/** sessionMode 可读文案；缺失 → 「未标注（旧 run）」，未知 → 带原始值。 */
-export function sessionModeText(value) {
-  const raw = text(value).trim()
-  if (raw === '') return '未标注（旧 run）'
-  return SESSION_MODE_TEXT[raw] || '未知（' + raw + '）'
-}
-
-/** G5-c：worktree 未启用原因的常用值 → 中文；`create-failed: …` 前缀单独展开。 */
-export const WORKTREE_REASON_TEXT = {
-  'not-a-git-repo': '工作区不是 git 仓库',
-  'disabled-by-initiator': '发起方关闭了 worktree',
-  'stub-engine': '桩引擎不创建 worktree',
-  'no-workspace': '没有工作区',
-  'git-workspace': 'git 工作区',
-}
-
-/** worktree 原因可读文案；未知值带原始值，缺失明确写「原因未标注」。 */
-export function worktreeReasonText(reason) {
-  const raw = text(reason).trim()
-  if (raw === '') return '原因未标注'
-  if (WORKTREE_REASON_TEXT[raw]) return WORKTREE_REASON_TEXT[raw]
-  if (raw.startsWith('create-failed')) {
-    const detail = raw.slice('create-failed'.length).replace(/^[:：]\s*/, '').trim()
-    return detail === '' ? '创建 worktree 失败' : '创建 worktree 失败：' + detail
-  }
-  return '未知原因（' + raw + '）'
-}
-
-/**
- * G5-c：运行详情里的 worktree 一行。
- * enabled=true 时显示路径与分支；未启用时显示原因（未知值也带原始值）。
- */
-export function worktreeDetailText(worktree) {
-  const record = worktree && typeof worktree === 'object' ? worktree : {}
-  if (record.enabled === true) {
-    const parts = []
-    if (record.branch) parts.push('分支 ' + record.branch)
-    if (record.path) parts.push('路径 ' + record.path)
-    return parts.length === 0 ? '已启用' : '已启用（' + parts.join(' · ') + '）'
-  }
-  return '未启用（原因：' + worktreeReasonText(record.reason) + '）'
-}
-
-/** G5-b：删除流程的二次确认文案（必须带流程名，并说明可撤销 / 草稿何时清）。 */
-export function deleteConfirmText(name) {
-  const shown = text(name).trim() || '未命名流程'
-  return '确认删除「' + shown + '」？删除后可用「撤销」恢复；本地草稿只有在服务器删除成功后才清理。'
-}
-
-/** 次数类字段：数字或数字字符串都收；坏值按 0（不编造唤醒记录）。 */
-function countOf(value) {
-  const number = typeof value === 'number'
-    ? value
-    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
-  return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0
-}
-
-/** supervision 只读视图；缺失 / 坏值一律 `enabled:false`（UI 显示「未开启」）。 */
-export function supervisionOf(run) {
-  const record = run && isObject(run.supervision) ? run.supervision : null
-  return {
-    present: record !== null,
-    enabled: Boolean(record && record.enabled === true),
-    nextDueAt: record && typeof record.nextDueAt === 'string' ? record.nextDueAt : '',
-    wakes: record ? countOf(record.wakes) : 0,
-    failures: record ? countOf(record.failures) : 0,
-    reason: record && typeof record.reason === 'string' ? record.reason.trim() : '',
-  }
-}
-
-const pad2 = value => String(value).padStart(2, '0')
-
-/** `nextDueAt` → 本地时钟。当天只显示 HH:MM:SS，跨天带 MM-DD；解析不了就原样显示。 */
-export function formatWakeAt(value) {
-  const raw = text(value).trim()
-  if (raw === '') return ''
-  const time = Date.parse(raw)
-  if (!Number.isFinite(time)) return raw
-  const date = new Date(time)
-  const clock = pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds())
-  const now = new Date()
-  const sameDay = date.getFullYear() === now.getFullYear()
-    && date.getMonth() === now.getMonth()
-    && date.getDate() === now.getDate()
-  return sameDay ? clock : pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) + ' ' + clock
-}
-
-/** v0.8 §11.4：节点自审状态的展示词表（颜色只落在 styles.js，文字走中文）。 */
-const NODE_STATE_TEXT = { working: '进行中', done: '完成', blocked: '阻塞', failed: '失败' }
-/** 节点多于这个数量时区块内部滚动（max-height + overflow），不撑爆 240px 左栏。 */
-export const NODE_STATUS_SCROLL_AT = 6
-/** 缺字段 / 空表 / 坏类型时的整块降级文案（老 run 走这里）。 */
-export const NODE_STATUS_EMPTY_TEXT = '节点状态：暂无自审上报'
-
-/** 进度：0..100 的有限数才收（取整夹取），坏值按 0——不编造进度。 */
-function progressOf(value) {
-  const number = typeof value === 'number'
-    ? value
-    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
-  if (!Number.isFinite(number)) return 0
-  return Math.min(100, Math.max(0, Math.floor(number)))
-}
-
-/** 单条自审记录归一化；`value` 不是对象 → null（坏输入不抛错）。 */
-export function nodeStatusOf(value) {
-  if (!isObject(value)) return null
-  const state = text(value.state).trim().toLowerCase()
-  const key = NODE_STATE_TEXT[state] ? state : 'working'
-  const members = Array.isArray(value.members)
-    ? value.members.filter(isObject).map(member => {
-      const memberState = text(member.state).trim().toLowerCase()
-      const memberKey = NODE_STATE_TEXT[memberState] ? memberState : 'working'
-      return {
-        name: text(member.name).trim() || '未命名成员',
-        state: memberKey,
-        label: NODE_STATE_TEXT[memberKey],
-        note: text(member.note).trim(),
-      }
-    })
-    : []
-  const blockers = Array.isArray(value.blockers)
-    ? value.blockers.map(item => text(item).trim()).filter(Boolean)
-    : []
-  const verdict = value.verdict === 'pass' || value.verdict === 'reject' ? value.verdict : ''
-  return {
-    state: key,
-    label: NODE_STATE_TEXT[key],
-    progress: progressOf(value.progress),
-    summary: text(value.summary).trim(),
-    members,
-    blockers,
-    verdict,
-  }
-}
-
-/**
- * `run.nodeStatus` → `[{ nodeId, state, label, progress, members, blockers, verdict }]`。
- * 缺字段 / 空对象 / 坏类型一律空数组：0.7 及以前的老 run 整块走降级文案，不报错。
- */
-export function nodeStatusEntries(run) {
-  const table = run && isObject(run.nodeStatus) ? run.nodeStatus : null
-  if (table === null) return []
-  const entries = []
-  for (const [nodeId, value] of Object.entries(table)) {
-    const id = text(nodeId).trim()
-    if (id === '') continue
-    const status = nodeStatusOf(value)
-    if (status !== null) entries.push({ nodeId: id, ...status })
-  }
-  return entries
-}
-
-/** 这个 run 是否有可展示的节点自审状态（页面据此决定要不要拉详情拿节点标题）。 */
-export function hasNodeStatus(run) {
-  return nodeStatusEntries(run).length > 0
-}
-
-/**
- * `GET /runs/<id>` 的 `nodes` → `nodeId → 标题`。
- * 契约是 `[{id, title}]`，这里同时容忍 `nodeId` 键与 `{ id: '标题' }` 映射；
- * 拿不到标题就返回空表，调用方退回显示 nodeId。
- */
-export function nodeTitleMap(nodes) {
-  const titles = new Map()
-  const take = item => {
-    if (!isObject(item)) return
-    const id = text(item.id).trim() || text(item.nodeId).trim()
-    if (id === '') return
-    const title = text(item.title).trim() || text(item.name).trim()
-    if (title !== '') titles.set(id, title)
-  }
-  if (Array.isArray(nodes)) {
-    for (const item of nodes) take(item)
-  } else if (isObject(nodes)) {
-    for (const [id, value] of Object.entries(nodes)) {
-      const key = text(id).trim()
-      if (key === '') continue
-      if (typeof value === 'string') {
-        const title = value.trim()
-        if (title !== '') titles.set(key, title)
-      } else if (isObject(value)) {
-        const title = text(value.title).trim() || text(value.name).trim()
-        if (title !== '') titles.set(key, title)
-      }
+export function normalizeDefinitionRow(entry) {
+  if (!isObject(entry)) {
+    return {
+      id: '', name: '', description: '', latestVersion: null,
+      latestHash: '', versionCount: 0, updatedAt: '',
     }
   }
-  return titles
-}
-
-/** 阻塞文案：最多列 3 条，更多用「等 N 条」收尾；没有阻塞返回空串。 */
-export function blockersText(blockers) {
-  const list = Array.isArray(blockers)
-    ? blockers.map(item => text(item).trim()).filter(Boolean)
-    : []
-  if (list.length === 0) return ''
-  const shown = list.slice(0, 3).join('、')
-  return '阻塞：' + shown + (list.length > 3 ? ' 等 ' + list.length + ' 条' : '')
-}
-
-/** 单个节点一行：标题 + 状态徽标 + 进度条（只读，无按钮）。 */
-function NodeStatusRow({ entry, title }) {
-  return h('div', {
-    className: 'fs-run-node',
-    'data-state': entry.state,
-    title: entry.summary === '' ? entry.nodeId : entry.nodeId + ' · ' + entry.summary,
-  },
-  h('div', { className: 'fs-run-node-head' },
-    h('span', { className: 'fs-run-node-title' }, title),
-    h('span', {
-      className: 'fs-node-state ' + entry.state,
-      title: '自审状态：' + entry.state,
-    }, entry.label),
-    entry.verdict === ''
-      ? null
-      : h('span', {
-        className: 'fs-run-node-verdict ' + entry.verdict,
-        title: '自审结论：' + entry.verdict,
-      }, entry.verdict),
-    h('span', { className: 'fs-run-node-pct' }, entry.progress + '%')),
-  h('div', {
-    className: 'fs-run-node-bar',
-    role: 'progressbar',
-    'aria-label': '节点进度',
-    'aria-valuemin': 0,
-    'aria-valuemax': 100,
-    'aria-valuenow': entry.progress,
-  }, h('span', { className: 'fs-run-node-bar-fill', style: { width: entry.progress + '%' } })),
-  entry.members.length === 0
-    ? null
-    : h('div', { className: 'fs-run-node-members' },
-      entry.members.map((member, index) => h('div', {
-        key: member.name + ':' + index,
-        className: 'fs-run-node-member',
-        title: member.note === ''
-          ? member.name + ' · ' + member.label
-          : member.name + ' · ' + member.label + ' · ' + member.note,
-      },
-      h('span', { className: 'fs-run-node-member-name' }, member.name),
-      ' · ',
-      h('span', { className: 'fs-run-node-member-state ' + member.state }, member.label),
-      member.note === '' ? null : ' · ' + member.note))),
-  blockersText(entry.blockers) === ''
-    ? null
-    : h('div', {
-      className: 'fs-run-node-blockers',
-      title: '阻塞：' + entry.blockers.join('；'),
-    }, blockersText(entry.blockers)))
+  const versions = Array.isArray(entry.versions) ? entry.versions : []
+  const latestVersion = positiveInt(entry.latestVersion)
+  return {
+    id: typeof entry.id === 'string' ? entry.id : '',
+    name: typeof entry.name === 'string' && entry.name.trim() !== ''
+      ? entry.name.trim()
+      : (typeof entry.id === 'string' ? entry.id : ''),
+    description: typeof entry.description === 'string' ? entry.description : '',
+    latestVersion,
+    latestHash: typeof entry.latestHash === 'string' ? entry.latestHash : '',
+    versionCount: Number.isSafeInteger(entry.versionCount) && entry.versionCount >= 0
+      ? entry.versionCount
+      : (latestVersion === null ? versions.length : Math.max(versions.length, latestVersion)),
+    updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : '',
+  }
 }
 
 /**
- * 节点自审状态区块（v0.8 §11.4，只读）：每个上报过的节点一行。
- * `nodes` 是 `GET /runs/<id>` 的节点表（`{id,title}`），只用来把 nodeId 换成标题。
+ * `GET /definitions` 信封 / 裸数组 → 行数组（丢掉没有 id 的坏行）。
+ * @param {object|object[]|null|undefined} payload
  */
-function NodeStatusBlock({ run, nodes }) {
-  const entries = nodeStatusEntries(run)
-  if (entries.length === 0) {
-    return h('div', { className: 'fs-run-nodes' },
-      h('div', { className: 'fs-run-nodes-empty' }, NODE_STATUS_EMPTY_TEXT))
+export function definitionsFromPayload(payload) {
+  const list = Array.isArray(payload)
+    ? payload
+    : (isObject(payload) && Array.isArray(payload.definitions) ? payload.definitions : [])
+  const rows = []
+  const seen = new Set()
+  for (const entry of list) {
+    const row = normalizeDefinitionRow(entry)
+    if (row.id === '' || seen.has(row.id)) continue
+    seen.add(row.id)
+    rows.push(row)
   }
-  const titles = nodeTitleMap(nodes)
-  return h('div', { className: 'fs-run-nodes' },
-    h('div', { className: 'fs-run-nodes-head' },
-      h('span', { className: 'fs-run-sup-label' }, '节点状态'),
-      h('span', { className: 'fs-run-nodes-count' }, entries.length + ' 个节点')),
-    h('div', {
-      className: 'fs-run-nodes-body' + (entries.length > NODE_STATUS_SCROLL_AT ? ' scroll' : ''),
-    },
-    entries.map(entry => h(NodeStatusRow, {
-      key: entry.nodeId,
-      entry,
-      title: titles.get(entry.nodeId) || entry.nodeId,
-    }))))
+  return rows
 }
 
-function SupervisionLine({ run }) {
-  const supervision = supervisionOf(run)
-  if (!supervision.enabled) {
-    return h('div', { className: 'fs-run-sup' },
-      h('div', null,
-        h('span', { className: 'fs-run-sup-label' }, '监督'),
-        h('span', null, '未开启')),
-      // 降级关闭（连续唤醒失败等）也要把原因显示出来，不能只说「未开启」。
-      supervision.reason === ''
-        ? null
-        : h('div', { className: 'fs-run-sup-reason' }, '关闭原因：' + supervision.reason))
-  }
-  const next = formatWakeAt(supervision.nextDueAt)
-  return h('div', { className: 'fs-run-sup on' },
-    h('div', null,
-      h('span', { className: 'fs-run-sup-label' }, '监督'),
-      h('span', null,
-        '已开启 · 下次唤醒 ' + (next === '' ? '—' : next)
-        + ' · 已唤醒 ' + supervision.wakes + ' 次'
-        + ' · 失败 ' + supervision.failures + ' 次')),
-    supervision.reason === ''
-      ? null
-      : h('div', { className: 'fs-run-sup-reason' }, '关闭原因：' + supervision.reason))
+/** 行的版本摘要：`v2 · 2 个版本`；没有版本时 `未保存版本`。 */
+export function versionSummary(row) {
+  if (!isObject(row) || row.latestVersion === null) return '未保存版本'
+  const count = Number.isSafeInteger(row.versionCount) ? row.versionCount : 1
+  return `v${row.latestVersion} · ${count} 个版本`
 }
 
-/** 运行详情头部：工作区 / worktree / supervision / 节点状态都只读。 */
-function RunDetail({ run, active, nodes }) {
-  const path = workspacePathOf(run)
-  const worktree = worktreeOf(run)
-  const name = text(run.name) || text(run.id) || '未命名运行'
-  return h('div', { className: 'fs-run-detail' + (active ? ' on' : ''), 'aria-label': '运行详情头部' },
-    h('div', { className: 'fs-run-detail-name', title: text(run.id) || name }, name),
-    h('div', { className: 'fs-run-detail-line', title: path === '' ? UNKNOWN_WORKSPACE : path },
-      '工作区 · ' + (path === '' ? UNKNOWN_WORKSPACE : workspaceTail(path))),
-    // G5-c：sessionMode / worktree.reason 不能只留在 API 里——运行详情必须能读到中文原因。
-    h('div', {
-      className: 'fs-run-detail-line',
-      'data-session-mode': text(run && run.sessionMode) || undefined,
-      title: '会话模式：' + sessionModeText(run && run.sessionMode),
-    }, '会话模式 · ' + sessionModeText(run && run.sessionMode)),
-    h('div', {
-      className: 'fs-run-detail-line',
-      'data-worktree-reason': worktree.reason || undefined,
-      title: worktree.enabled ? worktreeDetailText(worktree) : 'worktree 未启用原因：' + worktreeReasonText(worktree.reason),
-    }, 'worktree · ' + worktreeDetailText(worktree)),
-    h(SupervisionLine, { run }),
-    h(NodeStatusBlock, { run, nodes }))
+/** 行的可选描述：description 优先，其次 id。 */
+export function definitionSubText(row) {
+  if (!isObject(row)) return ''
+  if (row.description) return row.description
+  return row.id || ''
 }
 
-function RunRow({ run, on, onFocus }) {
-  const worktree = worktreeOf(run)
-  const name = text(run.name) || text(run.id) || '未命名运行'
-  const id = text(run.id)
-  const titleParts = [name]
-  if (id !== '' && id !== name) titleParts.push(id)
-  if (worktree.enabled) {
-    // 07 §4.3：worktree 行要在标题提示里写分支名；没有分支就只留标记。
-    titleParts.push(worktree.branch === '' ? 'worktree 已启用' : 'worktree 分支 ' + worktree.branch)
+/** 在列表里找某份定义；找不到返回 null。 */
+export function findDefinition(rows, id) {
+  if (!Array.isArray(rows) || typeof id !== 'string' || id === '') return null
+  return rows.find(row => row && row.id === id) || null
+}
+
+/**
+ * 定义列表组件（受控）。
+ *
+ * props:
+ * - `definitions`：{@link definitionsFromPayload} 的行数组；
+ * - `activeId`：当前打开的定义 id；
+ * - `busy`：操作进行中（禁用新建 / 导入 / 模板）；
+ * - `templates`：`listTemplates()` 的输出；
+ * - `onOpen(id)` / `onNew()` / `onImport(file)` / `onTemplate(templateId)`；
+ * - `onRefresh()`。
+ */
+export function DefinitionList(props = {}) {
+  const definitions = Array.isArray(props.definitions) ? props.definitions : []
+  const templates = Array.isArray(props.templates) ? props.templates : []
+  const busy = props.busy === true
+  const onOpen = typeof props.onOpen === 'function' ? props.onOpen : () => {}
+  const onNew = typeof props.onNew === 'function' ? props.onNew : () => {}
+  const onImport = typeof props.onImport === 'function' ? props.onImport : () => {}
+  const onTemplate = typeof props.onTemplate === 'function' ? props.onTemplate : () => {}
+  const onRefresh = typeof props.onRefresh === 'function' ? props.onRefresh : () => {}
+
+  const handleFile = event => {
+    const input = event && event.target
+    const file = input && input.files && input.files[0]
+    if (file) onImport(file)
+    if (input) {
+      try { input.value = '' } catch { /* 只读文件控件，忽略 */ }
+    }
   }
-  return h('button', {
-    type: 'button',
-    className: 'fs-run' + (on ? ' on' : ''),
-    title: titleParts.join(' · '),
-    onClick: () => {
-      if (typeof onFocus === 'function') onFocus(run)
-    },
+
+  return h('aside', {
+    className: 'fs-def-list',
+    'aria-label': '流程定义列表',
+    'data-definition-count': String(definitions.length),
   },
-  h('span', { className: 'fs-run-name' }, name),
-  h('span', { className: 'fs-run-meta' },
-    statusText(runStatusOf(run)),
-    worktree.enabled
-      ? h('span', {
-        className: 'fs-run-wt',
-        'aria-label': worktree.branch === '' ? 'worktree 已启用' : 'worktree 分支 ' + worktree.branch,
-      }, ' · ⎇ worktree')
-      : null))
-}
-
-function RunGroup({ group, open, onToggle, selectedRunId, onFocusRun }) {
-  return h('div', { className: 'fs-rail-group' },
-    h('button', {
-      type: 'button',
-      className: 'fs-rail-group-head',
-      'aria-expanded': open ? 'true' : 'false',
-      title: group.path === '' ? UNKNOWN_WORKSPACE : group.path,
-      onClick: () => onToggle(group.key, open),
-    },
-    h('span', { className: 'fs-rail-caret', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
-    h('span', { className: 'fs-rail-group-label' }, group.label),
-    h('span', { className: 'fs-rail-count' }, String(group.runs.length))),
-    open
-      ? h('div', { className: 'fs-run-list' },
-        group.runs.map((run, index) => h(RunRow, {
-          key: text(run.id) || group.key + ':' + index,
-          run,
-          on: text(run.id) !== '' && text(run.id) === selectedRunId,
-          onFocus: onFocusRun,
-        })))
-      : null)
-}
-
-export function FlowList({
-  flows = [], activeId, busy, collapsed, onToggle, onOpen, onCreate, onDelete,
-  // v0.7：运行记录。不传 runs 时保持旧行为（不渲染运行区），传入数组才显示。
-  runs = null,
-  selectedRunId = '',
-  activeRunId = '',
-  // v0.8 §11.4：`GET /runs/<id>` 的节点表（`{id,title}`），只用于把 nodeId 显示成标题。
-  nodes = null,
-  onFocusRun = null,
-  // G5-b：删除二次确认 / 撤销。initialDeleteId 只给 SSR 测试预置确认态。
-  initialDeleteId = '',
-  undoDelete = null,
-  onUndoDelete = null,
-}) {
-  const { useState } = rt.React
-  // 显式点过的分组才记状态；没点过的第一组默认展开（其余收起）。
-  const [groupToggles, setGroupToggles] = useState(() => new Map())
-  /** G5-b：第一次点「删除」只进入确认态，确认后才回调 onDelete。 */
-  const [deleteArmed, setDeleteArmed] = useState(() => text(initialDeleteId))
-  const runRows = Array.isArray(runs) ? runs.filter(isObject) : null
-  const groups = runRows === null ? [] : groupRunsByWorkspace(runRows)
-  const selected = runRows === null
-    ? null
-    : runRows.find(run => text(run.id) !== '' && text(run.id) === selectedRunId)
-      || runRows.find(run => text(run.id) !== '' && text(run.id) === activeRunId)
-      || runRows[0]
-      || null
-
-  const toggleGroup = (key, currentlyOpen) => {
-    setGroupToggles(previous => nextGroupToggles(previous, key, currentlyOpen))
-  }
-
-  return h('aside', { className: 'fs-rail' + (collapsed ? ' collapsed' : '') },
-    h('div', { className: 'fs-rail-head' },
-      h('span', { className: 'fs-rail-label' }, '流程模板 · ' + flows.length),
+  h('div', { className: 'fs-def-head' },
+    h('strong', { className: 'fs-def-title' }, '定义'),
+    h('div', { className: 'fs-def-actions' },
       h('button', {
-        type: 'button',
-        className: 'fs-tool',
-        title: collapsed ? '展开流程列表' : '收起流程列表',
-        onClick: onToggle,
-      }, collapsed ? '»' : '«')),
+        type: 'button', className: 'fs-btn sm', disabled: busy,
+        onClick: onNew, 'data-action': 'new-definition',
+      }, '新建'),
+      h('label', { className: 'fs-btn sm fs-def-import', title: '导入本地 .bpmn / .xml 文件' },
+        '导入',
+        h('input', {
+          type: 'file',
+          className: 'fs-def-import-input',
+          accept: '.bpmn,.xml,application/xml,text/xml',
+          onChange: handleFile,
+          disabled: busy,
+          'aria-label': '导入 BPMN 文件',
+          'data-action': 'import-definition',
+        }),
+      ),
+      h('select', {
+        className: 'fs-def-template',
+        value: '',
+        disabled: busy,
+        'aria-label': '从模板新建定义',
+        'data-action': 'template-definition',
+        onChange: event => {
+          const id = event && event.target ? event.target.value : ''
+          if (id) onTemplate(id)
+        },
+      },
+      h('option', { value: '' }, '模板'),
+      ...templates.map(template => h('option', { key: template.id, value: template.id }, template.name))),
+    )),
+  h('div', { className: 'fs-def-list-tools' },
+    h('span', { className: 'fs-def-count' }, `${definitions.length} 份定义`),
     h('button', {
-      type: 'button',
-      className: 'fs-btn fs-rail-new',
-      style: { margin: '0 8px 8px' },
-      disabled: busy,
-      onClick: onCreate,
-    }, '+ 新建'),
-    // G5-b：删除成功后的「撤销」入口——快照还在内存里，可以原 id 写回。
-    undoDelete
-      ? h('div', { className: 'fs-draft fs-rail-undo', role: 'status' },
-        h('span', { className: 'fs-draft-text fs-rail-undo-text' },
-          '已删除「' + (text(undoDelete.name) || text(undoDelete.id) || '未命名流程') + '」'),
+      type: 'button', className: 'fs-btn sm ghost', onClick: onRefresh, disabled: busy,
+      title: '重新读取定义列表',
+    }, '刷新')),
+  definitions.length === 0
+    ? h('p', { className: 'fs-def-empty' }, DEFINITION_LIST_EMPTY_TEXT)
+    : h('ul', { className: 'fs-def-rows' },
+      definitions.map(row => h('li', { key: row.id },
         h('button', {
           type: 'button',
-          className: 'fs-btn ghost sm fs-rail-undo-btn',
-          disabled: busy,
-          title: '把删除前的流程快照重新写回服务器',
-          onClick: () => {
-            if (onUndoDelete) onUndoDelete(undoDelete)
-          },
-        }, '撤销'))
-      : null,
-    h('div', { className: 'fs-rail-list' },
-      flows.length === 0
-        ? h('div', { className: 'fs-empty-panel' }, '还没有流程模板')
-        : flows.map(item => h('div', {
-          key: item.id,
-          className: 'fs-flow' + (item.id === activeId ? ' active' : ''),
-          role: 'button',
-          tabIndex: 0,
-          onClick: () => onOpen(item.id),
-          onKeyDown: event => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault()
-              onOpen(item.id)
-            }
-          },
+          className: 'fs-def-row' + (row.id === props.activeId ? ' active' : ''),
+          'data-definition-id': row.id,
+          'data-active': row.id === props.activeId ? 'true' : 'false',
+          'data-version': row.latestVersion === null ? '' : String(row.latestVersion),
+          title: row.id,
+          onClick: () => onOpen(row.id),
         },
-        h('div', { className: 'fs-flow-name', title: item.name }, item.name),
-        h('div', { className: 'fs-flow-meta' },
-          item.nodeCount + ' 节点 · ' + item.rejectCount + ' 打回' +
-          (item.updatedAt ? ' · ' + relativeTime(item.updatedAt) : '')),
-        item.id === activeId
-          ? h('div', { className: 'fs-flow-actions' },
-            deleteArmed === item.id
-              // G5-b：确认文案带流程名，并说明「删除后可撤销 / 草稿何时清」。
-              ? [
-                h('span', { key: 'confirm-text', className: 'fs-flow-meta fs-flow-confirm-text' }, deleteConfirmText(item.name)),
-                h('button', {
-                  key: 'confirm',
-                  type: 'button',
-                  className: 'fs-btn danger sm fs-flow-confirm',
-                  disabled: busy,
-                  onClick: event => {
-                    event.stopPropagation()
-                    setDeleteArmed('')
-                    onDelete(item.id)
-                  },
-                }, '确认删除'),
-                h('button', {
-                  key: 'cancel',
-                  type: 'button',
-                  className: 'fs-btn ghost sm',
-                  onClick: event => {
-                    event.stopPropagation()
-                    setDeleteArmed('')
-                  },
-                }, '取消'),
-              ]
-              : h('button', {
-                type: 'button',
-                className: 'fs-btn ghost sm',
-                onClick: event => {
-                  event.stopPropagation()
-                  setDeleteArmed(item.id)
-                },
-              }, '删除'))
-          : null))),
-    runRows === null
-      ? null
-      : h('div', { className: 'fs-rail-runs' },
-        h('div', { className: 'fs-rail-head fs-rail-subhead' },
-          h('span', { className: 'fs-rail-label' }, '运行记录 · ' + runRows.length)),
-        h('div', { className: 'fs-rail-runs-list' },
-          runRows.length === 0
-            ? h('div', { className: 'fs-empty-panel', style: { padding: '10px 8px' } }, '还没有运行记录')
-            : h('div', null,
-              selected ? h(RunDetail, {
-                run: selected,
-                active: text(selected.id) === activeRunId,
-                nodes,
-              }) : null,
-              groups.map((group, index) => h(RunGroup, {
-                key: group.key === '' ? 'unknown-workspace' : group.key,
-                group,
-                open: isGroupOpen(groupToggles, group.key, index),
-                onToggle: toggleGroup,
-                selectedRunId,
-                onFocusRun,
-              }))))))
+        h('span', { className: 'fs-def-row-name' }, row.name || row.id),
+        h('span', { className: 'fs-def-row-meta' }, versionSummary(row)),
+        definitionSubText(row) !== row.name
+          ? h('span', { className: 'fs-def-row-sub' }, definitionSubText(row))
+          : null,
+        )))),
+  )
 }

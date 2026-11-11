@@ -49,6 +49,8 @@ export const HOST_MODULES = [
   'store.js',
   'runlog.js',
   'runstore.js',
+  'definition-store.js',
+  'instance-store.js',
   'flowmachine.js',
   'engine.js',
   'node-tools.js',
@@ -64,6 +66,14 @@ export const HOST_MODULES = [
   'inbox.js',
   'audit.js',
   'tools.js',
+  'bpmn-moddle-vendor.js',
+  'feelin-vendor.js',
+  'zeebe-moddle-vendor.js',
+  'bpmn-expr.js',
+  'bpmn-parse.js',
+  'bpmn-convert.js',
+  'bpmn-runner.js',
+  'bpmn-runtime.js',
 ]
 
 /** 由 esbuild 生成、不是从 src 拷贝的产物，同样计入 lib/ 产物清单。 */

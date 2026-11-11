@@ -1,0 +1,1514 @@
+/**
+ * BPMN 运行时：把「定义域 / 实例域 / bpmn-runner / HTTP 路由」接成 0.13.0 的
+ * 最小可用面（灰度开关默认关）。
+ *
+ * 边界（0.13.0）：
+ *   - 只做 headless 引擎 + 定义/实例 API，不碰画布（bpmn.io 在后续阶段）；
+ *   - 不重写 `definition-store` / `instance-store`，只调用它们的导出函数；
+ *   - 服务处理器只接外部 CLI executor（codex / custom）；`dsh` 适配器与 http
+ *     connector **明确失败**，不伪造成功（错误码见下）。
+ *
+ * 目录（计划 §2：模板域与运行实例域隔离，均与老 `flows/`、`runs/` 平级）：
+ * ```
+ * <flow-studio>/definitions/<definitionId>/<version>.bpmn
+ * <flow-studio>/instances/<instanceId>/{instance.json,state.json,events/...}
+ * ```
+ * 传入的 `dir` 通常是老的 `flows/` 目录；本模块自动取它的父目录作为 flow-studio
+ * 根。也接受显式 `definitionsRoot` / `instancesRoot` 覆盖（测试与嵌入方使用）。
+ *
+ * 事件桥（runner onEvent → 落盘）：
+ *   - `process/start` / `activity/start` → 事件落盘 + 实例 running；
+ *   - `activity/wait` → 事件落盘 + 实例 waiting + `pendingTasks` 落 instance.json；
+ *   - `activity/end` → 事件落盘 + 刷新 `pendingTasks`；
+ *   - `process/end` → 事件落盘 + `completeInstance('done')`；
+ *   - `error` → 事件落盘 + `completeInstance('failed')`；
+ *   - 条件求值失败 / handler 失败都走 runner 的 `error`，这里不额外编故事。
+ *
+ * 事件写入不吞错：runner 的 `_safeCall` 会吞掉 onEvent 抛错，所以本模块把每次
+ * 追加挂在自己的串行链上，失败记进 `_eventFailures`，请求收口时以
+ * `BPMN_EVENT_WRITE_FAILED` 显式返回（不会静默丢事件）。
+ *
+ * 懒恢复：
+ *   - 请求碰到不在内存里的实例时，读 `state.json` + 实例目录里的 `definition.bpmn`，
+ *     新建 runner 并 `recover(state)`；
+ *   - state 缺失 / 不可恢复 / 定义损坏时**不假装成功**：GET 返回元数据 +
+ *     `recovered:false` + 可读原因；写操作返回 409 / 500。
+ *   - recover 会重放一次 `activity/wait`（runner 已知的坑 g），这里按 state 里的
+ *     `pendingTasks[].executionId` 去重，事件流不会出现重复的 wait。
+ *
+ * @module @feiyueve/dsh-flow-studio/bpmn-runtime
+ */
+
+import { Buffer } from 'node:buffer'
+import { basename, dirname, join, resolve } from 'node:path'
+
+import {
+  DefinitionError,
+  definitionsDir,
+  listDefinitions,
+  readDefinition,
+  readDefinitionVersion,
+  saveDefinitionVersion,
+} from './definition-store.js'
+import {
+  InstanceError,
+  appendInstanceEvents,
+  completeInstance,
+  createInstance,
+  instancesDir,
+  listInstances,
+  readInstance,
+  readInstanceDefinition,
+  readInstanceEvents,
+  readInstanceState,
+  updateInstance,
+  writeInstanceState,
+} from './instance-store.js'
+import { parseBpmn } from './bpmn-parse.js'
+import { BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
+import { normalizeExecutor, runExternalExecutor } from './executor.js'
+import { checkRunId } from './runlog.js'
+
+/** 引擎版本（计划 §10.4 的 health 字段）。 */
+export const BPMN_ENGINE_VERSION = '26.0.6'
+
+/** 灰度开关：`1` = 启用 definitions / instances 路由与新引擎；默认关。 */
+export const BPMN_ENV = 'FLOW_STUDIO_BPMN'
+/** 活跃实例 LRU 上限。 */
+export const BPMN_MAX_ACTIVE_ENV = 'FLOW_STUDIO_BPMN_MAX_ACTIVE'
+/** 单活动超时（毫秒）；不设 = 只受 run 时限 / signal 控制。 */
+export const BPMN_ACTIVITY_TIMEOUT_ENV = 'FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS'
+
+/** 默认活跃实例上限（研究 §7：≈450KB/实例，100 常驻 ≈45MB）。 */
+export const DEFAULT_MAX_ACTIVE_INSTANCES = 100
+
+/** 实例域终态；终态不再恢复 runner。 */
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'aborted'])
+
+/**
+ * 运行时错误：`status` 给 HTTP，`code` 是稳定业务码，`reason` 是中文可读原因。
+ *
+ * handler（executeAgent / executeHttp）抛的是更轻的 `handlerError`（只保证 `code`）；
+ * runner 会把它包成 `BPMN_HANDLER_FAILED`，直接调用 handler 的测试可按原始 `code` 分流。
+ * 实例失败时 runtime 会把 handler 的原始 code 写进 `instance.json.result.error.code`。
+ */
+export class BpmnRuntimeError extends Error {
+  /**
+   * @param {number} status HTTP 状态码（400/404/405/409/500/503）
+   * @param {string} code 稳定错误码
+   * @param {string} reason 中文可读原因
+   * @param {object} [extra] 附加诊断字段
+   */
+  constructor(status, code, reason, extra = {}) {
+    super(reason)
+    this.name = 'BpmnRuntimeError'
+    this.status = status
+    this.code = code
+    this.reason = reason
+    Object.assign(this, extra)
+  }
+
+  toPayload() {
+    const payload = { ok: false, code: this.code, error: this.reason }
+    if (typeof this.hint === 'string' && this.hint !== '') payload.hint = this.hint
+    if (Array.isArray(this.errors) && this.errors.length > 0) payload.errors = this.errors
+    if (Array.isArray(this.warnings) && this.warnings.length > 0) payload.warnings = this.warnings
+    return payload
+  }
+}
+
+/** handler 用的轻量结构化错误：只保证 `code` / `message`。 */
+function handlerError(code, message, details = {}) {
+  const error = new Error(message)
+  error.name = 'BpmnHandlerError'
+  error.code = code
+  Object.assign(error, details)
+  return error
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** 读取并校验正整数环境变量；非法 / 未设置返回 fallback（不把错配置当 0）。 */
+function positiveEnvInt(raw, fallback) {
+  if (raw === undefined || raw === null || raw === '') return fallback
+  const text = String(raw).trim()
+  if (!/^\d+$/.test(text)) return fallback
+  const value = Number(text)
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback
+}
+
+/** 灰度开关：只有明确的 `1` 才启用，避免 `0` / 空 / 拼错被当成开。 */
+export function isBpmnEnabled(env = process.env) {
+  const raw = env ? env[BPMN_ENV] : undefined
+  return typeof raw === 'string' && raw.trim() === '1'
+}
+
+/** 取 flow-studio 根：传进来的是 `.../flows` 时取父目录，否则原样。 */
+function baseDirOf(dir) {
+  const absolute = resolve(typeof dir === 'string' && dir.trim() !== '' ? dir.trim() : process.cwd())
+  return basename(absolute) === 'flows' ? dirname(absolute) : absolute
+}
+
+function resolveRoots(options = {}) {
+  const explicitDefinitions = typeof options.definitionsRoot === 'string' && options.definitionsRoot.trim() !== ''
+    ? resolve(options.definitionsRoot.trim())
+    : null
+  const explicitInstances = typeof options.instancesRoot === 'string' && options.instancesRoot.trim() !== ''
+    ? resolve(options.instancesRoot.trim())
+    : null
+  const base = baseDirOf(options.dir)
+  return {
+    base,
+    definitionsRoot: explicitDefinitions ?? join(base, 'definitions'),
+    instancesRoot: explicitInstances ?? join(base, 'instances'),
+  }
+}
+
+/** 单条事件落盘预算：store 的硬上限是 8KB，这里留一点 JSON 信封余量。 */
+const EVENT_BYTES_BUDGET = 7800
+
+/** 事件分片 id：BPMN id 允许大小写/点/下划线，但 store 只收 1–64 个安全字符。 */
+function shardIdOf(event) {
+  const raw = typeof event.elementId === 'string' && event.elementId !== ''
+    ? event.elementId
+    : typeof event.flowId === 'string' && event.flowId !== ''
+      ? event.flowId
+      : 'process'
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64)
+  return checkRunId(cleaned) ?? 'process'
+}
+
+/** 递归裁剪字符串，保证 event 不会因为大输出撑爆 store 的 8KB 单条上限。 */
+function clipDeep(value, maxChars, depth = 0) {
+  if (depth > 8) return '[depth-limit]'
+  if (typeof value === 'string') {
+    return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value
+  }
+  if (Array.isArray(value)) return value.slice(0, 200).map(item => clipDeep(item, maxChars, depth + 1))
+  if (isPlainObject(value)) {
+    const out = {}
+    for (const [key, item] of Object.entries(value)) out[key] = clipDeep(item, maxChars, depth + 1)
+    return out
+  }
+  return value
+}
+
+function safeJsonSize(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 落盘前的事件整形：正常事件原样写；超过 8KB 时递归裁剪字符串并标 `truncated:true`。
+ * `activity/end` 的 agent 输出可能很大，事件流是观测面，不能因为输出大就让整个实例失败。
+ * 仍超限时退化成「只保留定位字段」的最小事件（至少能看出发生过什么）。
+ */
+function persistableEvent(event) {
+  const size = safeJsonSize(event)
+  if (size === null) return null
+  if (size <= EVENT_BYTES_BUDGET) return event
+  const clipped = clipDeep({ ...event, truncated: true }, 1500)
+  const clippedSize = safeJsonSize(clipped)
+  if (clippedSize !== null && clippedSize <= EVENT_BYTES_BUDGET) return clipped
+  const minimal = {
+    type: event.type,
+    at: event.at,
+    ...(event.elementId === undefined ? {} : { elementId: event.elementId }),
+    ...(event.activityId === undefined ? {} : { activityId: event.activityId }),
+    truncated: true,
+  }
+  return minimal
+}
+
+function errorText(error) {
+  if (error && typeof error.message === 'string' && error.message !== '') return error.message
+  return String(error)
+}
+
+/** 把 store / runner 的错误收敛成 HTTP 结果；无法识别的一律 500。 */
+function errorResult(error) {
+  if (error instanceof BpmnRuntimeError) {
+    return { status: error.status, body: error.toPayload() }
+  }
+  if (error instanceof DefinitionError || error instanceof InstanceError) {
+    const body = { ok: false, code: error.code, error: error.reason ?? error.message }
+    if (typeof error.hint === 'string' && error.hint !== '') body.hint = error.hint
+    return { status: Number.isInteger(error.status) ? error.status : 500, body }
+  }
+  if (error instanceof BpmnRunnerError) {
+    return { status: runnerErrorStatus(error.code), body: { ok: false, code: error.code, error: error.message } }
+  }
+  return {
+    status: 500,
+    body: { ok: false, code: 'BPMN_INTERNAL_ERROR', error: errorText(error) },
+  }
+}
+
+/** runner 错误码 → HTTP 语义（400 入参 / 404 不存在 / 409 冲突 / 503 引擎不可用）。 */
+function runnerErrorStatus(code) {
+  if (code === 'BPMN_TASK_NOT_FOUND') return 404
+  if (code === 'BPMN_INSTANCE_FAILED' || code === 'BPMN_STATE_NOT_RESUMABLE'
+    || code === 'BPMN_STATE_DEFINITION_MISMATCH' || code === 'BPMN_RECOVER_RUNNING') return 409
+  if (code === 'BPMN_OPTIONS_INVALID' || code === 'BPMN_STATE_INVALID') return 400
+  if (code === 'BPMN_HANDLER_MISSING' || code === 'BPMN_HANDLER_FAILED'
+    || code === 'BPMN_INSTANCE_ID_CONFLICT' || code === 'BPMN_LRU_EVICT_UNSNAPSHOTTED') return 503
+  return 500
+}
+
+/** 事件是否已经由 runner 落成实例终态（避免重复 completeInstance）。 */
+function terminalForEvent(event) {
+  if (event?.type === 'process/end') return 'done'
+  if (event?.type === 'error') return 'failed'
+  return null
+}
+
+/**
+ * 创建 BPMN 运行时（工厂）。
+ *
+ * @param {{
+ *   ctx?: any,
+ *   dir?: string,
+ *   env?: NodeJS.ProcessEnv,
+ *   definitionsRoot?: string,
+ *   instancesRoot?: string,
+ *   maxActiveInstances?: number,
+ *   executorRunner?: Function,
+ *   executorNormalizer?: Function,
+ * }} [options]
+ * @returns {BpmnRuntime}
+ */
+export function createBpmnRuntime(options = {}) {
+  if (!isPlainObject(options)) {
+    throw new BpmnRuntimeError(400, 'BPMN_OPTIONS_INVALID', 'createBpmnRuntime(options) 需要一个对象')
+  }
+  const roots = resolveRoots(options)
+  const env = isPlainObject(options.env) ? options.env : process.env
+  return new BpmnRuntime({
+    ctx: options.ctx ?? null,
+    ...roots,
+    env,
+    maxActiveInstances: options.maxActiveInstances,
+    executorRunner: options.executorRunner,
+    executorNormalizer: options.executorNormalizer,
+  })
+}
+
+class BpmnRuntime {
+  constructor(options) {
+    this.ctx = options.ctx
+    this.base = options.base
+    this.definitionsRoot = options.definitionsRoot
+    this.instancesRoot = options.instancesRoot
+    this.env = options.env
+    this.maxActiveInstances = options.maxActiveInstances
+    this.executorRunner = typeof options.executorRunner === 'function' ? options.executorRunner : runExternalExecutor
+    this.executorNormalizer = typeof options.executorNormalizer === 'function' ? options.executorNormalizer : normalizeExecutor
+
+    /** @type {Map<string, any>} instanceId → runner（懒恢复后常驻） */
+    this._runners = new Map()
+    /** @type {Map<string, Promise<void>>} 同一实例的写操作串行链 */
+    this._locks = new Map()
+    /** @type {Map<string, Promise<void>>} 同一实例的事件追加串行链 */
+    this._eventChains = new Map()
+    /** @type {Map<string, Error[]>} 事件追加失败（请求收口时显式报出） */
+    this._eventFailures = new Map()
+    /** @type {Map<string, Map<string, number>>} instanceId → elementId → attempt */
+    this._attempts = new Map()
+    /** @type {Map<string, Set<string>>} recover 时抑制重放的 activity/wait */
+    this._suppressWait = new Map()
+    /** @type {Map<string, {code: string, message: string}>} runner 失败的结构化原因 */
+    this._runnerErrors = new Map()
+    this._disposed = false
+  }
+
+  /** 数据根（便于测试 / 运维核对）。 */
+  get roots() {
+    return { definitionsRoot: this.definitionsRoot, instancesRoot: this.instancesRoot }
+  }
+
+  /** 活跃实例数（只算真正在跑的：running / waiting；终态与已淘汰的不算）。 */
+  get activeCount() {
+    let count = 0
+    for (const runner of this._runners.values()) {
+      if (!runner || typeof runner.status !== 'function') continue
+      const status = runner.status()
+      if (status === 'running' || status === 'waiting') count += 1
+    }
+    return count
+  }
+
+  /** `GET /health` 用：计数每次现算，不缓存。 */
+  async health() {
+    let definitions = 0
+    let instances = 0
+    let error = null
+    try {
+      definitions = (await listDefinitions({ definitionsRoot: this.definitionsRoot })).length
+    } catch (caught) {
+      error = errorText(caught)
+    }
+    try {
+      instances = (await listInstances({ instancesRoot: this.instancesRoot, limit: 1000 })).length
+    } catch (caught) {
+      error = error ? `${error}; ${errorText(caught)}` : errorText(caught)
+    }
+    return {
+      enabled: true,
+      engine: BPMN_ENGINE_VERSION,
+      definitions,
+      instances,
+      active: this.activeCount,
+      ...(error === null ? {} : { error }),
+    }
+  }
+
+  /**
+   * 处理一条 definitions / instances 路由。**不抛错**：所有失败都收敛成
+   * `{status, body}`，由 index 的 `route()` 负责 sendJson（鉴权已在 index 完成）。
+   *
+   * @param {{method?: string, parts?: string[], url?: URL|string, body?: object}} request
+   * @returns {Promise<{status: number, body: object}>}
+   */
+  async handle(request = {}) {
+    try {
+      if (!isBpmnEnabled(this.env)) {
+        return {
+          status: 404,
+          body: { ok: false, code: 'BPMN_DISABLED', hint: `设置 ${BPMN_ENV}=1 启用` },
+        }
+      }
+      if (this._disposed) {
+        return { status: 503, body: { ok: false, code: 'BPMN_RUNTIME_DISPOSED', error: 'BPMN 运行时已释放' } }
+      }
+      const method = String(request.method ?? 'GET').toUpperCase()
+      const parts = Array.isArray(request.parts) ? request.parts.map(String) : []
+      const url = request.url instanceof URL
+        ? request.url
+        : new URL(typeof request.url === 'string' && request.url !== '' ? request.url : '/', 'http://localhost')
+      const body = request.body
+      if (parts[0] === 'definitions') return await this._handleDefinitions(method, parts, url, body)
+      if (parts[0] === 'instances') return await this._handleInstances(method, parts, url, body)
+      return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+
+  /** 释放内存中的 runner（进程退出 / 测试；不删磁盘数据、不把实例标成终态）。 */
+  async dispose() {
+    this._disposed = true
+    for (const runner of this._runners.values()) {
+      try {
+        await runner.stop()
+      } catch {
+        // 释放路径不抛：磁盘上的 state 仍可被新进程恢复。
+      }
+    }
+    this._runners.clear()
+    this._locks.clear()
+    this._eventChains.clear()
+    this._eventFailures.clear()
+    this._attempts.clear()
+    this._suppressWait.clear()
+    this._runnerErrors.clear()
+  }
+
+  // -------------------------------------------------------------------------
+  // definitions
+  // -------------------------------------------------------------------------
+
+  async _handleDefinitions(method, parts, url, body) {
+    if (parts.length === 1) {
+      if (method === 'GET') return await this._listDefinitions()
+      if (method === 'POST') return await this._saveDefinition(body)
+      return methodNotAllowed('GET / POST')
+    }
+    if (parts.length === 2) {
+      if (method === 'GET') return await this._readDefinition(parts[1], url)
+      return methodNotAllowed('GET')
+    }
+    return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+  }
+
+  async _listDefinitions() {
+    const summaries = await listDefinitions({ definitionsRoot: this.definitionsRoot })
+    const definitions = []
+    for (const summary of summaries) {
+      let meta = null
+      try {
+        meta = await readDefinition(summary.id, { definitionsRoot: this.definitionsRoot })
+      } catch {
+        // 坏 meta 不该让整张列表 500（store 的 list 也是这个口径）。
+      }
+      definitions.push({
+        id: summary.id,
+        name: summary.name,
+        description: summary.description,
+        tags: summary.tags,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        versionCount: summary.versionCount,
+        latestVersion: summary.latestVersion,
+        latestHash: meta?.latestHash ?? null,
+        versions: meta ? meta.versions.map(versionOf) : [],
+      })
+    }
+    return { status: 200, body: { ok: true, definitions } }
+  }
+
+  async _saveDefinition(body) {
+    if (!isPlainObject(body)) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ id?, name, xml }' },
+      }
+    }
+    const xml = body.xml
+    if (typeof xml !== 'string' || xml.trim() === '') {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_XML_REQUIRED', error: 'xml 必须是非空 BPMN 2.0 XML 字符串' },
+      }
+    }
+
+    // 先解析校验：ok:false 直接 400，不落盘（坏的模板不允许进定义域）。
+    const parsed = await parseBpmn(xml)
+    if (!parsed.ok) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          code: 'BPMN_XML_INVALID',
+          error: 'BPMN XML 未通过校验',
+          errors: parsed.errors,
+          warnings: parsed.warnings,
+        },
+      }
+    }
+
+    const id = this._definitionIdFrom(body, parsed.definition)
+    if (id === null) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          code: 'BPMN_DEFINITION_ID_INVALID',
+          error: 'id 只能由字母 / 数字 / 点 / 下划线 / 连字符组成，不以点开头，且不超过 64 字符',
+          hint: '不传 id 时会从 process id 或 name 推导一个合法 id',
+        },
+      }
+    }
+    const name = typeof body.name === 'string' && body.name.trim() !== ''
+      ? body.name.trim()
+      : (parsed.definition.name ?? id)
+    const saved = await saveDefinitionVersion(
+      id,
+      xml,
+      { name },
+      { definitionsRoot: this.definitionsRoot },
+    )
+    return {
+      status: saved.created ? 201 : 200,
+      body: {
+        ok: true,
+        id: saved.id,
+        version: saved.version,
+        hash: saved.hash,
+        created: saved.created,
+        warnings: parsed.warnings,
+      },
+    }
+  }
+
+  /** 显式 id 优先；缺省从 process id / name 推一个 store 能接受的 slug。 */
+  _definitionIdFrom(body, definition) {
+    if (body.id !== undefined && body.id !== null) {
+      if (typeof body.id !== 'string') return null
+      return checkRunId(body.id.trim())
+    }
+    for (const source of [definition?.id, body.name]) {
+      if (typeof source !== 'string' || source.trim() === '') continue
+      const slug = source
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60)
+      if (checkRunId(slug)) return slug
+    }
+    return checkRunId(`def-${Date.now().toString(36)}`)
+  }
+
+  async _readDefinition(id, url) {
+    const definitionId = checkRunId(id)
+    if (!definitionId) {
+      return { status: 400, body: { ok: false, code: 'BPMN_DEFINITION_ID_INVALID', error: 'definitionId 非法' } }
+    }
+    const meta = await readDefinition(definitionId, { definitionsRoot: this.definitionsRoot })
+    if (meta === null) {
+      return { status: 404, body: { ok: false, code: 'DEFINITION_NOT_FOUND', error: `定义 ${definitionId} 不存在` } }
+    }
+    const rawVersion = url.searchParams.get('version')
+    let wanted = meta.latestVersion
+    if (rawVersion !== null && rawVersion !== '') {
+      if (!/^\d+$/.test(rawVersion) || Number(rawVersion) < 1) {
+        return { status: 400, body: { ok: false, code: 'BPMN_VERSION_INVALID', error: 'version 必须是 ≥1 的整数' } }
+      }
+      wanted = Number(rawVersion)
+    }
+    const body = {
+      ok: true,
+      id: meta.id,
+      name: meta.name,
+      description: meta.description,
+      tags: meta.tags,
+      createdAt: meta.createdAt,
+      updatedAt: meta.updatedAt,
+      latestVersion: meta.latestVersion,
+      latestHash: meta.latestHash,
+      versions: meta.versions.map(versionOf),
+      version: null,
+      hash: null,
+      bytes: null,
+      xml: null,
+    }
+    if (wanted === null) return { status: 200, body }
+    const version = await readDefinitionVersion(definitionId, wanted, { definitionsRoot: this.definitionsRoot })
+    if (version === null) {
+      return {
+        status: 404,
+        body: { ok: false, code: 'DEFINITION_VERSION_NOT_FOUND', error: `定义 ${definitionId} 的 v${wanted} 不存在` },
+      }
+    }
+    body.version = version.version
+    body.hash = version.hash
+    body.bytes = version.bytes
+    body.xml = version.xml
+    return { status: 200, body }
+  }
+
+  // -------------------------------------------------------------------------
+  // instances — 路由
+  // -------------------------------------------------------------------------
+
+  async _handleInstances(method, parts, url, body) {
+    if (parts.length === 1) {
+      if (method === 'GET') return await this._listInstances(url)
+      if (method === 'POST') return await this._createInstance(body)
+      return methodNotAllowed('GET / POST')
+    }
+    const id = checkRunId(parts[1])
+    if (parts.length === 2) {
+      if (method !== 'GET') return methodNotAllowed('GET')
+      if (!id) return invalidInstanceId()
+      return await this._readInstance(id)
+    }
+    if (parts.length === 3) {
+      if (!id) return invalidInstanceId()
+      if (parts[2] === 'events') {
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readEvents(id, url)
+      }
+      if (parts[2] === 'tasks') {
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readTasks(id)
+      }
+      if (parts[2] === 'stop') {
+        if (method !== 'POST') return methodNotAllowed('POST')
+        return await this._stopInstance(id)
+      }
+      return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+    }
+    if (parts.length === 5 && parts[2] === 'tasks' && parts[4] === 'complete') {
+      if (method !== 'POST') return methodNotAllowed('POST')
+      if (!id) return invalidInstanceId()
+      return await this._completeTask(id, parts[3], body)
+    }
+    return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+  }
+
+  async _listInstances(url) {
+    const definitionId = url.searchParams.get('definitionId')
+    const status = url.searchParams.get('status')
+    const limitRaw = url.searchParams.get('limit')
+    const filter = { instancesRoot: this.instancesRoot }
+    if (definitionId !== null && definitionId !== '') filter.definitionId = definitionId
+    if (status !== null && status !== '') filter.status = status
+    if (limitRaw !== null && limitRaw !== '') {
+      if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1) {
+        return { status: 400, body: { ok: false, code: 'BPMN_LIMIT_INVALID', error: 'limit 必须是正整数' } }
+      }
+      filter.limit = Math.min(Number(limitRaw), 1000)
+    }
+    const instances = await listInstances(filter)
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        instances: instances.map(instance => ({
+          ...instance,
+          active: this._runners.has(instance.id),
+        })),
+        skipped: Array.isArray(instances.skipped) ? instances.skipped : [],
+      },
+    }
+  }
+
+  async _createInstance(body) {
+    if (!isPlainObject(body)) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ definitionId, definitionVersion?, variables? }' },
+      }
+    }
+    const definitionId = checkRunId(body.definitionId)
+    if (!definitionId) {
+      return { status: 400, body: { ok: false, code: 'INSTANCE_INVALID_ID', error: 'definitionId 非法' } }
+    }
+    if (body.variables !== undefined && body.variables !== null && !isPlainObject(body.variables)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_VARIABLES_INVALID', error: 'variables 必须是 JSON 对象' } }
+    }
+    let definitionVersion
+    if (body.definitionVersion !== undefined && body.definitionVersion !== null) {
+      const version = typeof body.definitionVersion === 'string' && /^\d+$/.test(body.definitionVersion)
+        ? Number(body.definitionVersion)
+        : body.definitionVersion
+      if (!Number.isSafeInteger(version) || version < 1) {
+        return { status: 400, body: { ok: false, code: 'BPMN_VERSION_INVALID', error: 'definitionVersion 必须是 ≥1 的整数' } }
+      }
+      definitionVersion = version
+    }
+
+    const instance = await createInstance({
+      definitionId,
+      ...(definitionVersion === undefined ? {} : { definitionVersion }),
+      variables: body.variables ?? {},
+      definitionsRoot: this.definitionsRoot,
+      instancesRoot: this.instancesRoot,
+    })
+
+    try {
+      const started = await this._withInstance(instance.id, () => this._startInstance(instance.id))
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          id: started.instance.id,
+          status: started.instance.status,
+          pendingTasks: started.instance.pendingTasks,
+          lastSeq: started.instance.lastSeq,
+          definitionId: started.instance.definitionId,
+          definitionVersion: started.instance.definitionVersion,
+          definitionHash: started.instance.definitionHash,
+          recovered: false,
+          ...(started.error === null ? {} : { error: { code: started.error.code, message: started.error.message } }),
+        },
+      }
+    } catch (error) {
+      // 实例已经建出来了：把可定位的信息带回给调用方，而不是只给一句 500。
+      const result = errorResult(error)
+      return {
+        status: result.status,
+        body: { ...result.body, id: instance.id, definitionId: instance.definitionId },
+      }
+    }
+  }
+
+  /** 建实例后启动；失败不抛 handler 错，收成 `{instance, error}`（实例已标 failed）。 */
+  async _startInstance(instanceId) {
+    const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+    if (instance === null) {
+      throw new BpmnRuntimeError(404, 'INSTANCE_NOT_FOUND', `实例 ${instanceId} 不存在`)
+    }
+    if (instance.status !== 'pending') {
+      throw new BpmnRuntimeError(409, 'INSTANCE_NOT_PENDING', `实例 ${instanceId} 当前状态是 ${instance.status}，不能重新启动`)
+    }
+    const snapshot = await readInstanceDefinition(instanceId, { instancesRoot: this.instancesRoot })
+    if (snapshot === null) {
+      throw new BpmnRuntimeError(500, 'INSTANCE_SNAPSHOT_MISSING', `实例 ${instanceId} 的定义快照缺失`)
+    }
+    const parsed = await parseBpmn(snapshot.xml)
+    if (!parsed.ok) {
+      await completeInstance(instanceId, 'failed', { instancesRoot: this.instancesRoot })
+      throw new BpmnRuntimeError(500, 'BPMN_DEFINITION_INVALID', '实例定义快照未通过 BPMN 校验，无法启动', {
+        errors: parsed.errors,
+      })
+    }
+
+    const runner = this._newRunner(parsed.definition, snapshot.xml, instanceId, instance.variables)
+    this._runners.set(instanceId, runner)
+    let startError = null
+    try {
+      await runner.start()
+    } catch (error) {
+      startError = error
+    }
+    await this._afterSettle(instanceId, runner)
+    const after = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+    if (after === null) {
+      throw new BpmnRuntimeError(500, 'INSTANCE_VANISHED', `实例 ${instanceId} 在启动过程中消失`)
+    }
+    // handler 失败 / 条件错误已经由 runner 收成 failed；不需要再抛，但把原因带回。
+    if (startError !== null && after.status !== 'failed') {
+      throw startError
+    }
+    return {
+      instance: after,
+      error: startError === null ? null : {
+        code: startError.code ?? 'BPMN_ENGINE_ERROR',
+        message: startError.message,
+      },
+    }
+  }
+
+  async _readInstance(id) {
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      const ensured = await this._ensureRunner(instance)
+      const current = await readInstance(id, { instancesRoot: this.instancesRoot }) ?? instance
+      const pendingTasks = ensured.runner !== null
+        ? ensured.runner.pendingTasks()
+        : (current.pendingTasks ?? [])
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id: current.id,
+          definitionId: current.definitionId,
+          definitionVersion: current.definitionVersion,
+          definitionHash: current.definitionHash,
+          status: current.status,
+          variables: current.variables,
+          result: current.result,
+          pendingTasks,
+          lastSeq: current.lastSeq,
+          eventCount: current.eventCount,
+          revision: current.revision,
+          createdAt: current.createdAt,
+          updatedAt: current.updatedAt,
+          completedAt: current.completedAt,
+          runnerStatus: ensured.runner === null ? null : ensured.runner.status(),
+          recovered: ensured.recovered,
+          ...(ensured.reason ? { recovery: { reason: ensured.reason, code: ensured.code ?? null } } : {}),
+        },
+      }
+    })
+  }
+
+  async _readEvents(id, url) {
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    const events = await readInstanceEvents(id, { instancesRoot: this.instancesRoot })
+    const sinceRaw = url.searchParams.get('since')
+    let filtered = events ?? []
+    if (sinceRaw !== null && sinceRaw !== '') {
+      if (!/^\d+$/.test(sinceRaw)) {
+        return { status: 400, body: { ok: false, code: 'BPMN_SEQ_INVALID', error: 'since 必须是非负整数' } }
+      }
+      const since = Number(sinceRaw)
+      filtered = filtered.filter(event => Number.isSafeInteger(event.seq) && event.seq > since)
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        id,
+        events: filtered,
+        lastSeq: instance.lastSeq,
+        skipped: events?.skipped ?? 0,
+        shards: events?.shards ?? 0,
+      },
+    }
+  }
+
+  async _readTasks(id) {
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      const ensured = await this._ensureRunner(instance)
+      const current = await readInstance(id, { instancesRoot: this.instancesRoot }) ?? instance
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          status: current.status,
+          tasks: ensured.runner !== null ? ensured.runner.pendingTasks() : (current.pendingTasks ?? []),
+          recovered: ensured.recovered,
+          ...(ensured.reason ? { recovery: { reason: ensured.reason, code: ensured.code ?? null } } : {}),
+        },
+      }
+    })
+  }
+
+  async _completeTask(id, activityId, body) {
+    const requested = activityIdLabel(activityId)
+    if (requested === null) {
+      return {
+        status: 400,
+        body: { ok: false, code: 'BPMN_ACTIVITY_ID_INVALID', error: 'activityId 必须是非空字符串（≤128）' },
+      }
+    }
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ payload?, decidedBy? }' } }
+    }
+    const payload = body?.payload
+    if (payload !== undefined && payload !== null && !isPlainObject(payload)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_PAYLOAD_INVALID', error: 'payload 必须是 JSON 对象' } }
+    }
+    const decidedBy = typeof body?.decidedBy === 'string' && body.decidedBy.trim() !== ''
+      ? body.decidedBy.trim()
+      : null
+    const executionId = typeof body?.executionId === 'string' && body.executionId !== '' ? body.executionId : null
+
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      if (TERMINAL_STATUSES.has(instance.status)) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_TERMINAL',
+            error: `实例 ${id} 已结束（${instance.status}），不能再完成人工任务`,
+          },
+        }
+      }
+      const ensured = await this._ensureRunner(instance)
+      if (ensured.runner === null) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_NOT_RECOVERABLE',
+            error: `实例 ${id} 当前无法恢复：${ensured.reason ?? '未知原因'}`,
+            ...(ensured.code ? { recoveryCode: ensured.code } : {}),
+          },
+        }
+      }
+      const runner = ensured.runner
+      if (runner.status() === 'failed') {
+        return { status: 409, body: { ok: false, code: 'BPMN_INSTANCE_FAILED', error: `实例 ${id} 已经失败，不能再完成任务` } }
+      }
+      if (runner.status() !== 'waiting') {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_NOT_WAITING',
+            error: `实例 ${id} 当前 runner 状态是 ${runner.status()}，没有等待中的人工任务`,
+          },
+        }
+      }
+      const tasks = runner.pendingTasks()
+      const task = tasks.find(item => item.activityId === requested
+        && (executionId === null || item.executionId === executionId))
+      if (!task) {
+        return {
+          status: 404,
+          body: {
+            ok: false,
+            code: 'BPMN_TASK_NOT_FOUND',
+            error: `实例 ${id} 没有在等待的任务 ${requested}`,
+            tasks,
+          },
+        }
+      }
+
+      // decidedBy 是审计字段：并入任务载荷（同一份会进 variables），不另造事件。
+      const effectivePayload = { ...(isPlainObject(payload) ? payload : {}) }
+      if (decidedBy !== null && effectivePayload.decidedBy === undefined) {
+        effectivePayload.decidedBy = decidedBy
+      }
+      let signalError = null
+      try {
+        await runner.signalTask({ activityId: task.activityId, executionId: task.executionId, payload: effectivePayload })
+      } catch (error) {
+        signalError = error
+      }
+      await this._afterSettle(id, runner)
+      const after = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (signalError !== null) {
+        const result = errorResult(signalError)
+        return { status: result.status, body: { ...result.body, id, tasks: runner.pendingTasks() } }
+      }
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          status: after?.status ?? 'unknown',
+          pendingTasks: after?.pendingTasks ?? runner.pendingTasks(),
+          lastSeq: after?.lastSeq ?? 0,
+          activityId: task.activityId,
+          executionId: task.executionId,
+          decidedBy,
+          recovered: ensured.recovered,
+        },
+      }
+    })
+  }
+
+  async _stopInstance(id) {
+    return await this._withInstance(id, async () => {
+      const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (instance === null) return instanceNotFound(id)
+      if (TERMINAL_STATUSES.has(instance.status)) {
+        return {
+          status: 200,
+          body: { ok: true, id, status: instance.status, alreadyTerminal: true, pendingTasks: [] },
+        }
+      }
+      const runner = this._runners.get(id) ?? null
+      if (runner !== null) {
+        try {
+          await runner.stop()
+        } catch {
+          // runner.stop 幂等；失败不改变「实例已中止」这个事实。
+        }
+        this._runners.delete(id)
+      }
+      const after = await completeInstance(id, 'aborted', { instancesRoot: this.instancesRoot })
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          status: after.status,
+          alreadyTerminal: false,
+          pendingTasks: after.pendingTasks,
+          lastSeq: after.lastSeq,
+        },
+      }
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // runner 生命周期 / 懒恢复
+  // -------------------------------------------------------------------------
+
+  /** 同实例写操作串行（complete / stop / 懒恢复都在同一把锁里）。 */
+  async _withInstance(id, task) {
+    const previous = this._locks.get(id) ?? Promise.resolve()
+    let release
+    const gate = new Promise(resolveGate => { release = resolveGate })
+    const tail = previous.then(() => gate)
+    this._locks.set(id, tail)
+    await previous.catch(() => {})
+    try {
+      return await task()
+    } finally {
+      release()
+      if (this._locks.get(id) === tail) this._locks.delete(id)
+    }
+  }
+
+  _newRunner(definition, xml, instanceId, variables) {
+    const maxActive = positiveEnvInt(this.env[BPMN_MAX_ACTIVE_ENV], this.maxActiveInstances ?? DEFAULT_MAX_ACTIVE_INSTANCES)
+    try {
+      return createBpmnRunner({
+        definition,
+        xml,
+        instanceId,
+        variables: isPlainObject(variables) ? { ...variables } : {},
+        services: this._servicesFor(instanceId),
+        limits: this._limits(),
+        // 快照点由本模块在每次收口后显式 getState()（只取一次），runner 的自动
+        // 快照关掉；`getState()` 仍会写 runner 的 `_lastState`，LRU 淘汰检查照常可用。
+        shouldSnapshot: () => false,
+        maxActiveInstances: maxActive,
+      })
+    } catch (error) {
+      if (error?.code === 'BPMN_INSTANCE_ID_CONFLICT') {
+        throw new BpmnRuntimeError(
+          503,
+          'BPMN_INSTANCE_ACTIVE_ELSEWHERE',
+          `同一进程内已有实例 ${instanceId} 的 runner 在活跃表中；先 dispose 旧 runtime 再恢复`,
+        )
+      }
+      throw error
+    }
+  }
+
+  _servicesFor(instanceId) {
+    return {
+      executeAgent: (element, ctx) => executeAgent(element, ctx, {
+        runExecutor: this.executorRunner,
+        normalizeExecutor: this.executorNormalizer,
+      }),
+      executeHttp: (element, ctx) => executeHttp(element, ctx),
+      onEvent: event => this._onRunnerEvent(instanceId, event),
+      onTaskWait: () => {},
+      onTaskDone: () => {},
+      onError: error => this._recordRunnerError(instanceId, error),
+    }
+  }
+
+  _limits() {
+    const limits = {}
+    const activityWaitMs = positiveEnvInt(this.env[BPMN_ACTIVITY_TIMEOUT_ENV], null)
+    if (activityWaitMs !== null) limits.activityWaitMs = activityWaitMs
+    return limits
+  }
+
+  /**
+   * 取 runner：内存里有就用；没有且实例非终态时按 state + 定义快照懒恢复。
+   * @returns {Promise<{runner: any|null, recovered: boolean, reason?: string, code?: string|null}>}
+   */
+  async _ensureRunner(instance) {
+    const cached = this._runners.get(instance.id)
+    if (cached !== undefined && cached.status() !== 'idle') {
+      return { runner: cached, recovered: false }
+    }
+    if (cached !== undefined) this._runners.delete(instance.id)
+
+    if (TERMINAL_STATUSES.has(instance.status)) {
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例已是终态 ${instance.status}，没有可推进的点`,
+        code: null,
+      }
+    }
+
+    let state
+    try {
+      state = await readInstanceState(instance.id, { instancesRoot: this.instancesRoot })
+    } catch (error) {
+      throw new BpmnRuntimeError(500, 'BPMN_STATE_READ_FAILED', `读取实例 ${instance.id} 的 state.json 失败：${errorText(error)}`, {
+        instanceId: instance.id,
+      })
+    }
+    if (state === null || state === undefined) {
+      return {
+        runner: null,
+        recovered: false,
+        reason: '没有可恢复的引擎快照（state.json 不存在或为空）',
+        code: 'BPMN_STATE_MISSING',
+      }
+    }
+
+    const snapshot = await readInstanceDefinition(instance.id, { instancesRoot: this.instancesRoot })
+    if (snapshot === null) {
+      throw new BpmnRuntimeError(500, 'INSTANCE_SNAPSHOT_MISSING', `实例 ${instance.id} 的定义快照缺失`, {
+        instanceId: instance.id,
+      })
+    }
+    const parsed = await parseBpmn(snapshot.xml)
+    if (!parsed.ok) {
+      throw new BpmnRuntimeError(500, 'BPMN_DEFINITION_INVALID', `实例 ${instance.id} 的定义快照未通过 BPMN 校验`, {
+        errors: parsed.errors,
+      })
+    }
+
+    const runner = this._newRunner(parsed.definition, snapshot.xml, instance.id, instance.variables)
+    this._runners.set(instance.id, runner)
+    // recover 会重放一次 activity/wait（runner 坑 g）：按 state 里已知的 executionId 去重。
+    const pending = Array.isArray(state?.pendingTasks) ? state.pendingTasks : []
+    this._suppressWait.set(instance.id, new Set(
+      pending.map(task => (typeof task?.executionId === 'string' ? task.executionId : null)).filter(Boolean),
+    ))
+    try {
+      await runner.recover(state)
+    } catch (error) {
+      this._suppressWait.delete(instance.id)
+      this._runners.delete(instance.id)
+      try {
+        await runner.stop()
+      } catch {
+        // 恢复失败时 stop 只是清活跃表；失败不影响「不可恢复」结论。
+      }
+      return {
+        runner: null,
+        recovered: false,
+        reason: `state 不可恢复：${errorText(error)}`,
+        code: error?.code ?? null,
+      }
+    } finally {
+      this._suppressWait.delete(instance.id)
+    }
+
+    await this._afterSettle(instance.id, runner)
+    return { runner, recovered: true }
+  }
+
+  /** 每次操作收口：事件落盘 → 快照落盘 → 实例状态同步；任何失败都显式抛出。 */
+  async _afterSettle(instanceId, runner) {
+    const failures = await this._flushEvents(instanceId)
+    if (failures.length > 0) {
+      throw new BpmnRuntimeError(
+        500,
+        'BPMN_EVENT_WRITE_FAILED',
+        `实例 ${instanceId} 的事件写入失败（${failures.length} 条）`,
+        { instanceId, eventErrors: failures.map(item => ({ code: item.code ?? 'BPMN_EVENT_WRITE_FAILED', message: errorText(item) })) },
+      )
+    }
+    try {
+      await this._persistState(instanceId, runner)
+    } catch (error) {
+      if (error instanceof BpmnRuntimeError) throw error
+      throw new BpmnRuntimeError(500, 'BPMN_STATE_WRITE_FAILED', `实例 ${instanceId} 的 state.json 写入失败：${errorText(error)}`, {
+        instanceId,
+      })
+    }
+    await this._syncInstanceStatus(instanceId, runner)
+  }
+
+  /** 只在等待 / 运行中落盘（done / failed 不需要恢复）——每次收口只取一次快照。 */
+  async _persistState(instanceId, runner) {
+    const status = runner.status()
+    if (status !== 'waiting' && status !== 'running') return
+    const state = await runner.getState()
+    await writeInstanceState(instanceId, state, { instancesRoot: this.instancesRoot })
+  }
+
+  /** 用 runner 的真实状态校正实例元数据（事件链已写过一次，这里幂等兜底）。 */
+  async _syncInstanceStatus(instanceId, runner) {
+    const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+    if (instance === null) return
+    const status = runner.status()
+    const patch = {}
+    // 变量账本在 runner 里（活动输出 + 人工载荷）；instance.json 是观测面，收口时同步。
+    if (isPlainObject(runner.variables) && Object.keys(runner.variables).length > 0) {
+      patch.variables = runner.variables
+    }
+    // 失败原因带上 handler 自己的 code（例如 BPMN_AGENT_ADAPTER_UNAVAILABLE），
+    // 不让 runner 外层的 BPMN_HANDLER_FAILED 把它盖掉。
+    if (status === 'failed') {
+      patch.result = { error: this._runnerErrors.get(instanceId) ?? { code: 'BPMN_ENGINE_ERROR', message: '实例执行失败' } }
+    }
+    if (Object.keys(patch).length > 0) {
+      await updateInstance(instanceId, patch, { instancesRoot: this.instancesRoot })
+    }
+    if (TERMINAL_STATUSES.has(instance.status)) return
+    if (status === 'done') {
+      await completeInstance(instanceId, 'done', { instancesRoot: this.instancesRoot })
+    } else if (status === 'failed') {
+      await completeInstance(instanceId, 'failed', { instancesRoot: this.instancesRoot })
+    } else if (status === 'waiting') {
+      await updateInstance(instanceId, {
+        status: 'waiting',
+        pendingTasks: runner.pendingTasks(),
+      }, { instancesRoot: this.instancesRoot })
+    } else if (status === 'running') {
+      await updateInstance(instanceId, { status: 'running' }, { instancesRoot: this.instancesRoot })
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 事件桥
+  // -------------------------------------------------------------------------
+
+  _recordRunnerError(instanceId, error) {
+    const innerCode = typeof error?.cause?.code === 'string' && error.cause.code !== ''
+      ? error.cause.code
+      : (typeof error?.code === 'string' && error.code !== '' ? error.code : 'BPMN_ENGINE_ERROR')
+    const innerMessage = typeof error?.cause?.message === 'string' && error.cause.message !== ''
+      ? error.cause.message
+      : errorText(error)
+    this._runnerErrors.set(instanceId, { code: innerCode, message: innerMessage })
+  }
+
+  _onRunnerEvent(instanceId, event) {
+    if (!isPlainObject(event) || typeof event.type !== 'string' || event.type === '') return
+    const runner = this._runners.get(instanceId) ?? null
+
+    // recover 重放的 wait：同一 executionId 已经落过盘，不再写第二条。
+    if (event.type === 'activity/wait') {
+      const suppress = this._suppressWait.get(instanceId)
+      if (suppress !== undefined) {
+        const executionId = typeof event.activityId === 'string' ? event.activityId : null
+        if (executionId !== null && suppress.has(executionId)) {
+          suppress.delete(executionId)
+          return
+        }
+      }
+    }
+
+    const activityId = shardIdOf(event)
+    const attempt = this._nextAttempt(instanceId, event)
+    const persisted = persistableEvent(event)
+    this._enqueueEvent(instanceId, async () => {
+      if (persisted === null) {
+        throw new BpmnRuntimeError(500, 'BPMN_EVENT_UNSERIALIZABLE', `实例 ${instanceId} 的事件 ${event.type} 不能被序列化为 JSON`)
+      }
+      await appendInstanceEvents(instanceId, activityId, attempt, persisted, { instancesRoot: this.instancesRoot })
+      if (event.type === 'process/start' || event.type === 'activity/start') {
+        await updateInstance(instanceId, { status: 'running' }, { instancesRoot: this.instancesRoot })
+      } else if (event.type === 'activity/wait') {
+        await updateInstance(instanceId, {
+          status: 'waiting',
+          pendingTasks: runner === null ? [] : runner.pendingTasks(),
+        }, { instancesRoot: this.instancesRoot })
+      } else if (event.type === 'activity/end') {
+        await updateInstance(instanceId, {
+          status: 'running',
+          pendingTasks: runner === null ? [] : runner.pendingTasks(),
+        }, { instancesRoot: this.instancesRoot })
+      }
+      const terminal = terminalForEvent(event)
+      if (terminal !== null) {
+        await completeInstance(instanceId, terminal, { instancesRoot: this.instancesRoot })
+      }
+    })
+  }
+
+  _nextAttempt(instanceId, event) {
+    let attempts = this._attempts.get(instanceId)
+    if (attempts === undefined) {
+      attempts = new Map()
+      this._attempts.set(instanceId, attempts)
+    }
+    if (event.type === 'activity/start' && typeof event.elementId === 'string') {
+      const next = (attempts.get(event.elementId) ?? 0) + 1
+      attempts.set(event.elementId, next)
+      return next
+    }
+    if (typeof event.elementId === 'string' && attempts.has(event.elementId)) {
+      return attempts.get(event.elementId)
+    }
+    if (event.type === 'flow/taken' && typeof event.from === 'string' && attempts.has(event.from)) {
+      return attempts.get(event.from)
+    }
+    return 1
+  }
+
+  _enqueueEvent(instanceId, task) {
+    const previous = this._eventChains.get(instanceId) ?? Promise.resolve()
+    const next = previous
+      .then(task)
+      .catch(error => {
+        const list = this._eventFailures.get(instanceId) ?? []
+        list.push(error)
+        this._eventFailures.set(instanceId, list)
+      })
+    this._eventChains.set(instanceId, next)
+  }
+
+  async _flushEvents(instanceId) {
+    // 等「当前的尾巴」；若期间又有事件入队，继续等新尾巴（迟到的 process/end 也收口）。
+    for (;;) {
+      const chain = this._eventChains.get(instanceId)
+      if (chain === undefined) break
+      await chain.catch(() => {})
+      if (this._eventChains.get(instanceId) === chain) break
+    }
+    const failures = this._eventFailures.get(instanceId) ?? []
+    this._eventFailures.delete(instanceId)
+    return failures
+  }
+}
+
+function methodNotAllowed(supported) {
+  return {
+    status: 405,
+    body: { ok: false, code: 'BPMN_METHOD_NOT_ALLOWED', error: `只支持 ${supported}` },
+  }
+}
+
+/** URL 里的 activityId：先解码，再按「非空、有界字符串」校验（不套 run id 路径规则）。 */
+function activityIdLabel(raw) {
+  let decoded = String(raw ?? '')
+  try {
+    decoded = decodeURIComponent(decoded)
+  } catch {
+    // 非法百分号编码：保留原文，交给长度校验。
+  }
+  return decoded.trim() !== '' && decoded.length <= 128 ? decoded : null
+}
+
+function invalidInstanceId() {
+  return {
+    status: 400,
+    body: {
+      ok: false,
+      code: 'BPMN_INSTANCE_ID_INVALID',
+      error: 'instanceId 只能由字母 / 数字 / 点 / 下划线 / 连字符组成，不以点开头，且不超过 64 字符',
+    },
+  }
+}
+
+function instanceNotFound(id) {
+  return {
+    status: 404,
+    body: { ok: false, code: 'INSTANCE_NOT_FOUND', error: `实例 ${id} 不存在` },
+  }
+}
+
+function versionOf(entry) {
+  return {
+    version: entry.version,
+    hash: entry.hash,
+    createdAt: entry.createdAt,
+    bytes: entry.bytes,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 服务处理器（0.13.0 范围：外部 CLI executor 薄接；其余明确失败）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读出 handler 该用的 attempt / variables（runner 的 ctx 是快照拷贝）。
+ */
+function handlerContext(ctx) {
+  const attempt = ctx && Number.isSafeInteger(ctx.attempt) && ctx.attempt >= 1 ? ctx.attempt : 1
+  const variables = ctx && isPlainObject(ctx.variables) ? ctx.variables : {}
+  return { attempt, variables }
+}
+
+function throwIfAborted(ctx) {
+  if (ctx?.signal?.aborted) {
+    throw handlerError('BPMN_ABORTED', '活动已被取消（ctx.signal 已 abort）', {
+      reason: 'aborted',
+    })
+  }
+}
+
+/** 外部 executor 的 prompt：节点提示词 + attempt / variables（下游能看见上下文）。 */
+function buildExecutorPrompt(element, ctx) {
+  const node = isPlainObject(element?.node) ? element.node : {}
+  const base = [node.prompt, node.roleCard]
+    .filter(value => typeof value === 'string' && value.trim() !== '')
+    .join('\n\n')
+    || (typeof element?.name === 'string' && element.name !== '' ? element.name : null)
+    || (typeof element?.id === 'string' ? element.id : '执行节点')
+  const { attempt, variables } = handlerContext(ctx)
+  const lines = [base, `执行上下文：attempt=${attempt}`]
+  if (Object.keys(variables).length > 0) {
+    lines.push(`变量：\n${JSON.stringify(variables)}`)
+  }
+  return lines.join('\n\n')
+}
+
+/**
+ * agent 节点处理器（签名固定 `(element, ctx)`）。
+ *
+ * - `adapter` = `codex` / `custom`：复用 `runExternalExecutor`（不重写进程管理）；
+ * - `adapter` = `dsh` 或缺失：**明确失败** `BPMN_AGENT_ADAPTER_UNAVAILABLE`
+ *   （0.13.1 才提供 AgentAdapter + hooks；0.13.0 不伪造 handler、不偷偷起子会话）；
+ * - 其他 adapter：`BPMN_AGENT_ADAPTER_UNSUPPORTED`。
+ *
+ * 第三个参数是本模块内部注入点（测试用桩 executor）；公开契约仍是两个参数。
+ *
+ * @param {object} element
+ * @param {{attempt?: number, variables?: object, signal?: AbortSignal, timeoutMs?: number|null}} ctx
+ * @param {{runExecutor?: Function, normalizeExecutor?: Function}} [options]
+ * @returns {Promise<{output?: unknown, usage?: object, events?: object[]}>}
+ */
+export async function executeAgent(element, ctx, options = {}) {
+  throwIfAborted(ctx)
+  const node = isPlainObject(element?.node) ? element.node : {}
+  const adapter = typeof node.adapter === 'string' && node.adapter.trim() !== ''
+    ? node.adapter.trim().toLowerCase()
+    : (typeof node.executor?.kind === 'string' && node.executor.kind !== '' ? node.executor.kind : null)
+
+  if (adapter === null || adapter === 'dsh') {
+    throw handlerError(
+      'BPMN_AGENT_ADAPTER_UNAVAILABLE',
+      'dsh 适配器在 0.13.1 提供（AgentAdapter + hooks），当前 0.13.0 只支持外部 CLI executor（adapter=codex/custom）',
+      { adapter: adapter ?? 'dsh', elementId: element?.id ?? null },
+    )
+  }
+  if (adapter !== 'codex' && adapter !== 'custom') {
+    throw handlerError(
+      'BPMN_AGENT_ADAPTER_UNSUPPORTED',
+      `不支持的 agent adapter「${adapter}」：0.13.0 只支持 codex / custom（dsh 在 0.13.1）`,
+      { adapter, elementId: element?.id ?? null },
+    )
+  }
+
+  const normalize = typeof options.normalizeExecutor === 'function' ? options.normalizeExecutor : normalizeExecutor
+  let spec
+  try {
+    spec = normalize({
+      executor: adapter,
+      executorCommand: node.executor?.command,
+      model: node.model,
+      mode: node.team?.mode,
+    })
+  } catch (error) {
+    throw handlerError(
+      typeof error?.code === 'string' ? error.code : 'BPMN_EXECUTOR_INVALID',
+      errorText(error),
+      { elementId: element?.id ?? null, cause: error },
+    )
+  }
+
+  const runExecutor = typeof options.runExecutor === 'function' ? options.runExecutor : runExternalExecutor
+  const timeoutMs = Number.isSafeInteger(ctx?.timeoutMs) && ctx.timeoutMs > 0
+    ? ctx.timeoutMs
+    : (Number.isSafeInteger(node.executor?.timeoutMs) && node.executor.timeoutMs > 0 ? node.executor.timeoutMs : 0)
+  const result = await runExecutor({
+    spec,
+    prompt: buildExecutorPrompt(element, ctx),
+    cwd: typeof node.executor?.cwd === 'string' && node.executor.cwd.trim() !== ''
+      ? node.executor.cwd.trim()
+      : process.cwd(),
+    timeoutMs,
+    signal: ctx?.signal,
+  })
+
+  throwIfAborted(ctx)
+  if (!result || result.ok !== true) {
+    const reason = result?.reason
+    const code = typeof result?.code === 'string' && result.code !== ''
+      ? result.code
+      : reason === 'aborted'
+        ? 'BPMN_ABORTED'
+        : reason === 'timeout'
+          ? 'BPMN_EXECUTOR_TIMEOUT'
+          : reason === 'OUTPUT_LIMIT'
+            ? 'BPMN_EXECUTOR_OUTPUT_LIMIT'
+            : 'BPMN_EXECUTOR_FAILED'
+    const tail = typeof result?.tail === 'string' && result.tail !== '' ? `；stderr 尾部：${result.tail}` : ''
+    throw handlerError(
+      code,
+      `外部 executor 执行失败（${reason ?? 'unknown'}）${result?.exitCode != null ? `，退出码 ${result.exitCode}` : ''}${tail}`,
+      { elementId: element?.id ?? null, reason: reason ?? null, exitCode: result?.exitCode ?? null },
+    )
+  }
+
+  const rawEvents = Array.isArray(result.events) ? result.events : []
+  const events = rawEvents
+    .filter(event => isPlainObject(event) && typeof event.text === 'string' && event.text.trim() !== '')
+    .slice(0, 200)
+    .map(event => ({
+      type: 'agent/log',
+      kind: event.kind ?? 'log',
+      text: event.text.length > 2000 ? `${event.text.slice(0, 2000)}…` : event.text,
+    }))
+  return {
+    output: result.structured ?? result.text,
+    ...(result.usage && isPlainObject(result.usage) ? { usage: result.usage } : {}),
+    ...(events.length > 0 ? { events } : {}),
+  }
+}
+
+/**
+ * http connector 处理器（签名固定 `(element, ctx)`）。
+ *
+ * 0.13.0 **不实现真实 HTTP**（0.13.4 才做 fetch + 超时/重试/变量映射/鉴权头脱敏），
+ * 抛 `BPMN_HTTP_NOT_IMPLEMENTED` 的结构化错误，避免半成品 fetch 被误认为可用。
+ *
+ * @param {object} element
+ * @param {{signal?: AbortSignal}} ctx
+ * @returns {Promise<never>}
+ */
+export async function executeHttp(element, ctx) {
+  throwIfAborted(ctx)
+  throw handlerError(
+    'BPMN_HTTP_NOT_IMPLEMENTED',
+    'http connector 在 0.13.4 提供（fetch + 超时/重试/变量映射/鉴权头脱敏）；0.13.0 不执行任何真实 HTTP',
+    { elementId: element?.id ?? null },
+  )
+}
+
+/** 导出目录 helper，便于运维/测试核对根位置（与 store 同口径）。 */
+export { definitionsDir, instancesDir }

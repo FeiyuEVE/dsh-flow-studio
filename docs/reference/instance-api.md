@@ -1,6 +1,6 @@
 # 实例域接口
 
-本页是 BPMN 定义域（`definitions/`）与实例域（`instances/`）的 HTTP 路由、参数、响应字段与当前行为契约，也是这些事实的唯一参考页。实现分布在 `src/bpmn-runtime.js`（路由 / 懒恢复 / 服务处理器）、`src/definition-store.js`、`src/instance-store.js`、`src/instance-inbox.js`、`src/instance-message-store.js`、`src/instance-worktree.js`、`src/connector-store.js` 与 `src/http-connector.js`。设计记录与阶段边界见 [design/10](../design/10-bpmn-instance-api.md)；旧运行域（`/flows`、`/runs`）的路由见 [Host 接口](host-api.md)。
+本页是 BPMN 定义域（`definitions/`）与实例域（`instances/`）的 HTTP 路由、参数、响应字段与当前行为契约，也是这些事实的唯一参考页。实现分布在 `src/bpmn-runtime.js`（路由 / 懒恢复 / 服务处理器）、`src/definition-store.js`、`src/instance-store.js`、`src/instance-inbox.js`、`src/instance-message-store.js`、`src/instance-worktree.js`、`src/connector-store.js`、`src/http-connector.js` 与 `src/instance-evidence.js`。设计记录与阶段边界见 [design/10](../design/10-bpmn-instance-api.md)、[design/13](../design/13-instance-evidence.md)；旧运行域（`/flows`、`/runs`）的路由见 [Host 接口](host-api.md)。
 
 ## 前缀与鉴权
 
@@ -8,7 +8,7 @@
 
 鉴权、同源校验与令牌档位与旧运行域是同一套：宿主 `connection.requestRejection` 先判 401 / 403（拿不到该服务时 fail-closed 503 `AUTH_SERVICE_UNAVAILABLE`），随后判同源，再进插件自己的令牌闸。这些判定不在 `src/bpmn-runtime.js` 里，而由 `src/index.js` 的 `route()` 在分发前统一完成；口径见 [Host 接口 · 鉴权](host-api.md#鉴权)，本页不复制。
 
-只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`，与请求落到哪个域无关。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复，可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages` 的 GET 只读磁盘或收件箱，不创建 runner。
+只读令牌只按 HTTP 方法判定：任何非 GET 请求一律 403 `READ_ONLY_TOKEN`，与请求落到哪个域无关。这个边界不保证读接口零副作用：`GET /instances/<id>` 与 `GET /instances/<id>/tasks` 会触发懒恢复，可能写 `state.json` 与事件；`/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 的 GET 只读磁盘或收件箱，不创建 runner。
 
 请求体上限 2 MiB，达到即 413；原始路径出现空段或 `.` / `..` 段在进路由前就 400。成功响应一律是 `{ok:true, …}` 信封；业务失败一般是 `{ok:false, code, error}`，不过鉴权 / 同源 / 请求体解析这类入口级拒绝可能只有 `{ok:false, error}`（与 [Host 接口](host-api.md) 同口径）。部分失败额外带 `hint`、`recoveryCode`、`tasks` 等定位字段。
 
@@ -31,6 +31,7 @@
 | POST | `/instances/<id>/stop` | 200 | 中止实例 |
 | GET | `/instances/<id>/metrics` | 200 | 单实例运行指标 |
 | GET | `/metrics` | 200 | 跨实例指标汇总 |
+| GET | `/instances/<id>/evidence` | 200 | 实例业务证据（claims / findings / 引用核对） |
 | GET | `/instances/<id>/worktree` | 200 | 实例工作区 / worktree 检查结果 |
 | DELETE | `/instances/<id>/worktree` | 200 | 删除实例 worktree（可连带删分支） |
 | DELETE | `/instances/<id>/worktree/branch` | 200 | 只删实例分支 |
@@ -307,6 +308,74 @@
 口径（未知不是零、按 `callId` 去重、四桶归一化、cohort 与分位数、缓存失效）唯一来源是 [design/12-instance-metrics.md](../design/12-instance-metrics.md)；本表只列入口与参数。
 
 `GET /metrics` 遍历 `instances/` 下全部实例，不用 `listInstances()` 的默认 limit；损坏实例计入 `totals.dataQuality.skippedInstances`，不中断整张汇总。
+
+## 证据
+
+实现：`src/bpmn-runtime.js` 的 `_readInstanceEvidence()`；解析与引用核对在 `src/instance-evidence.js` 的 `collectInstanceEvidence()`（纯函数）。语义唯一来源是 [design/13-instance-evidence.md](../design/13-instance-evidence.md)：什么算 `verified`、`fixed` 与 `verified` 的区别、来源与可信级别如何由宿主登记决定。
+
+### `GET /instances/<id>/evidence`
+
+只读，**不调用 `_ensureRunner()`**：查看证据不会恢复 / 推进实例。`?asOf=ISO` 可选，用于确定性观测；非法时间 400 `EVIDENCE_AS_OF_INVALID`。实例不存在 404 `INSTANCE_NOT_FOUND`。
+
+证据报告由 `flow_finish_node.documents[]` 以 `kind:"evidence-report"` 登记；报告正文在文件里，`instance.json.artifacts[]` 只存 `path + sha256`。响应：
+
+```json
+{
+  "ok": true,
+  "schema": "flow-evidence/v1",
+  "instanceId": "i-demo",
+  "instanceStatus": "ACTIVE",
+  "asOf": "2026-11-12T00:00:00.000Z",
+  "claims": [{
+    "id": "tests", "type": "test-result", "value": "passed",
+    "source": "report-claim", "trust": "report-claim", "valueTrust": "report-claim",
+    "executionId": "review_execution_7", "nodeId": "review", "attempt": 1,
+    "reportPath": "evidence/report.json", "reportSha256": "…",
+    "refs": [{ "path": "reports/tests.txt", "sha256": "…", "resolvedFrom": "artifact-snapshot", "verified": true }],
+    "refsChecked": true, "conflict": false
+  }],
+  "findings": [{
+    "id": "F-12", "status": "fixed", "declaredStatus": "fixed", "displayStatus": "verified",
+    "verified": true, "refsChecked": true, "conclusion": "report-claim", "conclusionVerified": false,
+    "executionId": "review_execution_7", "nodeId": "review", "attempt": 1,
+    "refs": [{ "path": "reports/tests.txt", "sha256": "…", "resolvedFrom": "artifact-snapshot", "verified": true }],
+    "conflict": false
+  }],
+  "verifiedRefs": [{ "path": "reports/tests.txt", "sha256": "…", "resolvedFrom": "artifact-snapshot", "claimIds": ["tests"], "findingIds": ["F-12"], "reportPaths": ["evidence/report.json"] }],
+  "missing": [],
+  "conflicts": [],
+  "sourceExecutions": [{ "executionId": "review_execution_7", "nodeId": "review", "reportPaths": ["evidence/report.json"], "reportHashVerified": true, "source": "host-registration" }],
+  "dataQuality": {
+    "evidenceStatus": "present", "unknown": false, "stub": false,
+    "reportCount": 1, "parsedReportCount": 1, "claimCount": 1, "findingCount": 1,
+    "verifiedRefCount": 1, "missingCount": 0, "conflictCount": 0,
+    "snapshotMissing": 0, "workspaceFallbacks": 0,
+    "reasons": [], "producerSelfClaims": [],
+    "contributesToAdmission": false, "injectedIntoInstanceState": false
+  }
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `schema` | 恒为 `flow-evidence/v1` |
+| `claims[]` | 报告声明的业务结论。`value` 永远是 `source:"report-claim"`；`refsChecked` 只表示引用是否全部核对 |
+| `findings[]` | 报告声明的缺陷 / 修复状态。`status` 原样保留；`fixed` 只有复验引用全部命中归档快照并核对通过时 `verified:true`，`displayStatus:"verified"`；只靠工作区回落不算 |
+| `verifiedRefs[]` | 内容 sha256 与快照 / 工作区一致（**只证明内容一致，不证明结论正确**），含 `resolvedFrom` |
+| `missing[]` | 缺报告、报告不可读、schema 不符、缺引用、引用读不到、`fixed` 无复验引用等，每项带 `kind` / `reason` |
+| `conflicts[]` | hash 不匹配、同 execution 同 ID 不同 value / status、跨 execution 分歧、报告自称 execution 与登记不一致等 |
+| `sourceExecutions[]` | 报告来源 execution（宿主登记；不同循环各留一条，不互相失效） |
+| `dataQuality.evidenceStatus` | `missing` / `invalid` / `partial` / `present` 四个事实状态，不是质量评级 |
+| `dataQuality.unknown` | 缺报告 / 报告不可读时为 `true`；空 claims 不代表全部通过 |
+| `dataQuality.stub` | 报告自报 `stub:true` / `synthetic:true` 时为 `true` |
+| `dataQuality.reasons` | 稳定原因串清单（如 `artifact-snapshot-missing`、`workspace-fallback`、`fixed-without-verification-refs`） |
+| `dataQuality.producerSelfClaims` | 报告自称 `producer` / `authority` / `trust` 的记录；这些自报被忽略，不授予宿主身份 |
+
+引用解析顺序：先按 `sha256` 命中 `artifacts/<sha256>` 快照；快照缺失才回落到工作区相对路径，并在 `dataQuality.reasons` 记 `artifact-snapshot-missing` 与 `workspace-fallback`。worktree / 工作区被清理后，已登记快照仍可读、hash 仍一致；从未登记过快照的引用才会变成 `missing`。
+
+本接口不产出「优 / 良 / 差」或统一 pass / warn / fail 总评级；findings 不写入实例状态、不参与 admission、不会自动触发节点完成。`activity/end` 只负责把本 execution 的 artifacts 关联到报告，不替报告做业务裁决。
+
+失败：400 `BPMN_INSTANCE_ID_INVALID` / `EVIDENCE_AS_OF_INVALID`，404 `INSTANCE_NOT_FOUND`，405 `BPMN_METHOD_NOT_ALLOWED`，500 `INSTANCE_CORRUPT` / `BPMN_INTERNAL_ERROR`。
 
 ## 实例 worktree
 
@@ -650,7 +719,7 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 `clear-tombstone` 只删除墓碑快照，不恢复引擎；删除后同一实例的懒恢复会变成 `BPMN_STATE_MISSING`，仍不能自动继续，需要新建实例。
 
-同一实例的 `complete` 与懒恢复走同一把进程内异步锁，事件写入再逐条串行；两个并发 complete 只有一个成功，另一个拿到 409。`stop` 故意在锁外先置停止闩并中止 runner（避免排在慢 complete 后面），再靠终态写保护与写操作竞争：竞争失败的一方按实际结果拿到 409 `INSTANCE_TERMINAL_IMMUTABLE` 或幂等的 `alreadyTerminal`。`GET /instances/<id>/definition`、`/events`、`/worktree`、`/resource-events`、`/messages` 不触发恢复。
+同一实例的 `complete` 与懒恢复走同一把进程内异步锁，事件写入再逐条串行；两个并发 complete 只有一个成功，另一个拿到 409。`stop` 故意在锁外先置停止闩并中止 runner（避免排在慢 complete 后面），再靠终态写保护与写操作竞争：竞争失败的一方按实际结果拿到 409 `INSTANCE_TERMINAL_IMMUTABLE` 或幂等的 `alreadyTerminal`。`GET /instances/<id>/definition`、`/events`、`/worktree`、`/resource-events`、`/messages`、`/metrics`、`/evidence` 不触发恢复。
 
 ### 收件箱状态机
 

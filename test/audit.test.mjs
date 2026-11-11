@@ -173,7 +173,6 @@ check('pending：run 建好但还没开始 → pending / inspect / 30s', () => {
   assert.equal(audit.currentNode, null)
   assert.equal(audit.progress.total, 4)
   assert.equal(audit.progress.ratio, null)
-  assert.equal(audit.quality, null)
   assert.equal(audit.tokens, null)
 })
 
@@ -390,147 +389,8 @@ check('无进展：一个节点都没跑完且超过 stallMs → no-progress', (
 })
 
 // ---------------------------------------------------------------------------
-// 9. done + quality pass
+// 9. done：只报流程完成，不再给质量总评分
 // ---------------------------------------------------------------------------
-check('done + quality pass：verdict done，headline 带质量结论', () => {
-  const ev = eventLog()
-  const events = [
-    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 2 } }),
-    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
-    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
-    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
-    nodeEnd(ev, 'n_shape', 'passed', 1, { ts: isoAt(0, 4) }),
-    ev('acceptance/verdict', {
-      ts: isoAt(0, 5),
-      nodeId: 'n_req',
-      attemptId: 1,
-      // 0.11 N1：pass 档要求权威覆盖 100%；这三条证据按「宿主已核对」的输入形状构造。
-      extra: { producer: 'host', authority: 'host' },
-      data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: 'artifacts/acc.md' },
-    }),
-    ev('test/report', {
-      ts: isoAt(0, 6),
-      nodeId: 'n_shape',
-      attemptId: 1,
-      extra: { producer: 'host', authority: 'host' },
-      data: {
-        suite: 'unit', executed: 10, passed: 10, failed: 0, skipped: 0,
-        reportRef: 'artifacts/test.md',
-      },
-    }),
-    ev('check/form', {
-      ts: isoAt(0, 7),
-      nodeId: 'n_shape',
-      attemptId: 1,
-      extra: { producer: 'host', authority: 'host' },
-      data: {
-        ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
-        passedChecks: 5, totalChecks: 5, executedAt: isoAt(0, 7),
-      },
-    }),
-    ev('review/finding', {
-      ts: isoAt(0, 8),
-      nodeId: 'n_dev',
-      attemptId: 1,
-      data: { id: 'f1', severity: 'P1', title: '小问题', status: 'verified' },
-    }),
-    ev('review/verdict', {
-      ts: isoAt(0, 9),
-      nodeId: 'n_dev',
-      attemptId: 1,
-      data: { verdict: 'approve', findingCount: 1 },
-    }),
-    ev('run/end', { ts: isoAt(0, 10), data: { status: 'done' } }),
-  ]
-  const audit = auditWorkflow({
-    flow: FLOW,
-    events,
-    now: msAt(1),
-    run: { status: 'done', startedAt: isoAt(0), endedAt: isoAt(0, 10) },
-    verifyHostExecution: () => true,
-  })
-  assertContract(audit, 'done')
-  assert.equal(audit.status, 'done')
-  assert.ok(audit.quality, 'done 必须有质量结论')
-  assert.equal(audit.quality.state, 'pass')
-  assert.match(audit.headline, /优/)
-  assert.ok(audit.headline.includes(audit.quality.label))
-  assert.ok(audit.tokens && typeof audit.tokens.total === 'object')
-  assert.equal(audit.currentNode, null)
-  assert.equal(audit.anomalies.length, 0)
-  assert.equal(audit.recommended, 'report')
-  assert.equal(audit.nextCheckSeconds, null)
-})
-
-// N1 反向锁：同一份证据内容改回旧 run 的 legacy 形状（无 extra 来源）后，不得再 pass。
-// 否则将来有人把上面的夹具改回无 extra，N1 会静默回退且本文件无测试发现。
-check('N1：legacy 形状（证据无 extra）的 done run 不得 pass，headline 写明来源未知', () => {
-  const ev = eventLog()
-  const events = [
-    ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 2 } }),
-    nodeStart(ev, 'n_req', 1, { ts: isoAt(0, 1) }),
-    nodeEnd(ev, 'n_req', 'passed', 1, { ts: isoAt(0, 2) }),
-    nodeStart(ev, 'n_shape', 1, { ts: isoAt(0, 3) }),
-    nodeEnd(ev, 'n_shape', 'passed', 1, { ts: isoAt(0, 4) }),
-    ev('acceptance/verdict', {
-      ts: isoAt(0, 5),
-      nodeId: 'n_req',
-      attemptId: 1,
-      data: { itemId: 'acc-1', status: 'pass', decidedBy: 'human', evidenceRef: 'artifacts/acc.md' },
-    }),
-    ev('test/report', {
-      ts: isoAt(0, 6),
-      nodeId: 'n_shape',
-      attemptId: 1,
-      data: {
-        suite: 'unit', executed: 10, passed: 10, failed: 0, skipped: 0,
-        reportRef: 'artifacts/test.md',
-      },
-    }),
-    ev('check/form', {
-      ts: isoAt(0, 7),
-      nodeId: 'n_shape',
-      attemptId: 1,
-      data: {
-        ruleSetId: 'eslint', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
-        passedChecks: 5, totalChecks: 5, executedAt: isoAt(0, 7),
-      },
-    }),
-    ev('review/finding', {
-      ts: isoAt(0, 8),
-      nodeId: 'n_dev',
-      attemptId: 1,
-      data: { id: 'f1', severity: 'P1', title: '小问题', status: 'verified' },
-    }),
-    ev('review/verdict', {
-      ts: isoAt(0, 9),
-      nodeId: 'n_dev',
-      attemptId: 1,
-      data: { verdict: 'approve', findingCount: 1 },
-    }),
-    ev('run/end', { ts: isoAt(0, 10), data: { status: 'done' } }),
-  ]
-  const audit = auditWorkflow({
-    flow: FLOW,
-    events,
-    now: msAt(1),
-    run: { status: 'done', startedAt: isoAt(0), endedAt: isoAt(0, 10) },
-  })
-  assertContract(audit, 'done')
-  assert.ok(audit.quality, 'done 必须有质量结论')
-  // 质量分类归 runlog 的质量层：v1.3 起 legacy（无产物归属）从 unknown 细分成 warn，
-  // 但「legacy 形状不得算通过」这条不能松——只断言不是 pass。
-  assert.ok(
-    audit.quality.state !== 'pass',
-    `legacy 形状不得 pass（实际 ${audit.quality.state}：${audit.quality.label}）`,
-  )
-  // 措辞同样归 runlog（可能说「来源未知 / 找不到产物归属 / 缺独立复核 / 证据不足」）；
-  // 审计这边只要求可读文案指明了「证据不足」这一类原因。
-  assert.match(audit.quality.label, /legacy|来源未知|找不到产物归属|缺独立复核|证据不足|无法判定/)
-  assert.match(audit.headline, /unknown|warn/)
-  assert.match(audit.headline, /legacy|来源未知|找不到产物归属|缺独立复核|证据不足|无法判定/)
-})
-
 // ---------------------------------------------------------------------------
 // 10. failed
 // ---------------------------------------------------------------------------
@@ -648,7 +508,7 @@ check('打回后从打回目标重跑不算偏航（正常 reject 循环不误�
 // ---------------------------------------------------------------------------
 // 14. done 但证据不足
 // ---------------------------------------------------------------------------
-check('done 但无证据：quality unknown，headline 明说未检测', () => {
+check('done 但无证据：仍然只说流程完成，不返回 quality', () => {
   const ev = eventLog()
   const events = [
     ev('run/start', { ts: isoAt(0), data: { flowId: 'f', nodeTotal: 2 } }),
@@ -665,9 +525,8 @@ check('done 但无证据：quality unknown，headline 明说未检测', () => {
     run: { status: 'done', startedAt: isoAt(0), endedAt: isoAt(0, 5) },
   })
   assertContract(audit, 'done')
-  assert.ok(audit.quality)
-  assert.equal(audit.quality.state, 'unknown')
-  assert.match(audit.headline, /未检测/)
+  assert.equal(Object.hasOwn(audit, 'quality'), false)
+  assert.match(audit.headline, /流程已完成/)
 })
 
 // ---------------------------------------------------------------------------

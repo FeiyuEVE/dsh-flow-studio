@@ -32,7 +32,7 @@ BPMN 实例域（`/definitions`、`/instances`、`/instance-worktrees`）的当�
 | GET/POST | `/runs/<runId>/events` | 事件流（`nodeId`、`attemptId`、`kind`、`since`、`order=desc`、`limit`）/ 追加事件（≤200 条/批，整批校验；只收观测类事件） |
 | GET/POST | `/worktrees` | 孤儿 worktree 清单（`listWorktrees` + 已记录的删除指针）/ `{action:'prune', keepRunIds?}` 回收（`pruneWorktrees`，连 `flow/<runId>` 分支一起清） |
 | DELETE | `/runs/<runId>/worktree` | 删该 run 的 worktree（显式传 `root`、`force` 恒 true；返回 `{ok, removed, reason, branchRemoved}`） |
-| GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度 / 质量结论）+ `nodeStatus` |
+| GET | `/runs/<runId>/summary` | 指标聚合（token / skill 覆盖率 / findings / 打回 / 进度）+ `nodeStatus`；0.13.12 起不再返回质量总评分 |
 | GET | `/runs/<runId>/export` | 导出 markdown（唯一允许 `?token=` 的接口） |
 
 保存的宽松口径（0.7 拍板）：`validation.errors` 非空照存；`nodes: []` / `edges: []`（用户删光节点）也是合法整份替换，仍然 200。`PUT` 只是额外要求这两个键**存在且是数组**（`FLOW_BODY_INCOMPLETE`），不对节点 / 连线内容做内容级校验——那留给启动 run 的 `validateFlowForRun`。

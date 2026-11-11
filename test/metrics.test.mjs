@@ -3,7 +3,7 @@
  * v1.1 指标与 Host 契约自检（05 §8）。
  *
  * 分两段：
- *   1. quality 判定表 / 打回失效的纯函数探针（会打印实际判定结果）；
+ *   1. 打回失效 / progress 的纯函数探针（会打印实际判定结果）；不再测质量总评分；
  *   2. /api/flow-studio 的真实 HTTP 语义：坏 run 的 skipped、413 可读、500 不带内部路径、
  *      health 字段、可选 token 两档、nodeDone 同口径。
  *
@@ -26,7 +26,7 @@ const home = process.env.DSH_HOME
 
 const { apply, PLUGIN_VERSION, AUTH_ENV } = await import('../src/index.js')
 const store = await import('../src/runstore.js')
-const { computeProgress, computeQuality, summarize } = await import('../src/runlog.js')
+const { computeProgress, summarize } = await import('../src/runlog.js')
 
 let checks = 0
 async function check(name, fn) {
@@ -36,7 +36,7 @@ async function check(name, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. quality / progress 探针
+// 1. progress 探针
 // ---------------------------------------------------------------------------
 
 let seq = 0
@@ -117,206 +117,7 @@ function fixture({ rework = 0, half = false, p1 = 'verified', p2 = null, p0 = nu
   return events
 }
 
-/** 0.11 N1：夹具里的宿主来源证据需要显式验证器才会被算作权威通过。 */
-const HOST_VERIFY = { verifyHostExecution: () => true }
-
-console.log('metrics · quality 判定表探针（05 §8.4）')
-
 const probeRows = []
-await check('quality 能出 pass：返工 0 → 优；返工 1 + P1=0 + 采纳率 1 → 良', () => {
-  const first = computeQuality(fixture({ rework: 0 }), HOST_VERIFY)
-  const good = computeQuality(fixture({ rework: 1, p1: 'verified' }), HOST_VERIFY)
-  probeRows.push(['返工 0', first.state, first.label])
-  probeRows.push(['返工 1 + P1=0 + 采纳率 100%', good.state, good.label])
-  assert.equal(first.state, 'pass')
-  assert.equal(first.label, '优：首轮通过')
-  assert.equal(good.state, 'pass')
-  assert.equal(good.label, '良：返工 1 轮后达标')
-  assert.equal(good.acceptedRate, 1)
-})
-
-// N1 反向锁：把夹具改回旧 run 的 legacy 形状（证据无 extra、也没有 artifact/write），
-// 通过条目既非自证也无独立归属 → 必须 warn（「有证据但不独立」），不得 pass。
-// （v1.3：判定理由从「legacy 权威覆盖 0」改为「找不到产物归属／缺独立复核」，见 05 §8.4。）
-await check('N1：legacy 形状（证据无 extra、无 artifact/write）的同一份 fixture 不得 pass', () => {
-  const legacy = fixture({ rework: 0 }).map(event => {
-    if (['acceptance/verdict', 'test/report', 'check/form'].includes(event.kind)) event.extra = undefined
-    return event
-  })
-  const quality = computeQuality(legacy)
-  probeRows.push(['legacy 形状（无 extra）', quality.state, quality.label])
-  assert.equal(quality.authorityCoverage, 0)
-  assert.equal(quality.claimedPassed, 0)
-  assert.equal(quality.independentPassed, 0, '没有 artifact/write 归属 → 独立证据为 0')
-  assert.ok(quality.legacyPassed >= 3, `legacyPassed=${quality.legacyPassed}`)
-  assert.equal(quality.state, 'warn', `legacy 形状不得 pass：${quality.label}`)
-  assert.match(quality.label, /找不到产物归属|来源未知|缺独立复核/)
-  assert.doesNotMatch(quality.label, /优：|良：/)
-})
-
-await check('缺证据 → unknown（列出缺项）；半成品 → warn；P1 未解决不给良', () => {
-  const unknown = computeQuality([])
-  const half = computeQuality(fixture({ half: true }), HOST_VERIFY)
-  const p1Open = computeQuality(fixture({ rework: 1, p1: 'open' }), HOST_VERIFY)
-  probeRows.push(['无事件', unknown.state, unknown.label])
-  probeRows.push(['证据全过但进度 1/2', half.state, half.label])
-  probeRows.push(['返工 1 + P1 未解决', p1Open.state, p1Open.label])
-  assert.equal(unknown.state, 'unknown')
-  assert.deepEqual([...unknown.missing].sort(), ['acceptance', 'checks', 'p0p1', 'review', 'tests'])
-  assert.equal(half.state, 'warn')
-  assert.match(half.label, /进度未完成（1\/2）/)
-  assert.equal(p1Open.state, 'warn')
-  assert.notEqual(p1Open.state, 'pass')
-})
-
-await check('v1.3 首轮通过 + P1/P2 未解决 → warn；P0 未解决 → fail', () => {
-  const p1Only = computeQuality(fixture({ rework: 0, p1: 'open' }), HOST_VERIFY)
-  const p2Only = computeQuality(fixture({ rework: 0, p2: 'fixed' }), HOST_VERIFY)
-  const p0Block = computeQuality(fixture({ rework: 0, p0: 'open', p1: 'open', p2: 'open' }), HOST_VERIFY)
-  probeRows.push(['首轮 + P1 未解决', p1Only.state, p1Only.label])
-  probeRows.push(['首轮 + P2 未解决', p2Only.state, p2Only.label])
-  probeRows.push(['首轮 + P0/P1/P2 未解决', p0Block.state, p0Block.label])
-  assert.equal(p1Only.state, 'warn', '首轮通过 + 遗留 P1 不能是绿灯')
-  assert.match(p1Only.label, /遗留 1 个 P1 未解决/)
-  assert.equal(p1Only.evidence.p0p1.state, 'warn')
-  assert.equal(p2Only.state, 'warn')
-  assert.match(p2Only.label, /遗留 1 个 P2 未解决/)
-  assert.equal(p0Block.state, 'fail')
-  assert.equal(p0Block.evidence.p0p1.state, 'fail')
-  assert.match(p0Block.label, /P0 缺陷/)
-})
-
-/**
- * v1.3 证据独立性夹具（05 §8.3 / §8.4）：
- *   - 每个指标 1 条「自证」通过条目（引用本节点写的 artifact/write）；
- *   - withPeer 时再加 1 条「独立」通过条目（引用别的节点写的 artifact/write → peer）。
- * 事件本身不带 provenance（legacy），独立性只看产物归属，正好覆盖最常见的历史形状。
- */
-function independenceFixture({ withPeer = false, acceptanceFail = false } = {}) {
-  const sha = 'a'.repeat(64)
-  const artifact = (nodeId, path) => ev('artifact/write', {
-    nodeId, attemptId: 1, data: { path, bytes: 10, kind: 'json', sha256: sha },
-  })
-  const events = [
-    ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 2 } }),
-    ev('node/end', { nodeId: 'n_a', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
-    ev('node/end', { nodeId: 'n_b', attemptId: 1, data: { status: 'passed', durationMs: 1 } }),
-    ev('review/finding', {
-      nodeId: 'n_review', attemptId: 1,
-      data: { id: 'f1', severity: 'P1', title: '问题', status: 'verified' },
-    }),
-    ev('review/verdict', {
-      nodeId: 'n_review', attemptId: 1, data: { verdict: 'approve', findingCount: 1 },
-    }),
-    // 自证：产物由声明节点自己写。
-    artifact('n_acc', 'ev/acc-self.json'),
-    ev('acceptance/verdict', {
-      nodeId: 'n_acc', attemptId: 1,
-      data: { itemId: 'acc-self', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/acc-self.json' },
-    }),
-    artifact('n_test', 'ev/test-self.json'),
-    ev('test/report', {
-      nodeId: 'n_test', attemptId: 1,
-      data: {
-        suite: 'unit-self', executed: 10, passed: 10, failed: 0, skipped: 0,
-        reportRef: 'ev/test-self.json',
-      },
-    }),
-    artifact('n_check', 'ev/check-self.json'),
-    ev('check/form', {
-      nodeId: 'n_check', attemptId: 1,
-      data: {
-        ruleSetId: 'eslint-self', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
-        passedChecks: 5, totalChecks: 5, executedAt: '2026-11-06T10:00:00.000Z',
-        reportRef: 'ev/check-self.json',
-      },
-    }),
-  ]
-  if (withPeer) {
-    // 独立复核：产物由别的节点写 → peer。
-    events.push(
-      artifact('n_ref', 'ev/acc-peer.json'),
-      ev('acceptance/verdict', {
-        nodeId: 'n_acc', attemptId: 1,
-        data: { itemId: 'acc-peer', status: 'pass', decidedBy: 'auto', evidenceRef: 'ev/acc-peer.json' },
-      }),
-      artifact('n_ref', 'ev/test-peer.json'),
-      ev('test/report', {
-        nodeId: 'n_test', attemptId: 1,
-        data: {
-          suite: 'unit-peer', executed: 7, passed: 7, failed: 0, skipped: 0,
-          reportRef: 'ev/test-peer.json',
-        },
-      }),
-      artifact('n_ref', 'ev/check-peer.json'),
-      ev('check/form', {
-        nodeId: 'n_check', attemptId: 1,
-        data: {
-          ruleSetId: 'eslint-peer', ruleSetVersion: '9', executor: 'eslint@9', state: 'pass',
-          passedChecks: 3, totalChecks: 3, executedAt: '2026-11-06T10:00:00.000Z',
-          reportRef: 'ev/check-peer.json',
-        },
-      }),
-    )
-  }
-  if (acceptanceFail) {
-    events.push(ev('acceptance/verdict', {
-      nodeId: 'n_acc', attemptId: 1,
-      data: { itemId: 'acc-self', status: 'fail', decidedBy: 'auto', evidenceRef: 'ev/acc-self.json' },
-    }))
-  }
-  return events
-}
-
-await check('C v1.3 独立性判定表：全 self → warn；peer + self → pass；fail → fail；无证据 → unknown', () => {
-  // ① 每个指标的通过条目全部为自证 → warn（不是 unknown，也不能是 pass）。
-  const selfOnly = computeQuality(independenceFixture())
-  probeRows.push(['三项指标全部自证', selfOnly.state, selfOnly.label])
-  assert.equal(selfOnly.state, 'warn', `全自证应 warn：${selfOnly.label}`)
-  assert.match(selfOnly.label, /全部为自证证据/)
-  assert.match(selfOnly.label, /缺独立复核/)
-  assert.doesNotMatch(selfOnly.label, /未检测/, '自证不是「未检测」，不能这么写')
-  assert.equal(selfOnly.independentPassed, 0)
-  assert.equal(selfOnly.selfCertified, 3)
-  for (const key of ['acceptance', 'tests', 'checks']) {
-    assert.equal(selfOnly.evidence[key].state, 'pass', key)
-    assert.equal(selfOnly.evidence[key].selfOnly, true, key)
-    assert.match(selfOnly.evidence[key].reason, /1 条自报 \+ 0 条独立/, key)
-  }
-
-  // ② 每个指标 1 条 peer + 1 条自证 → pass（自证可以共存，不降级）。
-  const mixed = computeQuality(independenceFixture({ withPeer: true }))
-  probeRows.push(['每项 1 peer + 1 自报', mixed.state, mixed.label])
-  assert.equal(mixed.state, 'pass', `peer + 自证应 pass：${mixed.label}`)
-  assert.equal(mixed.independentPassed, 3, '三项指标各 1 条独立证据')
-  assert.equal(mixed.selfCertified, 3, '三项指标各 1 条自证')
-  assert.deepEqual(mixed.selfOnlyMetrics, [])
-  for (const key of ['acceptance', 'tests', 'checks']) {
-    assert.equal(mixed.evidence[key].independentPassed, 1, key)
-    assert.match(mixed.evidence[key].reason, /1 条自报 \+ 1 条独立/, key)
-  }
-
-  // ③ 有 fail → fail（自证 / peer 都不能把它洗成 pass）。
-  const failed = computeQuality(independenceFixture({ withPeer: true, acceptanceFail: true }))
-  probeRows.push(['存在 fail 条目', failed.state, failed.label])
-  assert.equal(failed.state, 'fail')
-  assert.equal(failed.evidence.acceptance.state, 'fail')
-
-  // ④ 完全没证据 → unknown（不是 pass，也不是 warn）。
-  const nothing = computeQuality([])
-  probeRows.push(['无任何证据', nothing.state, nothing.label])
-  assert.equal(nothing.state, 'unknown')
-  assert.deepEqual([...nothing.missing].sort(), ['acceptance', 'checks', 'p0p1', 'review', 'tests'])
-
-  // ⑤ 通过条目找不到产物归属（legacy 且无 artifact/write）→ warn（有证据但不独立），
-  //    不是 unknown（unknown 只留给缺证据 / 数据矛盾）。
-  const unowned = computeQuality(independenceFixture().filter(event => event.kind !== 'artifact/write'))
-  probeRows.push(['通过条目无产物归属', unowned.state, unowned.label])
-  assert.equal(unowned.state, 'warn')
-  assert.match(unowned.label, /找不到产物归属/)
-  assert.match(unowned.label, /缺独立复核/)
-})
-
 await check('打回后 ratio 下降（A/B passed 被打回 A）', () => {
   const before = computeProgress([
     ev('run/start', { data: { flowId: 'f', flowName: 'F', nodeTotal: 2 } }),
@@ -680,11 +481,11 @@ await check('可选 token 两档：未设置同源放行；设置后缺/错 toke
   }
 })
 
-await check('summary 在纯函数层也能独立复算（quality 与 HTTP 同一口径）', () => {
+await check('summary 在纯函数层也能独立复算（acceptance / progress 与 HTTP 同一口径；不含质量总评分）', () => {
   const events = fixture({ rework: 1 })
-  const summary = summarize(events, HOST_VERIFY)
-  assert.equal(summary.quality.state, 'pass')
-  assert.equal(summary.quality.label, '良：返工 1 轮后达标')
+  const summary = summarize(events)
+  assert.equal(Object.hasOwn(summary, 'quality'), false, '0.13.12 起 summary 不再返回 quality')
+  assert.ok(summary.acceptance && typeof summary.acceptance === 'object')
   assert.equal(summary.progress.ratio, 1)
   assert.equal(summary.progress.nodeDone, 2)
 })
@@ -712,49 +513,7 @@ await check('§13.7 summarize 的 acceptance {passed,total,rate} 与 40px 主摘
   console.log(`  · summary.acceptance = ${JSON.stringify(result.json.summary.acceptance)}`)
 })
 
-await check('§13.7 伪造 evidenceRef（不存在 / 无 artifact sha256）→ acceptance unknown', async () => {
-  const meta = await makeRun(1)
-  // 模型自述证据是「内部证据」，走内部 append 通道；外部 /events 现在会盖 external 章。
-  const append = events => seedEvents(meta.id, events)
-  // 模型自述：引用了一个根本不存在的文件。
-  await append([{
-    ...rawEvent('acceptance/verdict', meta.id, {
-      nodeId: 'n_a',
-      data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: 'evidence/forged.md' },
-    }),
-    extra: { provenance: 'model-claim' },
-  }])
-  let result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
-  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'unknown')
-  assert.match(result.json.summary.quality.evidence.acceptance.reason, /证据对不上/)
-  assert.match(result.json.summary.quality.evidence.acceptance.unverifiedRefs[0], /artifact\/write/)
-  console.log(`  · 伪造引用 → acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
-
-  // 真产物 + 匹配的 artifact/write（path + sha256）+ 重新判定 pass → 才算通过。
-  const rel = 'evidence/real.md'
-  const abs = join(runsRoot, meta.id, rel)
-  mkdirSync(dirname(abs), { recursive: true })
-  writeFileSync(abs, '# 证据\n')
-  const sha256 = createHash('sha256').update('# 证据\n').digest('hex')
-  await append([
-    rawEvent('artifact/write', meta.id, {
-      // v1.3：产物由别的节点（n_peer）写出 → peer 级；同一节点自写自引的自证闭环会判 unknown。
-      nodeId: 'n_peer', data: { path: rel, bytes: 8, kind: 'md', sha256 },
-    }),
-    {
-      ...rawEvent('acceptance/verdict', meta.id, {
-        nodeId: 'n_a',
-        data: { itemId: 'n_a:R1', status: 'pass', decidedBy: 'auto', evidenceRef: rel },
-      }),
-      extra: { provenance: 'model-claim' },
-    },
-  ])
-  result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
-  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'pass')
-  console.log(`  · 真产物 + sha256 对齐（peer 证据）→ acceptance=${result.json.summary.quality.evidence.acceptance.state}`)
-})
-
-await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全部体现，quality=unknown 且 label 以「桩」开头', async () => {
+await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全部体现（不再带 quality）', async () => {
   const stubRun = await store.createRun(runsRoot, {
     flowId: 'flow-a', flowName: '默认流程', nodeTotal: 1, engine: 'stub',
   })
@@ -769,8 +528,7 @@ await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全�
   assert.equal(list.json.runs.find(run => run.id === stubRun.id).engine, 'stub')
   const summary = await call(route, 'GET', `/api/flow-studio/runs/${stubRun.id}/summary`)
   assert.equal(summary.json.summary.engine, 'stub')
-  assert.equal(summary.json.summary.quality.state, 'unknown')
-  assert.ok(summary.json.summary.quality.label.startsWith('桩'), summary.json.summary.quality.label)
+  assert.equal(Object.hasOwn(summary.json.summary, 'quality'), false)
 
   // FLOW_STUDIO_STUB_ENGINE=1 单独设置不生效；必须同时 TESTBED=1。
   process.env.FLOW_STUDIO_STUB_ENGINE = '1'
@@ -794,7 +552,6 @@ await check('§13.8 stub run：run.json.engine / 列表 / summary / health 全�
     delete process.env.FLOW_STUDIO_STUB_ENGINE
     delete process.env.FLOW_STUDIO_TESTBED
   }
-  console.log(`  · stub run → quality=${summary.json.summary.quality.state} label=${summary.json.summary.quality.label}`)
 })
 
 await check('§13.7 跨节点重复 itemId → acceptance unknown 且返回 conflicts', async () => {
@@ -810,8 +567,6 @@ await check('§13.7 跨节点重复 itemId → acceptance unknown 且返回 conf
   const result = await call(route, 'GET', `/api/flow-studio/runs/${meta.id}/summary`)
   assert.equal(result.json.summary.conflicts.acceptance.length, 1)
   assert.deepEqual(result.json.summary.conflicts.acceptance[0].nodes, ['n_a', 'n_b'])
-  assert.equal(result.json.summary.quality.evidence.acceptance.state, 'unknown')
-  assert.match(result.json.summary.quality.evidence.acceptance.reason, /跨节点重复/)
   console.log(`  · conflicts=${JSON.stringify(result.json.summary.conflicts)}`)
 })
 

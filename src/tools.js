@@ -2025,7 +2025,7 @@ export function createFlowTools(deps) {
       description:
         '审查「整个工作流是否在正常运转」（只读，不改任何状态、不自动修复、不自动停止）。'
         + '读 run.json + 事件 + 流程模板，调用审计模块给出 verdict / headline / progress / plan / '
-        + 'currentNode / rejects / anomalies / quality / tokens / idleMs / recommended 等结论，'
+        + 'currentNode / rejects / anomalies / tokens / idleMs / recommended 等结论，'
         + '并附 thresholds{stallMs, nodeTimeoutMs, runTimeoutMs, source}：本次判定实际用的阈值'
         + '（source=run 表示取自 run.json.limits，不是默认值）。'
         + 'restart 续跑的 run 会跳过上次已完成的阶段：progress.skipped / skippedCount 单列它们，'
@@ -2082,7 +2082,6 @@ export function createFlowTools(deps) {
         currentNode: anyJson('当前节点（对象或 null；审计模块原样返回）'),
         rejects: anyJson('打回统计（对象；审计模块原样返回）'),
         anomalies: anyJson('异常列表（通常是数组；审计模块原样返回）'),
-        quality: anyJson('质量摘要（对象；审计模块原样返回）'),
         tokens: anyJson('用量摘要（对象；审计模块原样返回）'),
         idleMs: nullable({ type: 'integer' }, '距最近一次事件的毫秒数'),
         recommended: anyJson('建议动作（只报告，是否执行由模型决定）'),

@@ -38,6 +38,7 @@ import { DefinitionList, definitionsFromPayload } from './flowlist.js'
 import { InstanceWorktreePanel } from './instance-worktree.js'
 import { InstanceInboxPanel } from './instance-inbox.js'
 import { InstanceMetricsPanel, MetricsSummaryPanel } from './instance-metrics.js'
+import { InstanceEvidencePanel } from './instance-evidence.js'
 import {
   InstanceEventDrawer, focusBpmnElement, mergeInstanceEvents, nextEventPollDelay,
 } from './logdrawer.js'
@@ -1546,6 +1547,13 @@ export function FlowStudioPage(props = {}) {
       panelExtras: h('div', null,
         // 0.13.10 E1：运行指标（单实例 + 跨实例汇总）。都是纯读；不启动 runner。
         h(InstanceMetricsPanel, {
+          client,
+          instanceId: activeInstanceId,
+          instanceStatus: activeInstance ? activeInstance.status : '',
+          notice: (kind, text) => setNotice({ kind, text }),
+        }),
+        // 0.13.12 E2：业务证据（claims / findings / 引用核对）；不产出总评级。
+        h(InstanceEvidencePanel, {
           client,
           instanceId: activeInstanceId,
           instanceStatus: activeInstance ? activeInstance.status : '',

@@ -42,8 +42,8 @@
 
 import { Buffer } from 'node:buffer'
 import { existsSync } from 'node:fs'
-import { readdir, rm } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   DefinitionError,
@@ -86,7 +86,14 @@ import {
   resolveAdapterId, resolveAgentTimeoutMs, runAgentNode,
 } from './agent-execute.js'
 import { checkRunId } from './runlog.js'
-import { artifactsRootFor, createArtifactStore } from './artifact-store.js'
+import { DEFAULT_ARTIFACT_MAX_BYTES, artifactsRootFor, createArtifactStore } from './artifact-store.js'
+import {
+  EVIDENCE_REASON,
+  EVIDENCE_REPORT_KIND,
+  collectInstanceEvidence,
+  isSafeEvidencePath,
+  normalizeEvidenceHash,
+} from './instance-evidence.js'
 import { createExecutionLimits } from './execution-limits.js'
 import {
   CLEANUP_POLICY_SET,
@@ -1041,6 +1048,11 @@ class BpmnRuntime {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readInstanceMetrics(id, url)
       }
+      if (parts[2] === 'evidence') {
+        // 0.13.12：业务证据是**纯读**——不建 runner、不懒恢复、不改实例状态。
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readInstanceEvidence(id, url)
+      }
       if (parts[2] === 'worktree') {
         if (method === 'GET') return await this._readInstanceWorktree(id)
         if (method === 'DELETE') return await this._deleteInstanceWorktree(id, body)
@@ -1766,6 +1778,175 @@ class BpmnRuntime {
     const ms = parseTimeMs(raw)
     if (ms === null) return { value: null, error: `${param} 必须是可解析的 ISO 时间（收到 ${JSON.stringify(raw)}）` }
     return { value: new Date(ms).toISOString(), error: null }
+  }
+
+  /**
+   * `GET /instances/<id>/evidence[?asOf=ISO]`：实例业务证据（0.13.12 E2，纯读）。
+   *
+   * 证据报告由 `flow_finish_node.documents[]` 以 `kind:"evidence-report"` 登记；
+   * 报告正文在文件里，`instance.json.artifacts[]` 只存引用。本接口：
+   *
+   *   - **不调用 `_ensureRunner()`**，不因查看证据恢复 / 推进实例；
+   *   - 引用解析优先命中 `artifacts/<sha256>` 快照（worktree 清理后仍可读），
+   *     快照缺失才回落到工作区，并在 `dataQuality.reasons` 标 `workspace-fallback`；
+   *   - 只返回 claims / findings / 引用核对结果，不产出任何总评级，也不把
+   *     findings 写进实例状态或 admission。
+   *
+   * 两段读取：第一段只读报告正文与报告自身快照；解析出报告内部引用后，再按
+   * `sha256` 去 `artifacts` 索引读快照、按相对路径补读工作区，最后复算一次。
+   *
+   * @param {string} id
+   * @param {URL} url
+   * @returns {Promise<{status:number, body:object}>}
+   */
+  async _readInstanceEvidence(id, url) {
+    const asOf = this._metricsAsOf(url)
+    if (asOf.error !== null) {
+      return { status: 400, body: { ok: false, code: 'EVIDENCE_AS_OF_INVALID', error: asOf.error } }
+    }
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    let events = []
+    let skippedEvents = 0
+    try {
+      const loaded = await readInstanceEvents(id, { instancesRoot: this.instancesRoot })
+      events = loaded ?? []
+      skippedEvents = Number.isInteger(loaded?.skipped) ? loaded.skipped : 0
+    } catch {
+      // 事件流损坏不影响证据报告本身；dataQuality 会从 missing / reasons 暴露缺口。
+      events = []
+    }
+    const documents = Array.isArray(instance.artifacts) ? instance.artifacts : []
+    const workspaceRoot = await this._evidenceWorkspaceRoot(id)
+    const reportDocs = documents.filter(doc => (
+      isPlainObject(doc)
+      && typeof doc.kind === 'string'
+      && doc.kind.trim().toLowerCase() === EVIDENCE_REPORT_KIND
+    ))
+    const snapshots = new Map()
+    const workspaceFiles = new Map()
+    await this._loadEvidenceSnapshots(reportDocs, snapshots)
+    // 报告自身没有快照时，优先从原工作区读一次（随后 refs 仍按快照优先）。
+    for (const doc of reportDocs) {
+      const sha = normalizeEvidenceHash(doc.sha256)
+      if (sha === null || snapshots.has(sha)) continue
+      const content = await this._readEvidenceWorkspaceFile(workspaceRoot, doc.path)
+      if (content !== null) workspaceFiles.set(doc.path, content)
+    }
+    const collect = () => collectInstanceEvidence({
+      instance,
+      events,
+      documents,
+      snapshots,
+      workspaceFiles,
+      workspaceAvailable: workspaceRoot !== null,
+      asOf: asOf.value,
+      skippedEvents,
+    })
+    let result = collect()
+    // 第二段：报告里引用的文件如果登记过 artifact，按 sha 读快照；否则回落到工作区。
+    const wantedHashes = new Set()
+    const wantedPaths = new Set()
+    for (const item of [...result.claims, ...result.findings]) {
+      for (const ref of Array.isArray(item.refs) ? item.refs : []) {
+        const sha = normalizeEvidenceHash(ref.sha256)
+        // 即使第一段已从工作区核对通过，只要该 hash 有登记产物，也把快照读进来：
+        // 下一段会优先命中 artifact 快照，不让「恰好也读得到的工作区」掩盖快照来源。
+        if (sha !== null && documents.some(doc => normalizeEvidenceHash(doc.sha256) === sha)) wantedHashes.add(sha)
+        if (ref.verified !== true && isSafeEvidencePath(ref.path)) wantedPaths.add(ref.path)
+      }
+    }
+    for (const item of result.missing) {
+      if (item.kind !== 'ref' || item.reason !== EVIDENCE_REASON.WORKSPACE_UNREADABLE) continue
+      if (isSafeEvidencePath(item.path)) wantedPaths.add(item.path)
+    }
+    let changed = false
+    for (const sha of wantedHashes) {
+      if (snapshots.has(sha)) continue
+      try {
+        const content = await this.artifactStore.read(sha)
+        snapshots.set(sha, content)
+        changed = true
+      } catch {
+        // 快照缺失 / 损坏：保持缺失，交给工作区回落与 dataQuality。
+      }
+    }
+    for (const relPath of wantedPaths) {
+      if (workspaceFiles.has(relPath)) continue
+      const content = await this._readEvidenceWorkspaceFile(workspaceRoot, relPath)
+      if (content !== null) {
+        workspaceFiles.set(relPath, content)
+        changed = true
+      }
+    }
+    if (changed) result = collect()
+    return { status: 200, body: { ok: true, ...result } }
+  }
+
+  /** 证据回落用的工作区根：冻结快照优先；快照缺失才退回宿主默认工作区。 */
+  async _evidenceWorkspaceRoot(instanceId) {
+    try {
+      const snapshot = await readWorkspaceSnapshot({ instancesRoot: this.instancesRoot, instanceId })
+      if (snapshot === null) return this.workspaceRoot
+      if (typeof snapshot.effectiveRoot === 'string' && isAbsolute(snapshot.effectiveRoot)) {
+        return snapshot.effectiveRoot
+      }
+      return null
+    } catch {
+      // 快照损坏：不猜路径（宁可让引用落在 missing，也不读错工作区）。
+      return null
+    }
+  }
+
+  /** 只读已登记文档的 artifact 快照；不存在 / 损坏都跳过，不升级成 500。 */
+  async _loadEvidenceSnapshots(documents, snapshots) {
+    for (const doc of Array.isArray(documents) ? documents : []) {
+      const sha = normalizeEvidenceHash(doc?.sha256)
+      if (sha === null || snapshots.has(sha)) continue
+      try {
+        snapshots.set(sha, await this.artifactStore.read(sha))
+      } catch {
+        // 缺失由 collectInstanceEvidence 计入 dataQuality / missing。
+      }
+    }
+  }
+
+  /**
+   * 安全读一个工作区相对路径（证据回落专用）：拒绝符号链接 / 非普通文件 /
+   * 越过工作区 / 超过 5 MiB。worktree 被清理后返回 null，由快照继续兜底。
+   */
+  async _readEvidenceWorkspaceFile(workspaceRoot, relPath) {
+    if (typeof workspaceRoot !== 'string' || workspaceRoot === '') return null
+    if (!isSafeEvidencePath(relPath)) return null
+    const base = resolve(workspaceRoot)
+    const target = resolve(base, relPath)
+    const rel = relative(base, target)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null
+    let info
+    try {
+      info = await lstat(target)
+    } catch {
+      return null
+    }
+    if (info.isSymbolicLink() || !info.isFile()) return null
+    if (info.size > DEFAULT_ARTIFACT_MAX_BYTES) return null
+    let realBase
+    let realTarget
+    try {
+      realBase = await realpath(base)
+      realTarget = await realpath(target)
+    } catch {
+      return null
+    }
+    const realRel = relative(realBase, realTarget)
+    if (realRel === '' || realRel.startsWith('..') || isAbsolute(realRel)) return null
+    try {
+      const content = await readFile(realTarget)
+      if (content.length > DEFAULT_ARTIFACT_MAX_BYTES) return null
+      return content
+    } catch {
+      return null
+    }
   }
 
   /**

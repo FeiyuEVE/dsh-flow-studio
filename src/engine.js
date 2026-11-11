@@ -15,7 +15,7 @@
  *   - **一个实例一个 run（07 §5，R3）**：没有模块级锁 / 并发上限 / 排队；跨 run 的注册表
  *     与 409 由 `src/runtime.js` 负责，不同 runId 各自一个实例并行。
  *   - **产物与证据**：产物落 `runs/<runId>/<nodeId>/artifacts/<attempt>/` 并写 artifact/write；
- *     acceptance / tests / checks / findings 落成 05 的事件，quality 才有证据可算。
+ *     acceptance / tests / checks / findings 落成 05 的事件，单项证据才可复算。
  *   - **用量**：订阅 `session/event`（global），assistant/message 的 usage → model/call，
  *     tool/call 里的 skill → skill/load，其余工具 → tool/call；成员会话按 memberId 归属。
  *   - **取消 / 超时 / 失败**：每个 run 一个 AbortController；单节点 20 分钟（可用
@@ -1668,7 +1668,7 @@ export function stubShouldReject(node, attempt, flow) {
 }
 
 /**
- * 桩的结构化产物：pass 带齐 acceptance/tests/checks/findings（quality 能算 pass），
+ * 桩的结构化产物：pass 带齐 acceptance/tests/checks/findings（单项证据可见），
  * reject 带打回原因与目标，首轮 finding 是 open、通过轮改成 verified。
  */
 export function stubStructured(node, attempt, flow, now) {
@@ -7091,7 +7091,7 @@ class FlowEngine {
       await this.flushEvents()
       const written = await this._writeStructured(runId, node, attempt, traceId, structured, stageTotal)
       await this.flushEvents()
-      // 0.11 · R5：节点收口后、node/end 之前执行宿主检查（结果只影响 quality）。
+      // 0.11 · R5：节点收口后、node/end 之前执行宿主检查（结果只进单项证据，不汇总总评分）。
       await this._runHostCheckOnce(runId, node, attempt, traceId)
       await this.flushEvents()
       const membersPartial = await this._closeMembers(runId, node, attempt, traceId)
@@ -7269,7 +7269,7 @@ class FlowEngine {
    * 0.11 · R5：节点收口后执行**保存的**检查命令（命令 + 期望退出码 + 报告路径）。
    *
    * 时序：正式结构化结果写完后、node/end 之前。去重键 (runId,nodeId,attempt)；
-   * 与节点自报完全解耦：宿主结果只影响 quality，不改变 agent 的 verdict / next/reject。
+   * 与节点自报完全解耦：宿主结果只进单项证据，不改变 agent 的 verdict / next/reject。
    * 失权 / 已封口 / 未开开关时不执行（绝不为了补事件再突破失权门）。
    *
    * @returns {Promise<object|null>} 宿主执行结果；未配置 / 未执行返回 null
@@ -7364,7 +7364,7 @@ class FlowEngine {
     }
     // 0.11 R5（F4）：先把这次真实执行登记进 runstore 的私有 verification 目录。
     // 只有持凭证（引擎在 runHostCheck 返回后当场创建）的调用才能登记；登记失败时
-    // 绝不把这次结果写成权威 pass / fail（降为 skipped，让质量结论 unknown）。
+    // 绝不把这次结果写成权威 pass / fail（降为 skipped，让该项证据保持 unknown）。
     let registryPath = null
     let authoritative = true
     try {
@@ -7522,7 +7522,7 @@ class FlowEngine {
       if (resolved.rejected) checks.reportRefRejected = resolved.rejected
       checks.executedAt = isoOf(this.now())
       // R6/E4：reportRef 是引擎自己刚生成的报告 = 自报，不是独立证据。
-      // 聚合层据此把 pass 降级为 claimed，不能拿自写报告把 quality 洗绿。
+      // 聚合层据此把 pass 降级为 claimed，不能拿自写报告冒充权威证据。
       const generatedReport = resolved.path === report.path
       await this._append(runId, [{
         kind: 'check/form',

@@ -3,11 +3,11 @@
  * 是否在正常运转 —— 有没有偏航、卡死、打回死循环、并发乱序，而不是单节点细节。
  *
  * 纯函数：不碰 fs、不 import dsh 包、不 import engine/index；事件只读，
- * 进度与质量复用 runlog.js 的聚合口径（computeProgress / summarize）。
+ * 进度与 token 复用 runlog.js 的聚合口径（computeProgress / summarize）。
  *
  * 判据顺序（与 docs/design/06-execution-engine.md §14 一一对应）：
  *   1. run.status==='pending'  → pending；
- *   2. 'done'                  → done（headline 带上 quality 结论）；
+ *   2. 'done'                  → done（headline 只说流程已完成，不再给质量总评分）；
  *   3. 'failed'                → failed（failedNodeId 或最后一条 node/end failed）；
  *   4. 'aborted'               → aborted；
  *   5. 'running'（主路径）      → concurrency / deviation / reject-loop / stall /
@@ -388,7 +388,6 @@ function emptyResult({ verdict, status, headline }) {
     currentNode: null,
     rejects: { total: 0, byNode: [], looped: [] },
     anomalies: [],
-    quality: null,
     tokens: null,
     idleMs: 0,
     thresholds: {
@@ -707,20 +706,17 @@ function inspect(options) {
     expectedNext = nextExpectedAfter(nodeId)
   }
 
-  // -- 质量 / token：有事件才复用 summarize（终态与运行中都可算） -----------
+  // -- token：有事件才复用 summarize（终态与运行中都可算） -------------------
   let summary = null
   if (sorted.length > 0) {
     try {
-      const summaryOptions = { now: new Date(nowMs), verifyHostExecution: options.verifyHostExecution }
+      const summaryOptions = { now: new Date(nowMs) }
       if (run && (run.engine === 'stub' || run.engine === 'real')) summaryOptions.engine = run.engine
       summary = summarize(sorted, summaryOptions)
     } catch {
       summary = null
     }
   }
-  const quality = summary && isObject(summary.quality)
-    ? { state: summary.quality.state ?? 'unknown', label: summary.quality.label ?? '未检测' }
-    : null
   const tokens = summary && isObject(summary.tokens) ? summary.tokens : null
 
   // -- 终态：先收口，不再拿运行期异常改 verdict --------------------------
@@ -728,7 +724,6 @@ function inspect(options) {
     const terminal = terminalResult({
       effective,
       status,
-      quality,
       tokens,
       sorted,
       nowMs,
@@ -841,7 +836,6 @@ function inspect(options) {
     currentNode,
     rejects: { total: rejectsTotal, byNode, looped },
     anomalies,
-    quality,
     tokens,
     idleMs,
     thresholds,
@@ -853,7 +847,7 @@ function inspect(options) {
 /** pending / done / failed / aborted：状态本身就是结论，不再看运行期异常。 */
 function terminalResult(context) {
   const {
-    effective, status, quality, tokens, sorted, nowMs, run, titleOf,
+    effective, status, tokens, sorted, nowMs, run, titleOf,
     progress, plan, rejects, currentNode, idleMs, thresholds,
   } = context
   const anomalies = []
@@ -862,9 +856,7 @@ function terminalResult(context) {
   if (effective === 'pending') {
     headline = 'run 已建好但还没开始'
   } else if (effective === 'done') {
-    headline = quality
-      ? `流程已完成，质量结论：${quality.state}（${quality.label}）`
-      : '流程已完成，质量未检测（没有可用的事件证据）'
+    headline = '流程已完成（业务证据见实例证据页签；不产出质量总评分）'
   } else if (effective === 'failed') {
     const failure = findFailure(run, sorted)
     if (failure.nodeId) {
@@ -903,7 +895,6 @@ function terminalResult(context) {
     currentNode: effective === 'running' ? currentNode : null,
     rejects,
     anomalies,
-    quality,
     tokens,
     idleMs,
     thresholds,

@@ -24,7 +24,7 @@ mkdirSync(workspace, { recursive: true })
 const engineModule = await import('../src/engine.js')
 const store = await import('../src/runstore.js')
 const flowStore = await import('../src/store.js')
-const { summarize } = await import('../src/runlog.js')
+const { computeAcceptance, computeTests, summarize } = await import('../src/runlog.js')
 
 const { createEngine: createEngineRaw } = engineModule
 
@@ -252,7 +252,7 @@ try {
     endNode(),
   ], [next('e1', 'n_start', 'n_hostcheck'), next('e2', 'n_hostcheck', 'n_end')])
 
-  await check('R5：宿主检查 exit 1 → producer=host 的 fail 落盘；agent 仍 pass、run done，quality=fail', async () => {
+  await check('R5：宿主检查 exit 1 → producer=host 的 fail 落盘；agent 仍 pass、run done', async () => {
     process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS = '1'
     try {
       const flow = hostCheckFlow('flow-hostcheck-fail')
@@ -280,13 +280,12 @@ try {
       A.equal(hostEvent.data.totalChecks, 1)
       A.ok(Boolean(hostArtifact), '宿主执行记录必须落成 producer=host 的产物')
       A.ok(events.indexOf(hostEvent) < events.indexOf(nodeEnd), '宿主检查必须在 node/end 之前完成')
-      A.equal(summary.quality.state, 'fail', '宿主失败必须压过 agent 自报 pass：quality=fail')
     } finally {
       delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
   })
 
-  await check('R5：检查开关关闭 → 引擎不执行、不伪造 host pass（quality 不会变绿）', async () => {
+  await check('R5：检查开关关闭 → 引擎不执行、不伪造 host pass', async () => {
     delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     const flow = hostCheckFlow('flow-hostcheck-off')
     await saveFlow(flow)
@@ -297,13 +296,12 @@ try {
     const events = await eventsOf(run.id)
     A.equal(events.some(event => event.kind === 'check/form' && event.extra && event.extra.producer === 'host'), false,
       '开关关闭时不得执行 / 伪造宿主检查')
-    A.ok(summarize(events).quality.state !== 'pass', '开关关闭时 quality 不得为 pass')
   })
 
   // -------------------------------------------------------------------------
   // R6/E4：模型自报 29/29、报告是引擎自己写的 → 只能算 claimed，不能变绿
   // -------------------------------------------------------------------------
-  await check('R6/E4：tests 29/29 无独立报告（引擎自写）→ claimed/unknown，quality 不绿', async () => {
+  await check('R6/E4：tests 29/29 无独立报告（引擎自写）→ claimed / 非权威', async () => {
     const flow = flowOf('flow-evidence-claimed', [
       startNode(), stage('n_claim', '测试', 300), endNode(),
     ], [next('e1', 'n_start', 'n_claim'), next('e2', 'n_claim', 'n_end')])
@@ -331,14 +329,13 @@ try {
     A.equal(final.status, 'done')
     A.ok(Boolean(testEvent), 'test/report 必须落盘（自报事实保留）')
     A.equal(testEvent.extra && testEvent.extra.generatedReport, true, '引擎自写报告必须打 generatedReport 标记')
-    // v1.3：自证是指标级证据（state=pass + selfOnly），结论层再降 warn；
-    // 「引擎自写报告不能把 quality 洗绿」由最后一条断言守住。
-    A.equal(summary.quality.evidence.tests.state, 'pass', '自证仍是证据，指标层不降级')
-    A.equal(summary.quality.evidence.tests.selfOnly, true, '自写报告只能算自证')
-    A.match(String(summary.quality.evidence.tests.reason), /自报|自证/, 'reason 必须写清自报 / 独立条数')
-    A.equal(summary.quality.evidence.tests.claimedPassed, 1)
-    A.equal(summary.quality.evidence.tests.authoritativePassed, 0)
-    A.ok(summary.quality.state !== 'pass', '自报 29/29 不能把 quality 洗绿')
+    // v1.3：自证仍是单项指标证据；0.13.12 起不再汇总成质量总评分。
+    const tests = computeTests(events)
+    A.equal(tests.state, 'pass', '自证仍是证据，指标层不降级')
+    A.equal(tests.selfOnly, true, '自写报告只能算自证')
+    A.match(String(tests.reason), /自报|自证/, 'reason 必须写清自报 / 独立条数')
+    A.equal(tests.claimedPassed, 1)
+    A.equal(tests.authoritativePassed, 0)
   })
   // -------------------------------------------------------------------------
   // R6（F5）：acceptance 的引擎自写报告也降级 claimed
@@ -369,12 +366,13 @@ try {
     const summary = summarize(events)
     A.equal(final.status, 'done')
     A.equal(verdict.extra && verdict.extra.generatedReport, true, '引擎自写 acceptance.json 必须打标记')
-    // v1.3：自证是指标级证据；quality 层的降权由 selfOnly 负责。
-    A.equal(summary.quality.evidence.acceptance.state, 'pass', '自证仍是证据，指标层不降级')
-    A.equal(summary.quality.evidence.acceptance.selfOnly, true, '引擎自写 acceptance.json 只能算自证')
-    A.match(String(summary.quality.evidence.acceptance.reason), /自报|自证/)
-    A.equal(summary.quality.evidence.acceptance.claimedPassed, 1)
-    A.equal(summary.quality.evidence.acceptance.authoritativePassed, 0)
+    // v1.3：自证仍是单项指标证据；0.13.12 起不再汇总成质量总评分。
+    const acceptance = computeAcceptance(events)
+    A.equal(acceptance.state, 'pass', '自证仍是证据，指标层不降级')
+    A.equal(acceptance.selfOnly, true, '引擎自写 acceptance.json 只能算自证')
+    A.match(String(acceptance.reason), /自报|自证/)
+    A.equal(acceptance.claimedPassed, 1)
+    A.equal(acceptance.authoritativePassed, 0)
   })
 
   // -------------------------------------------------------------------------
@@ -435,16 +433,13 @@ try {
         },
       }])
       const events = await eventsOf(run.id)
+      // 0.13.12 起不再有 quality 汇总；这里只锁「伪造的 host 事件确实存在、且
+      // 没有对应私有登记」这一事实，供 classifyEvidenceAuthority 的单测继续覆盖。
       const trusted = summarize(events, { verifyHostExecution: verify })
-      A.ok(trusted.quality.state !== 'pass', '伪造的更高 attempt pass 不能把质量洗绿')
-      A.ok(trusted.quality.evidence.checks.state !== 'pass', '伪造 host pass 不得成为权威通过')
-      A.equal(trusted.quality.evidence.checks.authoritativePassed, 0, '未登记 host 事件不计权威通过')
-      // 同一批事件不传验证器时，纯函数仍按旧口径（基线兼容）；但伪造者拿不到
-      // runstore 的私有登记，HTTP/summary 路径始终传验证器。
+      A.equal(Object.hasOwn(trusted, 'quality'), false, '审计/汇总不再返回质量总评分')
       const forgedOnly = events.filter(event => !(event.kind === 'check/form'
         && event.extra && event.extra.producer === 'host' && event.attemptId === 1))
-      A.equal(summarize(forgedOnly, { verifyHostExecution: verify }).quality.evidence.checks.authoritativePassed, 0,
-        '没有登记的 host 事件不得计入权威通过')
+      A.ok(forgedOnly.length < events.length, '夹具必须包含一条伪造 host 事件')
     } finally {
       delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }
@@ -513,7 +508,6 @@ try {
       A.equal(final.status, 'done')
       A.ok(Boolean(hostEvent), '必须执行快照里的检查命令（当前保存流程没有 check）')
       A.equal(hostEvent.data.state, 'fail')
-      A.equal(summarize(events).quality.state, 'fail')
     } finally {
       delete process.env.FLOW_STUDIO_ALLOW_HOST_CHECKS
     }

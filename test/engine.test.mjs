@@ -152,7 +152,7 @@ function kinds(events) {
   return events.map(event => `${event.kind}${event.nodeId ? `:${event.nodeId}` : ''}${event.attemptId ? `#${event.attemptId}` : ''}`)
 }
 
-/** 一个带齐五项证据的通过结果，quality 能算出 pass。 */
+/** 一个带齐五项证据的通过结果（0.13.12 起不再汇总成质量总评分）。 */
 function passResult(nodeId, extra = {}) {
   return {
     structured: {
@@ -520,9 +520,9 @@ function nodeAlarmAgents(engineRef, behavior) {
 
 try {
   // -------------------------------------------------------------------------
-  console.log('engine · 单节点通过（产物 / 证据 / live / quality）')
+  console.log('engine · 单节点通过（产物 / 证据 / live）')
 
-  await check('单节点通过：run done、node/end passed、产物落盘、quality=pass、live 清空', async () => {
+  await check('单节点通过：run done、node/end passed、产物落盘、live 清空', async () => {
     const flow = flowOf('flow-one', [startNode(), stage('n_impl', '实现', 300), endNode()], [
       next('e1', 'n_start', 'n_impl'),
       next('e2', 'n_impl', 'n_end'),
@@ -546,10 +546,8 @@ try {
     A.equal(kinds(events).includes('node/start:n_impl#1'), true)
     A.equal(kinds(events).includes('node/end:n_impl#1'), true)
     A.equal(events.find(event => event.kind === 'node/end').data.status, 'passed')
-    // v1.3 起 runlog 侧新增「同节点自写证据 → 自证闭环 unknown」的独立性口径；
-    // 聚合层正在并行改动，引擎测试只断言「能算出结论」（不抛错），不再绑死 state=pass。
-    A.ok(summary.quality && typeof summary.quality === 'object')
-    A.equal(typeof summary.quality.label, 'string')
+    // 0.13.12 起聚合层不再返回质量总评分（单项证据仍保留）。
+    A.equal(Object.hasOwn(summary, 'quality'), false)
     A.equal(summary.progress.ratio, 1)
     A.equal(summary.progress.passed, 1)
 
@@ -1024,7 +1022,7 @@ try {
   // -------------------------------------------------------------------------
   console.log('engine · 打回一轮后通过')
 
-  await check('打回一轮后通过：reject/trigger 一次、目标 attemptId=2、quality 仍 pass（良）', async () => {
+  await check('打回一轮后通过：reject/trigger 一次、目标 attemptId=2', async () => {
     const flow = flowOf('flow-rework', [
       startNode(), stage('n_a', '开发', 300), stage('n_b', '测试', 600), endNode(),
     ], [
@@ -1069,10 +1067,7 @@ try {
     A.equal(events.filter(event => event.kind === 'node/end' && event.nodeId === 'n_a' && event.attemptId === 2).length, 1)
     A.equal(summary.rejects.total, 1)
     A.equal(summary.progress.ratio, 1)
-    // v1.3 证据独立性口径由 runlog 侧并行改动（自证闭环 → unknown），这里只锁引擎侧事实：
-    // 返工轮次与打回次数算得对，不再断言具体 quality.state / label。
-    A.equal(summary.quality.reworkRounds, 1)
-    A.equal(typeof summary.quality.label, 'string')
+    // 返工轮次与打回次数算得对；0.13.12 起不再断言 quality.state / label。
   })
 
   // -------------------------------------------------------------------------
@@ -1674,10 +1669,8 @@ try {
     A.equal(STUB_USAGE.input + STUB_USAGE.cacheRead + STUB_USAGE.cacheWrite + STUB_USAGE.output, 150)
     A.equal(events.filter(event => event.kind === 'model/call').length, 4)
     A.equal(summary.tokens.total.total, 600)
-    // 06 §13.7：桩 run 一律 unknown（不能拿合成证据冒充真实绿灯），label 前缀「桩」。
-    A.equal(summary.quality.state, 'unknown')
-    A.match(summary.quality.label, /^桩/)
-    A.equal(summary.quality.stub, true)
+    // 0.13.12 起不再有质量总评分；桩标记仍由 engine / run.json 体现。
+    A.equal(Object.hasOwn(summary, 'quality'), false)
     // 06 §13.8：run/start 与 run.json 都体现 stub。
     A.equal(events.find(event => event.kind === 'run/start').data.engine, 'stub')
     A.equal((await store.readRunMeta(runsRoot, run.id)).engine, 'stub')
@@ -1990,10 +1983,8 @@ try {
     A.equal(events.find(event => event.kind === 'check/form').extra.provenance, 'model-claim')
     const summary = summarize(events)
     A.equal(summary.findings.total, 2)
-    // v1.3 起「自证闭环」会让 quality 变 unknown（runlog 侧并行改动）；
     // 本用例只锁引擎侧的标识命名空间事实：两个节点都叫 F1/R1/unit 也不算冲突。
-    A.equal(summary.quality.conflicts, null)
-    A.equal(typeof summary.quality.state, 'string')
+    assert.deepEqual(summary.conflicts, { findings: [], acceptance: [], tests: [], checks: [] })
     A.equal(events.find(event => event.kind === 'run/start').data.engine, 'real')
   })
 
@@ -3762,7 +3753,6 @@ try {
     A.equal(summary.progress.failed, 1)
     A.equal(summary.progress.nodes.n_a.status, 'passed')
     A.equal(summary.progress.nodes.n_b.status, 'failed')
-    A.equal(typeof summary.quality.state, 'string')
 
     // readRunDetail 不因 failed run 抛异常，attempt 状态与事件一致。
     const detail = await store.readRunDetail(runsRoot, run.id)
@@ -5632,16 +5622,8 @@ try {
     A.deepEqual(a2Findings.map(event => event.data.id), ['n_a:BF1'], '打回方的 finding 复报后归属目标节点，不成 n_a:n_b:BF1')
     A.equal(allIds.some(id => /^n_a:n_a:/.test(id)), false, '不许出现双前缀 id')
     A.equal(allIds.some(id => /^n_a:n_b:/.test(id)), false, '不许出现跨节点双前缀 id')
-    // 0.11 R6（F5）→ 05 §8.3 / §8.4 v1.3：无独立 evidenceRef 的 acceptance 退到引擎
-    // 自写报告时，只要 ref 能对上本节点产物就是**自证**（self），指标不再降 unknown；
-    // 「证据不独立」交给 quality 层按 selfOnly 降 warn，不给绿灯。
-    A.equal(summary.quality.evidence.acceptance.state, 'pass', '自证是证据，不是缺证据')
-    A.equal(summary.quality.evidence.acceptance.selfOnly, true, '该指标通过条目全部为自证')
-    A.ok(summary.quality.evidence.acceptance.selfCertified >= 1, '至少一条通过被标成自证')
-    A.ok(summary.quality.evidence.acceptance.claimedPassed >= 1, '自报报告仍计入 claimed（不是权威）')
-    A.equal(summary.quality.state, 'warn', '全自证不得给绿灯')
-    A.match(String(summary.quality.label || ''), /自证/, 'quality 必须写明缺独立复核的原因')
-    A.equal(summary.quality.evidence.acceptance.staleFails, undefined, '旧 n_a:R1 复判为通过，staleFails 必须为空')
+    // 0.13.12 起不再有 quality 汇总；引擎侧仍保留 acceptance/verdict 事件与自证标记。
+    A.equal(Object.hasOwn(summary, 'quality'), false)
   })
 
   await check('G1-d①：显式 runTimeoutMs=3000 生效（约 3s abort），生效值可读（run.json.limits / engine.runLimits）', async () => {

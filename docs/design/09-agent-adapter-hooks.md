@@ -33,6 +33,8 @@
 
 ### B-1 接口签名
 
+> **形状状态**：下面这份 `AgentAdapter` 是研究期的**完整拟议形状，未冻结**；冻结子集见 [`src/agent-adapter.js`](../../src/agent-adapter.js)（`probe / capabilities / start / cancel / dispose` 五个方法，`finishTool` 是 `'native' | 'unsupported'` 字符串而非下面的 `Capability` 对象，且不包含 `plan / resume / materialize / events`）。两者冲突以冻结子集为准，本文其余部分是语义说明。
+
 ```ts
 type Support = 'native' | 'emulated' | 'unsupported'
 type NormEvent = 'session.start' | 'session.end' | 'prompt.submit'

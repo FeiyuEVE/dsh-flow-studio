@@ -67,6 +67,10 @@ import {
 import { parseBpmn } from './bpmn-parse.js'
 import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
 import { BPMN_STATE_KIND, BPMN_STATE_VERSION, sha256Hex } from './bpmn-state.js'
+import {
+  AGENT_EXECUTE_ERROR, DEFAULT_ADAPTER_ID, admitAdapter, createAdapterProbeCache,
+  resolveAdapterId, runAgentNode,
+} from './agent-execute.js'
 import { normalizeExecutor, runExternalExecutor } from './executor.js'
 import { checkRunId } from './runlog.js'
 
@@ -271,6 +275,8 @@ function runnerErrorStatus(code) {
  *   maxActiveInstances?: number,
  *   executorRunner?: Function,
  *   executorNormalizer?: Function,
+ *   adapters?: object,       // AgentAdapter 注册表（createAdapterRegistry()）；缺省时 dsh 明确失败
+ *   workspaceRoot?: string,  // agent 节点的文档相对基准（默认 process.cwd()）
  * }} [options]
  * @returns {BpmnRuntime}
  */
@@ -287,6 +293,8 @@ export function createBpmnRuntime(options = {}) {
     maxActiveInstances: options.maxActiveInstances,
     executorRunner: options.executorRunner,
     executorNormalizer: options.executorNormalizer,
+    adapters: options.adapters,
+    workspaceRoot: options.workspaceRoot,
   })
 }
 
@@ -300,6 +308,14 @@ class BpmnRuntime {
     this.maxActiveInstances = options.maxActiveInstances
     this.executorRunner = typeof options.executorRunner === 'function' ? options.executorRunner : runExternalExecutor
     this.executorNormalizer = typeof options.executorNormalizer === 'function' ? options.executorNormalizer : normalizeExecutor
+    /** AgentAdapter 注册表（dsh / codex）；缺省时 dsh 节点按旧接线明确失败。 */
+    this.adapters = options.adapters && typeof options.adapters.get === 'function' ? options.adapters : null
+    /** agent 节点 documents 的相对基准。 */
+    this.workspaceRoot = typeof options.workspaceRoot === 'string' && options.workspaceRoot.trim() !== ''
+      ? resolve(options.workspaceRoot.trim())
+      : process.cwd()
+    /** 每个 runtime 的 probe 缓存：同一 adapter id 只 probe 一次（成功/失败都缓存）。 */
+    this._probeAdapter = createAdapterProbeCache()
 
     /** @type {Map<string, any>} instanceId → runner（懒恢复后常驻） */
     this._runners = new Map()
@@ -317,6 +333,12 @@ class BpmnRuntime {
     this._runnerErrors = new Map()
     /** @type {Set<string>} 停止闩：置位后该实例的迟到事件与懒恢复一律不再推进 */
     this._stopping = new Set()
+    /** @type {Map<string, object>} instanceId → 最后一个成功 agent 节点的 output（process/end 用） */
+    this._lastAgentOutputs = new Map()
+    /** @type {Map<string, string>} `instanceId\\0executionId` → agent 节点 summary（activity/end 用） */
+    this._agentSummaries = new Map()
+    /** @type {Map<string, number>} instanceId → agent handler 失败时的提醒次数（lastError.reminders） */
+    this._agentReminders = new Map()
     this._disposed = false
   }
 
@@ -405,6 +427,9 @@ class BpmnRuntime {
     this._suppressWait.clear()
     this._stopping.clear()
     this._runnerErrors.clear()
+    this._lastAgentOutputs.clear()
+    this._agentSummaries.clear()
+    this._agentReminders.clear()
   }
 
   // -------------------------------------------------------------------------
@@ -1083,6 +1108,8 @@ class BpmnRuntime {
       ?? 'BPMN_ENGINE_ERROR'
     const message = recorded?.message ?? errorText(error)
     const lastError = { code, message }
+    const reminders = this._agentReminders.get(instanceId)
+    if (Number.isSafeInteger(reminders) && reminders >= 0) lastError.reminders = reminders
     if (typeof error?.elementId === 'string' && error.elementId !== '') lastError.nodeId = error.elementId
     if (typeof error?.activityId === 'string' && error.activityId !== '') lastError.activityId = error.activityId
     return lastError
@@ -1154,16 +1181,72 @@ class BpmnRuntime {
 
   _servicesFor(instanceId) {
     return {
-      executeAgent: (element, ctx) => executeAgent(element, ctx, {
-        runExecutor: this.executorRunner,
-        normalizeExecutor: this.executorNormalizer,
-      }),
+      executeAgent: (element, ctx) => this._executeAgentFor(instanceId, element, ctx),
       executeHttp: (element, ctx) => executeHttp(element, ctx),
       onEvent: event => this._onRunnerEvent(instanceId, event),
       onTaskWait: () => {},
       onTaskDone: () => {},
       onError: error => this._recordRunnerError(instanceId, error),
     }
+  }
+
+  /**
+   * agent 节点 handler 的 runtime 侧包装：接适配器注册表 + probe 缓存，并记住
+   * 最后一个成功 agent 节点的 output / 本次 activity 的 summary（11 §5）。
+   *
+   * 注意：`executeAgent` 导出函数本身保持无实例状态的纯行为（测试可单独调用）；
+   * 与实例相关的收口（变量合并由 runner 做、产物与 result 由本类做）在这里。
+   */
+  async _executeAgentFor(instanceId, element, ctx) {
+    let result
+    try {
+      result = await executeAgent(element, ctx, {
+        adapters: this.adapters,
+        probeAdapter: this._probeAdapter,
+        workspaceRoot: this.workspaceRoot,
+        instanceId,
+        // 旧外部 CLI 逃生门（adapter=custom / 无注册表时的 codex）仍用注入的桩/真实现。
+        runExecutor: this.executorRunner,
+        normalizeExecutor: this.executorNormalizer,
+      })
+    } catch (error) {
+      // 失败落点（如 NODE_FINISH_MISSING）也必须让提醒事件进实例事件流：
+      // handler 抛错时 runner 不会处理它的 events[]，这里补一次透传。
+      if (error && Array.isArray(error.events)) {
+        for (const event of error.events) {
+          if (!isPlainObject(event) || typeof event.type !== 'string' || event.type === '') continue
+          this._onRunnerEvent(instanceId, {
+            ...event,
+            elementId: typeof element?.id === 'string' ? element.id : undefined,
+            activityId: typeof ctx?.executionId === 'string' ? ctx.executionId : undefined,
+          })
+        }
+      }
+      if (error && Number.isSafeInteger(error.reminders) && error.reminders >= 0) {
+        this._agentReminders.set(instanceId, error.reminders)
+      }
+      throw error
+    }
+    // 成功执行后清掉上一次失败留下的提醒计数（lastError 随后也会被清/覆盖）。
+    this._agentReminders.delete(instanceId)
+    if (result && isPlainObject(result.output)) {
+      this._lastAgentOutputs.set(instanceId, { ...result.output })
+    }
+    if (result && typeof result.summary === 'string'
+      && ctx && typeof ctx.executionId === 'string' && ctx.executionId !== '') {
+      this._agentSummaries.set(`${instanceId}\0${ctx.executionId}`, result.summary)
+    }
+    return result
+  }
+
+  /** 取走本次 activity 的 summary（只消费一次，避免 map 泄漏）。 */
+  _takeAgentSummary(instanceId, activityId) {
+    if (typeof activityId !== 'string' || activityId === '') return undefined
+    const key = `${instanceId}\0${activityId}`
+    if (!this._agentSummaries.has(key)) return undefined
+    const summary = this._agentSummaries.get(key)
+    this._agentSummaries.delete(key)
+    return summary
   }
 
   _limits() {
@@ -1384,9 +1467,15 @@ class BpmnRuntime {
       : undefined
 
     if (status === 'done') {
+      // 11 §5：process/end 时 instance.result 取最后一个成功 agent 节点的 output
+      // （endEvent 不产生输出）。output 在 gate 里已归一化为短变量对象。
+      const lastOutput = this._lastAgentOutputs.get(instanceId)
+      const result = isPlainObject(lastOutput) ? { ...lastOutput } : undefined
+      this._lastAgentOutputs.delete(instanceId)
       await completeInstance(instanceId, 'COMPLETED', {
         instancesRoot: this.instancesRoot,
         ...(variables === undefined ? {} : { variables }),
+        ...(result === undefined ? {} : { result }),
       })
       return
     }
@@ -1449,7 +1538,14 @@ class BpmnRuntime {
 
     const activityId = shardIdOf(event)
     const attempt = this._nextAttempt(instanceId, event)
-    const persisted = persistableEvent(event)
+    // 11 §5：activity/end 除了 runner 已带的 output/artifacts，还要带本次 agent 的 summary。
+    // summary 只存在 runtime 的短期表里（runner 的 handler 结果契约不额外扩字段）。
+    let persistedSource = event
+    if (event.type === 'activity/end') {
+      const summary = this._takeAgentSummary(instanceId, event.activityId)
+      if (summary !== undefined) persistedSource = { ...event, summary }
+    }
+    const persisted = persistableEvent(persistedSource)
     this._enqueueEvent(instanceId, async () => {
       // 事件是入队执行的：轮到这里时 stop 可能已经置闩 / 实例可能已终态，
       // 必须复查，不能把停止前排队的事件晚写到终态实例上。
@@ -1467,19 +1563,26 @@ class BpmnRuntime {
             pendingTasks: runner === null ? [] : runner.pendingTasks(),
           }, { instancesRoot: this.instancesRoot })
         } else if (event.type === 'activity/end') {
+          // 11 §3 / §5：产物索引由运行时维护，按 path+sha256 去重（重复活动执行不重复追加）。
+          if (Array.isArray(event.artifacts)) {
+            await this._mergeArtifacts(instanceId, event.artifacts)
+          }
           await updateInstance(instanceId, {
             status: 'ACTIVE',
             pendingTasks: runner === null ? [] : runner.pendingTasks(),
           }, { instancesRoot: this.instancesRoot })
         } else if (event.type === 'error') {
           // 出错**不改 status**：实例继续 ACTIVE，只把事实留成 lastError（连同 error 事件）。
+          const reminders = this._agentReminders.get(instanceId)
           const lastError = {
             code: typeof event.error?.code === 'string' ? event.error.code : 'BPMN_ENGINE_ERROR',
             message: typeof event.error?.message === 'string' ? event.error.message : '',
+            ...(Number.isSafeInteger(reminders) && reminders >= 0 ? { reminders } : {}),
             ...(typeof event.elementId === 'string' ? { nodeId: event.elementId } : {}),
             ...(typeof event.activityId === 'string' ? { activityId: event.activityId } : {}),
           }
-          await updateInstance(instanceId, { lastError }, { instancesRoot: this.instancesRoot })
+          // 失败即停机：待办一并清空（异步失败时可能没有 _syncInstanceStatus 收口）。
+          await updateInstance(instanceId, { lastError, pendingTasks: [] }, { instancesRoot: this.instancesRoot })
           // 失败事实一旦落盘，旧快照立刻变成不可恢复：不能等下一个请求/收口才处理
           // （runTimeout 等异步失败可能没有在等的请求）。
           await this._persistUnrecoverableState(instanceId, lastError)
@@ -1492,6 +1595,42 @@ class BpmnRuntime {
         throw error
       }
     })
+  }
+
+  /**
+   * 把 `flow_finish_node` 登记的产物引用合并进 `instance.json.artifacts[]`。
+   *
+   * 去重键固定 `path + sha256`：同一活动重试、同一文件被多个节点引用都不会重复追加；
+   * 内容变了（hash 不同）则是新产物。终态实例不再写（由 store 的终态保护兜底）。
+   */
+  async _mergeArtifacts(instanceId, artifacts) {
+    if (!Array.isArray(artifacts) || artifacts.length === 0) return
+    const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+    if (instance === null || TERMINAL_STATUSES.has(instance.status)) return
+    const current = Array.isArray(instance.artifacts) ? instance.artifacts : []
+    const seen = new Set(current.map(item => `${item?.path ?? ''}\0${item?.sha256 ?? ''}`))
+    const added = []
+    for (const item of artifacts) {
+      if (!isPlainObject(item)) continue
+      if (typeof item.path !== 'string' || item.path === '') continue
+      if (typeof item.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(item.sha256)) continue
+      const sha256 = item.sha256.toLowerCase()
+      const key = `${item.path}\0${sha256}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      added.push({
+        path: item.path,
+        sha256,
+        bytes: Number.isSafeInteger(item.bytes) && item.bytes >= 0 ? item.bytes : 0,
+        kind: typeof item.kind === 'string' ? item.kind : '',
+        title: typeof item.title === 'string' ? item.title : '',
+        ...(typeof item.nodeId === 'string' && item.nodeId !== '' ? { nodeId: item.nodeId } : {}),
+        ...(Number.isSafeInteger(item.attempt) && item.attempt >= 1 ? { attempt: item.attempt } : {}),
+        ...(typeof item.at === 'string' && item.at !== '' ? { at: item.at } : {}),
+      })
+    }
+    if (added.length === 0) return
+    await updateInstance(instanceId, { artifacts: [...current, ...added] }, { instancesRoot: this.instancesRoot })
   }
 
   _nextAttempt(instanceId, event) {
@@ -1625,45 +1764,107 @@ function buildExecutorPrompt(element, ctx) {
 /**
  * agent 节点处理器（签名固定 `(element, ctx)`）。
  *
- * - `adapter` = `codex` / `custom`：复用 `runExternalExecutor`（不重写进程管理）；
- * - `adapter` = `dsh` 或缺失：**明确失败** `BPMN_AGENT_ADAPTER_UNAVAILABLE`
- *   （0.13.1 才提供 AgentAdapter + hooks；0.13.0 不伪造 handler、不偷偷起子会话）；
- * - 其他 adapter：`BPMN_AGENT_ADAPTER_UNSUPPORTED`。
+ * 0.13.1 A3 起：`dsh` / `codex` 等注册过的 adapter 走 **AgentAdapter + flow_finish_node
+ * 完结门**（`agent-execute.js`）：
  *
- * 第三个参数是本模块内部注入点（测试用桩 executor）；公开契约仍是两个参数。
+ * 1. `fs:node@adapter` 决定 adapter id（缺失默认 `dsh`；旧 `fs:executor@kind` 兜底）；
+ * 2. admission：`adapter.probe()`（每个 runtime 只 probe 一次）→ `assertFinishToolNative`；
+ *    非 native / probe 失败 → 节点**零派发**，`NODE_FINISH_TOOL_UNAVAILABLE`；
+ * 3. `createFinishGate` + `adapter.start` → 等 `handle.exited`（不轮询 stdout）；
+ * 4. 成功只认闸门受理的 record：返回 `{ output, artifacts, summary, usage, events }`；
+ * 5. 失败码原样冒泡（`NODE_FINISH_MISSING` / `NODE_VARIABLES_INVALID` / …），
+ *    由 runtime 写 lastError、实例保持 ACTIVE。
+ *
+ * 兼容：`adapter=custom`（以及没有注册表时的 `codex`）仍走旧的 `runExternalExecutor`
+ * 外部 CLI 路径——这是逃生门，不破坏 0.13.0 的既有接线。没有注册表时的 `dsh`
+ * 明确报 `BPMN_AGENT_ADAPTER_UNAVAILABLE`（旧行为，不伪造成功）。
+ *
+ * 第三个参数是本模块内部注入点（测试用桩 executor / adapter 注册表）；公开契约仍是两个参数。
  *
  * @param {object} element
- * @param {{attempt?: number, variables?: object, signal?: AbortSignal, timeoutMs?: number|null}} ctx
- * @param {{runExecutor?: Function, normalizeExecutor?: Function}} [options]
- * @returns {Promise<{output?: unknown, usage?: object, events?: object[]}>}
+ * @param {{attempt?: number, variables?: object, signal?: AbortSignal, timeoutMs?: number|null,
+ *   executionId?: string}} ctx
+ * @param {{runExecutor?: Function, normalizeExecutor?: Function, adapters?: object,
+ *   probeAdapter?: Function, workspaceRoot?: string, instanceId?: string}} [options]
+ * @returns {Promise<{output?: unknown, usage?: object, artifacts?: object[], summary?: string,
+ *   events?: object[]}>}
  */
 export async function executeAgent(element, ctx, options = {}) {
   throwIfAborted(ctx)
+  const declared = resolveAdapterId(element)
+  const adapterId = declared ?? DEFAULT_ADAPTER_ID
+  const adapters = options.adapters && typeof options.adapters.get === 'function' ? options.adapters : null
+
+  // 逃生门：custom 永远走外部 CLI executor（既有测试与运维用法）。
+  if (adapterId === 'custom') {
+    return await executeAgentViaExecutor(element, ctx, options, 'custom')
+  }
+
+  if (adapters === null) {
+    // 旧接线（没有注册表）：codex 保留外部 CLI 路径；dsh / 未知 adapter 明确失败。
+    if (adapterId === 'codex') {
+      return await executeAgentViaExecutor(element, ctx, options, 'codex')
+    }
+    if (adapterId === 'dsh') {
+      throw handlerError(
+        AGENT_EXECUTE_ERROR.ADAPTER_UNAVAILABLE,
+        '0.13.1 起 dsh 走 AgentAdapter + flow_finish_node，但当前 runtime 没有适配器注册表'
+          + '（createAdapterRegistry + createDshAdapter）；只支持外部 CLI executor（adapter=codex/custom）',
+        { adapter: adapterId, elementId: element?.id ?? null },
+      )
+    }
+    throw handlerError(
+      AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
+      `不支持的 agent adapter「${adapterId}」：没有适配器注册表时只支持 codex / custom`,
+      { adapter: adapterId, elementId: element?.id ?? null },
+    )
+  }
+
+  const adapter = adapters.get(adapterId)
+  if (!adapter) {
+    const available = typeof adapters.list === 'function'
+      ? adapters.list().map(item => item && item.id).filter(Boolean)
+      : []
+    throw handlerError(
+      AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
+      `不支持的 agent adapter「${adapterId}」：没有注册这个 id`
+        + (available.length > 0 ? `（已注册：${available.join(' / ')}）` : '（注册表为空）'),
+      { adapter: adapterId, elementId: element?.id ?? null },
+    )
+  }
+
+  // admission：probe + 原生 finishTool 断言。失败时零派发（不调用 adapter.start）。
+  await admitAdapter(adapter, {
+    probeAdapter: options.probeAdapter,
+    nodeId: element?.id,
+  })
+
+  return await runAgentNode({
+    element,
+    ctx,
+    adapter,
+    workspaceRoot: options.workspaceRoot,
+    instanceId: options.instanceId,
+    log: typeof options.log === 'function' ? options.log : undefined,
+  })
+}
+
+/**
+ * 旧路径：外部 CLI executor（`adapter=custom` / 无注册表时的 `codex`）。
+ * 行为与 0.13.0 保持一致（便于回退与既有测试）。
+ *
+ * @param {object} element
+ * @param {object} ctx
+ * @param {{runExecutor?: Function, normalizeExecutor?: Function}} [options]
+ * @param {'custom'|'codex'} adapterId
+ */
+async function executeAgentViaExecutor(element, ctx, options, adapterId) {
   const node = isPlainObject(element?.node) ? element.node : {}
-  const adapter = typeof node.adapter === 'string' && node.adapter.trim() !== ''
-    ? node.adapter.trim().toLowerCase()
-    : (typeof node.executor?.kind === 'string' && node.executor.kind !== '' ? node.executor.kind : null)
-
-  if (adapter === null || adapter === 'dsh') {
-    throw handlerError(
-      'BPMN_AGENT_ADAPTER_UNAVAILABLE',
-      'dsh 适配器在 0.13.1 提供（AgentAdapter + hooks），当前 0.13.0 只支持外部 CLI executor（adapter=codex/custom）',
-      { adapter: adapter ?? 'dsh', elementId: element?.id ?? null },
-    )
-  }
-  if (adapter !== 'codex' && adapter !== 'custom') {
-    throw handlerError(
-      'BPMN_AGENT_ADAPTER_UNSUPPORTED',
-      `不支持的 agent adapter「${adapter}」：0.13.0 只支持 codex / custom（dsh 在 0.13.1）`,
-      { adapter, elementId: element?.id ?? null },
-    )
-  }
-
   const normalize = typeof options.normalizeExecutor === 'function' ? options.normalizeExecutor : normalizeExecutor
   let spec
   try {
     spec = normalize({
-      executor: adapter,
+      executor: adapterId,
       executorCommand: node.executor?.command,
       model: node.model,
       mode: node.team?.mode,

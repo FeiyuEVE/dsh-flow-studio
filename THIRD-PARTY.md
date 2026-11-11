@@ -1,6 +1,7 @@
 # 第三方代码（Third-party notices）
 
-本插件的运行时 npm 依赖有七个：`bpmn-engine`（精确 `26.0.6`）、`lru-cache`（`^11.5.3`）、
+本插件的运行时 npm 依赖有八个：`bpmn-engine`（精确 `26.0.6`）、`lru-cache`（`^11.5.3`）、
+`@modelcontextprotocol/sdk`（精确 `1.32.2`，`flow_finish_node` 的 stdio MCP server）、
 以及 `bpmn-elements` / `bpmn-moddle` / `moddle-context-serializer` / `smqp` / `debug`
 这五个 BPMN 栈件。**它们必须全部显式声明**：`bpmn-engine` 自己没有 `dependencies`，
 只把栈件写在 `peerDependencies` 里，而 pnpm 布局的 dsh profile **不会自动安装传递依赖的
@@ -12,7 +13,7 @@ FEEL 求值、Zeebe 扩展描述符）一律**编译成单文件 ESM 提交进�
 
 按形态分两类：
 
-- **npm 依赖**：上面七个 —— 不复制进本仓库，跟随 npm 安装。
+- **npm 依赖**：上面八个 —— 不复制进本仓库，跟随 npm 安装。
 - **vendored**：`xstate`、`bpmn-moddle`、`feelin`、`zeebe-bpmn-moddle` —— 单文件 ESM 放在
   `src/*-vendor.js`，构建时逐字节复制到 `lib/`。其中 `bpmn-moddle` 同时是 npm 依赖
   （引擎运行期要用它）和 vendored 产物（我们自己的解析器用它与主世界隔离）——两份用途不同，
@@ -135,6 +136,76 @@ without any warranty or condition, and no contributor
 will be liable to anyone for any damages related to this
 software or this license, under any kind of legal claim.***
 ```
+
+---
+
+## @modelcontextprotocol/sdk@1.32.2
+
+- **用途**：模型工具 `flow_finish_node` 的 stdio MCP server。`src/node-finish-mcp.js` 用
+  `Server` + `StdioServerTransport` 对外暴露 `flow_finish_node`（`tools/list` /
+  `tools/call`），并用 `Client` + `StdioClientTransport` 起子进程做通道自检。
+  **只有这一个模块** import 它。
+- **来源**：npm 依赖，`https://github.com/modelcontextprotocol/typescript-sdk`
+- **形态**：**npm 直接依赖**（`package.json` 里精确 `1.32.2`），不是 vendored——不随
+  `lib/` 拷贝、不进 `src/*-vendor.js`，安装后代码来自 `node_modules/`。
+- **为什么锁精确版本**：工具名、`tools/list` 的入参 schema、`tools/call` 的错误结构都
+  直接来自这份 SDK；小版本漂移会改变对模型暴露的契约，所以 `package.json` 固定为 `1.32.2`。
+- **许可**：MIT。版权行：`Copyright (c) 2024 Anthropic, PBC`。
+
+### License
+
+```
+MIT License
+
+Copyright (c) 2024 Anthropic, PBC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 传递依赖
+
+- **规模**：按 `package-lock.json` 从 `node_modules/@modelcontextprotocol/sdk` 出发的
+  依赖闭包共 **91 个包**（去重后的 name@version）。按安装路径计 94 份：
+  `content-type@2.1.0` 在 `express` / `body-parser` / `type-is` / `negotiator` 下各装了一份。
+- **许可分布**（按闭包内每个包 `license` 字段归类，91 个）：
+
+  | 许可 | 包数 | 性质 |
+  | --- | --- | --- |
+  | MIT | 81 | 宽松 |
+  | ISC | 7 | 宽松（与 MIT 实质等价） |
+  | BSD-3-Clause | 2 | 宽松 |
+  | BSD-2-Clause | 1 | 宽松 |
+
+  非 MIT 的 10 个包逐个列出：`fast-uri@3.1.9`（BSD-3-Clause）、`qs@6.17.1`
+  （BSD-3-Clause）、`json-schema-typed@8.0.2`（BSD-2-Clause）、`inherits@2.0.4`、
+  `isexe@2.0.0`、`once@1.4.0`、`setprototypeof@1.2.0`、`which@2.0.2`、`wrappy@1.0.2`、
+  `zod-to-json-schema@3.25.2`（后七个均 ISC）。
+- **非宽松许可证**：闭包内**未发现** copyleft / 非宽松许可证——没有 GPL / AGPL / SSPL /
+  CC-BY-NC / UNLICENSED / 自定义许可，也没有缺失 `license` 字段的包。另外逐个核对了磁盘上
+  94 份 `node_modules/*/package.json` 的 `license` 与 `package-lock.json`：0 处不符，
+  94 个包各自都带 `LICENSE` / `COPYING` 文件。
+- **复算方式**：按 `package-lock.json` 的 `packages` 闭包统计（用 Node 的向上查找
+  `node_modules` 规则解析每个依赖），一次性脚本 `./.tmp/mcp-closure.mjs`（已删）。
+- **版本与 peer 核对**：`npm ls @modelcontextprotocol/sdk` 没有 extraneous / unmet，
+  输出为 `@feiyueve/dsh-flow-studio@0.12.3` → `└── @modelcontextprotocol/sdk@1.32.2`。
+  它的 `peerDependenciesMeta` 里 `@cfworker/json-schema` 是 optional、`zod` 非 optional；
+  而 `zod`（实际安装 `4.6.7`）同时是它的直接依赖，所以 pnpm 不自动装 peer 也不会缺。
 
 ---
 

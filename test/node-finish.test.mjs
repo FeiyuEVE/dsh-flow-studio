@@ -7,9 +7,9 @@
  *      bytes 与 crypto 独立计算一致；
  *   2. 变量：键数 / Unicode 字符数 / UTF-8 JSON 字节数 / 嵌套结构 / 危险键 → 全部
  *      `NODE_VARIABLES_INVALID`，边界值（32 键 / 512 字符 / 8192 字节）通过；
- *   3. 文档：不存在 / 绝对路径 / `..` 逃逸 / 符号链接逃逸 / >5 MiB / 校验中被改
+ *   3. 文档：不存在 / 绝对路径 / `..` 逃逸 / 符号链接逃逸 / 硬链接 / >5 MiB / 校验中被改
  *      （变长、字节数不符、mtime 变化）→ `NODE_DOCUMENT_INVALID`，且零登记（gate 未
- *      settled、result 未决议）；
+ *      settled、result 未决议）；`documents[].summary` 持久化进 artifact；
  *   4. 重复与并发：并发两次 submit 恰好一个成功，产物只登记一次；
  *   5. abort：result reject（带 `aborted` 标记）、后续 submit `NODE_ALREADY_SETTLED`；
  *   6. 失败后可修正重试：纯校验失败不锁死闸门；
@@ -22,7 +22,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  appendFileSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync,
+  appendFileSync, closeSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync,
   symlinkSync, truncateSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -397,7 +397,7 @@ try {
     const [markdownArtifact, binaryArtifact] = record.artifacts
     A.deepEqual(
       Object.keys(markdownArtifact).sort(),
-      ['at', 'attempt', 'bytes', 'kind', 'nodeId', 'path', 'sha256', 'title'],
+      ['at', 'attempt', 'bytes', 'kind', 'nodeId', 'path', 'sha256', 'summary', 'title'],
       'artifact 字段冻结',
     )
     A.equal(markdownArtifact.path, 'docs/plan/0.13-方案.md')
@@ -405,6 +405,7 @@ try {
     A.equal(markdownArtifact.bytes, Buffer.byteLength(markdown), 'bytes 与真实字节数一致')
     A.equal(markdownArtifact.kind, 'markdown')
     A.equal(markdownArtifact.title, '方案')
+    A.equal(markdownArtifact.summary, '0.13 方案文档', 'documents[].summary 持久化进 artifact（m3）')
     A.equal(markdownArtifact.nodeId, 'agent-normal')
     A.equal(markdownArtifact.attempt, 3)
     A.equal(markdownArtifact.at, record.at, 'artifact.at 与 record.at 同一时间戳')
@@ -414,6 +415,7 @@ try {
     A.equal(binaryArtifact.bytes, 257)
     A.equal(binaryArtifact.kind, 'binary')
     A.equal(binaryArtifact.title, '构建产物')
+    A.equal(binaryArtifact.summary, '', '未传 summary 时持久化为空串')
 
     A.equal(JSON.stringify(record).includes('这里只写正文'), false, 'record 里没有文档正文')
     A.equal(await gate.result, record, 'result resolve 的就是 submit 返回的 record')
@@ -489,7 +491,26 @@ try {
       A.equal(gate.settled(), false)
     }
 
-    // 5.5 >5 MiB（稀疏文件，不真写内容；预检直接拒绝）
+    // 5.5 硬链接指向工作区外内容（路径本身在工作区，但 inode 与外文件共享）
+    {
+      const workspace = freshWorkspace()
+      const outsideDir = freshWorkspace()
+      const outsideFile = writeDoc(outsideDir, 'outside.txt', 'OUTSIDE-SECRET-CONTENT')
+      linkSync(outsideFile, join(workspace, 'hard.md'))
+      const gate = makeGate(workspace)
+      const error = await rejection(gate.submit({
+        variables: {},
+        documents: [{ path: 'hard.md', kind: 'markdown' }],
+        summary: '硬链接绕过',
+      }))
+      A.equal(error.code, NODE_FINISH_ERROR.DOCUMENT_INVALID)
+      A.equal(error.details?.reason, 'hardlink', '硬链接拒绝原因可定位（m8）')
+      A.match(error.message, /硬链接/, '错误信息说明不接受硬链接')
+      A.equal(gate.settled(), false, '硬链接不会登记产物')
+      A.equal(await raceState(gate.result), 'pending')
+    }
+
+    // 5.6 >5 MiB（稀疏文件，不真写内容；预检直接拒绝）
     {
       const workspace = freshWorkspace()
       sparseFile(workspace, 'huge.bin', NODE_FINISH_LIMITS.maxDocumentBytes + 1)
@@ -504,7 +525,7 @@ try {
       A.equal(gate.settled(), false)
     }
 
-    // 5.6 校验中被改：文件变长（读完注入字节后追加）
+    // 5.7 校验中被改：文件变长（读完注入字节后追加）
     {
       const workspace = freshWorkspace()
       const absolute = writeDoc(workspace, 'docs/a.md', 'hello')
@@ -526,7 +547,7 @@ try {
       A.equal(readFileSync(absolute, 'utf8'), 'hellox', '夹具确实改了文件')
     }
 
-    // 5.7 校验中被改：读到的字节数不符（注入实现截断）
+    // 5.8 校验中被改：读到的字节数不符（注入实现截断）
     {
       const workspace = freshWorkspace()
       writeDoc(workspace, 'docs/a.md', 'hello')
@@ -543,7 +564,7 @@ try {
       A.equal(gate.settled(), false)
     }
 
-    // 5.8 校验中被改：mtime 变化（内容与字节数不变）
+    // 5.9 校验中被改：mtime 变化（内容与字节数不变）
     {
       const workspace = freshWorkspace()
       const absolute = writeDoc(workspace, 'docs/a.md', 'hello')

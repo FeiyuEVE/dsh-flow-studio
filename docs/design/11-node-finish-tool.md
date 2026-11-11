@@ -25,8 +25,9 @@
 
 - **`variables` 是后续网关条件唯一的数据来源**（FEEL 直接读实例变量）。硬限制：键 ≤32 个；值只允许 `boolean | number | string(≤512 字符) | null`；序列化后 ≤8 KiB。超限 → `NODE_VARIABLES_INVALID`，整次调用失败，节点不结束。
 - **禁止**在 `variables` 里放大对象、数组、base64、文档正文、长 JSON。需要给下游看的内容一律落文件，用 `documents` 引用。
-- `documents` 最多 32 份；`path` 必须是**工作区内的相对路径**（禁止绝对路径、`..` 段、反斜杠、空段，≤1024 字符——沿用 `src/runlog.js` 的 artifact 路径规则）；`kind` ≤64、`title` ≤200、`summary` ≤200。宿主用**同一文件句柄**有界读取校验：普通文件、`realpath` 落在工作区内（防符号链接逃逸）、≤5 MiB、读到字节数与 stat 一致（校验中被改则拒），计算 `sha256` 与 `bytes`。
-- `documents[].summary` 只是给人看的一句话，不承载正文。
+- `documents` 最多 32 份；`path` 必须是**工作区内的相对路径**（禁止绝对路径、`..` 段、反斜杠、空段，≤1024 字符——沿用 `src/runlog.js` 的 artifact 路径规则）；`kind` ≤64、`title` ≤200、`summary` ≤200。宿主用**同一文件句柄**有界读取校验：普通文件且 `nlink === 1`（硬链接一律拒绝，见下）、`realpath` 落在工作区内（防符号链接逃逸）、≤5 MiB、读到字节数与 stat 一致（校验中被改则拒），计算 `sha256` 与 `bytes`。
+- `documents[].summary` 只是给人看的一句话，不承载正文；校验后**持久化进 artifact**（超 200 码点整次拒绝，不静默截断），`flow_finish_node` 返回与 `activity/end` 都能看到。
+- 硬链接（`stat.nlink > 1`）一律 `NODE_DOCUMENT_INVALID`：「文档必须是工作区内的独立文件，不接受硬链接」——工作区内的路径不应指向工作区外内容的 inode。
 
 ## 3 产物怎么落
 
@@ -40,8 +41,8 @@ $DSH_HOME/flow-studio/instances/<id>/
 ```
 
 - 文档正文由 agent 自己写进工作区文件（这是它本来就要做的事），宿主只登记引用。
-- `instance.json.artifacts[]` 由运行时维护；`activity/end` 事件的 `artifacts[]` 只带引用（path/hash/bytes/kind/title），事件里**不出现**文档正文。
-- 产物校验失败（路径越界、不存在、符号链接逃逸、超 5 MiB、校验中被改）→ `NODE_DOCUMENT_INVALID`，节点不结束；错误信息带 `path` 与原因，不打印文件内容。
+- `flow_finish_node` 的 record 与 `activity/end` 事件的 `artifacts[]` 带引用（path/hash/bytes/kind/title/summary），事件里**不出现**文档正文；`instance.json.artifacts[]` 由运行时维护，沿用既有稳定字段投影（`summary` 只在 record / 事件里，不写进实例索引）。
+- 产物校验失败（路径越界、不存在、符号链接逃逸、硬链接、超 5 MiB、校验中被改）→ `NODE_DOCUMENT_INVALID`，节点不结束；错误信息带 `path` 与原因，不打印文件内容。
 
 ## 3.1 默认的「停下来但没调工具」hook
 
@@ -89,8 +90,8 @@ adapter 必须把「怎么完结当前节点」写进节点提示词（不是可
 1. 正常：agent 调工具 → 节点完结、`activity/end` 带 `output` 与 `artifacts`，实例变量里能看到注入的 `verdict`，网关按它路由到正确的下一条连线；
 2. 不调工具：会话正常结束（提醒用尽）→ 实例 `status==='ACTIVE'` 且 `lastError.code==='NODE_FINISH_MISSING'`（既不 done，也没有 failed/blocked 状态可判）；
 3. 变量超限：塞 9 KiB 或嵌套对象 → `NODE_VARIABLES_INVALID`，节点不结束；
-4. 文档不存在 / 路径越界 / 超 5 MiB → `NODE_DOCUMENT_INVALID`；
+4. 文档不存在 / 路径越界 / 符号链接逃逸 / 硬链接 / 超 5 MiB → `NODE_DOCUMENT_INVALID`；
 5. 重复调用 → `NODE_ALREADY_FINISHED`，产物索引不重复；
 6. 超时中断：工具从未调用且活动超时 → `BPMN_ACTIVITY_TIMEOUT` 且会话被 abort（不是挂住）。
 7. 提醒：agent 停下来没调工具 → 收到一次提醒并被唤醒；调用后正常完结，事件流里有 `agent/reminder`（count=1），实例状态不变（不 blocked、不 failed）。
-8. 提醒用尽：连续 3 次停下都不调工具 → 3 条 `agent/reminder` + 实例仍 `ACTIVE`、`lastError.code='NODE_FINISH_MISSING'`（`reminders:3`）；把 maxFires 配成 0 时，第一次停下就直接记 lastError。
+8. 提醒用尽：前 3 次停下各发 1 条 `agent/reminder`（count=1..3）；**3 次提醒用尽后的下一次停下**（第 4 次）才以 `NODE_FINISH_MISSING` 停下，实例仍 `ACTIVE`、`lastError.code='NODE_FINISH_MISSING'`（`reminders:3`）；把 maxFires 配成 0 时，第一次停下就直接记 lastError。

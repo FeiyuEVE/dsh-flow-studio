@@ -77,6 +77,11 @@ export const HOST_MODULES = [
   'bpmn-runner.js',
   'bpmn-runtime.js',
   'node-finish.js',
+  'node-finish-mcp.js',
+  'agent-adapter.js',
+  'agent-adapter-dsh.js',
+  'agent-adapter-codex.js',
+  'agent-execute.js',
 ]
 
 /** 由 esbuild 生成、不是从 src 拷贝的产物，同样计入 lib/ 产物清单。 */

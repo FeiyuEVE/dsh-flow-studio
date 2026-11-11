@@ -334,6 +334,8 @@ function normalizeLastError(raw) {
   if (typeof raw.nodeId === 'string' && raw.nodeId !== '') out.nodeId = raw.nodeId
   if (typeof raw.activityId === 'string' && raw.activityId !== '') out.activityId = raw.activityId
   if (Number.isSafeInteger(raw.retries) && raw.retries >= 0) out.retries = raw.retries
+  // 11 §3.1：agent 节点停下但没调 flow_finish_node 时，lastError 要带提醒次数。
+  if (Number.isSafeInteger(raw.reminders) && raw.reminders >= 0) out.reminders = raw.reminders
   return out
 }
 

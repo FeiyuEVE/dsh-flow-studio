@@ -28,6 +28,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { deliverInboundMessage, validateReplyTarget } from './inbox.js'
+import { createAdapterRegistry } from './agent-adapter.js'
+import { createCodexAdapter } from './agent-adapter-codex.js'
+import { createDshAdapter } from './agent-adapter-dsh.js'
 import { createBpmnRuntime } from './bpmn-runtime.js'
 import { normalizeExecutor } from './executor.js'
 import { NODE_KIND, normalizeFlow, normalizeNodeCheck, validateFlow, validateNodeCheck } from './model.js'
@@ -90,6 +93,34 @@ const BASE = '/api/flow-studio'
 const summaryCache = new Map()
 
 /**
+ * AgentAdapter 注册表（0.13.1 A3）：`dsh` 用宿主 agents 服务注册会话级工具；
+ * `codex` 用自带 MCP stdio server（codex 没装 / 未登录时 probe 会失败，但**不能**因此
+ * 让插件加载失败——不可用只在节点 admission 阶段拒绝那个节点）。
+ *
+ * 用环境变量 / 外部注入覆盖时以 `env.bpmnAdapters` 为准（测试与嵌入方使用）。
+ */
+function buildAgentAdapters(ctx, log, codexTmpRoot) {
+  const registry = createAdapterRegistry()
+  const factories = [
+    ['dsh', () => createDshAdapter({ ctx, log })],
+    ['codex', () => createCodexAdapter({
+      // 适配器默认把每-execution 私有目录放插件包内的 `.tmp/`；装到只读 profile 时
+      // 会失败。这里显式指向 flow-studio 数据根（instances/ 的兄弟目录，必然可写）。
+      ...(typeof codexTmpRoot === 'string' && codexTmpRoot.trim() !== '' ? { tmpRoot: codexTmpRoot } : {}),
+    })],
+  ]
+  for (const [id, factory] of factories) {
+    try {
+      registry.register(factory())
+    } catch (error) {
+      // 单个适配器注册失败不能拖垮插件加载：其它 adapter / 面板 / /api 照常可用。
+      log('warn', `flow-studio: agent adapter「${id}」注册失败（该 adapter 的节点会被拒绝）：${error?.message ?? error}`)
+    }
+  }
+  return registry
+}
+
+/**
  * BPMN 运行时按 createHandler 的 env 懒建（同一 env 复用，不同测试 / profile 隔离）。
  * 开关关着时不会创建；创建后由 runtime 自己管 definitions/ 与 instances/。
  */
@@ -104,6 +135,11 @@ function bpmnRuntimeFor(env) {
       env: process.env,
       // 测试注入点：默认走真实的 runExternalExecutor（本文件不消费它，仅透传）。
       ...(typeof env.bpmnExecutor === 'function' ? { executorRunner: env.bpmnExecutor } : {}),
+      // A3：agent 节点走 AgentAdapter + flow_finish_node；没有注册表时 dsh 明确失败。
+      ...(env.bpmnAdapters && typeof env.bpmnAdapters.get === 'function' ? { adapters: env.bpmnAdapters } : {}),
+      ...(typeof env.bpmnWorkspaceRoot === 'string' && env.bpmnWorkspaceRoot.trim() !== ''
+        ? { workspaceRoot: env.bpmnWorkspaceRoot }
+        : {}),
     })
     bpmnRuntimes.set(env, runtime)
   }
@@ -2595,7 +2631,15 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: BASE,
-    handler: createHandler({ dir, runsRoot, ctx, engine, startOptions }),
+    handler: createHandler({
+      dir,
+      runsRoot,
+      ctx,
+      engine,
+      startOptions,
+      // 0.13.1 A3：agent 节点由 AgentAdapter 执行（dsh / codex）；codex 不可用不影响加载。
+      bpmnAdapters: buildAgentAdapters(ctx, log, join(dirname(dir), '.tmp')),
+    }),
   }), 'flow-studio: /api/flow-studio')
 
   // 06 §15：模型工具（会话内启停 + 定时自审）。

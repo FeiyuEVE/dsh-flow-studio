@@ -25,11 +25,13 @@
  * {
  *   executionId, nodeId, attempt,
  *   output,     // 归一化后的短变量（只含标量）
- *   artifacts,  // [{ path, sha256, bytes, kind, title, nodeId, attempt, at }]
+ *   artifacts,  // [{ path, sha256, bytes, kind, title, summary, nodeId, attempt, at }]
  *   summary, at,
  * }
  * ```
  * 文档正文**不进** record，也不进任何错误信息；错误里只出现工作区**相对路径**。
+ * `artifacts[].summary` 是 `documents[].summary` 的短投影（≤200 码点，超限整次拒绝），
+ * 让工具返回与 `activity/end` 都能看到「这份文档是什么」（m3）。
  *
  * @module @feiyueve/dsh-flow-studio/node-finish
  */
@@ -365,6 +367,12 @@ function statReason(error) {
   return 'stat-failed'
 }
 
+/** 是否硬链接（`nlink > 1`）。注入的 stat 可能不带 nlink：缺省按「不是」处理。 */
+function isHardLink(info) {
+  return Boolean(info && typeof info === 'object'
+    && Number.isSafeInteger(info.nlink) && info.nlink > 1)
+}
+
 /**
  * 宿主侧校验一份文档，返回**不含** nodeId/attempt/at 的产物引用。
  * 读取始终从同一个 FileHandle 分块进行（默认 64 KiB/块），读完前后各 fstat 一次；
@@ -387,6 +395,11 @@ async function verifyDocument(doc, index, deps, bounds) {
   }
   if (!info || typeof info !== 'object' || typeof info.isFile !== 'function' || !info.isFile()) {
     throw failDoc('not-regular-file', '不是普通文件')
+  }
+  // m8：工作区内路径但 nlink>1 = 硬链接到别处（可能在工区外）。只登记引用虽然不泄漏
+  // 正文，但「工作区内的独立文件」这条口径会被绕过；直接拒绝，错误里说明原因。
+  if (isHardLink(info)) {
+    throw failDoc('hardlink', '文档必须是工作区内的独立文件，不接受硬链接（nlink>1）')
   }
   if (info.size > bounds.maxDocumentBytes) {
     throw failDoc('too-large', `${info.size} 字节，超过 ${bounds.maxDocumentBytes} 字节上限`)
@@ -418,6 +431,10 @@ async function verifyDocument(doc, index, deps, bounds) {
     }
     if (typeof before.isFile !== 'function' || !before.isFile()) {
       throw failDoc('not-regular-file', '不是普通文件')
+    }
+    // stat 与 fstat 之间被换成硬链接也要拒（race 兜底）。
+    if (isHardLink(before)) {
+      throw failDoc('hardlink', '文档必须是工作区内的独立文件，不接受硬链接（nlink>1）')
     }
     if (before.size > bounds.maxDocumentBytes) {
       throw failDoc('too-large', `${before.size} 字节，超过 ${bounds.maxDocumentBytes} 字节上限`)
@@ -493,6 +510,8 @@ async function verifyDocument(doc, index, deps, bounds) {
       bytes,
       kind: doc.kind,
       title: doc.title,
+      // 短字段持久化：flow_finish_node 返回与 activity/end 都能看到（m3）。
+      summary: doc.summary,
     }
   } finally {
     if (handle) {

@@ -510,6 +510,7 @@ async function main() {
       A.equal(probe.bridge.skipped, true)
       const caps = adapter.capabilities()
       A.equal(caps.finishTool, 'native', 'probe 成功后才 native')
+      A.equal(caps.usage, 'native', '0.13.10：turn.completed.usage 可观测')
       A.equal(caps.hooks['turn.stop'], 'emulated', 'M7：probe 说 hooksNative 也仍默认 emulated')
       A.match(caps.evidence['turn.stop'], /emulated/)
       A.match(caps.evidence.userConfig, /config\.toml/, 'M6：evidence 如实写用户全局配置仍生效')

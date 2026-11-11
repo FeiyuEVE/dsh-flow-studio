@@ -103,6 +103,8 @@ export const HOST_MODULES = [
   'connector-store.js',
   'node-finish.js',
   'node-finish-mcp.js',
+  'instance-metrics.js',
+  'agent-telemetry.js',
   'agent-adapter.js',
   'agent-adapter-dsh.js',
   'agent-adapter-codex.js',

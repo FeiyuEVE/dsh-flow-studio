@@ -132,6 +132,7 @@ function makeFakeAdapter(behavior = {}) {
       const handle = {
         exited,
         usage: behavior.usage,
+        usageCalls: behavior.usageCalls,
         disposed: false,
         cancelCalls: [],
         finish: resolveExited,
@@ -240,7 +241,13 @@ await check('正常完结：返回 output/artifacts/summary/usage/events，probe
   A.equal(result.artifacts[0].bytes, Buffer.byteLength(content))
   A.equal(result.summary, '方案已落文件')
   A.deepEqual(result.usage, { tokens: 42 })
-  A.deepEqual(result.events, [{ type: 'agent/reminder', count: 1, maxFires: 3 }])
+  const reminders = result.events.filter(event => event.type === 'agent/reminder')
+  A.deepEqual(reminders, [{ type: 'agent/reminder', count: 1, maxFires: 3 }])
+  const invocations = result.events.filter(event => event.type === 'agent/invocation')
+  A.deepEqual(invocations.map(event => event.phase).sort(), ['reminder', 'start'],
+    '一次启动 + 一次提醒续跑各记一条 agent/invocation')
+  A.equal(invocations.filter(event => event.phase === 'start').length, 1)
+  A.equal(invocations.filter(event => event.phase === 'reminder').length, 1)
   A.equal(adapter.calls.probe, 1, 'probe 必须调用一次')
   A.equal(adapter.calls.starts, 1, 'start 必须调用一次')
   A.equal(adapter.calls.dispose, 1, 'dispose 必须调用一次')
@@ -728,6 +735,75 @@ await check('runAgentNode 直接调用：没有 probe 时也能工作（不经�
   })
   A.equal(result.output.direct, true)
   A.equal(adapter.calls.dispose, 1)
+})
+
+await check('usage 遥测：超时 / 取消 / NODE_FINISH_MISSING 都保留已观测用量（不只从 activity/end 取数）', async () => {
+  const workspace = freshWorkspace()
+  const usageCalls = () => [{
+    provider: 'dsh',
+    callId: 'call-1',
+    usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 3 },
+  }]
+  const telemetryCapabilities = {
+    finishTool: 'native',
+    hooks: { 'turn.stop': 'native' },
+    usage: 'native',
+  }
+
+  // ① 超时：适配器永远不结算，但 usage 已经观测到。
+  const timeoutAdapter = makeFakeAdapter({
+    capabilities: telemetryCapabilities,
+    usageCalls,
+    run() { return new Promise(() => {}) },
+    onCancel(handle) { handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 }) },
+  })
+  await rejectsCode(executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-timeout', variables: {}, timeoutMs: 30,
+  }, { adapters: registryWith(timeoutAdapter), workspaceRoot: workspace }), 'BPMN_ACTIVITY_TIMEOUT')
+  const timeoutError = await executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-timeout-2', variables: {}, timeoutMs: 30,
+  }, { adapters: registryWith(timeoutAdapter), workspaceRoot: workspace }).catch(error => error)
+  A.ok(Array.isArray(timeoutError.events), '超时错误必须携带已观测事件')
+  const timeoutUsage = timeoutError.events.filter(event => event.type === 'agent/usage')
+  A.equal(timeoutUsage.length, 1)
+  A.equal(timeoutUsage[0].trust, 'known')
+  A.equal(timeoutUsage[0].usage.input, 10)
+  A.equal(timeoutUsage[0].usage.cacheRead, 3)
+  A.ok(timeoutError.events.some(event => event.type === 'agent/invocation'), '启动轮次必须留痕')
+
+  // ② ctx.signal 取消：同样保留 usage。
+  const cancelAdapter = makeFakeAdapter({
+    capabilities: telemetryCapabilities,
+    usageCalls,
+    run() { return new Promise(() => {}) },
+    onCancel(handle) { handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 }) },
+  })
+  const controller = new AbortController()
+  const cancelPromise = executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-cancel', variables: {}, timeoutMs: 1_000, signal: controller.signal,
+  }, { adapters: registryWith(cancelAdapter), workspaceRoot: workspace }).catch(error => error)
+  await new Promise(resolveSleep => setTimeout(resolveSleep, 5))
+  controller.abort()
+  const cancelError = await cancelPromise
+  A.equal(cancelError.code, 'BPMN_ABORTED')
+  A.equal(cancelError.events.filter(event => event.type === 'agent/usage')[0]?.usage?.total, 15)
+
+  // ③ NODE_FINISH_MISSING：提醒耗尽也必须保留 usage。
+  const missingAdapter = makeFakeAdapter({
+    capabilities: telemetryCapabilities,
+    usageCalls,
+    async run(request, handle, resolveExited) {
+      request.reminder.onFire({ count: 1, maxFires: 1 })
+      resolveExited({ ok: false, code: 'NODE_FINISH_MISSING', reminders: 1 })
+    },
+  })
+  const missingError = await executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-missing', variables: {}, timeoutMs: 1_000,
+  }, { adapters: registryWith(missingAdapter), workspaceRoot: workspace }).catch(error => error)
+  A.equal(missingError.code, 'NODE_FINISH_MISSING')
+  A.equal(missingError.events.filter(event => event.type === 'agent/usage').length, 1)
+  A.equal(missingError.events.filter(event => event.type === 'agent/invocation').length, 2,
+    '一次启动 + 一次提醒续跑')
 })
 
 // ---------------------------------------------------------------------------

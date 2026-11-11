@@ -756,11 +756,15 @@ export function createCodexAdapter(options = {}) {
       // 0.13.10：codex 的 exec 通道没有稳定的「轮次中投递」能力，本轮明确不支持；
       // 宿主会把消息记成 failed + deliveryUnknown，不假装成功（CLI 投递下一轮补）。
       messages: 'unsupported',
+      // 0.13.10 运行指标：`turn.completed.usage` 是原始 provider usage（input 含缓存），
+      // 由 agent-telemetry 统一拆桶；每轮一个 callId。
+      usage: 'native',
       evidence: {
         finishTool: CODEX_FINISH_TOOL_EVIDENCE,
         'turn.stop': hooksContinueEvidence(probeValue, hookLevel),
         userConfig: CODEX_USER_CONFIG_EVIDENCE,
         messages: ['codex exec 目前没有可去重的轮次中投递通道：capabilities().messages=unsupported'],
+        usage: ['`codex exec --json` 的 turn.completed.usage（input_tokens 含缓存子集）'],
         sandbox: `exec: -s ${settings.sandbox} + -c approval_policy=${JSON.stringify(settings.approvalPolicy)}；`
           + `resume: -c sandbox_mode=${JSON.stringify(settings.sandbox)}（${CODEX_USER_CONFIG_EVIDENCE}）`,
       },
@@ -889,6 +893,9 @@ export function createCodexAdapter(options = {}) {
         record: undefined,
         lastMessage: undefined,
         usage: undefined,
+        // 0.13.10 运行指标：每轮 `turn.completed` 一条调用记录。
+        usageCalls: [],
+        usageCallSeq: 0,
         exitCode: undefined,
         signal: undefined,
         spawnError: null,
@@ -1163,6 +1170,16 @@ export function createCodexAdapter(options = {}) {
           state.sessionId = event.thread_id
         } else if (event.type === 'turn.completed' && isPlainObject(event.usage)) {
           state.usage = event.usage
+          // 一轮就是一次模型调用；thread_id 稳定时 callId 可复现，否则用进程内序号。
+          state.usageCallSeq += 1
+          state.usageCalls.push({
+            provider: CODEX_ADAPTER_ID,
+            callId: `${state.sessionId || 'codex'}:turn-${state.usageCallSeq}`,
+            usage: { ...event.usage },
+            source: 'turn.completed',
+          })
+          // 事件账本有界：一轮一次调用，200 轮已远超单节点正常轮次。
+          if (state.usageCalls.length > 200) state.usageCalls.splice(0, state.usageCalls.length - 200)
         } else if (event.type === 'item.completed' && isPlainObject(event.item)
           && event.item.type === 'agent_message' && typeof event.item.text === 'string') {
           state.lastMessage = event.item.text.slice(0, 2_000)
@@ -1323,6 +1340,17 @@ export function createCodexAdapter(options = {}) {
       },
       get usage() {
         return state.usage
+      },
+      /**
+       * 本次执行观测到的全部模型轮次 usage（每轮独立 callId）。
+       * agent-execute 在任何结局收尾时读它：超时 / 取消 / 未 finish 已花的 token
+       * 不能因为没走到 activity/end 就丢失。
+       */
+      usageCalls() {
+        return state.usageCalls.map(call => ({
+          ...call,
+          usage: { ...call.usage },
+        }))
       },
       /**
        * 诊断用：每次返回**脱敏后的深拷贝**（本 execution 的 token / socket / runDir

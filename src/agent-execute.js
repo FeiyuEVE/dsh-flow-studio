@@ -35,8 +35,12 @@
 import { resolve as resolvePath } from 'node:path'
 
 import {
-  ADAPTER_ERROR, AdapterError, assertFinishToolNative,
+  ADAPTER_ERROR, AdapterError, adapterUsageCapability, assertFinishToolNative,
 } from './agent-adapter.js'
+import {
+  USAGE_REASON, USAGE_SUPPORT, invocationEvent, readAdapterUsageCalls, unknownUsageEvent,
+  usageEventForCall,
+} from './agent-telemetry.js'
 import { NODE_FINISH_ERROR, createFinishGate } from './node-finish.js'
 import { WORKSPACE_ERROR, resolveNodeCwd } from './workspace-policy.js'
 
@@ -363,11 +367,26 @@ export async function runAgentNode(options = {}) {
     : (nonEmptyString(options.workspace?.workspaceId) ? options.workspace.workspaceId : null)
 
   // 11 §3.1：提醒由适配器内部触发；这里只把每次提醒翻成 handler 事件。
+  // 0.13.10 运行指标：每次**实际启动 / 提醒续跑**都记一条 `agent/invocation`，
+  // 不新增 BPMN attempt（attempt 仍由引擎快照推进）。
+  const invocationId = `${executionId}:invoke-1`
   const events = []
   const reminder = {
     onFire(info) {
       const event = defaultReminderEvent(info)
-      if (event !== null) events.push(event)
+      if (event !== null) {
+        events.push(event)
+        const count = Number.isSafeInteger(info?.count) && info.count >= 1 ? info.count : null
+        events.push(invocationEvent({
+          invocationId: count === null
+            ? `${executionId}:invoke-r${events.length}`
+            : `${executionId}:invoke-r${count}`,
+          provider: adapter.id,
+          phase: 'reminder',
+          attempt,
+          ...(count === null ? {} : { count }),
+        }))
+      }
     },
   }
 
@@ -480,6 +499,7 @@ export async function runAgentNode(options = {}) {
     await Promise.race([Promise.resolve(exited).catch(() => undefined), sleep(cancelGraceMs)])
   }
 
+  let failure = null
   try {
     if (signal && signal.aborted) {
       throw agentHandlerError(AGENT_EXECUTE_ERROR.ABORTED, `活动 ${nodeId} 在开始前已被取消（ctx.signal 已 abort）`, {
@@ -560,6 +580,13 @@ export async function runAgentNode(options = {}) {
         { elementId: nodeId, activityId: executionId, adapter: adapter.id },
       )
     }
+    // 0.13.10 运行指标：句柄可用 = 一次真实 agent 启动。提醒续跑在 onFire 里另记。
+    events.push(invocationEvent({
+      invocationId,
+      provider: adapter.id,
+      phase: 'start',
+      attempt,
+    }))
 
     // 0.13.10 收件箱：句柄可用后立刻登记 live 执行并投递排队消息。
     // 登记 / 投递失败不能把节点判失败（消息是旁路能力），但必须留下警告。
@@ -688,7 +715,31 @@ export async function runAgentNode(options = {}) {
       ...(reminders === undefined ? {} : { reminders }),
       ...(events.length > 0 ? { events } : {}),
     })
+  } catch (error) {
+    failure = error
+    throw error
   } finally {
+    // 0.13.10 运行指标：**任何结局**（成功 / 超时 / 取消 / 未 finish / 抛错）都把
+    // 已观测 usage 与调用身份落到事件账本。不能只在 activity/end 上取数——超时与
+    // 未 finish 的调用根本没有 activity/end。dispose 之前读，避免适配器清空句柄状态。
+    if (handle !== null) {
+      const usageCapability = adapterUsageCapability(adapter)
+      const calls = readAdapterUsageCalls(handle, adapter.id)
+      for (const call of calls) {
+        events.push(usageEventForCall({ ...call, invocationId }))
+      }
+      // 适配器宣称能观测却一条都没有：这是 unknown，不是 0。
+      if (calls.length === 0 && usageCapability === USAGE_SUPPORT.NATIVE) {
+        events.push(unknownUsageEvent({
+          provider: adapter.id,
+          invocationId,
+          reason: USAGE_REASON.UNAVAILABLE,
+        }))
+      }
+    }
+    if (failure !== null && typeof failure === 'object' && events.length > 0) {
+      failure.events = events
+    }
     if (timer !== null) {
       clearTimeout(timer)
       timer = null

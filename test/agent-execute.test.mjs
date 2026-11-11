@@ -1227,6 +1227,12 @@ await check('集成·F9 dispose 永不返回：槽位 / activeAgents 仍保留�
   A.equal(detail.status, 'ACTIVE', '物理清理未确认时实例仍是 ACTIVE')
   A.equal(detail.lastError.code, 'BPMN_ACTIVITY_TIMEOUT')
   A.ok(Date.now() - started < 5000, 'dispose 永不返回也必须让 handler 有界收口')
+  // handler 的 finally 与实例读回不共享同一个 await 链：满量程跑全量套件时（机器被
+  // 别的套件压满），dispose 可能比 readInstance 晚一拍才发起。这里做有界轮询而不是
+  // 赌「同一 tick」，否则用例会被负载抖成假红。
+  for (let waited = 0; waited < 2000 && disposeAttempts === 0; waited += 25) {
+    await new Promise(resolveWait => setTimeout(resolveWait, 25))
+  }
   A.equal(disposeAttempts, 1, 'dispose 必须发起一次')
   A.equal(runtime._activeAgents.get(created.id), 1, 'dispose 未确认前必须保留 activeAgents 占用')
   A.equal(runtime.executionLimits.snapshot().active, 1, 'dispose 未确认前必须保留执行槽位')

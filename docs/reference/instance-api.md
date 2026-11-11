@@ -804,6 +804,13 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 目录 0700、文件 0600；记录写入走临时文件 + fsync + rename，读者不会看到半截 JSON。
 
+### 锁与平台
+
+- 跨进程互斥用 util-linux `flock`：锁由**宿主进程自己的 fd** 持有（helper 进程只是持锁代理，fd 3 是同一打开文件描述的副本），因此 helper 单独死亡不等于失锁；持有期间 helper 退出会让临界区收到 `RESOURCE_LOCK_LOST` 并 **fail-closed 中止**，第二持有者在内核层被挡住。
+- 没有 `flock`（或 fd 形式不生效）的平台——Windows、macOS 无 util-linux、部分沙箱——降级为**进程内队列**：只保证同进程串行，**跨进程互斥不成立**；降级路径同样尊重 `waitMs`，超时返回 `RESOURCE_LOCK_TIMEOUT` 且不进入临界区。
+- 锁文件常驻、不删除：它是 inode 锚点，运行期外部 `unlink` / `rename` 锁文件会让两个进程持有不同 inode 的锁，破坏互斥。锁目录应放在本地盘（NFS / SMB 的 flock 语义不保证），并视为 Host 私有目录。
+- 正文物化文件（`.flow-studio-inbox/…`）与锁文件都**不做在线自动回收**：正文在实例结束后仍可能被 agent 读取，删早了会让已经交付的路径失效；需要回收时按实例目录整体清理（维护动作），不在投递路径里做 TTL 删除。
+
 `messages.jsonl` / `replies.jsonl` 的尾部修复在**锁内、replay / 幂等判断 / seq 分配之前**完成：完整 JSON 只是缺末尾 `\n` 的记录补一个换行正规化（不能当坏尾转存或丢弃，否则已受理记录会在下一次追加时消失）；只有真正不完整的尾行才转存到 `.torn` 并截断主 journal；追加写按 `bytesWritten` 循环补齐短写。
 
 ### 模型工具

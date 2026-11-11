@@ -99,7 +99,7 @@ try {
     eq(instance.definitionId, 'flow-x', '记录 definitionId')
     eq(instance.definitionVersion, 1, '记录 definitionVersion')
     eq(instance.definitionHash, definition.hash, '钉住创建时的 definitionHash')
-    eq(instance.status, 'pending', '新实例 pending')
+    eq(instance.status, 'ACTIVE', '新实例 ACTIVE')
     eq(instance.revision, 1, '新实例 revision=1')
     eq(instance.eventCount, 0, '新实例 eventCount=0')
     eq(instance.lastSeq, 0, '新实例 lastSeq=0')
@@ -138,15 +138,15 @@ try {
     const { instance } = await seed(home)
     const updated = await store.updateInstance(instance.id, {
       expectedVersion: 1,
-      status: 'running',
+      status: 'ACTIVE',
       variables: { b: 2 },
     }, { home })
     eq(updated.revision, 2, '成功更新后 revision +1')
-    eq(updated.status, 'running', 'status 被更新')
+    eq(updated.status, 'ACTIVE', 'status 被更新')
     deep(updated.variables, { a: 1, b: 2 }, 'variables 浅合并')
 
     await rejects(
-      () => store.updateInstance(instance.id, { expectedVersion: 1, status: 'waiting' }, { home }),
+      () => store.updateInstance(instance.id, { expectedVersion: 1, status: 'SUSPENDED' }, { home }),
       error => error.status === 409
         && error.code === 'INSTANCE_VERSION_CONFLICT'
         && error.expectedVersion === 1
@@ -154,7 +154,7 @@ try {
       '旧 expectedVersion 必须 409 INSTANCE_VERSION_CONFLICT',
     )
     const afterConflict = await store.readInstance(instance.id, { home })
-    eq(afterConflict.status, 'running', '冲突时状态不被写')
+    eq(afterConflict.status, 'ACTIVE', '冲突时状态不被写')
     eq(afterConflict.revision, 2, '冲突时 revision 不变')
 
     await rejects(
@@ -163,7 +163,7 @@ try {
       '定义域字段是钉死的，patch 里出现必须 400',
     )
     await rejects(
-      () => store.updateInstance('i-missing', { status: 'running' }, { home }),
+      () => store.updateInstance('i-missing', { status: 'ACTIVE' }, { home }),
       error => error.status === 404 && error.code === 'INSTANCE_NOT_FOUND',
       '不存在的实例 404',
     )
@@ -248,25 +248,25 @@ try {
 
   await check('completeInstance：只能进终态、写 completedAt、同终态幂等、列表可按状态过滤', async ({ home }) => {
     const { instance } = await seed(home)
-    const done = await store.completeInstance(instance.id, 'done', { home })
-    eq(done.status, 'done', '状态变成 done')
+    const done = await store.completeInstance(instance.id, 'COMPLETED', { home })
+    eq(done.status, 'COMPLETED', '状态变成 COMPLETED')
     eq(done.revision, 2, '收口后 revision +1')
     ok(Number.isFinite(Date.parse(done.completedAt)), '终态写 completedAt')
 
-    const idempotent = await store.completeInstance(instance.id, 'done', { home })
+    const idempotent = await store.completeInstance(instance.id, 'COMPLETED', { home })
     eq(idempotent.revision, 2, '重复收口同一终态不涨 revision')
 
     await rejects(
-      () => store.completeInstance(instance.id, 'running', { home }),
+      () => store.completeInstance(instance.id, 'ACTIVE', { home }),
       error => error.status === 400 && error.code === 'INSTANCE_STATUS_INVALID',
       '非终态不能走 completeInstance',
     )
 
     const all = await store.listInstances({ home })
     eq(all.length, 1, 'listInstances 列出实例')
-    eq(all[0].status, 'done', '列表里是终态')
-    eq((await store.listInstances({ home, status: 'done' })).length, 1, '按状态过滤命中')
-    eq((await store.listInstances({ home, status: 'running' })).length, 0, '按状态过滤排除')
+    eq(all[0].status, 'COMPLETED', '列表里是终态')
+    eq((await store.listInstances({ home, status: 'COMPLETED' })).length, 1, '按状态过滤命中')
+    eq((await store.listInstances({ home, status: 'ACTIVE' })).length, 0, '按状态过滤排除')
     eq((await store.listInstances({ home, definitionId: 'flow-x' })).length, 1, '按定义过滤命中')
     eq((await store.listInstances({ home, definitionId: 'flow-other' })).length, 0, '按定义过滤排除')
     await rejects(
@@ -320,7 +320,7 @@ try {
       '坏 JSON 读侧必须 500 INSTANCE_CORRUPT',
     )
     await rejects(
-      () => store.updateInstance(instance.id, { status: 'running' }, { home }),
+      () => store.updateInstance(instance.id, { status: 'ACTIVE' }, { home }),
       error => error.status === 500 && error.code === 'INSTANCE_CORRUPT',
       '坏 instance.json 时更新必须拒绝',
     )
@@ -329,7 +329,7 @@ try {
     const badShape = JSON.stringify({ id: instance.id, definitionId: 'flow-x' })
     writeFileSync(join(dir, 'instance.json'), badShape, { mode: FILE_MODE })
     await rejects(
-      () => store.updateInstance(instance.id, { status: 'running' }, { home }),
+      () => store.updateInstance(instance.id, { status: 'ACTIVE' }, { home }),
       error => error.status === 500 && error.code === 'INSTANCE_CORRUPT',
       '缺字段的 instance.json 必须报 CORRUPT',
     )
@@ -339,7 +339,7 @@ try {
     eq(await store.readInstanceEvents('missing-instance', { home }), null, '不存在实例 readInstanceEvents 返回 null')
     eq(await store.readInstance('../escape', { home }), null, '路径穿越型 id 返回 null')
     await rejects(
-      () => store.updateInstance('../escape', { status: 'running' }, { home }),
+      () => store.updateInstance('../escape', { status: 'ACTIVE' }, { home }),
       error => error.status === 400 && error.code === 'INSTANCE_INVALID_ID',
       '路径穿越型 id 的写操作必须 400',
     )
@@ -347,5 +347,75 @@ try {
 } finally {
   // 每个用例自己清理 home。
 }
+
+
+await check('终态不可逆：COMPLETED / CANCELED 不能被改回、改另一终态或补写（字节不变）', async ({ home }) => {
+  for (const terminal of ['COMPLETED', 'CANCELED']) {
+    const { instance, dir } = await seed(home, `flow-terminal-${terminal.toLowerCase()}`)
+    const first = await store.completeInstance(instance.id, terminal, { home })
+    eq(first.status, terminal)
+    const before = readFileSync(join(dir, 'instance.json'), 'utf8')
+
+    const rejectedPatches = [
+      { status: 'ACTIVE' },
+      { status: 'SUSPENDED' },
+      { status: terminal === 'COMPLETED' ? 'CANCELED' : 'COMPLETED' },
+      { variables: { late: 1 } },
+      { result: { late: true } },
+      { pendingTasks: [{ activityId: 'task-a' }] },
+      { lastError: { code: 'LATE_ERROR', message: '晚到' } },
+    ]
+    for (const patch of rejectedPatches) {
+      await rejects(
+        () => store.updateInstance(instance.id, patch, { home }),
+        error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+        `${terminal} 之后 ${JSON.stringify(patch)} 必须 409 INSTANCE_TERMINAL_IMMUTABLE`,
+      )
+      eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, '被拒绝的晚到写入不得改文件字节')
+    }
+
+    // 另一终态：completeInstance 也要拒绝。
+    await rejects(
+      () => store.completeInstance(instance.id, terminal === 'COMPLETED' ? 'CANCELED' : 'COMPLETED', { home }),
+      error => error.status === 409 && error.code === 'INSTANCE_TERMINAL_IMMUTABLE',
+      '终态之间不能互相改写',
+    )
+    eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, '跨终态失败也不改文件')
+
+    // 同终态重复提交幂等：revision 不涨、文件字节不变。
+    const again = await store.completeInstance(instance.id, terminal, { home })
+    eq(again.revision, first.revision, '同终态重复提交不涨 revision')
+    eq(readFileSync(join(dir, 'instance.json'), 'utf8'), before, '同终态重复提交不改文件字节')
+  }
+})
+
+await check('lastError：ACTIVE 时可写可读；最终 variables/result 与终态一次提交', async ({ home }) => {
+  const { instance } = await seed(home, 'flow-lasterror')
+  const withError = await store.updateInstance(instance.id, {
+    lastError: { code: 'BPMN_FLOW_TAKE_LIMIT', message: '连线超限', nodeId: 'r01', activityId: 'exec-1' },
+  }, { home })
+  eq(withError.status, 'ACTIVE', '出错不改 status')
+  eq(withError.lastError.code, 'BPMN_FLOW_TAKE_LIMIT')
+  eq(withError.lastError.nodeId, 'r01')
+  eq(withError.lastError.activityId, 'exec-1')
+
+  const done = await store.completeInstance(instance.id, 'COMPLETED', {
+    home,
+    variables: { verdict: 'pass' },
+    result: { summary: 'ok' },
+  })
+  eq(done.revision, withError.revision + 1, '终态与最终结果一次提交（只涨一次 revision）')
+  deep(done.variables, { a: 1, verdict: 'pass' })
+  deep(done.result, { summary: 'ok' })
+  eq(done.lastError.code, 'BPMN_FLOW_TAKE_LIMIT', '历史 lastError 保留（它是发生过的事实）')
+
+  // 非终态不能走 completeInstance。
+  const another = await seed(home, 'flow-nonterminal')
+  await rejects(
+    () => store.completeInstance(another.instance.id, 'SUSPENDED', { home }),
+    error => error.status === 400 && error.code === 'INSTANCE_STATUS_INVALID',
+    'completeInstance 只接受 COMPLETED / CANCELED',
+  )
+})
 
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

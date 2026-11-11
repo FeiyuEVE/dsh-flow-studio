@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
@@ -325,14 +325,14 @@ try {
     await seed(route)
 
     const instance = await startInstance(route)
-    eq(instance.status, 'waiting')
+    eq(instance.status, 'ACTIVE')
     eq(instance.pendingTasks.length, 1, '必须停在人工任务上')
     eq(instance.pendingTasks[0].activityId, 'human1')
     ok(instance.lastSeq > 0, '事件必须已经落盘')
     eq(calls.length, 1, 'serviceTask 必须调用一次外部 executor 桩')
 
     const raw = readInstanceJson(home, instance.id)
-    eq(raw.status, 'waiting')
+    eq(raw.status, 'ACTIVE')
     eq(raw.pendingTasks.length, 1, 'instance.json 必须真的带 pendingTasks')
     eq(raw.pendingTasks[0].activityId, 'human1')
     eq(raw.pendingTasks[0].executionId, instance.pendingTasks[0].executionId)
@@ -352,7 +352,7 @@ try {
     eq(tasks.json.tasks.length, 1)
     eq(tasks.json.tasks[0].activityId, 'human1')
 
-    const list = await call(route, 'GET', `${API}/instances?definitionId=flow-demo&status=waiting`)
+    const list = await call(route, 'GET', `${API}/instances?definitionId=flow-demo&status=ACTIVE`)
     eq(list.status, 200)
     eq(list.json.instances.length, 1)
     eq(list.json.instances[0].active, true, '内存里有 runner 时 active=true')
@@ -388,12 +388,12 @@ try {
       decidedBy: 'tester',
     })
     eq(done.status, 200, JSON.stringify(done.json))
-    eq(done.json.status, 'done')
+    eq(done.json.status, 'COMPLETED')
     deep(done.json.pendingTasks, [], '完成后没有待办')
     eq(done.json.decidedBy, 'tester')
 
     const raw = readInstanceJson(home, instance.id)
-    eq(raw.status, 'done')
+    eq(raw.status, 'COMPLETED')
     deep(raw.pendingTasks, [], '完成后的 instance.json 不能留下待办')
     eq(raw.variables.approved, true, 'payload 必须写回变量')
     eq(raw.variables.decidedBy, 'tester', 'decidedBy 进变量留审计')
@@ -427,7 +427,7 @@ try {
     ok(typeof conflicts[0].json.error === 'string' && conflicts[0].json.error !== '', '409 必须可读')
 
     const raw = readInstanceJson(home, instance.id)
-    eq(raw.status, 'done')
+    eq(raw.status, 'COMPLETED')
     deep(raw.pendingTasks, [], '并发不能让 pendingTasks 残留 / 半写')
     const detail = await call(route, 'GET', `${API}/instances/${instance.id}`)
     deep(detail.json.pendingTasks, [])
@@ -448,7 +448,7 @@ try {
 
     const stopped = await call(route, 'POST', `${API}/instances/${instance.id}/stop`)
     eq(stopped.status, 200, JSON.stringify(stopped.json))
-    eq(stopped.json.status, 'aborted')
+    eq(stopped.json.status, 'CANCELED')
     eq(stopped.json.alreadyTerminal, false)
 
     const after = await call(route, 'GET', `${API}/instances/${instance.id}/events`)
@@ -457,20 +457,20 @@ try {
     eq(countType(after.json.events, 'process/end'), 0, 'aborted 不是 done，不能有 process/end')
 
     const detail = await call(route, 'GET', `${API}/instances/${instance.id}`)
-    eq(detail.json.status, 'aborted')
+    eq(detail.json.status, 'CANCELED')
     eq(detail.json.recovered, false)
     eq(detail.json.recovery.code, null, '终态实例不需要恢复，原因只说终态')
-    ok(detail.json.recovery.reason.includes('aborted'))
+    ok(detail.json.recovery.reason.includes('CANCELED'))
 
     const raw = readInstanceJson(home, instance.id)
-    eq(raw.status, 'aborted')
+    eq(raw.status, 'CANCELED')
     deep(raw.pendingTasks, [], '中止后待办必须清空')
     ok(typeof raw.completedAt === 'string' && raw.completedAt !== '', '终态要写 completedAt')
 
     const again = await call(route, 'POST', `${API}/instances/${instance.id}/stop`)
     eq(again.status, 200)
     eq(again.json.alreadyTerminal, true)
-    eq(again.json.status, 'aborted')
+    eq(again.json.status, 'CANCELED')
   })
 
   // -------------------------------------------------------------------------
@@ -500,7 +500,7 @@ try {
     const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId], url })
     eq(detail.status, 200, JSON.stringify(detail.body))
     eq(detail.body.recovered, true, '新 runtime 必须从 state 恢复')
-    eq(detail.body.status, 'waiting')
+    eq(detail.body.status, 'ACTIVE')
     eq(detail.body.runnerStatus, 'waiting')
     eq(detail.body.pendingTasks.length, 1)
     eq(detail.body.pendingTasks[0].executionId, executionId, '恢复后 executionId 必须一致')
@@ -516,7 +516,7 @@ try {
       body: { payload: { approved: true }, decidedBy: 'recover-test' },
     })
     eq(done.status, 200, JSON.stringify(done.body))
-    eq(done.body.status, 'done')
+    eq(done.body.status, 'COMPLETED')
     eq(done.body.recovered, false, 'GET 已把 runner 恢复进内存，complete 命中同一 runner')
 
     const events = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId, 'events'], url })
@@ -529,7 +529,7 @@ try {
     deep(seqs, [...seqs].sort((a, b) => a - b), '恢复后 seq 仍严格递增')
 
     const raw = readInstanceJson(home, instanceId)
-    eq(raw.status, 'done')
+    eq(raw.status, 'COMPLETED')
     deep(raw.pendingTasks, [])
     await runtimeB.dispose()
   })
@@ -581,9 +581,9 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  // 8b. 通过实例验证 dsh adapter：实例 failed，result.error.code 保留真实原因
+  // 8b. 通过实例验证 dsh adapter：实例 status 仍 ACTIVE，lastError 保留真实原因
   // -------------------------------------------------------------------------
-  await check('实例里的 dsh adapter：failed + result.error.code = BPMN_AGENT_ADAPTER_UNAVAILABLE', async home => {
+  await check('实例里的 dsh adapter：ACTIVE + lastError.code = BPMN_AGENT_ADAPTER_UNAVAILABLE', async home => {
     const calls = []
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor(calls) })) }
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -602,14 +602,17 @@ try {
     eq(saved.status, 201, JSON.stringify(saved.json))
     const created = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-dsh' })
     eq(created.status, 201, JSON.stringify(created.json))
-    eq(created.json.status, 'failed', 'dsh adapter 必须让实例明确失败')
+    eq(created.json.status, 'ACTIVE', '出错不改 status：实例继续 ACTIVE')
     eq(calls.length, 0, '不得偷偷跑外部 executor')
 
     const detail = await call(route, 'GET', `${API}/instances/${created.json.id}`)
     eq(detail.status, 200)
-    eq(detail.json.status, 'failed')
-    eq(detail.json.result.error.code, 'BPMN_AGENT_ADAPTER_UNAVAILABLE', '实例 result 必须保留 handler 的真实错误码')
-    ok(detail.json.result.error.message.includes('0.13.1'), '文案说明 dsh adapter 在 0.13.1 提供')
+    eq(detail.json.status, 'ACTIVE', '出错后 status 仍是 ACTIVE（不判死）')
+    eq(detail.json.lastError.code, 'BPMN_AGENT_ADAPTER_UNAVAILABLE', 'lastError 必须保留 handler 的真实错误码')
+    ok(detail.json.lastError.message.includes('0.13.1'), '文案说明 dsh adapter 在 0.13.1 提供')
+    const events = await call(route, 'GET', `${API}/instances/${created.json.id}/events`)
+    ok(events.json.events.some(event => event.type === 'error'), 'error 事件必须留痕')
+    ok(!events.json.events.some(event => event.type === 'process/end'), '出错不发 process/end')
   })
 
   // -------------------------------------------------------------------------
@@ -626,7 +629,7 @@ try {
     const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: hugeExecutor })) }
     await seed(route)
     const instance = await startInstance(route)
-    eq(instance.status, 'waiting', '大输出不能把实例打挂')
+    eq(instance.status, 'ACTIVE', '大输出不能把实例打挂')
 
     const events = await call(route, 'GET', `${API}/instances/${instance.id}/events`)
     const agentEnd = events.json.events.find(event => event.type === 'activity/end' && event.elementId === 'agent1')
@@ -636,7 +639,233 @@ try {
 
     const done = await call(route, 'POST', `${API}/instances/${instance.id}/tasks/human1/complete`, { payload: { approved: true } })
     eq(done.status, 200, JSON.stringify(done.json))
-    eq(done.json.status, 'done')
+    eq(done.json.status, 'COMPLETED')
+  })
+
+
+  // -------------------------------------------------------------------------
+  // 10. A1 · 恢复失败映射：409 + 实例仍 ACTIVE + lastError（handler 调用数不变）
+  // -------------------------------------------------------------------------
+  await check('恢复失败：裸快照 / 结构篡改 → 409 + ACTIVE + lastError，不派发 handler', async home => {
+    const calls = []
+    const dir = store.flowsDir(home)
+    const env = {}
+    const url = new URL('http://localhost/')
+    const runtimeA = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-demo', name: '演示流程', xml: workflowXml() } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-demo', variables: { amount: 7 } } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    const instanceId = res.body.id
+    const callsAfterStart = calls.length
+    ok(callsAfterStart >= 1, '首次启动确实跑过一次 executor')
+    await runtimeA.dispose()
+
+    const statePath = join(home, 'flow-studio', 'instances', instanceId, 'state.json')
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'))
+    const envelope = saved.state
+    eq(envelope.v, 2, '落盘信封是 v2')
+    for (const field of ['definitionId', 'definitionHash', 'version', 'processId', 'instanceId', 'kind']) {
+      ok(envelope[field] !== undefined, `state 信封必须带 ${field}`)
+    }
+
+    const newRuntime = () => createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    const writeState = (state) => writeFileSync(statePath, `${JSON.stringify({ savedAt: new Date().toISOString(), state }, null, 2)}\n`)
+
+    // (a) 裸 bpmn-engine 快照（里面塞一个 parallelGateway）：版本不支持。
+    const bare = JSON.parse(JSON.stringify(envelope.engine))
+    const bareSource = JSON.parse(bare.definitions[0].source)
+    bareSource.activities.push({
+      id: 'pg',
+      type: 'bpmn:ParallelGateway',
+      parent: { id: bareSource.processes[0].id, type: 'bpmn:Process' },
+      behaviour: { $type: 'bpmn:ParallelGateway', id: 'pg' },
+    })
+    bare.definitions[0].source = JSON.stringify(bareSource)
+    writeState(bare)
+    {
+      const runtime = newRuntime()
+      const detail = await runtime.handle({ method: 'GET', parts: ['instances', instanceId], url })
+      eq(detail.status, 200)
+      eq(detail.body.status, 'ACTIVE', '恢复失败不改 status')
+      eq(detail.body.recovery.code, 'BPMN_STATE_VERSION_UNSUPPORTED', '裸快照必须报版本不支持')
+      eq(detail.body.lastError.code, 'BPMN_STATE_VERSION_UNSUPPORTED', '恢复失败写 lastError')
+      const complete = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+      })
+      eq(complete.status, 409, '恢复失败的写操作返回 409')
+      eq(complete.body.recoveryCode, 'BPMN_STATE_VERSION_UNSUPPORTED')
+      eq(calls.length, callsAfterStart, '恢复失败不得派发 handler')
+      await runtime.dispose()
+    }
+
+    // (b) 合法 v2 身份 + 篡改条件：身份对得上，结构对不上。
+    {
+      const tampered = JSON.parse(JSON.stringify(envelope))
+      const source = JSON.parse(tampered.engine.definitions[0].source)
+      source.sequenceFlows.find(flow => flow.id === 'f2').behaviour.conditionExpression = {
+        $type: 'bpmn:FormalExpression',
+        language: 'feel',
+        body: '= true',
+      }
+      tampered.engine.definitions[0].source = JSON.stringify(source)
+      writeState(tampered)
+      const runtime = newRuntime()
+      const detail = await runtime.handle({ method: 'GET', parts: ['instances', instanceId], url })
+      eq(detail.body.status, 'ACTIVE')
+      eq(detail.body.recovery.code, 'BPMN_STATE_DEFINITION_MISMATCH', '篡改条件必须报定义不匹配')
+      eq(detail.body.lastError.code, 'BPMN_STATE_DEFINITION_MISMATCH')
+      const complete = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+      })
+      eq(complete.status, 409)
+      eq(complete.body.recoveryCode, 'BPMN_STATE_DEFINITION_MISMATCH')
+      eq(calls.length, callsAfterStart, '结构不匹配不得派发 handler')
+      await runtime.dispose()
+    }
+
+    // 恢复合法状态仍然正常（不要为了封闭入口把正常恢复一起打死）。
+    writeState(envelope)
+    {
+      const runtime = newRuntime()
+      const detail = await runtime.handle({ method: 'GET', parts: ['instances', instanceId], url })
+      eq(detail.body.recovered, true, '合法 state 必须能恢复')
+      eq(detail.body.status, 'ACTIVE')
+      await runtime.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 11. A1 · 正常 sequenceFlow 条件仍按变量走对分支
+  // -------------------------------------------------------------------------
+  await check('正常 sequenceFlow 条件：true / false 走不同分支（ACTIVE → COMPLETED）', async home => {
+    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="defs-cond" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-cond" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="human1"/>
+    <bpmn:exclusiveGateway id="gw" default="f_no"/>
+    <bpmn:endEvent id="end_yes"/>
+    <bpmn:endEvent id="end_no"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="human1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="human1" targetRef="gw"/>
+    <bpmn:sequenceFlow id="f_yes" sourceRef="gw" targetRef="end_yes">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" language="feel">= approved = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_no" sourceRef="gw" targetRef="end_no"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const saved = await call(route, 'POST', `${API}/definitions`, { id: 'flow-cond', name: '条件', xml })
+    eq(saved.status, 201, JSON.stringify(saved.json))
+
+    const instance = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-cond' })
+    eq(instance.status, 201, JSON.stringify(instance.json))
+    eq(instance.json.status, 'ACTIVE')
+    const doneYes = await call(route, 'POST', `${API}/instances/${instance.json.id}/tasks/human1/complete`, { payload: { approved: true } })
+    eq(doneYes.status, 200, JSON.stringify(doneYes.json))
+    eq(doneYes.json.status, 'COMPLETED')
+    const eventsYes = await call(route, 'GET', `${API}/instances/${instance.json.id}/events`)
+    const flowsYes = eventTypes(eventsYes.json.events).length > 0
+      ? eventsYes.json.events.filter(event => event.type === 'flow/taken').map(event => event.flowId)
+      : []
+    ok(flowsYes.includes('f_yes'), 'approved=true 必须走 f_yes')
+    ok(!flowsYes.includes('f_no'), 'approved=true 不能走默认边')
+
+    const instance2 = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-cond' })
+    const doneNo = await call(route, 'POST', `${API}/instances/${instance2.json.id}/tasks/human1/complete`, { payload: { approved: false } })
+    eq(doneNo.status, 200, JSON.stringify(doneNo.json))
+    eq(doneNo.json.status, 'COMPLETED')
+    const eventsNo = await call(route, 'GET', `${API}/instances/${instance2.json.id}/events`)
+    const flowsNo = eventsNo.json.events.filter(event => event.type === 'flow/taken').map(event => event.flowId)
+    ok(flowsNo.includes('f_no'), 'approved=false 必须走默认边 f_no')
+    ok(!flowsNo.includes('f_yes'), 'approved=false 不能走 f_yes')
+  })
+
+  // -------------------------------------------------------------------------
+  // 12. A2 · 慢 handler 在飞时并发 stop：stop 不被 complete 挡住，先 abort
+  // -------------------------------------------------------------------------
+  await check('慢 complete 在飞时 stop：立即 CANCELED、先 abort，晚到结果不回写', async home => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-slow" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-slow" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="agent1">
+      <bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo a"/></fs:node></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="human1"/>
+    <bpmn:serviceTask id="agent2">
+      <bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo b"/></fs:node></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="human1"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="human1" targetRef="agent2"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="agent2" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    let releaseSlow = null
+    let slowAborted = false
+    let slowStarted = false
+    const slowExecutor = async (options) => {
+      if (String(options.prompt).includes('agent2')) {
+        slowStarted = true
+        options.signal?.addEventListener('abort', () => { slowAborted = true }, { once: true })
+        await new Promise((resolve) => { releaseSlow = resolve })
+        return { ok: true, text: 'late', structured: { late: true }, usage: {}, exitCode: 0, events: [] }
+      }
+      return { ok: true, text: 'fast', structured: {}, usage: {}, exitCode: 0, events: [] }
+    }
+    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: slowExecutor })) }
+    const saved = await call(route, 'POST', `${API}/definitions`, { id: 'flow-slow', name: '慢节点', xml })
+    eq(saved.status, 201, JSON.stringify(saved.json))
+    const created = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-slow' })
+    eq(created.status, 201, JSON.stringify(created.json))
+    const id = created.json.id
+    eq(created.json.status, 'ACTIVE')
+
+    // complete 在飞：它会停在 agent2 的慢 executor 上并持有实例锁。
+    const completePromise = call(route, 'POST', `${API}/instances/${id}/tasks/human1/complete`, { payload: { approved: true } })
+    for (let index = 0; index < 200 && !slowStarted; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    ok(slowStarted, 'agent2 的慢 executor 必须已经在飞')
+
+    // stop 不能排在慢 complete 的锁后面。
+    const stopped = await Promise.race([
+      call(route, 'POST', `${API}/instances/${id}/stop`),
+      new Promise((resolve) => setTimeout(() => resolve({ status: 0, json: null, timedOut: true }), 3000)),
+    ])
+    eq(stopped.timedOut, undefined, 'stop 不能被慢 complete 挡住（3s 内返回）')
+    eq(stopped.status, 200, JSON.stringify(stopped.json))
+    eq(stopped.json.status, 'CANCELED')
+    eq(slowAborted, true, 'stop 先发 abort 信号（在 handler 释放之前）')
+
+    const lastSeqAtStop = stopped.json.lastSeq
+    releaseSlow()
+    const completed = await completePromise
+    ok([200, 409].includes(completed.status), `在飞的 complete 只允许成功返回或 409，实际 ${completed.status}`)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const raw = readInstanceJson(home, id)
+    eq(raw.status, 'CANCELED', '终态不可逆：晚到的 complete 不能把实例改回 ACTIVE')
+    eq(raw.lastError, null, 'stop 不是错误：不应写 lastError')
+    eq(raw.variables.approved, undefined, '晚到 agent2 的输出不得写回 variables')
+    const events = await call(route, 'GET', `${API}/instances/${id}/events`)
+    eq(events.json.lastSeq, lastSeqAtStop, 'stop 之后不得再追加事件')
+  })
+
+  // -------------------------------------------------------------------------
+  // 13. 防回潮：新域代码不把 failed / blocked 当实例状态字面量
+  // -------------------------------------------------------------------------
+  await check('防回潮：instance-store / bpmn-runtime 不出现 failed/blocked 实例状态字面量', async () => {
+    const inst = await import('../src/instance-store.js')
+    deep(inst.INSTANCE_STATUSES, ['ACTIVE', 'COMPLETED', 'SUSPENDED', 'CANCELED'], '实例状态集合对齐 Camunda 8')
+    for (const file of ['instance-store.js', 'bpmn-runtime.js']) {
+      const source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8')
+      ok(!source.includes("'failed'"), `${file} 不得再把 'failed' 当实例状态字面量`)
+      ok(!source.includes("'blocked'"), `${file} 不得再把 'blocked' 当实例状态字面量`)
+    }
   })
 
   console.log('bpmn-runtime.test.mjs')

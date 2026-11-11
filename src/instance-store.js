@@ -54,13 +54,21 @@ const LOCK_WAIT_MS = 15 * 1000
 const HASH_PATTERN = /^[0-9a-f]{64}$/
 const ATTEMPT_FILE = /^(\d+)\.jsonl$/
 
-/** 实例状态集合。`blocked` = 卡住（可重试，不是终态）；终态只有 done / aborted。 */
-export const INSTANCE_STATUSES = Object.freeze(['pending', 'running', 'waiting', 'blocked', 'done', 'aborted'])
+/**
+ * 实例状态集合（对齐 Camunda 8 口径）。
+ *
+ * - `ACTIVE`：活着——正在跑、停在人工任务、或出错后停住，**都是 ACTIVE**；
+ * - `COMPLETED` / `CANCELED`：仅有的两个终态（正常结束 / 被 stop 取消）；
+ * - `SUSPENDED`：保留取值（暂无 suspend 操作）。
+ *
+ * 没有 failed / blocked：引擎出错时 status 保持 ACTIVE，把事实写进 `lastError`。
+ */
+export const INSTANCE_STATUSES = Object.freeze(['ACTIVE', 'COMPLETED', 'SUSPENDED', 'CANCELED'])
 const STATUS_SET = new Set(INSTANCE_STATUSES)
-const TERMINAL_STATUSES = Object.freeze(['done', 'aborted'])
+const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'CANCELED'])
 const TERMINAL_SET = new Set(TERMINAL_STATUSES)
 /** updateInstance 的字段白名单；定义域字段是钉死的，改它们一律 400。 */
-const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'blockedReason'])
+const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError'])
 /** 人工待办上限：BPMN 0.13.0 一次只会停在少量 userTask 上，100 是异常闸门。 */
 const MAX_PENDING_TASKS = 100
 
@@ -303,25 +311,26 @@ function normalizeVariables(raw) {
 }
 
 /**
- * 阻塞原因（`status==='blocked'` 时的事实留痕）：`{ code, message, nodeId?, activityId?, reminders? }`。
+ * 最近一次执行错误（`lastError`）：`{ code, message, nodeId?, activityId?, retries? }`。
  *
- * 只保留稳定字段；`code` 必填（错误码是消费方分流依据），`message` 缺省成空串。
+ * 引擎出错**不改实例 status**（仍是 ACTIVE），这里是把「发生过什么」留成可读事实；
+ * 下一次成功推进不会自动清掉它（它是历史），需要时由调用方显式覆盖。
  * @param {unknown} raw
- * @returns {null | { code: string, message: string, nodeId?: string, activityId?: string, reminders?: number }}
+ * @returns {null | { code: string, message: string, nodeId?: string, activityId?: string, retries?: number }}
  */
-function normalizeBlockedReason(raw) {
+function normalizeLastError(raw) {
   if (raw === undefined || raw === null) return null
   if (!isPlainObject(raw)) {
-    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'blockedReason 必须是 JSON 对象或 null', { field: 'blockedReason' })
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'lastError 必须是 JSON 对象或 null', { field: 'lastError' })
   }
   const code = typeof raw.code === 'string' && raw.code.trim() !== '' ? raw.code.trim() : null
   if (!code) {
-    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'blockedReason.code 必须是非空字符串', { field: 'blockedReason.code' })
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'lastError.code 必须是非空字符串', { field: 'lastError.code' })
   }
   const out = { code, message: typeof raw.message === 'string' ? raw.message : '' }
   if (typeof raw.nodeId === 'string' && raw.nodeId !== '') out.nodeId = raw.nodeId
   if (typeof raw.activityId === 'string' && raw.activityId !== '') out.activityId = raw.activityId
-  if (Number.isSafeInteger(raw.reminders) && raw.reminders >= 0) out.reminders = raw.reminders
+  if (Number.isSafeInteger(raw.retries) && raw.retries >= 0) out.retries = raw.retries
   return out
 }
 
@@ -409,12 +418,12 @@ function normalizeInstance(raw, id) {
   if (raw.result !== null && raw.result !== undefined && !isPlainObject(raw.result)) {
     throw new InstanceError(500, 'INSTANCE_CORRUPT', 'instance.json 的 result 必须是 JSON 对象或 null')
   }
-  let blockedReason = null
-  if (raw.blockedReason !== null && raw.blockedReason !== undefined) {
+  let lastError = null
+  if (raw.lastError !== null && raw.lastError !== undefined) {
     try {
-      blockedReason = normalizeBlockedReason(raw.blockedReason)
+      lastError = normalizeLastError(raw.lastError)
     } catch (error) {
-      throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 blockedReason 形状非法：${error?.reason ?? error?.message ?? error}`)
+      throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 lastError 形状非法：${error?.reason ?? error?.message ?? error}`)
     }
   }
   if (!Number.isSafeInteger(raw.revision) || raw.revision < 1) {
@@ -437,7 +446,7 @@ function normalizeInstance(raw, id) {
     status: raw.status,
     variables: { ...raw.variables },
     result: raw.result === undefined || raw.result === null ? null : { ...raw.result },
-    blockedReason,
+    lastError,
     pendingTasks: normalizePendingTasks(raw.pendingTasks),
     revision: raw.revision,
     eventCount: raw.eventCount,
@@ -510,8 +519,8 @@ function normalizePatch(patch) {
   if (patch.pendingTasks !== undefined) {
     source.pendingTasks = normalizePendingTasks(patch.pendingTasks)
   }
-  if (patch.blockedReason !== undefined) {
-    source.blockedReason = normalizeBlockedReason(patch.blockedReason)
+  if (patch.lastError !== undefined) {
+    source.lastError = normalizeLastError(patch.lastError)
   }
   return source
 }
@@ -524,7 +533,7 @@ function normalizePatch(patch) {
  *
  * @param {{definitionId: string, definitionVersion?: number, definitionHash?: string,
  *   variables?: object, home?: string, definitionsRoot?: string, instancesRoot?: string}} input
- * @returns {Promise<object>} 实例元数据（含 id / revision=1 / status='pending'）
+ * @returns {Promise<object>} 实例元数据（含 id / revision=1 / status='ACTIVE'）
  */
 export async function createInstance(input = {}) {
   if (!isPlainObject(input)) {
@@ -596,10 +605,10 @@ export async function createInstance(input = {}) {
         definitionId,
         definitionVersion: definition.version,
         definitionHash: definition.hash,
-        status: 'pending',
+        status: 'ACTIVE',
         variables,
         result: null,
-        blockedReason: null,
+        lastError: null,
         pendingTasks: [],
         revision: 1,
         eventCount: 0,
@@ -725,16 +734,16 @@ export async function updateInstance(id, patch = {}, options = {}) {
     }
     const hasChange = source.status !== undefined || source.variables !== undefined
       || source.result !== undefined || source.pendingTasks !== undefined
-      || source.blockedReason !== undefined
+      || source.lastError !== undefined
     if (!hasChange) return current
 
     // 终态不可逆（同一把写锁内判定）：晚到的 variables / result / 待办 / 产物 /
-    // 状态切换一律拒绝，且**一个字节都不写**。blocked 不是终态，可以被重试或 stop 改掉。
+    // 状态切换一律拒绝，且**一个字节都不写**。
     if (TERMINAL_SET.has(current.status)) {
       throw new InstanceError(
         409,
         'INSTANCE_TERMINAL_IMMUTABLE',
-        `实例 ${loc.id} 已是终态 ${current.status}，拒绝任何后续写入（status/variables/result/pendingTasks/blockedReason）；终态不可逆`,
+        `实例 ${loc.id} 已是终态 ${current.status}，拒绝任何后续写入（status/variables/result/pendingTasks/lastError）；终态不可逆`,
         { field: 'status', actualStatus: current.status },
       )
     }
@@ -759,22 +768,7 @@ export async function updateInstance(id, patch = {}, options = {}) {
     }
     if (source.result !== undefined) next.result = source.result
     if (source.pendingTasks !== undefined) next.pendingTasks = source.pendingTasks
-    if (source.blockedReason !== undefined) next.blockedReason = source.blockedReason
-    // 离开 blocked（例如后续 retry 写回 running）时自动清掉旧原因；同一次提交显式给的
-    // blockedReason 优先。
-    if (source.status !== undefined && source.status !== 'blocked'
-      && source.blockedReason === undefined && current.blockedReason !== null) {
-      next.blockedReason = null
-    }
-    // blocked 必须带原因：这是「卡在哪」的唯一可读事实，不允许只写状态。
-    if (next.status === 'blocked' && next.blockedReason === null) {
-      throw new InstanceError(
-        400,
-        'INSTANCE_BLOCKED_REASON_REQUIRED',
-        'status=blocked 必须同时提供 blockedReason{code,message}',
-        { field: 'blockedReason' },
-      )
-    }
+    if (source.lastError !== undefined) next.lastError = source.lastError
     const normalized = normalizeInstance(next, loc.id)
     await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), normalized)
     return normalized
@@ -1064,14 +1058,14 @@ export async function readInstanceState(id, options = {}) {
 }
 
 /**
- * 把实例收口成终态（**只有 done / aborted**；blocked 不是终态，用 updateInstance）。
+ * 把实例收口成终态（**只有 COMPLETED / CANCELED**）。
  *
  * 同一终态重复提交幂等：不写盘、不涨 revision、不接受晚到的 result/variables；
  * 一个终态改成另一个终态 → 409 `INSTANCE_TERMINAL_IMMUTABLE`。
  * `options.variables` / `options.result` 会与终态**一次提交**。
  *
  * @param {string} id
- * @param {'done'|'aborted'} status
+ * @param {'COMPLETED'|'CANCELED'} status
  * @param {{ home?: string, instancesRoot?: string, variables?: object, result?: object|null }} [options]
  */
 export async function completeInstance(id, status, options = {}) {
@@ -1080,7 +1074,7 @@ export async function completeInstance(id, status, options = {}) {
     throw new InstanceError(
       400,
       'INSTANCE_STATUS_INVALID',
-      `终态只能是 ${TERMINAL_STATUSES.join(' / ')}；blocked（卡住）用 updateInstance 写`,
+      `终态只能是 ${TERMINAL_STATUSES.join(' / ')}`,
       { field: 'status' },
     )
   }
@@ -1104,7 +1098,6 @@ export async function completeInstance(id, status, options = {}) {
       status,
       completedAt: current.completedAt || now,
       pendingTasks: [],
-      blockedReason: null,
       revision: current.revision + 1,
       updatedAt: now,
     }

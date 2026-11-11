@@ -171,7 +171,11 @@ function violation(code, message, extra = {}) {
 function eventDefinitionViolations(element, elementId) {
   const definitions = Array.isArray(element?.eventDefinitions) ? element.eventDefinitions : []
   if (definitions.length === 0) return []
-  const hasConditional = definitions.some(item => item?.$type === 'bpmn:ConditionalEventDefinition')
+  // 原始 moddle 用 `$type`；序列化后的执行上下文用 `type`。
+  const hasConditional = definitions.some((item) => {
+    const type = typeof item?.$type === 'string' ? item.$type : item?.type
+    return type === 'bpmn:ConditionalEventDefinition'
+  })
   if (hasConditional) {
     return [violation(
       'BPMN_CONDITIONAL_EVENT_FORBIDDEN',
@@ -181,7 +185,7 @@ function eventDefinitionViolations(element, elementId) {
   }
   return [violation(
     'BPMN_EXECUTION_UNSUPPORTED',
-    `0.13 禁止事件定义：${elementId ?? '?'} 带了 ${definitions.map(item => item?.$type ?? '?').join('、')}；所有事件定义（timer/message/signal/error/…）都不在执行白名单内。`,
+    `0.13 禁止事件定义：${elementId ?? '?'} 带了 ${definitions.map(item => (typeof item?.$type === 'string' ? item.$type : item?.type) ?? '?').join('、')}；所有事件定义（timer/message/signal/error/…）都不在执行白名单内。`,
     { elementId }
   )]
 }
@@ -190,7 +194,7 @@ function eventDefinitionViolations(element, elementId) {
 function loopViolations(element, elementId) {
   const loop = element?.loopCharacteristics
   if (!loop) return []
-  const type = typeof loop?.$type === 'string' ? loop.$type : ''
+  const type = typeof loop?.$type === 'string' ? loop.$type : (typeof loop?.type === 'string' ? loop.type : '')
   if (type === 'bpmn:StandardLoopCharacteristics') {
     return [violation(
       'BPMN_STANDARD_LOOP_FORBIDDEN',

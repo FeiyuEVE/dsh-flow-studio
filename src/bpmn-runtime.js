@@ -20,8 +20,8 @@
  *   - `process/start` / `activity/start` → 事件落盘 + 实例 running；
  *   - `activity/wait` → 事件落盘 + 实例 waiting + `pendingTasks` 落 instance.json；
  *   - `activity/end` → 事件落盘 + 刷新 `pendingTasks`；
- *   - `process/end` → 事件落盘 + `completeInstance('done')`；
- *   - `error` → 事件落盘 + 实例 `blocked`（带 blockedReason；不是 failed）；
+ *   - `process/end` → 事件落盘 + `completeInstance('COMPLETED')`；
+ *   - `error` → 事件落盘 + 实例 `lastError`（status 保持 ACTIVE，不判死）；
  *   - 条件求值失败 / handler 失败都走 runner 的 `error`，这里不额外编故事。
  *
  * 事件写入不吞错：runner 的 `_safeCall` 会吞掉 onEvent 抛错，所以本模块把每次
@@ -65,7 +65,7 @@ import {
   writeInstanceState,
 } from './instance-store.js'
 import { parseBpmn } from './bpmn-parse.js'
-import { BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
+import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-runner.js'
 import { sha256Hex } from './bpmn-state.js'
 import { normalizeExecutor, runExternalExecutor } from './executor.js'
 import { checkRunId } from './runlog.js'
@@ -82,7 +82,11 @@ export const BPMN_ACTIVITY_TIMEOUT_ENV = 'FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS'
 export const DEFAULT_MAX_ACTIVE_INSTANCES = 100
 
 /** 实例域终态；终态不再恢复 runner。 */
-const TERMINAL_STATUSES = new Set(['done', 'aborted'])
+/**
+ * 实例终态（Camunda 8 口径）：只有 COMPLETED / CANCELED。
+ * 引擎出错**不改 status**（保持 ACTIVE），事实写进 `lastError`。
+ */
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELED'])
 
 /**
  * 运行时错误：`status` 给 HTTP，`code` 是稳定业务码，`reason` 是中文可读原因。
@@ -704,14 +708,14 @@ class BpmnRuntime {
     }
   }
 
-  /** 建实例后启动；失败不抛 handler 错，收成 `{instance, error}`（实例已标 blocked）。 */
+  /** 建实例后启动；失败不抛 handler 错，收成 `{instance, error}`（status 仍 ACTIVE + lastError）。 */
   async _startInstance(instanceId) {
     const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
     if (instance === null) {
       throw new BpmnRuntimeError(404, 'INSTANCE_NOT_FOUND', `实例 ${instanceId} 不存在`)
     }
-    if (instance.status !== 'pending') {
-      throw new BpmnRuntimeError(409, 'INSTANCE_NOT_PENDING', `实例 ${instanceId} 当前状态是 ${instance.status}，不能重新启动`)
+    if (instance.status !== 'ACTIVE') {
+      throw new BpmnRuntimeError(409, 'INSTANCE_NOT_ACTIVE', `实例 ${instanceId} 当前状态是 ${instance.status}，不能重新启动`)
     }
     const snapshot = await readInstanceDefinition(instanceId, { instancesRoot: this.instancesRoot })
     if (snapshot === null) {
@@ -719,8 +723,8 @@ class BpmnRuntime {
     }
     const parsed = await parseBpmn(snapshot.xml)
     if (!parsed.ok) {
-      // 定义快照不可执行 = 引擎不可恢复：实例卡住（blocked），不是 failed。
-      await this._markInstanceBlocked(instanceId, {
+      // 定义快照不可执行：实例 status 不动（ACTIVE），只留 lastError。
+      await this._markInstanceError(instanceId, {
         code: 'BPMN_DEFINITION_INVALID',
         message: '实例定义快照未通过 BPMN 校验，无法启动',
         nodeId: parsed.errors?.[0]?.elementId ?? null,
@@ -746,15 +750,15 @@ class BpmnRuntime {
     if (after === null) {
       throw new BpmnRuntimeError(500, 'INSTANCE_VANISHED', `实例 ${instanceId} 在启动过程中消失`)
     }
-    // handler 失败 / 条件错误已经由 runner 收成 blocked；启动前校验失败（白名单/
-    // 定义不一致）也落 blocked——实例不会凭空消失，也不判 failed。
+    // handler 失败 / 条件错误 / 启动前校验失败：实例 status 保持 ACTIVE，
+    // 只把事实写进 lastError（要不要重试由人/业务决定）。
     if (startError !== null) {
-      if (after.status !== 'blocked' && !TERMINAL_STATUSES.has(after.status)) {
-        await this._markInstanceBlocked(instanceId, this._blockedReasonFor(instanceId, startError))
+      if (!TERMINAL_STATUSES.has(after.status)) {
+        await this._markInstanceError(instanceId, this._lastErrorFor(instanceId, startError))
       }
-      const blocked = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? after
+      const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? after
       return {
-        instance: blocked,
+        instance: current,
         error: {
           code: startError.code ?? 'BPMN_ENGINE_ERROR',
           message: startError.message,
@@ -784,7 +788,7 @@ class BpmnRuntime {
           status: current.status,
           variables: current.variables,
           result: current.result,
-          blockedReason: current.blockedReason ?? null,
+          lastError: current.lastError ?? null,
           pendingTasks,
           lastSeq: current.lastSeq,
           eventCount: current.eventCount,
@@ -898,10 +902,12 @@ class BpmnRuntime {
         }
       }
       const runner = ensured.runner
-      if (runner.status() === 'blocked') {
+      // runner 内部 blocked = 这个实例的执行已经停下（error 事件已发、lastError 已写）：
+      // 实例 status 仍是 ACTIVE，但不能再完成人工任务。
+      if (runner.status() === BPMN_RUNNER_STATUS.BLOCKED) {
         return {
           status: 409,
-          body: { ok: false, code: 'BPMN_INSTANCE_BLOCKED', error: `实例 ${id} 已阻塞（blocked），不能再完成任务` },
+          body: { ok: false, code: 'BPMN_INSTANCE_BLOCKED', error: `实例 ${id} 的执行已停下（lastError），不能再完成任务` },
         }
       }
       if (runner.status() !== 'waiting') {
@@ -976,12 +982,12 @@ class BpmnRuntime {
   }
 
   /**
-   * 中止实例：**先在实例 HTTP 串行队列之外**置停止闩并发取消信号，再落盘 aborted。
+   * 中止实例：**先在实例 HTTP 串行队列之外**置停止闩并发取消信号，再落盘 CANCELED。
    *
    * 慢 complete 可能长时间持有 `_withInstance` 锁（等 handler / 等流程静默），
    * stop 不能排在它后面——否则「点了停止却要等五分钟」。所以：
    *   1. 锁外读实例、置 `_stopping` 闩、`runner.stop()`（abort 在飞 handler）；
-   *   2. 直接 `completeInstance('aborted')`（store 自己的文件锁只覆盖毫秒级写入）；
+   *   2. 直接 `completeInstance('CANCELED')`（store 自己的文件锁只覆盖毫秒级写入）；
    *   3. 闩保留到 runtime dispose；期间 runner 的迟到事件一律丢弃。
    */
   async _stopInstance(id) {
@@ -1009,7 +1015,7 @@ class BpmnRuntime {
 
     let after
     try {
-      after = await completeInstance(id, 'aborted', { instancesRoot: this.instancesRoot })
+      after = await completeInstance(id, 'CANCELED', { instancesRoot: this.instancesRoot })
     } catch (error) {
       // 另一个请求（慢 complete）先以 done 收口：先成立者保持不变。
       if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') {
@@ -1036,36 +1042,37 @@ class BpmnRuntime {
     }
   }
 
-  /** 把实例标记成 blocked（卡住）：不是终态，不发 process/end，可被 stop / 将来 retry 处理。 */
-  async _markInstanceBlocked(instanceId, reason) {
+  /**
+   * 记录执行错误：**只写 `lastError`，不改 status**（仍是 ACTIVE）。
+   *
+   * 这是用户口径的落点：条件求值错 / 超时 / handler 失败 / 恢复失败都只是「发生过一次
+   * 错误」，要不要重试、终止还是继续由业务或人决定，引擎不替它判死。
+   */
+  async _markInstanceError(instanceId, lastError) {
     const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
     if (instance === null) return null
     if (TERMINAL_STATUSES.has(instance.status)) return instance
-    if (instance.status === 'blocked') return instance
     try {
-      return await updateInstance(instanceId, {
-        status: 'blocked',
-        blockedReason: reason,
-        pendingTasks: [],
-      }, { instancesRoot: this.instancesRoot })
+      // 执行已停止：待办表清空（否则 UI 会以为人还能接着完成那个节点）。
+      return await updateInstance(instanceId, { lastError, pendingTasks: [] }, { instancesRoot: this.instancesRoot })
     } catch (error) {
       if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return null
       throw error
     }
   }
 
-  /** 从 runner 的阻塞错误生成 `blockedReason`（保留 handler 自己的 code，例如 adapter 不可用）。 */
-  _blockedReasonFor(instanceId, error) {
+  /** 从 runner 的执行错误生成 `lastError`（保留 handler 自己的 code，例如 adapter 不可用）。 */
+  _lastErrorFor(instanceId, error) {
     const recorded = this._runnerErrors.get(instanceId) ?? null
     const code = recorded?.code
       ?? (typeof error?.cause?.code === 'string' && error.cause.code !== '' ? error.cause.code : null)
       ?? (typeof error?.code === 'string' && error.code !== '' ? error.code : null)
       ?? 'BPMN_ENGINE_ERROR'
     const message = recorded?.message ?? errorText(error)
-    const reason = { code, message }
-    if (typeof error?.elementId === 'string' && error.elementId !== '') reason.nodeId = error.elementId
-    if (typeof error?.activityId === 'string' && error.activityId !== '') reason.activityId = error.activityId
-    return reason
+    const lastError = { code, message }
+    if (typeof error?.elementId === 'string' && error.elementId !== '') lastError.nodeId = error.elementId
+    if (typeof error?.activityId === 'string' && error.activityId !== '') lastError.activityId = error.activityId
+    return lastError
   }
 
   // -------------------------------------------------------------------------
@@ -1158,6 +1165,15 @@ class BpmnRuntime {
    * @returns {Promise<{runner: any|null, recovered: boolean, reason?: string, code?: string|null}>}
    */
   async _ensureRunner(instance) {
+    // 终态最先判：已结束的实例不需要恢复，也不该被停止闩影响成「恢复失败」。
+    if (TERMINAL_STATUSES.has(instance.status)) {
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例已是终态 ${instance.status}，没有可推进的点`,
+        code: null,
+      }
+    }
     // 停止闩：stop 已经接管这个实例，谁都不许再懒恢复 / 推进。
     if (this._stopping.has(instance.id)) {
       return {
@@ -1172,15 +1188,6 @@ class BpmnRuntime {
       return { runner: cached, recovered: false }
     }
     if (cached !== undefined) this._runners.delete(instance.id)
-
-    if (TERMINAL_STATUSES.has(instance.status)) {
-      return {
-        runner: null,
-        recovered: false,
-        reason: `实例已是终态 ${instance.status}，没有可推进的点`,
-        code: null,
-      }
-    }
 
     let state
     try {
@@ -1237,10 +1244,10 @@ class BpmnRuntime {
       // 快照/定义无法反序列化或结构不一致 = 引擎不可恢复：实例卡住（blocked），
       // 不是 failed。missing 快照也按卡住处理（等人补数据 / 将来 retry）。
       if (code !== 'BPMN_STATE_STOPPING' && !this._stopping.has(instance.id)) {
-        await this._markInstanceBlocked(instance.id, {
+        await this._markInstanceError(instance.id, {
           code,
           message: reason,
-          nodeId: typeof error?.elementId === 'string' ? error.elementId : null,
+          ...(typeof error?.elementId === 'string' ? { nodeId: error.elementId } : {}),
         })
       }
       return {
@@ -1302,7 +1309,7 @@ class BpmnRuntime {
    * 用 runner 的真实状态校正实例元数据（事件链已写过一次，这里幂等兜底）。
    *
    * 终态（done / aborted）先检查：已经结束的实例绝不再写任何字段。
-   * runner 侧 `blocked` → 实例 `blocked` + `blockedReason`（不是 failed，也不是终态）。
+   * runner 侧 `blocked` → **只写 `lastError`，实例 status 保持 ACTIVE**（不判死）。
    * 最终 variables / result 与 status 在同一次 updateInstance / completeInstance 提交。
    */
   async _syncInstanceStatus(instanceId, runner) {
@@ -1318,20 +1325,19 @@ class BpmnRuntime {
       : undefined
 
     if (status === 'done') {
-      await completeInstance(instanceId, 'done', {
+      await completeInstance(instanceId, 'COMPLETED', {
         instancesRoot: this.instancesRoot,
         ...(variables === undefined ? {} : { variables }),
       })
       return
     }
-    if (status === 'blocked') {
-      const reason = this._blockedReasonFor(instanceId, runner.failure())
-      await this._markInstanceBlocked(instanceId, reason)
+    if (status === BPMN_RUNNER_STATUS.BLOCKED) {
+      await this._markInstanceError(instanceId, this._lastErrorFor(instanceId, runner.failure()))
       return
     }
     if (status === 'waiting') {
       await updateInstance(instanceId, {
-        status: 'waiting',
+        status: 'ACTIVE',
         pendingTasks: runner.pendingTasks(),
         ...(variables === undefined ? {} : { variables }),
       }, { instancesRoot: this.instancesRoot })
@@ -1339,7 +1345,7 @@ class BpmnRuntime {
     }
     if (status === 'running') {
       await updateInstance(instanceId, {
-        status: 'running',
+        status: 'ACTIVE',
         ...(variables === undefined ? {} : { variables }),
       }, { instancesRoot: this.instancesRoot })
     }
@@ -1386,16 +1392,26 @@ class BpmnRuntime {
       }
       await appendInstanceEvents(instanceId, activityId, attempt, persisted, { instancesRoot: this.instancesRoot })
       if (event.type === 'process/start' || event.type === 'activity/start') {
-        await updateInstance(instanceId, { status: 'running' }, { instancesRoot: this.instancesRoot })
+        await updateInstance(instanceId, { status: 'ACTIVE' }, { instancesRoot: this.instancesRoot })
       } else if (event.type === 'activity/wait') {
         await updateInstance(instanceId, {
-          status: 'waiting',
+          status: 'ACTIVE',
           pendingTasks: runner === null ? [] : runner.pendingTasks(),
         }, { instancesRoot: this.instancesRoot })
       } else if (event.type === 'activity/end') {
         await updateInstance(instanceId, {
-          status: 'running',
+          status: 'ACTIVE',
           pendingTasks: runner === null ? [] : runner.pendingTasks(),
+        }, { instancesRoot: this.instancesRoot })
+      } else if (event.type === 'error') {
+        // 出错**不改 status**：实例继续 ACTIVE，只把事实留成 lastError（连同 error 事件）。
+        await updateInstance(instanceId, {
+          lastError: {
+            code: typeof event.error?.code === 'string' ? event.error.code : 'BPMN_ENGINE_ERROR',
+            message: typeof event.error?.message === 'string' ? event.error.message : '',
+            ...(typeof event.elementId === 'string' ? { nodeId: event.elementId } : {}),
+            ...(typeof event.activityId === 'string' ? { activityId: event.activityId } : {}),
+          },
         }, { instancesRoot: this.instancesRoot })
       }
       // 终态 / blocked 一律由 `_syncInstanceStatus` 在收口时一次提交：

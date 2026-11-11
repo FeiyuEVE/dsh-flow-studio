@@ -436,4 +436,140 @@ await check('附加：serviceTask 缺出边 / 空 XML / 非 XML 都收敛成 ok:
   A.equal(hasCode(garbage.errors, 'BPMN_PARSE_ERROR'), true)
 })
 
+
+// ---------------------------------------------------------------------------
+// A1 · 执行白名单：归一化之前就拒绝（条件/循环/白名单外结构）
+// ---------------------------------------------------------------------------
+
+/** 一条最小的 start → serviceTask → end，body 可替换。 */
+function execXml(parts) {
+  return xml(`
+    ${parts.elements}
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="mid" />
+    <bpmn:sequenceFlow id="f2" sourceRef="mid" targetRef="end" />
+  `)
+}
+
+const blockedCases = [
+  {
+    name: '条件 startEvent（= 1 > 2）',
+    code: 'BPMN_CONDITIONAL_EVENT_FORBIDDEN',
+    elements: `
+      <bpmn:startEvent id="start">
+        <bpmn:conditionalEventDefinition id="ced">
+          <bpmn:condition xsi:type="bpmn:tFormalExpression" language="feel">= 1 &gt; 2</bpmn:condition>
+        </bpmn:conditionalEventDefinition>
+      </bpmn:startEvent>
+      <bpmn:userTask id="mid" />
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: '条件 endEvent',
+    code: 'BPMN_CONDITIONAL_EVENT_FORBIDDEN',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:userTask id="mid" />
+      <bpmn:endEvent id="end">
+        <bpmn:conditionalEventDefinition id="ced"><bpmn:condition xsi:type="bpmn:tFormalExpression" language="feel">= true</bpmn:condition></bpmn:conditionalEventDefinition>
+      </bpmn:endEvent>`,
+  },
+  {
+    name: 'timer startEvent（其它事件定义）',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start"><bpmn:timerEventDefinition id="ted"><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT1S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:startEvent>
+      <bpmn:userTask id="mid" />
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'standardLoopCharacteristics',
+    code: 'BPMN_STANDARD_LOOP_FORBIDDEN',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:serviceTask id="mid">
+        <bpmn:extensionElements><fs:node nodeType="agent" /></bpmn:extensionElements>
+        <bpmn:standardLoopCharacteristics testBefore="false" />
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'scriptTask（node:vm 不是沙箱）',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:scriptTask id="mid" scriptFormat="javascript">process.exit(1)</bpmn:scriptTask>
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'subProcess',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:subProcess id="mid"><bpmn:startEvent id="s2" /><bpmn:endEvent id="e2" /><bpmn:sequenceFlow id="f9" sourceRef="s2" targetRef="e2" /></bpmn:subProcess>
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'callActivity',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:callActivity id="mid" calledElement="Other" />
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'eventBasedGateway',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:eventBasedGateway id="mid" />
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'serviceTask implementation（内置 resolveExpression）',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:serviceTask id="mid" implementation="##WebService">
+        <bpmn:extensionElements><fs:node nodeType="agent" /></bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="end" />`,
+  },
+  {
+    name: 'boundaryEvent',
+    code: 'BPMN_EXECUTION_UNSUPPORTED',
+    elements: `
+      <bpmn:startEvent id="start" />
+      <bpmn:userTask id="mid" />
+      <bpmn:boundaryEvent id="b" attachedToRef="mid" />
+      <bpmn:endEvent id="end" />`,
+  },
+]
+
+for (const item of blockedCases) {
+  await check(`执行白名单：${item.name} → ${item.code}`, async () => {
+    const result = await parseBpmn(execXml({ elements: item.elements }))
+    A.equal(result.ok, false, `${item.name} 必须被拒绝`)
+    A.equal(hasCode(result.errors, item.code), true, `${item.name} 必须报 ${item.code}；实际 ${JSON.stringify(result.errors.map(e => e.code))}`)
+    // 解析器不能把不支持的执行元素归一成可执行节点（否则 handler 会被派发）。
+    if (item.code === 'BPMN_CONDITIONAL_EVENT_FORBIDDEN' || item.code === 'BPMN_EXECUTION_UNSUPPORTED') {
+      A.equal(result.errors.every(error => error.code !== 'BPMN_PARSE_ERROR'), true, '必须是结构化拒绝，不是解析失败')
+    }
+  })
+}
+
+await check('执行白名单：条件 startEvent 的 `= 1 > 2` 不会被当成可执行条件（handler 侧另有 runner 测试）', async () => {
+  const result = await parseBpmn(execXml({
+    elements: `
+      <bpmn:startEvent id="start">
+        <bpmn:conditionalEventDefinition id="ced">
+          <bpmn:condition xsi:type="bpmn:tFormalExpression">= 1 &gt; 2</bpmn:condition>
+        </bpmn:conditionalEventDefinition>
+      </bpmn:startEvent>
+      <bpmn:userTask id="mid" />
+      <bpmn:endEvent id="end" />`,
+  }))
+  A.equal(result.ok, false)
+  A.equal(hasCode(result.errors, 'BPMN_CONDITIONAL_EVENT_FORBIDDEN'), true, '无 language 的条件事件同样拒绝')
+})
+
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

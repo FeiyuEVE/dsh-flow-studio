@@ -430,6 +430,20 @@ try {
     A.notEqual(b.instanceId, a.instanceId, '恢复用的是新实例')
     await b.recover(restored)
 
+    // 拒绝型 expressions 解析器必须扛过 Environment.clone / recover。
+    A.equal(
+      b._engine.environment.expressions.resolveExpression,
+      b._rejectExpressions.resolveExpression,
+      '引擎环境仍是拒绝型表达式解析器'
+    )
+    const recoveredDefinitions = b._engine.execution.definitions
+    A.equal(recoveredDefinitions.length, 1)
+    A.equal(
+      recoveredDefinitions[0].environment.expressions.resolveExpression,
+      b._rejectExpressions.resolveExpression,
+      '定义环境（clone 出来的）仍是拒绝型表达式解析器'
+    )
+
     A.equal(b.status(), 'waiting', '恢复后停在同一个等待点')
     A.equal(b.pendingTasks().length, 1)
     A.equal(b.pendingTasks()[0].executionId, executionA, '同一条活动执行（executionId 由 state 带过来）')
@@ -694,7 +708,7 @@ try {
           return true
         }
       )
-      A.equal(runner.status(), 'failed', '非法条件必须让实例失败')
+      A.equal(runner.status(), 'blocked', '非法条件必须让实例失败')
       A.equal(recorder.errors.length, 1)
       A.equal(recorder.errors[0].code, 'BPMN_CONDITION_INVALID')
       A.equal(recorder.types().includes('process/end'), false, '没有静默走完流程')
@@ -714,7 +728,7 @@ try {
         () => runner.signalTask({ activityId: 'n_human', payload: { approved: false } }),
         { code: 'BPMN_CONDITION_LANGUAGE_UNSUPPORTED' }
       )
-      A.equal(runner.status(), 'failed')
+      A.equal(runner.status(), 'blocked')
       A.match(recorder.errors[0].message, /内置表达式/)
     }
   })
@@ -737,7 +751,7 @@ try {
       return true
     })
 
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     // maxRounds = 允许的重跑次数 → 目标一共执行 maxRounds + 1 = 4 次。
     A.equal(recorder.handlerCalls.length, 4, 'handler 调用次数正好 4')
     A.deepEqual(recorder.handlerCalls.map((call) => call.attempt), [1, 2, 3, 4], 'ctx.attempt 逐次递增')
@@ -775,7 +789,7 @@ try {
       A.match(error.message, /连线 r01 已被走过 1 次，第 2 次超过 fs:maxRounds=1/)
       return true
     })
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     A.equal(recorder.handlerCalls.length, 2, 'maxRounds=1 → 目标执行 2 次')
     A.equal(recorder.flowIds().filter((id) => id === 'r01').length, 1)
     A.equal(recorder.types().includes('process/end'), false)
@@ -794,12 +808,13 @@ try {
       A.equal(error.code, 'BPMN_LOOP_LIMIT')
       A.equal(typeof error.flowId, 'string', '错误体带违规连线的 flowId')
       A.ok(error.flowId.length > 0)
-      A.equal(error.takes, 6, '第 6 次 take 越界（上限 5）')
+      A.equal(error.takes, 5, '已成功走过 5 次')
+      A.equal(error.attemptedTake, 6, '第 6 次 take 被拦在发布之前（上限 5）')
       A.equal(error.loopGuardMax, 5)
       A.match(error.message, /循环护栏（上限 5）/)
       return true
     })
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     A.ok(recorder.handlerCalls.length <= 6, `死环必须被拦住（handler 只跑了 ${recorder.handlerCalls.length} 次）`)
     A.equal(recorder.types().includes('process/end'), false)
     const state = await runner.getState()
@@ -915,7 +930,7 @@ try {
       return true
     })
     A.equal(recorderB.handlerCalls.length, 0, '超限判定在重跑之前 → 恢复后的实例没有再调 handler')
-    A.equal(b.status(), 'failed')
+    A.equal(b.status(), 'blocked')
   })
 
   await check('连线次数上限按「这条连线自己」计数：目标多入口不误判', async () => {
@@ -963,7 +978,7 @@ try {
         A.match(error.message, /连线 e_back 已被走过 2 次，第 3 次超过 fs:maxRounds=2 的连线次数上限/)
         return true
       })
-      A.equal(runner.status(), 'failed')
+      A.equal(runner.status(), 'blocked')
       A.equal(recorder.flowIds().filter((id) => id === flowIdOf).length, 2, 'e_back 走满 2 次后才失败')
       const backIndexes = []
       recorder.events.forEach((event, index) => {
@@ -996,7 +1011,7 @@ try {
       A.match(error.message, /agent exploded/)
       return true
     })
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     A.equal(recorder.errors.length, 1, 'onError 只被调用一次')
     A.equal(recorder.errors[0].code, 'BPMN_HANDLER_FAILED')
     const errorEvents = recorder.events.filter((event) => event.type === 'error')
@@ -1008,10 +1023,10 @@ try {
     A.deepEqual(recorder.types().slice(-1), ['error'], '最后一条事件是 error')
 
     const state = await runner.getState()
-    A.equal(state.status, 'failed')
+    A.equal(state.status, 'blocked')
     A.equal(state.engine.state, 'error', '引擎也进了 error')
 
-    await A.rejects(() => runner.signalTask({ activityId: 'n_human', payload: {} }), { code: 'BPMN_INSTANCE_FAILED' })
+    await A.rejects(() => runner.signalTask({ activityId: 'n_human', payload: {} }), { code: 'BPMN_INSTANCE_BLOCKED' })
   })
 
   // -------------------------------------------------------------------------
@@ -1045,10 +1060,44 @@ try {
     const elapsed = Date.now() - startedAt
     A.ok(elapsed >= 50, `超时不能早于 50ms（实测 ${elapsed}ms）`)
     A.ok(elapsed < 3000, `超时不能拖太久（实测 ${elapsed}ms）`)
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     A.equal(aborted, true, '超时必须 abort 在飞 handler 的 ctx.signal（坑 9）')
     A.equal(errors.length, 1)
     A.equal(errors[0].code, 'BPMN_ACTIVITY_TIMEOUT')
+  })
+
+  await check('activityWaitMs：超时后晚到的 handler 成功不得回写（保留 BPMN_ACTIVITY_TIMEOUT）', async () => {
+    const events = []
+    let release = null
+    let abortObserved = false
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-timeout-late' }),
+      limits: { activityWaitMs: 40 },
+      services: {
+        executeAgent(element, ctx) {
+          ctx.signal.addEventListener('abort', () => { abortObserved = true }, { once: true })
+          return new Promise((resolve) => {
+            release = () => resolve({ output: { late: 'yes' } })
+          })
+        },
+        onEvent(event) { events.push(event) },
+      },
+    }))
+    await A.rejects(() => runner.start(), { code: 'BPMN_ACTIVITY_TIMEOUT' })
+    A.equal(abortObserved, true)
+    const eventsAtFail = events.length
+    const variablesAtFail = { ...runner.variables }
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    A.equal(events.length, eventsAtFail, '超时之后不得再发事件')
+    A.deepEqual(runner.variables, variablesAtFail, '晚到成功不得写进变量账本')
+    A.equal(
+      events.filter(event => event.type === 'activity/end' && event.elementId === 'n_agent').length,
+      0,
+      '晚到成功不得产生 agent 的 activity/end'
+    )
+    A.equal(runner.status(), 'blocked')
+    A.equal(runner.failure().code, 'BPMN_ACTIVITY_TIMEOUT', '保留原来的超时错误，不被晚到成功覆盖')
   })
 
   await check('activityWaitMs：userTask 一直没人完成任务 → 超时 failed', async () => {
@@ -1061,7 +1110,7 @@ try {
     A.equal((await runner.start()).state, 'waiting')
     A.equal(runner.pendingTasks().length, 1)
     await new Promise((resolve) => setTimeout(resolve, 200))
-    A.equal(runner.status(), 'failed', '没人完成任务 → 活动超时')
+    A.equal(runner.status(), 'blocked', '没人完成任务 → 活动超时')
     A.equal(recorder.errors.length, 1)
     A.equal(recorder.errors[0].code, 'BPMN_ACTIVITY_TIMEOUT')
     A.equal(runner.pendingTasks().length, 0, '失败后待办清空')
@@ -1086,7 +1135,7 @@ try {
     }))
     A.equal((await runner.start()).state, 'waiting')
     await new Promise((resolve) => setTimeout(resolve, 200))
-    A.equal(runner.status(), 'failed')
+    A.equal(runner.status(), 'blocked')
     A.equal(errors.length, 1)
     A.equal(errors[0].code, 'BPMN_RUN_TIMEOUT')
   })
@@ -1242,6 +1291,331 @@ try {
     A.equal(warnedState.warnings.length, 1, '默认流带条件要留下 warning')
     A.match(warnedState.warnings[0], /默认流/)
   })
+
+  // -------------------------------------------------------------------------
+  // A1 · 条件 / 恢复入口封闭（BLOCKER）
+  // -------------------------------------------------------------------------
+
+  await check('A1：拒绝型内置表达式解析器（直接调用）', async () => {
+    const { createRejectingExpressions } = await import('../src/bpmn-policy.js')
+    const expressions = createRejectingExpressions()
+    A.throws(() => expressions.resolveExpression('${approved}'), { code: 'BPMN_BUILTIN_EXPRESSION_FORBIDDEN' })
+    A.equal(expressions.isExpression('${a}'), false, '不承认任何内置表达式语法')
+    A.equal(expressions.hasExpression('${a}'), false, '不承认任何内置表达式语法')
+  })
+
+  await check('A1：条件 startEvent 在 runner 入口被拒（handler=0）', async () => {
+    const recorder = makeRecorder()
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="D-cond" targetNamespace="http://x">
+  <bpmn:process id="proc-cond" isExecutable="true">
+    <bpmn:startEvent id="s">
+      <bpmn:conditionalEventDefinition id="ced"><bpmn:condition xsi:type="bpmn:tFormalExpression" language="feel">= 1 &gt; 2</bpmn:condition></bpmn:conditionalEventDefinition>
+    </bpmn:startEvent>
+    <bpmn:userTask id="h" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="h" />
+    <bpmn:sequenceFlow id="f2" sourceRef="h" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>`
+    const definition = {
+      id: 'proc-cond', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'h', type: 'bpmn:UserTask', kind: 'human' },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f1', from: 's', to: 'h' },
+        { id: 'f2', from: 'h', to: 'e' },
+      ],
+    }
+    const runner = track(createRunner({ definition, xml, services: recorder.services() }))
+    await A.rejects(() => runner.start(), { code: 'BPMN_CONDITIONAL_EVENT_FORBIDDEN' })
+    A.equal(recorder.handlerCalls.length, 0, '拒绝发生在任何 handler 之前')
+    A.equal(runner.status(), 'idle', '未启动成功，保持 idle')
+  })
+
+  await check('A1：standardLoop 在 runner 入口被拒（handler=0）', async () => {
+    const recorder = makeRecorder()
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D-loop" targetNamespace="http://x">
+  <bpmn:process id="proc-loop" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="a">
+      <bpmn:standardLoopCharacteristics testBefore="false" />
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="a" />
+    <bpmn:sequenceFlow id="f2" sourceRef="a" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>`
+    const definition = {
+      id: 'proc-loop', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'a', type: 'bpmn:ServiceTask', kind: 'agent', node: { kind: 'agent' } },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f1', from: 's', to: 'a' },
+        { id: 'f2', from: 'a', to: 'e' },
+      ],
+    }
+    const runner = track(createRunner({ definition, xml, services: recorder.services() }))
+    await A.rejects(() => runner.start(), { code: 'BPMN_STANDARD_LOOP_FORBIDDEN' })
+    A.equal(recorder.handlerCalls.length, 0)
+  })
+
+  await check('A1：definition-only 入口按原始 type 拒绝禁止网关（不先归一成 gateway）', async () => {
+    const definition = {
+      id: 'def-raw-parallel', startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', type: 'bpmn:StartEvent', kind: 'start' },
+        { id: 'g', type: 'bpmn:ParallelGateway', kind: 'gateway' },
+        { id: 'e', type: 'bpmn:EndEvent', kind: 'end' },
+      ],
+      flows: [
+        { id: 'f1', from: 's', to: 'g' },
+        { id: 'f2', from: 'g', to: 'e' },
+      ],
+    }
+    A.throws(
+      () => createRunner({ definition, services: makeRecorder().services() }),
+      { code: 'PARALLEL_GATEWAY_FORBIDDEN' }
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // A1 · 恢复：裸快照 / 身份 / 结构（含条件、default）都要拒绝
+  // -------------------------------------------------------------------------
+
+  /** 造一个停在 userTask 的合法 state（agent 已跑过一次）。 */
+  async function makeWaitingState(definitionId = 'def-recover-v2') {
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: definitionId }),
+      services: recorder.services(),
+    }))
+    A.equal((await runner.start()).state, 'waiting')
+    return { state: JSON.parse(JSON.stringify(await runner.getState())), recorder }
+  }
+
+  await check('A1：裸快照（含 parallelGateway）→ BPMN_STATE_VERSION_UNSUPPORTED，handler=0', async () => {
+    const { state } = await makeWaitingState('def-recover-bare')
+    const bare = JSON.parse(JSON.stringify(state.engine))
+    const source = JSON.parse(bare.definitions[0].source)
+    const processId = source.processes[0].id
+    source.activities.push({
+      id: 'pg',
+      type: 'bpmn:ParallelGateway',
+      parent: { id: processId, type: 'bpmn:Process' },
+      behaviour: { $type: 'bpmn:ParallelGateway', id: 'pg' },
+    })
+    bare.definitions[0].source = JSON.stringify(source)
+
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-recover-bare' }),
+      services: recorder.services(),
+    }))
+    await A.rejects(() => runner.recover(bare), { code: 'BPMN_STATE_VERSION_UNSUPPORTED' })
+    A.equal(recorder.handlerCalls.length, 0, '裸快照不得派发 handler')
+    A.equal(runner.status(), 'idle')
+  })
+
+  await check('A1：补齐合法 v2 身份但结构不同 → BPMN_STATE_DEFINITION_MISMATCH（handler=0）', async () => {
+    const { state } = await makeWaitingState('def-recover-identity')
+    const tampered = JSON.parse(JSON.stringify(state))
+    const source = JSON.parse(tampered.engine.definitions[0].source)
+    const processId = source.processes[0].id
+    source.activities.push({
+      id: 'pg',
+      type: 'bpmn:ParallelGateway',
+      parent: { id: processId, type: 'bpmn:Process' },
+      behaviour: { $type: 'bpmn:ParallelGateway', id: 'pg' },
+    })
+    tampered.engine.definitions[0].source = JSON.stringify(source)
+
+    const recorder = makeRecorder()
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-recover-identity' }),
+      services: recorder.services(),
+    }))
+    await A.rejects(() => runner.recover(tampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+    A.equal(recorder.handlerCalls.length, 0)
+  })
+
+  await check('A1：只篡改条件 / 只篡改 default 的快照同样拒绝（来源逐项对照）', async () => {
+    const { state } = await makeWaitingState('def-recover-tamper')
+
+    // (a) 改条件表达式
+    const conditionTampered = JSON.parse(JSON.stringify(state))
+    const conditionSource = JSON.parse(conditionTampered.engine.definitions[0].source)
+    const flow = conditionSource.sequenceFlows.find(item => item.id === 'f_back')
+    flow.behaviour.conditionExpression = {
+      $type: 'bpmn:FormalExpression',
+      language: 'feel',
+      body: '= true',
+    }
+    conditionTampered.engine.definitions[0].source = JSON.stringify(conditionSource)
+    {
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-recover-tamper' }),
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(conditionTampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+      A.equal(recorder.handlerCalls.length, 0)
+    }
+
+    // (b) 改默认流标记（f_back 变成默认边）
+    const defaultTampered = JSON.parse(JSON.stringify(state))
+    const defaultSource = JSON.parse(defaultTampered.engine.definitions[0].source)
+    defaultSource.sequenceFlows.find(item => item.id === 'f_back').isDefault = true
+    defaultTampered.engine.definitions[0].source = JSON.stringify(defaultSource)
+    {
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-recover-tamper' }),
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.recover(defaultTampered), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+      A.equal(recorder.handlerCalls.length, 0)
+    }
+
+    // (c) 删 definitionHash / 换 version 也必须失败
+    {
+      const noHash = JSON.parse(JSON.stringify(state))
+      delete noHash.definitionHash
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-recover-tamper' }),
+        services: makeRecorder().services(),
+      }))
+      await A.rejects(() => runner.recover(noHash), { code: 'BPMN_STATE_VERSION_UNSUPPORTED' })
+    }
+    {
+      const wrongVersion = JSON.parse(JSON.stringify(state))
+      wrongVersion.version = 99
+      const runner = track(createRunner({
+        definition: makeDefinition({ id: 'def-recover-tamper' }),
+        services: makeRecorder().services(),
+      }))
+      await A.rejects(() => runner.recover(wrongVersion), { code: 'BPMN_STATE_DEFINITION_MISMATCH' })
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // A2 · 连线超限：默认边 / 无条件边 / 条件边都在**发布 take 之前**拦住
+  // -------------------------------------------------------------------------
+
+  /** `s → g → t(agent) → g`，进入 t 的那条边带 fs:maxRounds=1（三种边的形状可切换）。 */
+  function makeEntryLimitDefinition({ definitionId, mode }) {
+    const entryFlow = mode === 'default'
+      ? { id: 'f_entry', from: 'g', to: 't', isDefault: true }
+      : mode === 'conditional'
+        ? { id: 'f_entry', from: 'g', to: 't', condition: { expression: '= true', language: 'feel' } }
+        : { id: 'f_entry', from: 'g', to: 't' }
+    entryFlow.extensions = [{ type: 'fs:MaxRounds', name: 'maxRounds', value: 1 }]
+    const exitFlow = mode === 'conditional'
+      ? { id: 'f_exit', from: 'g', to: 'e', isDefault: true }
+      : { id: 'f_exit', from: 'g', to: 'e', condition: { expression: '= false', language: 'feel' } }
+    if (mode === 'default' || mode === 'unconditional') {
+      // 默认流 / 无条件边：另一条条件永远为 false，保证每次都走 f_entry。
+    }
+    return {
+      id: definitionId, startId: 's', endIds: ['e'],
+      elements: [
+        { id: 's', kind: 'start', name: '开始' },
+        { id: 'g', kind: 'gateway', name: '入口' },
+        { id: 't', kind: 'agent', name: '目标' },
+        { id: 'e', kind: 'end', name: '结束' },
+      ],
+      flows: [
+        { id: 'f_start', from: 's', to: 'g' },
+        entryFlow,
+        { id: 'f_loop', from: 't', to: 'g' },
+        exitFlow,
+      ],
+    }
+  }
+
+  for (const mode of ['default', 'unconditional', 'conditional']) {
+    await check(`A2：${mode} 边 fs:maxRounds=1 → 第 2 次 take 前拦住（handler 恰好 1 次）`, async () => {
+      const recorder = makeRecorder()
+      const runner = track(createRunner({
+        definition: makeEntryLimitDefinition({ definitionId: `def-entry-${mode}`, mode }),
+        services: recorder.services(),
+      }))
+      await A.rejects(() => runner.start(), (error) => {
+        A.equal(error.code, 'BPMN_FLOW_TAKE_LIMIT')
+        A.equal(error.flowId, 'f_entry')
+        A.equal(error.maxTakes, 1)
+        A.equal(error.takes, 1, '已成功走过 1 次')
+        A.equal(error.attemptedTake, 2, '被拦的是第 2 次')
+        return true
+      })
+      A.equal(recorder.handlerCalls.length, 1, 'handler 恰好 1 次：超限边不得驱动目标')
+      A.equal(runner._flowTakes.get('f_entry'), 1, 'flowTakes 只记成功走过的边')
+      A.equal(runner.status(), 'blocked')
+      const types = recorder.types()
+      const errorIndex = types.indexOf('error')
+      A.ok(errorIndex >= 0, 'error 事件必须存在')
+      A.equal(types.slice(errorIndex + 1).includes('activity/start'), false, 'error 之后不得再有 activity/start')
+      A.equal(types.includes('process/end'), false, '超限不是正常完成')
+      const errorEvent = recorder.events.find(event => event.type === 'error')
+      A.equal(errorEvent.error.attemptedTake, 2, 'error 事件带 attemptedTake')
+      A.equal(recorder.errors.length, 1)
+      A.equal(recorder.errors[0].code, 'BPMN_FLOW_TAKE_LIMIT')
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // A2 · handler 挂起时并发 stop：先 abort，晚到结果不生效
+  // -------------------------------------------------------------------------
+
+  await check('A2：handler 挂起时 stop → 先收到 abort；之后派发/回写都不生效', async () => {
+    const events = []
+    let aborted = false
+    let release = null
+    const runner = track(createRunner({
+      definition: makeDefinition({ id: 'def-stop-inflight' }),
+      services: {
+        executeAgent(element, ctx) {
+          ctx.signal.addEventListener('abort', () => { aborted = true }, { once: true })
+          return new Promise((resolve) => {
+            release = () => resolve({ output: { late: true } })
+          })
+        },
+        onEvent(event) { events.push(event) },
+      },
+    }))
+
+    const started = runner.start()
+    // 等 handler 真正在飞
+    for (let index = 0; index < 100 && release === null; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    A.ok(release !== null, 'handler 在飞')
+    await runner.stop()
+    A.equal(aborted, true, 'stop 先发 abort 信号')
+    A.equal(runner.status(), 'idle')
+    const eventsAtStop = events.length
+    const agentEndAtStop = events.filter(event => event.type === 'activity/end' && event.elementId === 'n_agent').length
+    // 晚到成功：不得回写变量 / 发 activity/end / 推进引擎
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    A.equal(events.length, eventsAtStop, 'stop 之后不得再发任何事件')
+    A.equal(
+      events.filter(event => event.type === 'activity/end' && event.elementId === 'n_agent').length,
+      agentEndAtStop,
+      '晚到 handler 不得产生 agent 的 activity/end'
+    )
+    A.deepEqual(runner.variables, {}, '晚到输出不得写进变量账本')
+    A.equal(runner.pendingTasks().length, 0)
+    await started.catch(() => {})
+  })
+
 } finally {
   for (const runner of openRunners.splice(0)) {
     try {

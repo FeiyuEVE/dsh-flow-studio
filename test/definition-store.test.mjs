@@ -141,7 +141,7 @@ try {
     eq(instance.definitionId, 'flow-pinned', '实例记录 definitionId')
     eq(instance.definitionVersion, 1, '实例记录 definitionVersion')
     eq(instance.definitionHash, definition.hash, '实例钉住创建时的 definitionHash')
-    eq(instance.status, 'pending', '新实例初始状态 pending')
+    eq(instance.status, 'ACTIVE', '新实例初始状态 ACTIVE')
     eq(instance.revision, 1, '新实例 revision=1')
     eq(instance.variables.env, 'test', 'variables 被保存')
 

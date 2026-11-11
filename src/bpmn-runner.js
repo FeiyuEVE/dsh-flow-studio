@@ -179,6 +179,15 @@ import {
   validateStateEnvelope,
 } from './bpmn-state.js'
 
+/** runner 内部执行状态（**不是实例状态**；实例状态见 instance-store 的 ACTIVE/COMPLETED/…）。 */
+export const BPMN_RUNNER_STATUS = Object.freeze({
+  IDLE: 'idle',
+  RUNNING: 'running',
+  WAITING: 'waiting',
+  DONE: 'done',
+  BLOCKED: 'blocked',
+})
+
 /** 活跃实例默认上限（研究 §7：单实例 ≈450KB，1000 常驻 ≈435MB）。 */
 const DEFAULT_MAX_ACTIVE_INSTANCES = 100
 /** `lru-cache` 的容器上限只增不减；真正的上限由 `activeLimit` 手工裁剪执行。 */
@@ -1024,7 +1033,7 @@ class BpmnRunner {
     return this._status
   }
 
-  /** 阻塞原因（runner 侧 `status()==='blocked'` 时才有）；实例层据此写 `blockedReason`。 */
+  /** 阻塞原因（runner 侧 `status()==='blocked'` 时才有）；实例层据此写 `lastError`。 */
   failure() {
     return this._fatal
   }

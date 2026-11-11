@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.14）
+# 版本历史（0.1 → 0.14.0）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -809,3 +809,43 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - drain 的 `pending` 标志是进程内状态，进程崩溃会丢失这次唤醒，只能等下一次触发。
 - M6 若成功写回与补偿写**都**失败，进程内不再重发，但重启后仍可能再试一次（at-least-once）。
 - 没有 util-linux `flock` 的平台（Windows / macOS）跨进程互斥不成立，只保证同进程串行；NFS / SMB 不保证 flock 语义。
+
+## 0.14.0 — 旧运行域一次性退役
+
+破坏性版本：**只剩一个运行域**——BPMN 定义域（`definitions/`）与实例域（`instances/`）。旧 run 域的引擎、路由、工具、客户端与测试一次性删除，不做兼容跳转、不留开关，也不迁移历史数据。
+
+**删掉的 Host 核心（整文件）**
+
+`src/engine.js`、`runtime.js`、`tools.js`、`supervise.js`、`worktree.js`、`inbox.js`、`runlog.js`、`runstore.js`、`flowmachine.js`、`xstate-vendor.js`、`node-tools.js`、`restart.js`、`resume.js`、`admission.js`、`audit.js`、`executor.js`、`model.js`、`store.js`、`flowdir.js`、`bpmn-convert.js`。删前把仍有公共价值的东西迁出：`storage-contract.js`（`resolveHome` / `flowStudioDir` / `checkRunId` / 事件大小上限）、`node-check.js`（节点 check 的归一化与限额）；`process-output.js`、`host-check.js` 保留限额 / 脱敏 / 证据校验，只删旧执行链接线。
+
+**Host 启动与路由**
+
+- `src/index.js` 重写：只留 `/health`、`/skills`、`/definitions`、`/instances`、`/instance-worktrees`、`/metrics`。旧的 `createRuntime()`、supervision 启动、`repairRunStates/sweepStaleRuns/sweepExpiredLeases`、`createFlowTools()` 全部删除。
+- 旧路由 `/flows`（含 import-dir / export-dir）、`/runs`（事件 / 消息 / inbox / summary / export / start / stop / restart / supervision / worktree）、`/worktrees`、`/worktrees/prune`：**已认证请求返回 404**（无认证仍是 401），不做兼容跳转。
+- `/health` 删掉 engine / stub / run 字段，只报新 runtime、adapter 与 definitions / instances 能力。
+
+**模型工具**
+
+删除 12 个旧工具（`flow_list`、`flow_compile`、`flow_decompile`、`flow_worktrees`、`flow_start`、`flow_watch`、`flow_stop`、`flow_restart`、`flow_supervise`、`flow_send_message`、`flow_reply`、`flow_node_reject`）。现在只注册**恰好 11 个**实例域工具：`flow_definition_list/get`、`flow_instance_run/list/get/events/cancel/complete_task`、`flow_instance_worktrees/send_message/reply`；`flow_finish_node` 仍由 AgentAdapter 在节点会话里提供。
+
+**客户端**
+
+删除 `src/client/canvas-flow.js`、`inspector.js`、`geometry.js`、`link.js`、`dialogs.js`，以及 `canvas.js` 的旧画布 re-export、`api.js` 的 `legacyApi` / 旧 run helpers / export 入口、旧菜单文案与 React Flow 样式段。保留并继续承载新域的是：`canvas.js`（`BpmnCanvas`）、`flowlist.js`（`DefinitionList`）、`logdrawer.js`（`InstanceEventDrawer`）、`src/client/runtime.js`（前端宿主桥）与 `client/bpmn/*`、`client/instance-*`。
+
+**测试、构建与脚本**
+
+- 删 26 个旧域套件（engine / runtime / runstore / runlog / flowmachine / supervise / audit / admission / executor / trust-engine / resume-setup / flowdir / geometry / link / model / worktree / inbox / tools / migrate-flows 等），保留并更新新域套件，共 45 个。
+- 迁移而不是丢弃：`host.test.mjs`、`tools.test.mjs` 里仍然有效的断言（connection fail-closed 503、401 / 403 原样返回、跨站 403、同源放行、两档令牌、只读令牌写 403、原始路径 400、工具集合）迁到 `test/host-auth.test.mjs`（10 组 / 151 断言），并把「工具集合固定数量」改成恰好 11 且逐个断言旧工具名不出现。
+- `scripts/build.mjs` 的 `HOST_MODULES` 收敛到 37 个 Host 模块（`lib/` 共 39 个产物 = 37 + 2 生成）；`lib/` 里旧产物删掉，`verify-build.mjs` 对多余产物继续硬失败。
+- 脚本收敛：只剩 `build.mjs`、`build-bpmn-assets.mjs`、`vendor-bpmn.mjs`、`verify-build.mjs`、`e2e-bpmn.sh`；`migrate-flows-to-bpmn.mjs`、`vendor-xstate.mjs`、`e2e-docker.sh`、`codex-smoke.mjs` 删除。
+- 依赖去掉 `@xyflow/react`。
+
+**文档**
+
+`README`、`CONTRIBUTING`、`guide/*`、`reference/{host-api,data-model,instance-api}`、`faq`、`docs/cookbook/*`、`docs/AGENTS.md`、`docs/README.md` 全部按「一个运行域」重写；`design/01–08` 与 `REVIEW.md` 加「历史资料」标注但**不重写**，`design/09–13` 是当前契约（适配器 hooks / 实例 API / finish 工具 / 指标 / 证据），`reference/run-log.md` 只解释历史 run 事件。
+
+**已知边界**
+
+- 代码退役**不删除磁盘上的旧数据**：`~/.dsh/flow-studio/flows/`、`runs/`、旧 worktree 目录不会再被加载，清理属于独立维护动作。
+- 回滚以完整版本包为单位，不在新版本里保留切回旧域的开关，也不做双写或历史数据迁移。
+- 并发 / 超时 / 取消 / 鉴权 / 脱敏 / 路径校验这些横切能力没有随旧域消失，它们已在新域（见 0.13.x 记录）。

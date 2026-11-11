@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.1）
+# 版本历史（0.1 → 0.13.3）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -478,3 +478,19 @@
 - 真实模型 turn 不在自动化测试里：DSH 适配器用桩会话、codex 适配器用假 CLI 加真 MCP 通道；原生 Stop hook 只有手工隔离探测证据，`settings.stopHook:'native'` 时才启用，probe 不复测。
 - Windows 清理未实机验证：`taskkill /T /F /PID` 与 socket / runDir 清理只在 Linux 自动化里跑过。
 - `claude` 适配器与原生 hook 桥（`tool.pre` 可阻断）在 0.13.2；HTTP connector 在 0.13.4；画布在 0.13.3。
+
+## 0.13.3 — bpmn.io 画布与主界面切换
+
+**画布换成 bpmn.io**：`bpmn-js@18.31.1` + 官方 `bpmn-js-properties-panel@5.65.3`（`@bpmn-io/properties-panel@3.59.0`）只进懒加载 chunk `client.bpmn.js`，主包不含它们；宿主 `require.async('./client.bpmn.js')` 首次打开画布才加载。
+
+- **体积**：`client.js` 161,160 B / gzip 37,998（旧 React Flow 画布移出主包）；`client.bpmn.js` 1,986,232 / gzip 539,385；官方 CSS 与 bpmn-font woff2 全部 base64 内联，零额外请求；`CLIENT_LIMIT` 硬失败改为只报数。
+- **属性面板**：官方组件 + 自定义 `FsPropertiesProvider` 业务组（节点类型/provider/adapter/model/agentPreset、prompt/roleCard、skills/hooks、team、check、output、http、连线 maxRounds 与 FEEL 条件）；`moddle.create` + commandStack 合成一次撤销；check JSON 非法保留原文并报错；palette/替换菜单对齐执行白名单。
+- **主题与许可**：`--bio-*` → `--dsw-*` 桥接（含暗色），主题切换不写 DI、不脏撤销栈；bpmn.io 水印保持官方显示（bpmn.io License 义务，见 THIRD-PARTY §四）。
+- **主界面切到定义/实例**：左侧定义列表、中间画布、右侧实例与人工待办、底部实例事件抽屉；保存 = 提交属性输入 → 序列化 XML → `POST /definitions` → 钉 version/hash；运行强制 `definitionVersion`；实例用冻结快照 + NavigatedViewer 只读；事件 `?since=` 增量去重、按 `elementId` 定位；201 带执行错误时保留实例并展示 `lastError`。
+- **新增接口**：`GET /instances/<id>/definition`（只读实例冻结 XML，不触发懒恢复）。
+- **验证**：`npm test` 47 个套件 / 1235 组 / 8090 条断言 / 0 失败；真实浏览器（Chrome 149 + playwright-core）跑通新建/编辑/保存/运行/完成待办/事件定位/导入/201 错误保留；容器测试台（`dsh-testbed-bpmn`，0.13.3 tgz）实测 chunk 返回 200、定义/实例列表与画布渲染正常。
+
+**已知边界**
+- 旧 `flows/`、`runs/` 运行域与旧组件（React Flow 画布、inspector 等）仍在仓库，`api.js` 里以 `legacyApi` 临时保留；退役是下一步（0.13.3 收尾 / 0.14），当前页面已不调用它们。
+- HTTP connector 尚未实现（`0.13.4`）；面板对 http 节点如实标注。
+- bpmn-js 键盘绑定画布 SVG；输入框/面板内不触发图操作。

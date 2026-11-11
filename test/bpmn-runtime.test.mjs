@@ -538,6 +538,59 @@ try {
   })
 
   // -------------------------------------------------------------------------
+  // 7.1 恢复校验不能把业务变量误当 BPMN 引用（codex 复审回归）
+  // -------------------------------------------------------------------------
+  await check('恢复校验：人工任务 payload 里的 id/activityId 等业务键不影响恢复', async home => {
+    const env = {}
+    const dir = store.flowsDir(home)
+    const url = new URL('http://localhost/')
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="http://x">
+  <bpmn:process id="p-business" isExecutable="true">
+    <bpmn:startEvent id="s"/>
+    <bpmn:userTask id="h1"/>
+    <bpmn:userTask id="h2"/>
+    <bpmn:endEvent id="e"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="h1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="h1" targetRef="h2"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="h2" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const runtimeA = createBpmnRuntime({ dir, env })
+    let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-business', name: '业务键', xml } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-business' } })
+    eq(res.status, 201, JSON.stringify(res.body))
+    const instanceId = res.body.id
+    // 业务 payload 的键名恰好与结构引用同名：它们会进 execution.environment.output，
+    // 不是 BPMN 元素引用，恢复时不能被误判成「来自另一份引擎」。
+    const payload = {
+      id: 'business-id',
+      activityId: 'biz-activity',
+      elementId: 'biz-element',
+      flowId: 'biz-flow',
+      executionId: 'biz-exec',
+      sourceId: 'biz-source',
+      targetId: 'biz-target',
+      customer: { id: 'customer-42' },
+    }
+    const done = await runtimeA.handle({
+      method: 'POST', parts: ['instances', instanceId, 'tasks', 'h1', 'complete'], url, body: { payload },
+    })
+    eq(done.status, 200, JSON.stringify(done.body))
+    eq(done.body.status, 'ACTIVE', '还有 h2 等待，实例没结束')
+    await runtimeA.dispose()
+
+    const runtimeB = createBpmnRuntime({ dir, env })
+    const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId], url })
+    eq(detail.status, 200, JSON.stringify(detail.body))
+    eq(detail.body.recovered, true, '业务变量名不能导致恢复被拒')
+    eq(detail.body.pendingTasks[0].activityId, 'h2')
+    eq(detail.body.variables.customer.id, 'customer-42')
+    await runtimeB.dispose()
+  })
+
+  // -------------------------------------------------------------------------
   // 8. handler 边界：dsh 明确失败 / http 明确未实现 / custom 传上下文
   // -------------------------------------------------------------------------
   await check('handler 边界：dsh 报 BPMN_AGENT_ADAPTER_UNAVAILABLE，http 报 BPMN_HTTP_NOT_IMPLEMENTED', async () => {

@@ -739,6 +739,12 @@ export function assertEngineStateBoundToStructure(engineState, structure) {
     }
     for (const [key, item] of Object.entries(value)) {
       const childPath = path === '' ? key : `${path}.${key}`
+      // `environment` 是引擎的运行态数据（活动 output / variables 就是业务变量），
+      // 不是结构引用：业务 payload 的键名恰好叫 id / activityId / elementId 时，
+      // 它们会出现在 execution.processes[i].environment.output.<activity>.* 下。
+      // 这一层不能按「结构 id」校验，否则合法快照会被当成「来自另一份引擎」拒绝恢复
+      // （codex 复审实测：人工任务提交 {customer:{id}, activityId} 后重启即 503）。
+      if (key === 'environment') continue
       if (checkedKeys.has(key) && typeof item === 'string' && item !== '' && !allowed(item)) {
         violations.push(`${childPath}=${JSON.stringify(item)}`)
       }

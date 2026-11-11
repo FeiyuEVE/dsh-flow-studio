@@ -482,10 +482,15 @@ function pickRoute(value) {
 
 function resolveAgentOptions(options, runnerCtx, element) {
   const node = isPlainObject(element && element.node) ? element.node : {}
+  // BPMN 里 provider / model 是**两个字符串属性**（`fs:node@provider` / `@model`），
+  // 必须自己拼成 pair，否则 pickRoute 只看到单个 model 会整条丢掉——节点就会以
+  // 「has no provider/model」失败（codex 复审实测）。
+  const nodeRoute = { provider: node.provider, model: node.model }
   const candidates = [
     options && options.agentOptions,
     runnerCtx && runnerCtx.agentOptions,
     node.agentOptions,
+    nodeRoute,
     node.model,
   ]
   for (const candidate of candidates) {

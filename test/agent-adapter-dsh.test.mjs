@@ -346,6 +346,29 @@ await check('提醒：第一轮停下 1 次 steer → 第二轮调工具 → 成
   await adapter.dispose(handle)
 })
 
+await check('BPMN provider/model 成对传给 agents.create（不被静默丢弃）', async () => {
+  // codex 复审发现：BPMN 里 provider / model 是两个字符串属性，旧实现只把 node.model
+  // 当候选、pickRoute 要成对，于是整条路由被丢掉，节点以「has no provider/model」失败。
+  const host = createFakeHost()
+  const gate = makeGate(freshWorkspace())
+  const adapter = makeAdapter(host)
+  const element = {
+    ...ELEMENT,
+    node: { ...ELEMENT.node, provider: 'deepseek', model: 'deepseek-chat' },
+  }
+  const handle = await adapter.start({
+    element,
+    ctx: { attempt: 1 },
+    finishGate: gate,
+    workspaceRoot: freshWorkspace(),
+  })
+  A.deepEqual(host.createCalls[0].agentOptions, { provider: 'deepseek', model: 'deepseek-chat' })
+  host.agent.idle.resolve()
+  await adapter.dispose(handle)
+  const exited = await handle.exited
+  A.equal(exited.code, 'NODE_FINISH_CANCELED', 'dispose 视为取消')
+})
+
 // ---------------------------------------------------------------------------
 // 3. 提醒用尽 → NODE_FINISH_MISSING
 // ---------------------------------------------------------------------------

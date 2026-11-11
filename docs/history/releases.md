@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.11）
+# 版本历史（0.1 → 0.13.12）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -722,3 +722,27 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 - 新增 `docs/reference/instance-api.md`：定义域 + 实例域的全部 HTTP 路由、请求 / 响应字段、错误码与语义口径（状态、收件箱、worktree、connector、资源事件）。`host-api.md` 退回只描述旧运行域并一行指过去，`design/10` 保留设计记录。
 - 文档里如实标出「没有的路由」：没有 `GET /instances/<id>/connector` 读取调用记录、没有删除实例、没有 suspend / resume、没有列回复 outbox。
+
+## 0.13.12 — 0.13.10 复审收口（收件箱安全与可靠性）
+
+0.13.10 的独立复审给出 1 BLOCKER + 11 MAJOR（N1–N13）。本版把它们全部收口；其中 N2 / N3 也真正关闭了 0.13.9 遗留的 F3（物理退出确认）与 F4（锁抢占 ABA）。
+
+- **N1（BLOCKER）正文物化不再跟随符号链接**：落盘到 `.flow-studio-inbox/<instanceId>/<messageId>.<sha16>.md`；父目录逐级 `lstat` 拒绝软链与非目录，文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建；同名同内容复用、异内容换名不覆盖；任何异常返回 `MESSAGE_BODY_UNSAFE` 且不留半文件。
+- **N4** 不同实例共用工作区时同名 `messageId` 不再串正文（路径含实例身份 + 内容 hash），已交给 agent 的文件不可变。
+- **N5** journal 尾部半行不再吞掉下一条已受理记录：锁内把不完整尾行原样转存 `.torn` 并截断到最后一个完整行，幂等与 seq 语义不变。
+- **N6** 回复 outbox 改为「领取投递权（token）→ 外发 → token CAS 写回」：并发只外发一次、`attempts` 只加一、迟到失败不覆盖 `delivered`；跨进程拿不到投递权时返回 409 `MESSAGE_REPLY_DISPATCH_IN_FLIGHT`。
+- **N7** finish 与受理的竞态不再留下无人消费的 `queued`：落盘后复核执行生命周期，仍排队且执行已结束的按 `failed`（`execution-ended`）条件收口；已投递消息不会被过期改写。
+- **N8** 同一激活内持续分批推进到队列空（总上限 100 条 / 激活），超限留在 `queued` 并在 `remaining` 报数——不再「首批 5 条之后就没有下一批」。
+- **N9** 只有附件的 session 回复不再上报 `delivered` 空文本：附件转成含 `path` / `sha256` / 字节数的引用；确实无法表达时明确失败。
+- **N2**（关闭 F3）codex 进程退出按子进程跟踪（初始进程 + 每次 resume），**全部**确认退出才 `cleanup.disposed:true`；dispose 有界等待并如实返回 `pending`，不再把「发出 SIGKILL」当成「已退出」。
+- **N3**（关闭 F4）资源锁改用内核 `flock`（util-linux）：删掉 `.steal` guard 与 stale 恢复，结构上不再存在 check-then-delete 的 ABA；持锁进程崩溃由内核释放；锁文件常驻只作 inode 锚点，不再删除。
+- **N10–N13** 收件箱 GUI：状态按实例隔离（迟到的列表 / 正文 / 发送结果 / 通知一律丢弃）、一次逻辑提交固定 `messageId`（响应丢失后重试仍幂等）、游标分页（不再截断 50 条、可「加载更多」）、目标模式可切换（exact 目标消失时自动回退到「下次激活」并说明）。
+- **提示词信任边界**：外部正文进入 `<untrusted-message>` 数据区块并声明「不可信输入、不得覆盖节点任务与完成契约」；DSH 侧 `source.meta.untrusted` + 发起方 id 可区分来源。明确这只是可辨识性，**不是权限控制**，finish gate 未改（注入文本不会让节点自动完结）。
+- **文档与元数据**：计划里 D 章节的版本号、0.13.10 段失实的表述（F1–F9 全关 / GUI 有回复 / 缺失路径定向注销）修正，`package-lock.json` 版本对齐 `package.json`。
+
+**已知边界**
+- 没有 util-linux `flock` 的平台（Windows / macOS）退回进程内队列，只保证同进程串行，跨进程互斥不成立；NFS / SMB 共享卷不保证 flock 语义，锁目录应放本地盘。
+- 正文物化的「父目录在写入期间被替换」TOCTOU 窗口无法在语言层彻底消除（已用 lstat + `O_NOFOLLOW` + 写后 realpath 复核收敛）。
+- 提示词不可信边界只提高可辨识度，不构成权限控制；真实模型是否受其约束未验证。
+- N6 的跨进程等待路径只测到 store 层 claim / CAS，未做跨进程集成用例。
+- 自定义 session 投递实现如果忽略附件，属宿主实现责任；默认实现已不再静默丢弃。

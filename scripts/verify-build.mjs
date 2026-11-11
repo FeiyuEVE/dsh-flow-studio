@@ -12,13 +12,18 @@
  *   B. 依赖归属（模块级）：重建时的 esbuild metafile 记录每个产物真正包含的模块与
  *      字节数；主包不得出现 bpmn-js / diagram-js / @bpmn-io，chunk 不得出现 @xyflow。
  *      同时与 lib/build-meta.json 的 modules 清单交叉核对。
- *   C. 输入绑定：meta.inputsHash 必须等于当前磁盘输入重算的哈希。输入集合 =
+ *   C. 输入绑定：meta.inputs 的**每一条**都要与磁盘重算的 {bytes, sha256} 一致，
+ *      inputsHash 必须等于当前磁盘输入重算的哈希；声明集合还必须与「重建 metafile
+ *      的实际打包输入 + 资源输入」完全相同（缺项 / 多项都失败）。输入集合 =
  *      src/**、scripts/build*.mjs、package.json / package-lock.json、esbuild 版本、
  *      官方 CSS 与 woff2 字体、以及 esbuild metafile 的打包输入（含 node_modules）。
- *   D. 注册与 factory：**前面的字节/元数据检查全部通过后**，才在受限沙箱里求值
- *      两个产物并执行 factory。自定义 require 只暴露受控模块（react 等），
- *      process / require('process') 不可用；整个 factory 调用带 VM 超时。
- *      提前退出、抛错、超时一律按失败处理，不看进程退出码。
+ *   D. 注册与 factory：**前面的字节/元数据检查全部通过后**，才在**独立子进程**里
+ *      求值两个产物并执行 factory。子进程内用无宿主对象的 VM realm（null 原型
+ *      context + 禁止动态代码生成），自定义 require 只暴露受控模块（react 等），
+ *      process / require('process') 不可用；属性读取、序列化、错误格式化全在
+ *      该 realm 内完成。子进程带外部硬超时（超时 SIGKILL），父进程只认 stdout 上
+ *      带完成标记的完整 JSON —— 退出码 0 本身不算通过（逃逸后 process.exit(0)
+ *      会被判失败）。
  *
  * meta 缺失、字段缺失、schemaVersion 不符一律失败 —— 不允许静默跳过。
  * 与 `node scripts/build.mjs` 共用构建实现（都从 scripts/build.mjs import）。
@@ -30,7 +35,6 @@ import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
-import vm from 'node:vm'
 
 import {
   HOST_MODULES,
@@ -44,6 +48,7 @@ import {
   collectBuildInputs,
   hashInputManifest,
   findLeakMarkers,
+  runFactoryCheckInChild,
 } from './build.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -110,161 +115,20 @@ for (const file of GENERATED_MODULES) {
   if (leaks.length > 0) problems.push(`lib/${file} 依赖泄漏：命中 ${leaks.join('、')}`)
 }
 
-/** 注册代码求值超时：只覆盖同步代码。 */
-const REGISTRATION_TIMEOUT_MS = 10000
-/** factory 执行超时：VM timeout 覆盖整个同步调用，卡死也按失败处理。 */
-const FACTORY_TIMEOUT_MS = 3000
-/** factory 允许访问的模块白名单；process / 文件系统 / 子进程一律不在里面。 */
-const FACTORY_ALLOWED_MODULES = ['react', 'react-dom', 'react/jsx-runtime']
-
 /**
- * 构造一个**全部对象都由 VM realm 自己创建**的沙箱。
+ * 求值注册 + 形状检查 + 执行 factory —— 全部在**独立子进程**里完成（0.13.6 复审 F4）。
  *
- * 不把任何 host 函数 / 对象传进 context：host 函数可以被
- * `fn.constructor('return process')()` 拿来逃逸回宿主。所以 window、
- * __ModuleLoader__、console、require、React 占位全部在 context 内脚本里创建。
- *
- * @param {string} file 产物文件名（用于错误信息）
- * @returns {object} vm context
- */
-function createSandboxContext(file) {
-  const context = vm.createContext({}, { name: `lib/${file}` })
-  const allowed = FACTORY_ALLOWED_MODULES.join(', ')
-  vm.runInContext(`
-    globalThis.window = globalThis
-    globalThis.console = { log() {}, info() {}, warn() {}, error() {}, debug() {} }
-    globalThis.__definition__ = null
-    globalThis.window.__ModuleLoader__ = {
-      load(definition) { globalThis.__definition__ = definition },
-    }
-    globalThis.__hostModules__ = {
-      react: { createElement: (...args) => args[0] },
-      'react-dom': {},
-      'react/jsx-runtime': {},
-    }
-    globalThis.__factoryRequire__ = function (name) {
-      if (Object.prototype.hasOwnProperty.call(globalThis.__hostModules__, name)) {
-        return globalThis.__hostModules__[name]
-      }
-      throw new Error(
-        ${JSON.stringify(`lib/${file} 的 factory 请求了未授权的宿主模块 `)}
-        + JSON.stringify(name)
-        + ${JSON.stringify(`（白名单：${allowed}；process / 文件系统不可用）`)},
-      )
-    }
-  `, context, { filename: `lib/${file}#sandbox` })
-  return context
-}
-
-/**
- * 在独立 VM context 里求值产物，捕获注册定义。
- * 返回 context 供后续 factory 调用复用（同一 context，timeout 才覆盖得到 factory 代码）。
- *
- * @param {string} source 产物源码
- * @param {string} file 产物文件名
- * @returns {{ context: object, definition: object|null }}
- */
-function loadRegistration(source, file) {
-  const context = createSandboxContext(file)
-  vm.runInContext(source, context, { filename: `lib/${file}`, timeout: REGISTRATION_TIMEOUT_MS })
-  const definition = vm.runInContext('globalThis.__definition__', context, {
-    filename: `lib/${file}#definition`,
-  })
-  return { context, definition }
-}
-
-/** 检查 client.js factory 返回值是不是宿主期望的插件对象。 */
-function checkPluginShape(file, plugin) {
-  if (plugin === null || typeof plugin !== 'object') {
-    problems.push(`lib/${file} 的 factory 返回的不是插件对象（实际：${String(plugin)}）`)
-    return
-  }
-  if (plugin.name !== 'flow-studio') {
-    problems.push(`lib/${file} 返回的插件 name 是 ${JSON.stringify(plugin.name)}，应为 flow-studio`)
-  }
-  if (typeof plugin.apply !== 'function') problems.push(`lib/${file} 返回的插件缺少 apply 方法`)
-  if (!Array.isArray(plugin.inject) || !plugin.inject.includes('slots')) {
-    problems.push(`lib/${file} 返回的插件 inject 不是 ['slots']（实际：${JSON.stringify(plugin.inject)}）`)
-  }
-}
-
-/** 检查 chunk factory 返回值是不是宿主期望的 exports 形状。 */
-function checkChunkShape(file, chunkExports) {
-  if (chunkExports === null || typeof chunkExports !== 'object') {
-    problems.push(`lib/${file} 的 factory 没有返回 exports 对象（实际：${String(chunkExports)}）`)
-    return
-  }
-  if (typeof chunkExports.mountEditor !== 'function') problems.push(`lib/${file} 的 exports 缺少 mountEditor 函数`)
-  if (typeof chunkExports.version !== 'string' || chunkExports.version === '') {
-    problems.push(`lib/${file} 的 exports 缺少非空 version 字符串`)
-  }
-  if (typeof chunkExports.BPMN_EDITOR_CSS !== 'string' || chunkExports.BPMN_EDITOR_CSS === '') {
-    problems.push(`lib/${file} 的 exports 缺少 BPMN_EDITOR_CSS 样式字符串`)
-  }
-}
-
-/**
- * 求值注册 + 形状检查 + 在受限沙箱里执行 factory。
- *
- * factory 的调用被放进 `vm.runInContext('__definition__.factory(__factoryRequire__)')`：
- *   - 同步部分受 timeout 保护（while(true) 会在超时后中止）；
- *   - require 是 context 内创建的函数，只返回白名单占位模块，
- *     `require('process').exit(0)` 会抛错，`process` 在沙箱里不存在；
- *   - 提前退出 / 抛错 / 超时都记成 problems，最终由本脚本非零退出，
- *     不依赖 factory 自己的进程退出码。
+ * 父进程只拿到子进程 stdout 上的一行结构化 JSON：属性读取、序列化、错误格式化
+ * 都在子进程的受限 VM realm 里发生（无限 getter 因此同样受 VM 超时保护），
+ * 子进程本身还有外部硬超时（超时 SIGKILL）。最终判定只认带完成标记的完整
+ * 结果 —— 子进程退出码 0（例如逃逸后 process.exit(0)）一律不算通过。
  *
  * @param {string} file 产物文件名
  * @param {Buffer} buffer 产物字节
  */
 function checkRegistration(file, buffer) {
-  const source = buffer.toString('utf8')
-  let context
-  let definition
-  try {
-    ({ context, definition } = loadRegistration(source, file))
-  } catch (error) {
-    problems.push(`lib/${file} 求值失败（注册形状不可用）：${error.message}`)
-    return
-  }
-  if (definition === null || typeof definition !== 'object') {
-    problems.push(`lib/${file} 没有调用 window.__ModuleLoader__.load（或传入的不是对象）`)
-    return
-  }
-  if (definition.id !== '@feiyueve/dsh-flow-studio') {
-    problems.push(`lib/${file} 注册 id 是 ${JSON.stringify(definition.id)}，应为 @feiyueve/dsh-flow-studio`)
-  }
-  if (typeof definition.factory !== 'function') {
-    problems.push(`lib/${file} 的 factory 不是函数`)
-    return
-  }
-  if (file === 'client.js') {
-    if ('chunk' in definition) {
-      problems.push(`lib/${file} 不应带 chunk 字段（它是主包，chunk=${JSON.stringify(definition.chunk)}）`)
-    }
-  } else if (definition.chunk !== 'client.bpmn.js') {
-    problems.push(`lib/${file} 的注册字段不是 chunk: 'client.bpmn.js'（实际：${JSON.stringify(definition.chunk)}）`)
-  }
-
-  let result
-  try {
-    result = vm.runInContext('__definition__.factory(__factoryRequire__)', context, {
-      filename: `lib/${file}#factory`,
-      timeout: FACTORY_TIMEOUT_MS,
-    })
-  } catch (error) {
-    if (error !== null && typeof error === 'object' && error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
-      problems.push(`lib/${file} 的 factory 执行超时（>${FACTORY_TIMEOUT_MS}ms），已中止校验`)
-    } else {
-      const message = error !== null && typeof error === 'object' && typeof error.message === 'string'
-        ? error.message
-        : String(error)
-      problems.push(`lib/${file} 的 factory 执行失败：${message}`)
-    }
-    return
-  }
-
-  if (file === 'client.js') checkPluginShape(file, result)
-  else checkChunkShape(file, result)
+  const result = runFactoryCheckInChild(file, buffer, { rootDir: root })
+  for (const problem of result.problems) problems.push(`lib/${file} ${problem}`)
 }
 
 // ⑤ 构建元数据：输入绑定 + 产物绑定。任何字段缺失都不静默跳过。
@@ -380,11 +244,14 @@ if (meta !== null) {
       entry === null
       || typeof entry !== 'object'
       || typeof entry.path !== 'string'
+      || entry.path === ''
       || !Number.isInteger(entry.bytes)
+      || entry.bytes < 0
       || typeof entry.sha256 !== 'string'
+      || !HEX64.test(entry.sha256)
     ))
     if (malformed.length > 0) {
-      problems.push(`lib/${BUILD_META_FILE} 的 inputs 有 ${malformed.length} 条格式不合法（缺 path/bytes/sha256）`)
+      problems.push(`lib/${BUILD_META_FILE} 的 inputs 有 ${malformed.length} 条格式不合法（缺 path/bytes/64 位 sha256）`)
     } else {
       const currentInputs = collectBuildInputs(
         root,
@@ -394,6 +261,34 @@ if (meta !== null) {
       for (const entry of currentInputs) {
         if (entry.sha256 === 'missing') {
           problems.push(`构建输入缺失：${entry.path}（构建元数据记录过它，磁盘上已不存在）`)
+        }
+      }
+
+      // 条目自校验（0.13.6 复审 f1）：每条声明都必须和**从磁盘重算**的
+      // {bytes, sha256} 一致。只比对 aggregate hash 会漏掉「改单条哈希、
+      // 保留旧 inputsHash」这种伪造。
+      const currentMap = new Map(currentInputs.map(entry => [entry.path, entry]))
+      const declaredPaths = meta.inputs.map(entry => entry.path)
+      const duplicates = [...new Set(declaredPaths.filter((path, index) => declaredPaths.indexOf(path) !== index))]
+      if (duplicates.length > 0) {
+        problems.push(
+          `lib/${BUILD_META_FILE} 的 inputs 有重复条目：${duplicates.slice(0, MAX_INPUT_DIFF).join(', ')}`
+          + `${duplicates.length > MAX_INPUT_DIFF ? ' …' : ''}`,
+        )
+      }
+      const checked = new Set()
+      for (const entry of meta.inputs) {
+        if (checked.has(entry.path)) continue
+        checked.add(entry.path)
+        const actual = currentMap.get(entry.path)
+        if (actual === undefined || actual.sha256 === 'missing') continue
+        if (actual.bytes !== entry.bytes || actual.sha256 !== entry.sha256) {
+          problems.push(
+            `输入清单条目与磁盘不一致：${entry.path}`
+            + `（声明 ${entry.bytes} 字节 / sha256 ${entry.sha256.slice(0, 12)}…，`
+            + `实际 ${actual.bytes} 字节 / sha256 ${actual.sha256.slice(0, 12)}…）；`
+            + '逐条声明必须由构建真实写出，不能事后伪造',
+          )
         }
       }
       const currentHash = hashInputManifest(currentInputs)
@@ -498,19 +393,54 @@ try {
       }
     }
   }
+
+  // 输入清单完整性（0.13.6 复审 f1）：声明的输入集合必须与「重建 metafile 的
+  // 实际打包输入 + 资源输入 + 源码/脚本/清单扫描」完全一致；缺项 / 多项都失败。
+  // 只重算 aggregate hash 不够 —— 删掉一条依赖输入再重算哈希，旧口径仍然自洽。
+  if (Array.isArray(meta?.inputs) && meta.inputs.length > 0) {
+    const declaredPaths = meta.inputs
+      .filter(entry => entry !== null && typeof entry === 'object' && typeof entry.path === 'string')
+      .map(entry => entry.path)
+    const bundled = [...new Set([...rebuilt.inputs['client.js'], ...rebuilt.inputs['client.bpmn.js']])]
+    const authoritative = collectBuildInputs(root, bundled, { outputInputs: rebuilt.inputs })
+    const authoritativePaths = new Set(authoritative.map(entry => entry.path))
+    const declaredSet = new Set(declaredPaths)
+    const missing = [...authoritativePaths].filter(path => !declaredSet.has(path)).sort()
+    const extra = [...declaredSet].filter(path => !authoritativePaths.has(path)).sort()
+    if (missing.length > 0 || extra.length > 0) {
+      const detail = []
+      if (missing.length > 0) {
+        detail.push(
+          `清单缺少 ${missing.length} 个：${missing.slice(0, MAX_INPUT_DIFF).join(', ')}`
+          + `${missing.length > MAX_INPUT_DIFF ? ' …' : ''}`,
+        )
+      }
+      if (extra.length > 0) {
+        detail.push(
+          `清单多出 ${extra.length} 个：${extra.slice(0, MAX_INPUT_DIFF).join(', ')}`
+          + `${extra.length > MAX_INPUT_DIFF ? ' …' : ''}`,
+        )
+      }
+      problems.push(
+        `构建输入集合与独立重建不一致（meta.inputs 不可信）：${detail.join('；')}；`
+        + '声明集合必须与「重建 metafile 实际输入 + 资源输入」完全一致',
+      )
+    }
+  }
 } catch (error) {
   problems.push(`独立重建失败（无法用当前源码验证 lib/，可能是 esbuild/依赖不可用）：${error.message}`)
 }
 
 // ⑥ 注册形状与 factory：只有前面的字节 / 元数据 / 模块检查全部通过后才执行。
-//    这样损坏或恶意产物没机会用 factory 里的 process.exit(0) 提前结束校验。
+//    子进程只在这是「干净的当前构建」时才拿到产物源码；即使它被逃逸代码
+//    process.exit(0) 提前结束，也拿不到完成标记，父进程仍然判失败。
 if (problems.length === 0) {
   for (const file of GENERATED_MODULES) {
     if (generated[file] === undefined) continue
     try {
       checkRegistration(file, generated[file])
     } catch (error) {
-      // 注册对象/返回值若是恶意 Proxy，属性访问也可能抛错；一律按失败处理。
+      // 例如子进程根本起不来（spawn 失败）：一律按失败处理。
       const message = error !== null && typeof error === 'object' && typeof error.message === 'string'
         ? error.message
         : String(error)
@@ -548,13 +478,13 @@ if (problems.length > 0) {
 }
 
 console.log(`✓ 构建元数据完整：schemaVersion=${meta.schemaVersion} inputsHash=${meta.inputsHash}`)
-console.log(`✓ 输入绑定一致（${meta.inputs.length} 个输入文件，含 src/scripts/锁文件/官方 CSS/字体/依赖文件内容）`)
+console.log(`✓ 输入绑定一致（${meta.inputs.length} 个输入文件逐条与磁盘一致，且与重建输入集合完全相同；含 src/scripts/锁文件/官方 CSS/字体/依赖文件内容）`)
 console.log('✓ 独立重建与 lib/ 逐字节一致：client.js / client.bpmn.js（按当前源码在内存重建，不信任自报哈希）')
 for (const output of meta.outputs) {
   console.log(`✓ lib/${output.file} 与元数据逐字节绑定（${output.bytes} 字节 sha256=${output.sha256.slice(0, 12)}…，${output.modules.length} 个模块）`)
 }
 console.log('✓ 注册形状与 factory 可执行：client.js → flow-studio 插件；client.bpmn.js → exports(mountEditor/version/BPMN_EDITOR_CSS)')
-console.log('✓ factory 在受限沙箱执行：require 只暴露白名单模块、process 不可用、带 VM 超时')
+console.log('✓ factory 在独立子进程里执行：require 只暴露白名单模块、process 不可达、属性读取/序列化同受 VM 超时，父进程只认带完成标记的结构化结果')
 console.log('✓ 依赖归属：主包模块清单无 bpmn-js / diagram-js / @bpmn-io；chunk 模块清单无 @xyflow（内容特征为辅助）')
 console.log(`✓ src ↔ lib 逐字节一致（${HOST_MODULES.length} 个 Host 模块）`)
 console.log(`✓ lib/ 下 .js 数量 ${audit.actual.length} 与清单一致（Host ${HOST_MODULES.length} + 生成 ${GENERATED_MODULES.length}）`)

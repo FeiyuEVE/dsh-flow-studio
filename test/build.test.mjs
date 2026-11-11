@@ -47,9 +47,11 @@ import {
   GENERATED_MODULES,
   HOST_MODULES,
   EXPECTED_LIB_MODULES,
+  FACTORY_CHECK_MARKER,
   collectBuildInputs,
   findLeakMarkers,
   hashInputManifest,
+  parseFactoryCheckChildOutput,
 } from '../scripts/build.mjs'
 
 let checks = 0
@@ -706,7 +708,127 @@ try {
     A.match(output, /process/, '沙箱里 process 不可达')
   })
 
-  await check('反例十四：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
+  await check('反例十五：globalThis.constructor 构造器逃逸后 exit(0)（子进程提前退出）必须失败', async () => {
+    const dir = makeCase('factory-global-ctor')
+    injectPluginCode(dir, "globalThis.constructor.constructor('return process')().exit(0)")
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'globalThis.constructor 逃逸路径让 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行失败/, '逃逸尝试被当作 factory 执行失败')
+    A.match(output, /process|动态代码生成|Code generation/, '报错说明 process 不可达 / 代码生成被禁')
+  })
+
+  await check('反例十六：window.constructor 构造器逃逸后 exit(0) 必须失败', async () => {
+    const dir = makeCase('factory-window-ctor')
+    injectPluginCode(dir, "window.constructor.constructor('return process')().exit(0)")
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, 'window.constructor 逃逸路径让 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行失败/, '逃逸尝试被当作 factory 执行失败')
+    A.match(output, /process|动态代码生成|Code generation/, '报错说明 process 不可达 / 代码生成被禁')
+  })
+
+  await check('反例十七：factory 返回带无限 getter 的对象时属性读取也必须被 VM 超时中止', async () => {
+    const dir = makeCase('factory-getter-timeout')
+    injectPluginCode(dir, 'return { get name() { while (true) {} } }')
+    buildCase(dir)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '无限 getter 让 verify-build 非零退出')
+    A.ok(!output.includes('跳过 factory 执行'), '字节检查通过后 factory 确实被执行')
+    A.match(output, /factory 执行超时/, '属性读取发生在受限执行范围内，超时被明确报出')
+    A.match(output, /3000ms/, '报错给出 factory 超时阈值')
+  })
+
+  await check('反例十八：输入清单单条 sha256 归零（aggregate hash 不变）必须失败', async () => {
+    const dir = makeCase('manifest-zero-hash')
+    buildCase(dir)
+    const caseMetaPath = join(dir, 'lib', BUILD_META_FILE)
+    const meta = JSON.parse(readFileSync(caseMetaPath, 'utf8'))
+    const target = meta.inputs.find(entry => entry.path === 'src/client/page.js')
+    A.ok(target !== undefined, '清单里有 src/client/page.js 的输入条目')
+    target.sha256 = '0'.repeat(64)
+    writeFileSync(caseMetaPath, `${JSON.stringify(meta, null, 2)}\n`)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '单条 sha256 归零后 verify-build 非零退出')
+    A.ok(!output.includes('构建输入已变化'), 'aggregate hash 未变，旧口径查不出这一条')
+    A.match(output, /输入清单条目与磁盘不一致/, '逐条声明被拿磁盘重算结果核对')
+    A.match(output, /src\/client\/page\.js/, '报错点名被伪造的输入条目')
+  })
+
+  await check('反例十九：从输入清单删掉一条依赖并重算 aggregate hash 必须失败', async () => {
+    const dir = makeCase('manifest-drop-input')
+    buildCase(dir)
+    const caseMetaPath = join(dir, 'lib', BUILD_META_FILE)
+    const meta = JSON.parse(readFileSync(caseMetaPath, 'utf8'))
+    const removed = meta.inputs.find(entry => entry.path.endsWith('diagram-js/lib/command/CommandStack.js'))
+    A.ok(removed !== undefined, '清单里有 diagram-js 的 CommandStack 依赖条目')
+    meta.inputs = meta.inputs.filter(entry => entry !== removed)
+    // 按剩余条目重算 aggregate hash：模拟「删项后把哈希也做成自洽」。
+    meta.inputsHash = hashInputManifest(meta.inputs)
+    writeFileSync(caseMetaPath, `${JSON.stringify(meta, null, 2)}\n`)
+    const result = verifyCase(dir)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '删掉依赖输入后 verify-build 非零退出')
+    A.ok(!output.includes('构建输入已变化'), 'aggregate hash 已按剩余条目重算，旧口径自洽')
+    A.match(output, /构建输入集合与独立重建不一致/, '声明集合与重建输入集合被完整比对')
+    A.match(output, /CommandStack\.js/, '报错点名被删掉的依赖输入')
+  })
+
+  await check('反例二十：子进程退出码 0 但没有完整完成标记必须判失败（判据不恒假）', async () => {
+    const validPayload = { marker: FACTORY_CHECK_MARKER, file: 'client.js', done: true, problems: [] }
+    const earlyExit = parseFactoryCheckChildOutput('client.js', { status: 0, signal: null, stdout: '', stderr: '' })
+    A.ok(!earlyExit.ok, '空输出 + 退出码 0 不算通过（子进程提前退出）')
+    A.match(earlyExit.problems.join(' '), /退出码 0 不算通过|不被采信/, '报错说明退出码不被采信')
+
+    const partial = parseFactoryCheckChildOutput('client.js', {
+      status: 0,
+      signal: null,
+      stdout: '{"done":true,"problems":[]}',
+      stderr: '',
+    })
+    A.ok(!partial.ok, '缺完成标记的 JSON 不算通过')
+
+    const wrongFile = parseFactoryCheckChildOutput('client.js', {
+      status: 0,
+      signal: null,
+      stdout: JSON.stringify({ ...validPayload, file: 'client.bpmn.js' }),
+      stderr: '',
+    })
+    A.ok(!wrongFile.ok, '标记属于另一个产物时不算通过')
+
+    const multiLine = parseFactoryCheckChildOutput('client.js', {
+      status: 0,
+      signal: null,
+      stdout: `${JSON.stringify(validPayload)}\n{"trace":1}\n`,
+      stderr: '',
+    })
+    A.ok(!multiLine.ok, '多于一行输出不算通过（拒绝以部分输出放行）')
+
+    const timedOut = parseFactoryCheckChildOutput('client.js', {
+      status: null,
+      signal: 'SIGKILL',
+      stdout: '',
+      stderr: '',
+      error: { code: 'ETIMEDOUT' },
+    })
+    A.ok(!timedOut.ok, '外部硬超时必须判失败')
+
+    const good = parseFactoryCheckChildOutput('client.js', {
+      status: 0,
+      signal: null,
+      stdout: `${JSON.stringify(validPayload)}\n`,
+      stderr: '',
+    })
+    A.ok(good.ok, '带完整完成标记的结构化结果才通过（确认判据不是恒假）')
+  })
+
+  await check('反例二十一：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
     rmSync(join(checkout, 'lib'), { recursive: true, force: true })
     const packDir2 = join(work, 'pack-no-scripts')
     mkdirSync(packDir2, { recursive: true })

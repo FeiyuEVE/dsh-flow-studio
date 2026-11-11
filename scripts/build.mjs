@@ -28,6 +28,7 @@
  * HOST_MODULES 派生，不再写第二份（scripts/verify-build.mjs 也从这里 import）。
  */
 
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   copyFileSync,
@@ -482,6 +483,380 @@ export async function buildClientBundles(options = {}) {
       'client.bpmn.js': Object.keys(chunkResult.metafile.inputs).filter(path => !path.startsWith('bpmn-assets:')),
     },
   }
+}
+
+// ---- factory 隔离执行（verify-build.mjs 专用） ---------------------------------
+// 背景（0.13.6 复审 F4）：factory 是不可信代码。0.13.5 在**当前进程**里用 vm 跑它，
+// 于是有两个洞：
+//   ① `vm.createContext({})` 的全局对象继承宿主 Object.prototype，
+//      `globalThis.constructor.constructor('return process')()` 拿到了真实 process；
+//   ② 形状检查 / 属性读取 / JSON 序列化都在 vm 之外做，一个无限循环的 `name`
+//      getter 就能越过 vm 的 3s 超时把整个校验挂住。
+// 现在改成**独立子进程**：父进程把产物源码通过 stdin 交给子进程，子进程在自己的
+// 硬超时（SIGKILL）内用无宿主对象的 VM realm 完成「注册 → factory → 返回值检查 →
+// 序列化」，只往 stdout 写一行带完成标记的 JSON。父进程只认这一行结构化结果：
+// 子进程退出码 0 本身（例如逃逸后 process.exit(0)）一律判失败。
+
+/** 完整完成标记：父进程只接受带它的一行 JSON，退出码不构成通过。 */
+export const FACTORY_CHECK_MARKER = 'dsh-flow-studio.factory-check.v1'
+/** 注册代码求值超时（子进程内 VM，只覆盖同步代码）。 */
+export const FACTORY_REGISTRATION_TIMEOUT_MS = 10000
+/** factory 调用 + 返回值属性读取 + 序列化，整体受同一个 VM 超时保护。 */
+export const FACTORY_CALL_TIMEOUT_MS = 3000
+/** 子进程外部硬超时：VM 超时失效或进程卡死时由父进程 SIGKILL。 */
+export const FACTORY_CHILD_TIMEOUT_MS = 15000
+/** factory 允许访问的模块白名单；process / 文件系统 / 子进程一律不在里面。 */
+export const FACTORY_ALLOWED_MODULES = ['react', 'react-dom', 'react/jsx-runtime']
+
+/**
+ * factory 校验子进程入口。**必须以函数源码形式**在子进程 `node -e` 里执行
+ * （见 runFactoryCheckInChild）：只从 stdin 读 JSON 请求、往 stdout 写一行 JSON，
+ * 不引用父进程的任何对象，也不 import 本模块。
+ */
+function factoryCheckChildMain() {
+  const fs = require('node:fs')
+  const vm = require('node:vm')
+
+  /** 同步写 stdout 后立即退出：factory 残留的微任务 / 定时器挂不住进程。 */
+  const write = payload => {
+    fs.writeSync(1, JSON.stringify(payload) + '\n')
+    process.exit(0)
+  }
+
+  /**
+   * 子进程宿主侧的错误只可能来自 vm 本身（语法错误 / 超时）。
+   * 其他错误对象属于 realm，一律不在宿主侧读属性 —— 那会绕过超时。
+   */
+  const describeHostError = error => {
+    if (error instanceof SyntaxError) return error.message
+    return '无法安全格式化子进程异常（已拒绝访问跨 realm 错误对象）'
+  }
+
+  let request
+  try {
+    request = JSON.parse(fs.readFileSync(0, 'utf8'))
+  } catch {
+    write({ marker: 'invalid-request', file: null, done: false, problems: ['子进程读不到合法的 JSON 请求'] })
+    return
+  }
+
+  const reply = extra => write({
+    marker: request.marker,
+    file: request.file,
+    done: true,
+    problems: [],
+    ...extra,
+  })
+
+  /**
+   * 在 VM realm 内执行：所有对象（window / console / loader / require / 模块表）
+   * 都由 realm 自己创建，绝不把宿主对象或宿主函数放进 context —— 宿主函数被
+   * `fn.constructor('return process')()` 借道正是 0.13.5 的逃逸面。
+   *
+   * 额外关闭动态代码生成（eval / new Function / 各种构造器），把「用字符串造函数」
+   * 这条路也从根上封死。
+   */
+  function bootstrap(allowed) {
+    globalThis.window = globalThis
+    globalThis.console = { log() {}, info() {}, warn() {}, error() {}, debug() {} }
+    globalThis.__definition__ = null
+    globalThis.window.__ModuleLoader__ = {
+      load(definition) { globalThis.__definition__ = definition },
+    }
+    var modules = Object.create(null)
+    modules.react = { createElement(tag) { return tag } }
+    modules['react-dom'] = Object.create(null)
+    modules['react/jsx-runtime'] = Object.create(null)
+    globalThis.__hostModules__ = modules
+    globalThis.__factoryRequire__ = function (name) {
+      if (typeof name === 'string' && name in modules) return modules[name]
+      throw new Error('未授权的宿主模块 ' + String(name) + '（白名单：' + allowed + '；process / 文件系统不可用）')
+    }
+  }
+
+  /**
+   * 在 realm 内完成全部判定：读注册对象、调 factory、读返回对象属性、序列化。
+   * 宿主只拿到一个 JSON 字符串；无限 getter / 恶意 Proxy 都被同一个 VM 超时覆盖。
+   * 错误格式化也在这里做 —— 绝不让宿主去碰 realm 的 error 对象。
+   */
+  function checker(kind) {
+    var describe = function (error) {
+      try {
+        if (error !== null && typeof error === 'object' && typeof error.message === 'string') return error.message
+      } catch (_) {}
+      try { return String(error) } catch (_) { return '[无法格式化的异常]' }
+    }
+    var safeJson = function (value) {
+      try { return JSON.stringify(value) } catch (_) { return '[不可序列化]' }
+    }
+    var withHint = function (error, message) {
+      try {
+        if (error !== null && typeof error === 'object' && error.name === 'EvalError') {
+          return message + '（VM 沙箱禁止动态代码生成，process 不可达）'
+        }
+      } catch (_) {}
+      return message
+    }
+    var problems = []
+    try {
+      var definition = globalThis.__definition__
+      if (definition === null || typeof definition !== 'object') {
+        problems.push('没有调用 window.__ModuleLoader__.load（或传入的不是对象）')
+        return JSON.stringify({ problems: problems })
+      }
+      try {
+        if (definition.id !== '@feiyueve/dsh-flow-studio') {
+          problems.push('注册 id 是 ' + safeJson(definition.id) + '，应为 @feiyueve/dsh-flow-studio')
+        }
+      } catch (error) {
+        problems.push('读取注册 id 失败：' + describe(error))
+      }
+      var factory
+      try {
+        factory = definition.factory
+      } catch (error) {
+        problems.push('读取 factory 失败：' + describe(error))
+      }
+      if (typeof factory !== 'function') {
+        problems.push('factory 不是函数')
+        return JSON.stringify({ problems: problems })
+      }
+      try {
+        if (kind === 'plugin') {
+          if ('chunk' in definition) {
+            problems.push('不应带 chunk 字段（它是主包，chunk=' + safeJson(definition.chunk) + '）')
+          }
+        } else if (definition.chunk !== 'client.bpmn.js') {
+          problems.push('注册字段不是 chunk: \'client.bpmn.js\'（实际：' + safeJson(definition.chunk) + '）')
+        }
+      } catch (error) {
+        problems.push('读取 chunk 字段失败：' + describe(error))
+      }
+      var result
+      try {
+        result = factory(globalThis.__factoryRequire__)
+      } catch (error) {
+        problems.push(withHint(error, 'factory 执行失败：' + describe(error)))
+        return JSON.stringify({ problems: problems })
+      }
+      if (kind === 'plugin') {
+        if (result === null || typeof result !== 'object') {
+          problems.push('factory 返回的不是插件对象（实际：' + safeJson(result) + '）')
+          return JSON.stringify({ problems: problems })
+        }
+        try {
+          if (result.name !== 'flow-studio') {
+            problems.push('返回的插件 name 是 ' + safeJson(result.name) + '，应为 flow-studio')
+          }
+          if (typeof result.apply !== 'function') problems.push('返回的插件缺少 apply 方法')
+          if (!Array.isArray(result.inject) || result.inject.includes('slots') === false) {
+            problems.push('返回的插件 inject 不是 [\'slots\']（实际：' + safeJson(result.inject) + '）')
+          }
+        } catch (error) {
+          problems.push('检查插件返回值失败：' + describe(error))
+        }
+      } else {
+        if (result === null || typeof result !== 'object') {
+          problems.push('factory 没有返回 exports 对象（实际：' + safeJson(result) + '）')
+          return JSON.stringify({ problems: problems })
+        }
+        try {
+          if (typeof result.mountEditor !== 'function') problems.push('factory 返回的 exports 缺少 mountEditor 函数')
+          if (typeof result.version !== 'string' || result.version === '') {
+            problems.push('factory 返回的 exports 缺少非空 version 字符串')
+          }
+          if (typeof result.BPMN_EDITOR_CSS !== 'string' || result.BPMN_EDITOR_CSS === '') {
+            problems.push('factory 返回的 exports 缺少 BPMN_EDITOR_CSS 样式字符串')
+          }
+        } catch (error) {
+          problems.push('检查 exports 返回值失败：' + describe(error))
+        }
+      }
+      return JSON.stringify({ problems: problems })
+    } catch (error) {
+      return JSON.stringify({ problems: ['注册检查异常：' + describe(error)] })
+    }
+  }
+
+  const timeoutCode = 'ERR_SCRIPT_EXECUTION_TIMEOUT'
+  const isTimeout = error => error !== null && typeof error === 'object' && error.code === timeoutCode
+
+  // null 原型 context：全局对象的原型链不再挂到宿主 Object.prototype 上，
+  // `globalThis.constructor.constructor` 只能拿到 realm 自己的 Function（且被禁用）。
+  const context = vm.createContext(Object.create(null), {
+    name: 'lib/' + request.file,
+    codeGeneration: { strings: false, wasm: false },
+  })
+
+  try {
+    vm.runInContext(
+      '(' + bootstrap.toString() + ')(' + JSON.stringify(request.allowed.join(', ')) + ')',
+      context,
+      { filename: 'lib/' + request.file + '#sandbox', timeout: request.registrationTimeoutMs },
+    )
+  } catch (error) {
+    reply({ problems: ['沙箱初始化失败：' + describeHostError(error)] })
+    return
+  }
+
+  // 产物源码整段包进 realm 内的 try/catch：注册阶段抛错也由 realm 自己格式化。
+  const registrationScript = '(function () {\n'
+    + 'var describe = function (error) {\n'
+    + '  try { if (error !== null && typeof error === "object" && typeof error.message === "string") return error.message } catch (_) {}\n'
+    + '  try { return String(error) } catch (_) { return "[无法格式化的异常]" }\n'
+    + '}\n'
+    + 'try {\n'
+    + request.source
+    + '\n} catch (error) {\n'
+    + 'return JSON.stringify({ error: describe(error) })\n'
+    + '}\n'
+    + 'return null\n'
+    + '})()'
+
+  let registrationMessage = null
+  try {
+    const registrationReport = vm.runInContext(registrationScript, context, {
+      filename: 'lib/' + request.file,
+      timeout: request.registrationTimeoutMs,
+    })
+    if (typeof registrationReport === 'string') {
+      const parsed = JSON.parse(registrationReport)
+      if (parsed !== null && typeof parsed === 'object' && typeof parsed.error === 'string') {
+        registrationMessage = parsed.error
+      }
+    }
+  } catch (error) {
+    if (isTimeout(error)) {
+      reply({ problems: ['注册代码求值超时（>' + request.registrationTimeoutMs + 'ms），已中止校验'] })
+      return
+    }
+    reply({ problems: ['求值失败（注册形状不可用）：' + describeHostError(error)] })
+    return
+  }
+  if (registrationMessage !== null) {
+    reply({ problems: ['求值失败（注册形状不可用）：' + registrationMessage] })
+    return
+  }
+
+  let rawReport
+  try {
+    rawReport = vm.runInContext('(' + checker.toString() + ')(' + JSON.stringify(request.kind) + ')', context, {
+      filename: 'lib/' + request.file + '#factory',
+      timeout: request.factoryTimeoutMs,
+    })
+  } catch (error) {
+    if (isTimeout(error)) {
+      reply({ problems: ['factory 执行超时（>' + request.factoryTimeoutMs + 'ms），已中止校验'] })
+      return
+    }
+    reply({ problems: ['注册检查异常：' + describeHostError(error)] })
+    return
+  }
+
+  let report
+  try {
+    report = JSON.parse(rawReport)
+  } catch {
+    reply({ problems: ['校验结果不是合法 JSON'] })
+    return
+  }
+  const problems = report !== null && typeof report === 'object' && Array.isArray(report.problems)
+    ? report.problems.filter(item => typeof item === 'string')
+    : ['校验结果缺少 problems 数组']
+  reply({ problems })
+}
+
+/**
+ * 判定子进程结果：只接受**恰好一行**带完成标记的 JSON。
+ * 退出码 0 不是判据 —— 子进程被逃逸代码 process.exit(0) 提前结束、
+ * 或只输出半截内容，都按失败处理。
+ *
+ * @param {string} file 产物文件名
+ * @param {object} result spawnSync 的返回值（测试可传等价对象）
+ * @returns {{ ok: boolean, problems: string[] }}
+ */
+export function parseFactoryCheckChildOutput(file, result) {
+  if (result === null || typeof result !== 'object') {
+    return { ok: false, problems: ['factory 检查子进程没有返回结果'] }
+  }
+  if (result.error !== undefined && result.error !== null) {
+    if (result.error.code === 'ETIMEDOUT') {
+      return {
+        ok: false,
+        problems: [`factory 检查子进程超时（>${FACTORY_CHILD_TIMEOUT_MS}ms），已强制终止并判定失败`],
+      }
+    }
+    const reason = typeof result.error.message === 'string' ? result.error.message : String(result.error.code)
+    return { ok: false, problems: [`factory 检查子进程启动/运行失败：${reason}`] }
+  }
+  if (result.signal) {
+    return { ok: false, problems: [`factory 检查子进程被信号 ${result.signal} 终止，没有完成校验`] }
+  }
+  const stdout = typeof result.stdout === 'string' ? result.stdout : ''
+  const trimmed = stdout.trim()
+  if (trimmed === '') {
+    return {
+      ok: false,
+      problems: [`factory 检查子进程没有输出校验结果（退出码 ${String(result.status)} 不被采信；退出码 0 不算通过）`],
+    }
+  }
+  if (trimmed.includes('\n')) {
+    return { ok: false, problems: ['factory 检查子进程输出多于一行，拒绝以部分输出判定通过'] }
+  }
+  let payload
+  try {
+    payload = JSON.parse(trimmed)
+  } catch {
+    return { ok: false, problems: ['factory 检查子进程输出不是合法 JSON（没有完整校验标记）'] }
+  }
+  if (payload === null || typeof payload !== 'object'
+    || payload.marker !== FACTORY_CHECK_MARKER
+    || payload.done !== true
+    || payload.file !== file
+    || !Array.isArray(payload.problems)
+    || payload.problems.some(item => typeof item !== 'string')) {
+    return { ok: false, problems: ['factory 检查子进程缺少完整的校验结果标记（退出码 0 不算通过）'] }
+  }
+  return { ok: true, problems: payload.problems }
+}
+
+/**
+ * 在独立子进程里执行一次 factory 校验，返回结构化判定。
+ * 子进程带外部硬超时（FACTORY_CHILD_TIMEOUT_MS，超时 SIGKILL），
+ * 父进程只解析 stdout 上的完成标记，不看退出码。
+ *
+ * 返回的 `ok` 表示「子进程给出了可信的完整结果」，不是「factory 检查通过」：
+ * 检查发现的问题在 problems 里，调用方必须把它们一律当作失败。
+ *
+ * @param {string} file 产物文件名
+ * @param {Buffer} buffer 产物字节
+ * @param {{rootDir?: string}} [options]
+ * @returns {{ ok: boolean, problems: string[] }}
+ */
+export function runFactoryCheckInChild(file, buffer, options = {}) {
+  const { rootDir = root } = options
+  const request = JSON.stringify({
+    marker: FACTORY_CHECK_MARKER,
+    file,
+    kind: file === 'client.js' ? 'plugin' : 'chunk',
+    allowed: FACTORY_ALLOWED_MODULES,
+    registrationTimeoutMs: FACTORY_REGISTRATION_TIMEOUT_MS,
+    factoryTimeoutMs: FACTORY_CALL_TIMEOUT_MS,
+    source: buffer.toString('utf8'),
+  })
+  const child = spawnSync(process.execPath, ['-e', `(${factoryCheckChildMain.toString()})()`], {
+    cwd: rootDir,
+    input: request,
+    encoding: 'utf8',
+    // 外部截止时间：VM 超时失效时（例如宿主侧属性访问被挂住）也一定能收场。
+    timeout: FACTORY_CHILD_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    maxBuffer: 16 * 1024 * 1024,
+    windowsHide: true,
+    // 父进程的 NODE_OPTIONS（可能带 --require 之类）不能钻进隔离进程。
+    env: { ...process.env, NODE_OPTIONS: '' },
+  })
+  return parseFactoryCheckChildOutput(file, child)
 }
 
 /**

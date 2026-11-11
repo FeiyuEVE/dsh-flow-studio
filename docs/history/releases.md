@@ -665,7 +665,7 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 ## 0.13.10 — 实例域收件箱 + 复审修复
 
-把「外部消息进得来、agent 回得去」搬进实例域：节点执行期间能收外部消息，agent 也能主动回一条；收件箱有幂等键、正文落盘与体积上限，投递语义按适配器如实标注。同时收掉 0.13.9 复审提出的 9 条发现（F1–F9）。
+把「外部消息进得来、agent 回得去」搬进实例域：节点执行期间能收外部消息，agent 也能主动回一条；收件箱有幂等键、正文落盘与体积上限，投递语义按适配器如实标注。同时收掉 0.13.9 复审提出的 9 条发现中的 7 条（F1、F2、F5、F6、F7、F8、F9）；F3 的物理退出确认与 F4 的锁抢占在 0.13.12 才真正关闭。
 
 **实例域收件箱**
 
@@ -674,15 +674,15 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 体积：正文 ≤ 4 KiB 直接进提示词；更大的落盘到 `inbox/bodies/` 并在提示词里给路径；超过 1 MiB 整条拒绝，一个字节都不写（不截断、不留半截文件）。
 - 消息状态机 `queued → injected / resumed / delivered / failed`：投递未确认就不会标成 delivered。每次推进最多取 5 条，剩余条数随结果返回。
 - 投递语义按适配器如实暴露：DSH 会话走 `deliverMessage`（宿主回 `deliveryUnknown` 时保持未确认）；codex 适配器明确报「不支持收件箱投递」，不静默丢弃。
-- 模型工具 `flow_instance_send_message`、`flow_instance_reply`；实例详情页新增收件箱区块（列表、发消息、回复）。
+- 模型工具 `flow_instance_send_message`、`flow_instance_reply`；实例详情页新增收件箱区块（列表、正文读取、发送）。回复 outbox 目前只有 HTTP 与工具入口，界面尚未接线。
 - 执行收尾摘掉 live 表，未投递完的消息按过期处理，不会在后续会话里补投。
 
 **复审修复（F1–F9）**
 
-- F1 创建失败回滚不再跑仓库级 `git worktree prune`：改为 `rollbackCreatedWorktree` 只撤销本次创建的那一份，缺失路径走定向注销。全仓 prune 会顺带清掉**别的**缺失路径登记，属于误伤。
+- F1 创建失败回滚不再跑仓库级 `git worktree prune`：改为 `rollbackCreatedWorktree` 只撤销本次创建的那一份；目录已经不在时保留登记、不动路径。全仓 prune 会顺带清掉**别的**缺失路径登记，属于误伤。
 - F2 合并检查与分支删除用同一个 tip：先捕获 tip、检查合并状态，删除也针对这个 tip（之前「检查的是 A、删的是 B」，能删掉别的实例分支）。
-- F3 `DELETE /instances/<id>/worktree` 与 `POST /instance-worktrees/prune` 改看**物理退出确认**：`_activeAgents` 计数、适配器 `cleanup` 标志与进程存活一起判；只看到 CANCELED 状态不再当成「已退出」。codex 适配器补了 cleanup 契约。
-- F4 锁协议收紧：抢占前先过 `.steal` guard 串行化，并在 guard 内复核 owner/inode；迟到的 rename 不再把活锁搬走。
+- F3 `DELETE /instances/<id>/worktree` 与 `POST /instance-worktrees/prune` 改看**物理退出确认**：`_activeAgents` 计数、适配器 `cleanup` 标志与进程存活一起判；只看到 CANCELED 状态不再当成「已退出」。codex 适配器补了 cleanup 契约（初始进程与续跑进程的分别确认在 0.13.12 补齐）。
+- F4 锁协议收紧：抢占前先过 `.steal` guard 串行化，并在 guard 内复核 owner/inode（0.13.12 进一步指出 guard 自身的 stale 恢复仍有 ABA，改用内核级 `flock`）。
 - F5 connector 调用记录写盘加 store 级互斥（进程内共享队列 + 跨进程 `.locks` 文件锁），generation 检查在锁内做；旧 fence 不再覆盖新世代的终态。
 - F6 过期导入失败不再顶掉最新选择：catch 先判选择世代，过期即安静返回；画布恢复调用带上世代，迟到的旧导入改不动新视图。
 - F7 容器 e2e 的挂载隔离检查改成 realpath 双向比对，symlink + 更深 bind 的双重叠组合不再漏判。

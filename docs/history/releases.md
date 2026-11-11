@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.3）
+# 版本历史（0.1 → 0.13.4）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -494,3 +494,23 @@
 - 旧 `flows/`、`runs/` 运行域与旧组件（React Flow 画布、inspector 等）仍在仓库，`api.js` 里以 `legacyApi` 临时保留；退役是下一步（0.13.3 收尾 / 0.14），当前页面已不调用它们。
 - HTTP connector 尚未实现（`0.13.4`）；面板对 http 节点如实标注。
 - bpmn-js 键盘绑定画布 SVG；输入框/面板内不触发图操作。
+
+## 0.13.4 — 0.13.3 审查修复
+
+这一版只修审查发现，不加功能。codex 对 0.13.3 的独立复审给出 1 BLOCKER + 9 MAJOR + 2 MINOR，逐项关闭。
+
+- **BLOCKER：画布变更没接到页面。** `BpmnCanvas` 从未收到 `mountOptions.onChange`，编辑器创建时捕获到的回调为空——打开已保存定义后改节点 / 属性 / 布局，页面仍认为已保存、不调草稿、运行也不被拦。现在按编辑器真实协议透传；编辑后出现「有未保存修改」、运行按钮禁用、600ms 去抖草稿落盘，保存期间继续编辑不会被保存响应误清 dirty。
+- **导入失败整模型回滚。** 无 BPMN DI 的合法 XML 会先在 `importXML` 内部替换 `_definitions`、再在绘制阶段报 `no diagram to display`；旧实现只恢复 XML 字符串，接着保存就把新流程写进旧定义。现在先用 moddle 预检 DI，失败则重建 Modeler 并从旧 XML 恢复模型、撤销栈、dirty 与运行态 marker。
+- **属性弹窗先 flush 再保存。** 官方弹出编辑器挂在 `document.body`，不在画布容器内，保存前只找容器内焦点会漏掉未提交输入；保存链先调 `editor.flushProperties()`（触发官方 `propertiesPanel.closePopup`，关闭时同步 flush 去抖输入），再序列化。
+- **类型切换一次撤销。** 属性面板改用单条 `shape.replace` 并把目标类型放进 `hints.fsNodeType`，扩展修正由 behavior 在同一条命令的 `postExecuted` 内完成；撤销一次同时回滚类型与扩展，不再留下中间态。
+- **替换菜单校验 nodeType。** 官方替换会复制扩展；现在校验 `fs:node` 的 `nodeType` 合法性，缺省 / 非法回落 `agent`，切成人工节点时清掉 serviceTask 专属字段。
+- **HTTP 方法修改不再抛错。** `HttpMethodField.setValue` 引用了未定义的 `field`，已有 HTTP 配置后再改方法直接 `ReferenceError`；改用 `live.method`。
+- **实例视图三处竞态。** 定义与实例共用选择世代，迟到的实例响应不再覆盖后选的定义；事件缓存与游标按 `instanceId` 隔离，请求失败不回退上一个实例的事件；进入终态停轮询前先追平 `detail.lastSeq`，不再漏掉最后的 `activity/end`、`process/end`。
+- **待办 409/404 原因保留。** 完成人工任务失败时先刷新待办、后写原因，刷新不再把服务端原因清掉。
+- **构建校验可信。** 新增 `lib/build-meta.json`：551 个输入文件 sha256 + 输入哈希 + 每个产物的 bytes/sha256；`verify-build` 对缺元数据、产物被替换、输入已变化一律失败。依赖泄漏检查改成内容特征 + VM 里真执行 factory，删改元数据绕不过去；另补 6 条反例（factory 返回 null、主包混入真实 chunk、单字节替换等）。
+- **测试盲区。** 新增 `test/client-page-wiring.test.mjs`（8 组 / 66 条断言，修复前 8 组全红）与 5 组真浏览器回归；`npm test` 48 个套件、1221 组全过，浏览器 29 组 / 206 条断言全过。
+
+**已知边界**
+- 新 BPMN 域目前只有 GUI 与 HTTP 入口，没有模型工具面（`flow_run_instance` 等）；对话里仍是旧 `flow_*` 工具，退役旧域前必须补（见 [0.14 计划](../plan/0.14-能力补齐与旧域退役.md) E3）。
+- 旧 `flows/`、`runs/` 运行域、旧客户端组件与 `legacyApi` 仍在仓库，页面已不调用；一次性退役排在 0.14.0。
+- HTTP connector 按新排期移到 0.13.5。

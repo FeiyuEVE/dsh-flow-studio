@@ -1629,6 +1629,88 @@ await check('N1 B 详情成功 + 画布挂起 + 选 C 失败：详情/任务/事
   })
 })
 
+// 15c. R3：旧选择的迟到恢复不得以新世代覆盖最新成功选择 ------------------------
+
+await check('R3 A→B→C：B 的迟到恢复不得覆盖 C，最终 activeInstance=C、busy=false', async () => {
+  await withFakeTimers(async () => {
+    const gateB = deferred()
+    const gateC = deferred()
+    const editor = createEditor()
+    const imports = []
+    const XML_C = '<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="C"/>'
+    editor.importXML = async value => {
+      imports.push(value)
+      // B / C 的画布导入都挂起：详情、事件、快照都已经成功，只有画布没落地。
+      if (value === XML_B) await gateB.promise
+      if (value === XML_C) await gateC.promise
+    }
+    const instanceA = { id: 'i-a', status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }
+    const { client } = makeClient({
+      readInstance: async id => ({ id, status: 'ACTIVE', lastSeq: id === 'i-b' ? 4 : (id === 'i-c' ? 5 : 2), pendingTasks: [] }),
+      readInstanceDefinition: async id => ({
+        id,
+        xml: id === 'i-b' ? XML_B : (id === 'i-c' ? XML_C : XML_A),
+      }),
+      readInstanceTasks: async id => ({ id, tasks: [] }),
+      readInstanceEvents: async id => {
+        if (id === 'i-b') {
+          return { id, events: [event(4, 'activity/wait', { elementId: 'TB', status: 'waiting' })], lastSeq: 4 }
+        }
+        if (id === 'i-c') {
+          return { id, events: [event(5, 'activity/wait', { elementId: 'TC', status: 'waiting' })], lastSeq: 5 }
+        }
+        return { id, events: [event(2, 'activity/end', { elementId: 'T', status: 'completed' })], lastSeq: 2 }
+      },
+    })
+    const mounted = await mountPage({
+      client,
+      editor,
+      props: {
+        initialDefinition: definitionA,
+        initialInstance: instanceA,
+        initialInstanceDefinition: { xml: XML_A },
+        initialEvents: [event(1, 'activity/wait', { elementId: 'T', status: 'waiting' })],
+        initialTasks: [],
+      },
+    })
+    const { probe } = mounted
+    const panel = () => findElement(probe.tree, node => node.type === InstancePanel)
+    const select = id => panel().props.onSelectInstance(id)
+
+    // A 已打开：第一次导入是 A。
+    deep(imports, [XML_A], '初始画布导入 A')
+
+    // 选 B：详情 / 事件 / 快照成功，画布导入挂起。
+    select('i-b')
+    await settle(probe)
+    deep(imports, [XML_A, XML_B], '选择 B 必须发起 B 的导入')
+    eq(panel().props.activeInstance.id, 'i-a', 'B 未提交前仍显示 A')
+
+    // 选 C（最新世代）：B 的导入仍在挂起。
+    select('i-c')
+    await settle(probe)
+    deep(imports, [XML_A, XML_B, XML_C], '选择 C 必须发起 C 的导入')
+
+    // 先释放 B：B 的世代已过期，只能安静退出，不得用当前世代发起 A 的恢复。
+    gateB.resolve()
+    await settle(probe)
+    eq(imports.filter(xml => xml === XML_A).length, 1, '旧选择过期后不得再发起 A 的恢复导入')
+    eq(panel().props.activeInstance.id, 'i-a', 'B 过期退出时不得改动已提交状态')
+
+    // 再释放 C：最新事务必须成功提交，且 busy 结束。
+    gateC.resolve()
+    await settle(probe)
+    eq(panel().props.activeInstance.id, 'i-c', '最终必须显示最新成功选择 C（不能被 A 覆盖）')
+    eq(panel().props.busy, false, '最新事务成功后 busy 必须结束')
+    eq(drawerOf(probe).props.instanceId, 'i-c', '事件缓存归属必须切到 C')
+    eq(drawerOf(probe).props.lastSeq, 5, '事件游标必须是 C 的')
+    eq(markerState(editor, 'TC'), 'waiting', '画布 marker 必须是 C 的')
+    eq(imports[imports.length - 1], XML_C, '画布最终必须是 C 的视图')
+    eq(imports.filter(xml => xml === XML_A).length, 1, 'C 生效后不得再被 A 的迟到恢复覆盖')
+    deep(imports, [XML_A, XML_B, XML_C], '导入顺序只允许 A→B→C，不得出现额外的 A 恢复')
+  })
+})
+
 // 16. F3 页面：回滚失败后成功打开定义，必须统一恢复到 ready ------------------
 
 await check('F3 页面：画布 error 后成功打开定义，保存按钮必须恢复可用', async () => {

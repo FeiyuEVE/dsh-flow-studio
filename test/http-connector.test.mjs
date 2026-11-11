@@ -953,6 +953,89 @@ await check('H4：DNS / auth resolver / 调用记录等待参与统一 deadline�
   }
 })
 
+await check('R2：迟到 recordAttempt 不得把「确定未发送」覆盖成 sent（重试不得变成假 unknown）', async ({ root }) => {
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  try {
+    const real = createConnectorStore({ root: join(root, 'store') })
+    // 模拟真实存储写入的延迟：底层记录写 200ms 后才完成，整体 deadline 80ms。
+    const slowStore = {
+      ...real,
+      recordAttempt: async (...args) => { await sleep(200); return real.recordAttempt(...args) },
+    }
+    await rejects(
+      executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://127.0.0.1:${fixture.port}/late`, timeoutMs: 80 }),
+        makeContext(),
+        { policy: policyFor(fixture.port), store: slowStore },
+      ),
+      'HTTP_TIMEOUT',
+      '调用记录写入超时必须明确失败',
+    )
+    A.equal(fixture.requests.length, 0, 'recordAttempt 超时后零发送')
+
+    // 等迟到写入与补偿写入都落完：最终必须是「确定未发送」，而不是迟到的 sent。
+    await sleep(400)
+    const record = await real.readInvocation(invocationIdentity())
+    A.equal(record.state, 'started', '迟到 recordAttempt 不能把记录写成 sent 覆盖「确定未发送」')
+    A.equal(record.attempts, 0, 'attempts 必须回滚为 0，重启后才能安全重开')
+    A.equal(record.error.code, 'HTTP_NOT_SENT')
+
+    // 再次执行同一激活身份（真实 store）：必须是 fresh 重发，而不是 HTTP_OUTCOME_UNKNOWN。
+    const result = await executeHttpConnector(
+      elementOf({ method: 'GET', url: `http://127.0.0.1:${fixture.port}/late`, timeoutMs: 3000 }),
+      makeContext(),
+      { policy: policyFor(fixture.port), store: real },
+    )
+    A.equal(result.status, 200, '确定未发送后重试必须成功')
+    A.equal(fixture.requests.length, 1, '重试必须真的发送一次（不是被假 unknown 挡住）')
+  } finally {
+    await fixture.close()
+  }
+})
+
+await check('R2：成功结果落盘超出 deadline 时明确失败（HTTP_TIMEOUT / 结果落盘），不得静默成功', async ({ root }) => {
+  const fixture = await startFixture((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"ok":true}')
+  })
+  try {
+    const real = createConnectorStore({ root: join(root, 'store') })
+    // 响应及时返回，但成功结果落盘延迟 250ms；整体 deadline 100ms。
+    const slowStore = {
+      ...real,
+      commitResult: async (...args) => { await sleep(250); return real.commitResult(...args) },
+    }
+    const started = Date.now()
+    let failure = null
+    try {
+      await executeHttpConnector(
+        elementOf({ method: 'GET', url: `http://127.0.0.1:${fixture.port}/commit`, timeoutMs: 100 }),
+        makeContext(),
+        { policy: policyFor(fixture.port), store: slowStore },
+      )
+    } catch (error) {
+      failure = error
+    }
+    const elapsed = Date.now() - started
+    A.equal(failure?.code, 'HTTP_TIMEOUT', '结果落盘超时必须明确失败，而不是静默返回成功')
+    A.equal(failure?.details?.stage, '结果落盘', '失败阶段必须写明是结果落盘')
+    A.ok(elapsed < 220, `不得等迟到的 commitResult 250ms 才返回（实测 ${elapsed}ms）`)
+    A.equal(fixture.requests.length, 1, '请求本身已经发出过一次')
+
+    // 迟到的成功写入可能稍后落盘（请求确实成功过）：记录可以变成 succeeded，
+    // 但调用方已经明确失败，下一次同激活只会复用该结果，不会重复发送。
+    await sleep(400)
+    const record = await real.readInvocation(invocationIdentity())
+    A.ok(record.state === 'succeeded' || record.state === 'sent',
+      `迟到写入只能落到 succeeded / sent（实际 ${record?.state}）`)
+  } finally {
+    await fixture.close()
+  }
+})
+
 await check('m2：请求头 / 响应头显式预算，1 MiB 请求头到不了 transport', async ({ root }) => {
   const fixture = await startFixture((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' })

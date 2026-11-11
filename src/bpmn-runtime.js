@@ -42,6 +42,7 @@
 
 import { Buffer } from 'node:buffer'
 import { existsSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import {
@@ -896,14 +897,17 @@ class BpmnRuntime {
 
   /**
    * `POST /instances/<id>/connector/<recordId>/resolve`：
-   * `{ action: 'mark-succeeded' | 'mark-failed' | 'retry', evidence, operator?, result? }`。
+   * `{ action: 'mark-succeeded' | 'mark-failed' | 'retry' | 'clear-tombstone', evidence, operator?, result? }`。
    *
    * 安全边界：
-   *   - 只操作 connector 调用记录，**不调用 runner / 不写 activity/end / 不改实例状态**；
-   *     实例保持 ACTIVE（或它原本的状态）语义，避免用「处置」伪造一次成功执行；
+   *   - 只操作 connector 调用记录（以及 clear-tombstone 的墓碑快照），**不调用 runner /
+   *     不写 activity/end / 不改实例状态**；实例保持 ACTIVE（或它原本的状态）语义，
+   *     避免用「处置」伪造一次成功执行；
    *   - 终态实例 / 正在停止的实例拒绝处置；
    *   - evidence 必填，所有真实变更追加 `connector/audit.jsonl`；重复动作幂等；
-   *   - retry 只把记录重置为 attempts=0，不自动重发；是否重跑仍由上层受控推进决定。
+   *   - retry 只把记录重置为 attempts=0，不自动重发；是否重跑仍由上层受控推进决定；
+   *   - clear-tombstone 只删除不可恢复墓碑快照，**不重放任何前序副作用**；清除后
+   *     实例不会自动恢复（引擎快照已不存在），仍需人工决定是否新建实例。
    */
   async _resolveConnectorInvocation(instanceId, recordId, body) {
     const wanted = typeof recordId === 'string' ? recordId.trim() : ''
@@ -962,6 +966,7 @@ class BpmnRuntime {
           },
         }
       }
+      const action = typeof input.action === 'string' ? input.action.trim().toLowerCase() : ''
       let resolved
       try {
         resolved = await store.resolveInvocation({
@@ -986,6 +991,11 @@ class BpmnRuntime {
         }
         throw error
       }
+      // clear-tombstone 的实例侧动作：只删墓碑快照；不创建 runner、不落事件、不重放。
+      // 放在记录处置之后（evidence / 动作非法时 store 已经先报错，不会误清墓碑）。
+      const tombstoneCleared = action === 'clear-tombstone'
+        ? await this._clearUnrecoverableTombstone(instanceId)
+        : false
       const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? instance
       const audit = resolved.audit
       return {
@@ -994,6 +1004,7 @@ class BpmnRuntime {
           ok: true,
           id: instanceId,
           status: current.status,
+          ...(action === 'clear-tombstone' ? { tombstoneCleared } : {}),
           executionId: record.executionId,
           invocationId: typeof record.invocationId === 'string' ? record.invocationId : null,
           engineExecutionId: typeof record.engineExecutionId === 'string' ? record.engineExecutionId : null,
@@ -1004,10 +1015,51 @@ class BpmnRuntime {
           lastSeq: current.lastSeq,
           pendingTasks: current.pendingTasks ?? [],
           lastError: current.lastError ?? null,
-          note: '处置只更新 connector 调用记录与审计，不重放引擎活动、不伪造 activity/end；实例状态保持现状。',
+          note: action === 'clear-tombstone'
+            ? 'clear-tombstone 只删除不可恢复墓碑快照并追加审计，不重放引擎活动、不伪造 activity/end、不改 instance.json；'
+              + '清除后实例没有可恢复的引擎快照，仍不能自动继续，需要人工决定是否新建实例。'
+            : '处置只更新 connector 调用记录与审计，不重放引擎活动、不伪造 activity/end；实例状态保持现状。',
         },
       }
     })
+  }
+
+  /**
+   * 清除失败实例的「不可恢复墓碑」（m1）。
+   *
+   * 墓碑是 `state.json` 里 `{ unrecoverable }` 标记（`engine` 已被丢弃）。这里只做
+   * 一件事：确认它确实是墓碑后删除这份快照。**不创建 runner、不恢复引擎、不重放
+   * 任何前序活动 / 副作用**；实例状态、lastError、事件流都保持原样。
+   *
+   * 删除后 `_ensureRunner` 会报 `BPMN_STATE_MISSING`（仍不能继续），而不是
+   * `BPMN_STATE_UNRECOVERABLE`；是否新建实例由人工决定。
+   *
+   * @returns {Promise<boolean>} 是否真的删除了墓碑（重复处置返回 false）。
+   */
+  async _clearUnrecoverableTombstone(instanceId) {
+    let state
+    try {
+      state = await readInstanceState(instanceId, { instancesRoot: this.instancesRoot })
+    } catch (error) {
+      throw new BpmnRuntimeError(
+        500,
+        'BPMN_STATE_READ_FAILED',
+        `读取实例 ${instanceId} 的 state.json 失败：${errorText(error)}`,
+        { instanceId },
+      )
+    }
+    if (!isPlainObject(state?.unrecoverable)) return false
+    try {
+      await rm(join(this.instancesRoot, instanceId, 'state.json'), { force: true })
+    } catch (error) {
+      throw new BpmnRuntimeError(
+        500,
+        'BPMN_STATE_WRITE_FAILED',
+        `删除实例 ${instanceId} 的不可恢复墓碑失败：${errorText(error)}`,
+        { instanceId },
+      )
+    }
+    return true
   }
 
   async _listInstances(url) {
@@ -2578,7 +2630,12 @@ class BpmnRuntime {
       return {
         runner: null,
         recovered: false,
-        reason: `实例因执行失败已停机（${code}），快照被标记为不可恢复：${typeof state.unrecoverable.message === 'string' ? state.unrecoverable.message : '需要人工处理后重新创建实例'}`,
+        // m1：说明处置边界——retry 只解除调用记录限制；要解除墓碑必须显式
+        // clear-tombstone，而且清除后本实例仍不能自动继续（引擎快照已被墓碑替换）。
+        reason: `实例因执行失败已停机（${code}），快照被标记为不可恢复：${typeof state.unrecoverable.message === 'string' ? state.unrecoverable.message : '需要人工处理后重新创建实例'}。`
+          + '人工处置：retry / mark-* 只解除 connector 调用记录限制，当前实例仍不能继续；'
+          + '若要移除本墓碑，请用 POST /instances/<id>/connector/<recordId>/resolve '
+          + '{ action: "clear-tombstone", evidence }；清除后实例不会自动恢复，仍需人工决定是否新建实例。',
         code,
       }
     }

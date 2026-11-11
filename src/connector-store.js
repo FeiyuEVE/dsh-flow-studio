@@ -67,7 +67,7 @@ function optionalId(value, field) {
 }
 
 /** 人工处置允许的动作；未知动作直接拒绝（不做「猜意图」）。 */
-const RESOLVE_ACTIONS = new Set(['mark-succeeded', 'mark-failed', 'retry'])
+const RESOLVE_ACTIONS = new Set(['mark-succeeded', 'mark-failed', 'retry', 'clear-tombstone'])
 const MAX_EVIDENCE_CHARS = 2000
 const MAX_RESOLUTION_RESULT_BYTES = 64 * 1024
 
@@ -174,6 +174,48 @@ function nowIso() {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * 记录写入世代（R2）。
+ *
+ * 存储写入（recordAttempt / commitResult / mark*）是在**调用方 deadline 之外**继续
+ * 执行的：`Promise.race` 只能结束等待，不能取消已经排队的 fs 写入。为了不让「已经
+ * 判超时的旧调用」在迟到时覆盖新调用，`beginInvocation` 每次真正取得记录所有权
+ * （fresh / unknown / 人工 retry）都会把 `generation` +1；后续写入必须带上它所属的
+ * 世代，不匹配就拒绝（`HTTP_STORE_STALE`）。
+ *
+ * 旧记录没有 generation（0.13.7 之前落盘）时按 0 处理：调用方不带 generation 时
+ * 仍然兼容；带了却不匹配的写入一律拒绝。
+ */
+function recordGeneration(record) {
+  return Number.isSafeInteger(record?.generation) && record.generation > 0 ? record.generation : 0
+}
+
+function nextGeneration(record) {
+  return recordGeneration(record) + 1
+}
+
+/** 带 generation 的写入：不匹配说明记录已被新调用接管，直接拒绝而不是覆盖。 */
+function assertGeneration(existing, input, action) {
+  const expected = input.generation
+  if (expected === undefined || expected === null) return
+  if (!Number.isSafeInteger(expected) || expected < 1) {
+    throw new ConnectorStoreError(
+      'HTTP_INVOCATION_INVALID',
+      `${action} 的 generation 必须是 ≥1 的整数。`,
+      { field: 'generation' },
+    )
+  }
+  const actual = recordGeneration(existing)
+  if (actual !== expected) {
+    throw new ConnectorStoreError(
+      'HTTP_STORE_STALE',
+      `${action} 的写入世代已过期（期望 generation=${expected}，记录现在是 ${actual}）：`
+      + '迟到的写入不能覆盖新调用。',
+      { field: 'generation', expected, actual },
+    )
+  }
 }
 
 async function readJson(path) {
@@ -309,6 +351,8 @@ export function createConnectorStore(options = {}) {
           const updated = {
             ...existing,
             state: 'unknown',
+            // 新一次 begin 取得记录所有权：旧调用迟到的写入不能覆盖 unknown 结论。
+            generation: nextGeneration(existing),
             error: {
               code: 'HTTP_OUTCOME_UNKNOWN',
               message: '上次调用已发送但结果未落盘；为避免重复副作用，重启后不自动重发。',
@@ -327,6 +371,8 @@ export function createConnectorStore(options = {}) {
           error: null,
           idempotencyKey,
           invocationId,
+          // 重新开始 = 新世代：上一轮未完成的迟到写入不得再改这条记录（R2）。
+          generation: nextGeneration(existing),
           ...(activationAttempt === null ? {} : { activationAttempt }),
           ...(engineExecutionId === null ? {} : { engineExecutionId }),
           updatedAt: nowIso(),
@@ -344,6 +390,7 @@ export function createConnectorStore(options = {}) {
         invocationId,
         requestHash,
         idempotencyKey,
+        generation: 1,
         ...(activationAttempt === null ? {} : { activationAttempt }),
         ...(engineExecutionId === null ? {} : { engineExecutionId }),
         state: 'started',
@@ -373,6 +420,7 @@ export function createConnectorStore(options = {}) {
           executionId: key.executionId,
         })
       }
+      assertGeneration(existing, input, 'recordAttempt')
       const updated = {
         ...existing,
         state: 'sent',
@@ -402,6 +450,7 @@ export function createConnectorStore(options = {}) {
           executionId: key.executionId,
         })
       }
+      assertGeneration(existing, input, 'commitResult')
       const updated = {
         ...existing,
         state,
@@ -422,6 +471,7 @@ export function createConnectorStore(options = {}) {
     return withLock(key.digest, async () => {
       const existing = await readJson(path)
       if (existing === null) return null
+      assertGeneration(existing, input, 'markOutcomeUnknown')
       const updated = {
         ...existing,
         state: 'unknown',
@@ -442,6 +492,10 @@ export function createConnectorStore(options = {}) {
    * 请求**没有真正发出**时把记录回滚成可安全重开的状态（H4）：
    * `attempts=0` + state=started，重启后 `beginInvocation` 会当作 fresh。
    * 与 `markOutcomeUnknown` 的区别是语义：这里确定远端没收到任何请求。
+   *
+   * `input.fence === true` 时顺便把记录推进到新世代（R2）：这次补偿写入之后，
+   * 仍排在锁队列里的旧 `recordAttempt` / `commitResult`（携带旧 generation）
+   * 会被拒绝，不能让「确定未发送」被迟到的 `sent` 覆盖。
    */
   async function markNotSent(input = {}, reason = null) {
     const key = keyOf(input)
@@ -449,11 +503,13 @@ export function createConnectorStore(options = {}) {
     return withLock(key.digest, async () => {
       const existing = await readJson(path)
       if (existing === null) return null
+      assertGeneration(existing, input, 'markNotSent')
       const updated = {
         ...existing,
         state: 'started',
         attempts: 0,
         result: null,
+        ...(input.fence === true ? { generation: nextGeneration(existing) } : {}),
         error: {
           code: 'HTTP_NOT_SENT',
           message: typeof reason === 'string' && reason !== ''
@@ -508,7 +564,9 @@ export function createConnectorStore(options = {}) {
    * 人工处置调用记录（m1）。**只改记录，不推进引擎、不伪造 activity/end**：
    *   - `mark-succeeded`：补录远端已确认成功（可带 result；缺省 status=0）；
    *   - `mark-failed`：确认远端失败 / 放弃；
-   *   - `retry`：仅对未成功记录重置为 attempts=0，允许下一次同激活重放重新发送。
+   *   - `retry`：仅对未成功记录重置为 attempts=0，允许下一次同激活重放重新发送；
+   *   - `clear-tombstone`：只解除实例的不可恢复墓碑（见 bpmn-runtime），不重放任何
+   *     前序副作用、不改调用记录状态；重复提交幂等。
    *
    * 同一个动作对已处于目标状态的记录是幂等的（不重复写记录、不追加审计）。
    * 所有真实变更都追加 `audit.jsonl`（append-only，含 evidence / operator / 前后状态）。
@@ -520,7 +578,7 @@ export function createConnectorStore(options = {}) {
     if (!RESOLVE_ACTIONS.has(action)) {
       throw new ConnectorStoreError(
         'HTTP_RESOLVE_INVALID',
-        `处置动作必须是 mark-succeeded / mark-failed / retry（收到 ${JSON.stringify(action)}）。`,
+        `处置动作必须是 mark-succeeded / mark-failed / retry / clear-tombstone（收到 ${JSON.stringify(action)}）。`,
         { field: 'action' },
       )
     }
@@ -565,6 +623,20 @@ export function createConnectorStore(options = {}) {
             completedAt: nowIso(),
           }
         }
+      } else if (action === 'clear-tombstone') {
+        // 只清记录侧的处置标记；实例的墓碑快照由 runtime 在同一请求里删除。
+        // 记录状态、attempts、result、error 一律不动（不重放、不伪造结果）。
+        idempotent = existing.tombstoneCleared === true
+        if (!idempotent) {
+          next = {
+            ...existing,
+            tombstoneCleared: true,
+            tombstoneClearedAt: nowIso(),
+            tombstoneEvidence: evidence,
+            tombstoneOperator: operator ?? 'operator',
+            updatedAt: nowIso(),
+          }
+        }
       } else {
         // retry：已成功 / 已确认失败且记录本身已是可重开状态时才幂等；其他情况要求显式重置。
         if (existing.state === 'succeeded') {
@@ -583,6 +655,9 @@ export function createConnectorStore(options = {}) {
             result: null,
             error: null,
             retryAuthorizedAt: nowIso(),
+            // 人工 retry 也是一次新世代：旧调用迟到的 recordAttempt / commitResult
+            // 不能在重置之后又把记录写回 sent / succeeded（R2）。
+            generation: nextGeneration(existing),
             updatedAt: nowIso(),
           }
         }
@@ -609,6 +684,7 @@ export function createConnectorStore(options = {}) {
         fromState: previousState,
         toState: next.state,
         idempotent: false,
+        ...(action === 'clear-tombstone' ? { tombstoneCleared: true } : {}),
         ...(previousAction === null ? {} : { previousAction }),
       }
       const history = Array.isArray(existing.resolution?.history) ? existing.resolution.history : []

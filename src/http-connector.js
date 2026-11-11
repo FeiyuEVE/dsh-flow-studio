@@ -243,16 +243,22 @@ function assertResponseHeaderBudget(rawHeaders) {
 
 /* ── 统一截止时间（H4）────────────────────────────────────────── */
 
-function deadlineError(timeoutMs, stage) {
+function deadlineError(timeoutMs, stage, sent = false) {
   return new HttpConnectorError(
     'HTTP_TIMEOUT',
-    `HTTP 调用超过整体时限 ${timeoutMs}ms（${stage}阶段已过期，未发送请求）。`,
-    { timeoutMs, stage },
+    `HTTP 调用超过整体时限 ${timeoutMs}ms（${stage}阶段已过期${sent
+      ? '；请求已经发出，但结果未能在期限内确认 / 落盘'
+      : '，未发送请求'}）。`,
+    { timeoutMs, stage, ...(sent ? { sent: true } : {}) },
   )
 }
 
-function canceledError(stage) {
-  return new HttpConnectorError('HTTP_CANCELED', `HTTP 调用在${stage}阶段被取消，未发送请求。`, { stage })
+function canceledError(stage, sent = false) {
+  return new HttpConnectorError(
+    'HTTP_CANCELED',
+    `HTTP 调用在${stage}阶段被取消${sent ? '（请求可能已经发出，结果不明）' : '，未发送请求'}。`,
+    { stage, ...(sent ? { sent: true } : {}) },
+  )
 }
 
 /**
@@ -263,8 +269,9 @@ function canceledError(stage) {
  */
 function withinDeadline(promise, options) {
   const { deadlineAt, timeoutMs, signal, stage } = options
+  const sent = options.sent === true
   const remaining = deadlineAt - Date.now()
-  if (remaining <= 0) return Promise.reject(deadlineError(timeoutMs, stage))
+  if (remaining <= 0) return Promise.reject(deadlineError(timeoutMs, stage, sent))
   return new Promise((resolve, reject) => {
     let settled = false
     const cleanup = () => {
@@ -280,8 +287,8 @@ function withinDeadline(promise, options) {
       if (error) reject(error)
       else resolve(value)
     }
-    const timer = setTimeout(() => finish(deadlineError(timeoutMs, stage)), remaining)
-    const onAbort = () => finish(canceledError(stage))
+    const timer = setTimeout(() => finish(deadlineError(timeoutMs, stage, sent)), remaining)
+    const onAbort = () => finish(canceledError(stage, sent))
     if (signal) {
       if (signal.aborted === true) {
         finish(canceledError(stage))
@@ -291,6 +298,43 @@ function withinDeadline(promise, options) {
     }
     Promise.resolve(promise).then(value => finish(null, value), error => finish(error))
   })
+}
+
+/** 结论落盘的宽限：调用 deadline 结束后最多再等这么久（有界，不是无限等待）。 */
+const STORE_SETTLE_GRACE_MS = 100
+
+/**
+ * 在「期限 + 有界宽限」内等待一次结论写入；超时 / 取消后**不取消**底层写入
+ * （fs 无法取消），但也不会让调用方继续等。写入本身由 store 的 generation 约束
+ * 兜底（R2）。宽限只用于把已经确定的结论（failed / unknown / not-sent）落到记录上，
+ * 避免调用方紧接着读记录时看到中间态 `sent` 而误判成 unknown。
+ */
+async function settleStoreWrite(promise, options, graceMs = STORE_SETTLE_GRACE_MS) {
+  const deadlineAt = Math.max(options.deadlineAt, Date.now() + Math.max(0, graceMs))
+  try {
+    // 结论写入不再跟随 ctx.signal：调用已经被取消 / 超时，正是要趁宽限把结论落盘。
+    // 这里只受「期限 + 宽限」约束，底层写入本身超时也不会无限阻塞调用方。
+    await withinDeadline(promise, { ...options, deadlineAt, signal: null })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 不等待地排队一次补偿写入（R2）。
+ *
+ * `withinDeadline` 结束的只是等待，底层 `recordAttempt` 仍可能迟到写入。补偿写入
+ * 与它在同一条记录锁（store.withLock）上排队，因此一定在迟到写入**之后**执行；
+ * 再配合 generation，既能把「确定未发送」最终落到记录上，也不会覆盖新调用。
+ */
+function queueStoreWrite(run) {
+  try {
+    const promise = run()
+    if (promise && typeof promise.catch === 'function') promise.catch(() => {})
+  } catch {
+    // 连补偿都排不上队时不影响主结论：本次调用已经确定没有发送请求。
+  }
 }
 
 /** 把宿主 parse 出来的 headers 对象/字符串归一化成小写 key 的字符串 map。 */
@@ -1027,7 +1071,7 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     ? Math.min(http.timeoutMs, policy.maxTimeoutMs)
     : policy.defaultTimeoutMs
   const deadlineAt = Date.now() + timeoutMs
-  const deadlineOptions = stage => ({ deadlineAt, timeoutMs, signal: ctx.signal, stage })
+  const deadlineOptions = (stage, sent = false) => ({ deadlineAt, timeoutMs, signal: ctx.signal, stage, sent })
 
   // H5：调用记录身份必须跨崩溃恢复可复现。
   // `executionId` 由引擎每次活动执行随机生成（恢复重放会变），不能作为幂等键；
@@ -1187,6 +1231,12 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       { invocationId, executionId: activationKey, idempotencyKey },
     )
   }
+  // R2：本次 begin 取得的写入世代。所有后续写入都带上它；一旦记录被新调用接管，
+  // 迟到的旧写入会被 store 拒绝，不会覆盖新状态。
+  const generation = Number.isSafeInteger(begun.record?.generation) && begun.record.generation > 0
+    ? begun.record.generation
+    : null
+  const writeIdentity = generation === null ? identity : { ...identity, generation }
 
   let lastError = null
   /** 本次调用是否至少有一次请求真正进入了传输层（用于决定 unknown / not-sent）。 */
@@ -1199,17 +1249,32 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     }
     try {
       await withinDeadline(
-        store.recordAttempt(identity, { attempt: attemptNo, at: new Date().toISOString() }),
+        store.recordAttempt(writeIdentity, { attempt: attemptNo, at: new Date().toISOString() }),
         deadlineOptions('调用记录写入'),
       )
     } catch (error) {
-      throw toHttpConnectorError(error)
+      const failure = toHttpConnectorError(error)
+      // R2：deadline 只结束等待，底层 recordAttempt 仍可能迟到写入 sent。
+      // 立即在同一记录锁队列里排一条补偿写入，保证最终状态是「确定未发送」；
+      // generation 保证补偿（以及迟到写入）不会覆盖后来接管记录的新调用。
+      if (sentAny === false && (failure.code === 'HTTP_TIMEOUT' || failure.code === 'HTTP_CANCELED')) {
+        // fence：补偿写入把记录推进到新世代，排在后面的迟到 `recordAttempt` 会被拒绝；
+        // 若迟到写入已经先落成 sent，这条补偿再把它改回 started/attempts=0。
+        queueStoreWrite(() => store.markNotSent?.(
+          { ...writeIdentity, fence: true },
+          '调用记录写入在发送前超时；请求未发出。',
+        ))
+      }
+      throw failure
     }
     // H4：recordAttempt 之后必须再次复查；过期必须零发送。
     if (deadlineAt - Date.now() <= 0) {
       const expired = deadlineError(timeoutMs, '请求发送')
       if (sentAny === false) {
-        await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+        await settleStoreWrite(
+          store.markNotSent?.(writeIdentity, '整体时限在发送前到期；请求未发出。'),
+          deadlineOptions('调用记录写入'),
+        )
       }
       lastError = expired
       break
@@ -1248,8 +1313,17 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       if (attemptSent) sentAny = true
       if (isAbortError(ctx, error)) {
         // 已发送但结果不明：记录为 unknown，重启后不自动重发。
-        if (sentAny) await store.markOutcomeUnknown(identity, 'HTTP 调用在等待结果时被取消。').catch(() => {})
-        else await store.markNotSent?.(identity, 'HTTP 调用在发送前被取消；请求未发出。').catch(() => {})
+        if (sentAny) {
+          await settleStoreWrite(
+            store.markOutcomeUnknown(writeIdentity, 'HTTP 调用在等待结果时被取消。'),
+            deadlineOptions('调用记录写入', true),
+          )
+        } else {
+          await settleStoreWrite(
+            store.markNotSent?.(writeIdentity, 'HTTP 调用在发送前被取消；请求未发出。'),
+            deadlineOptions('调用记录写入'),
+          )
+        }
         throw new HttpConnectorError('HTTP_CANCELED', 'HTTP 调用已取消，迟到响应不得推动流程。', { invocationId })
       }
       lastError = sanitizeError(failure, secrets)
@@ -1260,7 +1334,10 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
           try {
             await sleepUntil(wait, ctx)
           } catch (errorCancel) {
-            await store.markOutcomeUnknown(identity, 'HTTP 调用在重试退避期间被取消。').catch(() => {})
+            await settleStoreWrite(
+              store.markOutcomeUnknown(writeIdentity, 'HTTP 调用在重试退避期间被取消。'),
+              deadlineOptions('调用记录写入', sentAny),
+            )
             throw errorCancel
           }
           continue
@@ -1268,13 +1345,19 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       }
       if (sentAny === false) {
         // 从未发出：回滚成「未发送」，重启后允许安全重开（不制造假的 unknown）。
-        await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+        await settleStoreWrite(
+          store.markNotSent?.(writeIdentity, '整体时限在发送前到期；请求未发出。'),
+          deadlineOptions('调用记录写入'),
+        )
         throw lastError
       }
-      await store.commitResult(identity, {
-        state: 'failed',
-        error: { code: lastError.code, message: lastError.message },
-      }).catch(() => {})
+      await settleStoreWrite(
+        store.commitResult(writeIdentity, {
+          state: 'failed',
+          error: { code: lastError.code, message: lastError.message },
+        }),
+        deadlineOptions('结果落盘', true),
+      )
       throw lastError
     }
     sentAny = true
@@ -1288,7 +1371,10 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
         `目标返回 ${response.status} 重定向；首版不允许跟随（避免每一跳重新校验与跨 origin 转发凭据）。`,
         { status: response.status, location: redactNeedleText(response.headers.location ?? '', secrets) || null },
       ), secrets)
-      await store.commitResult(identity, { state: 'failed', error: { code: error.code, message: error.message } }).catch(() => {})
+      await settleStoreWrite(
+        store.commitResult(writeIdentity, { state: 'failed', error: { code: error.code, message: error.message } }),
+        deadlineOptions('结果落盘', true),
+      )
       throw error
     }
 
@@ -1309,7 +1395,10 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
           try {
             await sleepUntil(wait, ctx)
           } catch (errorCancel) {
-            await store.markOutcomeUnknown(identity, 'HTTP 调用在重试退避期间被取消。').catch(() => {})
+            await settleStoreWrite(
+              store.markOutcomeUnknown(writeIdentity, 'HTTP 调用在重试退避期间被取消。'),
+              deadlineOptions('调用记录写入', true),
+            )
             throw errorCancel
           }
           continue
@@ -1320,7 +1409,10 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
         `远端返回 ${response.status}，不在可接受状态内（默认只接受 2xx）。`,
         { status: response.status, acceptStatuses },
       )
-      await store.commitResult(identity, { state: 'failed', error: { code: error.code, message: error.message } }).catch(() => {})
+      await settleStoreWrite(
+        store.commitResult(writeIdentity, { state: 'failed', error: { code: error.code, message: error.message } }),
+        deadlineOptions('结果落盘', true),
+      )
       throw error
     }
 
@@ -1329,10 +1421,13 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       output = applyOutputMappings(io.output, response, variables, elementId, secrets)
     } catch (error) {
       const failure = toHttpConnectorError(error)
-      await store.commitResult(identity, {
-        state: 'failed',
-        error: { code: failure.code, message: failure.message },
-      }).catch(() => {})
+      await settleStoreWrite(
+        store.commitResult(writeIdentity, {
+          state: 'failed',
+          error: { code: failure.code, message: failure.message },
+        }),
+        deadlineOptions('结果落盘', true),
+      )
       throw failure
     }
 
@@ -1342,8 +1437,13 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
       output,
       completedAt: new Date().toISOString(),
     }
+    // R2：成功结果落盘同样纳入整体 deadline。超时 / 取消时明确失败（不静默成功）；
+    // 若底层写入迟到完成，记录会是 succeeded，同激活重试直接复用、不会重复发送。
     try {
-      await store.commitResult(identity, { state: 'succeeded', result })
+      await withinDeadline(
+        store.commitResult(writeIdentity, { state: 'succeeded', result }),
+        deadlineOptions('结果落盘', true),
+      )
     } catch (error) {
       throw toHttpConnectorError(error)
     }
@@ -1364,15 +1464,21 @@ export async function executeHttpConnector(element, ctx = {}, options = {}) {
     }
   }
 
-  const failure = lastError ?? deadlineError(timeoutMs, '请求发送')
+  const failure = lastError ?? deadlineError(timeoutMs, '请求发送', sentAny)
   if (sentAny === false) {
-    await store.markNotSent?.(identity, '整体时限在发送前到期；请求未发出。').catch(() => {})
+    await settleStoreWrite(
+      store.markNotSent?.(writeIdentity, '整体时限在发送前到期；请求未发出。'),
+      deadlineOptions('调用记录写入'),
+    )
     throw failure
   }
-  await store.commitResult(identity, {
-    state: 'failed',
-    error: { code: failure.code, message: failure.message },
-  }).catch(() => {})
+  await settleStoreWrite(
+    store.commitResult(writeIdentity, {
+      state: 'failed',
+      error: { code: failure.code, message: failure.message },
+    }),
+    deadlineOptions('结果落盘', true),
+  )
   throw failure
 }
 

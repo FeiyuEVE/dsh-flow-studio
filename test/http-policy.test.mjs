@@ -290,18 +290,54 @@ await check('H1：本地 NAT64 / site-local / 其他特殊用途前缀默认不�
     '未配置 nat64Prefixes 时本地转换前缀整体阻断',
   )
   await rejects(
-    validateDestination('https://[64:ff9b:1::a00:1]/', { nat64Prefixes: ['64:ff9b:1::/48'] }),
+    validateDestination('https://[64:ff9b:1::a00:1]/', { nat64Prefixes: ['64:ff9b:1::/96'] }),
     'HTTP_DESTINATION_BLOCKED',
     '显式启用后内嵌私网 IPv4 仍阻断',
   )
   const allowed = await validateDestination(
     'https://[64:ff9b:1::5db8:d822]/',
-    { nat64Prefixes: ['64:ff9b:1::/48'] },
+    { nat64Prefixes: ['64:ff9b:1::/96'] },
   )
   A.equal(allowed.ok, true, '显式启用且内嵌公网 IPv4 才允许')
   A.equal(allowed.addresses[0].address, '64:ff9b:1::5db8:d822')
   policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: ['2002::/16'] }), 'nat64Prefixes 只接受 64:ff9b:1::/48 子前缀')
-  policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: ['64:ff9b:1::/24'] }), 'nat64Prefixes 前缀长度必须 32–96')
+  policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: ['64:ff9b:1::/24'] }), 'nat64Prefixes 前缀长度必须固定 /96')
+})
+
+await check('R1：NAT64 只接受 /96；其他长度按 RFC 6052 提取位置不同，必须拒绝而不是读错位段', async () => {
+  // RFC 6052 §2.2：/64 的 IPv4 不在最低 32 位。修复前这里允许 /64，并用低 32 位
+  // 把 64:ff9b:1:0:a:0:100:0 误读成 1.0.0.0（实际映射 10.0.0.1）。
+  for (const cidr of ['64:ff9b:1::/32', '64:ff9b:1::/48', '64:ff9b:1::/56', '64:ff9b:1::/64']) {
+    policyThrows(() => normalizeHttpPolicy({ nat64Prefixes: [cidr] }), `${cidr} 不是本版实现的 NAT64 映射长度`)
+  }
+  // 只配 /96 时，落在 /48 里但不在该 /96 内的地址仍按不通配处理（不会借低 32 位绕过）。
+  await rejects(
+    validateDestination('https://[64:ff9b:1:0:a:0:100:0]/', { nat64Prefixes: ['64:ff9b:1::/96'] }),
+    'HTTP_DESTINATION_BLOCKED',
+    '/64 映射形态的地址不能被 /96 配置放行',
+  )
+  await rejects(
+    validateDestination('https://[64:ff9b:1:0:a:0:100:0]/'),
+    'HTTP_DESTINATION_BLOCKED',
+    '默认策略必须拒绝本地 NAT64 映射地址',
+  )
+})
+
+await check('R1：ORCHID /28 按掩码判定，2001:11::1 等不能被当成公网', async () => {
+  // 2001:10::/28 与 2001:20::/28 只固定第 3 字节的高 4 位；修复前整字节相等判断
+  // 漏掉了 2001:11::/28 … 2001:1f::/28 与 2001:21::/28 … 2001:2f::/28。
+  for (const address of ['2001:10::1', '2001:11::1', '2001:1f::1', '2001:20::1', '2001:2f::1']) {
+    A.deepEqual(classifyAddress(address), { family: 6, kind: 'reserved' }, `${address} 属于 ORCHID / ORCHIDv2`)
+  }
+  // /28 之外的相邻地址不受影响（只按固定前缀判定，不扩大到整段 2001::/32）。
+  A.deepEqual(classifyAddress('2001:30::1'), { family: 6, kind: 'public' }, '2001:30::1 不在 ORCHID 前缀内')
+  for (const address of ['2001:11::1', '2001:2f::1']) {
+    await rejects(
+      validateDestination(`https://[${address}]/`),
+      'HTTP_DESTINATION_BLOCKED',
+      `${address} 必须被 ORCHID 规则拦下`,
+    )
+  }
 })
 
 await check('H2：非法 / 通配符 / 空前缀策略配置加载即报错，不静默扩权', async () => {

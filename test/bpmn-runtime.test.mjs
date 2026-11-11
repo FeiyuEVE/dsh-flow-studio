@@ -2394,6 +2394,70 @@ try {
       eq(readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').length, 1)
       const detailFinal = await call(route, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
       eq(detailFinal.json.status, 'ACTIVE')
+
+      // ── m1（0.13.9）：不可恢复墓碑的受控清除 ──────────────────────────────
+      const statePath = join(home, 'flow-studio', 'instances', instanceId, 'state.json')
+      ok(existsSync(statePath), '失败实例必须留下 state.json 墓碑快照')
+      const tombstone = JSON.parse(readFileSync(statePath, 'utf8'))
+      ok(tombstone.state && tombstone.state.unrecoverable, '墓碑里必须带 unrecoverable 标记')
+      // 模拟进程重启：内存里的 runner 仍是 blocked，墓碑只在磁盘快照里。
+      const restarted = { handler: createHandler(makeEnv(home)) }
+      const blocked = await call(restarted, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
+      ok(typeof blocked.json.recovery?.reason === 'string' && blocked.json.recovery.reason.includes('不可恢复'),
+        '墓碑阻断必须给出可读原因')
+      ok(blocked.json.recovery.reason.includes('clear-tombstone'),
+        '墓碑原因必须说明 clear-tombstone 处置入口与「清除后仍不能自动继续」')
+      ok(blocked.json.recovery.reason.includes('retry'),
+        '墓碑原因必须说明 retry 只解除记录限制')
+
+      // 鉴权 / 参数校验：失败时不得动墓碑。
+      res = await call(restarted, 'POST', resolveUrl, { action: 'clear-tombstone', evidence: 'x' })
+      eq(res.status, 401, 'clear-tombstone 缺 token 必须 401')
+      res = await call(restarted, 'POST', resolveUrl, { action: 'clear-tombstone' }, auth)
+      eq(res.status, 400, 'clear-tombstone 缺 evidence 必须 400')
+      eq(res.json.code, 'HTTP_RESOLVE_INVALID')
+      ok(existsSync(statePath), '参数非法时不得清除墓碑')
+
+      const recordBeforeClear = JSON.parse(readFileSync(join(connectorDir, recordName), 'utf8'))
+      const auditBeforeClear = readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').length
+      res = await call(restarted, 'POST', resolveUrl, {
+        action: 'clear-tombstone',
+        evidence: '运维确认远端已失败，放弃本实例并清除墓碑',
+        operator: 'ops-k1',
+      }, auth)
+      eq(res.status, 200, JSON.stringify(res.json))
+      eq(res.json.ok, true)
+      eq(res.json.tombstoneCleared, true, '首次处置必须真的清除墓碑')
+      eq(res.json.idempotent, false)
+      eq(res.json.status, 'ACTIVE', '清墓碑不改实例状态')
+      eq(res.json.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE', '清墓碑不改 lastError（不伪造恢复）')
+      ok(!existsSync(statePath), '墓碑快照必须被删除')
+      const afterClear = await call(restarted, 'GET', `${API}/instances/${instanceId}`, undefined, auth)
+      eq(afterClear.json.recovery?.code, 'BPMN_STATE_MISSING',
+        '清墓碑后剩余原因应是「没有可恢复快照」，而不是不可恢复墓碑')
+      const eventsAfterClear = await call(restarted, 'GET', `${API}/instances/${instanceId}/events`, undefined, auth)
+      eq(eventsAfterClear.json.events.length, eventCountBefore, '清墓碑不得追加任何引擎事件（不重放）')
+      ok(!eventsAfterClear.json.events.some(item => item.type === 'process/end'), '不得伪造 process/end')
+      // 不重放副作用：调用记录状态 / attempts 保持原样（clear-tombstone 不重置发送）。
+      const recordAfterClear = JSON.parse(readFileSync(join(connectorDir, recordName), 'utf8'))
+      eq(recordAfterClear.state, recordBeforeClear.state, 'clear-tombstone 不改调用记录状态（不重放 / 不伪造结果）')
+      eq(recordAfterClear.attempts, recordBeforeClear.attempts, 'clear-tombstone 不重置发送尝试次数')
+      const auditAfterClear = readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      eq(auditAfterClear.length, auditBeforeClear + 1, 'clear-tombstone 真实变更追加一条审计')
+      const clearAudit = auditAfterClear[auditAfterClear.length - 1]
+      eq(clearAudit.action, 'clear-tombstone')
+      eq(clearAudit.evidence, '运维确认远端已失败，放弃本实例并清除墓碑')
+      eq(clearAudit.tombstoneCleared, true)
+      eq(clearAudit.instanceId, instanceId)
+
+      // 幂等：重复提交不再改记录、不再追加审计、不再重复清墓碑。
+      res = await call(restarted, 'POST', resolveUrl, { action: 'clear-tombstone', evidence: '重复提交' }, auth)
+      eq(res.status, 200)
+      eq(res.json.idempotent, true)
+      eq(res.json.tombstoneCleared, false, '没有墓碑时重复处置返回 false')
+      eq(readFileSync(join(connectorDir, 'audit.jsonl'), 'utf8').trim().split('\n').length, auditAfterClear.length,
+        '幂等重复不得追加审计')
+      ok(!existsSync(statePath), '墓碑保持已清除状态')
     } finally {
       if (previousToken === undefined) delete process.env.FLOW_STUDIO_TOKEN
       else process.env.FLOW_STUDIO_TOKEN = previousToken

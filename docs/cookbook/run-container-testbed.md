@@ -40,7 +40,7 @@ bash scripts/e2e-docker.sh
 
 `scripts/e2e-docker.sh` 验的是旧运行域（`/flows`、`/runs`、打回、supervision）。0.13 的新 BPMN 域（`/definitions`、`/instances`、人工任务、画布 chunk）用单独的 `scripts/e2e-bpmn.sh` 验收：打包 → 装进 `dsh-testbed-bpmn` → 重启容器内 dsh（带一次性插件令牌）→ 换宿主登录 cookie → **只走 HTTP** 跑 `start → userTask → end`。
 
-**前置阶段先验身份、再做破坏性操作**：脚本在任何安装 / 杀进程之前，先按顺序校验容器在跑、`docker port` 的 3080 宿主端口等于 `TESTBED_PORT`、PID 与 network namespace 不与宿主共享，并逐条核对挂载：挂载源不能是宿主 `$HOME` 本身或它的祖先、也不能是宿主 `~/.dsh`（含其子孙）；测试台根目录 `/testbed` 的专用挂载允许，但它内部不能再有覆盖 `home` / `profiles` / `logs` / `dt` / `prefix` 的嵌套 bind 挂载（volume / tmpfs 由容器自己管理，不算宿主暴露）。随后用容器内 `node` 解析 profile、日志、安装目录等**真实路径**（realpath），任何解析到其它 bind 挂载的路径都拒绝；`sed` / `pnpm install` 之前会再复核一次。之后分两种情况：容器里**已有**监听 3080 的实例时，要求该 PID 属于本容器且是测试台 dsh（socket inode 反查 PID，再核对 `comm` / `cwd` / `cmdline`），并用容器日志里的令牌登录一次、必须 303，否则拒绝；容器里**没有**监听 3080 的实例时（刚重启 / dsh 崩了 / 第一次跑）走 **bootstrap**：不 kill 任何进程，由脚本用一次性 `FLOW_STUDIO_TOKEN` 启动 dsh，等端口就绪后再用它日志里的令牌登录 303，作为端口归属的证明。任一项不匹配就直接退出并打印期望 / 实际，不碰容器。
+**前置阶段先验身份、再做破坏性操作**：脚本在任何安装 / 杀进程之前，先按顺序校验容器在跑、`docker port` 的 3080 宿主端口等于 `TESTBED_PORT`、PID 与 network namespace 不与宿主共享，并逐条核对挂载：挂载源不能是宿主 `$HOME` 本身或它的祖先、也不能是宿主 `~/.dsh`（含其子孙）；**只认可测试台根目录 `/testbed` 这一条 bind 挂载**——根目录内部任何嵌套 bind（包括 `home/profiles/web/node_modules`、`dt/cache` 这类写入子目录）都拒绝，根目录之外的 bind 与写入路径做**双向**重叠判断（目的地是写入根的祖先或子孙都算重叠），避免 `pnpm install` 把包写进另一份宿主存储（volume / tmpfs 由容器自己管理，不算宿主暴露）。随后用容器内 `node` 解析 profile、日志、安装目录以及**实际写入叶路径**（`profile/package.json`、`profile/node_modules`、`prefix/bin/dsh`、日志文件）的**真实路径**（realpath），任何解析到其它 bind 挂载的路径都拒绝；`sed` / `pnpm install` 之前会再复核一次。之后分两种情况：容器里**已有**监听 3080 的实例时，要求该 PID 属于本容器且是测试台 dsh（socket inode 反查 PID，再核对 `comm` / `cwd` / `cmdline`），并用容器日志里的令牌登录一次、必须 303，否则拒绝；容器里**没有**监听 3080 的实例时（刚重启 / dsh 崩了 / 第一次跑）走 **bootstrap**：不 kill 任何进程，由脚本用一次性 `FLOW_STUDIO_TOKEN` 启动 dsh，等端口就绪后再用它日志里的令牌登录 303，作为端口归属的证明。任一项不匹配就直接退出并打印期望 / 实际，不碰容器。
 
 ```sh
 bash scripts/e2e-bpmn.sh
@@ -49,7 +49,7 @@ bash scripts/e2e-bpmn.sh
 它断言（按脚本打印的阶段编号）：
 
 - **0**：记录宿主 `dsh-web` 的 active 状态与启动时间作为隔离基线。
-- **1**：容器在跑、端口映射与 `TESTBED_PORT` 一致、PID / NET namespace 隔离；挂载源不是宿主 `$HOME` / 祖先 / `~/.dsh`，profile、日志、安装目录的真实路径不落在其它 bind 挂载下（`sed` / `pnpm install` 前还会再复核）；已有监听 3080 的实例时校验它是本容器的 dsh 且日志令牌登录返回 303，没有实例时走 bootstrap（不 kill，由脚本启动 dsh 再登录 303）。全部通过后才检查容器内 `git` 与 `pnpm`（缺 `git` 时只在容器里装）。
+- **1**：容器在跑、端口映射与 `TESTBED_PORT` 一致、PID / NET namespace 隔离；挂载源不是宿主 `$HOME` / 祖先 / `~/.dsh`，只允许 `/testbed` 根 bind（根内嵌套 bind 与写入路径双向重叠一律拒绝），profile、日志、安装目录与实际写入叶路径的真实路径不落在其它 bind 挂载下（`sed` / `pnpm install` 前还会再复核）；已有监听 3080 的实例时校验它是本容器的 dsh 且日志令牌登录返回 303，没有实例时走 bootstrap（不 kill，由脚本启动 dsh 再登录 303）。全部通过后才检查容器内 `git` 与 `pnpm`（缺 `git` 时只在容器里装）。
 - **2**：`npm run build` → `node scripts/verify-build.mjs` → `npm pack`；tgz 内版本等于仓库 `package.json`。
 - **3**：用 `sed` 把 profile 依赖指向拷进容器的 tgz，`pnpm install`（不手工解包）；容器内版本等于仓库版本，且 `lib/client.bpmn.js` 与仓库构建产物逐字节一致。
 - **4–6**：只终止本容器内监听 3080 的 dsh（按 socket inode 反查 PID，并核对 `comm` / `cwd` / `cmdline`），然后重启并再次核对新监听进程；登录换 cookie 期望 303；`/health` 的 `version`、`ok`、`bpmn.enabled` 正确，`authMode=full` 证明插件令牌生效。

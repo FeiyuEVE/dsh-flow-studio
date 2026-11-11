@@ -308,4 +308,60 @@ await check('markNotSent：发送前超时回滚为可安全重开，不制造�
 })
 
 
+await check('R2：迟到写入的世代约束——fence 补偿之后旧 recordAttempt 必须被拒绝', async (root) => {
+  const store = createConnectorStore({ root })
+  const begun = await store.beginInvocation(baseInput())
+  A.equal(begun.record.generation, 1, '新记录从 generation=1 开始')
+  const attempt = await store.recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 1 })
+  A.equal(attempt.state, 'sent')
+
+  // 模拟「recordAttempt 超时后立即排补偿」：fence 写入把记录推进到下一代并回滚成未发送。
+  const fenced = await store.markNotSent(
+    { ...IDENTITY, generation: 1, fence: true },
+    '调用记录写入在发送前超时；请求未发出。',
+  )
+  A.equal(fenced.state, 'started')
+  A.equal(fenced.attempts, 0)
+  A.equal(fenced.generation, 2, '补偿写入必须推进世代')
+
+  // 迟到的 recordAttempt（旧世代）此时到达：不能把记录写回 sent。
+  await rejects(
+    store.recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 2 }),
+    'HTTP_STORE_STALE',
+    '旧世代的迟到 recordAttempt 必须被拒绝',
+  )
+  await rejects(
+    store.commitResult({ ...IDENTITY, generation: 1 }, { state: 'succeeded', result: { status: 200 } }),
+    'HTTP_STORE_STALE',
+    '旧世代的迟到 commitResult 必须被拒绝',
+  )
+  const after = await store.readInvocation(IDENTITY)
+  A.equal(after.state, 'started', '「确定未发送」不能被迟到写入覆盖')
+  A.equal(after.attempts, 0)
+
+  // 新调用（新世代）可以正常写，且不会与旧写入交叉。
+  const reopened = await store.beginInvocation(baseInput())
+  A.equal(reopened.status, 'fresh')
+  A.equal(reopened.record.generation, 3, '重开取得新世代')
+  const rewritten = await store.recordAttempt({ ...IDENTITY, generation: 3 }, { attempt: 1 })
+  A.equal(rewritten.state, 'sent')
+  A.equal(rewritten.attempts, 1)
+})
+
+await check('R2：人工 retry 推进世代，旧调用迟到的写入不能覆盖重置结果', async (root) => {
+  const store = createConnectorStore({ root })
+  await store.beginInvocation(baseInput())
+  await store.recordAttempt(IDENTITY, { attempt: 1 })
+  const retried = await store.resolveInvocation(IDENTITY, { action: 'retry', evidence: '工单 #9 允许重发' })
+  A.equal(retried.record.state, 'started')
+  A.equal(retried.record.attempts, 0)
+  A.equal(retried.record.generation, 2, 'retry 重置必须推进世代')
+  // 用旧世代写回 sent：必须被拒绝，否则「可安全重开」会被旧调用的迟到写入破坏。
+  await rejects(
+    store.recordAttempt({ ...IDENTITY, generation: 1 }, { attempt: 1 }),
+    'HTTP_STORE_STALE',
+    'retry 之后旧世代的迟到 recordAttempt 必须被拒绝',
+  )
+})
+
 console.log(`\nconnector-store: ${checks} 组 / ${assertions} 条断言通过`)

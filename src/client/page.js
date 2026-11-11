@@ -273,6 +273,21 @@ export function FlowStudioPage(props = {}) {
   // 都 +1，让两条加载链上的所有在飞请求一起失效；响应回来先比对世代再落地，
   // 迟到的实例响应因此不能覆盖后来选择的定义（反之亦然）。
   const selectSeqRef = useRef(0)
+  // 在飞的「视图选择事务」世代集合（复审 R3）：迟到请求只允许在**没有更新选择在途**
+  // 时修复画布；否则会把正在加载的最新视图替换掉。每个选择入口开始时登记、结束时注销。
+  const inFlightSelectionsRef = useRef(new Set())
+  const beginSelection = () => {
+    const seq = ++selectSeqRef.current
+    inFlightSelectionsRef.current.add(seq)
+    return seq
+  }
+  const endSelection = seq => { inFlightSelectionsRef.current.delete(seq) }
+  const hasNewerSelectionInFlight = seq => {
+    for (const other of inFlightSelectionsRef.current) {
+      if (other > seq) return true
+    }
+    return false
+  }
   const eventsRef = useRef(initialEvents.slice())
   // 已消费游标：只取**实际返回事件**的最大 seq。Host 的 `lastSeq` 是「预留游标」
   // （先写 instance.lastSeq、后追加事件），可能超前于可读事件；拿它当 since 会
@@ -613,7 +628,7 @@ export function FlowStudioPage(props = {}) {
   const openDefinition = useCallback(async (id, options = {}) => {
     if (typeof id !== 'string' || id === '') return false
     // 与实例共用同一个选择世代：这次选择让两条链上的所有在飞请求一起失效。
-    const seq = ++selectSeqRef.current
+    const seq = beginSelection()
     setLoadingInstance(false)
     setLoadingDefinition(true)
     setNotice(null)
@@ -646,6 +661,8 @@ export function FlowStudioPage(props = {}) {
       setLoadingDefinition(false)
       setNotice({ kind: 'error', text: `打开定义 ${id} 失败：` + failureMessage(error) })
       return false
+    } finally {
+      endSelection(seq)
     }
   }, [applyCanvasView, client, flushLocalDraft])
 
@@ -659,10 +676,14 @@ export function FlowStudioPage(props = {}) {
   const openInstance = useCallback(async (id, options = {}) => {
     if (typeof id !== 'string' || id === '') return false
     // 选择世代：实例加载同样让定义链上的在飞请求失效（统一计数器）。
-    const seq = ++selectSeqRef.current
+    const seq = beginSelection()
     // 从定义编辑切到实例视图前，先把当前画布的去抖草稿落盘（实例视图不能写定义草稿）。
     if (viewRef.current.kind === 'definition') await flushLocalDraft()
-    if (seq !== selectSeqRef.current || !mountedRef.current) return false
+    if (seq !== selectSeqRef.current || !mountedRef.current) {
+      // 这个提前返回发生在 try 之外，必须显式注销在飞登记，避免永久占着「更新选择」。
+      endSelection(seq)
+      return false
+    }
     setLoadingDefinition(false)
     setLoadingInstance(true)
     // 刷新待办后要保留 404 / 409 的服务端原因，不能被刷新动作立即清掉。
@@ -673,11 +694,21 @@ export function FlowStudioPage(props = {}) {
 
     /**
      * 失败 / 过期时把画布恢复到「最近一次成功提交的视图」。
+     *
+     * 恢复必须属于**仍然持有选择世代的当前事务**（复审 R3）：旧请求（seq 已过期）
+     * 不得借执行时的 `selectSeqRef.current` 发起恢复，否则会以新世代把正在加载的
+     * 最新视图替换掉。此时新事务自己会落最终视图，旧请求只负责安静退出。
      * 不 await：编辑器队列可能还在等一个挂起的导入，等待会把加载态卡死。
+     *
+     * @returns {boolean} 是否真的发起了恢复（调用方可据此收口 loading）。
      */
     const restoreCommittedView = () => {
-      if (!viewAttempted) return
+      if (!viewAttempted) return false
+      if (!mountedRef.current || hasNewerSelectionInFlight(seq)) return false
+      // 没有更新选择在途：可以安全地用当前世代修复画布（恢复的是最后一次成功提交的
+      // 视图）。若有更新选择在途，则交给它自己落最终视图，旧请求安静退出。
       void applyCanvasView(committedViewRef.current, selectSeqRef.current)
+      return true
     }
 
     try {
@@ -772,7 +803,9 @@ export function FlowStudioPage(props = {}) {
             && committedView.instanceId === id && committedView.xml === snapshot.xml
           if (!sameViewApplied) {
             // 过期导入可能已经把模型换成别的实例：恢复最近一次提交的视图。
+            // 这是当前事务的提前返回，必须在这里结束 loading（不会走到末尾提交）。
             restoreCommittedView()
+            setLoadingInstance(false)
             return false
           }
         } else if (applied.pending !== true && applied.ok !== true) {
@@ -814,6 +847,8 @@ export function FlowStudioPage(props = {}) {
       setLoadingInstance(false)
       setNotice({ kind: 'error', text: `打开实例 ${id} 失败：` + failureMessage(error) })
       return false
+    } finally {
+      endSelection(seq)
     }
   }, [applyCanvasView, client, flushLocalDraft, markCaughtUp])
 
@@ -1044,34 +1079,42 @@ export function FlowStudioPage(props = {}) {
   /** 新建：从最小人工模板开始，显式生成定义 id（不覆盖模板 process id）。 */
   const startNewDefinition = useCallback(async ({ definitionName, xml }) => {
     // 新建也是一次视图选择：让定义 / 实例两条链上的在飞请求一起失效。
-    const selection = ++selectSeqRef.current
-    setLoadingDefinition(false)
-    setLoadingInstance(false)
-    await flushLocalDraft()
-    if (selection !== selectSeqRef.current || !mountedRef.current) return false
-    const state = createDefinitionState()
-    state.markDirty()
-    definitionStateRef.current = state
-    draftIdRef.current = newDefinitionId()
-    revisionRef.current.reset()
-    revisionRef.current.markChanged()
-    setMeta(state.state)
-    setDirty(true)
-    setName(definitionName)
-    setSaveStatus('idle')
-    setDraftNotice(null)
-    setNotice(null)
-    await applyCanvasView({ kind: 'definition', xml, markers: [] }, selection)
-    return true
+    const selection = beginSelection()
+    try {
+      setLoadingDefinition(false)
+      setLoadingInstance(false)
+      await flushLocalDraft()
+      if (selection !== selectSeqRef.current || !mountedRef.current) return false
+      const state = createDefinitionState()
+      state.markDirty()
+      definitionStateRef.current = state
+      draftIdRef.current = newDefinitionId()
+      revisionRef.current.reset()
+      revisionRef.current.markChanged()
+      setMeta(state.state)
+      setDirty(true)
+      setName(definitionName)
+      setSaveStatus('idle')
+      setDraftNotice(null)
+      setNotice(null)
+      await applyCanvasView({ kind: 'definition', xml, markers: [] }, selection)
+      return true
+    } finally {
+      endSelection(selection)
+    }
   }, [applyCanvasView, flushLocalDraft])
 
   const handleOpenDefinition = useCallback(async (id, options) => {
     // 用户的选择动作一发生就让在飞请求失效：flushLocalDraft 是 await，
     // 不能给这一刻之前发出的实例响应留落地窗口（openDefinition 会再取新世代）。
-    const selection = ++selectSeqRef.current
-    await flushLocalDraft()
-    if (selection !== selectSeqRef.current || !mountedRef.current) return false
-    return openDefinition(id, options)
+    const selection = beginSelection()
+    try {
+      await flushLocalDraft()
+      if (selection !== selectSeqRef.current || !mountedRef.current) return false
+      return openDefinition(id, options)
+    } finally {
+      endSelection(selection)
+    }
   }, [flushLocalDraft, openDefinition])
 
   const handleNewDefinition = useCallback(async () => {
@@ -1103,55 +1146,59 @@ export function FlowStudioPage(props = {}) {
       return false
     }
     // 导入同样是一次视图选择：让在飞的定义 / 实例请求失效。
-    const selection = ++selectSeqRef.current
-    setLoadingDefinition(false)
-    setLoadingInstance(false)
-    await flushLocalDraft()
-    if (selection !== selectSeqRef.current || !mountedRef.current) return false
-    const previousView = viewRef.current
-    const seq = ++viewSeqRef.current
+    const selection = beginSelection()
     try {
-      // 导入也走原子的「模式 + XML」提交：与在飞的视图请求串行化，
-      // 过期导入在触碰真实模型之前就会被丢弃（复审 F2）。
-      const applied = await applyEditorView(editor, { viewer: false, xml: text, token: seq })
-      if (applied.stale || seq !== viewSeqRef.current || selection !== selectSeqRef.current) return false
-      const state = createDefinitionState()
-      state.markDirty()
-      definitionStateRef.current = state
-      draftIdRef.current = newDefinitionId()
-      revisionRef.current.reset()
-      revisionRef.current.markChanged()
-      const baseName = typeof file.name === 'string' ? file.name.replace(/\.(bpmn|xml)$/i, '') : ''
-      setName(baseName || '导入的流程')
-      setMeta(state.state)
-      setDirty(true)
-      setSaveStatus('idle')
-      setDraftNotice(null)
-      setNotice({ kind: 'success', text: '已导入 BPMN（尚未保存为服务端版本）' })
-      viewRef.current = { kind: 'definition', xml: text, markers: [] }
-      committedViewRef.current = viewRef.current
-      setViewKind('definition')
-      editor.setRuntimeState([])
-      // 恢复失败后再次导入成功（编辑器已重建）：画布重新可用。
-      if (editorUnavailableReason(editor) === '') setCanvasStatus('ready')
-      return true
-    } catch (error) {
-      // 回滚重建失败时编辑器进入不可用态：必须显式显示原因并降级画布状态，
-      // 不能继续提示“导入成功”（复审 M6）。
-      const restoreReason = error && error.restoreError ? failureMessage(error.restoreError) : ''
-      const unavailable = editorUnavailableReason(editor)
-      if (unavailable !== '') setCanvasStatus('error')
-      setNotice({
-        kind: 'error',
-        text: '导入失败（保留原定义）：' + failureMessage(error)
-          + (restoreReason !== '' ? `；画布恢复失败：${restoreReason}` : '')
-          + (unavailable !== '' ? '；画布不可用，请重新导入 BPMN 或刷新页面。' : ''),
-      })
-      // 画布可能已经从 viewer 切到 modeler：恢复原视图。
-      if (previousView.kind === 'instance') {
-        await applyCanvasView(previousView)
+      setLoadingDefinition(false)
+      setLoadingInstance(false)
+      await flushLocalDraft()
+      if (selection !== selectSeqRef.current || !mountedRef.current) return false
+      const previousView = viewRef.current
+      const seq = ++viewSeqRef.current
+      try {
+        // 导入也走原子的「模式 + XML」提交：与在飞的视图请求串行化，
+        // 过期导入在触碰真实模型之前就会被丢弃（复审 F2）。
+        const applied = await applyEditorView(editor, { viewer: false, xml: text, token: seq })
+        if (applied.stale || seq !== viewSeqRef.current || selection !== selectSeqRef.current) return false
+        const state = createDefinitionState()
+        state.markDirty()
+        definitionStateRef.current = state
+        draftIdRef.current = newDefinitionId()
+        revisionRef.current.reset()
+        revisionRef.current.markChanged()
+        const baseName = typeof file.name === 'string' ? file.name.replace(/\.(bpmn|xml)$/i, '') : ''
+        setName(baseName || '导入的流程')
+        setMeta(state.state)
+        setDirty(true)
+        setSaveStatus('idle')
+        setDraftNotice(null)
+        setNotice({ kind: 'success', text: '已导入 BPMN（尚未保存为服务端版本）' })
+        viewRef.current = { kind: 'definition', xml: text, markers: [] }
+        committedViewRef.current = viewRef.current
+        setViewKind('definition')
+        editor.setRuntimeState([])
+        // 恢复失败后再次导入成功（编辑器已重建）：画布重新可用。
+        if (editorUnavailableReason(editor) === '') setCanvasStatus('ready')
+        return true
+      } catch (error) {
+        // 回滚重建失败时编辑器进入不可用态：必须显式显示原因并降级画布状态，
+        // 不能继续提示“导入成功”（复审 M6）。
+        const restoreReason = error && error.restoreError ? failureMessage(error.restoreError) : ''
+        const unavailable = editorUnavailableReason(editor)
+        if (unavailable !== '') setCanvasStatus('error')
+        setNotice({
+          kind: 'error',
+          text: '导入失败（保留原定义）：' + failureMessage(error)
+            + (restoreReason !== '' ? `；画布恢复失败：${restoreReason}` : '')
+            + (unavailable !== '' ? '；画布不可用，请重新导入 BPMN 或刷新页面。' : ''),
+        })
+        // 画布可能已经从 viewer 切到 modeler：恢复原视图。
+        if (previousView.kind === 'instance') {
+          await applyCanvasView(previousView)
+        }
+        return false
       }
-      return false
+    } finally {
+      endSelection(selection)
     }
   }, [applyCanvasView, applyEditorView, flushLocalDraft])
 

@@ -417,26 +417,40 @@ verify_mount_isolation() {
 挂载源暴露宿主 home / ~/.dsh：$mtype $msrc → $mdst（宿主 home=$host_home，~/.dsh=$host_dsh）"
       fi
     fi
-    # 测试台根目录整体的挂载是设计内的；但它内部再 bind 别的宿主目录、或根目录
-    # 之外的 bind 覆盖了写入路径，都必须拒绝（写入会落到另一份宿主存储）。
+    # 只认可测试台根目录 `/testbed` 这一条 bind 挂载（复审 R4）：
+    #   - 根目录内部任何**嵌套 bind** 都不认可：即使目的地是
+    #     `profiles/web/node_modules` / `dt/cache` 这种写入子目录，pnpm install
+    #     也会直接写进另一份宿主存储；
+    #   - 根目录之外的 bind 与写入路径做**双向**重叠判断（祖先或子孙都算重叠），
+    #     不能再只判「目的地是写入根的祖先」。
     # volume / tmpfs 由容器自己管理，不指向宿主 home，不需要在这里拒绝。
     if [ "$mtype" = "bind" ] && [ "$mdst" != "$GUEST_ROOT" ]; then
       local guest_path
-      for guest_path in "$GUEST_HOME" "$GUEST_PROFILE" "$GUEST_LOG" "$GUEST_LOGS" "$GUEST_DT" "$GUEST_PREFIX"; do
-        if path_within "$mdst" "$guest_path"; then
-          problems="$problems
-挂载目的地覆盖测试台写入路径：$mtype ${msrc:-<空>} → $mdst（$guest_path 会写进这个挂载）"
-        fi
-      done
+      if path_within "$GUEST_ROOT" "$mdst"; then
+        problems="$problems
+挂载目的地是测试台根内的嵌套 bind（只允许 $GUEST_ROOT 根挂载）：$mtype ${msrc:-<空>} → $mdst"
+      else
+        for guest_path in "$GUEST_HOME" "$GUEST_PROFILE" "$GUEST_PROFILE/node_modules" "$GUEST_LOG" "$GUEST_LOGS" "$GUEST_DT" "$GUEST_PREFIX"; do
+          if path_within "$mdst" "$guest_path" || path_within "$guest_path" "$mdst"; then
+            problems="$problems
+挂载目的地与测试台写入路径双向重叠：$mtype ${msrc:-<空>} → $mdst（与 $guest_path 重叠）"
+          fi
+        done
+      fi
     fi
   done <<< "$table"
 
+  # 核对**实际写入叶路径**的解析结果，而不只是几个根目录：pnpm install 直接写
+  # `profile/node_modules`，sed 写 `profile/package.json`，安装/启动写 `prefix/bin/dsh`。
   realpaths="$(guest_realpaths "$GUEST_HOME
 $GUEST_PROFILE
+$GUEST_PROFILE/package.json
+$GUEST_PROFILE/node_modules
 $GUEST_LOG
 $GUEST_LOGS
 $GUEST_DT
-$GUEST_PREFIX" 2>/dev/null || true)"
+$GUEST_PREFIX
+$GUEST_PREFIX/bin/dsh" 2>/dev/null || true)"
   if [ -z "$realpaths" ]; then
     problems="$problems
 读不到容器 $CONTAINER 内测试台路径的真实路径（期望容器内有 node）"

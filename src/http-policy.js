@@ -222,8 +222,13 @@ function normalizeCidrRules(raw, field) {
 }
 
 /**
- * 本地 NAT64 前缀（RFC 8215）显式配置：只接受 `64:ff9b:1::/48` 的子前缀，
- * 且前缀长度 32–96（IPv4 映射在内嵌的低 32 位）。默认列表为空 = 全部阻断。
+ * 本地 NAT64 前缀（RFC 8215）显式配置：只接受 `64:ff9b:1::/48` 内、**固定 /96** 的前缀。
+ *
+ * RFC 6052 §2.2 的映射位置随前缀长度变化：只有 /96 把 IPv4 放在最低 32 位，
+ * /32、/40、/48、/56、/64 的 IPv4 分别落在高位或中间（例如 /64 的
+ * `64:ff9b:1:0:a:0:100:0` 实际映射 10.0.0.1，而不是低 32 位读出的 1.0.0.0）。
+ * 本版分类与内嵌 IPv4 提取只实现 /96，其他长度直接拒绝，避免用错误位段做安全判定
+ * （复审 R1）。默认列表为空 = 全部阻断。
  */
 function normalizeNat64Prefixes(raw) {
   const field = 'nat64Prefixes'
@@ -231,9 +236,10 @@ function normalizeNat64Prefixes(raw) {
     const [networkText, prefixText] = rule.split('/')
     const family = networkText.includes(':') ? 6 : 4
     const prefix = Number(prefixText)
-    if (family !== 6 || prefix < 32 || prefix > 96 || !addressInCidr(networkText, '64:ff9b:1::/48')) {
+    if (family !== 6 || prefix !== 96 || !addressInCidr(networkText, '64:ff9b:1::/48')) {
       throw policyInvalid(
-        'nat64Prefixes 只接受 64:ff9b:1::/48 内、前缀长度 32–96 的本地 NAT64 前缀；其他转换前缀不支持。',
+        'nat64Prefixes 只接受 64:ff9b:1::/48 内、前缀长度固定为 /96 的本地 NAT64 前缀'
+        + '（IPv4 内嵌在最低 32 位；其他长度的映射位置按 RFC 6052 不同，本版不支持）。',
         { field, rule },
       )
     }
@@ -294,7 +300,7 @@ function normalizeAuthOrigins(raw) {
  *   - `allowInsecureOrigins`: ['host:port', '[v6]:port']，同时放行 http 与私网判定；
  *   - `allowedHosts`: ['host:port']，允许 https 访问私网/回环地址；
  *   - `allowedCidrs`: ['10.0.0.0/8', '2001:db8::/32']，按**已解析地址**放行；
- *   - `nat64Prefixes`: ['64:ff9b:1::/48']，显式启用本地 NAT64；内嵌 IPv4 仍必须是公网；
+ *   - `nat64Prefixes`: ['64:ff9b:1::/96']（仅 /96），显式启用本地 NAT64；内嵌 IPv4 仍必须是公网；
  *   - `authOrigins`: { authRef: ['https://host:port'] }，把凭据绑定到允许的目标 origin；
  *   - `allowMetadata`: true 才允许 metadata 地址（默认 false，通常不该开）。
  *
@@ -495,8 +501,10 @@ function classifyIPv6(bytes) {
   // 2001:2::/48 基准测试地址
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x02) return 'benchmark'
   // 2001:10::/28 / 2001:20::/28 ORCHID / ORCHIDv2：不可路由的特殊用途。
+  // /28 只固定第 3 字节的高 4 位（2001:10xx::/28 与 2001:20xx::/28），
+  // 不能用整字节相等判断：2001:11::1、2001:2f::1 等同样落在这些前缀内（复审 R1）。
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00
-    && (bytes[3] === 0x10 || bytes[3] === 0x20)) return 'reserved'
+    && ((bytes[3] & 0xf0) === 0x10 || (bytes[3] & 0xf0) === 0x20)) return 'reserved'
   // 2001::/32 Teredo：隧道内容不可见，按保留地址处理。
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) return 'reserved'
   // 100::/64 丢弃前缀（RFC 6666）
@@ -578,8 +586,9 @@ function normalizeAddressList(raw) {
  * 地址是否被例外规则放行（metadata 例外必须 allowMetadata=true）。
  *
  * `nat64-local` 是 64:ff9b:1::/48 本地转换前缀：默认阻断；只有宿主显式配置了覆盖它的
- * `nat64Prefixes`，并且低 32 位内嵌的 IPv4 本身分类为公网时才放行。这样即使部署了
- * 转换路由，也不能用本地 NAT64 地址绕过私网 / metadata 分类。
+ * `nat64Prefixes`（配置侧只接受 /96，IPv4 确实在最低 32 位），并且内嵌的 IPv4 本身
+ * 分类为公网时才放行。这样即使部署了转换路由，也不能用本地 NAT64 地址绕过
+ * 私网 / metadata 分类。
  */
 function isAddressAllowed(address, kind, host, port, policy) {
   if (kind === 'public') return true

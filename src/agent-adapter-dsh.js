@@ -1104,16 +1104,23 @@ export function createDshAdapter(options = {}) {
         // 0.13.10 运行指标：`assistant/message` 的 usage 先经过 process-local 的
         // `agent/assistant-stream` 发布；按 attemptId 去重（同一条调用多个 usage
         // chunk 是替换，不是累加）。中断/取消的调用也可能已有 usage，必须保留。
-        const offUsage = agentCtx.on('agent/assistant-stream', payload => {
-          const frame = isPlainObject(payload?.frame) ? payload.frame : null
-          if (frame === null || frame.type !== 'chunk') return
-          const chunk = isPlainObject(frame.chunk) ? frame.chunk : null
-          if (chunk === null || chunk.type !== 'usage' || !isPlainObject(chunk.usage)) return
-          if (frame.attemptId === undefined || frame.attemptId === null) return
-          const callId = `${st.sessionId || sessionId}:${String(frame.attemptId)}`
-          st.usageCalls.set(callId, { ...chunk.usage })
-          st.usageLast = { ...chunk.usage }
-        })
+        // usage 是可选观测能力：订阅失败不能把节点判失败（否则看指标反而拖垮执行），
+        // 只会让本次调用在指标里如实变成 unknown。
+        let offUsage = null
+        try {
+          offUsage = agentCtx.on('agent/assistant-stream', payload => {
+            const frame = isPlainObject(payload?.frame) ? payload.frame : null
+            if (frame === null || frame.type !== 'chunk') return
+            const chunk = isPlainObject(frame.chunk) ? frame.chunk : null
+            if (chunk === null || chunk.type !== 'usage' || !isPlainObject(chunk.usage)) return
+            if (frame.attemptId === undefined || frame.attemptId === null) return
+            const callId = `${st.sessionId || sessionId}:${String(frame.attemptId)}`
+            st.usageCalls.set(callId, { ...chunk.usage })
+            st.usageLast = { ...chunk.usage }
+          })
+        } catch (error) {
+          log('warn', `flow-studio: 订阅 agent/assistant-stream 失败（usage 将标未知）：${errorText(error)}`)
+        }
         if (typeof offUsage === 'function') st.unlisteners.push(offUsage)
         // 0.13.10：宿主可把「绑定本实例/执行身份」的收件箱工具注册进这个会话。
         // 未提供时保持旧行为（全局工具仍在宿主 tools 服务里）。

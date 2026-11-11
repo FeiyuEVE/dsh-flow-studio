@@ -25,13 +25,16 @@
  * 生命周期：
  *   start ──► probe（未探测则先探测）──► agents.create(setup: 注册工具 + 挂 turn.stop)
  *     │                                        └─► followup(节点提示词)
- *     │                        工具被调用 ─► finishGate.submit ─► exited {ok:true, record}
+ *     │                        工具被调用 ─► finishGate.submit（成功 = 不可逆受理点）
+ *     │                                        ─► exited {ok:true, record}
  *     │                        本轮停下但没调 ─► turn-stopping ─► steer(提醒) ×≤maxFires
  *     │                                   提醒用尽 ─► finishGate.abort（未 settled 时）
  *     │                                             ─► exited {ok:false, code:'NODE_FINISH_MISSING', reminders}
  *     │                                             └─ 迟到 submit 一律 NODE_ALREADY_SETTLED
  *     └─ cancel / ctx.signal abort / dispose ─► finishGate.abort + agent.cancel({kind:'parent'})
  *                                     ─► exited {ok:false, code:'NODE_FINISH_CANCELED', reminders}
+ *                                     └─ dispose 等待宿主 created.dispose() 有界（默认 2s），
+ *                                        超时写 handle.cleanup={disposed:false,timedOut:true}
  *
  * @module @feiyueve/dsh-flow-studio/agent-adapter-dsh
  */
@@ -50,6 +53,54 @@ export const FINISH_TOOL_NAME = 'flow_finish_node'
 
 /** 内置 `turn.stop` hook 的默认提醒上限（11 §3.1）。 */
 export const DEFAULT_FINISH_REMINDER_MAX_FIRES = 3
+
+/**
+ * `dispose()` / `start()` 收尾时等待宿主 `created.dispose()` 的默认 deadline（毫秒）。
+ *
+ * 宿主释放会话可能永远不 resolve（codex 复审 #6 实测：工具已成功受理、宿主
+ * `dispose()` 返回 pending 的 Promise，`runAgentNode()` 的 finally 被无界挂住）。
+ * 适配器自己必须有界：超时后返回，并把**真实**清理状态写进 `handle.cleanup`
+ * （`disposed:false, timedOut:true`），不声称已清理完成。
+ */
+export const DEFAULT_DISPOSE_TIMEOUT_MS = 2_000
+
+const TIMED_OUT = Symbol('flow-studio-dispose-timeout')
+
+/**
+ * 给一个可能永不决议的 Promise 套 deadline。
+ *
+ * @param {() => any} factory 真正发起收尾动作（同步抛错也按拒绝处理）
+ * @param {number} timeoutMs 正整数 deadline；非法值按「不设上限」处理（调用方已归一）
+ * @returns {Promise<{timedOut: true} | {timedOut: false, value?: any, error?: any}>}
+ */
+async function withDeadline(factory, timeoutMs) {
+  let pending
+  try {
+    pending = Promise.resolve(factory())
+  } catch (error) {
+    return { timedOut: false, error }
+  }
+  if (!(Number.isSafeInteger(timeoutMs) && timeoutMs > 0)) {
+    return pending.then(
+      value => ({ timedOut: false, value }),
+      error => ({ timedOut: false, error }),
+    )
+  }
+  let timer = null
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs)
+  })
+  const settled = pending.then(
+    value => ({ timedOut: false, value }),
+    error => ({ timedOut: false, error }),
+  )
+  const outcome = await Promise.race([settled, timeout])
+  if (timer !== null) {
+    clearTimeout(timer)
+    timer = null
+  }
+  return outcome === TIMED_OUT ? { timedOut: true } : outcome
+}
 
 /** 「停下来但没调工具、提醒也用尽」的结局码（11 §3.1；实例仍保持 ACTIVE）。 */
 export const NODE_FINISH_MISSING = 'NODE_FINISH_MISSING'
@@ -345,12 +396,12 @@ function isExecAborted(exec) {
     && exec.signal && typeof exec.signal === 'object' && exec.signal.aborted === true)
 }
 
-/** 取消后的工具结果：明确「未受理」，不伪装成完成也不抛出。 */
+/** 提交**之前**已取消的工具结果：明确「未受理」，不伪装成完成也不抛出。 */
 function abortedToolResult() {
   return {
     ok: false,
     code: NODE_FINISH_CANCELED,
-    message: '工具调用已被取消（exec.signal 已 abort），本次提交没有被受理。',
+    message: '工具调用在受理之前已被取消（exec.signal 已 abort），本次提交没有被受理。',
     hint: FINISH_ERROR_HINT[NODE_FINISH_CANCELED],
   }
 }
@@ -388,8 +439,13 @@ export function createFinishToolDefinition({ finishGate, element } = {}) {
     timeoutMs: 30_000,
     isConcurrencySafe: () => false,
     async execute(args, exec) {
-      // 声明了 timeoutMs 就必须遵守 exec.signal（m4）：提交前 / 返回前都检查，
-      // 取消后不再把「提交成功」当成工具结果回给模型。
+      // 声明了 timeoutMs 就必须遵守 exec.signal（m4）：**提交前**已取消则不碰闸门。
+      //
+      // 语义（codex 复审 #10）：`finishGate.submit()` 成功返回是**不可逆的受理点**；
+      // 一旦它 resolve，闸门已 settled、适配器会按成功推进，工具就必须如实返回
+      // `ok:true + record`。提交后再 abort 不能再把「已受理」改写成「没有被受理」——
+      // 那是事后篡改事实，只会让模型以为节点没完成而重试。取消只能阻止**尚未受理**
+      // 的提交，所以 abort 检查只放在提交之前。
       if (isExecAborted(exec)) return abortedToolResult()
       let submitted
       try {
@@ -405,7 +461,6 @@ export function createFinishToolDefinition({ finishGate, element } = {}) {
         if (error && isPlainObject(error.details)) result.details = error.details
         return result
       }
-      if (isExecAborted(exec)) return abortedToolResult()
       const record = submitted && submitted.record ? submitted.record : {}
       const artifacts = Array.isArray(record.artifacts)
         ? record.artifacts.map(item => ({
@@ -432,17 +487,33 @@ export function createFinishToolDefinition({ finishGate, element } = {}) {
 /**
  * 释放 `agents.create` 返回的句柄（幂等；失败只 warn，不把释放失败当节点失败）。
  *
+ * **有界**：等待宿主 `created.dispose()` 最多 `timeoutMs`。宿主不返回时不再等待，
+ * 而是如实返回 `{disposed:false, timedOut:true}`——调用方据此把真实清理状态记到
+ * `handle.cleanup`，不能把「等不到」说成「已清理」。
+ *
  * @param {{dispose?: Function}|null} created
  * @param {(level: string, message: string) => void} log
  * @param {string} sessionId
+ * @param {number} timeoutMs 收尾 deadline（正整数毫秒）
+ * @returns {Promise<{disposed: boolean, timedOut: boolean, timeoutMs?: number, elapsedMs?: number, reason?: string, error?: string}>}
  */
-async function disposeAgentHandle(created, log, sessionId) {
-  if (!created || typeof created.dispose !== 'function') return
-  try {
-    await created.dispose()
-  } catch (error) {
-    log('warn', `flow-studio: 释放节点会话失败（${sessionId}）：${errorText(error)}`)
+async function disposeAgentHandle(created, log, sessionId, timeoutMs) {
+  if (!created || typeof created.dispose !== 'function') {
+    return { disposed: true, timedOut: false, reason: created ? 'no-dispose' : 'no-handle' }
   }
+  const startedAt = Date.now()
+  const outcome = await withDeadline(() => created.dispose(), timeoutMs)
+  const elapsedMs = Date.now() - startedAt
+  if (outcome.timedOut) {
+    log('warn', `flow-studio: 释放节点会话超时（${sessionId}，deadline=${timeoutMs}ms）：`
+      + '宿主 created.dispose() 仍未返回；不再等待，按未完成清理记录（disposed=false, timedOut=true）')
+    return { disposed: false, timedOut: true, timeoutMs, elapsedMs }
+  }
+  if (Object.prototype.hasOwnProperty.call(outcome, 'error')) {
+    log('warn', `flow-studio: 释放节点会话失败（${sessionId}）：${errorText(outcome.error)}`)
+    return { disposed: false, timedOut: false, timeoutMs, elapsedMs, error: errorText(outcome.error) }
+  }
+  return { disposed: true, timedOut: false, timeoutMs, elapsedMs }
 }
 
 function normalizeMaxFires(value, fallback) {
@@ -578,6 +649,7 @@ async function resolveHostVersion(options) {
  *   version?: string,        // probe() 报告的宿主版本（最高优先级）
  *   versionProvider?: () => (string|Promise<string>), // 嵌入方提供版本来源（次优先）
  *   maxFires?: number,       // 提醒上限默认值（默认 3）
+ *   disposeTimeoutMs?: number, // 等待宿主 created.dispose() 的 deadline（默认 2000ms）
  *   now?: () => Date,
  *   log?: (level: string, message: string) => void,
  * }} [options]
@@ -587,6 +659,10 @@ export function createDshAdapter(options = {}) {
   const now = typeof options.now === 'function' ? options.now : () => new Date()
   const log = typeof options.log === 'function' ? options.log : () => {}
   const defaultMaxFires = normalizeMaxFires(options.maxFires, DEFAULT_FINISH_REMINDER_MAX_FIRES)
+  // 收尾 deadline 必须有界（codex 复审 #6）：非法 / 未配置都退回 2s。
+  const disposeTimeoutMs = Number.isSafeInteger(options.disposeTimeoutMs) && options.disposeTimeoutMs > 0
+    ? options.disposeTimeoutMs
+    : DEFAULT_DISPOSE_TIMEOUT_MS
   /** @type {WeakMap<object, object>} handle → 内部状态 */
   const states = new WeakMap()
 
@@ -706,6 +782,7 @@ export function createDshAdapter(options = {}) {
         unlisteners: [],
         signalOff: null,
         disposed: false,
+        cleanup: null,
         handle: null,
       }
 
@@ -781,10 +858,18 @@ export function createDshAdapter(options = {}) {
         if (st.agentCanceled) return false
         if (!st.agent || typeof st.agent.cancel !== 'function') return false
         st.agentCanceled = true
+        const reasonText = reason === undefined ? 'cancel' : String(reason)
         try {
-          st.agent.cancel({ kind: 'parent' })
+          const pending = st.agent.cancel({ kind: 'parent' })
+          // cancel 不等待宿主收尾（有界性见 cancel()），但必须接住宿主返回的
+          // Promise 的 rejection，否则会变成 unhandled rejection。
+          if (pending && typeof pending.then === 'function') {
+            Promise.resolve(pending).catch((error) => {
+              log('warn', `flow-studio: agent.cancel 异步失败（${reasonText}）：${errorText(error)}`)
+            })
+          }
         } catch (error) {
-          log('warn', `flow-studio: agent.cancel 失败（${reason === undefined ? 'cancel' : String(reason)}）：${errorText(error)}`)
+          log('warn', `flow-studio: agent.cancel 失败（${reasonText}）：${errorText(error)}`)
         }
         return true
       }
@@ -985,13 +1070,16 @@ export function createDshAdapter(options = {}) {
           // DSH 里 agent 的注册身份就是 sessionId（没有独立的 agentId）。
           get agentId() { return st.sessionId },
           get agent() { return st.agent },
+          // dispose 之前为 null；之后是真实清理状态（宿主不返回时 disposed=false、
+          // timedOut=true——调用方据此知道「没清完」，不能当成已释放）。
+          get cleanup() { return st.cleanup },
         }
         st.handle = handle
         states.set(handle, st)
         return handle
       }
 
-      const disposeCreated = created => disposeAgentHandle(created, log, sessionId)
+      const disposeCreated = created => disposeAgentHandle(created, log, sessionId, disposeTimeoutMs)
 
       let created = null
       try {
@@ -1010,9 +1098,12 @@ export function createDshAdapter(options = {}) {
 
       if (st.canceled) {
         // 迟到创建结果：取消发生在 create 期间，句柄一回来就释放，绝不留活会话。
+        // 释放同样有界；超时也要如实记到即将返回的 handle 上，不能被后来的 dispose
+        // 用「没有句柄可释放」覆盖成已清理。
         cleanupTransient()
-        await disposeCreated(created)
+        const cleanup = await disposeCreated(created)
         st.createdHandle = null
+        st.cleanup = { ...cleanup, finishedAt: now().toISOString() }
         return makeHandle()
       }
 
@@ -1062,6 +1153,10 @@ export function createDshAdapter(options = {}) {
     },
 
     async cancel(handle, reason) {
+      // cancel **全程同步**：abort 闸门 + `agent.cancel()` + resolve exited，不 await
+      // 宿主任何 Promise（`agent.cancel` 的返回值也刻意不等待），所以它天然有界，
+      // 不需要单独的 deadline；真正可能挂住的是 dispose 里的 `created.dispose()`，
+      // 那一段由 disposeTimeoutMs 限制（codex 复审 #6）。
       const st = handle && typeof handle === 'object' ? states.get(handle) : undefined
       if (!st) {
         throw new AdapterError(
@@ -1095,7 +1190,7 @@ export function createDshAdapter(options = {}) {
       }
       if (st.disposed) return false
       st.disposed = true
-      // dispose 视为一次取消：未 settle 时 abort 闸门并把 exited resolve 成
+      // dispose 视为一次取消：未 settle 时**先** abort 闸门并把 exited resolve 成
       // NODE_FINISH_CANCELED——绝不留一个永远 pending 的 exited（m2）。
       if (!st.settled && typeof st.cancelState === 'function') {
         st.cancelState('disposed')
@@ -1105,9 +1200,33 @@ export function createDshAdapter(options = {}) {
         st.cancelAgent('disposed-after-missing')
       }
       if (typeof st.cleanupTransient === 'function') st.cleanupTransient()
+      // 收尾有界（codex 复审 #6）：宿主 created.dispose() 永不 resolve 时，
+      // disposeAgentHandle 在 disposeTimeoutMs 后返回；这里如实记录清理状态，
+      // 不能无限等待、也不能声称已清理完成。
+      const previousCleanup = st.cleanup
       const created = st.createdHandle
       st.createdHandle = null
-      await disposeAgentHandle(created, log, st.sessionId)
+      const result = await disposeAgentHandle(created, log, st.sessionId, disposeTimeoutMs)
+      const finishedAt = now().toISOString()
+      if (previousCleanup
+        && previousCleanup.timedOut === true
+        && previousCleanup.disposed === false
+        && created === null) {
+        // 之前那次宿主 dispose 已超时、会话可能还活着；这次没有新句柄可释放。
+        // 保留「未完成清理」的事实，只补记一次重试时间。
+        st.cleanup = { ...previousCleanup, retriedAt: finishedAt }
+        return true
+      }
+      st.cleanup = {
+        disposed: result.disposed === true,
+        timedOut: result.timedOut === true,
+        timeoutMs: disposeTimeoutMs,
+        startedAt: previousCleanup && previousCleanup.startedAt ? previousCleanup.startedAt : finishedAt,
+        finishedAt,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(typeof result.elapsedMs === 'number' ? { elapsedMs: result.elapsedMs } : {}),
+        ...(result.error ? { error: result.error } : {}),
+      }
       return true
     },
   }

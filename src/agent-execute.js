@@ -16,10 +16,14 @@
  *   └─ createFinishGate(executionId, nodeId, attempt, workspaceRoot)
  *        └─ adapter.start({ element, ctx, finishGate, workspaceRoot, reminder })
  *             ├─ handle.exited 先到 → 成功（gate 必须已 settled）或结构化失败
- *             ├─ ctx.timeoutMs 先到 → adapter.cancel(handle, 'timeout') → BPMN_ACTIVITY_TIMEOUT
+ *             ├─ 有效时限先到 → adapter.cancel(handle, 'timeout') → BPMN_ACTIVITY_TIMEOUT
  *             └─ ctx.signal abort 先到 → adapter.cancel(handle, 'aborted') → BPMN_ABORTED
  *        └─ finally: gate.abort（未完结时）+ adapter.dispose(handle)
  * ```
+ *
+ * 有效时限（review-0131 #3）：`ctx.timeoutMs > node.executor.timeoutMs > 0`，同一个
+ * deadline 覆盖 probe / start / 执行 / 取消阶段；`executeAgent` 会把 probe 花掉的时间
+ * 从剩余预算里扣掉再传给 `runAgentNode`。
  *
  * **不做**：不轮询 stdout、不解析文本猜结论、不判「模型说完成了」；完成只认
  * `finishGate.submit` 产生的那一条 record（11 §1）。
@@ -133,14 +137,20 @@ export function resolveWorkspaceRoot(element, fallback) {
 }
 
 /**
- * 每个 runtime 一份的 probe 缓存：同一 adapter id **只 probe 一次**，
- * 成功 / 失败都缓存（失败的适配器每次都会失败，不应反复起子进程）。
+ * 每个 runtime 一份的 probe **进行中合并**（in-flight dedupe）。
+ *
+ * 只合并「同一 adapter id 已经在跑的那一次 probe」：并发 admission 不会重复起子进程，
+ * 但 probe 结束（成功或失败）后立即从表里移除，**不缓存结果**。
+ *
+ * 结果缓存的有效期由适配器自己拥有（例如 codex 的 `probeCacheTtlMs`，默认 10 分钟）：
+ * runtime 若永久缓存，adapter 的 TTL 一过，`capabilities()` 已经变回 `unsupported`，
+ * 而 admission 仍握着旧 Promise，节点会被永久拒绝（review-0131 #2）。
  *
  * @returns {(adapter: object) => Promise<object>}
  */
 export function createAdapterProbeCache() {
   /** @type {Map<string, Promise<object>>} */
-  const cache = new Map()
+  const inflight = new Map()
   return function probeAdapter(adapter) {
     if (!adapter || typeof adapter !== 'object') {
       throw new AdapterError(ADAPTER_ERROR.INVALID, 'probeAdapter 需要适配器对象', { field: 'adapter' })
@@ -153,11 +163,36 @@ export function createAdapterProbeCache() {
       )
     }
     const id = typeof adapter.id === 'string' && adapter.id !== '' ? adapter.id : '(anonymous)'
-    if (!cache.has(id)) {
-      cache.set(id, Promise.resolve().then(() => adapter.probe()))
-    }
-    return cache.get(id)
+    const running = inflight.get(id)
+    if (running !== undefined) return running
+    const pending = Promise.resolve().then(() => adapter.probe())
+    const tracked = pending.finally(() => {
+      if (inflight.get(id) === tracked) inflight.delete(id)
+    })
+    inflight.set(id, tracked)
+    return tracked
   }
+}
+
+/**
+ * 解析一次 agent 活动的有效时限（里程碑 review-0131 #3）。
+ *
+ * 优先级与旧外部 executor 路径一致：`ctx.timeoutMs > node.executor.timeoutMs > 0`。
+ * 0 / 非法值表示不设活动时限（由 runner 的全局 run 时限或调用方控制）。
+ *
+ * @param {object} element BPMN agent 元素
+ * @param {object} [ctx] handler ctx（runner 传入的全局活动时限）
+ * @returns {number} 正整数毫秒，或 0
+ */
+export function resolveAgentTimeoutMs(element, ctx) {
+  const fromCtx = Number.isSafeInteger(ctx?.timeoutMs) && ctx.timeoutMs > 0 ? ctx.timeoutMs : 0
+  if (fromCtx > 0) return fromCtx
+  const node = isPlainObject(element?.node) ? element.node : {}
+  const executor = isPlainObject(node.executor) ? node.executor : null
+  const fromNode = executor && Number.isSafeInteger(executor.timeoutMs) && executor.timeoutMs > 0
+    ? executor.timeoutMs
+    : 0
+  return fromNode
 }
 
 /**
@@ -166,25 +201,52 @@ export function createAdapterProbeCache() {
  * probe 失败（codex 不在 / 未登录 / MCP 通道握手失败）与 `finishTool !== 'native'`
  * 都收敛成 `NODE_FINISH_TOOL_UNAVAILABLE`——节点**零派发**，不退回解析文本（11 §1.6）。
  *
+ * `options.timeoutMs` 是本次活动的有效时限（review-0131 #3）：probe 也受它约束，
+ * 超时报 `BPMN_ACTIVITY_TIMEOUT`（不是「适配器不可用」——probe 慢不等于能力缺失）。
+ *
  * @param {object} adapter
- * @param {{ probeAdapter?: Function, nodeId?: string }} [options]
+ * @param {{ probeAdapter?: Function, nodeId?: string, timeoutMs?: number }} [options]
  * @returns {Promise<{version: string, helpDigest: string}>}
  * @throws {Error & {code: string}}
  */
 export async function admitAdapter(adapter, options = {}) {
   const nodeId = nonEmptyString(options.nodeId) ? options.nodeId : undefined
+  const timeoutMs = Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0
+    ? options.timeoutMs
+    : 0
   const probe = typeof options.probeAdapter === 'function'
     ? options.probeAdapter
     : candidate => Promise.resolve().then(() => candidate.probe())
   let result
+  let timer = null
   try {
-    result = await probe(adapter)
+    const probing = Promise.resolve().then(() => probe(adapter))
+    // 超时之后 probe 自己的 rejection 不能让进程崩（适配器仍在后台收尾）。
+    probing.catch(() => {})
+    result = timeoutMs > 0
+      ? await Promise.race([
+        probing,
+        new Promise((resolvePromise, rejectPromise) => {
+          timer = setTimeout(() => {
+            rejectPromise(agentHandlerError(
+              AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+              `适配器「${adapter?.id ?? '(unknown)'}」的 probe 超过 ${timeoutMs}ms 仍未返回：`
+                + `节点 ${nodeId ?? '(agent)'} 的活动时限已用尽（按超时处理，不派发）`,
+              { adapterId: adapter?.id, nodeId, phase: 'probe', timeoutMs, reason: 'timeout' },
+            ))
+          }, timeoutMs)
+        }),
+      ])
+      : await probing
   } catch (error) {
+    if (error && error.code === AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT) throw error
     throw agentHandlerError(
       ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
       `adapter「${adapter?.id ?? '(unknown)'}」probe 失败：${errorText(error)}（按不可用处理，不派发节点）`,
       { adapterId: adapter?.id, nodeId, phase: 'probe', cause: error },
     )
+  } finally {
+    if (timer !== null) clearTimeout(timer)
   }
   try {
     assertFinishToolNative(adapter, { nodeId, phase: 'admission' })
@@ -226,6 +288,8 @@ function sleep(ms) {
  *   workspaceRoot?: string,
  *   instanceId?: string,
  *   probeAdapter?: Function,
+ *   effectiveTimeoutMs?: number, // 配置口径的有效时限（透传给适配器 ctx.timeoutMs）
+ *   timeoutMs?: number,   // 本活动剩余的执行预算（executeAgent 扣掉 probe 后传入）
  *   cancelGraceMs?: number,
  *   log?: (level: string, message: string) => void,
  * }} options
@@ -274,7 +338,20 @@ export async function runAgentNode(options = {}) {
   let abortListener = null
   let resolveAborted
   const aborted = new Promise(resolvePromise => { resolveAborted = resolvePromise })
-  const timeoutMs = Number.isSafeInteger(ctx.timeoutMs) && ctx.timeoutMs > 0 ? ctx.timeoutMs : 0
+  // review-0131 #3：有效时限 = 显式 options.effectiveTimeoutMs（executeAgent 解析的
+  // `ctx.timeoutMs > node.executor.timeoutMs`）> 直接调用时的 ctx / 节点配置。
+  // 配置口径的时限透传给适配器（与旧 executor 的 options.timeoutMs 同口径），
+  // 真正计时用 `options.timeoutMs`（executeAgent 扣掉 probe 之后的剩余预算）。
+  const configuredTimeoutMs = Number.isSafeInteger(options.effectiveTimeoutMs) && options.effectiveTimeoutMs > 0
+    ? options.effectiveTimeoutMs
+    : resolveAgentTimeoutMs(element, ctx)
+  const timeoutMs = Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0
+    ? options.timeoutMs
+    : configuredTimeoutMs
+  // 适配器按契约拿到 handler ctx；把有效时限也透给它，与旧 executor 的 options.timeoutMs 同口径。
+  const adapterCtx = configuredTimeoutMs > 0 && ctx.timeoutMs !== configuredTimeoutMs
+    ? { ...ctx, timeoutMs: configuredTimeoutMs }
+    : ctx
   const cancelGraceMs = Number.isSafeInteger(options.cancelGraceMs) && options.cancelGraceMs >= 0
     ? options.cancelGraceMs
     : DEFAULT_CANCEL_GRACE_MS
@@ -284,6 +361,14 @@ export async function runAgentNode(options = {}) {
     ? ctx.signal
     : null
 
+  /** 一次活动只有一个 deadline：probe 之后剩下的时间同时约束 start 与执行。 */
+  const timeoutRace = timeoutMs > 0
+    ? new Promise(resolveRace => {
+      // 不 unref：活动超时是 handler 的语义，不能因为进程里没有其它句柄就静默消失。
+      timer = setTimeout(() => resolveRace({ kind: 'timeout' }), timeoutMs)
+    })
+    : null
+
   const cancelHandle = async reason => {
     if (handle === null) return
     try {
@@ -291,6 +376,45 @@ export async function runAgentNode(options = {}) {
     } catch (error) {
       log('warn', `flow-studio: 取消 agent 活动失败（节点 ${nodeId}）：${errorText(error)}`)
     }
+  }
+
+  /**
+   * start 阶段就超时 / abort 时句柄可能稍后才到：拿到后立刻 cancel + dispose，
+   * 不能把已经放弃的活动留在适配器里空转。
+   */
+  const discardLateHandle = (started, reason) => {
+    Promise.resolve(started).then(late => {
+      if (!late || typeof late !== 'object') return
+      Promise.resolve()
+        .then(() => adapter.cancel(late, reason))
+        .catch(error => log('warn', `flow-studio: 取消迟到的 agent 句柄失败（节点 ${nodeId}）：${errorText(error)}`))
+        .then(() => adapter.dispose(late))
+        .catch(error => log('warn', `flow-studio: 释放迟到的 agent 句柄失败（节点 ${nodeId}）：${errorText(error)}`))
+    }, () => {})
+  }
+
+  /** start 抛错的统一映射：canceled → abort，其余保留可行动 code。 */
+  const startFailure = error => {
+    if (error && error.code === 'NODE_FINISH_CANCELED') {
+      return agentHandlerError(AGENT_EXECUTE_ERROR.ABORTED, `适配器 ${adapter.id} 在启动阶段被取消：${errorText(error)}`, {
+        elementId: nodeId,
+        activityId: executionId,
+        cause: error,
+      })
+    }
+    if (error && typeof error.code === 'string' && error.code !== '') {
+      return agentHandlerError(error.code, errorText(error), {
+        elementId: nodeId,
+        activityId: executionId,
+        adapter: adapter.id,
+        cause: error,
+      })
+    }
+    return agentHandlerError(ADAPTER_ERROR.INVALID, `适配器 ${adapter.id} 启动失败：${errorText(error)}`, {
+      elementId: nodeId,
+      activityId: executionId,
+      cause: error,
+    })
   }
 
   /** 等适配器把 exited 收掉；超过宽限就不等了（dispose 还会再兜一次底）。 */
@@ -315,37 +439,54 @@ export async function runAgentNode(options = {}) {
       })
     }
 
+    let started
     try {
-      handle = await adapter.start({
+      started = adapter.start({
         element,
-        ctx,
+        ctx: adapterCtx,
         finishGate: gate,
         workspaceRoot,
         reminder,
       })
     } catch (error) {
-      // 适配器在 start 阶段的失败码：canceled 映射成 abort，其余保留可行动 code。
-      if (error && error.code === 'NODE_FINISH_CANCELED') {
-        throw agentHandlerError(AGENT_EXECUTE_ERROR.ABORTED, `适配器 ${adapter.id} 在启动阶段被取消：${errorText(error)}`, {
-          elementId: nodeId,
-          activityId: executionId,
-          cause: error,
-        })
-      }
-      if (error && typeof error.code === 'string' && error.code !== '') {
-        throw agentHandlerError(error.code, errorText(error), {
-          elementId: nodeId,
-          activityId: executionId,
-          adapter: adapter.id,
-          cause: error,
-        })
-      }
-      throw agentHandlerError(ADAPTER_ERROR.INVALID, `适配器 ${adapter.id} 启动失败：${errorText(error)}`, {
-        elementId: nodeId,
-        activityId: executionId,
-        cause: error,
-      })
+      throw startFailure(error)
     }
+
+    if (signal && typeof signal.addEventListener === 'function') {
+      abortListener = () => resolveAborted({ kind: 'aborted' })
+      signal.addEventListener('abort', abortListener, { once: true })
+    }
+    const startRacers = [
+      Promise.resolve(started).then(
+        value => ({ kind: 'started', handle: value }),
+        error => ({ kind: 'startFailed', error }),
+      ),
+    ]
+    if (timeoutRace !== null) startRacers.push(timeoutRace)
+    if (abortListener !== null) startRacers.push(aborted)
+    const firstStart = await Promise.race(startRacers)
+    if (firstStart.kind === 'timeout') {
+      settledBy = 'timeout'
+      discardLateHandle(started, `activity timeout after ${timeoutMs}ms (during start)`)
+      throw agentHandlerError(
+        AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+        `活动 ${nodeId} 在启动阶段超过 ${configuredTimeoutMs}ms 的活动时限仍未就绪（迟到句柄会被取消并释放）`,
+        { elementId: nodeId, activityId: executionId, adapter: adapter.id, timeoutMs: configuredTimeoutMs, remainingTimeoutMs: timeoutMs, phase: 'start' },
+      )
+    }
+    if (firstStart.kind === 'aborted' || (signal && signal.aborted)) {
+      settledBy = 'aborted'
+      discardLateHandle(started, 'ctx.signal aborted (during start)')
+      throw agentHandlerError(
+        AGENT_EXECUTE_ERROR.ABORTED,
+        `活动 ${nodeId} 在启动阶段被取消（ctx.signal abort；迟到的适配器句柄会被取消并释放）`,
+        { elementId: nodeId, activityId: executionId, adapter: adapter.id, reason: 'aborted', phase: 'start' },
+      )
+    }
+    if (firstStart.kind === 'startFailed') {
+      throw startFailure(firstStart.error)
+    }
+    handle = firstStart.handle
 
     if (!handle || typeof handle !== 'object' || !handle.exited || typeof handle.exited.then !== 'function') {
       throw agentHandlerError(
@@ -361,28 +502,19 @@ export async function runAgentNode(options = {}) {
         error => ({ kind: 'failed', error }),
       ),
     ]
-    if (timeoutMs > 0) {
-      racers.push(new Promise(resolveRace => {
-        // 不 unref：活动超时是 handler 的语义，不能因为进程里没有其它句柄就静默消失。
-        timer = setTimeout(() => resolveRace({ kind: 'timeout' }), timeoutMs)
-      }))
-    }
-    if (signal && typeof signal.addEventListener === 'function') {
-      abortListener = () => resolveAborted({ kind: 'aborted' })
-      signal.addEventListener('abort', abortListener, { once: true })
-      racers.push(aborted)
-    }
+    if (timeoutRace !== null) racers.push(timeoutRace)
+    if (abortListener !== null) racers.push(aborted)
 
     const first = await Promise.race(racers)
     settledBy = first.kind
 
     if (first.kind === 'timeout') {
-      await cancelHandle(`activity timeout after ${timeoutMs}ms`)
+      await cancelHandle(`activity timeout after ${configuredTimeoutMs}ms`)
       await waitExited()
       throw agentHandlerError(
         AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
-        `活动 ${nodeId} 超过 ${timeoutMs}ms 仍未调用 ${FINISH_TOOL_NAME} 完结（已取消适配器）`,
-        { elementId: nodeId, activityId: executionId, adapter: adapter.id, timeoutMs },
+        `活动 ${nodeId} 超过 ${configuredTimeoutMs}ms 的活动时限仍未调用 ${FINISH_TOOL_NAME} 完结（已取消适配器）`,
+        { elementId: nodeId, activityId: executionId, adapter: adapter.id, timeoutMs: configuredTimeoutMs, remainingTimeoutMs: timeoutMs, phase: 'activity' },
       )
     }
 

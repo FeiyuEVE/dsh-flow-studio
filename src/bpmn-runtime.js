@@ -69,7 +69,7 @@ import { BPMN_RUNNER_STATUS, BpmnRunnerError, createBpmnRunner } from './bpmn-ru
 import { BPMN_STATE_KIND, BPMN_STATE_VERSION, sha256Hex } from './bpmn-state.js'
 import {
   AGENT_EXECUTE_ERROR, DEFAULT_ADAPTER_ID, admitAdapter, createAdapterProbeCache,
-  resolveAdapterId, runAgentNode,
+  resolveAdapterId, resolveAgentTimeoutMs, runAgentNode,
 } from './agent-execute.js'
 import { normalizeExecutor, runExternalExecutor } from './executor.js'
 import { checkRunId } from './runlog.js'
@@ -733,6 +733,45 @@ class BpmnRuntime {
     }
   }
 
+  /**
+   * 读实例定义快照。抽成方法是为了让测试能暂停「异步准备」这一段，
+   * 复现 stop 与启动/恢复的竞态（review-0131 #1）；生产路径就是 store 的直读。
+   *
+   * @param {string} instanceId
+   * @returns {Promise<object|null>}
+   */
+  async _readDefinitionSnapshot(instanceId) {
+    return await readInstanceDefinition(instanceId, { instancesRoot: this.instancesRoot })
+  }
+
+  /**
+   * 启动 / 恢复共用的同步复查：异步准备（读快照 / 解析 XML）期间 stop 可能已经
+   * 置了停止闩并把实例收成 CANCELED。此时**不能再创建/登记 runner**——否则 stop
+   * 已经返回 CANCELED 之后仍会派发新的 agent（review-0131 #1）。
+   *
+   * 只做同步判位；命中后由调用方异步读一次实例状态再返回。
+   *
+   * @param {string} instanceId
+   * @returns {{code: string, message: string, reason: string}|null}
+   */
+  _latchBlockForPrepare(instanceId) {
+    if (this._disposed) {
+      return {
+        code: 'BPMN_RUNTIME_DISPOSED',
+        reason: 'BPMN 运行时已释放，未创建执行器、未派发节点',
+        message: `实例 ${instanceId} 的启动/恢复准备期间 runtime 已被 dispose：不创建执行器、不派发节点`,
+      }
+    }
+    if (this._stopping.has(instanceId)) {
+      return {
+        code: 'BPMN_INSTANCE_STOPPING',
+        reason: '实例在启动/恢复准备期间被停止（stop 已置停止闩），未创建执行器、未派发节点',
+        message: `实例 ${instanceId} 在启动/恢复准备期间被停止（stop 已置停止闩）：不创建执行器、不派发节点`,
+      }
+    }
+    return null
+  }
+
   /** 建实例后启动；失败不抛 handler 错，收成 `{instance, error}`（status 仍 ACTIVE + lastError）。 */
   async _startInstance(instanceId) {
     const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
@@ -742,11 +781,23 @@ class BpmnRuntime {
     if (instance.status !== 'ACTIVE') {
       throw new BpmnRuntimeError(409, 'INSTANCE_NOT_ACTIVE', `实例 ${instanceId} 当前状态是 ${instance.status}，不能重新启动`)
     }
-    const snapshot = await readInstanceDefinition(instanceId, { instancesRoot: this.instancesRoot })
+    const snapshot = await this._readDefinitionSnapshot(instanceId)
+    // stop 可能在快照读取期间就返回了；不等解析完就先挡一次（终态实例上任何解析错误都没意义）。
+    const stoppedAfterRead = this._latchBlockForPrepare(instanceId)
+    if (stoppedAfterRead !== null) {
+      const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? instance
+      return { instance: current, error: { code: stoppedAfterRead.code, message: stoppedAfterRead.message } }
+    }
     if (snapshot === null) {
       throw new BpmnRuntimeError(500, 'INSTANCE_SNAPSHOT_MISSING', `实例 ${instanceId} 的定义快照缺失`)
     }
     const parsed = await parseBpmn(snapshot.xml)
+    // 解析也是异步的：这里到 runner 创建之间**没有 await**，复查必须同步完成。
+    const stoppedAfterParse = this._latchBlockForPrepare(instanceId)
+    if (stoppedAfterParse !== null) {
+      const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot }) ?? instance
+      return { instance: current, error: { code: stoppedAfterParse.code, message: stoppedAfterParse.message } }
+    }
     if (!parsed.ok) {
       // 定义快照不可执行：实例 status 不动（ACTIVE），只留 lastError。
       await this._markInstanceError(instanceId, {
@@ -1234,7 +1285,12 @@ class BpmnRuntime {
     // 成功执行后清掉上一次失败留下的提醒计数（lastError 随后也会被清/覆盖）。
     this._agentReminders.delete(instanceId)
     if (result && isPlainObject(result.output)) {
-      this._lastAgentOutputs.set(instanceId, { ...result.output })
+      // 11 §5：result 取「最后一个成功 agent 节点的 output」；来源 nodeId 一起记住，
+      // 并在收口时随 instance.json 持久化（review-0131 #4）。
+      this._lastAgentOutputs.set(instanceId, {
+        nodeId: typeof element?.id === 'string' && element.id !== '' ? element.id : null,
+        output: { ...result.output },
+      })
     }
     if (result && typeof result.summary === 'string'
       && ctx && typeof ctx.executionId === 'string' && ctx.executionId !== '') {
@@ -1283,6 +1339,19 @@ class BpmnRuntime {
         code: 'BPMN_STATE_STOPPING',
       }
     }
+    // 恢复「最后一个成功 agent 输出 + 来源节点」（review-0131 #4）：它随 instance.json
+    // 的小字段 `lastAgentOutput` 持久化，内存 Map 只是它的一份读缓存；进程重启 /
+    // dispose 之后必须能从快照重建，否则流程跑完时 result 会丢。
+    if (!this._lastAgentOutputs.has(instance.id)
+      && isPlainObject(instance.lastAgentOutput)
+      && isPlainObject(instance.lastAgentOutput.output)) {
+      this._lastAgentOutputs.set(instance.id, {
+        nodeId: typeof instance.lastAgentOutput.nodeId === 'string' && instance.lastAgentOutput.nodeId !== ''
+          ? instance.lastAgentOutput.nodeId
+          : null,
+        output: { ...instance.lastAgentOutput.output },
+      })
+    }
     const cached = this._runners.get(instance.id)
     if (cached !== undefined && cached.status() !== 'idle') {
       return { runner: cached, recovered: false }
@@ -1319,13 +1388,24 @@ class BpmnRuntime {
       }
     }
 
-    const snapshot = await readInstanceDefinition(instance.id, { instancesRoot: this.instancesRoot })
+    const snapshot = await this._readDefinitionSnapshot(instance.id)
     if (snapshot === null) {
       throw new BpmnRuntimeError(500, 'INSTANCE_SNAPSHOT_MISSING', `实例 ${instance.id} 的定义快照缺失`, {
         instanceId: instance.id,
       })
     }
     const parsed = await parseBpmn(snapshot.xml)
+    // 恢复准备也是异步的：stop 在读取/解析期间同样可能已经返回 CANCELED。
+    // 这里到 runner 创建之间没有 await，复查必须同步完成（review-0131 #1）。
+    const stoppedWhilePreparing = this._latchBlockForPrepare(instance.id)
+    if (stoppedWhilePreparing !== null) {
+      return {
+        runner: null,
+        recovered: false,
+        reason: stoppedWhilePreparing.reason,
+        code: stoppedWhilePreparing.code,
+      }
+    }
     if (!parsed.ok) {
       throw new BpmnRuntimeError(500, 'BPMN_DEFINITION_INVALID', `实例 ${instance.id} 的定义快照未通过 BPMN 校验`, {
         errors: parsed.errors,
@@ -1469,18 +1549,27 @@ class BpmnRuntime {
     const variables = isPlainObject(runner.variables) && Object.keys(runner.variables).length > 0
       ? runner.variables
       : undefined
+    // 最后一个成功 agent 输出（+来源节点）随快照持久化：恢复后 result 不能靠内存 Map。
+    const lastAgent = this._lastAgentOutputs.get(instanceId)
+    const lastAgentPatch = isPlainObject(lastAgent) && isPlainObject(lastAgent.output)
+      ? {
+        lastAgentOutput: {
+          nodeId: typeof lastAgent.nodeId === 'string' && lastAgent.nodeId !== '' ? lastAgent.nodeId : null,
+          output: { ...lastAgent.output },
+        },
+      }
+      : null
 
     if (status === 'done') {
       // 11 §5：process/end 时 instance.result 取最后一个成功 agent 节点的 output
       // （endEvent 不产生输出）。output 在 gate 里已归一化为短变量对象。
-      const lastOutput = this._lastAgentOutputs.get(instanceId)
-      const result = isPlainObject(lastOutput) ? { ...lastOutput } : undefined
-      this._lastAgentOutputs.delete(instanceId)
+      const result = lastAgentPatch === null ? undefined : { ...lastAgentPatch.lastAgentOutput.output }
       await completeInstance(instanceId, 'COMPLETED', {
         instancesRoot: this.instancesRoot,
         ...(variables === undefined ? {} : { variables }),
         ...(result === undefined ? {} : { result }),
       })
+      this._lastAgentOutputs.delete(instanceId)
       return
     }
     if (status === BPMN_RUNNER_STATUS.BLOCKED) {
@@ -1497,6 +1586,7 @@ class BpmnRuntime {
         status: 'ACTIVE',
         pendingTasks: runner.pendingTasks(),
         ...(variables === undefined ? {} : { variables }),
+        ...(lastAgentPatch === null ? {} : lastAgentPatch),
       }, { instancesRoot: this.instancesRoot })
       return
     }
@@ -1504,6 +1594,7 @@ class BpmnRuntime {
       await updateInstance(instanceId, {
         status: 'ACTIVE',
         ...(variables === undefined ? {} : { variables }),
+        ...(lastAgentPatch === null ? {} : lastAgentPatch),
       }, { instancesRoot: this.instancesRoot })
     }
   }
@@ -1838,10 +1929,27 @@ export async function executeAgent(element, ctx, options = {}) {
   }
 
   // admission：probe + 原生 finishTool 断言。失败时零派发（不调用 adapter.start）。
+  //
+  // review-0131 #3：有效时限与旧 executor 路径同优先级（ctx > node.executor.timeoutMs），
+  // 且是**整个活动**的 deadline——probe 花掉的时间从预算里扣，剩余部分交给 runAgentNode
+  // 约束 start / 执行 / 取消阶段；没有全局活动超时时，节点自己的 executor.timeoutMs 生效。
+  const effectiveTimeoutMs = resolveAgentTimeoutMs(element, ctx)
+  const admissionStartedAt = Date.now()
   await admitAdapter(adapter, {
     probeAdapter: options.probeAdapter,
     nodeId: element?.id,
+    timeoutMs: effectiveTimeoutMs,
   })
+  const remainingTimeoutMs = effectiveTimeoutMs > 0
+    ? effectiveTimeoutMs - (Date.now() - admissionStartedAt)
+    : 0
+  if (effectiveTimeoutMs > 0 && remainingTimeoutMs <= 0) {
+    throw handlerError(
+      AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+      `活动 ${element?.id ?? '(agent)'} 的 ${effectiveTimeoutMs}ms 时限在 admission 阶段已用尽（未派发节点）`,
+      { elementId: element?.id ?? null, adapter: adapterId, timeoutMs: effectiveTimeoutMs, phase: 'admission' },
+    )
+  }
 
   return await runAgentNode({
     element,
@@ -1849,6 +1957,9 @@ export async function executeAgent(element, ctx, options = {}) {
     adapter,
     workspaceRoot: options.workspaceRoot,
     instanceId: options.instanceId,
+    // 配置口径的总时限（透传给适配器 ctx.timeoutMs）与扣掉 probe 后剩余的执行预算。
+    effectiveTimeoutMs,
+    ...(remainingTimeoutMs > 0 ? { timeoutMs: remainingTimeoutMs } : {}),
     log: typeof options.log === 'function' ? options.log : undefined,
   })
 }

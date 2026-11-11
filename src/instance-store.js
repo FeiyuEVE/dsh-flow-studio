@@ -68,7 +68,7 @@ const STATUS_SET = new Set(INSTANCE_STATUSES)
 const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'CANCELED'])
 const TERMINAL_SET = new Set(TERMINAL_STATUSES)
 /** updateInstance 的字段白名单；定义域字段是钉死的，改它们一律 400。 */
-const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError', 'artifacts'])
+const PATCH_KEYS = new Set(['expectedVersion', 'status', 'variables', 'result', 'pendingTasks', 'lastError', 'artifacts', 'lastAgentOutput'])
 /** 人工待办上限：BPMN 0.13.0 一次只会停在少量 userTask 上，100 是异常闸门。 */
 const MAX_PENDING_TASKS = 100
 /** 产物索引上限：instance.json 只存引用（path/hash/bytes），不存正文。 */
@@ -420,6 +420,33 @@ function normalizePendingTasks(raw) {
   })
 }
 
+/**
+ * 「最后一个成功 agent 输出 + 来源节点」（review-0131 #4）。
+ *
+ * 可选字段：老实例没有它就是 `null`。它是 `instance.result` 的唯一来源，
+ * 不能拿合并后的 `variables` 顶替（variables 里可能有多个节点/人工任务的字段）。
+ * 形状：`{ nodeId: string|null, output: object }`，预算与 result 一致。
+ *
+ * @param {unknown} raw
+ * @returns {{nodeId: string|null, output: object}|null}
+ */
+function normalizeLastAgentOutput(raw) {
+  if (raw === undefined || raw === null) return null
+  if (!isPlainObject(raw)) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'lastAgentOutput 必须是对象或 null', { field: 'lastAgentOutput' })
+  }
+  if (!isPlainObject(raw.output)) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', 'lastAgentOutput.output 必须是 JSON 对象', { field: 'lastAgentOutput.output' })
+  }
+  if (sizeOfJson(raw, 'lastAgentOutput') > MAX_RESULT_BYTES) {
+    throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `lastAgentOutput 超过 ${MAX_RESULT_BYTES} 字节上限`, { field: 'lastAgentOutput' })
+  }
+  return {
+    nodeId: typeof raw.nodeId === 'string' && raw.nodeId !== '' ? raw.nodeId : null,
+    output: { ...raw.output },
+  }
+}
+
 /** 磁盘上的 instance.json → 收敛后的对象；任何字段坏掉都按 INSTANCE_CORRUPT 报。 */
 function normalizeInstance(raw, id) {
   if (!isPlainObject(raw)) {
@@ -468,6 +495,14 @@ function normalizeInstance(raw, id) {
       throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 lastError 形状非法：${error?.reason ?? error?.message ?? error}`)
     }
   }
+  let lastAgentOutput = null
+  if (raw.lastAgentOutput !== null && raw.lastAgentOutput !== undefined) {
+    try {
+      lastAgentOutput = normalizeLastAgentOutput(raw.lastAgentOutput)
+    } catch (error) {
+      throw new InstanceError(500, 'INSTANCE_CORRUPT', `instance.json 的 lastAgentOutput 形状非法：${error?.reason ?? error?.message ?? error}`)
+    }
+  }
   if (!Number.isSafeInteger(raw.revision) || raw.revision < 1) {
     throw new InstanceError(500, 'INSTANCE_CORRUPT', 'instance.json 的 revision 必须是 ≥1 的整数')
   }
@@ -490,6 +525,7 @@ function normalizeInstance(raw, id) {
     result: raw.result === undefined || raw.result === null ? null : { ...raw.result },
     artifacts,
     lastError,
+    lastAgentOutput,
     pendingTasks: normalizePendingTasks(raw.pendingTasks),
     revision: raw.revision,
     eventCount: raw.eventCount,
@@ -567,6 +603,9 @@ function normalizePatch(patch) {
   }
   if (patch.lastError !== undefined) {
     source.lastError = normalizeLastError(patch.lastError)
+  }
+  if (patch.lastAgentOutput !== undefined) {
+    source.lastAgentOutput = normalizeLastAgentOutput(patch.lastAgentOutput)
   }
   return source
 }
@@ -656,6 +695,7 @@ export async function createInstance(input = {}) {
         result: null,
         artifacts: [],
         lastError: null,
+        lastAgentOutput: null,
         pendingTasks: [],
         revision: 1,
         eventCount: 0,
@@ -782,6 +822,7 @@ export async function updateInstance(id, patch = {}, options = {}) {
     const hasChange = source.status !== undefined || source.variables !== undefined
       || source.result !== undefined || source.pendingTasks !== undefined
       || source.lastError !== undefined || source.artifacts !== undefined
+      || source.lastAgentOutput !== undefined
     if (!hasChange) return current
 
     // 终态不可逆（同一把写锁内判定）：晚到的 variables / result / 待办 / 产物 /
@@ -819,6 +860,7 @@ export async function updateInstance(id, patch = {}, options = {}) {
     // 进入终态的那次更新已经强制清空 pendingTasks，不允许被 source.pendingTasks 覆盖回来。
     if (source.pendingTasks !== undefined && !enteringTerminal) next.pendingTasks = source.pendingTasks
     if (source.lastError !== undefined) next.lastError = source.lastError
+    if (source.lastAgentOutput !== undefined) next.lastAgentOutput = source.lastAgentOutput
     const normalized = normalizeInstance(next, loc.id)
     await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), normalized)
     return normalized

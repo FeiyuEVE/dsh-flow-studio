@@ -13,11 +13,12 @@
  *      `maxFires=0` 时第一次停下立即结束；
  *   4. 取消 / dispose：`cancel` 幂等、`gate.abort` 生效、`ctx.signal` abort 时迟到创建
  *      结果被 dispose；dispose 视为取消（exited 不再 pending）、MISSING 后 cancel/dispose
- *      仍收掉节点会话；
+ *      仍收掉节点会话；宿主 `created.dispose()` 永不 resolve 时 dispose 在 deadline 内
+ *      返回并如实记录 `handle.cleanup={disposed:false,timedOut:true}`（#6）；
  *   5. 能力（M1）：probe 前 `finishTool==='unsupported'`，probe 后 `native`；start 自动
  *      probe；缺 `tools.register` / `agentCtx.on` → `NODE_FINISH_TOOL_UNAVAILABLE`；
- *   6. 工具契约：`exec.signal` 提交前/返回前检查、parameters 过宿主 schema 子集、
- *      `documents[].summary` 进 artifact；
+ *   6. 工具契约：`exec.signal` 只拦截尚未受理的提交，submit 成功后如实返回已受理（#10）、
+ *      parameters 过宿主 schema 子集、`documents[].summary` 进 artifact；
  *   7. 注册表：`probeAll` 单适配器超时记 `ok:false`、重复 id、非法能力。
  *
  * 全程用假宿主（不真起 agent、不碰 `~/.dsh`）。临时工作区在 `<repo>/.tmp/`。
@@ -160,7 +161,7 @@ const ELEMENT = {
  *   - `tools.register` 记录定义并返回 disposer；
  *   - `agent.followup/steer/cancel/whenIdle` 记录调用；`whenIdle` 由测试显式 resolve。
  *
- * @param {{ noTools?: boolean, noOn?: boolean }} [features]
+ * @param {{ noTools?: boolean, noOn?: boolean, disposeHangs?: boolean, cancelHangs?: boolean }} [features]
  */
 function createFakeHost(features = {}) {
   const host = {
@@ -203,7 +204,12 @@ function createFakeHost(features = {}) {
           agent.followupMessages.push(message)
         },
         steer(message) { agent.steerMessages.push(message) },
-        cancel(cause) { agent.cancelCauses.push(cause) },
+        cancel(cause) {
+          agent.cancelCauses.push(cause)
+          // 复审 #6：宿主 cancel 也可能返回永不决议的 Promise；适配器不得等待它。
+          if (features.cancelHangs) return new Promise(() => {})
+          return undefined
+        },
         whenIdle() { return idle.promise },
         idle,
       }
@@ -211,7 +217,12 @@ function createFakeHost(features = {}) {
       await createOptions.setup(agentCtx, agent)
       return {
         agent,
-        dispose: async () => { host.disposeCalls += 1 },
+        dispose() {
+          host.disposeCalls += 1
+          // 复审 #6：模拟宿主 created.dispose() 永不 resolve。
+          if (features.disposeHangs) return new Promise(() => {})
+          return Promise.resolve()
+        },
       }
     },
   }
@@ -550,6 +561,54 @@ await check('ctx.signal abort：迟到 create 结果被 dispose、不 followup',
   A.equal(host.disposeCalls, 1, 'dispose 幂等，不重复释放')
 })
 
+// 复审 #6 的迟到创建分支：start 里的收尾也必须走同一个 deadline；超时后不能在
+// 后续 dispose 时用「没有句柄可释放」把状态改写回「已清理」。
+await check('ctx.signal abort + 迟到 create 的 dispose 挂住 → start 有界返回、状态不降级（#6）', async () => {
+  const host = createFakeHost({ disposeHangs: true })
+  host.holdCreate = createDeferred()
+  const logs = []
+  const gate = makeGate(freshWorkspace())
+  const adapter = makeAdapter(host, {
+    disposeTimeoutMs: 40,
+    log: (level, message) => logs.push({ level, message }),
+  })
+  const controller = new AbortController()
+
+  const startPromise = adapter.start({
+    element: ELEMENT,
+    ctx: { attempt: 1, signal: controller.signal },
+    finishGate: gate,
+    workspaceRoot: freshWorkspace(),
+  })
+  await waitUntil(() => host.createCalls.length === 1)
+  controller.abort()
+  await flush()
+
+  host.holdCreate.resolve()
+  const startedAt = Date.now()
+  const returned = await Promise.race([
+    startPromise.then(handle => ({ state: 'settled', handle })),
+    new Promise(resolvePromise => setTimeout(() => resolvePromise({ state: 'pending' }), 1000)),
+  ])
+  const elapsedMs = Date.now() - startedAt
+
+  A.equal(returned.state, 'settled', '迟到创建后的 dispose 挂住时 start 仍有界返回')
+  A.ok(elapsedMs < 1000, `start 有界（实际 ${elapsedMs}ms）`)
+  A.equal(host.disposeCalls, 1, '迟到句柄被释放一次')
+  A.equal(returned.handle.cleanup.disposed, false, '如实记录未完成清理')
+  A.equal(returned.handle.cleanup.timedOut, true)
+  A.equal(logs.some(entry => /超时/.test(entry.message)), true, '留下超时告警')
+
+  // 后续 dispose 没有新句柄：不能把「超时未清完」降级成「已清理」。
+  A.equal(await adapter.dispose(returned.handle), true)
+  A.equal(returned.handle.cleanup.disposed, false, 'dispose 不覆盖既有的未完成状态')
+  A.equal(returned.handle.cleanup.timedOut, true)
+  A.equal(typeof returned.handle.cleanup.retriedAt, 'string', '记录重试时间')
+  A.equal(host.disposeCalls, 1, '没有句柄时不重复调用宿主')
+
+  host.agent.idle.resolve()
+})
+
 // ---------------------------------------------------------------------------
 // 5. 能力表 / 没有 tools.register
 // ---------------------------------------------------------------------------
@@ -698,7 +757,86 @@ await check('dispose：未 settle 视为取消 → exited=CANCELED、gate aborte
   await A.rejects(gate.result, error => error.aborted === true)
   A.equal(host.agent.cancelCauses.length, 1, 'dispose 收掉节点会话')
   A.equal(host.disposeCalls, 1, 'agents.create 的句柄被释放')
+  A.equal(handle.cleanup.disposed, true, '正常释放后 cleanup 如实标成已清理')
+  A.equal(handle.cleanup.timedOut, false, '正常释放不算超时')
   A.equal(await adapter.dispose(handle), false, 'dispose 幂等')
+
+  host.agent.idle.resolve()
+})
+
+// 复审 #6：宿主 created.dispose() 永不 resolve 时，适配器必须有界返回，
+// 并如实记录「没清完」——不能无限等待，也不能声称已清理完成。
+await check('dispose：宿主 created.dispose() 挂住 → deadline 内返回、cleanup 如实标注未完成（#6）', async () => {
+  const host = createFakeHost({ disposeHangs: true })
+  const logs = []
+  const gate = makeGate(freshWorkspace())
+  const adapter = makeAdapter(host, {
+    disposeTimeoutMs: 40,
+    log: (level, message) => logs.push({ level, message }),
+  })
+  const handle = await adapter.start({
+    element: ELEMENT,
+    ctx: { attempt: 1 },
+    finishGate: gate,
+    workspaceRoot: freshWorkspace(),
+  })
+
+  const startedAt = Date.now()
+  const returned = await Promise.race([
+    adapter.dispose(handle).then(value => ({ state: 'settled', value })),
+    new Promise(resolvePromise => setTimeout(() => resolvePromise({ state: 'pending' }), 1000)),
+  ])
+  const elapsedMs = Date.now() - startedAt
+
+  A.equal(returned.state, 'settled', '宿主 dispose 挂住时适配器仍在 deadline 内返回')
+  A.equal(returned.value, true, 'dispose 已执行（返回 true 只表示走过收尾，不等于宿主已释放）')
+  A.ok(elapsedMs < 1000, `返回有界（实际 ${elapsedMs}ms < 1000ms）`)
+  A.ok(elapsedMs >= 30, `确实等到了 deadline 附近才放弃（实际 ${elapsedMs}ms）`)
+  A.equal(host.disposeCalls, 1, '宿主 dispose 被调用一次')
+  A.equal(handle.cleanup.disposed, false, '不声称已清理完成')
+  A.equal(handle.cleanup.timedOut, true, '如实标注 timedOut')
+  A.equal(handle.cleanup.timeoutMs, 40, 'cleanup 记录本次 deadline')
+  A.equal(typeof handle.cleanup.elapsedMs, 'number', 'cleanup 记录实际等待时长')
+  const exitedAfter = await promiseState(handle.exited, 20)
+  A.equal(exitedAfter.state, 'settled', 'dispose 仍先把 exited resolve 掉，不留 pending')
+  A.equal(exitedAfter.value.code, NODE_FINISH_CANCELED, '未完结时 dispose 视为取消')
+  A.equal(gate.settled(), true, 'dispose 先 abort 闸门')
+  A.equal(host.agent.cancelCauses.length, 1, '再关节点会话')
+  A.equal(
+    logs.some(entry => entry.level === 'warn' && /超时/.test(entry.message)),
+    true,
+    '超时留下可核对的告警',
+  )
+  A.equal(await adapter.dispose(handle), false, 'dispose 幂等')
+  A.equal(host.disposeCalls, 1, '幂等：不重复调用宿主 dispose')
+})
+
+// 复审 #6：cancel 不 await 宿主任何 Promise，因此宿主 agent.cancel 挂住时也有界。
+await check('cancel：宿主 agent.cancel 挂住时仍同步有界返回（#6）', async () => {
+  const host = createFakeHost({ cancelHangs: true })
+  const gate = makeGate(freshWorkspace())
+  const adapter = makeAdapter(host, { disposeTimeoutMs: 40 })
+  const handle = await adapter.start({
+    element: ELEMENT,
+    ctx: { attempt: 1 },
+    finishGate: gate,
+    workspaceRoot: freshWorkspace(),
+  })
+
+  const startedAt = Date.now()
+  const returned = await Promise.race([
+    adapter.cancel(handle, 'bounded-cancel').then(value => ({ state: 'settled', value })),
+    new Promise(resolvePromise => setTimeout(() => resolvePromise({ state: 'pending' }), 1000)),
+  ])
+  const elapsedMs = Date.now() - startedAt
+
+  A.equal(returned.state, 'settled', 'cancel 不等待宿主 agent.cancel 的 Promise')
+  A.equal(returned.value, true)
+  A.ok(elapsedMs < 200, `cancel 立即返回（实际 ${elapsedMs}ms）`)
+  A.equal((await handle.exited).code, NODE_FINISH_CANCELED, 'exited 已收口')
+  A.equal(gate.settled(), true, 'cancel abort 闸门')
+  A.equal(host.agent.cancelCauses.length, 1, '发出 agent.cancel 一次')
+  A.equal(handle.cleanup, null, 'cancel 不伪造 dispose 清理状态')
 
   host.agent.idle.resolve()
 })
@@ -765,7 +903,7 @@ await check('documents[].summary 持久化到 artifact，工具返回与 record 
   await active.dispose(handle)
 })
 
-await check('tool execute：exec.signal 提交前/返回前都检查，取消后不报成功（m4）', async () => {
+await check('tool execute：abort 只拦「尚未受理」的提交；受理后如实返回成功（m4 / #10）', async () => {
   // 提交前已 abort：不碰闸门。
   const gateBefore = makeGate(freshWorkspace())
   const toolBefore = createFinishToolDefinition({ finishGate: gateBefore, element: ELEMENT })
@@ -777,9 +915,11 @@ await check('tool execute：exec.signal 提交前/返回前都检查，取消后
   )
   A.equal(beforeValue.ok, false)
   A.equal(beforeValue.code, NODE_FINISH_CANCELED)
+  A.match(beforeValue.message, /没有被受理/)
   A.equal(gateBefore.settled(), false, '取消的调用不占用闸门')
 
-  // 提交成功后、返回前 abort：结果必须报告取消（即使闸门已经受理）。
+  // 提交成功后、返回前 abort：submit 成功就是不可逆受理点，工具必须如实返回已受理，
+  // 不能事后把已经 settled 的闸门改写成「没有被受理」（复审 #10）。
   const workspace = freshWorkspace()
   const gateAfter = makeGate(workspace)
   const abortedAfter = new AbortController()
@@ -800,9 +940,19 @@ await check('tool execute：exec.signal 提交前/返回前都检查，取消后
     { variables: {}, documents: [], summary: '取消后' },
     { signal: abortedAfter.signal },
   )
-  A.equal(afterValue.ok, false, '返回前 abort 不把结果报成成功')
-  A.equal(afterValue.code, NODE_FINISH_CANCELED)
-  A.equal(gateAfter.settled(), true, '闸门本身已经受理（取消只影响工具返回值）')
+  A.equal(afterValue.ok, true, '受理后 abort 不得改写受理事实')
+  A.equal(afterValue.code, undefined, '成功结果不带取消码')
+  A.equal(afterValue.summary, '取消后', '返回闸门受理的 record')
+  A.equal(afterValue.nodeId, 'agent-1')
+  A.equal(
+    typeof afterValue.message === 'string' && /没有被受理/.test(afterValue.message),
+    false,
+    '不再声称「本次提交没有被受理」',
+  )
+  A.equal(gateAfter.settled(), true, '闸门已经受理')
+  const accepted = await gateAfter.result
+  A.deepEqual(accepted.output, {}, '闸门记录与工具返回值同源')
+  A.equal(accepted.summary, '取消后')
 })
 
 await check('probeAll：单个适配器探测超时 → ok:false，后续适配器照常（m9）', async () => {

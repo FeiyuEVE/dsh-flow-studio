@@ -210,6 +210,22 @@ if (mode === 'leak') {
   out({ type: 'item.completed', item: { id: 'item_msg', type: 'agent_message', text: 'token=' + token + ' socket=' + socketPath } })
 }
 
+if (mode === 'leak-deep') {
+  // #9：把测试凭据放进 12 层嵌套对象，验证超深子树也被替换成占位符（不返回原对象）。
+  let nested = { credential: token }
+  for (let level = 0; level < 12; level += 1) nested = { ['level_' + level]: nested }
+  out({
+    type: 'item.completed',
+    item: {
+      id: 'item_deep',
+      type: 'command_execution',
+      command: 'env',
+      aggregated_output: 'deep',
+      deep: nested,
+    },
+  })
+}
+
 async function callTool() {
   const result = await client.callTool({
     name: 'flow_finish_node',
@@ -301,6 +317,27 @@ if (mode === 'hook-never') {
 if (mode === 'leak') {
   // 第一次 exec 先不调工具（让 adapter 走 resume），resume 再调工具收尾。
   if (isResume) await callTool()
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'call-on-resume-hang') {
+  // #5：resume 提交成功后**不退出**（且忽略 SIGTERM），宽限期清理必须打到这个活跃进程，
+  // 而不是早已退出的初始进程。
+  if (isResume) {
+    process.on('SIGTERM', () => {
+      writeFileSync(join(stateDir, 'resume-sigterm'), String(process.pid))
+    })
+    writeFileSync(join(stateDir, 'resume.pid'), String(process.pid))
+    await callTool()
+    writeFileSync(join(stateDir, 'resume-submitted'), String(process.pid))
+    setInterval(() => {}, 1000)
+    await new Promise(() => {})
+  }
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'leak-deep') {
+  await callTool()
   await closeClient()
   process.exit(0)
 }
@@ -784,6 +821,47 @@ async function main() {
       await adapter.dispose(handle)
     })
 
+    await check('#5：resume 提交后不退出 → 宽限清理发给活跃 resume 进程，exited 有界 resolve', async () => {
+      resetState()
+      const workspace = freshWorkspace('resume-grace')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'call-on-resume-hang' },
+        probeResult: { ...FAKE_PROBE, hooksNative: false },
+        postFinishGraceMs: 800,
+        killTimeoutMs: 800,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '提醒续跑不退出节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const initialPid = handle.pid
+      A.equal(await waitForFile(join(stateDir, 'resume-submitted')), true, 'resume 已提交工具并保持运行')
+      const resumePid = Number(readFileSync(join(stateDir, 'resume.pid'), 'utf8'))
+      A.equal(Number.isSafeInteger(resumePid) && resumePid > 0, true, '拿到 resume 进程 pid')
+      A.equal(pidAlive(resumePid), true, '#5：resume 提交成功后仍在运行')
+      A.equal(pidAlive(initialPid), false, '#5：初始进程已退出，清理必须换目标')
+      A.equal(gate.settled(), true, '工具已提交，闸门已 settle')
+
+      const started = Date.now()
+      const exited = await Promise.race([handle.exited, sleep(8_000).then(() => null)])
+      A.ok(exited, '#5：宽限清理收掉 resume 后 exited 必须在有限时间内 resolve')
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(exited.code, 'OK', '工具已提交，收尾应是 OK（不是取消 / MISSING）')
+      A.ok(Date.now() - started < 6_000, '#5：exited 有界，不挂住 handler')
+      A.equal(await waitForDead(resumePid), true, '#5：活跃 resume 进程收到 TERM/SIGKILL 并退出')
+      A.equal(existsSync(join(stateDir, 'resume-sigterm')), true, '#5：TERM 先发给活跃 resume 进程组')
+
+      const all = invocations()
+      A.equal(all.length, 2, '初始 exec + 一次 resume')
+      A.equal(all[1].isResume, true)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [], 'dispose 后 runDir 必须被清理')
+    })
+
     await check('cancel：杀整个进程组；M3 闸门 abort；无残留 runDir', async () => {
       resetState()
       const workspace = freshWorkspace('cancel')
@@ -918,6 +996,29 @@ async function main() {
       A.match(String(handle.lastMessage), /\[redacted\]/)
       A.equal(String(handle.stdoutTail).includes(invocation.token), false, 'stdoutTail 里不能出现凭据')
       A.equal(String(handle.stderrTail).includes(invocation.token), false, 'stderrTail 里不能出现凭据')
+      await adapter.dispose(handle)
+    })
+
+    await check('#9：12 层嵌套对象里的凭据不进 handle.events（超深子树替换成截断占位符）', async () => {
+      resetState()
+      const workspace = freshWorkspace('leak-deep')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'leak-deep' } })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '深层泄漏节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const [invocation] = invocations()
+      A.ok(typeof invocation.token === 'string' && invocation.token.length > 0, '假 codex 确实拿到了本 execution 的凭据')
+      const eventsText = JSON.stringify(handle.events)
+      A.equal(eventsText.includes(invocation.token), false, '#9：12 层嵌套里的凭据不能出现在 handle.events')
+      A.ok(eventsText.includes('level_11'), '深层事件确实被收进 events（不是整条丢了）')
+      A.ok(eventsText.includes('[redacted:depth]'), '#9：超深子树必须替换成截断占位符')
       await adapter.dispose(handle)
     })
 

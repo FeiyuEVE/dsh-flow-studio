@@ -914,6 +914,140 @@ try {
   })
 
   // -------------------------------------------------------------------------
+  // 12.3 启动/恢复竞态：异步准备期间 stop 已返回 CANCELED → 不得再派发
+  // -------------------------------------------------------------------------
+  await check('启动竞态：定义快照读取期间 stop → 不建 runner、零派发、实例 CANCELED', async home => {
+    const calls = []
+    const dir = store.flowsDir(home)
+    const env = {}
+    const runtime = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    const url = new URL('http://localhost/')
+    try {
+      const saved = await runtime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-start-race', name: '启动竞态', xml: workflowXml('proc-start-race') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+
+      // 暂停点：定义快照读取完成之后、runner 创建之前（review-0131 #1 的窗口）。
+      let releaseRead
+      const readGate = new Promise(resolveGate => { releaseRead = resolveGate })
+      let markReadStarted
+      const readStarted = new Promise(resolve => { markReadStarted = resolve })
+      runtime._readDefinitionSnapshot = async id => {
+        markReadStarted()
+        await readGate
+        return await instStore.readInstanceDefinition(id, { instancesRoot: runtime.instancesRoot })
+      }
+
+      const createPromise = runtime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-start-race', variables: { amount: 7 } },
+      })
+      await readStarted
+
+      const listed = await instStore.listInstances({ instancesRoot: runtime.instancesRoot })
+      eq(listed.length, 1)
+      const id = listed[0].id
+      const stopped = await runtime.handle({ method: 'POST', parts: ['instances', id, 'stop'], url })
+      eq(stopped.status, 200, JSON.stringify(stopped.body))
+      eq(stopped.body.status, 'CANCELED')
+      eq(calls.length, 0, 'stop 返回时不得有派发')
+
+      releaseRead()
+      const created = await createPromise
+      eq(created.status, 201, JSON.stringify(created.body))
+      eq(created.body.status, 'CANCELED', '实例必须保持 CANCELED')
+      eq(created.body.error?.code, 'BPMN_INSTANCE_STOPPING', '启动必须返回明确的 stopped 结果')
+      eq(calls.length, 0, '放行后也不得派发 agent（外部副作用为零）')
+      eq(runtime.activeCount, 0, '不得残留 runner')
+
+      const events = await runtime.handle({ method: 'GET', parts: ['instances', id, 'events'], url })
+      eq(countType(events.body.events, 'activity/start'), 0, '不得出现 activity/start 事件')
+      const raw = readInstanceJson(home, id)
+      eq(raw.status, 'CANCELED')
+      eq(raw.lastError, null, 'stop 不是错误：不写 lastError')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('恢复竞态：定义快照读取期间 stop → 不建 runner、不重放 agent、实例 CANCELED', async home => {
+    const dir = store.flowsDir(home)
+    const url = new URL('http://localhost/')
+    const callsA = []
+    const runtimeA = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor(callsA) })
+    let id
+    try {
+      let res = await runtimeA.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-recover-race', name: '恢复竞态', xml: workflowXml('proc-recover-race') },
+      })
+      eq(res.status, 201, JSON.stringify(res.body))
+      res = await runtimeA.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-recover-race', variables: { amount: 7 } },
+      })
+      eq(res.status, 201, JSON.stringify(res.body))
+      id = res.body.id
+      eq(callsA.length, 1, '首次启动执行一次 agent，然后停在人工任务')
+      eq(res.body.status, 'ACTIVE')
+    } finally {
+      await runtimeA.dispose()
+    }
+
+    const instancesRoot = join(home, 'flow-studio', 'instances')
+    const beforeEvents = (await instStore.readInstanceEvents(id, { instancesRoot })) ?? []
+    const beforeLastSeq = readInstanceJson(home, id).lastSeq
+
+    // 新 runtime（模拟进程重启）：GET 触发懒恢复，在定义快照读取处暂停。
+    const callsB = []
+    const runtimeB = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor(callsB) })
+    try {
+      let releaseRead
+      const readGate = new Promise(resolveGate => { releaseRead = resolveGate })
+      let markReadStarted
+      const readStarted = new Promise(resolve => { markReadStarted = resolve })
+      runtimeB._readDefinitionSnapshot = async instanceId => {
+        markReadStarted()
+        await readGate
+        return await instStore.readInstanceDefinition(instanceId, { instancesRoot: runtimeB.instancesRoot })
+      }
+
+      const getPromise = runtimeB.handle({ method: 'GET', parts: ['instances', id], url })
+      await readStarted
+      const stopped = await runtimeB.handle({ method: 'POST', parts: ['instances', id, 'stop'], url })
+      eq(stopped.status, 200, JSON.stringify(stopped.body))
+      eq(stopped.body.status, 'CANCELED')
+      releaseRead()
+
+      const detail = await getPromise
+      eq(detail.status, 200, JSON.stringify(detail.body))
+      eq(detail.body.status, 'CANCELED')
+      eq(detail.body.recovered, false, '恢复必须失败（stop 已接管）')
+      eq(detail.body.recovery?.code, 'BPMN_INSTANCE_STOPPING', '恢复入口必须覆盖「尚未登记 runner」阶段')
+      eq(callsB.length, 0, '恢复不得重放 agent')
+      eq(runtimeB.activeCount, 0, '不得残留 runner')
+
+      const raw = readInstanceJson(home, id)
+      eq(raw.status, 'CANCELED')
+      eq(raw.lastSeq, beforeLastSeq, 'stop 之后不得再追加事件')
+      const afterEvents = (await instStore.readInstanceEvents(id, { instancesRoot })) ?? []
+      eq(afterEvents.length, beforeEvents.length, '事件流不得新增')
+    } finally {
+      await runtimeB.dispose()
+    }
+  })
+
+  // -------------------------------------------------------------------------
   // 12.4 F1 · 异构 execution/broker：GET 不卡、快速标记不可恢复、零派发
   // -------------------------------------------------------------------------
   await check('F1：source 相同但 execution/broker 异构 → GET <2s 拒绝，ACTIVE + lastError，无待办', async home => {

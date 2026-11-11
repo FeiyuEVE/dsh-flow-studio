@@ -993,6 +993,7 @@ export function createCodexAdapter(options = {}) {
     /**
      * 导出前脱敏（M4）：本 execution 的凭据、socket 路径与 runDir 都替换成占位符。
      * `state.events` 里仍保留原始事件（诊断需要），只有 `handle` 暴露的副本被脱敏。
+     * 深度超过 8 层的子树一律替换成 `[redacted:depth]`——**绝不返回原对象**（#9）。
      */
     const redactText = text => {
       let output = typeof text === 'string' ? text : String(text)
@@ -1004,11 +1005,13 @@ export function createCodexAdapter(options = {}) {
     }
     const redactValue = (value, depth = 0) => {
       if (typeof value === 'string') return redactText(value)
+      const tooDeep = depth > 8
       if (Array.isArray(value)) {
-        if (depth > 8) return value.map(redactText)
-        return value.map(item => redactValue(item, depth + 1))
+        // 超深子树**必须**替换成占位符：直接返回原值会让深层凭据绕过脱敏（#9）。
+        return tooDeep ? '[redacted:depth]' : value.map(item => redactValue(item, depth + 1))
       }
-      if (isPlainObject(value) && depth <= 8) {
+      if (isPlainObject(value)) {
+        if (tooDeep) return '[redacted:depth]'
         const output = {}
         for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
         return output
@@ -1048,6 +1051,20 @@ export function createCodexAdapter(options = {}) {
         }
       }
     }
+
+    /** 进程是否仍在运行（exitCode / signalCode 都为空才算活着）。 */
+    const childRunning = target => Boolean(target && target.pid
+      && target.exitCode === null && target.signalCode === null)
+
+    /**
+     * 完结后宽限清理的默认目标：**当前活跃执行进程**。
+     *
+     * 提醒续跑跑在独立的 `resumeChild` 里，初始 `child` 往往早就退出了——只杀初始进程
+     * 等于没杀，resume 会一直活着、`handle.exited` 等不到（#5）。resume 已退出时才回落到
+     * 初始 child（用于收掉它同组可能残留的 MCP server）。
+     */
+    const activeKillTarget = () => (childRunning(resumeChild) ? resumeChild : child)
+    const killActiveTree = signal => killTree(signal, activeKillTarget())
 
     /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
     const abortGate = reason => {
@@ -1101,13 +1118,13 @@ export function createCodexAdapter(options = {}) {
       if (state.gateSettled || exitedDone) return
       state.gateSettled = true
       if (settings.postFinishGraceMs === 0) {
-        killTree('SIGTERM')
+        killActiveTree('SIGTERM')
         return
       }
       graceTimer = setTimeout(() => {
         graceTimer = null
-        killTree('SIGTERM')
-        setTimeout(() => killTree('SIGKILL'), settings.killTimeoutMs).unref?.()
+        killActiveTree('SIGTERM')
+        setTimeout(() => killActiveTree('SIGKILL'), settings.killTimeoutMs).unref?.()
       }, settings.postFinishGraceMs)
       graceTimer.unref?.()
     }
@@ -1266,8 +1283,9 @@ export function createCodexAdapter(options = {}) {
     child.on('exit', (code, signal) => {
       state.exitCode = code
       state.signal = signal
-      // 子进程退出后，顺手收掉同一进程组里可能残留的 MCP server。
-      if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM')
+      // 子进程退出后，顺手收掉同一进程组里可能残留的 MCP server（只针对初始进程组；
+      // 提醒续跑由 resumeChild 自己的退出路径 + 宽限清理负责，别在这里打成活跃进程组）。
+      if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', child)
       if (!channel.contacted && !state.canceled) earlyExitResolve?.({ code, signal })
       finishAfterNaturalExit().catch(error => {
         resolveExited({

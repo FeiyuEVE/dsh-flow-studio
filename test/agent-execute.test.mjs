@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url'
 
 import { ADAPTER_ERROR, createAdapterRegistry } from '../src/agent-adapter.js'
 import {
-  AGENT_EXECUTE_ERROR, createAdapterProbeCache, runAgentNode,
+  AGENT_EXECUTE_ERROR, admitAdapter, createAdapterProbeCache, resolveAgentTimeoutMs, runAgentNode,
 } from '../src/agent-execute.js'
 import { executeAgent, createBpmnRuntime } from '../src/bpmn-runtime.js'
 import { flowsDir } from '../src/store.js'
@@ -357,7 +357,94 @@ await check('超时：ctx.timeoutMs 到 → BPMN_ACTIVITY_TIMEOUT + cancel + dis
   A.equal(adapter.calls.dispose, 1, '超时后必须 dispose（不留僵尸）')
 })
 
+await check('节点 executor.timeoutMs：旧 executor 与新 adapter 同一时限，超时后 cancel（review-0131 #3）', async () => {
+  const workspace = freshWorkspace()
+  const NODE_TIMEOUT = 25
+
+  // 解析口径：ctx 缺省时回落到节点配置；ctx 有值时优先。
+  A.equal(resolveAgentTimeoutMs({ node: { executor: { timeoutMs: NODE_TIMEOUT } } }, {}), NODE_TIMEOUT)
+  A.equal(resolveAgentTimeoutMs({ node: { executor: { timeoutMs: NODE_TIMEOUT } } }, { timeoutMs: 40 }), 40)
+  A.equal(resolveAgentTimeoutMs({ node: {} }, {}), 0)
+
+  // 旧路径：外部 executor 在 ctx.timeoutMs 缺省时使用 node.executor.timeoutMs。
+  const executorCalls = []
+  const oldElement = {
+    id: 'agent-old-timeout',
+    node: {
+      adapter: 'custom',
+      executor: { kind: 'custom', command: 'echo stub', timeoutMs: NODE_TIMEOUT },
+      prompt: 'x',
+    },
+  }
+  await rejectsCode(
+    executeAgent(oldElement, { attempt: 1, variables: {} }, {
+      runExecutor: async options => {
+        executorCalls.push(options)
+        return { ok: false, reason: 'timeout', exitCode: null, tail: 'timed out' }
+      },
+    }),
+    'BPMN_EXECUTOR_TIMEOUT',
+    '旧路径超时',
+  )
+  A.equal(executorCalls[0].timeoutMs, NODE_TIMEOUT, '旧 executor 必须收到 node.executor.timeoutMs')
+
+  // 新路径：没有全局活动超时时，节点自己的限时也必须生效并 cancel 适配器。
+  const adapter = makeFakeAdapter({}) // exited 永不 resolve
+  const registry = registryWith(adapter)
+  const newElement = {
+    id: 'agent-new-timeout',
+    node: { adapter: 'dsh', executor: { kind: 'dsh', timeoutMs: NODE_TIMEOUT }, prompt: 'x' },
+  }
+  const startedAt = Date.now()
+  await rejectsCode(
+    executeAgent(newElement, { attempt: 1, executionId: 'exec-node-timeout', variables: {} }, {
+      adapters: registry,
+      workspaceRoot: workspace,
+    }),
+    AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+    '新路径必须按节点时限超时',
+  )
+  A.ok(Date.now() - startedAt < 2000, '节点时限不能挂住 handler')
+  A.equal(adapter.calls.startRequests[0].ctx.timeoutMs, NODE_TIMEOUT, 'adapter 收到同一有效时限')
+  A.equal(adapter.calls.cancelReasons.length, 1, '节点时限到必须 cancel 适配器')
+  A.equal(adapter.calls.dispose, 1, '超时后必须 dispose')
+})
+
+await check('节点 executor.timeoutMs 覆盖 probe / start 阶段（review-0131 #3）', async () => {
+  const workspace = freshWorkspace()
+
+  // probe 永不返回：有效时限用尽即报活动超时，零派发。
+  const slowProbe = makeFakeAdapter(successBehavior())
+  slowProbe.probe = async () => new Promise(() => {})
+  const probeStarted = Date.now()
+  await rejectsCode(
+    executeAgent({
+      id: 'agent-probe-timeout',
+      node: { adapter: 'dsh', executor: { kind: 'dsh', timeoutMs: 30 }, prompt: 'x' },
+    }, { attempt: 1, variables: {} }, { adapters: registryWith(slowProbe), workspaceRoot: workspace }),
+    AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+    'probe 阶段超时必须报活动超时',
+  )
+  A.ok(Date.now() - probeStarted < 2000, 'probe 超时不能挂住 handler')
+  A.equal(slowProbe.calls.starts, 0, 'probe 超时零派发')
+
+  // start 永不返回：同一个 deadline 也要覆盖启动阶段。
+  const slowStart = makeFakeAdapter(successBehavior())
+  slowStart.start = async () => new Promise(() => {})
+  const startStarted = Date.now()
+  await rejectsCode(
+    executeAgent({
+      id: 'agent-start-timeout',
+      node: { adapter: 'dsh', executor: { kind: 'dsh', timeoutMs: 30 }, prompt: 'x' },
+    }, { attempt: 1, variables: {} }, { adapters: registryWith(slowStart), workspaceRoot: workspace }),
+    AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
+    'start 阶段超时必须报活动超时',
+  )
+  A.ok(Date.now() - startStarted < 2000, 'start 超时不能挂住 handler')
+})
+
 await check('ctx.signal abort → BPMN_ABORTED + cancel + dispose', async () => {
+
   const workspace = freshWorkspace()
   const controller = new AbortController()
   const adapter = makeFakeAdapter({
@@ -431,20 +518,55 @@ await check('未知 adapter → BPMN_AGENT_ADAPTER_UNSUPPORTED，probe 都不跑
   A.equal(dsh.calls.starts, 0)
 })
 
-await check('probe 缓存：同一 runtime 的多个活动只 probe 一次', async () => {
+await check('probe 缓存：并发 admission 只 probe 一次（in-flight 去重）', async () => {
   const workspace = freshWorkspace()
   const adapter = makeFakeAdapter(successBehavior({ variables: { ok: true } }))
   const registry = registryWith(adapter)
   const probeAdapter = createAdapterProbeCache()
-  for (const executionId of ['exec-a', 'exec-b']) {
-    await executeAgent(elementFor(), { attempt: 1, executionId, variables: {} }, {
-      adapters: registry,
-      workspaceRoot: workspace,
-      probeAdapter,
-    })
-  }
-  A.equal(adapter.calls.probe, 1, '同一 adapter id 只 probe 一次')
+  // 同时发起的两个活动：第一个 probe 还在飞，第二个必须复用它。
+  await Promise.all(['exec-a', 'exec-b'].map(executionId => executeAgent(
+    elementFor(),
+    { attempt: 1, executionId, variables: {} },
+    { adapters: registry, workspaceRoot: workspace, probeAdapter },
+  )))
+  A.equal(adapter.calls.probe, 1, '并发活动只能 probe 一次（in-flight 去重）')
   A.equal(adapter.calls.starts, 2)
+})
+
+await check('probe 缓存跨 TTL：runtime 不永久缓存结果，adapter TTL 到期后能重新 probe（review-0131 #2）', async () => {
+  // 假 codex：probe 结果有 30ms TTL，capabilities() 只认「最近一次成功 probe」。
+  // 修复前 runtime 永久缓存 probe Promise：TTL 过后 admission 仍拿旧结论 →
+  // capabilities() 返回 unsupported → 节点被永久拒绝（NODE_FINISH_TOOL_UNAVAILABLE）。
+  const ttlMs = 30
+  let cachedAt = 0
+  let probes = 0
+  const adapter = {
+    id: 'codex-ttl',
+    get probes() { return probes },
+    async probe() {
+      probes += 1
+      cachedAt = Date.now()
+      return { version: 'fake-1.0.0', helpDigest: 'fake-help-digest' }
+    },
+    capabilities() {
+      const fresh = cachedAt !== 0 && Date.now() - cachedAt < ttlMs
+      return {
+        finishTool: fresh ? 'native' : 'unsupported',
+        hooks: { 'turn.stop': fresh ? 'emulated' : 'unsupported' },
+        evidence: {},
+      }
+    },
+    async start() { throw new Error('本用例不派发') },
+    async cancel() {},
+    async dispose() {},
+  }
+  const probeAdapter = createAdapterProbeCache()
+  await admitAdapter(adapter, { probeAdapter })
+  A.equal(probes, 1, '首次 admission 必须 probe')
+  await new Promise(resolve => setTimeout(resolve, ttlMs + 15))
+  // 修复前这里拿到 runtime 的旧 Promise，capabilities() 已是 unsupported → 抛错。
+  await admitAdapter(adapter, { probeAdapter })
+  A.equal(probes, 2, '跨过 adapter TTL 必须重新 probe（结果缓存归 adapter 自己管）')
 })
 
 await check('runAgentNode 直接调用：没有 probe 时也能工作（不经过 admission）', async () => {
@@ -583,7 +705,7 @@ await check('集成·正常：变量注入 + 网关按 verdict 路由 + activity
   A.ok(!taken.includes('f_fail'), '不能走默认分支 f_fail')
 })
 
-await check('集成·两个 agent 同文件：artifacts 按 path+sha256 去重，result 取最后一个 output，probe 只一次', async () => {
+await check('集成·两个 agent 同文件：artifacts 按 path+sha256 去重，result 取最后一个 output', async () => {
   const workspace = freshWorkspace()
   writeDoc(workspace, 'docs/shared.md', '同一份产物\n')
   let nodeRuns = 0
@@ -618,13 +740,59 @@ await check('集成·两个 agent 同文件：artifacts 按 path+sha256 去重�
   A.equal(raw.artifacts.length, 1, '同 path+sha256 只能登记一次')
   A.deepEqual(detail.result, { verdict: 'pass', step: 2 }, 'result 取最后一个 agent 的 output')
   A.equal(detail.variables.step, 2, '变量覆盖为最后一个 output')
-  A.equal(adapter.calls.probe, 1, '同一 runtime 里 probe 只跑一次')
+  A.equal(adapter.calls.probe, 2, '每个活动都会重新 probe（结果缓存归 adapter 自己管）')
   A.equal(adapter.calls.starts, 2)
   const events = await readEvents(runtime, created.id)
   const ends = events.filter(event => event.type === 'activity/end' && String(event.elementId).startsWith('agent'))
   A.equal(ends.length, 2)
   A.equal(ends[0].summary, '第 1 个 agent')
   A.equal(ends[1].summary, '第 2 个 agent')
+})
+
+await check('集成·恢复 result：agent → human → dispose/新 runtime，result 仍是最后 agent 输出（review-0131 #4）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter(successBehavior({ variables: { verdict: 'pass' }, summary: '判定 pass' }))
+  const runtimeA = await makeRuntime(registryWith(adapter), workspace)
+  const xml = workflowXml({
+    processId: 'proc-recover-result',
+    nodes: [
+      '<bpmn:serviceTask id="agent1" name="判定"><bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh" prompt="判断并完结。" /></bpmn:extensionElements></bpmn:serviceTask>',
+      '<bpmn:userTask id="human1" name="人工确认"/>',
+    ].join(''),
+    flows: [
+      '<bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>',
+      '<bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="human1"/>',
+      '<bpmn:sequenceFlow id="f3" sourceRef="human1" targetRef="end"/>',
+    ].join(''),
+  })
+  const created = await seedAndStart(runtimeA, xml, 'flow-recover-result')
+  A.equal(created.status, 'ACTIVE')
+  const waiting = await readInstance(runtimeA, created.id)
+  A.equal(waiting.pendingTasks.length, 1, '必须停在人工任务')
+  A.equal(waiting.result, null, '未结束前 result 仍是 null')
+
+  // 最后一个 agent 输出必须随实例快照持久化（内存 Map 在 dispose 后清空）。
+  const rawWaiting = readInstanceJson(runtimeA, created.id)
+  A.deepEqual(rawWaiting.lastAgentOutput, { nodeId: 'agent1', output: { verdict: 'pass' } },
+    'instance.json 必须持久化最后 agent 输出 + 来源 nodeId')
+  await runtimeA.dispose()
+
+  // 新 runtime（模拟进程重启）：懒恢复后完成 human1，agent 不能重放。
+  const adapterB = makeFakeAdapter(successBehavior({ variables: { verdict: 'from-B' } }))
+  const runtimeB = await makeRuntime(registryWith(adapterB), workspace)
+  const completed = await runtimeB.handle({
+    method: 'POST',
+    parts: ['instances', created.id, 'tasks', 'human1', 'complete'],
+    body: { payload: { approved: true } },
+  })
+  A.equal(completed.status, 200, JSON.stringify(completed.body))
+  const detail = await readInstance(runtimeB, created.id)
+  A.equal(detail.status, 'COMPLETED')
+  A.deepEqual(detail.result, { verdict: 'pass' }, 'result 必须仍是最后一个 agent 的 output（不能是 null / variables）')
+  A.equal(detail.variables.verdict, 'pass', 'variables 仍是 agent 的短变量')
+  A.equal(detail.variables.approved, true, '人工任务 payload 合并进 variables')
+  A.equal(adapter.calls.starts, 1, 'agent 只执行一次（恢复不能重放）')
+  A.equal(adapterB.calls.starts, 0, '新 runtime 不能重新派发已完成的 agent')
 })
 
 await check('集成·不调工具：NODE_FINISH_MISSING → 实例 ACTIVE + lastError，不发 process/end', async () => {

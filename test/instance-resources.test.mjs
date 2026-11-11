@@ -7,11 +7,12 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
@@ -22,6 +23,7 @@ const resources = await import('../src/instance-resources.js')
 
 let checks = 0
 let assertions = 0
+let skips = 0
 
 function eq(actual, expected, message) {
   assertions += 1
@@ -47,6 +49,24 @@ async function rejectsCode(fn, code, message) {
 }
 
 const sleep = ms => new Promise(resolveSleep => { setTimeout(resolveSleep, ms) })
+
+async function waitForStdout(child, needle, timeoutMs = 5_000) {
+  let buffer = ''
+  return await new Promise(resolveWait => {
+    const timer = setTimeout(() => resolveWait(false), timeoutMs)
+    child.stdout.on('data', chunk => {
+      buffer += String(chunk)
+      if (buffer.includes(needle)) {
+        clearTimeout(timer)
+        resolveWait(true)
+      }
+    })
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolveWait(buffer.includes(needle))
+    })
+  })
+}
 
 async function waitUntil(predicate, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs
@@ -129,125 +149,187 @@ try {
     eq(scanned.corrupt[0].instanceId, 'i-demo', '损坏条目带 instanceId')
   })
 
-  await check('锁：临界区串行 / 被占用时等待超时返回 RESOURCE_LOCK_TIMEOUT', async home => {
+  await check('锁：flock 串行 / 被占用时超时 / 锁文件常驻且无 guard 文件', async home => {
     const lock = join(home, 'test.lock')
-    writeFileSync(lock, 'held')
+    let releaseHolder = null
+    const holderGate = new Promise(resolveGate => { releaseHolder = resolveGate })
+    const holder = resources.withResourceLock(lock, async () => {
+      await holderGate
+      return 'A'
+    }, { waitMs: 2_000 })
+    ok(await waitUntil(() => existsSync(lock)), '持有者已建锁文件')
     await rejectsCode(
-      () => resources.withResourceLock(lock, async () => 'never', { waitMs: 60, ttlMs: 60_000 }),
+      () => resources.withResourceLock(lock, async () => 'never', { waitMs: 80 }),
       resources.RESOURCE_ERROR.LOCK_TIMEOUT,
       '锁被占用时超时',
     )
-    rmSync(lock)
-    const value = await resources.withResourceLock(lock, async () => 'done', { waitMs: 500 })
-    eq(value, 'done', '正常拿到锁执行')
-    ok(!existsSync(lock), '执行结束后锁被释放')
-  })
-
-  await check('W7 锁：活持有者不被 TTL 抢占；旧持有者 release 不删继任锁', async home => {
-    const lock = join(home, 'owned.lock')
-    let releaseHolder = null
-    const holder = resources.withResourceLock(lock, async () => {
-      await new Promise(resolveHold => { releaseHolder = resolveHold })
-      return 'A'
-    }, { ttlMs: 60, waitMs: 1000 })
-    ok(await waitUntil(() => existsSync(lock)), '持有者已建锁文件')
-    // 超过 TTL 后仍不能被第二个持有者抢占（pid 还活着）。
-    await sleep(120)
-    await rejectsCode(
-      () => resources.withResourceLock(lock, async () => 'B', { ttlMs: 60, waitMs: 80 }),
-      resources.RESOURCE_ERROR.LOCK_TIMEOUT,
-      '活持有者不被 TTL 抢占',
+    ok(existsSync(lock), '等待超时不会删除持有者的锁文件')
+    deep(
+      readdirSync(home).filter(name => name.includes('.steal') || name.includes('.stale-')),
+      [],
+      '没有 guard / parking 文件（flock 协议没有 stale 恢复）',
     )
-    ok(existsSync(lock), 'A 的锁文件仍在')
-
-    // 模拟继任者：A 还没 release 时锁文件被 B 接管（同 inode 覆盖 + 新 owner token）。
-    writeFileSync(lock, `${JSON.stringify({
-      v: resources.RESOURCE_LOCK_VERSION,
-      owner: 'successor-token',
-      pid: process.pid,
-      at: new Date().toISOString(),
-    })}\n`)
     releaseHolder()
-    eq(await holder, 'A', '旧持有者任务正常结束')
-    ok(existsSync(lock), '旧持有者 release 没有删掉继任锁')
-    eq(JSON.parse(readFileSync(lock, 'utf8')).owner, 'successor-token', '继任锁内容未被改')
-    rmSync(lock)
-
-    // 明确 stale 判定：pid 不存在 → 可以被接管。
-    writeFileSync(lock, `${JSON.stringify({
-      v: resources.RESOURCE_LOCK_VERSION,
-      owner: 'dead-token',
-      pid: 999999,
-      at: new Date(Date.now() - 60_000).toISOString(),
-    })}\n`)
-    eq(
-      await resources.withResourceLock(lock, async () => 'C', { ttlMs: 60_000, waitMs: 1000 }),
-      'C',
-      'pid 不存在的 stale 锁可被接管',
-    )
-    ok(!existsSync(lock), '接管者释放后锁文件消失')
+    eq(await holder, 'A', '持有者正常结束')
+    ok(existsSync(lock), '释放后锁文件常驻（删除会造成两 inode 两把锁的 ABA）')
+    eq(await resources.withResourceLock(lock, async () => 'done', { waitMs: 1_000 }), 'done', '常驻锁文件可再次获取')
+    ok(!existsSync(`${lock}.steal`), '从不创建 .steal guard')
   })
 
-  await check('F4 stale 抢占：guard 复核保证任一时刻只有一个持有者，不搬走继任锁', async home => {
-    const lock = join(home, 'guarded.lock')
+  await check('N3 stale 无 ABA：旧 owner/pid 内容不参与抢占判定，活持有者不被过期内容影响', async home => {
+    const lock = join(home, 'stale.lock')
+    // 旧格式 / 旧持有者留下的内容：pid 已不存在、owner 是旧的。flock 协议只把文件
+    // 当 inode 锚点，内容不参与互斥判定，所以它不应该阻塞任何获取。
     writeFileSync(lock, `${JSON.stringify({
       v: resources.RESOURCE_LOCK_VERSION,
       owner: 'dead-token',
-      pid: 999999,
+      pid: 999_999,
       at: new Date(Date.now() - 60_000).toISOString(),
     })}\n`)
+    const startedAt = Date.now()
+    eq(
+      await resources.withResourceLock(lock, async () => 'stale-ok', { waitMs: 2_000 }),
+      'stale-ok',
+      '陈旧内容不会让新持有者等待 TTL / pid 判定',
+    )
+    ok(Date.now() - startedAt < 1_500, '没有 stale 恢复窗口，获取是即时的')
+    ok(existsSync(lock), '锁文件保留')
 
+    // 活持有者期间，再写一个「pid 不存在」的内容也不会让别人抢进来：互斥在内核层。
+    let releaseHolder = null
+    const holderGate = new Promise(resolveGate => { releaseHolder = resolveGate })
+    const holder = resources.withResourceLock(lock, async () => {
+      await holderGate
+    }, { waitMs: 2_000 })
+    ok(await waitUntil(() => existsSync(lock)), '持有者已获取')
+    writeFileSync(lock, `${JSON.stringify({ v: 1, owner: 'fake-dead', pid: 999_999 })}\n`)
+    await rejectsCode(
+      () => resources.withResourceLock(lock, async () => 'intruder', { waitMs: 100 }),
+      resources.RESOURCE_ERROR.LOCK_TIMEOUT,
+      '内容看起来 stale 也不能绕过内核锁',
+    )
+    releaseHolder()
+    await holder
+  })
+
+  await check('N3 崩溃恢复：持锁进程被 SIGKILL 后由内核释放，无需 stale 恢复', async home => {
+    const lock = join(home, 'crash.lock')
+    const helper = join(home, 'holder.mjs')
+    writeFileSync(helper, `
+import { withResourceLock } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+const lock = process.argv[2]
+await withResourceLock(lock, async () => {
+  process.stdout.write('held\\n')
+  await new Promise(() => {})
+}, { waitMs: 5000 })
+`)
+    const child = spawn(process.execPath, [helper, lock], { stdio: ['ignore', 'pipe', 'inherit'] })
+    try {
+      eq(await waitForStdout(child, 'held'), true, '子进程已持有锁')
+      child.kill('SIGKILL')
+      await new Promise(resolveExit => child.once('exit', resolveExit))
+      const startedAt = Date.now()
+      eq(
+        await resources.withResourceLock(lock, async () => 'after-crash', { waitMs: 2_000 }),
+        'after-crash',
+        '崩溃后没有 stale 恢复流程，内核已释放锁',
+      )
+      ok(Date.now() - startedAt < 1_500, '恢复不需要等 TTL / guard 清理')
+      ok(!existsSync(`${lock}.steal`), '崩溃恢复也不会遗留 .steal guard')
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+        await new Promise(resolveExit => child.once('exit', resolveExit))
+      }
+    }
+  })
+
+  await check('N3 两个进程并发：任一时刻只有一个临界区（flock 跨进程互斥）', async home => {
+    const lock = join(home, 'concurrent.lock')
+    // 先跑一次让后端定案（Linux 上是 flock；Windows / 无 flock 平台明确 SKIP）。
+    await resources.withResourceLock(lock, async () => {}, { waitMs: 2_000 })
+    if (resources.resourceLockBackend() !== 'flock') {
+      skips += 1
+      console.log('    ↷ SKIP 当前平台没有 util-linux flock，只有进程内队列')
+      return
+    }
+    const log = join(home, 'events.jsonl')
+    const helper = join(home, 'contender.mjs')
+    writeFileSync(helper, `
+import { appendFileSync } from 'node:fs'
+import { withResourceLock } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+const [lockPath, logPath, holdMs, label] = process.argv.slice(2)
+await withResourceLock(lockPath, async () => {
+  appendFileSync(logPath, JSON.stringify({ phase: 'enter', label, at: Date.now() }) + '\\n')
+  await new Promise(resolve => setTimeout(resolve, Number(holdMs)))
+  appendFileSync(logPath, JSON.stringify({ phase: 'exit', label, at: Date.now() }) + '\\n')
+}, { waitMs: 10000 })
+`)
+    const run = label => new Promise((resolveRun, rejectRun) => {
+      const child = spawn(process.execPath, [helper, lock, log, '150', label], { stdio: ['ignore', 'inherit', 'inherit'] })
+      child.once('error', rejectRun)
+      child.once('exit', code => (code === 0 ? resolveRun() : rejectRun(new Error(`${label} exit ${code}`))))
+    })
+    await Promise.all([run('A'), run('B')])
+    const events = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    eq(events.length, 4, '两个竞争者各进入 / 退出一次')
     let active = 0
     let maxActive = 0
-    const runTask = async label => {
-      active += 1
-      maxActive = Math.max(maxActive, active)
-      await sleep(60)
-      active -= 1
-      return label
+    for (const event of events) {
+      if (event.phase === 'enter') {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+      } else {
+        active -= 1
+      }
     }
+    eq(maxActive, 1, '两个进程的临界区不得重叠')
+    eq(active, 0, '最终没有残留的临界区')
+    deep(
+      readdirSync(home).filter(name => name.includes('.steal') || name.includes('.stale-')),
+      [],
+      '并发抢占不会生成 guard / parking（没有迟到的 unlink / rename）',
+    )
+    ok(existsSync(lock), '锁文件常驻，供下一次获取复用')
+  })
 
-    // B 在抢占 stale 锁前暂停；期间 A 完成抢占、建锁并开始任务。
-    // 旧协议里 B 迟到的 rename 会搬走 A 的新锁；新协议在 guard 内复核后放弃。
-    let resumeB = null
-    let signalPaused = null
-    const bGate = new Promise(resolveGate => { resumeB = resolveGate })
-    const bPaused = new Promise(resolvePaused => { signalPaused = resolvePaused })
-    let pausedOnce = false
-    const bPromise = resources.withResourceLock(lock, () => runTask('B'), {
-      ttlMs: 60_000,
-      waitMs: 5_000,
-      hooks: {
-        beforeSteal: async () => {
-          if (pausedOnce) return
-          pausedOnce = true
-          signalPaused()
-          await bGate
-        },
-      },
-    })
-    await bPaused
+  await check('N3 正常释放不误删继任锁：释放后继任者进入，后续竞争者仍排队', async home => {
+    const lock = join(home, 'successor.lock')
+    let releaseA = null
+    const gateA = new Promise(resolveGate => { releaseA = resolveGate })
+    const a = resources.withResourceLock(lock, async () => {
+      await gateA
+      return 'A'
+    }, { waitMs: 2_000 })
+    ok(await waitUntil(() => existsSync(lock)), 'A 持有锁文件')
 
-    let signalAStarted = null
-    const aStarted = new Promise(resolveStarted => { signalAStarted = resolveStarted })
-    const aPromise = resources.withResourceLock(lock, async () => {
-      signalAStarted()
-      return await runTask('A')
-    }, { ttlMs: 60_000, waitMs: 5_000 })
-    await aStarted
-    ok(existsSync(lock), 'A 已持有锁')
-    const heldOwner = JSON.parse(readFileSync(lock, 'utf8')).owner
-    ok(typeof heldOwner === 'string' && heldOwner !== 'dead-token', '锁内容已换成 A')
-
-    resumeB()
-    await sleep(20)
-    ok(existsSync(lock), 'B 的迟到抢占没有搬走 A 的锁')
-    eq(JSON.parse(readFileSync(lock, 'utf8')).owner, heldOwner, 'A 的锁内容未被替换')
-
-    const values = await Promise.all([aPromise, bPromise])
-    deep(values.sort(), ['A', 'B'], '两个持锁任务都完成')
-    eq(maxActive, 1, '任一时刻只有一个持有者')
-    ok(!existsSync(lock), '最终锁被释放')
+    let bEntered = null
+    const bEnteredSignal = new Promise(resolveEntered => { bEntered = resolveEntered })
+    let releaseB = null
+    const gateB = new Promise(resolveGate => { releaseB = resolveGate })
+    const b = resources.withResourceLock(lock, async () => {
+      bEntered()
+      await gateB
+      return 'B'
+    }, { waitMs: 2_000 })
+    // B 在 A 释放前不能进入。
+    await sleep(80)
+    await rejectsCode(
+      () => resources.withResourceLock(lock, async () => 'C', { waitMs: 80 }),
+      resources.RESOURCE_ERROR.LOCK_TIMEOUT,
+      'C 也必须排队',
+    )
+    releaseA()
+    await bEnteredSignal
+    ok(existsSync(lock), 'B 持有的锁文件没有被 A 的释放删除')
+    await rejectsCode(
+      () => resources.withResourceLock(lock, async () => 'D', { waitMs: 80 }),
+      resources.RESOURCE_ERROR.LOCK_TIMEOUT,
+      'B 持有期间 D 不能进入',
+    )
+    releaseB()
+    deep(await Promise.all([a, b]), ['A', 'B'], 'A / B 都正常完成')
+    ok(!existsSync(`${lock}.steal`), '正常释放不创建 / 残留 guard')
   })
 
   await check('资源事件：独立 resourceSeq / since 过滤 / 终态实例仍可写（执行事件仍封口）', async home => {
@@ -325,7 +407,7 @@ try {
   })
 
   console.log('instance-resources.test.mjs')
-  console.log(`${checks} 组通过（${assertions} 条断言）`)
+  console.log(`${checks} 组通过（${assertions} 条断言）${skips > 0 ? `，${skips} 组 SKIP` : ''}`)
 } catch (error) {
   console.error('✗ 实例资源自检失败')
   console.error(error)

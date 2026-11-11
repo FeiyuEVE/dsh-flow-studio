@@ -7,7 +7,7 @@
  * instances/<instanceId>/workspace.json               实例冻结的工作区快照
  * instances/<instanceId>/resources/state.json         资源事件序号（独立 resourceSeq）
  * instances/<instanceId>/resources/events.jsonl       资源事件（append-only）
- * instances/<instanceId>/resources/.lock              资源临界区锁
+ * instances/<instanceId>/resources/.lock              资源临界区锁（flock 锚点，常驻不删）
  * ```
  *
  * 硬规则：
@@ -19,9 +19,10 @@
  * @module @feiyueve/dsh-flow-studio/instance-resources
  */
 
+import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import {
-  chmod, lstat, mkdir, open, readFile, readdir, rename, stat, unlink, utimes, writeFile,
+  chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile,
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -60,6 +61,7 @@ export const RESOURCE_ERROR = Object.freeze({
   RECORD_CORRUPT: 'RESOURCE_RECORD_CORRUPT',
   SNAPSHOT_CORRUPT: 'RESOURCE_SNAPSHOT_CORRUPT',
   LOCK_TIMEOUT: 'RESOURCE_LOCK_TIMEOUT',
+  LOCK_FAILED: 'RESOURCE_LOCK_FAILED',
   WRITE_FAILED: 'RESOURCE_WRITE_FAILED',
 })
 
@@ -72,7 +74,6 @@ const DIR_MODE = 0o700
 const FILE_MODE = 0o600
 const MAX_RECORD_BYTES = 64 * 1024
 const MAX_RESOURCE_EVENT_BYTES = 8 * 1024
-const LOCK_TTL_MS = 10 * 1000
 const LOCK_WAIT_MS = 15 * 1000
 
 let tmpCounter = 0
@@ -183,202 +184,203 @@ async function writeTextAtomic(path, text) {
   }
 }
 
-/** 资源锁内容格式版本。 */
+/** 资源锁内容格式版本（只作诊断字段；互斥语义由内核 flock 提供）。 */
 export const RESOURCE_LOCK_VERSION = 1
 
-/** pid 是否仍存活：ESRCH = 已退出；EPERM = 存在但无权限（按存活处理）。 */
-function pidIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return Boolean(error && error.code === 'EPERM')
-  }
+/**
+ * 锁后端与 ABA 的关系（review-0140 N3）。
+ *
+ * 旧实现用「锁文件 + pid/TTL + `.steal` guard + 按路径 unlink/rename」做 stale
+ * 恢复。guard 自身也要 stale 恢复，于是「读旧 owner → 按路径 unlink」仍有
+ * check-then-delete 竞态：迟到的 unlink 删掉继任者的活 guard，迟到的 rename
+ * 再搬走活主锁（ABA），两个临界区同时进入。
+ *
+ * 新实现把互斥交给内核：
+ *   - POSIX：spawn util-linux `flock` 持有 `<lock>` 的排他 flock；关闭 stdin
+ *     让持锁进程退出即释放。持有者崩溃时内核自动释放——没有 stale 概念，
+ *     也就没有 stale 恢复，因此不存在 check-then-delete / ABA。
+ *   - Windows 或找不到 flock 的平台：退回**进程内队列**，只保证同一 Node 进程
+ *     内的串行；跨进程互斥不成立（明确的平台限制）。
+ *   - flock 的可靠性依赖底层文件系统：本地文件系统可靠；NFS/SMB 等共享卷上
+ *     跨主机的 flock 语义不保证，锁目录应放在本地盘。
+ *
+ * 锁文件**永不删除**：删除会让等待者继续持有已 unlink 的 inode，而新路径又能
+ * 建出新 inode，形成「两个文件、两把锁」的经典 ABA。文件只作为 flock 的锚点，
+ * 里面的 owner/pid 只用于排障，不参与任何 stale / 抢占判定。
+ */
+const KERNEL_LOCK_BIN = process.env.FLOW_STUDIO_FLOCK_BIN || 'flock'
+// 拿到锁后先打标记（父进程据此确认已持有），再由 cat 阻塞读 stdin；关闭 stdin
+// 即 EOF → cat 退出 → 内核释放 flock。整个过程没有按路径 unlink/rename。
+const KERNEL_LOCK_COMMAND = 'echo locked; exec cat >/dev/null'
+const KERNEL_LOCK_RELEASE_MS = 2_000
+/** 'unknown' | 'available' | 'unavailable'；首次 acquire 后定案。 */
+let kernelLockState = 'unknown'
+/** 进程内队列：Windows / 找不到 flock 时的退路。 */
+const processLockQueues = new Map()
+
+/** spawn 层面的「后端不可用」错误：只对它们退回进程内队列。 */
+function backendUnavailable(error) {
+  return Boolean(error && typeof error.code === 'string'
+    && ['ENOENT', 'EACCES', 'ENOSYS', 'EPERM'].includes(error.code))
 }
 
-/**
- * 读锁的持有者事实。
- *
- * 新格式是 `{v, owner, pid, at}`：
- *   - **活进程持有的锁不因 TTL 被抢占**（只有 pid 不存在才算 stale）；
- *   - 无法识别持有者（旧格式 / 半截写入）才退回 mtime TTL。
- */
-async function readLockSnapshot(lockPath, ttlMs) {
-  let info
-  try {
-    info = await lstat(lockPath)
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null
-    throw error
-  }
-  let text = ''
-  try {
-    text = await readFile(lockPath, 'utf8')
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null
-  }
-  let parsed = null
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    parsed = null
-  }
-  let owner = parsed && typeof parsed === 'object' && typeof parsed.owner === 'string' ? parsed.owner : null
-  let pid = parsed && typeof parsed === 'object' && Number.isSafeInteger(parsed.pid) ? parsed.pid : null
-  if (pid === null) {
-    // 兼容旧格式：首行是 pid。
-    const first = text.split('\n')[0].trim()
-    if (/^\d+$/.test(first)) pid = Number(first)
-    if (pid !== null) owner = null
-  }
-  const ageMs = Date.now() - info.mtimeMs
-  const recognized = owner !== null && pid !== null
-  let stale = false
-  let reason = ''
-  if (recognized) {
-    if (!pidIsAlive(pid)) {
-      stale = true
-      reason = 'pid-dead'
-    }
-  } else if (ageMs > ttlMs) {
-    // 无法证明持有者还活着：超过 TTL 的半截 / 旧锁按 stale 处理。
-    stale = true
-    reason = 'unrecognized-ttl'
-  }
-  return { info, owner, pid, recognized, ageMs, stale, reason }
+/** 等一个已 spawn 的子进程退出（已经退出则立即 resolve）。 */
+function waitChildExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise(resolveWait => { child.once('exit', () => resolveWait()) })
 }
 
-/**
- * 抢占 stale 锁：先在**抢占互斥**（`<lock>.steal`）里复核锁 inode，再把同一
- * inode 的旧锁搬走并删除。
- *
- * 旧实现「先 lstat、再 rename、发现搬错就尽量放回」有一个确定的 ABA：
- * B 读到旧死锁 inode → A 抢占成功并建了新锁 → B 迟到的 rename 把 A 的新锁搬走
- * → C 在空窗拿锁 → B 发现 inode 不符、放回失败后仍删掉 parking 里的 A 锁
- * （review-0139 F4：`activeTasks=[A,C]`，A 的锁消失）。
- *
- * 现在所有抢占者先串行拿 `<lock>.steal`，再复核“仍是同一 inode 且仍 stale”。
- * 复核后到 rename 之间不会再有别的抢占者插进来；而锁的当前持有者若还活着，
- * 复核会直接放弃。搬错（理论上不可达）也**绝不删除** parking，只返回失败。
- */
-async function stealStaleLock(lockPath, snapshot, ttlMs, hooks) {
-  const guard = await acquireStealGuard(lockPath, ttlMs)
-  if (guard === null) return false
+/** 锁文件先以 0600 建好并常驻；flock 只把它当 inode 锚点。 */
+async function ensureLockFile(lockPath) {
+  const handle = await open(lockPath, 'a', FILE_MODE)
   try {
-    const current = await readLockSnapshot(lockPath, ttlMs)
-    if (current === null) return true
-    if (!current.stale) return false
-    if (current.info.ino !== snapshot.info.ino || current.info.dev !== snapshot.info.dev) return false
-    if (typeof hooks?.beforeStealRemove === 'function') {
-      await hooks.beforeStealRemove({ lockPath })
-    }
-    const parking = `${lockPath}.stale-${process.pid}-${tmpCounter++}-${randomBytes(4).toString('hex')}`
-    try {
-      await rename(lockPath, parking)
-    } catch (error) {
-      if (error && error.code === 'ENOENT') return true
-      return false
-    }
-    let moved
-    try {
-      moved = await lstat(parking)
-    } catch {
-      return true
-    }
-    if (moved.ino !== snapshot.info.ino || moved.dev !== snapshot.info.dev) {
-      // 复核之后仍搬错：不 link 回去（那会再次移动继任者的锁），也不删除 parking。
-      // 让这份复制留在私有路径上，至少不会破坏当前 lockPath 的互斥。
-      return false
-    }
-    await unlink(parking).catch(() => {})
-    return true
+    await handle.chmod(FILE_MODE).catch(() => {})
   } finally {
-    await guard.release()
+    await handle.close().catch(() => {})
+  }
+}
+
+/** 持有者诊断信息（best-effort；互斥与 stale 判定都不读它）。 */
+async function writeHolderInfo(lockPath, owner) {
+  try {
+    await writeFile(lockPath, `${JSON.stringify({
+      v: RESOURCE_LOCK_VERSION,
+      owner,
+      pid: process.pid,
+      at: new Date().toISOString(),
+      backend: 'flock',
+    })}\n`, { encoding: 'utf8', mode: FILE_MODE })
+    await chmod(lockPath, FILE_MODE).catch(() => {})
+  } catch {
+    // 诊断信息写失败不影响互斥本身。
   }
 }
 
 /**
- * 抢占互斥：`<lock>.steal` 的短临界区，只保护「复核 + 搬走 stale 锁」。
- * guard 自己带 pid，活进程持有不会被 TTL 抢；崩溃留下的 guard 只有 pid 不存在
- * 或超过 TTL 才清掉。
- */
-async function acquireStealGuard(lockPath, ttlMs) {
-  const guardPath = `${lockPath}.steal`
-  const waitMs = Math.max(250, Math.min(ttlMs, 2_000))
-  const deadline = Date.now() + waitMs
-  const owner = `guard-${process.pid}-${randomBytes(6).toString('hex')}`
-  for (;;) {
-    let handle = null
-    try {
-      handle = await open(guardPath, 'wx', FILE_MODE)
-    } catch (error) {
-      if (!error || error.code !== 'EEXIST') return null
-      const snapshot = await readLockSnapshot(guardPath, ttlMs)
-      if (snapshot === null) continue
-      if (snapshot.stale) {
-        await unlink(guardPath).catch(() => {})
-        continue
-      }
-      if (Date.now() >= deadline) return null
-      await sleep(2)
-      continue
-    }
-    let ino
-    let dev
-    try {
-      const info = await handle.stat()
-      ino = info.ino
-      dev = info.dev
-      await handle.writeFile(
-        `${JSON.stringify({ v: RESOURCE_LOCK_VERSION, owner, pid: process.pid, at: new Date().toISOString() })}\n`,
-        'utf8',
-      )
-    } finally {
-      await handle.close().catch(() => {})
-    }
-    return {
-      async release() {
-        try {
-          const info = await lstat(guardPath)
-          if (info.ino === ino && info.dev === dev) await unlink(guardPath)
-        } catch {
-          // 已被清掉 / 被替换：不是我们的 guard 就不动。
-        }
-      },
-    }
-  }
-}
-
-/** 只有「inode 未变 + owner token 一致」的持有者才能释放锁。 */
-async function releaseOwnedLock(lockPath, owner, ino, dev) {
-  if (ino === undefined || dev === undefined) return false
-  let info
-  try {
-    info = await lstat(lockPath)
-  } catch {
-    return false
-  }
-  if (info.isSymbolicLink() || info.ino !== ino || info.dev !== dev) return false
-  let parsed = null
-  try {
-    parsed = JSON.parse(await readFile(lockPath, 'utf8'))
-  } catch {
-    return false
-  }
-  if (!parsed || typeof parsed !== 'object' || parsed.owner !== owner) return false
-  await unlink(lockPath).catch(() => {})
-  return true
-}
-
-/**
- * 跨进程粗粒度锁：`open(lock, 'wx')` + owner token + pid + 心跳。
+ * 用 util-linux `flock` 在 `<lockPath>` 上持有内核排他锁。
  *
- * - 持有者内容带 `owner`（随机 token）与 `pid`，并周期性 touch mtime 续租；
- * - **活进程持有的锁不会被 TTL 抢占**；只有 pid 不存在（或无法识别的旧锁超过 TTL）
- *   才按 stale 处理（review-0137 W7）；
- * - 释放时比对 inode + owner token：旧持有者不会删掉继任者的锁；
- * - 等待超时报 LOCK_TIMEOUT。
+ * `-F/--no-fork` 让 flock 直接 exec shell，锁 fd 由 `cat` 继承并一直持有；
+ * `-w` 只是内核侧的兜底，JS 计时器负责毫秒级 waitMs。返回的 `release()`
+ * 关闭 stdin 并等持锁进程退出，确保「await 返回后锁真的已释放」。
+ */
+async function acquireKernelLock(lockPath, waitMs) {
+  const startedAt = Date.now()
+  const timeoutSeconds = Math.max(1, Math.ceil(Math.max(1, waitMs) / 1000))
+  const child = spawn(KERNEL_LOCK_BIN, [
+    '-x', '-w', String(timeoutSeconds), '-F', lockPath, 'sh', '-c', KERNEL_LOCK_COMMAND,
+  ], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+  let stdout = ''
+  let stderr = ''
+  let settled = false
+  let timer = null
+  // 子进程可能先退出（超时 / 后端报错），此时写 stdin 会 EPIPE；不能让它变成未捕获异常。
+  child.stdin.on('error', () => {})
+  child.stdout.on('error', () => {})
+  child.stderr.on('error', () => {})
+  return await new Promise((resolveAcquire, rejectAcquire) => {
+    const finishReject = error => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // 已经退出
+      }
+      rejectAcquire(error)
+    }
+    timer = setTimeout(() => {
+      finishReject(fail(
+        RESOURCE_ERROR.LOCK_TIMEOUT,
+        `等待资源锁超时（${waitMs}ms）：${lockPath}`,
+        { path: lockPath },
+      ))
+    }, Math.max(1, waitMs))
+    timer.unref?.()
+    child.stdout.on('data', chunk => {
+      stdout += String(chunk)
+      if (settled || !stdout.includes('locked')) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      resolveAcquire({
+        async release() {
+          try {
+            child.stdin.end()
+          } catch {
+            // 已经退出
+          }
+          // 等内核真正释放锁：不能让调用方在锁仍被持有时继续。
+          await Promise.race([waitChildExit(child), sleep(KERNEL_LOCK_RELEASE_MS)])
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill('SIGKILL')
+            } catch {
+              // 已经退出
+            }
+            await Promise.race([waitChildExit(child), sleep(1_000)])
+          }
+        },
+      })
+    })
+    child.stderr.on('data', chunk => {
+      stderr = (stderr + String(chunk)).slice(-2_048)
+    })
+    child.once('error', error => finishReject(error))
+    child.once('exit', code => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      const elapsed = Date.now() - startedAt
+      const timedOut = elapsed >= Math.max(1, waitMs) - 50 || (code === 1 && elapsed >= waitMs / 2)
+      rejectAcquire(fail(
+        timedOut ? RESOURCE_ERROR.LOCK_TIMEOUT : RESOURCE_ERROR.LOCK_FAILED,
+        timedOut
+          ? `等待资源锁超时（${waitMs}ms）：${lockPath}`
+          : `资源锁后端失败（flock 退出码 ${code}）：${stderr.trim() || lockPath}`,
+        { path: lockPath, ...(timedOut ? {} : { exitCode: code }) },
+      ))
+    })
+  })
+}
+
+/** 进程内串行队列：只保证同进程互斥（Windows / 无 flock 的退路）。 */
+async function withProcessQueue(lockPath, task) {
+  const key = resolve(lockPath)
+  const previous = processLockQueues.get(key) ?? Promise.resolve()
+  let releaseGate
+  const gate = new Promise(resolveGate => { releaseGate = resolveGate })
+  const tail = previous.then(() => gate)
+  processLockQueues.set(key, tail)
+  await previous.catch(() => {})
+  try {
+    return await task()
+  } finally {
+    releaseGate()
+    if (processLockQueues.get(key) === tail) processLockQueues.delete(key)
+  }
+}
+
+/**
+ * 当前实际使用的锁后端：`flock`（内核互斥）/ `process`（仅进程内）/ `unknown`。
+ * 供测试与排障读取；不参与锁语义。
+ */
+export function resourceLockBackend() {
+  if (process.platform === 'win32') return 'process'
+  return kernelLockState === 'available' ? 'flock' : (kernelLockState === 'unavailable' ? 'process' : 'unknown')
+}
+
+/**
+ * 跨进程粗粒度锁：**内核 flock**（POSIX）或进程内队列（Windows / 无 flock）。
+ *
+ * 与旧实现的关键区别：没有 stale 恢复，也没有 `.steal` guard。持有者崩溃时
+ * 内核自动释放，不存在「读旧 owner → 按路径删除/搬走」的 check-then-delete
+ * 窗口，因此不会误删 / 搬走继任者的活锁（review-0140 N3）。
+ *
+ * `ttlMs` 仅为兼容旧调用保留：flock 后端不使用 TTL（活锁不需要续租，死锁由
+ * 内核判定），进程内退路也不需要。
  *
  * @param {string} lockPath
  * @param {() => Promise<any>} task
@@ -388,61 +390,34 @@ export async function withResourceLock(lockPath, task, options = {}) {
   if (typeof task !== 'function') {
     throw fail(RESOURCE_ERROR.INVALID, 'withResourceLock 需要 task 函数')
   }
-  const ttlMs = Number.isSafeInteger(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : LOCK_TTL_MS
   const waitMs = Number.isSafeInteger(options.waitMs) && options.waitMs > 0 ? options.waitMs : LOCK_WAIT_MS
   await ensureDir(dirname(lockPath))
-  const startedAt = Date.now()
-  const owner = `${process.pid}-${randomBytes(8).toString('hex')}`
-  const hooks = isPlainObject(options.hooks) ? options.hooks : null
-  for (;;) {
-    let handle = null
+  await ensureLockFile(lockPath)
+
+  if (process.platform !== 'win32' && kernelLockState !== 'unavailable') {
+    let kernelLock = null
     try {
-      handle = await open(lockPath, 'wx', FILE_MODE)
+      kernelLock = await acquireKernelLock(lockPath, waitMs)
     } catch (error) {
-      if (!error || error.code !== 'EEXIST') throw error
-      const snapshot = await readLockSnapshot(lockPath, ttlMs)
-      if (snapshot === null) continue
-      if (snapshot.stale) {
-        if (typeof hooks?.beforeSteal === 'function') await hooks.beforeSteal({ lockPath, snapshot })
-        const stolen = await stealStaleLock(lockPath, snapshot, ttlMs, hooks)
-        // 抢占失败（锁刚被换掉 / 权限问题）也要退避，不能空转成忙等。
-        if (!stolen) {
-          if (Date.now() - startedAt >= waitMs) {
-            throw fail(RESOURCE_ERROR.LOCK_TIMEOUT, `等待资源锁超时（${waitMs}ms）：${lockPath}`, { path: lockPath })
-          }
-          await sleep(20)
-        }
-        continue
-      }
-      if (Date.now() - startedAt >= waitMs) {
-        throw fail(RESOURCE_ERROR.LOCK_TIMEOUT, `等待资源锁超时（${waitMs}ms）：${lockPath}`, { path: lockPath })
-      }
-      await sleep(20)
-      continue
+      // 只有「从未成功用过内核后端」且确实是后端不可用（如 macOS / 精简容器
+      // 没有 util-linux flock）才降级；已经证明可用之后绝不再静默退回进程内
+      // 队列（那会把跨进程互斥悄悄降成只保证单进程）。
+      if (kernelLockState === 'available' || !backendUnavailable(error)) throw error
+      kernelLockState = 'unavailable'
     }
-    let ino
-    let dev
-    let heartbeat = null
-    try {
-      const info = await handle.stat()
-      ino = info.ino
-      dev = info.dev
-      await handle.writeFile(
-        `${JSON.stringify({ v: RESOURCE_LOCK_VERSION, owner, pid: process.pid, at: new Date().toISOString() })}\n`,
-        'utf8',
-      )
-      // 心跳：只 touch mtime（不动 token 内容），避免读写内容时出现半截 JSON。
-      heartbeat = setInterval(() => {
-        utimes(lockPath, new Date(), new Date()).catch(() => {})
-      }, Math.max(25, Math.floor(ttlMs / 3)))
-      heartbeat.unref?.()
-      return await task()
-    } finally {
-      if (heartbeat !== null) clearInterval(heartbeat)
-      await handle.close().catch(() => {})
-      await releaseOwnedLock(lockPath, owner, ino, dev)
+    if (kernelLock !== null) {
+      kernelLockState = 'available'
+      // 诊断信息：owner token 与 pid 只用于排障，不参与互斥 / stale 判定。
+      await writeHolderInfo(lockPath, `${process.pid}-${randomBytes(8).toString('hex')}`)
+      try {
+        return await task()
+      } finally {
+        await kernelLock.release()
+      }
     }
   }
+
+  return await withProcessQueue(lockPath, task)
 }
 
 /** 资源记录形状校验（读 / 写共用）。 */

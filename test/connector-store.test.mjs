@@ -7,10 +7,10 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { join, resolve } from 'node:path'
-import { dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { createConnectorStore, ConnectorStoreError } from '../src/connector-store.js'
 
@@ -51,6 +51,24 @@ async function rejects(promise, code, message) {
   await assert.rejects(promise, (error) => {
     assert.equal(error.code, code, `${message}（实际 code=${error.code}）`)
     return true
+  })
+}
+
+async function waitForStdout(child, needle, timeoutMs = 5_000) {
+  let buffer = ''
+  return await new Promise(resolveWait => {
+    const timer = setTimeout(() => resolveWait(false), timeoutMs)
+    child.stdout.on('data', chunk => {
+      buffer += String(chunk)
+      if (buffer.includes(needle)) {
+        clearTimeout(timer)
+        resolveWait(true)
+      }
+    })
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolveWait(buffer.includes(needle))
+    })
   })
 }
 
@@ -440,6 +458,37 @@ await check('F5 旧 fence 不能覆盖另一个 store 的新成功记录', async
     'HTTP_STORE_STALE',
     '已成功记录上旧世代 recordAttempt 必须被拒绝',
   )
+})
+
+await check('N3 跨进程互斥：另一个进程持锁时 store 的 read→check→write 必须排队', async (root) => {
+  const store = createConnectorStore({ root })
+  await store.beginInvocation(baseInput())
+  const digest = basename(store.pathFor(IDENTITY), '.json')
+  const lockPath = join(root, '.locks', `${digest}.lock`)
+  const helper = join(root, 'hold-lock.mjs')
+  writeFileSync(helper, `
+import { withResourceLock } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'src', 'instance-resources.js')).href)}
+const [lockPath, holdMs] = process.argv.slice(2)
+await withResourceLock(lockPath, async () => {
+  process.stdout.write('held\\n')
+  await new Promise(resolve => setTimeout(resolve, Number(holdMs)))
+}, { waitMs: 10000 })
+`)
+  const child = spawn(process.execPath, [helper, lockPath, '500'], { stdio: ['ignore', 'pipe', 'inherit'] })
+  try {
+    A.equal(await waitForStdout(child, 'held'), true, '另一个进程已持有 store 锁')
+    const startedAt = Date.now()
+    const recorded = await store.recordAttempt(IDENTITY, { attempt: 1 })
+    const waitedMs = Date.now() - startedAt
+    A.equal(recorded.state, 'sent', '拿到锁后写入成功')
+    A.ok(waitedMs >= 300, `跨进程锁生效：store 写入排队 ${waitedMs}ms（应 >= 300ms）`)
+    A.equal(existsSync(`${lockPath}.steal`), false, '没有 .steal guard（没有 check-then-delete）')
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL')
+      await new Promise(resolveExit => child.once('exit', resolveExit))
+    }
+  }
 })
 
 console.log(`\nconnector-store: ${checks} 组 / ${assertions} 条断言通过`)

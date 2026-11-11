@@ -246,6 +246,44 @@ export function mountEditor(container, options = {}) {
     return xml
   }
 
+  /**
+   * 用当前 moddle 预检 XML：bpmn-js 会先把新 definitions 装进 Modeler，再在绘制
+   * 阶段因缺少 BPMN DI 抛错；预检把这类失败挡在替换当前模型之前。
+   */
+  async function assertImportable(xml) {
+    if (!instance) return
+    const moddle = instance.get('moddle', false)
+    if (!moddle || typeof moddle.fromXML !== 'function') return
+    const parsed = await moddle.fromXML(xml)
+    const definitions = parsed && (parsed.rootElement || parsed)
+    const diagrams = definitions && Array.isArray(definitions.diagrams) ? definitions.diagrams : []
+    if (diagrams.length === 0) throw new Error('no diagram to display')
+  }
+
+  /**
+   * 导入失败后的完整回滚：从旧 XML 重建 Modeler/Viewer，连同 definitions、DI、
+   * 属性面板与撤销栈一起恢复，避免只恢复字符串、模型却停在新定义的空壳里。
+   */
+  async function restoreModel(previousXml, previousDirty) {
+    const wasSuppressed = suppressChange
+    suppressChange = true
+    try {
+      destroyInstance()
+      await createInstance()
+      if (previousXml) {
+        await instance.importXML(previousXml)
+      } else if (!isViewer) {
+        await instance.createDiagram()
+      }
+      resetHistory()
+      dirty = previousDirty
+      fitViewport()
+      applyRuntimeMarkers()
+    } finally {
+      suppressChange = wasSuppressed
+    }
+  }
+
   async function loadXml(xml) {
     const next = String(xml)
     if (!instance) {
@@ -253,11 +291,19 @@ export function mountEditor(container, options = {}) {
       return
     }
     const previous = currentXml
+    const previousDirty = dirty
+    // 先独立解析并检查 DI，再触碰当前实例；无 DI 的合法 XML 会在这里被拒绝。
+    await assertImportable(next)
     try {
       await instance.importXML(next)
     } catch (error) {
-      // 导入失败时保留旧快照引用，页面可以继续展示/重试，不会被坏 XML 覆盖。
+      // bpmn-js 在绘制失败前可能已经替换 _definitions：重建整个实例恢复旧模型。
       currentXml = previous
+      try {
+        await restoreModel(previous, previousDirty)
+      } catch (restoreError) {
+        if (error && typeof error === 'object') error.restoreError = restoreError
+      }
       throw error
     }
     currentXml = next
@@ -341,6 +387,30 @@ export function mountEditor(container, options = {}) {
     return { ok: true, count: runtimeMarkers.length }
   }
 
+  /**
+   * 保存前把属性面板里未提交的输入落进模型：
+   *   - 关闭官方弹出编辑器（弹窗挂在 document.body，不在本编辑器容器内）；
+   *   - 关闭时官方 TextArea 会 flush 去抖输入。
+   * 容器内普通控件的 blur 仍由页面 `commitPendingProperties` 的焦点处理负责，
+   * 这里不抢先 blur，避免把需要等去抖窗的 contenteditable 路径截断。
+   */
+  async function flushProperties() {
+    if (disposed || !instance || isViewer) return { ok: false, popupClosed: false }
+    let popupClosed = false
+    try {
+      const popup = instance.get('feelPopup', false)
+      popupClosed = Boolean(popup && typeof popup.isOpen === 'function' && popup.isOpen())
+      const eventBus = instance.get('eventBus', false)
+      if (eventBus) eventBus.fire('propertiesPanel.closePopup')
+      else if (popup && typeof popup.close === 'function') popup.close()
+    } catch {
+      // 关闭弹窗失败不阻断保存：模型里仍是上一次已提交值。
+    }
+    // 让 preact 的命令栈/受控组件回调先跑完。
+    await Promise.resolve()
+    return { ok: true, popupClosed }
+  }
+
   function destroy() {
     if (disposed) return
     disposed = true
@@ -370,6 +440,7 @@ export function mountEditor(container, options = {}) {
     },
     importXML,
     saveXML,
+    flushProperties,
     setViewerMode,
     setRuntimeState,
     destroy,

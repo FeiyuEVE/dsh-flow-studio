@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 
 import { parseBpmn } from '../src/bpmn-parse.js'
+import { commitPendingProperties } from '../src/client/page.js'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const outDir = join(repoRoot, '.tmp', '0.13.3', 'phase-b')
@@ -203,6 +204,56 @@ async function selectField(page, entryId, value) {
   await locator.waitFor({ state: 'visible', timeout: 5000 })
   await locator.selectOption(value)
   await page.waitForTimeout(220)
+}
+
+async function remountEditor(page) {
+  await page.evaluate(async () => {
+    if (window.__editor && !window.__editor.isDestroyed()) window.__editor.destroy()
+    await window.__mountEditor({})
+  })
+  await page.waitForTimeout(180)
+}
+
+async function createRegressionNodes(page) {
+  const canvasBox = await page.locator('.djs-container').boundingBox()
+  const y = Math.round(canvasBox.y + canvasBox.height / 2)
+  const plan = [
+    ['create.user-task', 300],
+    ['create.http-task', 520],
+    ['create.agent-task', 740],
+    ['create.end-event', 940],
+  ]
+  for (const [action, x] of plan) {
+    await page.click(`.djs-palette [data-action="${action}"]`)
+    await page.mouse.click(canvasBox.x + x, y)
+    await page.waitForTimeout(220)
+  }
+  return page.evaluate(() => {
+    const modeler = window.__modeler
+    const registry = modeler.get('elementRegistry')
+    const result = {}
+    for (const element of registry.getAll()) {
+      if (element.type === 'bpmn:StartEvent') result.start = element.id
+      if (element.type === 'bpmn:EndEvent') result.end = element.id
+      if (element.type === 'bpmn:UserTask') result.human = element.id
+      if (element.type !== 'bpmn:ServiceTask') continue
+      const values = element.businessObject.extensionElements
+        ? element.businessObject.extensionElements.values || []
+        : []
+      const fsNode = values.find(value => value.$type === 'fs:Node')
+      if (fsNode && fsNode.nodeType === 'agent') result.agent = element.id
+      if (fsNode && fsNode.nodeType === 'http') result.http = element.id
+    }
+    const get = id => registry.get(id)
+    const modeling = modeler.get('modeling')
+    if (result.start && result.human && result.http && result.agent && result.end) {
+      modeling.connect(get(result.start), get(result.human))
+      modeling.connect(get(result.human), get(result.http))
+      modeling.connect(get(result.http), get(result.agent))
+      modeling.connect(get(result.agent), get(result.end))
+    }
+    return result
+  })
 }
 
 async function panelHeader(page) {
@@ -982,6 +1033,248 @@ async function run() {
       A.equal(result.editor, 0, '编辑器 DOM 已移除')
       A.equal(result.style, 0, '样式节点已移除')
       A.equal(result.mountChildren, 0, '挂载点已清空')
+    })
+
+    await check('回归 #2：导入无 DI XML 失败后模型与保存仍是旧定义', async () => {
+      await remountEditor(page)
+      await createRegressionNodes(page)
+      const before = await page.evaluate(async () => {
+        const definitions = window.__modeler.getDefinitions()
+        const process = (definitions.rootElements || []).find(element => element.$type === 'bpmn:Process')
+        return {
+          xml: await window.__editor.saveXML(),
+          processId: process ? process.id : '',
+        }
+      })
+      A.ok(before.processId !== '', '旧定义有 process id')
+      const noDiagramXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_REGRESSION" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="Process_REGRESSION_NEW" isExecutable="true">
+    <bpmn:startEvent id="RegressionStart" />
+    <bpmn:endEvent id="RegressionEnd" />
+    <bpmn:sequenceFlow id="RegressionFlow" sourceRef="RegressionStart" targetRef="RegressionEnd" />
+  </bpmn:process>
+</bpmn:definitions>`
+      const parsedNoDiagram = await parseBpmn(noDiagramXml)
+      A.equal(parsedNoDiagram.ok, true, '无 DI XML 本身是合法的服务端定义')
+
+      const result = await page.evaluate(async xml => {
+        const editor = window.__editor
+        let importError = null
+        let saveError = null
+        try {
+          await editor.importXML(xml)
+        } catch (error) {
+          importError = String((error && error.message) || error)
+        }
+        let afterXml = null
+        try {
+          afterXml = await editor.saveXML()
+        } catch (error) {
+          saveError = String((error && error.message) || error)
+        }
+        let againXml = null
+        try {
+          againXml = await editor.saveXML()
+        } catch (error) {
+          saveError = String((error && error.message) || error)
+        }
+        const definitions = window.__modeler.getDefinitions()
+        const process = (definitions.rootElements || []).find(element => element.$type === 'bpmn:Process')
+        return {
+          importError,
+          saveError,
+          afterXml,
+          againXml,
+          processId: process ? process.id : '',
+        }
+      }, noDiagramXml)
+
+      A.match(result.importError || '', /no diagram to display/, '导入因缺少 DI 失败')
+      A.equal(result.saveError, null, '失败后 saveXML 不崩溃')
+      A.equal(result.afterXml, before.xml, '失败后保存仍是旧 XML（逐字节）')
+      A.equal(result.againXml, before.xml, '再次保存提交的仍是旧 XML')
+      A.equal(result.processId, before.processId, '模型 definitions 恢复为旧 process')
+      A.ok(!result.againXml.includes('Process_REGRESSION_NEW'), '旧 XML 不含新 process')
+      const parsedAfter = await parseBpmn(result.againXml)
+      A.equal(parsedAfter.ok, true, '失败后保存的旧 XML 仍可被服务端解析')
+
+      // 预检放行、但 bpmn-js 绘制阶段失败（有 BPMNDiagram、没有 plane）时走重建回滚。
+      const noPlaneXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" id="Definitions_NOPLANE" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="Process_NOPLANE" isExecutable="true">
+    <bpmn:startEvent id="NoPlaneStart" />
+    <bpmn:endEvent id="NoPlaneEnd" />
+    <bpmn:sequenceFlow id="NoPlaneFlow" sourceRef="NoPlaneStart" targetRef="NoPlaneEnd" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="NoPlaneDiagram" />
+</bpmn:definitions>`
+      const fallback = await page.evaluate(async xml => {
+        let importError = null
+        let saveError = null
+        let afterXml = null
+        try {
+          await window.__editor.importXML(xml)
+        } catch (error) {
+          importError = String((error && error.message) || error)
+        }
+        try {
+          afterXml = await window.__editor.saveXML()
+        } catch (error) {
+          saveError = String((error && error.message) || error)
+        }
+        return { importError, saveError, afterXml }
+      }, noPlaneXml)
+      A.ok(fallback.importError !== null, '绘制阶段失败的导入也会报错')
+      A.equal(fallback.saveError, null, '重建回滚后 saveXML 不崩溃')
+      A.ok(fallback.afterXml.includes(before.processId), '重建回滚恢复旧 process')
+      A.ok(!fallback.afterXml.includes('Process_NOPLANE'), '重建回滚不残留失败导入的新 process')
+    })
+
+    await check('回归 #4：Change element 换成 Service Task 补齐合法 nodeType', async () => {
+      await remountEditor(page)
+      const ids = await createRegressionNodes(page)
+      await selectById(page, ids.human)
+      await page.waitForSelector('[data-group-id="group-fs-prompt"]', { timeout: 5000 })
+      await openGroup(page, 'fs-prompt')
+      await fillField(page, 'fs-node-prompt', '替换前的人工提示词')
+      const before = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const values = element.businessObject.extensionElements.values
+        const fsNode = values.find(value => value.$type === 'fs:Node')
+        return { type: element.type, nodeType: fsNode.nodeType, prompt: fsNode.prompt }
+      }, ids.human)
+      A.equal(before.type, 'bpmn:UserTask', '替换前是 userTask')
+      A.equal(before.nodeType, undefined, '替换前 fs:Node 没有 nodeType')
+      await page.evaluate(() => window.__modeler.get('commandStack').clear())
+
+      await page.evaluate(id => {
+        const modeler = window.__modeler
+        const shape = modeler.get('elementRegistry').get(id)
+        modeler.get('selection').select(shape)
+        modeler.get('contextPad').open(shape, true)
+      }, ids.human)
+      await page.locator('.djs-context-pad [data-action="replace"]').click()
+      await page.waitForSelector('.djs-popup [data-id="replace-with-service-task"]', { timeout: 5000 })
+      await page.locator('.djs-popup [data-id="replace-with-service-task"]').click()
+      await page.waitForTimeout(250)
+      const after = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const values = element.businessObject.extensionElements.values
+        const fsNode = values.find(value => value.$type === 'fs:Node')
+        return { type: element.type, nodeType: fsNode && fsNode.nodeType, prompt: fsNode && fsNode.prompt }
+      }, ids.human)
+      A.equal(after.type, 'bpmn:ServiceTask', '替换后是 serviceTask')
+      A.equal(after.nodeType, 'agent', '替换后补齐 nodeType=agent（不再是 undefined）')
+      A.equal(after.prompt, '替换前的人工提示词', '替换保留原有 fs:Node 内容')
+    })
+
+    await check('回归 #5：属性面板 HTTP→人工后一次撤销回到切换前', async () => {
+      await remountEditor(page)
+      const ids = await createRegressionNodes(page)
+      await selectById(page, ids.http)
+      await page.waitForSelector('[data-group-id="group-fs-node"]', { timeout: 5000 })
+      await page.evaluate(() => window.__modeler.get('commandStack').clear())
+      await openGroup(page, 'fs-node')
+      const before = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+        return { type: element.type, nodeType: fsNode.nodeType }
+      }, ids.http)
+      A.equal(before.type, 'bpmn:ServiceTask', '切换前是 serviceTask')
+      A.equal(before.nodeType, 'http', '切换前 nodeType=http')
+
+      await selectField(page, 'fs-node-type', 'human')
+      const switched = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+        return { type: element.type, nodeType: fsNode && fsNode.nodeType }
+      }, ids.http)
+      A.equal(switched.type, 'bpmn:UserTask', '切换后是 userTask')
+      A.equal(switched.nodeType, undefined, '切换后人工节点不保留 nodeType')
+
+      await page.evaluate(() => window.__modeler.get('commandStack').undo())
+      await page.waitForTimeout(250)
+      const undone = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element && element.businessObject.extensionElements
+          ? element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+          : null
+        return { exists: !!element, type: element && element.type, nodeType: fsNode && fsNode.nodeType }
+      }, ids.http)
+      A.equal(undone.exists, true, '撤销后旧图元仍存在')
+      A.equal(undone.type, 'bpmn:ServiceTask', '一次撤销即恢复 serviceTask')
+      A.equal(undone.nodeType, 'http', '一次撤销即恢复 nodeType=http（无中间态）')
+    })
+
+    await check('回归 #6：已有 HTTP 配置时 POST 改 GET 不抛错且写回 GET', async () => {
+      await remountEditor(page)
+      const ids = await createRegressionNodes(page)
+      await selectById(page, ids.http)
+      await page.waitForSelector('[data-group-id="group-fs-http"]', { timeout: 5000 })
+      await openGroup(page, 'fs-http')
+      await selectField(page, 'fs-http-method', 'POST')
+      const afterPost = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+        return fsNode && fsNode.http && fsNode.http.method
+      }, ids.http)
+      A.equal(afterPost, 'POST', '先设置 POST')
+      await selectField(page, 'fs-http-method', 'GET')
+      const afterGet = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+        return fsNode && fsNode.http && fsNode.http.method
+      }, ids.http)
+      A.equal(afterGet, 'GET', '再改 GET 后扩展值为 GET')
+      const referenceErrors = pageErrors.filter(text => /field is not defined/.test(text))
+      A.deepEqual(referenceErrors, [], '修改方法没有 ReferenceError')
+    })
+
+    await check('回归 #3：Prompt 弹窗未失焦时页面保存前 flush 提交新值', async () => {
+      await remountEditor(page)
+      const ids = await createRegressionNodes(page)
+      await selectById(page, ids.human)
+      await page.waitForSelector('[data-group-id="group-fs-prompt"]', { timeout: 5000 })
+      await openGroup(page, 'fs-prompt')
+      const entry = page.locator('[data-entry-id="fs-node-prompt"]')
+      await entry.locator('textarea').hover()
+      await page.waitForTimeout(100)
+      await entry.locator('.bio-properties-panel-open-feel-popup').click()
+      const popupEditor = page.locator('.bio-properties-panel-text-popup textarea')
+      await popupEditor.waitFor({ state: 'visible', timeout: 5000 })
+      const popupValue = '弹窗里未失焦的新提示词'
+      await popupEditor.fill(popupValue)
+      const popupState = await page.evaluate(() => {
+        const popup = document.querySelector('.bio-properties-panel-text-popup textarea')
+        return {
+          inContainer: !!(popup && window.__editor.getContainer().contains(popup)),
+          focused: document.activeElement === popup,
+        }
+      })
+      A.equal(popupState.inContainer, false, '弹窗挂在编辑器容器之外')
+      A.equal(popupState.focused, true, '输入后焦点仍在弹窗内')
+
+      // 真实页面的保存前路径：commitPendingProperties(editor) 先让画布 flush 属性输入。
+      const remoteEditor = {
+        getContainer: () => null,
+        flushProperties: () => page.evaluate(() => window.__editor.flushProperties()),
+      }
+      const flushed = await commitPendingProperties(remoteEditor)
+      A.ok(flushed.flushed && flushed.flushed.popupClosed, '保存前识别并关闭了属性弹窗')
+
+      const saved = await page.evaluate(async () => ({
+        xml: await window.__editor.saveXML(),
+        popupCount: document.querySelectorAll('.bio-properties-panel-text-popup').length,
+      }))
+      A.ok(saved.xml.includes(popupValue), '保存出的 XML 含弹窗里刚输入的新值')
+      A.equal(saved.popupCount, 0, '保存前弹窗已关闭')
+      const prompt = await page.evaluate(id => {
+        const element = window.__modeler.get('elementRegistry').get(id)
+        const fsNode = element.businessObject.extensionElements.values.find(value => value.$type === 'fs:Node')
+        return fsNode && fsNode.prompt
+      }, ids.human)
+      A.equal(prompt, popupValue, '模型里的 prompt 已更新')
     })
 
     await check('全程没有未捕获页面错误', async () => {

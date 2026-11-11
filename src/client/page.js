@@ -132,10 +132,21 @@ export function syncRuntimeMarkers(editor, markers) {
  *
  * @param {object} editor mountEditor() 控制器
  * @param {{waitMs?: number, delay?: (ms:number)=>Promise<any>}} [options]
+ * @returns {Promise<{waited: boolean, waitedMs: number, flushed: object|null}>}
  */
 export async function commitPendingProperties(editor, options = {}) {
+  // 官方弹出编辑器挂在 document.body，不在编辑器容器内：先让画布关闭弹窗并 flush
+  // 去抖输入，再做容器内焦点兜底。
+  let flushed = null
+  if (editor && typeof editor.flushProperties === 'function') {
+    try {
+      flushed = await editor.flushProperties()
+    } catch {
+      flushed = null
+    }
+  }
   const container = editor && typeof editor.getContainer === 'function' ? editor.getContainer() : null
-  if (!container) return { waited: false, waitedMs: 0 }
+  if (!container) return { waited: false, waitedMs: 0, flushed }
   let field = null
   try {
     field = container.querySelector(
@@ -144,7 +155,7 @@ export async function commitPendingProperties(editor, options = {}) {
   } catch {
     field = null
   }
-  if (!field) return { waited: false, waitedMs: 0 }
+  if (!field) return { waited: false, waitedMs: 0, flushed }
   const isContentEditable = field.isContentEditable === true
     || field.getAttribute?.('contenteditable') === 'true'
     || field.getAttribute?.('contenteditable') === ''
@@ -156,14 +167,14 @@ export async function commitPendingProperties(editor, options = {}) {
   if (!isContentEditable) {
     // blur 已同步提交；让 preact 的命令栈回调先跑完。
     await Promise.resolve()
-    return { waited: false, waitedMs: 0 }
+    return { waited: false, waitedMs: 0, flushed }
   }
   const waitMs = Number.isFinite(options.waitMs) ? Math.max(0, options.waitMs) : PROPERTY_COMMIT_WAIT_MS
   const delay = typeof options.delay === 'function'
     ? options.delay
     : ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms))
   await delay(waitMs)
-  return { waited: true, waitedMs: waitMs }
+  return { waited: true, waitedMs: waitMs, flushed }
 }
 
 /** `GET /instances` 信封 / 裸数组 → 实例数组（丢掉没有 id 的坏行）。 */

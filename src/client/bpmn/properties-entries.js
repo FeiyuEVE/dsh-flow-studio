@@ -132,25 +132,17 @@ function NodeTypeSelect(props) {
     const current = nodeKindOf(element)
     if (!value || value === current) return
 
-    if (value === 'human') {
-      if (!is(element, 'bpmn:ServiceTask')) return
-      const newShape = bpmnReplace.replaceElement(element, { type: 'bpmn:UserTask' }, {})
-      const fsNode = getFsNode(newShape)
-      if (fsNode) {
-        applyCommands(commandStack, [updateCommand(newShape, fsNode, { nodeType: undefined, http: undefined })])
-      }
+    const targetType = value === 'human' ? 'bpmn:UserTask' : 'bpmn:ServiceTask'
+    if (element.type !== targetType) {
+      // 目标类型与扩展修正由 behavior 的 replace 监听器在同一 shape.replace 命令内
+      // 完成；这里传 hint，避免替换完再执行第二条命令（一次撤销回不到切换前）。
+      const newShape = bpmnReplace.replaceElement(element, { type: targetType }, { fsNodeType: value })
       selection.select(newShape)
       return
     }
 
-    if (is(element, 'bpmn:UserTask')) {
-      const newShape = bpmnReplace.replaceElement(element, { type: 'bpmn:ServiceTask' }, {})
-      const ensured = ensureFsNodeCommands(newShape, moddle, value)
-      applyCommands(commandStack, ensured.commands)
-      selection.select(newShape)
-      return
-    }
-
+    // 已是该 BPMN 类型：只有 serviceTask 的 agent/http 语义需要一条扩展命令。
+    if (is(element, 'bpmn:UserTask')) return
     const ensured = ensureFsNodeCommands(element, moddle, value)
     applyCommands(commandStack, ensured.commands)
   }
@@ -666,7 +658,7 @@ function HttpMethodField(props) {
   const getValue = () => (http && http.method ? String(http.method) : '')
   const setValue = value => {
     const live = httpOf(element)
-    const liveValue = live ? live[field] : undefined
+    const liveValue = live ? live.method : undefined
     const candidate = value === undefined || value === null || value === '' ? undefined : String(value)
     if ((liveValue === undefined || liveValue === null ? undefined : String(liveValue)) === candidate) {
       return

@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.4）
+# 版本历史（0.1 → 0.13.5）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -497,20 +497,52 @@
 
 ## 0.13.4 — 0.13.3 审查修复
 
-这一版只修审查发现，不加功能。codex 对 0.13.3 的独立复审给出 1 BLOCKER + 9 MAJOR + 2 MINOR，逐项关闭。
+这一版只修审查发现，不加功能。codex 对 0.13.3 的独立复审给出 1 BLOCKER + 9 MAJOR + 2 MINOR；本版关闭 BLOCKER 与其中 7 条，剩余 #9 / #10 / #12 的残留问题在 [0.13.5](#0135--0134-复审修复) 修完。
 
 - **BLOCKER：画布变更没接到页面。** `BpmnCanvas` 从未收到 `mountOptions.onChange`，编辑器创建时捕获到的回调为空——打开已保存定义后改节点 / 属性 / 布局，页面仍认为已保存、不调草稿、运行也不被拦。现在按编辑器真实协议透传；编辑后出现「有未保存修改」、运行按钮禁用、600ms 去抖草稿落盘，保存期间继续编辑不会被保存响应误清 dirty。
-- **导入失败整模型回滚。** 无 BPMN DI 的合法 XML 会先在 `importXML` 内部替换 `_definitions`、再在绘制阶段报 `no diagram to display`；旧实现只恢复 XML 字符串，接着保存就把新流程写进旧定义。现在先用 moddle 预检 DI，失败则重建 Modeler 并从旧 XML 恢复模型、撤销栈、dirty 与运行态 marker。
+- **导入失败整模型回滚。** 无 BPMN DI 的合法 XML 会先在 `importXML` 内部替换 `_definitions`、再在绘制阶段报 `no diagram to display`；旧实现只恢复 XML 字符串，接着保存就把新流程写进旧定义。现在先用 moddle 预检 DI，失败则重建 Modeler 并从旧 XML 恢复模型、dirty 与运行态 marker（撤销栈会清空，这是有意的安全取舍；导入期间的销毁 / 重建失败边界由 0.13.5 补齐）。
 - **属性弹窗先 flush 再保存。** 官方弹出编辑器挂在 `document.body`，不在画布容器内，保存前只找容器内焦点会漏掉未提交输入；保存链先调 `editor.flushProperties()`（触发官方 `propertiesPanel.closePopup`，关闭时同步 flush 去抖输入），再序列化。
 - **类型切换一次撤销。** 属性面板改用单条 `shape.replace` 并把目标类型放进 `hints.fsNodeType`，扩展修正由 behavior 在同一条命令的 `postExecuted` 内完成；撤销一次同时回滚类型与扩展，不再留下中间态。
 - **替换菜单校验 nodeType。** 官方替换会复制扩展；现在校验 `fs:node` 的 `nodeType` 合法性，缺省 / 非法回落 `agent`，切成人工节点时清掉 serviceTask 专属字段。
 - **HTTP 方法修改不再抛错。** `HttpMethodField.setValue` 引用了未定义的 `field`，已有 HTTP 配置后再改方法直接 `ReferenceError`；改用 `live.method`。
-- **实例视图三处竞态。** 定义与实例共用选择世代，迟到的实例响应不再覆盖后选的定义；事件缓存与游标按 `instanceId` 隔离，请求失败不回退上一个实例的事件；进入终态停轮询前先追平 `detail.lastSeq`，不再漏掉最后的 `activity/end`、`process/end`。
+- **实例视图三处竞态。** 定义与实例共用选择世代，迟到的实例响应不再覆盖后选的定义；事件缓存与游标按 `instanceId` 隔离，请求失败不回退上一个实例的事件；进入终态停轮询前先追平 `detail.lastSeq`（成功路径不再漏掉最后的 `activity/end`、`process/end`；补拉失败与预留游标的边界由 0.13.5 修掉）。
 - **待办 409/404 原因保留。** 完成人工任务失败时先刷新待办、后写原因，刷新不再把服务端原因清掉。
-- **构建校验可信。** 新增 `lib/build-meta.json`：551 个输入文件 sha256 + 输入哈希 + 每个产物的 bytes/sha256；`verify-build` 对缺元数据、产物被替换、输入已变化一律失败。依赖泄漏检查改成内容特征 + VM 里真执行 factory，删改元数据绕不过去；另补 6 条反例（factory 返回 null、主包混入真实 chunk、单字节替换等）。
-- **测试盲区。** 新增 `test/client-page-wiring.test.mjs`（8 组 / 66 条断言，修复前 8 组全红）与 5 组真浏览器回归；`npm test` 48 个套件、1221 组全过，浏览器 29 组 / 206 条断言全过。
+- **构建校验可信。** 新增 `lib/build-meta.json`：551 个输入文件 sha256 + 输入哈希 + 每个产物的 bytes/sha256；`verify-build` 对缺元数据、产物被替换、输入已变化一律失败。依赖泄漏检查改成内容特征 + VM 里真执行 factory，常见的删改元数据已拦不住；另补 6 条反例（factory 返回 null、主包混入真实 chunk、单字节替换等）。这一版仍靠自报哈希，改输入 + 重算元数据、无特征依赖夹带、factory 提前 `process.exit(0)` 还能绕过——0.13.5 改成独立重建比对与受限沙箱后才封住。
+- **测试盲区。** 新增 `test/client-page-wiring.test.mjs`（8 组 / 66 条断言，修复前 8 组全红）与 5 组真浏览器回归；`npm test` 48 个套件、1221 组全过，浏览器 29 组 / 206 条断言全过。该测试当时自建画布桩、没有渲染真实 `BpmnCanvas` 壳，真实接线覆盖在 0.13.5 补上。
 
 **已知边界**
 - 新 BPMN 域目前只有 GUI 与 HTTP 入口，没有模型工具面（`flow_run_instance` 等）；对话里仍是旧 `flow_*` 工具，退役旧域前必须补（见 [0.14 计划](../plan/0.14-能力补齐与旧域退役.md) E3）。
 - 旧 `flows/`、`runs/` 运行域、旧客户端组件与 `legacyApi` 仍在仓库，页面已不调用；一次性退役排在 0.14.0。
 - HTTP connector 按新排期移到 0.13.5。
+
+## 0.13.5 — 0.13.4 复审修复
+
+codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR + 2 MINOR」。这一版逐条关闭，并把构建校验从「信任产物里的自报哈希」改成「按源码独立重建后逐字节比对」。
+
+**客户端（M1–M6、m1）**
+- **实例切换失败要回滚（M1）**：选择 B 但 `readInstance(B)` 失败时，事件归属 / 缓存 / 游标 / marker 整体回滚到 A，不再留下 `activeInstance=A / eventsOwner=B` 的错位；后续对 A 的轮询正常继续。
+- **终态补拉失败不停轮询（M2）**：「实例已终态」与「事件已追平」分开记录，补拉失败或游标不推进时按退避继续重试，只有真正追平才停；同时修掉「打开非终态实例就把 caughtUp 置真、转终态后停轮询」的竞态（M2b 回归）。
+- **预留游标不再当已读游标（M3）**：Host 会先写 `instance.lastSeq` 再追加事件，详情里的 lastSeq 可能超前；现在 `since` 与显示游标只取**实际返回事件**的最大 seq，预留值只作为追平目标，不再永久跳过事件。
+- **异步导入完成后按最新事件重算 marker（M4）**：导入返回时用当前实例归属的最新事件缓存重算，并在视图世代变化时丢弃，不再用调用时捕获的旧 marker 覆盖终态。
+- **导入期间销毁不再复活 Modeler（M5）**：生命周期世代 + `assertAlive` 覆盖所有 await 边界；销毁后禁止回滚重建，`onChange` 也检查 disposed。
+- **回滚重建失败进入显式不可用态（M6）**：页面显示恢复失败原因、保存明确报「画布不可用（恢复失败）」，再次导入必须真正重建实例，不再假成功。
+- **m1 测试盲区**：页面测试改为真实递归渲染组件树（`BpmnCanvas` 的 effect 真跑、`chunk.mountEditor/onReady` 真接线、卸载真调 `destroy`），删掉 `canvas.js` 的 `mountOptions` 透传会让 4 组变红。
+
+**构建校验（M7、M8）**
+- `verify-build` 主判据换成**独立重建 + 逐字节比较**：按当前源码在内存里用 esbuild 重建两个客户端包（官方 CSS/字体现场渲染注入，不读工作树里可能陈旧的生成物），与 `lib/` 逐字节比对；不一致直接失败并指出首个不同字节。
+- 输入清单补进 4 份官方 CSS 与 1 个 woff2 字体（共 556 项）；每个产物写入模块清单（`client.js` 17 个模块、`client.bpmn.js` 461 个），verify 用**重建的 metafile** 交叉核对并做模块级泄漏断言。
+- factory 执行移进受限 VM：沙箱内不存在 `process`，`require('process')` 直接抛「未授权的宿主模块」，并带 3s 超时；只有字节 / 元数据 / 模块检查全部通过才执行。
+- 新增 8 条反例：改官方 CSS、只重算 `inputsHash`、主包夹带真实 `bpmn-js` Modeling bundle、factory `require('process').exit(0)`、直接 `process.exit(0)`、死循环、`constructor('return process')` 逃逸、无 prepack。
+
+**agent 完结门（发布门槛缺口）**
+- 删除 `executeAgent()` 里 `adapter=custom` 与「无注册表 codex」的旧 `runExternalExecutor` 逃生门：agent 节点只能经注册 adapter + `flow_finish_node` 完结；custom / 缺注册表一律零派发 + 明确错误码（`BPMN_AGENT_ADAPTER_UNSUPPORTED` / `BPMN_AGENT_ADAPTER_UNAVAILABLE`）。
+
+**容器验收**
+- 新增 `scripts/e2e-bpmn.sh`：打包 → 装进 `dsh-testbed-bpmn` → 重启容器内 dsh（带一次性插件令牌）→ health / 画布 chunk 字节一致 / 定义 / 实例 / 人工任务 / 事件 / 鉴权 / 宿主隔离全链路断言，实测连续 3 次通过（详见 [测试台 cookbook](../cookbook/run-container-testbed.md)）。
+
+**测试**：`npm test` 48 个套件、1236 组全过；真浏览器 31 组 / 218 条断言全过（新增真实画布壳渲染与「导入期间销毁」用例）。
+
+**已知边界**
+- 终态补拉是「有界循环 + 退避的长期重试」：若 Host 预留 seq 永远不落盘，页面会持续显示明确错误并按退避重试，不会静默停住。
+- 主包仍含旧 React Flow（退役在 0.14.0），所以构建校验对主包只硬禁 BPMN 栈、对 chunk 硬禁 `@xyflow`。
+- m1 的页面测试用自建渲染器（真实组件函数 + effect 调度），不是 react-dom 的真实 reconciliation；真实浏览器覆盖在 `client-bpmn.browser.test.mjs`。

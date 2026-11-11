@@ -874,6 +874,12 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 **真实 CLI 通道尚未验收**：本机与容器都没有 `claude` CLI，适配器只用假 CLI 夹具验证了协议与失败语义（15 组 / 238 断言，另有 1 组明确 SKIP）。因此 `capabilities().evidence.realChannel` 如实标注未验证，不能在真实环境里默认当作 native。
 
+**勘误（0.14.5）· Claude 证据层次与用量口径**
+
+- 本条目原文把「probe 通过」与「真实通道可用」写得容易混淆。**证据分三层**：① **参数探测**（`claude --version` / `--help` 的版本与参数面）、② **桥自检**（`verifyFinishBridge()` 跑我们自己的 MCP stdio server 往返）、③ **真实 CLI 握手 + finish**（真实 `claude -p` 拉起本插件 server、模型真的调用 `flow_finish_node`）。本机只覆盖 ①②；`scripts/claude-smoke.mjs` 输出 `skipped:true` 只代表**没找到/没跑**，不是通过。CLI 发现改为共享的 `scripts/claude-cli-discovery.mjs`（`CLAUDE_BIN` 优先 → 搜 `PATH` 并校验可执行），PATH 里有可执行 `claude` 时 smoke 会「已尝试」并如实失败，不再误报 skipped。
+- 原文的「每条 assistant 事件 = 一次模型调用」「`result.usage` 只兜底一次」是 0.14.2 的实现，已过时：调用身份改由 `src/claude-usage-ledger.js` 按**稳定 `message.id`** 去重（并行工具块是同一个模型响应），`result.usage` 改成**范围级结算快照**（`agent/usage-snapshot`，scope=invocation / session-cumulative / unknown），不增加调用数、不把累计值相加。口径见 [12 · 实例指标](../design/12-instance-metrics.md) §2–§3。
+- 第 ③ 层仍未验证：真实 CLI 的 stream-json 版本差异、`--resume` 的用量范围、native Stop hook 的装载与时序、Windows 进程树回收都不在自动化覆盖内。
+
 **0.14.1 复审小修**
 
 - `node-check.js` 恢复诊断值的 **256 字符上限**（`timeoutMs` / `expectExitCode` 超长时错误消息不会膨胀到上万字符；实际执行的 `command` 不被截短），补差分断言。
@@ -887,7 +893,7 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 默认 `--permission-mode acceptEdits`（不默认 bypassPermissions），需要执行命令的节点要显式配 `permissionMode`。
 - 用户自己的 `~/.claude` settings / CLAUDE.md / hooks 仍会生效（只隔离了 MCP 配置）；用户 Stop hook 可能额外阻止停止，但不改变我们的单层提醒计数。
 - `messages` 能力为 unsupported；Windows 的进程树回收（`taskkill /T /F`）未在 Windows 实测。
-- Claude 的 `result.usage` 是会话累计值：有 assistant usage 时忽略它，只在整次执行没有任何 assistant usage 时兜底一次。
+- ~~Claude 的 `result.usage` 是会话累计值：有 assistant usage 时忽略它，只在整次执行没有任何 assistant usage 时兜底一次。~~ **（0.14.5 勘误）** 改为结算快照：`claude-usage-ledger.js` 按作用域归约（初始新 session 的 result 是 invocation 结算；resume 后范围不可证明则 unknown，不猜 sum / max）。
 
 ## 0.14.3 — 实例挂起 / 恢复（quiesce 式软挂起）
 

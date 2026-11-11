@@ -26,14 +26,21 @@ import assert from 'node:assert/strict'
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createClaudeAdapter, CLAUDE_ADAPTER_ID } from '../src/agent-adapter-claude.js'
-import { normalizeUsage } from '../src/agent-telemetry.js'
+import {
+  createClaudeAdapter, CLAUDE_ADAPTER_ID, CLAUDE_PROVIDER_ERROR_CODE,
+} from '../src/agent-adapter-claude.js'
+import {
+  normalizeUsage, readAdapterUsageCalls, readAdapterUsageSnapshots, usageEventForCall, usageSnapshotEventFor,
+} from '../src/agent-telemetry.js'
+import { computeInstanceMetrics } from '../src/instance-metrics.js'
 import { createFinishGate } from '../src/node-finish.js'
 import { ADAPTER_ERROR, assertFinishToolNative, validateAdapter } from '../src/agent-adapter.js'
 import { admitAdapter, runAgentNode } from '../src/agent-execute.js'
+import { discoverClaudeCli } from '../scripts/claude-cli-discovery.mjs'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
@@ -103,7 +110,12 @@ if (argv[0] === '--help') {
     process.stdout.write('Usage: claude [options] [prompt]\\n  -p, --print\\n  --output-format <format>\\n  --verbose\\n')
     process.exit(0)
   }
-  process.stdout.write([
+  const dropFlags = String(process.env.FAKE_CLAUDE_DROP_FLAG || '')
+    .split(',').map(item => item.trim()).filter(Boolean)
+  const allowedToolsLine = process.env.FAKE_CLAUDE_HELP_ALIAS === '1'
+    ? '  --allowed-tools <tools...>        Tools that execute without prompting'
+    : '  --allowedTools <tools...>         Tools that execute without prompting'
+  const helpLines = [
     'Usage: claude [options] [prompt]',
     '',
     '  -p, --print                       Print response and exit',
@@ -116,10 +128,11 @@ if (argv[0] === '--help') {
     '  --session-id <uuid>               Use a specific session ID',
     '  --permission-mode <mode>          default | acceptEdits | plan | auto | dontAsk | bypassPermissions',
     '  --permission-prompts <mode>       host | none',
-    '  --allowedTools <tools...>         Tools that execute without prompting',
+    allowedToolsLine,
     '  --model <model>                   Model for the session',
     '',
-  ].join('\\n'))
+  ].filter(line => !dropFlags.some(flag => line.includes(flag)))
+  process.stdout.write(helpLines.join('\\n'))
   process.exit(0)
 }
 
@@ -137,7 +150,7 @@ const sessionIdArg = takeValue('--session-id')
 const model = takeValue('--model')
 const permissionMode = takeValue('--permission-mode')
 const permissionPrompts = takeValue('--permission-prompts')
-const allowedTools = takeValue('--allowedTools')
+const allowedTools = takeValue('--allowedTools') || takeValue('--allowed-tools')
 const isResume = typeof resumeId === 'string' && resumeId !== ''
 const sessionId = isResume ? resumeId : (sessionIdArg || fallbackSessionId)
 
@@ -186,7 +199,7 @@ writeFileSync(join(stateDir, 'invocations', process.pid + '.json'), JSON.stringi
 
 out({ type: 'system', subtype: 'init', session_id: sessionId })
 
-const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn'
+const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn' || mode === 'early-error'
 let transport = null
 let client = null
 if (!skipMcp && mcpConfig) {
@@ -200,13 +213,13 @@ if (!skipMcp && mcpConfig) {
   if (transport.pid) writeFileSync(join(stateDir, 'mcp.pid'), String(transport.pid))
 }
 
-function assistantEvent(usage, text) {
+function assistantEvent(usage, text, id) {
   out({
     type: 'assistant',
     session_id: sessionId,
     parent_tool_use_id: null,
     message: {
-      id: 'msg_' + Date.now() + '_' + Math.random().toString(16).slice(2),
+      id: id || ('msg_' + Date.now() + '_' + Math.random().toString(16).slice(2)),
       type: 'message',
       role: 'assistant',
       model: 'claude-sonnet-4-5',
@@ -232,8 +245,10 @@ function resultEvent(usage, text) {
 
 const usageA = { input_tokens: 10, cache_creation_input_tokens: 5, cache_read_input_tokens: 20, output_tokens: 30 }
 const usageB = { input_tokens: 7, cache_creation_input_tokens: 0, cache_read_input_tokens: 11, output_tokens: 13 }
-const usageCumulative = {
-  input_tokens: 999, cache_creation_input_tokens: 999, cache_read_input_tokens: 999, output_tokens: 999,
+// 真实夹具：result.usage 是**最终结算值**（不是 999 哨兵）。0.14.5 M2 起它就是
+// agent/usage-snapshot（scope=invocation），不能再用「999 被忽略」掩盖契约。
+const usageResultFinal = {
+  input_tokens: 17, cache_creation_input_tokens: 5, cache_read_input_tokens: 31, output_tokens: 43,
 }
 
 async function callTool(summary) {
@@ -342,7 +357,7 @@ if (mode === 'doc') {
     },
   })
   assistantEvent(usageB, '已调用工具。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -362,7 +377,7 @@ if (mode === 'doc-escape') {
     code: toolErrorCode(result),
   }))
   assistantEvent(usageA, '越界引用被拒。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -370,13 +385,13 @@ if (mode === 'call') {
   assistantEvent(usageA, '我先调用 flow_finish_node。')
   await callTool()
   assistantEvent(usageB, '已完成。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
 if (mode === 'never') {
   assistantEvent(usageA, '我完成了，不需要调用工具。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -387,7 +402,7 @@ if (mode === 'call-on-resume') {
   } else {
     assistantEvent(usageA, '我完成了。')
   }
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -402,7 +417,7 @@ if (mode === 'dup') {
     secondCode: toolErrorCode(second),
   }))
   assistantEvent(usageB, '已完成。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -411,7 +426,7 @@ if (mode === 'foreign-token') {
   mkdirSync(stateDir, { recursive: true })
   writeFileSync(join(stateDir, 'foreign.json'), JSON.stringify(response))
   assistantEvent(usageA, '跨 execution 凭据被拒。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -422,7 +437,7 @@ if (mode === 'hook-once') {
     await callTool('hook 提醒后完成')
     await runStopHook(true)
   }
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
@@ -432,14 +447,14 @@ if (mode === 'hook-never') {
     if (!hook.block) break
   }
   assistantEvent(usageA, '我完成了。')
-  resultEvent(usageCumulative, '完成')
+  resultEvent(usageResultFinal, '完成')
   await closeClient()
   process.exit(0)
 }
 if (mode === 'leak') {
   assistantEvent(usageA, 'token=' + token + ' socket=' + socketPath)
   await callTool('泄漏测试')
-  resultEvent(usageCumulative, 'token=' + token + ' socket=' + socketPath)
+  resultEvent(usageResultFinal, 'token=' + token + ' socket=' + socketPath)
   await closeClient()
   process.exit(0)
 }
@@ -462,6 +477,178 @@ if (mode === 'no-mcp-stubborn') {
   writeFileSync(join(stateDir, 'stubborn.pid'), String(process.pid))
   setInterval(() => {}, 1000)
   await new Promise(() => {})
+}
+if (mode === 'dup-id') {
+  // M1：同一 message.id 的两次上报是同一个模型响应（并行工具块），不能计两次调用。
+  assistantEvent(
+    { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 20, output_tokens: 1 },
+    '同一 message（并行工具块）', 'msg_shared',
+  )
+  assistantEvent(
+    { input_tokens: 10, cache_creation_input_tokens: 5, cache_read_input_tokens: 20, output_tokens: 9 },
+    '同一 message 的第二次上报', 'msg_shared',
+  )
+  assistantEvent(usageB, '另一个 message', 'msg_other')
+  await callTool('dup-id')
+  resultEvent({ input_tokens: 20, cache_creation_input_tokens: 5, cache_read_input_tokens: 31, output_tokens: 43 }, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'placeholder') {
+  // M2：assistant 的 output 只是占位值，最终值在 result 里。
+  const zero = { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  assistantEvent({ input_tokens: 10, output_tokens: 1, ...zero }, '先占位', 'msg_ph')
+  await callTool('placeholder')
+  resultEvent({ input_tokens: 10, output_tokens: 30, ...zero }, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'result-only') {
+  // M2：没有任何 assistant usage，只有 result；resume 后的 result 范围不可证明。
+  const zero = { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  resultEvent(isResume
+    ? { input_tokens: 30, output_tokens: 3, ...zero }
+    : { input_tokens: 10, output_tokens: 1, ...zero }, '完成')
+  if (isResume) await callTool('result-only')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'unicode') {
+  // M3：中文字符被切成两个 chunk（按字节切在字符中间）。
+  const payload = Buffer.from(JSON.stringify({
+    type: 'assistant',
+    session_id: sessionId,
+    message: {
+      id: 'msg_unicode',
+      usage: usageA,
+      content: [ { type: 'text', text: '中文 🚀 结束' } ],
+    },
+  }) + '\\n')
+  const cut = payload.indexOf(Buffer.from('中')) + 1
+  process.stdout.write(payload.subarray(0, cut))
+  await new Promise(resolve => setTimeout(resolve, 60))
+  process.stdout.write(payload.subarray(cut))
+  await callTool('unicode')
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'unterminated') {
+  // M3：合法 JSON 没有尾换行 → EOF flush 必须交付。
+  process.stdout.write(JSON.stringify({
+    type: 'assistant',
+    session_id: sessionId,
+    message: { id: 'msg_eof', usage: usageA, content: [ { type: 'text', text: '没有尾换行' } ] },
+  }))
+  await callTool('unterminated')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'long') {
+  // M3：600 KiB 合法单行，按 32 KiB 分块写。
+  const line = JSON.stringify({
+    type: 'assistant',
+    session_id: sessionId,
+    message: { id: 'msg_long', usage: usageA, content: [ { type: 'text', text: 'x'.repeat(600 * 1024) } ] },
+  }) + '\\n'
+  for (let index = 0; index < line.length; index += 32768) {
+    process.stdout.write(line.slice(index, index + 32768))
+    await new Promise(resolve => setTimeout(resolve, 2))
+  }
+  await callTool('long')
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'format') {
+  // M3：BOM + CRLF + 非 JSON 行 + 空行，后面的合法行不能丢。
+  process.stdout.write('\\uFEFF\\r\\nnot json\\r\\n\\r\\n')
+  assistantEvent(usageA, 'BOM 之后的有效行', 'msg_fmt')
+  await callTool('format')
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'resume-half') {
+  // M3：初始进程留下半行就退出；resume 进程绝不能把它的半行拼成合法 JSON。
+  if (!isResume) {
+    process.stdout.write('{"type":"assistant","session_id":"' + sessionId + '","message":{"id":"joined","usage":{"input_tokens":10,')
+    await closeClient()
+    process.exit(0)
+  }
+  process.stdout.write('"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4}}}\\n')
+  assistantEvent(usageB, 'resume 自己的事件', 'msg_resume')
+  await callTool('resume-half')
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'late-output') {
+  // M3：父进程先退出，后代继承 stdout 并在之后写出合法事件；结算必须等排空。
+  const lateLine = JSON.stringify({
+    type: 'assistant',
+    session_id: sessionId,
+    message: { id: 'msg_late', usage: usageA, content: [ { type: 'text', text: 'late output' } ] },
+  }) + '\\n'
+  spawn(process.execPath, ['-e', 'setTimeout(() => process.stdout.write(' + JSON.stringify(lateLine) + '), 150)'], {
+    stdio: ['ignore', 'inherit', 'ignore'],
+  })
+  await callTool('late-output')
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'zero-grace') {
+  // M5：完成后忽略 SIGTERM；适配器必须升级到 SIGKILL 才能有界结算。
+  process.on('SIGTERM', () => {})
+  await callTool('zero-grace')
+  await hangForever()
+}
+if (mode === 'cancel-tree') {
+  // m1：组长会响应 TERM 退出；后代忽略 TERM，只有升级到 KILL 才能收掉。
+  const descendant = spawn(process.execPath, [
+    '-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+  ], { stdio: 'ignore' })
+  writeFileSync(join(stateDir, 'descendant.pid'), String(descendant.pid))
+  writeFileSync(join(stateDir, 'ready'), 'yes')
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+if (mode === 'error') {
+  // M6：握手成功后 CLI 自己报终态错误（认证失败 + result error + 退出码 1）。
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'authentication_failed',
+    message: { id: 'msg_err', content: [ { type: 'text', text: 'invalid API credential' } ] },
+  })
+  out({
+    type: 'result',
+    subtype: 'error_during_execution',
+    session_id: sessionId,
+    is_error: true,
+    errors: ['authentication_failed'],
+    result: 'API Error: 401 invalid credential',
+  })
+  await closeClient()
+  process.exit(1)
+}
+if (mode === 'early-error') {
+  // M6：握手之前就退出（没有拉起 MCP）——start 必须报 TOOL_UNAVAILABLE，而不是 ABORTED。
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'authentication_failed',
+    message: { id: 'msg_err', content: [ { type: 'text', text: 'invalid API credential' } ] },
+  })
+  out({
+    type: 'result',
+    subtype: 'error_during_execution',
+    session_id: sessionId,
+    is_error: true,
+    errors: ['authentication_failed'],
+    result: 'API Error: 401 invalid credential',
+  })
+  process.exit(1)
 }
 await closeClient()
 process.exit(0)
@@ -600,6 +787,70 @@ function elementWithPrompt(overrides = {}) {
   }
 }
 
+/** 按 fake mode 跑一次完整活动（resetState 后启动，默认等到 exited）。 */
+async function runClaudeMode(mode, options = {}) {
+  resetState()
+  const workspace = freshWorkspace(`mode-${mode}-${Math.random().toString(16).slice(2, 8)}`)
+  const adapter = makeAdapter({
+    env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: mode },
+    ...(options.overrides || {}),
+  })
+  const gate = makeGate(workspace)
+  const handle = await adapter.start({
+    element: options.element || { id: 'agent-1', name: `${mode} 节点` },
+    ctx: {},
+    finishGate: gate,
+    workspaceRoot: workspace,
+    reminder: { onFire: () => {} },
+  })
+  const exited = options.awaitExit === false ? null : await handle.exited
+  return { adapter, workspace, gate, handle, exited }
+}
+
+/**
+ * handle 的调用 / 快照事实 → 真实归约链（agent-execute 就是这么落盘的），
+ * 用来断言「适配器接线 + 指标口径」一起正确。
+ */
+function metricsForHandle(handle, invocationId = 'inv-adapter') {
+  const at = '2026-11-12T00:00:00.000Z'
+  const events = []
+  let seq = 0
+  for (const call of readAdapterUsageCalls(handle, 'claude')) {
+    events.push({
+      seq: ++seq, at, ...usageEventForCall({ ...call, invocationId: call.invocationId ?? invocationId }),
+    })
+  }
+  for (const snapshot of readAdapterUsageSnapshots(handle, 'claude')) {
+    events.push({
+      seq: ++seq, at, ...usageSnapshotEventFor({ ...snapshot, invocationId: snapshot.invocationId ?? invocationId }),
+    })
+  }
+  return computeInstanceMetrics({
+    instance: {
+      id: 'i-claude-adapter',
+      definitionId: 'flow-claude',
+      definitionVersion: 1,
+      definitionHash: 'a'.repeat(64),
+      status: 'ACTIVE',
+      variables: {},
+      result: null,
+      artifacts: [],
+      lastError: null,
+      lastAgentOutput: null,
+      pendingTasks: [],
+      revision: 1,
+      eventCount: events.length,
+      lastSeq: events.length,
+      createdAt: at,
+      updatedAt: at,
+      completedAt: null,
+      definitionSnapshot: 'definition.bpmn',
+    },
+    events,
+    asOf: at,
+  })
+}
+
 async function main() {
   console.log('agent-adapter-claude：假 claude + 真 MCP 通道 + 真进程组')
   try {
@@ -735,7 +986,10 @@ async function main() {
           workspaceRoot: workspace,
         }),
         error => {
-          A.equal(error?.code, ADAPTER_ERROR.PROBE_INVALID, '直接 start 保留真实 probe 错误码')
+          // m5：start 统一 NODE_FINISH_TOOL_UNAVAILABLE，原 probe 错误码放 details.cause。
+          A.equal(error?.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE, 'start 统一不可用错误码')
+          A.equal(error?.details?.cause, ADAPTER_ERROR.PROBE_INVALID, '原 probe 错误码保留在 cause')
+          A.equal(error?.details?.causeReason, 'cli-unavailable')
           return true
         },
       )
@@ -792,27 +1046,30 @@ async function main() {
       A.equal(invocation.mcpConfig.mcpServers.flow_finish.command, process.execPath)
       A.ok(invocation.mcpConfig.mcpServers.flow_finish.args[0].endsWith('node-finish-mcp.js'))
 
-      // usage：两条 assistant 事件 = 两次调用 = 两个 callId；result 的累计值不双计。
+      // usage：两条**不同 message.id** 的 assistant 事件 = 两次调用 = 两个 callId。
       const calls = handle.usageCalls()
-      A.equal(calls.length, 2, '一个调用一条 callId')
+      A.equal(calls.length, 2, '一个模型调用一条 callId')
       A.equal(new Set(calls.map(call => call.callId)).size, 2, 'callId 唯一')
       A.equal(calls[0].provider, 'claude')
       A.equal(calls[0].source, 'assistant')
+      A.match(calls[0].callId, /^claude-message-v1:[0-9a-f]{64}$/, 'callId 是稳定 message 身份（账本契约）')
       A.deepEqual(calls[0].usage, {
-        input_tokens: 10,
-        cache_creation_input_tokens: 5,
-        cache_read_input_tokens: 20,
-        output_tokens: 30,
-        cache_write_input_tokens: 5,
-      }, '保留 provider 原始字段，并补四桶别名')
+        input: 10, cacheRead: 20, cacheWrite: 5, output: 30, total: 65, canonical: 1,
+      }, 'Anthropic 四桶互斥：cache_creation 必须进 cacheWrite，不能丢')
       A.deepEqual(calls[1].usage, {
-        input_tokens: 7,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 11,
-        output_tokens: 13,
-        cache_write_input_tokens: 0,
+        input: 7, cacheRead: 11, cacheWrite: 0, output: 13, total: 31, canonical: 1,
       })
-      A.ok(!calls.some(call => call.usage.input_tokens === 999), 'result.usage 累计值不能重复记账')
+      A.equal(calls[0].provisional, true, 'assistant output 是未结算的占位观测')
+      // result.usage 是**范围级结算快照**：不增加调用数、不进 usageCalls。
+      const snapshots = handle.usageSnapshots()
+      A.equal(snapshots.length, 1, '一次 result 一条结算快照')
+      A.equal(snapshots[0].provider, 'claude')
+      A.equal(snapshots[0].scope, 'invocation', '初始全新 session（显式 --session-id、非 resume）按文档契约采用 result')
+      A.deepEqual(snapshots[0].usage, {
+        input: 17, cacheRead: 31, cacheWrite: 5, output: 43, total: 96, canonical: 1,
+      })
+      A.equal(snapshots[0].provenance.realCliVerified, false, '快照如实标注真实 CLI 未验证')
+      A.ok(!calls.some(call => call.usage && call.usage.output === 43), 'result 不能变成第三次调用')
       // 交给 agent-telemetry 后必须四桶互斥且不漏计缓存写入。
       const normalized = normalizeUsage(calls[0].usage, { provider: 'claude' })
       A.equal(normalized.trust, 'known')
@@ -1300,16 +1557,433 @@ async function main() {
       A.equal(invocations().length, 0, 'probe 失败 → 零派发')
     })
 
+    await check('M3 解码与分帧：UTF-8 跨块 / EOF 无尾换行 / 600 KiB 单行 / BOM+CRLF+坏行 都不丢事件', async () => {
+      // (a) UTF-8 多字节字符跨 chunk：基线解码成 U+FFFD。
+      {
+        const { adapter, handle, exited } = await runClaudeMode('unicode')
+        A.equal(exited.ok, true, JSON.stringify(exited))
+        const assistantEvents = handle.events.filter(event => event.type === 'assistant')
+        A.equal(assistantEvents.length, 1, '跨块的合法事件必须完整交付')
+        A.equal(assistantEvents[0].message.content[0].text, '中文 🚀 结束', '基线：跨块解码出 U+FFFD 乱码')
+        A.equal(JSON.stringify(handle.events).includes('\uFFFD'), false, '不得出现替换字符')
+        A.equal(handle.usageCalls().length, 1)
+        await adapter.dispose(handle)
+        A.deepEqual(leftoverDirs(), [])
+      }
+      // (b) 合法 JSON 没有尾换行：EOF flush。
+      {
+        const { adapter, handle, exited } = await runClaudeMode('unterminated')
+        A.equal(exited.ok, true, JSON.stringify(exited))
+        A.equal(handle.usageCalls().length, 1, '没有尾换行的合法 JSON 不能丢（基线：0）')
+        A.equal(handle.diagnostics.protocolErrors, 0)
+        await adapter.dispose(handle)
+      }
+      // (c) 600 KiB 合法单行（按 32 KiB 分块写）：基线被裁成半截 JSON。
+      {
+        const { adapter, handle, exited } = await runClaudeMode('long')
+        A.equal(exited.ok, true, JSON.stringify(exited))
+        A.equal(handle.usageCalls().length, 1, '600 KiB 合法单行必须原样解析（基线：0）')
+        A.equal(handle.diagnostics.droppedLines, 0)
+        A.equal(handle.diagnostics.outputIncomplete, false)
+        await adapter.dispose(handle)
+      }
+      // (d) BOM / CRLF / 非 JSON 行 / 空行。
+      {
+        const { adapter, handle, exited } = await runClaudeMode('format')
+        A.equal(exited.ok, true, JSON.stringify(exited))
+        A.equal(handle.usageCalls().length, 1, '坏行之后的有效行继续处理')
+        A.equal(handle.diagnostics.protocolErrors, 1, '非 JSON 行必须可诊断（不是静默 continue）')
+        await adapter.dispose(handle)
+      }
+    })
+
+    await check('M3 每个进程独立半行缓冲：初始进程的残行不能拼到 resume 上', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('resume-half', {
+        overrides: { reminderLimit: 1 },
+      })
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const calls = handle.usageCalls()
+      A.equal(calls.length, 1, '只有 resume 自己的 message 是一条调用（基线：初始残行被拼成第 2 条）')
+      A.equal(calls[0].usage.output, 13, 'resume 事件的用量（被拼出来的那条是 output=4）')
+      A.ok(handle.diagnostics.protocolErrors >= 1, '两侧残行都必须记协议错误')
+      A.equal(invocations().length, 2)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M3 结算等 stdout 排空：父进程退出后后代写出的合法事件仍计入', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('late-output')
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(handle.usageCalls().length, 1, '结算前必须等 stdout 排空（基线：exit 即结算 → 0）')
+      A.equal(handle.diagnostics.outputDrained, true)
+      A.equal(handle.diagnostics.outputIncomplete, false)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M4 同步 spawn 异常（E2BIG）：TOOL_UNAVAILABLE + cleanup，目录/channel/listener 不残留', async () => {
+      resetState()
+      const workspace = freshWorkspace('e2big')
+      const adapter = makeAdapter({ env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call' } })
+      const before = leftoverDirs()
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          // 约 200 KB 单参数：Linux MAX_ARG_STRLEN=128 KiB → spawn 同步 E2BIG。
+          element: { id: 'agent-1', name: '超长提示词节点', node: { prompt: 'x'.repeat(200_000) } },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, '参数超限必须失败而不是只留下资源')
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.equal(failure.details.reason, 'spawn-failed')
+      A.equal(failure.details.cause, 'E2BIG')
+      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir / socket（基线：目录仍在）')
+      A.ok(failure.cleanup && typeof failure.cleanup === 'object')
+      A.equal(failure.cleanup.disposed, true, 'cleanup 必须如实报告已释放')
+      A.equal((await failure.cleanupFinal).disposed, true)
+      A.equal(gate.settled(), true, '启动失败必须 abort gate')
+      A.equal(invocations().length, 0, '同步 spawn 失败 → 零派发')
+    })
+
+    await check('M5 零宽限：grace=0 只跳过等待，TERM→KILL 仍执行并完成结算', async () => {
+      resetState()
+      const workspace = freshWorkspace('zero-grace')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'zero-grace' },
+        postFinishGraceMs: 0,
+        killTimeoutMs: 50,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '零宽限节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const pid = handle.pid
+      await gate.result
+      const settled = await Promise.race([handle.exited.then(() => true), sleep(3_000).then(() => false)])
+      A.equal(settled, true, '零宽限 + 忽略 TERM 的进程也必须被 KILL 后有界结算（基线：永不完成）')
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(await waitForDead(pid), true, '整组已被 SIGKILL 收掉')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('m1 并发 cancel：组长先退、忽略 TERM 的后代也必须被升级清理', async () => {
+      resetState()
+      const workspace = freshWorkspace('cancel-tree')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'cancel-tree' },
+        killTimeoutMs: 200,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '进程树节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      A.equal(await waitForFile(join(stateDir, 'descendant.pid')), true, '后代进程已拉起')
+      const leaderPid = handle.pid
+      const descendantPid = Number(readFileSync(join(stateDir, 'descendant.pid'), 'utf8'))
+      A.equal(pidAlive(leaderPid), true)
+      A.equal(pidAlive(descendantPid), true)
+      await Promise.all([adapter.cancel(handle, 'first'), adapter.cancel(handle, 'second')])
+      A.equal(await waitForDead(leaderPid), true, '组长已退出')
+      A.equal(await waitForDead(descendantPid), true, '忽略 TERM 的后代必须被 KILL（基线：仍存活）')
+      A.equal(handle.cleanup.disposed, true, '整组确认消失后才报告 disposed')
+      const exited = await handle.exited
+      A.equal(exited.code, 'NODE_FINISH_CANCELED')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M6 握手后 CLI 终态错误：稳定 provider 码、0 提醒、原因透传 runner', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('error')
+      A.equal(exited.ok, false)
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE, '握手后终态错误必须是稳定 provider 错误码（基线：NODE_FINISH_MISSING）')
+      A.equal(exited.reminders, 0, '终态错误不消耗提醒预算（基线：提醒 3 次）')
+      A.match(exited.message, /authentication_failed/, '真实原因不能丢')
+      A.match(exited.message, /error_during_execution/)
+      A.match(String(handle.lastMessage), /401 invalid credential/)
+      A.equal(invocations().length, 1, '终态错误之后不再起 resume 进程')
+      A.deepEqual(
+        { protocolErrors: handle.diagnostics.protocolErrors, outputIncomplete: handle.diagnostics.outputIncomplete },
+        { protocolErrors: 0, outputIncomplete: false },
+      )
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+
+      // 经 runner：错误码与原因透传，reminders=0，实例状态不新增 failed（runtime 写 lastError）。
+      resetState()
+      const runnerWorkspace = freshWorkspace('provider-error-runner')
+      const runnerAdapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'error' },
+      })
+      let failure = null
+      try {
+        await runAgentNode({
+          element: { id: 'agent-1', name: '认证失败节点' },
+          ctx: {},
+          adapter: runnerAdapter,
+          workspaceRoot: runnerWorkspace,
+          log: () => {},
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'runner 必须失败')
+      A.equal(failure.code, CLAUDE_PROVIDER_ERROR_CODE, '错误码透传到 agent-execute')
+      A.match(failure.message, /authentication_failed/, 'runner 侧仍能看到脱敏后的真实原因')
+      A.equal(failure.reminders, 0, '不得消耗提醒预算')
+      A.equal(invocations().length, 1, 'runner 也不再续跑')
+    })
+
+    await check('M6 握手前退出（提醒预算 0）：TOOL_UNAVAILABLE 带原原因，不是 ABORTED', async () => {
+      resetState()
+      const workspace = freshWorkspace('early-error')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'early-error' },
+        reminderLimit: 0,
+        helloTimeoutMs: 5_000,
+      })
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          element: { id: 'agent-1', name: '握手前退出节点' },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+          reminder: { onFire: () => {} },
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'start 必须失败')
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        '握手前失败 → TOOL_UNAVAILABLE（基线：旧代码先 abort gate，最终报 NODE_FINISH_ABORTED）')
+      A.equal(failure.details.reason, 'exited-before-handshake')
+      A.equal(failure.details.cause, 'EXIT_1')
+      A.equal(failure.details.cliError?.code, 'authentication_failed', '原原因（脱敏后）必须保留')
+      A.match(failure.message, /握手前退出/)
+      A.equal(failure.cleanup.disposed, true)
+      A.equal((await failure.cleanupFinal).disposed, true)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('m4 参数要求表：逐个删必需 flag → probe 拒绝、start 零派发；argv 用探测到的别名', async () => {
+      for (const flag of ['--verbose', '--strict-mcp-config', '--permission-mode', '--allowedTools', '--mcp-config', '--resume']) {
+        const adapter = createClaudeAdapter({
+          claudeBin: fakeBin,
+          tmpRoot: sandbox,
+          selfTest: false,
+          env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_DROP_FLAG: flag },
+        })
+        await A.rejects(adapter.probe(), error => {
+          A.equal(error?.code, ADAPTER_ERROR.PROBE_INVALID, `${flag} 缺失 → probe 拒绝`)
+          A.equal(error?.details?.reason, 'cli-flags-missing')
+          A.ok(Array.isArray(error?.details?.missing) && error.details.missing.length >= 1)
+          return true
+        })
+        A.equal(adapter.capabilities().finishTool, 'unsupported', `${flag} 缺失不能声明 native`)
+      }
+
+      // start：注入的 probeResult 缺 flag → TOOL_UNAVAILABLE 且零派发、零资源。
+      resetState()
+      const workspace = freshWorkspace('flags-missing')
+      const before = leftoverDirs()
+      const missing = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        probeResult: { ...FAKE_PROBE, flags: { ...FAKE_FLAGS, verbose: false } },
+      })
+      A.equal(missing.capabilities().finishTool, 'unsupported', '缺 --verbose 不再声明 native')
+      A.match(missing.capabilities().evidence.parameters, /--verbose/, '参数证据必须指出缺了什么')
+      let failure = null
+      try {
+        await missing.start({
+          element: { id: 'agent-1' },
+          ctx: {},
+          finishGate: makeGate(workspace),
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.equal(failure?.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.equal(failure?.details?.reason, 'cli-flags-missing')
+      A.deepEqual(failure?.details?.missing, ['verbose'])
+      A.equal(invocations().length, 0, '缺参数 → 零派发')
+      A.deepEqual(leftoverDirs(), before, '零派发不建 runDir')
+
+      // 别名：help 只给 --allowed-tools 时 argv 必须用该别名，其余必需参数照常拼上。
+      resetState()
+      const aliasWorkspace = freshWorkspace('flags-alias')
+      const aliasAdapter = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call', FAKE_CLAUDE_HELP_ALIAS: '1' },
+      })
+      const aliasProbe = await aliasAdapter.probe()
+      A.equal(aliasProbe.allowedToolsFlag, '--allowed-tools', 'probe 记录实际识别到的别名')
+      const aliasGate = makeGate(aliasWorkspace)
+      const aliasHandle = await aliasAdapter.start({
+        element: elementWithPrompt({ id: 'agent-1' }),
+        ctx: {},
+        finishGate: aliasGate,
+        workspaceRoot: aliasWorkspace,
+      })
+      const aliasExited = await aliasHandle.exited
+      A.equal(aliasExited.ok, true, JSON.stringify(aliasExited))
+      const [aliasInvocation] = invocations()
+      A.ok(aliasInvocation.argv.includes('--allowed-tools'), 'argv 使用探测到的别名（基线：拼 --allowedTools）')
+      A.equal(aliasInvocation.allowedTools, 'mcp__flow_finish__flow_finish_node')
+      A.ok(aliasInvocation.argv.includes('--verbose'))
+      A.ok(aliasInvocation.argv.includes('--strict-mcp-config'))
+      A.ok(aliasInvocation.argv.includes('--permission-mode'))
+      await aliasAdapter.dispose(aliasHandle)
+    })
+
+    await check('M1/M2 接线：同 message.id 去重；result 是结算快照；指标链 assistant(10/1)+result(10/30)=40', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('placeholder')
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const calls = handle.usageCalls()
+      A.equal(calls.length, 1, '一条 message 一条调用')
+      A.equal(calls[0].usage.output, 1, 'assistant output 是未结算的占位观测')
+      const snapshots = handle.usageSnapshots()
+      A.equal(snapshots.length, 1, 'result 是结算快照，不是第二次调用')
+      A.equal(snapshots[0].scope, 'invocation')
+      A.equal(snapshots[0].usage.output, 30)
+      const metrics = metricsForHandle(handle)
+      A.equal(metrics.agent.modelCalls, 1, 'result 不增加模型调用数')
+      A.deepEqual(
+        {
+          input: metrics.agent.observedTokens.input,
+          cacheRead: metrics.agent.observedTokens.cacheRead,
+          cacheWrite: metrics.agent.observedTokens.cacheWrite,
+          output: metrics.agent.observedTokens.output,
+          total: metrics.agent.observedTokens.total,
+        },
+        { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 },
+        '结算快照覆盖占位 output（基线：沿用 1，总量 11）',
+      )
+      A.deepEqual(metrics.agent.usageCoverage, { known: 1, partial: 0, unknown: 0 })
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M1 接线：同一 message.id 的并行工具块在适配器侧也只计一次', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('dup-id')
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const calls = handle.usageCalls()
+      A.equal(calls.length, 2, '两个 message.id = 两次模型响应（基线：3 条，同 ID 被重复计数）')
+      const shared = calls.find(call => call.usage.output === 9)
+      A.ok(shared, '同一 message 的第二次上报覆盖第一次（output 1 → 9，不是相加）')
+      A.equal(shared.usage.cacheWrite, 5, '第二次上报的桶替换旧值')
+      await adapter.dispose(handle)
+    })
+
+    await check('M2 result-only 两轮：invocation 与 unknown 两种快照作用域（不猜 sum/max）', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('result-only', {
+        overrides: { reminderLimit: 1 },
+      })
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.deepEqual(handle.usageCalls(), [], '没有 assistant usage 就没有调用记录')
+      const snapshots = handle.usageSnapshots()
+      A.equal(snapshots.length, 2, '两轮 result 各一份快照')
+      A.deepEqual(snapshots.map(snapshot => snapshot.scope).sort(), ['invocation', 'unknown'],
+        '初始 invocation 可结算；resume 后范围不可证明 → unknown（resumed 必须如实传）')
+      const metrics = metricsForHandle(handle)
+      A.equal(metrics.agent.modelCalls, null, '没有调用身份就不伪造确定调用数（不是 0）')
+      A.equal(metrics.agent.snapshots.unknown, 1)
+      A.equal(metrics.agent.observedTokens.total, null, 'unknown 范围不能给出确定总量')
+      A.equal(metrics.agent.observedTokens.partial, true)
+      await adapter.dispose(handle)
+    })
+
+    await check('m6 CLI 发现：CLAUDE_BIN 优先、PATH 搜索并校验可执行；smoke 不把 PATH-only 当 skipped', async () => {
+      const binDir = join(sandbox, 'bin-path')
+      mkdirSync(binDir, { recursive: true })
+      const pathClaude = join(binDir, 'claude')
+      writeFileSync(pathClaude, '#!/bin/sh\necho "fake claude: broken build" 1>&2\nexit 1\n', { mode: 0o755 })
+      chmodSync(pathClaude, 0o755)
+      A.equal(discoverClaudeCli({ env: { PATH: binDir } }).found, true)
+      const viaPath = discoverClaudeCli({ env: { PATH: binDir } })
+      A.equal(viaPath.bin, pathClaude, 'PATH 里的可执行 claude 必须被发现（基线：只查固定路径）')
+      A.equal(viaPath.source, 'PATH')
+      const viaExplicit = discoverClaudeCli({ env: { CLAUDE_BIN: pathClaude, PATH: '' } })
+      A.equal(viaExplicit.found, true, 'CLAUDE_BIN 优先')
+      A.equal(viaExplicit.source, 'CLAUDE_BIN')
+
+      const brokenExplicit = discoverClaudeCli({
+        env: { CLAUDE_BIN: join(sandbox, 'no-such-claude'), PATH: binDir },
+      })
+      A.equal(brokenExplicit.found, true, '显式路径坏掉时继续搜 PATH')
+      A.equal(brokenExplicit.attempts[0].ok, false)
+      A.equal(brokenExplicit.attempts[0].reason, 'not-found')
+
+      const nonExecDir = join(sandbox, 'bin-nonexec')
+      mkdirSync(nonExecDir, { recursive: true })
+      const nonExec = join(nonExecDir, 'claude')
+      writeFileSync(nonExec, 'not executable\n', { mode: 0o644 })
+      chmodSync(nonExec, 0o644)
+      const viaNonExec = discoverClaudeCli({ env: { PATH: nonExecDir } })
+      A.equal(viaNonExec.found, false, '不可执行文件不能当 CLI')
+      A.ok(viaNonExec.attempts.some(attempt => attempt.reason === 'not-executable'))
+
+      const dirDir = join(sandbox, 'bin-dirclaude')
+      mkdirSync(join(dirDir, 'claude'), { recursive: true })
+      const viaDir = discoverClaudeCli({ env: { PATH: dirDir } })
+      A.equal(viaDir.found, false, '同名目录不能当 CLI')
+      A.ok(viaDir.attempts.some(attempt => attempt.reason === 'not-a-regular-file'))
+
+      // smoke：PATH-only 的 fake claude 必须「已尝试、失败」（skipped:false），不能 skipped。
+      const smoke = spawnSync(process.execPath, [join(repoRoot, 'scripts', 'claude-smoke.mjs')], {
+        cwd: repoRoot,
+        env: { PATH: binDir, HOME: process.env.HOME || '', TMPDIR: sandbox },
+        encoding: 'utf8',
+        timeout: 90_000,
+      })
+      const payload = JSON.parse((smoke.stdout || '').trim().split('\n').filter(Boolean).pop() || '{}')
+      A.equal(payload.skipped, false, 'PATH 里有可执行 claude 就必须「已尝试」，不能 skipped（基线：skipped:true）')
+      A.equal(payload.ok, false)
+      A.equal(smoke.status, 1, '真实通道失败必须退出 1')
+    })
+
+    await check('N1 文档：README 三适配器、design/11 Claude 行、三层证据与「真实 CLI 未验证」', async () => {
+      const readme = readFileSync(join(repoRoot, 'README.md'), 'utf8')
+      A.match(readme, /`dsh` \/ `codex` \/ `claude`/, 'README 适配器名单必须含 Claude（基线：两种）')
+      const design11 = readFileSync(join(repoRoot, 'docs', 'design', '11-node-finish-tool.md'), 'utf8')
+      A.match(design11, /\| `claude` \|/, 'design/11 适配器表必须有 Claude 行（基线：缺）')
+      A.match(design11, /真实 Claude CLI 未验证/)
+      const design12 = readFileSync(join(repoRoot, 'docs', 'design', '12-instance-metrics.md'), 'utf8')
+      A.match(design12, /claude-usage-ledger/, 'design/12 必须说明 Claude 用量账本与快照口径')
+      const releases = readFileSync(join(repoRoot, 'docs', 'history', 'releases.md'), 'utf8')
+      A.match(releases, /参数探测/, 'releases 必须区分三层证据：参数探测')
+      A.match(releases, /桥自检/)
+      A.match(releases, /真实 CLI/)
+    })
+
     await check('真实 claude CLI（找不到 CLI 时明确 SKIP，不计入通过数）', async () => {
-      const candidates = [
-        process.env.CLAUDE_BIN,
-        '/home/feiyueve/.local/bin/claude',
-        '/usr/local/bin/claude',
-        '/usr/bin/claude',
-      ].filter(Boolean)
-      const claudeBin = candidates.find(candidate => existsSync(candidate))
+      // m6：发现规则与 smoke 共用（CLAUDE_BIN 优先 → PATH 搜索并校验可执行）。
+      const discovered = discoverClaudeCli()
+      const claudeBin = discovered.found ? discovered.bin : null
       if (!claudeBin) {
-        console.log('    SKIP（无 claude）：本机找不到 claude CLI，真实 probe / 通道未验收')
+        console.log(`    SKIP（无 claude）：CLAUDE_BIN / PATH 都没找到可执行 claude，`
+          + `真实 probe / 通道未验收（尝试记录 ${discovered.attempts.length} 条）`)
         return { skipped: true }
       }
       const adapter = createClaudeAdapter({ claudeBin, tmpRoot: sandbox, selfTest: true })

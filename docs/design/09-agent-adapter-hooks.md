@@ -2,6 +2,8 @@
 
 > 状态：研究稿，供 `docs/plan/0.13-bpmn引擎与适配器.md` §4 定稿；不改任何代码。
 > 证据口径：本机 `codex 0.167.0` 的 `--help` / 实跑 / 二进制字符串；Claude Code 本机未安装（`which claude` = 127），只引官方文档；DSH 引本仓库 file:line。
+>
+> **证据层次（0.14.5 勘误）**：下文「Codex CLI / Claude Code」两列的差异是**参数探测**（`--version` / `--help`）与官方文档层面的结论，不等于通道验收。适配器的证据分三层：**① 参数探测**（版本与参数面）、**② 桥自检**（我们自己 MCP server 的 stdio 往返）、**③ 真实 CLI 握手 + finish**（真实 CLI 拉起 server、模型真的调用完结工具）。Claude 目前只完成 ①②：`src/agent-adapter-claude.js` 的 `probe()` 用假 CLI 夹具与真实 MCP 往返覆盖 ①②，第 ③ 层由 `scripts/claude-smoke.mjs` 在有 CLI 的机器上验证，本机输出 `skipped:true`（**不代表通过**）。Codex 的第 ③ 层已用本机真实 `codex` 跑通。
 > **关键更正**：codex 0.167 已有原生 hook（`hooks.json` / `[hooks]`），「codex 无 hook」的前提已过期；差异在事件面、阻断/改写能力与信任模型，不在有无。
 
 ## A 实测事实

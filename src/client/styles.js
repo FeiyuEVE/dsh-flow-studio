@@ -886,7 +886,7 @@ body[data-ds-dark-theme] .fs-edge-tag{box-shadow:0 2px 8px color-mix(in srgb, va
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);
 }
-/* 中性 pill：没拿到 quality 证据时用，明确「不是绿灯」。 */
+/* 中性 pill：没拿到证据时用，明确「不是绿灯」。 */
 .fs-log-pill.neutral{
   color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);
   box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2);
@@ -1627,6 +1627,35 @@ body[data-ds-dark-theme] .fs-log-event[aria-selected="true"]{
 .fs-metrics-groups li{display:flex;gap:6px;align-items:baseline;min-width:0}
 .fs-metrics-day{color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
 .fs-metrics-groups-meta{color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-evidence{display:flex;flex-direction:column;gap:6px;padding:8px 10px 10px;font-size:12px;line-height:18px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.fs-evidence-head{display:flex;align-items:center;gap:6px}
+.fs-evidence-head strong{font-size:13px;line-height:20px}
+.fs-evidence-head .fs-evidence-note{margin-left:auto}
+.fs-evidence-head button{margin-left:6px}
+.fs-evidence-empty{margin:0;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-evidence-note{margin:0;color:var(--dsw-alias-label-tertiary);word-break:break-word}
+.fs-evidence-body{display:flex;flex-direction:column;gap:6px}
+.fs-evidence-badges{display:flex;flex-wrap:wrap;gap:4px}
+.fs-evidence-badge{display:inline-flex;align-items:center;min-height:18px;padding:0 8px;border-radius:var(--dsw-radius-panel);font-size:12px;line-height:14px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}
+.fs-evidence-badge.verified{color:var(--fs-r2-success, var(--dsw-alias-state-success-primary));background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--fs-r1-success, var(--dsw-alias-state-success-primary)) 35%, transparent)}
+.fs-evidence-badge.warn{color:var(--fs-r2-warn, var(--dsw-alias-state-warn-primary));background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent)}
+.fs-evidence-badge.stub{color:var(--fs-r2-warn, var(--dsw-alias-state-warn-primary));background:transparent;box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--fs-r1-warn, var(--dsw-alias-state-warn-primary)) 60%, transparent)}
+.fs-evidence-facts{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 8px;margin:0}
+.fs-evidence-facts > div{display:contents}
+.fs-evidence-facts dt{color:var(--dsw-alias-label-tertiary)}
+.fs-evidence-facts dd{margin:0;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+.fs-evidence-reasons{margin:0;padding-left:16px;color:var(--fs-r2-warn);word-break:break-word}
+.fs-evidence-error{margin:0;color:var(--fs-r2-error);word-break:break-word}
+.fs-evidence-block{display:flex;flex-direction:column;gap:4px;min-width:0}
+.fs-evidence-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;min-width:0}
+.fs-evidence-item{display:flex;flex-direction:column;gap:2px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);min-width:0}
+.fs-evidence-item-head{display:flex;align-items:baseline;gap:6px;min-width:0}
+.fs-evidence-item-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-evidence-item-body{display:flex;align-items:baseline;gap:4px;flex-wrap:wrap;min-width:0}
+.fs-evidence-item-body code{font-family:var(--dsw-font-markdown-code-font-family, monospace);font-size:11px;overflow-wrap:anywhere}
+.fs-evidence-meta{color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.fs-evidence-refs{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px;color:var(--dsw-alias-label-secondary);min-width:0}
+.fs-evidence-refs code{font-family:var(--dsw-font-markdown-code-font-family, monospace);font-size:11px;overflow-wrap:anywhere}
 
 @media (max-width:980px){
   .fs-instance-panel{width:290px}

@@ -729,8 +729,8 @@ try {
     const summary = (await import('../src/runlog.js')).summarize(
       (await store.readEvents(runsRoot, meta.id, { limit: 100 })).events,
     )
-    assert.equal(summary.quality.evidence.acceptance.state, 'pass')
-    assert.equal(summary.quality.evidence.tests.state, 'pass')
+    assert.equal(Object.hasOwn(summary, 'quality'), false, '0.13.12 起 summary 不再返回质量总评分')
+    assert.ok(summary.acceptance.total >= 1, '验收条目仍进入单项通过率')
   })
 
   await check('整批校验：run 级事件带 nodeId 也整批拒绝（§8.1）', async () => {

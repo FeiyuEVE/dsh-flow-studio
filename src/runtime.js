@@ -68,7 +68,7 @@ import { Engine, EngineError, createEngine, validateFlowForRun } from './engine.
 import { buildFollowupPayload } from './inbox.js'
 import { checkRunId } from './runlog.js'
 import {
-  appendEvents, buildHostExecutionVerifier, claimLease, createRun, listRuns, readAllEvents, readHostExecutions,
+  appendEvents, claimLease, createRun, listRuns, readAllEvents,
   readLease, readNodeSessions,
   readRunMeta, releaseLease, runsDir, writeNodeSessions, writeRunMeta,
 } from './runstore.js'
@@ -936,15 +936,9 @@ export function createRuntime(options = {}) {
         flow = null
       }
     }
-    const hostExecutions = await readHostExecutions(runsRoot, runId).catch(() => [])
-    const hostById = new Map(hostExecutions
-      .filter(record => record && typeof record.executionId === 'string')
-      .map(record => [record.executionId, record]))
-    // 0.11 R5（返工）：自审 summary 与 HTTP 同口径（同一 runstore 验证器，含副本 sha256）。
-    const verifyHostExecution = buildHostExecutionVerifier(hostExecutions, events, runId, join(runsRoot, runId))
     let audited = null
     try {
-      audited = auditFn({ flow, events, run: meta, now: now(), verifyHostExecution })
+      audited = auditFn({ flow, events, run: meta, now: now() })
     } catch (error) {
       log('warn', `supervision: 审计 run ${runId} 失败：${error && error.message ? error.message : String(error)}`)
       audited = null

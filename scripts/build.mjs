@@ -104,6 +104,7 @@ export const HOST_MODULES = [
   'node-finish.js',
   'node-finish-mcp.js',
   'instance-metrics.js',
+  'instance-evidence.js',
   'agent-telemetry.js',
   'agent-adapter.js',
   'agent-adapter-dsh.js',

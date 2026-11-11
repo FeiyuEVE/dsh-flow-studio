@@ -375,7 +375,7 @@ function NodeForm({ node, flow, skills, skillsOpen = false, onPatch, onDelete, o
         // 命令原文随流程保存，运行期由宿主 spawn，不走模型提示词。
         h(Field, {
           label: '宿主检查（可选）',
-          hint: '节点收口后宿主真跑一次；结果只影响质量结论，不改 agent verdict',
+          hint: '节点收口后宿主真跑一次；结果只进单项证据，不改 agent verdict',
         },
           h('div', { className: 'fs-check-editor' },
             h('input', {

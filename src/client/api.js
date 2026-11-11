@@ -338,6 +338,13 @@ export function metricsPath(options = {}) {
   })
 }
 
+/** `GET /instances/<id>/evidence[?asOf=ISO]`（0.13.12 业务证据，纯读）。 */
+export function instanceEvidencePath(id, options = {}) {
+  return withQuery(`${instancePath(id)}/evidence`, {
+    asOf: options && options.asOf,
+  })
+}
+
 /** `GET /instances/<id>/resource-events[?since=N]`（worktree / 产物资源事件）。 */
 export function instanceResourceEventsPath(id, options = {}) {
   return withQuery(`${instancePath(id)}/resource-events`, {
@@ -384,6 +391,9 @@ export const api = {
   // ── 运行指标（0.13.10 E1）──────────────────────────────────────────────
   readInstanceMetrics: (id, options) => request('GET', instanceMetricsPath(id, options)),
   readMetrics: options => request('GET', metricsPath(options)),
+
+  // ── 业务证据（0.13.12 E2）──────────────────────────────────────────────
+  readInstanceEvidence: (id, options) => request('GET', instanceEvidencePath(id, options)),
 }
 
 // ---------------------------------------------------------------------------

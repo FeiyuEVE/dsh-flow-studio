@@ -59,7 +59,7 @@ dsh plugin --profile web add ./dsh-flow-studio
 | 人工任务完结工具 | [finish 工具](docs/design/11-node-finish-tool.md) |
 | 用容器测试台验收一次改动 | [容器测试台](docs/cookbook/run-container-testbed.md) |
 | 发一个版本 | [发版](docs/cookbook/release.md) |
-| 0.1 → 0.13 每一版改了什么 | [版本历史](docs/history/releases.md) |
+| 0.1 → 0.14 每一版改了什么 | [版本历史](docs/history/releases.md) |
 | 常见问题 | [FAQ](docs/faq.md) |
 | 设计总案与 01–08 分册（历史资料） | [设计总案](docs/DESIGN.md) |
 

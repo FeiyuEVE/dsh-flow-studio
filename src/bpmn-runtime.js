@@ -2244,6 +2244,10 @@ class BpmnRuntime {
       resources = { events: [], skipped: 0, resourceSeq: 0 }
     }
     const fingerprint = metricsFingerprintFor(instance, {
+      // 事件内容也进指纹（0.14.4）：只按 lastSeq/revision 会在「元数据已提交、事件正文
+      // 随后补写」时命中事件尚不完整时算出的旧结果。list 本来就已读出来，不额外读盘。
+      events: list,
+      skippedEvents: events?.skipped ?? 0,
       connector: connectorFingerprint(connectorRecords),
       resources: Number.isInteger(resources.resourceSeq) ? resources.resourceSeq : 0,
     })
@@ -4442,26 +4446,11 @@ class BpmnRuntime {
         if (persisted === null) {
           throw new BpmnRuntimeError(500, 'BPMN_EVENT_UNSERIALIZABLE', `实例 ${instanceId} 的事件 ${event.type} 不能被序列化为 JSON`)
         }
-        // 真正写盘前复查磁盘事实：排队期间可能已经 stop / 终态 / 挂起。
-        // 挂起后**不得**再写 status:'ACTIVE'，也不得追加推进事件——任务直接丢弃并记诊断。
-        const current = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
-        if (current === null) {
-          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'instance-missing' })
-          return
-        }
+        // stop 之后不再落盘（同步闩已经挡住绝大多数；排队期间 stop 由终态保护兜底）。
         if (this._stopping.has(instanceId)) {
           this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'stopping' })
           return
         }
-        if (TERMINAL_STATUSES.has(current.status)) {
-          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'terminal', status: current.status })
-          return
-        }
-        if (current.status === 'SUSPENDED' && event.type !== 'error') {
-          this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'suspended' })
-          return
-        }
-
         if (event.type === 'error') {
           // MAJOR-3：错误事实通道。即使实例已 SUSPENDED，也要把 error 事件、lastError
           // 和清空后的待办一次写下去（超时不会因为挂起而「没发生过」）。
@@ -4503,7 +4492,7 @@ class BpmnRuntime {
       } catch (error) {
         // 另一个请求先收成终态：晚到事件丢弃，不升级成事件写入失败。
         if (error?.code === 'INSTANCE_TERMINAL_IMMUTABLE') return
-        // 挂起先一步提交：store 的 SUSPENDED 闸门是第二道防线，丢弃并记诊断。
+        // 挂起先一步提交：store 的 SUSPENDED 闸门拒掉这次追加，丢弃并记诊断（零写入）。
         if (error?.code === 'INSTANCE_SUSPENDED') {
           this._recordEventDiagnostic(instanceId, { type: event.type, reason: 'suspended', code: error.code })
           return

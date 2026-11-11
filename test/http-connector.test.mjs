@@ -265,7 +265,14 @@ await check('无幂等键的 POST 超时：不自动重发，报 HTTP_TIMEOUT', 
       '超时必须明确失败',
     )
     A.ok(fixture.requests.length <= 1, '有副作用且无幂等键 → 超时不重发（负载下可能连首个请求都没发出，但绝不能 >1）')
-    const record = await store.readInvocation(invocationIdentity())
+    // 负载下「超时错误已抛出」与「调用记录终结写盘」之间可能隔一拍（0.14.4 全量套件
+    // 并发时实测），这里按有界轮询读最终状态；始终等不到 failed 才算失败。
+    const recordDeadline = Date.now() + 2000
+    let record = await store.readInvocation(invocationIdentity())
+    while (record.state !== 'failed' && Date.now() < recordDeadline) {
+      await new Promise(resolveWait => setTimeout(resolveWait, 10))
+      record = await store.readInvocation(invocationIdentity())
+    }
     A.equal(record.state, 'failed')
     A.equal(record.error.code, 'HTTP_TIMEOUT')
   } finally {

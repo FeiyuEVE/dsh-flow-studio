@@ -1177,7 +1177,8 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
     const now = new Date().toISOString()
     const next = normalizeInstance({
       ...current,
-      // 挂起 / 恢复：状态与事件一起提交，避免「状态已 SUSPENDED、事件还没落盘」的中间态。
+      // 挂起 / 恢复：状态与本次 seq 区间 / eventCount / revision 一次写入；事件正文随后追加，
+      // 两步之间崩溃只会留下「已分配但不可见」的 seq，读侧按可见水位与缺口处理。
       ...(nextStatus === null ? {} : { status: nextStatus, completedAt: null }),
       // 执行事实（lastError / pendingTasks / executionFailure）与事件同一次写盘：
       // 事件桥不再需要「先写事件、再 updateInstance」的第二个提交窗口。

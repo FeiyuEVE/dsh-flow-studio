@@ -2,7 +2,7 @@
 
 > 本册是**实例域运行指标口径的唯一之家**：哪些数字能算、怎么算、什么时候是「未知」、汇总怎么选 cohort。
 > 事件字段与实例 API 的落地位置在 `src/instance-metrics.js` / `src/agent-telemetry.js` / `src/bpmn-runtime.js`；
-> 路由与查询参数归 [Host API · 实例域运行指标](../reference/host-api.md#实例域运行指标01310)。
+> 路由与查询参数归 [实例域接口 · 运行指标](../reference/instance-api.md#运行指标)。
 > 旧运行域（`/runs`）的指标口径在 [04](04-metrics.md) 与 [05](05-run-log.md)，两者**不互相复用**：实例域按 `executionId` 计时，旧域按节点 attempt 计时。
 
 ## 1 目标与非目标
@@ -54,7 +54,7 @@
 | 指标 | JSON 位置 | 口径 | 未知语义 |
 |---|---|---|---|
 | 实例墙钟耗时 | `duration.wallMs` | `createdAt → completedAt`（终态）；`createdAt → asOf`（非终态）。含挂起时间，用 `wallIncludesSuspended:true` 明示 | 时间戳不可解析 → `null` + `invalid-timestamps` |
-| 挂起耗时 | `duration.suspendedMs` | 只算显式 `instance/suspended` → `instance/resumed` 区间；终点按 `completedAt/asOf` 收口；单列，不混入执行耗时 | 只有 `SUSPENDED` 状态、没有区间 → `null` + `suspend-timeline-unavailable`；从未挂起 → `0` |
+| 挂起耗时 | `duration.suspendedMs` | 只算显式 `instance/suspended` → `instance/resumed` 区间；终点按 `completedAt/asOf` 收口；单列，不混入执行耗时。区间内的 `error` 事件（挂起期间允许落错误事实）**不结束区间** | 只有 `SUSPENDED` 状态、没有区间 → `null` + `suspend-timeline-unavailable`；磁盘已是 `ACTIVE` 但事件流最后一条生命周期事件仍是 `instance/suspended`（缺 resume，典型来源是「恢复的元数据已提交、事件正文追加失败」）→ 恢复时刻不可知，整个时长 `null` + 同一 reason，**不能**把此后到 `asOf` 的时间继续累计成挂起；从未挂起 → `0` |
 | 节点耗时 | `nodes.executions[].durationMs` | 按 `executionId`：`activity/start → activity/end`；事件带 `durationMs` 时以事件为准；循环两次 / 同节点不同 execution 各自独立 | 缺 start 或缺 end → `null` |
 | 节点状态 | `nodes.{completed,errored,canceled,interrupted,running,waiting}` | `activity/end` = completed；`error` 事件 = error；终态实例里未结束的 execution = canceled / interrupted。**不把错误 / 取消 / 中断算成 completed** | 状态只有以上几种，不造 `failed` 实例状态 |
 | 已执行 / 当前活动 | `nodes.executed`、`nodes.active` | 已执行 execution 数、当前 `running/waiting` 的 execution；不输出完成百分比 | 空实例 → `0` / `[]` |
@@ -95,7 +95,9 @@
 
 ## 7 缓存与读取边界
 
-- 缓存只缓存**事件侧归约**，指纹 = `schemaVersion + lastSeq + revision`（另加 connector 记录指纹与 `resourceSeq`）。事件或实例事实一变，指纹变 → 自动重算；缓存可整体清空并重建，权威永远是事件与实例事实。
+- 缓存只缓存**事件侧归约**，指纹 = `schemaVersion + lastSeq + revision + 事件集合内容指纹`（另加 connector 记录指纹与 `resourceSeq`）。事件或实例事实一变，指纹变 → 自动重算；缓存可整体清空并重建，权威永远是事件与实例事实。
+- 事件集合内容指纹（0.14.4）取「条数 + 最大 seq + 坏行数 + `(seq|type|at)` 序列的 sha256」，不序列化整条事件。它专门覆盖「元数据没变、事件正文被补写」：生命周期 / 执行事件都是先提交 `lastSeq` / `revision` 再追加正文，只按元数据做 key 会命中事件尚不完整时算出的旧值。
+- 归约自己报告 `complete:false`（缺已公布 seq、或有坏行）时**不写入缓存**：补写之后即使 key 相同也必须重算，不能返回窗口期算出的残缺值。
 - `asOf` 只参与最终投影（墙钟终点、当前等待、活跃 execution 的 `elapsedMs`），所以**没有新事件时人工等待仍会按 `asOf` 增长**，不会冻结在最后一个事件时间。
 - 两个指标 GET 都是**纯读**：不调用 `_ensureRunner()`、不恢复 runner、不因看页面推进实例。
 - `?asOf=` 是给离线复算 / 测试对账用的确定性入口；不传则用请求时刻。
@@ -115,6 +117,7 @@
 ## 9 验收对照
 
 - 循环两次 / 同节点不同 execution：计时和次数独立 → `test/instance-metrics.test.mjs`「节点耗时按 executionId」。
+- 挂起时间轴缺失（`ACTIVE` + 缺 `resumed`）、补写后重算、残缺归约不入缓存 → `test/instance-metrics.test.mjs`「MINOR-1」三组用例。
 - 重复 usage 更新 / resume 重放 / 提醒续跑：替换不双计、不漏计 → `test/agent-telemetry.test.mjs` 与 `test/instance-metrics.test.mjs`。
 - 缺 usage / 坏事件 / 截断：明确降完整性，不给伪零 → 同上「未知不是零」与 `dataQuality.reasons`。
 - API 与离线纯函数一致、追加事件后缓存失效、GET 不启动 runner → `test/instance-metrics.test.mjs` 最后一个用例。

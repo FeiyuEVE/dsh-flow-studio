@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.3）
+# 版本历史（0.1 → 0.14.4）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -907,3 +907,30 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 状态与事件先写 `instance.json` 再追加事件行；两步之间崩溃会留下 `SUSPENDED` 但缺事件（指标报 `suspendedMs:null` + `suspend-timeline-unavailable`，不是 0）。
 - 恢复不主动 drain 排队消息：要等下一次投递触发；进程重启后没有 live execution 登记时，排队消息不会自动投递（收件箱既有行为）。
 - 未做硬挂起（停引擎 + 快照恢复）、未做挂起/恢复 GUI。
+
+> 勘误（0.14.4）：「事件与状态同一次写入提交」应读作**状态与已分配 seq / eventCount / revision 的同一次元数据写入**——事件正文是随后追加的，读侧按可见水位与空洞处理。见 [0.14.4](#0144--挂起--恢复并发加固)。
+
+## 0.14.4 — 挂起 / 恢复并发加固
+
+修的是挂起 / 恢复在并发与部分写入下的正确性，外加收件箱投递门禁、挂起时间轴未知语义与工具错误字段三处卫星缺陷。
+
+- **条件提交（CAS）**：挂起 / 恢复提交必须带期望状态；状态在判忙之后被别处改过 → 409 `INSTANCE_LIFECYCLE_CONFLICT`（带 `expectedStatus` / `actualStatus`），零写入、无新事件。两个请求同时挂起不再各写一条 `instance/suspended`；`stop` 抢先收口的那个拿到 409 `BPMN_INSTANCE_TERMINAL`。
+- **`SUSPENDED` 变受保护状态**：挂起期间拒绝执行事件追加（409 `INSTANCE_SUSPENDED`，一个字节都不写）、拒绝写引擎快照、拒绝收口成 `COMPLETED`；`stop` 收成 `CANCELED` 仍可用。绕过生命周期路由改状态会被 store 拒掉：挂起写回 `ACTIVE` → `INSTANCE_SUSPENDED_IMMUTABLE`，把非挂起实例改成 `SUSPENDED` → `INSTANCE_LIFECYCLE_USE_ROUTE`。
+- **错误事实通道（唯一写穿口）**：挂起期间发生的执行失败（如活动超时）仍然落一条 `error` 事件 + `lastError` + 清空 `pendingTasks` + `executionFailure{code,message,at}`，并把快照写成不可恢复墓碑；`resume` 只解除挂起、不清这个标记，所以恢复后完成人工任务返回 `BPMN_INSTANCE_BLOCKED`。**挂起不暂停计时器**是明确边界：超时照常触发，只是事实不再被丢弃。
+- **判忙扩到六类**：`activities[]` 的 `kind` 现在是 `agent` / `engine` / `http` / `event-queue`（还有事件在排队或写盘）/ `preparing`（首次创建 / 工作区准备窗口）/ `owner`（另一个活进程持有执行所有权），后三类是这次新补的窗口（`http` 在 0.14.3 就有）。判忙仍在实例锁外先做一次、锁内再复核。
+- **跨进程执行所有权**：谁建出 runner 谁写实例目录的 `owner.json`（`{pid, host, bootId, startTime, runtimeId, since}`），终态收口 / `dispose` 时只删自己写的那份。存活判定分 `alive` / `gone` / `unknown`，只有 `gone` 允许接管，`unknown` 保守拒绝（不按时间 TTL 猜）。别的活进程持有时：挂起 409（`kind:"owner"` 点名 pid / host / since），懒恢复不建第二个 runner（`recovery.code` = `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_OWNER_UNKNOWN`）。范围限定同机、本地文件系统、所有进程都使用新协议。
+- **生命周期部分提交**：状态已提交、事件正文追加失败时不再报 500，而是 200 + `committed:true` + `eventLogPending:true` + `eventLogError`；磁盘状态以最后成功写入为准，重试不会补写那条缺失事件。
+- **事件读侧水位**：`GET /instances/<id>/events` 的 `lastSeq` 只到实际可见事件，已分配但不可见时带 `eventLogGap{allocated, visible, missing?, skipped?}`；响应新增 `eventsHash`（事件内容 sha256）。读侧不再拿「已分配水位」冒充可消费游标，`?since=lastSeq` 不会跳过还没落盘的正文。
+- **收件箱投递门禁**：每次真正领取投递权（进 adapter / 写 `delivered`）前重读实例状态；`SUSPENDED` / 终态 / 实例缺失 / 读不出 → 不投递、不标 `failed`、消息保持 `queued`，drain 结果带 `deliveryBlocked`（必要时 `blockedStatus` / `blockedCode` / `suspended`）。已进 adapter 的投递无法回滚：如实记 `delivered` 并标 `deliveredWhileSuspended:true`。
+- **指标**：磁盘 `ACTIVE` 但事件流缺 `instance/resumed` → `suspendedMs:null` + `suspend-timeline-unavailable`（不再把此后时间继续累计成挂起）；挂起区间内的 `error` 事件不断开区间；缓存指纹加入事件集合内容，`complete:false` 的归约不入缓存。
+- **工具错误字段**：`flow_instance_suspend` / `flow_instance_resume` 的失败返回把 HTTP 状态放 `httpStatus:number`，`status` 只承载实例状态字符串——修掉「schema 声明 `status:string` 却塞 409」的违例；其余 11 个工具的错误形状不变。
+- **GUI**：实例详情新增「挂起实例 / 恢复实例」（挂起期间「停止实例」仍可用）。错误文案按 `activities[]` 分类：另一个进程持有执行权时点名 pid / host 并给出「去那个进程操作，或先停掉它」；首次准备窗口单独一句；`INSTANCE_LIFECYCLE_CONFLICT` 提示「状态刚被改过，刷新后重试」。
+
+**勘误（0.14.3）**：0.14.3 条目里的「事件与状态同一次写入提交」指**状态与已分配 seq / eventCount / revision 的同一次元数据写入**；事件正文随后追加，读侧按可见水位与空洞处理。不是「状态与事件正文原子提交」。
+
+**已知边界**
+- 软挂起不是硬冻结：不杀 runner、不做新快照、**不暂停计时器**、不冻结平台侧 I/O（消息投递进了 adapter 就无法回滚，回复外发走 outbox、不受实例闸门约束）。需要「绝对静默」的场景不适用。
+- 判忙是检查点判定，不是派发前的硬栅栏：跨进程看不到对方的 `preparing` 计数（它只是进程内事实），极端交错下挂起仍可能插进首次创建窗口，恢复后实例可能只剩 `BPMN_STATE_MISSING`，需要人工处置。
+- 跨主机、NFS / SMB 共享目录、以及仍按 0.14.3 及更早协议运行（不写 `owner.json`）的进程不在互斥保证内；`unknown` 所有权不会自动接管；非 Linux 平台读不到 starttime，只剩 pid 存活判定。
+- 工具面不投影 `committed` / `eventLogPending` / `eventLogGap` / `eventsHash`：要判断部分提交与事件缺口，走 HTTP 响应。
+- 未做硬挂起（停引擎 + 快照恢复）。

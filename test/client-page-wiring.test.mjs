@@ -2079,6 +2079,27 @@ await check('0.14.3 挂起 / 恢复：成功刷新详情并提示；BUSY 提示�
     ok(instanceLifecycleFailureText({ code: 'BPMN_INSTANCE_TERMINAL' }, 'resume').includes('终态'))
     ok(instanceLifecycleFailureText({ code: 'INSTANCE_NOT_FOUND' }, 'suspend').includes('刷新'))
     ok(instanceLifecycleFailureText({ code: 'WEIRD' }, 'suspend').includes('先刷新实例再挂起'))
+
+    // 0.14.4：另一个活进程持有执行权时，「等它结束」是错的——必须指向那个进程。
+    const foreign = instanceLifecycleFailureText({
+      code: 'INSTANCE_SUSPEND_BUSY',
+      data: { activities: [{ kind: 'owner', pid: 4321, host: 'h1', state: 'alive' }] },
+    }, 'suspend')
+    ok(foreign.includes('另一个进程') && foreign.includes('4321'), 'owner 冲突必须点名进程 pid：' + foreign)
+    ok(foreign.includes('或先停掉它'), 'owner 冲突必须给可操作出口：' + foreign)
+    // 首次准备窗口：单独一句，不要混进「等它们结束」。
+    const preparing = instanceLifecycleFailureText({
+      code: 'INSTANCE_SUSPEND_BUSY',
+      data: { activities: [{ kind: 'preparing', pending: 1, state: 'preparing' }] },
+    }, 'suspend')
+    ok(preparing.includes('首次创建'), '准备窗口必须有自己的解释：' + preparing)
+    // 生命周期条件提交冲突：状态刚被别处改过。
+    const conflict = instanceLifecycleFailureText({
+      code: 'INSTANCE_LIFECYCLE_CONFLICT',
+      data: { actualStatus: 'SUSPENDED' },
+    }, 'suspend')
+    ok(conflict.includes('刚被改过') && conflict.includes('SUSPENDED'), '冲突提示必须带当前状态：' + conflict)
+    ok(conflict.includes('刷新'), '冲突提示必须给下一步：' + conflict)
   })
 })
 

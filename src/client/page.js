@@ -215,6 +215,15 @@ function lifecycleActivityLabel(activity) {
   if (activity.kind === 'agent') return 'agent 活动'
   if (activity.kind === 'http') return 'HTTP 调用'
   if (activity.kind === 'engine') return '引擎推进'
+  // 0.14.4：挂起判忙扩展出的三类活动。
+  if (activity.kind === 'owner') {
+    const pid = Number.isSafeInteger(activity.pid) ? `pid ${activity.pid}` : ''
+    const host = typeof activity.host === 'string' && activity.host !== '' ? activity.host : ''
+    const who = [pid, host].filter(value => value !== '').join(' @ ')
+    return who === '' ? '另一个进程持有执行权' : `另一个进程（${who}）`
+  }
+  if (activity.kind === 'preparing') return '首次创建 / 工作区准备'
+  if (activity.kind === 'event-queue') return '待提交事件'
   return ''
 }
 
@@ -233,12 +242,31 @@ export function instanceLifecycleFailureText(error, action) {
   const detail = data && typeof data.error === 'string' && data.error.trim() !== '' ? data.error.trim() : ''
   if (code === 'INSTANCE_SUSPEND_BUSY') {
     const activities = data && Array.isArray(data.activities) ? data.activities : []
+    // 0.14.4：另一个活进程持有执行权时，本页面的「等它结束」是错的——用户得去那个
+    // 进程里操作，或者先停掉它。单独给一句，别混进普通活动列表里。
+    const foreignOwner = activities.find(activity => activity && activity.kind === 'owner') ?? null
+    if (foreignOwner !== null) {
+      const pid = Number.isSafeInteger(foreignOwner.pid) ? `pid ${foreignOwner.pid}` : ''
+      const host = typeof foreignOwner.host === 'string' && foreignOwner.host !== '' ? foreignOwner.host : ''
+      const who = [pid, host].filter(value => value !== '').join(' @ ')
+      return `另一个进程${who === '' ? '' : `（${who}）`}正在执行这个实例，不能在这里${verb}；`
+        + `请到持有执行权的那个进程里操作，或先停掉它。`
+    }
     if (activities.length > 0) {
       const labels = activities.map(lifecycleActivityLabel).filter(label => label !== '')
       const listed = labels.length > 0 ? `（${labels.join('、')}）` : ''
+      const preparingOnly = activities.every(activity => activity && activity.kind === 'preparing')
+      if (preparingOnly) {
+        return '实例还在首次创建 / 工作区准备中，这时候挂起会打断首次启动；等准备完成再挂起。'
+      }
       return `实例还有 ${activities.length} 个活动未结束${listed}，等它们结束再${verb}；急着收尾可以点「停止实例」。`
     }
     return `${detail !== '' ? detail : '实例还有未结束的活动'}，等它们结束再${verb}。`
+  }
+  if (code === 'INSTANCE_LIFECYCLE_CONFLICT') {
+    const actual = data && typeof data.actualStatus === 'string' ? data.actualStatus : ''
+    return `实例状态刚被改过${actual === '' ? '' : `（现在 ${actual}）`}，这次${verb}没有生效；`
+      + '刷新实例后重新操作。'
   }
   if (code === 'INSTANCE_ALREADY_SUSPENDED') {
     return '实例已经处于挂起状态，不用重复挂起；要继续推进请点「恢复实例」。'

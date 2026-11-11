@@ -22,7 +22,7 @@
 | `flow_instance_events` | 增量事件（`since` 游标） |
 | `flow_instance_cancel` | 取消 `ACTIVE` 实例 |
 | `flow_instance_complete_task` | 完成人工待办 |
-| `flow_instance_suspend` | 挂起实例（仅限无在飞活动的 `ACTIVE` 实例） |
+| `flow_instance_suspend` | 挂起实例（仅限 `ACTIVE`、没有在飞活动 / 首次准备窗口、且没有别的活进程持有执行权） |
 | `flow_instance_resume` | 恢复挂起实例（不主动推进） |
 | `flow_instance_worktrees` | 实例 worktree 的 list / inspect / remove / branch / prune |
 | `flow_instance_send_message` | 往实例收件箱发消息 |

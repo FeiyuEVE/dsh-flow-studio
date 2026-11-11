@@ -17,7 +17,7 @@
 | 用容器测试台验收一次改动 | [容器测试台](cookbook/run-container-testbed.md) |
 | 发一个版本 | [发版](cookbook/release.md) |
 | 给节点加一种新的 agent 适配器（历史：旧外部执行器） | [加执行器](cookbook/add-executor.md) |
-| 看 0.1 → 0.13.x 每一版改了什么 | [版本历史](history/releases.md) |
+| 看 0.1 → 0.14.x 每一版改了什么 | [版本历史](history/releases.md) |
 | 找常见问题的答案 | [FAQ](faq.md) |
 | 看历史设计总案、01–08 分册与独立审核（历史资料） | [历史设计总案](DESIGN.md) · [设计任务书](DESIGN-BRIEF.md) · [分册](design/01-ia-interaction.md) · [审核](design/REVIEW.md) |
 | 给这个仓库写文档（人或 agent） | [文档标准](AGENTS.md) |
@@ -37,7 +37,7 @@
 | [reference/instance-api.md](reference/instance-api.md) | BPMN 定义 / 实例域路由、实例状态、收件箱、worktree、connector 与实例工具 | 集成方 / 排障 |
 | [reference/data-model.md](reference/data-model.md) | 定义版本、实例目录与 `instance.json` 字段、worktree 布局；旧 run 数据只说明历史 | 集成方 / 排障 |
 | [reference/run-log.md](reference/run-log.md) | **历史资料**：旧 run 事件契约速查；当前实例事件以 [design/10](design/10-bpmn-instance-api.md) 为准 | 回溯旧数据的人 |
-| [history/releases.md](history/releases.md) | 0.1 → 0.13.x 逐版本变化（README 不再承载历史） | 升级 / 回溯的人 |
+| [history/releases.md](history/releases.md) | 0.1 → 0.14.x 逐版本变化（README 不再承载历史） | 升级 / 回溯的人 |
 | [faq.md](faq.md) | 高频问题：实例 worktree、实例状态、旧数据边界、为什么 BPMN | 所有人 |
 | [cookbook/run-container-testbed.md](cookbook/run-container-testbed.md) | 用 `scripts/e2e-bpmn.sh` 在容器里端到端验收 | 贡献者 |
 | [cookbook/release.md](cookbook/release.md) | build → verify → pack 检查 → publish → 装机对账 | 发版者 |

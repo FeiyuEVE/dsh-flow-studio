@@ -37,6 +37,7 @@ instances/<instanceId>/
   instance.json          # 可变元数据（原子写；乐观锁 revision）
   definition.bpmn        # 启动时冻结的定义快照
   state.json             # BPMN 引擎状态快照（懒恢复用）
+  owner.json             # 执行所有权记录（内部；见「内部字段与文件」）
   events/                # 执行事件分片（append-only；seq 单调）
   workspace.json         # 实例冻结的工作区快照
   resources/
@@ -62,6 +63,7 @@ instances/<instanceId>/
 | `variables` / `result` | 启动变量 / 最终结果（JSON 对象） |
 | `artifacts[]` | `flow_finish_node` 登记的产物引用（`path` / `sha256` / `bytes` / `kind` / `title` / `nodeId` / `attempt`）；只存引用不存正文 |
 | `lastError` | 执行错误 `{code, message, nodeId?, activityId?, retries?, reminders?}`；错误不是状态 |
+| `executionFailure` | 已确认执行失败、禁止自动恢复的标记 `{code, message, at}`；**内部字段**，HTTP 响应不投影，对外用 `lastError` 与 `recovery.reason`（见「内部字段与文件」） |
 | `lastAgentOutput` | 最近一次 agent 输出摘要（有界） |
 | `pendingTasks[]` | 人工待办（`activityId` / `elementId` / `name` / `since` / `executionId`） |
 | `revision` | 乐观锁版本；每次元数据写入 +1 |
@@ -71,12 +73,32 @@ instances/<instanceId>/
 
 实例状态只有四个；人工等待用 `pendingTasks` 表达，执行失败用 `lastError` 表达，**不伪造 failed 状态**（[design/10 · 实例状态](instance-api.md#实例状态)）。
 
+## 内部字段与文件（不承诺对外稳定）
+
+下面这些落盘字段 / 文件是**实现内部事实**，不参与 HTTP 契约的兼容承诺：字段名、形状与文件位置可能随版本调整，排障时按当前源码核对，不要把脚本钉死在这些形状上。
+
+```text
+instances/<instanceId>/
+  owner.json             # 执行所有权：{pid, host, bootId, startTime, runtimeId, since}
+  events/<activityId>/<attempt>.jsonl   # 事件正文（同一目录下可能出现已分配 seq 的空洞）
+  state.json             # 引擎快照；执行失败停机时是 {kind, unrecoverable:{code,message,at}, engine:null} 的墓碑
+```
+
+| 事实 | 落盘位置 | 形状与语义 |
+|---|---|---|
+| 执行所有权 | `owner.json`（0600，原子写） | `{pid, host, bootId, startTime, runtimeId, since}`。谁建出 runner（首次启动或懒恢复）谁登记；实例进入终态或 runtime `dispose` 时只删 `runtimeId` 相同的记录。进程崩溃会留下记录：`pid` 不在 / 同 pid 但 starttime 或 bootId 变了 → 判定为 `gone`，允许接管；跨主机、旧格式、坏 JSON → `unknown`，保守拒绝（不按时间猜） |
+| 执行失败禁止恢复 | `instance.json.executionFailure` | `{code, message, at}`（`at` 是 ISO 时间）。挂起期间发生的失败也会写它，`resume` 不清除；存在时懒恢复直接拒绝重建 runner：`recovery.code` 取 `lastError.code`（缺省 `executionFailure.code`），写操作拿到 409 `BPMN_INSTANCE_NOT_RECOVERABLE` + `recoveryCode` |
+| 不可恢复墓碑 | `state.json` 的 `unrecoverable` | `{unrecoverable:{code,message,at}, engine:null}`；懒恢复遇到它零派发并给明确错误码。`clear-tombstone` 只删墓碑（并把 `executionFailure` 置 `null`），不恢复引擎 |
+| 生命周期时间 | `instance.json.completedAt` | 只有终态才有值；挂起 / 恢复提交时写 `null`。`suspendedAt` / `resumedAt` **不落盘**，它们是响应字段，等于对应事件的 `at` |
+| 事件水位 | `instance.json.lastSeq` / `eventCount` | 已分配的 seq 上限 / 已提交的事件条数；生命周期切换与事件追加都先提交这两个值，再追加事件正文，所以磁盘上 `lastSeq` 可能大于可见事件数（读侧报 `eventLogGap`） |
+| 消息投递权 | `inbox/replies.jsonl` 的 `dispatch` | `{token, at, attempt, owner:{pid, host, bootId, startTime, at}}`；接管判据与执行所有权同一套（`instance-owner.js` 的 `ownerState()`），确认不了就保持 in-flight，不按 TTL 猜 |
+
 ## 事件与收件箱
 
 实例事件与资源事件的 kind、信封、分片与顺序规则在 [design/10](../design/10-bpmn-instance-api.md)。本页不复述 kind 表；只强调三条落盘约束：
 
 - 单条事件 ≤ 8 KiB、单批 ≤ 200 条（`src/storage-contract.js` 的 `MAX_EVENT_BYTES` / `MAX_BATCH_EVENTS`），超限 400。
-- `seq` 在实例锁内先写 `lastSeq` 再追加事件；进程崩溃会留下「预留但未落盘」的 seq，读侧按已返回事件的最大 seq 推进游标。
+- `seq` 在实例锁内先写 `lastSeq` 再追加事件；进程崩溃 / 追加失败会留下「已分配但不可见」的 seq，读侧按**可见事件的最大 seq** 推进游标，并把缺口报成 `eventLogGap{allocated, visible, missing?, skipped?}`（`GET /instances/<id>/events`）。
 - 收件箱正文 > 阈值时只存头部并物化全文到 `inbox/bodies/`；`bodyPath` 是实例目录内的安全相对路径。
 
 ## Worktree

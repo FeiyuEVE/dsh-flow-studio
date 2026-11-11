@@ -1131,6 +1131,131 @@ async function run() {
       A.ok(!fallback.afterXml.includes('Process_NOPLANE'), '重建回滚不残留失败导入的新 process')
     })
 
+    await check('M5：导入期间销毁编辑器，不得回滚重建无法销毁的 Modeler', async () => {
+      await page.evaluate(async () => {
+        if (window.__editor && !window.__editor.isDestroyed()) window.__editor.destroy()
+        window.__changeCount = 0
+        await window.__mountEditor({ onChange: () => { window.__changeCount += 1 } })
+      })
+      await page.waitForTimeout(180)
+      const result = await page.evaluate(async () => {
+        const editor = window.__editor
+        const validXml = await editor.saveXML()
+        const pending = editor.importXML(validXml)
+        // 同步销毁：此时导入还停在预检的 await 上，尚未触碰 instance。
+        editor.destroy()
+        let rejected = false
+        let message = ''
+        try {
+          await pending
+        } catch (error) {
+          rejected = true
+          message = String((error && error.message) || error)
+        }
+        editor.destroy() // 第二次 destroy 必须是 no-op
+        // 若销毁后回滚重建了幽灵 Modeler，getModeler() 非空，且它的
+        // commandStack.changed 仍能回调 onChange（复审 M5 的实跑证据）。
+        window.__changeCount = 0
+        const model = editor.getModeler()
+        if (model) {
+          try {
+            model.get('eventBus').fire('commandStack.changed')
+          } catch {
+            // 模型已不可用
+          }
+        }
+        return {
+          rejected,
+          message,
+          destroyed: editor.isDestroyed(),
+          modelAlive: model !== null,
+          changeCount: window.__changeCount,
+        }
+      })
+      A.equal(result.rejected, true, '销毁后挂起的导入必须以失败结束')
+      A.match(result.message, /已销毁/, '失败原因必须是「画布已销毁」')
+      A.equal(result.destroyed, true, 'isDestroyed()=true')
+      A.equal(result.modelAlive, false, '销毁后不能留下仍然存活的 Modeler')
+      A.equal(result.changeCount, 0, '销毁后 commandStack.changed 不能再回调 onChange')
+    })
+
+    await check('M6：回滚重建失败进入不可用态；再次导入必须真正重建或失败', async () => {
+      await remountEditor(page)
+      const noPlaneXml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" id="Definitions_LIFECYCLE" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="Process_LIFECYCLE" isExecutable="true">
+    <bpmn:startEvent id="LifecycleStart" />
+    <bpmn:endEvent id="LifecycleEnd" />
+    <bpmn:sequenceFlow id="LifecycleFlow" sourceRef="LifecycleStart" targetRef="LifecycleEnd" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="LifecycleDiagram" />
+</bpmn:definitions>`
+      const result = await page.evaluate(async xml => {
+        const editor = window.__editor
+        const validXml = await editor.saveXML()
+        const originalCreateElementNS = document.createElementNS
+        let rebuildArmed = false
+        // 只在回滚重建时制造构造失败：旧 Modeler 的 destroy 被调用 = 重建开始。
+        const oldModel = editor.getModeler()
+        const originalDestroy = oldModel.destroy.bind(oldModel)
+        oldModel.destroy = function (...args) {
+          rebuildArmed = true
+          return originalDestroy(...args)
+        }
+        document.createElementNS = function (...args) {
+          if (rebuildArmed) throw new Error('rebuild constructor failed')
+          return originalCreateElementNS.apply(document, args)
+        }
+        const out = {
+          importError: '',
+          restoreReason: '',
+          saveError: '',
+          firstAgain: null,
+          secondAgain: null,
+          modelAfterFirst: false,
+          modelAfterSecond: false,
+        }
+        try {
+          await editor.importXML(xml)
+        } catch (error) {
+          out.importError = String((error && error.message) || error)
+        }
+        out.restoreReason = String(editor.getUnavailableReason() || '')
+        try {
+          await editor.saveXML()
+        } catch (error) {
+          out.saveError = String((error && error.message) || error)
+        }
+        // 故障仍在：再次导入必须失败，不能把 XML 当缓存就报告成功。
+        try {
+          await editor.importXML(validXml)
+          out.firstAgain = { ok: true }
+        } catch (error) {
+          out.firstAgain = { ok: false, message: String((error && error.message) || error) }
+        }
+        out.modelAfterFirst = editor.getModeler() !== null
+        // 解除故障：再次导入必须重新创建实例并真正成功。
+        document.createElementNS = originalCreateElementNS
+        try {
+          await editor.importXML(validXml)
+          out.secondAgain = { ok: true }
+        } catch (error) {
+          out.secondAgain = { ok: false, message: String((error && error.message) || error) }
+        }
+        out.modelAfterSecond = editor.getModeler() !== null
+        document.createElementNS = originalCreateElementNS
+        return out
+      }, noPlaneXml)
+      A.ok(result.importError !== '', '无 plane 导入必须报错')
+      A.match(result.restoreReason, /rebuild constructor failed/, '必须记录回滚重建失败原因')
+      A.match(result.saveError, /恢复失败|rebuild constructor failed/,
+        '保存必须给出明确的不可用原因，不能只说「画布尚未创建」')
+      A.equal(result.firstAgain.ok, false, '故障未解除时再次导入必须失败，不能报告假成功')
+      A.equal(result.modelAfterFirst, false, '失败后不能留下半成品实例')
+      A.equal(result.secondAgain.ok, true, '解除构造故障后再次导入必须成功')
+      A.equal(result.modelAfterSecond, true, '成功导入必须真正重建出模型，不能只写缓存 XML')
+    })
+
     await check('回归 #4：Change element 换成 Service Task 补齐合法 nodeType', async () => {
       await remountEditor(page)
       const ids = await createRegressionNodes(page)

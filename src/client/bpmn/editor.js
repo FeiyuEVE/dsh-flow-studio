@@ -112,6 +112,11 @@ export function mountEditor(container, options = {}) {
   propertiesEl.addEventListener('keydown', guardPanelKeyboard, true)
 
   let disposed = false
+  // 生命周期世代：每次 destroy +1。所有 await 之后都必须校验，
+  // 防止「导入/重建进行中编辑器被销毁」时继续操作已清空的实例（复审 M5）。
+  let lifecycle = 0
+  // 回滚重建失败后的显式不可用原因；再次导入必须先真正重建实例。
+  let unavailableReason = ''
   let instance = null
   let isViewer = options.mode === 'viewer'
   let currentXml = typeof options.xml === 'string' && options.xml.trim() !== '' ? options.xml : null
@@ -122,6 +127,22 @@ export function mountEditor(container, options = {}) {
 
   const onChange = typeof options.onChange === 'function' ? options.onChange : null
   const onError = typeof options.onError === 'function' ? options.onError : null
+
+  function destroyedError() {
+    return new Error('BPMN 画布已销毁')
+  }
+
+  function failureMessage(error) {
+    if (!error) return '未知原因'
+    if (typeof error === 'string') return error
+    if (typeof error.message === 'string' && error.message !== '') return error.message
+    return String(error)
+  }
+
+  /** 异步边界统一校验：销毁或世代变化后禁止再触碰 instance / 回滚重建。 */
+  function assertAlive(generation) {
+    if (disposed || generation !== lifecycle) throw destroyedError()
+  }
 
   if (isViewer) wrapper.classList.add('fs-bpmn-editor-viewer')
 
@@ -158,7 +179,8 @@ export function mountEditor(container, options = {}) {
   }
 
   function handleCommandChanged() {
-    if (suppressChange) return
+    // 销毁后旧 Modeler 若还活着，它的 commandStack 事件也不能再回调宿主。
+    if (disposed || suppressChange) return
     dirty = true
     if (onChange) {
       try {
@@ -238,7 +260,10 @@ export function mountEditor(container, options = {}) {
   }
 
   async function serialize(extra = {}) {
-    if (!instance) throw new Error('BPMN 画布尚未创建')
+    if (!instance) {
+      if (unavailableReason !== '') throw new Error('BPMN 画布不可用（恢复失败）：' + unavailableReason)
+      throw new Error('BPMN 画布尚未创建')
+    }
     if (isViewer) return currentXml || ''
     const result = await instance.saveXML({ format: true, ...extra })
     const xml = typeof result === 'string' ? result : (result && result.xml) || ''
@@ -250,11 +275,15 @@ export function mountEditor(container, options = {}) {
    * 用当前 moddle 预检 XML：bpmn-js 会先把新 definitions 装进 Modeler，再在绘制
    * 阶段因缺少 BPMN DI 抛错；预检把这类失败挡在替换当前模型之前。
    */
-  async function assertImportable(xml) {
-    if (!instance) return
-    const moddle = instance.get('moddle', false)
+  async function assertImportable(xml, generation) {
+    assertAlive(generation)
+    const target = instance
+    if (!target) throw destroyedError()
+    const moddle = target.get('moddle', false)
     if (!moddle || typeof moddle.fromXML !== 'function') return
     const parsed = await moddle.fromXML(xml)
+    // await 期间可能已被 destroy：绝不能用已清空的实例继续导入。
+    assertAlive(generation)
     const definitions = parsed && (parsed.rootElement || parsed)
     const diagrams = definitions && Array.isArray(definitions.diagrams) ? definitions.diagrams : []
     if (diagrams.length === 0) throw new Error('no diagram to display')
@@ -263,50 +292,72 @@ export function mountEditor(container, options = {}) {
   /**
    * 导入失败后的完整回滚：从旧 XML 重建 Modeler/Viewer，连同 definitions、DI、
    * 属性面板与撤销栈一起恢复，避免只恢复字符串、模型却停在新定义的空壳里。
+   *
+   * 重建失败时销毁半成品并抛出原因，由 `loadXml` 把编辑器标记为不可用；
+   * document 已销毁则直接中止，禁止「销毁后回滚又造出一个无法销毁的 Modeler」。
    */
-  async function restoreModel(previousXml, previousDirty) {
+  async function restoreModel(previousXml, previousDirty, generation) {
+    assertAlive(generation)
     const wasSuppressed = suppressChange
     suppressChange = true
     try {
       destroyInstance()
-      await createInstance()
+      assertAlive(generation)
+      await createInstance(generation)
+      assertAlive(generation)
       if (previousXml) {
         await instance.importXML(previousXml)
       } else if (!isViewer) {
         await instance.createDiagram()
       }
+      assertAlive(generation)
       resetHistory()
       dirty = previousDirty
       fitViewport()
       applyRuntimeMarkers()
+    } catch (error) {
+      // 重建失败：不能留下半成品实例，也不能让后续 loadXml 把 XML 当缓存静默成功。
+      destroyInstance()
+      throw error
     } finally {
       suppressChange = wasSuppressed
     }
   }
 
-  async function loadXml(xml) {
+  async function loadXml(xml, generation) {
     const next = String(xml)
+    assertAlive(generation)
     if (!instance) {
-      currentXml = next
-      return
+      // 只有回滚重建失败 / 尚未 ready 才会走到这里：必须真正重新创建实例，
+      // 不能把 XML 写进 currentXml 就当成功（复审 M6）。
+      await createInstance(generation)
+      assertAlive(generation)
     }
     const previous = currentXml
     const previousDirty = dirty
     // 先独立解析并检查 DI，再触碰当前实例；无 DI 的合法 XML 会在这里被拒绝。
-    await assertImportable(next)
+    await assertImportable(next, generation)
+    assertAlive(generation)
     try {
       await instance.importXML(next)
     } catch (error) {
+      // 销毁是取消这次导入，不是导入失败：不许回滚重建。
+      if (disposed || generation !== lifecycle) throw destroyedError()
       // bpmn-js 在绘制失败前可能已经替换 _definitions：重建整个实例恢复旧模型。
       currentXml = previous
       try {
-        await restoreModel(previous, previousDirty)
+        await restoreModel(previous, previousDirty, generation)
       } catch (restoreError) {
+        if (disposed || generation !== lifecycle) throw destroyedError()
+        unavailableReason = failureMessage(restoreError)
         if (error && typeof error === 'object') error.restoreError = restoreError
       }
       throw error
     }
+    // importXML 期间被销毁：模型已经不是这台编辑器的，不能再确认成功。
+    assertAlive(generation)
     currentXml = next
+    unavailableReason = ''
     resetHistory()
     fitViewport()
     applyRuntimeMarkers()
@@ -317,7 +368,14 @@ export function mountEditor(container, options = {}) {
     if (typeof xml !== 'string' || xml.trim() === '') {
       throw new TypeError('importXML(xml) 需要非空 BPMN XML 字符串')
     }
-    await loadXml(xml)
+    const generation = lifecycle
+    try {
+      await loadXml(xml, generation)
+    } catch (error) {
+      // 被销毁时不把「实例已清空」之类的内部错误抛给宿主。
+      if (disposed || generation !== lifecycle) throw destroyedError()
+      throw error
+    }
     return { ok: true }
   }
 
@@ -328,27 +386,50 @@ export function mountEditor(container, options = {}) {
 
   function destroyInstance() {
     clearRuntimeMarkers()
-    if (!instance) return
     const target = instance
     instance = null
-    try {
-      target.destroy()
-    } catch {
-      // 销毁失败不阻断卸载
+    if (target) {
+      try {
+        target.destroy()
+      } catch {
+        // 销毁失败不阻断卸载
+      }
     }
+    // 构造失败可能留下部分 DOM：即使 instance 为空也要清干净画布容器。
     while (canvasEl.firstChild) canvasEl.removeChild(canvasEl.firstChild)
   }
 
-  async function createInstance() {
+  async function createInstance(generation = lifecycle) {
+    assertAlive(generation)
     destroyInstance()
-    instance = isViewer ? buildViewer() : buildModeler()
-    attachListeners(instance)
-    wrapper.classList.toggle('fs-bpmn-editor-viewer', isViewer)
-    propertiesEl.hidden = isViewer
-    if (isViewer) {
-      propsElClear()
+    assertAlive(generation)
+    let built = null
+    try {
+      built = isViewer ? buildViewer() : buildModeler()
+      // 构造是同步的，但保留边界检查：销毁后不能把模型挂到已卸载的容器上。
+      if (disposed || generation !== lifecycle) throw destroyedError()
+      instance = built
+      attachListeners(instance)
+      wrapper.classList.toggle('fs-bpmn-editor-viewer', isViewer)
+      propertiesEl.hidden = isViewer
+      if (isViewer) {
+        propsElClear()
+      }
+      return instance
+    } catch (error) {
+      if (built) {
+        try {
+          built.destroy()
+        } catch {
+          // 构造半成品销毁失败不阻断
+        }
+      }
+      instance = null
+      // 构造失败可能已经往画布容器里加了节点：清理掉再抛错。
+      while (canvasEl.firstChild) canvasEl.removeChild(canvasEl.firstChild)
+      if (!disposed && generation === lifecycle) unavailableReason = failureMessage(error)
+      throw error
     }
-    return instance
   }
 
   /** Viewer 没有属性面板模块，清掉可能残留的面板 DOM。 */
@@ -358,23 +439,29 @@ export function mountEditor(container, options = {}) {
 
   async function setViewerMode(enabled) {
     if (disposed) throw new Error('BPMN 画布已销毁')
+    const generation = lifecycle
     const next = Boolean(enabled)
-    if (next === isViewer) return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }
+    // 模式相同且实例还在：无需重建；实例已经被销毁 / 恢复失败时必须重建。
+    if (next === isViewer && instance) return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }
     if (!isViewer) {
       try {
         await serialize()
       } catch {
         // 空图还没有定义时保持已有 currentXml/undefined
       }
+      assertAlive(generation)
     }
     isViewer = next
-    await createInstance()
+    await createInstance(generation)
+    assertAlive(generation)
     if (currentXml) {
       await instance.importXML(currentXml)
     } else if (!isViewer) {
       await instance.createDiagram()
       currentXml = await serialize()
     }
+    assertAlive(generation)
+    unavailableReason = ''
     resetHistory()
     fitViewport()
     applyRuntimeMarkers()
@@ -414,6 +501,8 @@ export function mountEditor(container, options = {}) {
   function destroy() {
     if (disposed) return
     disposed = true
+    // 先推进世代：任何在飞导入 / 回滚重建都会在下一个 await 边界中止。
+    lifecycle += 1
     propertiesEl.removeEventListener('keydown', guardPanelKeyboard, true)
     destroyInstance()
     if (wrapper.parentNode) wrapper.parentNode.removeChild(wrapper)
@@ -435,6 +524,10 @@ export function mountEditor(container, options = {}) {
     isDestroyed() {
       return disposed
     },
+    /** 回滚重建失败后的不可用原因；空串 = 可用。 */
+    getUnavailableReason() {
+      return unavailableReason
+    },
     getContainer() {
       return wrapper
     },
@@ -447,17 +540,21 @@ export function mountEditor(container, options = {}) {
   }
 
   controller.ready = (async () => {
+    const generation = lifecycle
     try {
-      await createInstance()
+      await createInstance(generation)
+      assertAlive(generation)
       if (currentXml) {
         await instance.importXML(currentXml)
       } else if (!isViewer) {
         await instance.createDiagram()
         currentXml = await serialize()
       }
+      assertAlive(generation)
       resetHistory()
       fitViewport()
       applyRuntimeMarkers()
+      unavailableReason = ''
       dirty = false
       if (onChange) onChange({ dirty: false, mode: isViewer ? 'viewer' : 'modeler' })
       return { ok: true, mode: isViewer ? 'viewer' : 'modeler' }

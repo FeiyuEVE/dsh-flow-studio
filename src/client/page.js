@@ -202,6 +202,16 @@ export function failureMessage(error) {
   return String(error)
 }
 
+/**
+ * 编辑器控制器报告的「不可用」原因（导入回滚重建失败后的显式降级态）。
+ * 页面必须据此把画布标成 error 并展示原因，不能继续提示“导入成功”。
+ */
+export function editorUnavailableReason(editor) {
+  if (!editor || typeof editor.getUnavailableReason !== 'function') return ''
+  const reason = editor.getUnavailableReason()
+  return typeof reason === 'string' ? reason : (reason ? String(reason) : '')
+}
+
 /** 事件游标：取事件 max(seq) 与提供值里的较大者。 */
 export function eventCursorOf(events, fallback = 0) {
   let cursor = Number.isSafeInteger(fallback) && fallback >= 0 ? fallback : 0
@@ -250,7 +260,12 @@ export function FlowStudioPage(props = {}) {
   const draftIdRef = useRef(initialDefinition && initialDefinition.id ? initialDefinition.id : newDefinitionId())
   const editorRef = useRef(null)
   const viewRef = useRef(initialInstance
-    ? { kind: 'instance', xml: initialInstanceXml, markers: runtimeMarkersFromEvents(initialEvents) }
+    ? {
+      kind: 'instance',
+      instanceId: typeof initialInstance.id === 'string' ? initialInstance.id : '',
+      xml: initialInstanceXml,
+      markers: runtimeMarkersFromEvents(initialEvents),
+    }
     : { kind: 'definition', xml: initialDefinition && typeof initialDefinition.xml === 'string' ? initialDefinition.xml : '', markers: [] })
   const viewSeqRef = useRef(0)
   // 视图选择世代：定义与实例**共用**同一个计数器。打开定义 / 打开实例 / 新建 / 导入
@@ -258,7 +273,19 @@ export function FlowStudioPage(props = {}) {
   // 迟到的实例响应因此不能覆盖后来选择的定义（反之亦然）。
   const selectSeqRef = useRef(0)
   const eventsRef = useRef(initialEvents.slice())
-  const lastSeqRef = useRef(eventCursorOf(initialEvents, initialInstance && initialInstance.lastSeq))
+  // 已消费游标：只取**实际返回事件**的最大 seq。Host 的 `lastSeq` 是「预留游标」
+  // （先写 instance.lastSeq、后追加事件），可能超前于可读事件；拿它当 since 会
+  // 永久跳过尚未落盘的事件（0.13.4 复审 M3）。
+  const lastSeqRef = useRef(eventCursorOf(initialEvents))
+  // Host 目标游标：只用于判断「终态是否已经追平」，绝不作为 since 使用。
+  const targetSeqRef = useRef(initialInstance && Number.isSafeInteger(initialInstance.lastSeq)
+    ? initialInstance.lastSeq
+    : 0)
+  // 「实例已终态」与「事件已追平」是两件事：只有后者为 true 才能停轮询。
+  const initialCaughtUp = initialInstance !== null && isTerminalStatus(initialInstance.status)
+    ? eventCursorOf(initialEvents) >= targetSeqRef.current
+    : false
+  const eventsCaughtUpRef = useRef(initialCaughtUp)
   // 事件缓存属于哪个实例：切实例时立即清空，绝不复用上一个实例的事件 / 游标。
   const eventsInstanceRef = useRef(initialInstance && typeof initialInstance.id === 'string'
     ? initialInstance.id
@@ -278,6 +305,7 @@ export function FlowStudioPage(props = {}) {
   })
   const [events, setEvents] = useState(() => initialEvents.slice())
   const [lastSeq, setLastSeq] = useState(() => lastSeqRef.current)
+  const [eventsCaughtUp, setEventsCaughtUp] = useState(initialCaughtUp)
   const [drawerOpen, setDrawerOpen] = useState(props.initialDrawerOpen === true || Boolean(initialInstance))
   const [selectedElementId, setSelectedElementId] = useState('')
   const [submittingTasks, setSubmittingTasks] = useState(() => new Set())
@@ -302,6 +330,13 @@ export function FlowStudioPage(props = {}) {
   const templates = useMemo(() => listTemplates(), [])
 
   const activeInstanceId = activeInstance && typeof activeInstance.id === 'string' ? activeInstance.id : ''
+
+  /** 同步「事件是否已追平」：ref 供异步路径读，state 驱动轮询 effect 的停/续。 */
+  const markCaughtUp = useCallback(value => {
+    const next = value === true
+    eventsCaughtUpRef.current = next
+    setEventsCaughtUp(current => (current === next ? current : next))
+  }, [])
 
   // ── 本地 XML 草稿：去抖 + maxWait + 乱序丢弃；只写 localStorage，不建服务端版本 ──
   useEffect(() => {
@@ -380,6 +415,9 @@ export function FlowStudioPage(props = {}) {
    * 合并一批实例事件：只追新、按 seq 去重升序，并同步游标 / 画布 marker。
    * 事件与 lastSeq 都挂在实例级 ref 上，切实例前先清空，绝不回退到上一个实例。
    *
+   * `payload.lastSeq` 是 Host 的**预留游标**（先写 instance.lastSeq，再追加事件），
+   * 不能拿来推进 since；已消费游标只认实际返回事件的最大 seq。
+   *
    * @returns {number} 合并后的显示游标（已加载事件的最大 seq）
    */
   const applyEventBatch = useCallback(payload => {
@@ -388,10 +426,7 @@ export function FlowStudioPage(props = {}) {
       payload && Array.isArray(payload.events) ? payload.events : [],
       { baseSeq: lastSeqRef.current },
     )
-    const cursor = eventCursorOf(
-      merged.events,
-      Math.max(lastSeqRef.current, payload && Number.isSafeInteger(payload.lastSeq) ? payload.lastSeq : 0),
-    )
+    const cursor = merged.lastSeq
     eventsRef.current = merged.events
     lastSeqRef.current = cursor
     setEvents(merged.events)
@@ -402,12 +437,13 @@ export function FlowStudioPage(props = {}) {
   }, [])
 
   /**
-   * 进入终态、停轮询**之前**先追平 `detail.lastSeq`。
+   * 进入终态、停轮询**之前**先追平 `targetSeq`。
    *
    * 轮询顺序是先读事件、再读详情，两次请求之间实例可能已经结束：
    * 详情返回 `COMPLETED,lastSeq=4` 而事件只到 seq=2 时，直接停轮询会让最后的
-   * activity/end、process/end 永远不再读取。这里循环补拉到 displayLastSeq >=
-   * target，并用 `TERMINAL_EVENT_CATCHUP_LIMIT` 防死循环。
+   * activity/end、process/end 永远不再读取。这里循环补拉到已消费游标 >= target，
+   * 并用 `TERMINAL_EVENT_CATCHUP_LIMIT` 防止单次 tick 死循环；返回 false 时调用方
+   * 必须继续安排重试（不能把「暂时失败」当成「已经追平」）。
    */
   const catchUpInstanceEvents = useCallback(async (instanceId, targetSeq, generation) => {
     const target = Number.isSafeInteger(targetSeq) && targetSeq >= 0 ? targetSeq : 0
@@ -426,7 +462,7 @@ export function FlowStudioPage(props = {}) {
       if (eventsInstanceRef.current !== instanceId) return false
       const before = lastSeqRef.current
       applyEventBatch(data)
-      // 游标没有推进：再拉也是同一批，立即收手。
+      // 游标没有推进：再拉也是同一批，交给调用方退避重试（不能静默停）。
       if (lastSeqRef.current <= before) return false
     }
     return lastSeqRef.current >= target
@@ -459,13 +495,24 @@ export function FlowStudioPage(props = {}) {
         await editor.importXML(view.xml)
         if (seq !== viewSeqRef.current) return { ok: false, reason: '已被新的画布请求取代' }
       }
-      editor.setRuntimeState(Array.isArray(view.markers) ? view.markers : [])
+      // 导入是异步的：期间轮询可能已经收到终态事件。实例视图必须按**当前归属的
+      // 最新事件缓存**重算 marker，不能把调用时捕获的旧 markers 写回（复审 M4）。
+      const markers = view.kind === 'instance' && eventsInstanceRef.current === view.instanceId
+        ? runtimeMarkersFromEvents(eventsRef.current)
+        : (Array.isArray(view.markers) ? view.markers : [])
+      editor.setRuntimeState(markers)
       return { ok: true }
     } catch (error) {
+      const unavailable = editorUnavailableReason(editor)
       if (seq === viewSeqRef.current) {
-        setNotice({ kind: 'error', text: '画布加载失败（保留原图）：' + failureMessage(error) })
+        if (unavailable !== '') setCanvasStatus('error')
+        setNotice({
+          kind: 'error',
+          text: '画布加载失败（保留原图）：' + failureMessage(error)
+            + (unavailable !== '' ? `；画布不可用：${unavailable}` : ''),
+        })
       }
-      return { ok: false, reason: failureMessage(error) }
+      return { ok: false, reason: failureMessage(error), unavailable }
     }
   }, [])
 
@@ -573,12 +620,24 @@ export function FlowStudioPage(props = {}) {
     // 刷新待办后要保留 404 / 409 的服务端原因，不能被刷新动作立即清掉。
     if (options.preserveNotice !== true) setNotice(null)
     setEventError('')
-    // 切实例：事件缓存与游标按 instanceId 隔离，先立即清空旧实例的事件。
+    // 切实例：事件缓存与游标按 instanceId 隔离。切换是一次完整状态转换：先备份
+    // 旧实例的归属与缓存，详情加载失败时必须整体回滚，不能留下
+    // activeInstance=A / eventsOwner=B 的撕裂状态（复审 M1）。
     const switched = eventsInstanceRef.current !== id
+    let previous = null
     if (switched) {
+      previous = {
+        owner: eventsInstanceRef.current,
+        events: eventsRef.current,
+        lastSeq: lastSeqRef.current,
+        targetSeq: targetSeqRef.current,
+        caughtUp: eventsCaughtUpRef.current,
+      }
       eventsInstanceRef.current = id
       eventsRef.current = []
       lastSeqRef.current = 0
+      targetSeqRef.current = 0
+      markCaughtUp(false)
       setEvents([])
       setLastSeq(0)
       // 旧实例的运行态 marker 也一并清掉（稍后会按新实例事件重算）。
@@ -593,6 +652,11 @@ export function FlowStudioPage(props = {}) {
       ])
       if (seq !== selectSeqRef.current || !mountedRef.current) return false
       setActiveInstance(detail)
+      const detailTarget = detail && Number.isSafeInteger(detail.lastSeq) ? detail.lastSeq : 0
+      const eventsTarget = eventsPayload && !eventsPayload.__error
+        && Number.isSafeInteger(eventsPayload.lastSeq) ? eventsPayload.lastSeq : 0
+      // Host 目标游标：只用于判断终态是否追平，绝不作为 since 使用。
+      targetSeqRef.current = Math.max(detailTarget, eventsTarget)
       setTasks(normalizeTasks(tasksPayload && !tasksPayload.__error
         ? tasksPayload
         : (detail && detail.pendingTasks)))
@@ -600,26 +664,34 @@ export function FlowStudioPage(props = {}) {
         // 切实例时从空集合开始；同一实例刷新才在已加载事件上增量合并。
         const base = switched ? [] : eventsRef.current
         const merged = mergeInstanceEvents(base, Array.isArray(eventsPayload.events) ? eventsPayload.events : [], {
-          baseSeq: Number.isSafeInteger(eventsPayload.lastSeq) ? eventsPayload.lastSeq : 0,
+          baseSeq: switched ? 0 : lastSeqRef.current,
         })
         eventsRef.current = merged.events
-        lastSeqRef.current = eventCursorOf(merged.events, merged.lastSeq)
+        // 已消费游标 = 实际事件的最大 seq；Host 的 lastSeq 可能先于事件落盘。
+        lastSeqRef.current = merged.lastSeq
         setEvents(merged.events)
         setLastSeq(lastSeqRef.current)
       } else if (eventsPayload && eventsPayload.__error) {
         // 请求失败：保留空集合 + 错误提示，绝不回退到上一个实例的事件 / 游标。
         setEventError('读取实例事件失败：' + failureMessage(eventsPayload.__error))
       }
-      // 实例可能在校验事件 / 详情之间已经结束：停轮询前先追平 detail.lastSeq。
-      if (isTerminalStatus(detail && detail.status)) {
-        await catchUpInstanceEvents(id, detail && detail.lastSeq, seq)
+      // 实例可能在校验事件 / 详情之间已经结束：停轮询前先追平目标游标。
+      // 无论是否终态都先清掉「已追平」标记：非终态本来就不算追平，否则之后
+      // 转为终态时轮询 effect 会被旧标记误导而直接停止（复审 M2 的竞态）。
+      const terminal = isTerminalStatus(detail && detail.status)
+      markCaughtUp(false)
+      if (terminal) {
+        const done = await catchUpInstanceEvents(id, targetSeqRef.current, seq)
         if (seq !== selectSeqRef.current || !mountedRef.current) return false
+        // 补拉失败时不置为「已追平」：轮询 effect 会继续退避重试（复审 M2）。
+        markCaughtUp(done)
       }
       if (snapshot && snapshot.__error) {
         setNotice({ kind: 'error', text: '读取实例定义快照失败：' + failureMessage(snapshot.__error) })
       } else if (snapshot && typeof snapshot.xml === 'string') {
         await applyCanvasView({
           kind: 'instance',
+          instanceId: id,
           xml: snapshot.xml,
           markers: runtimeMarkersFromEvents(eventsRef.current),
         })
@@ -629,11 +701,22 @@ export function FlowStudioPage(props = {}) {
       return true
     } catch (error) {
       if (seq !== selectSeqRef.current || !mountedRef.current) return false
+      // 切换失败：恢复原实例的缓存归属、游标与画布 marker，旧实例轮询继续生效。
+      if (previous !== null) {
+        eventsInstanceRef.current = previous.owner
+        eventsRef.current = previous.events
+        lastSeqRef.current = previous.lastSeq
+        targetSeqRef.current = previous.targetSeq
+        markCaughtUp(previous.caughtUp)
+        setEvents(previous.events)
+        setLastSeq(previous.lastSeq)
+        syncRuntimeMarkers(editorRef.current, runtimeMarkersFromEvents(previous.events))
+      }
       setLoadingInstance(false)
       setNotice({ kind: 'error', text: `打开实例 ${id} 失败：` + failureMessage(error) })
       return false
     }
-  }, [applyCanvasView, catchUpInstanceEvents, client, flushLocalDraft])
+  }, [applyCanvasView, catchUpInstanceEvents, client, flushLocalDraft, markCaughtUp])
 
   /** 保存版本：提交属性输入 → 序列化最新 XML → POST /definitions → 钉版本。 */
   const saveDefinition = useCallback(async () => {
@@ -949,9 +1032,21 @@ export function FlowStudioPage(props = {}) {
       viewRef.current = { kind: 'definition', xml: text, markers: [] }
       setViewKind('definition')
       editor.setRuntimeState([])
+      // 恢复失败后再次导入成功（编辑器已重建）：画布重新可用。
+      if (editorUnavailableReason(editor) === '') setCanvasStatus('ready')
       return true
     } catch (error) {
-      setNotice({ kind: 'error', text: '导入失败（保留原定义）：' + failureMessage(error) })
+      // 回滚重建失败时编辑器进入不可用态：必须显式显示原因并降级画布状态，
+      // 不能继续提示“导入成功”（复审 M6）。
+      const restoreReason = error && error.restoreError ? failureMessage(error.restoreError) : ''
+      const unavailable = editorUnavailableReason(editor)
+      if (unavailable !== '') setCanvasStatus('error')
+      setNotice({
+        kind: 'error',
+        text: '导入失败（保留原定义）：' + failureMessage(error)
+          + (restoreReason !== '' ? `；画布恢复失败：${restoreReason}` : '')
+          + (unavailable !== '' ? '；画布不可用，请重新导入 BPMN 或刷新页面。' : ''),
+      })
       // 画布可能已经从 viewer 切到 modeler：恢复原视图。
       if (previousView.kind === 'instance') {
         await applyCanvasView(previousView)
@@ -983,10 +1078,11 @@ export function FlowStudioPage(props = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── 实例事件增量轮询：?since=lastSeq，合并去重；终态停止 ────────────────────
+  // ── 实例事件增量轮询：?since=已消费游标；终态且追平后才停 ─────────────────
   useEffect(() => {
     if (viewKind !== 'instance' || activeInstanceId === '') return undefined
-    if (isTerminalStatus(activeInstance && activeInstance.status)) return undefined
+    // 「实例已终态」与「事件已追平」分别记录：只有两者都成立才停止轮询。
+    if (isTerminalStatus(activeInstance && activeInstance.status) && eventsCaughtUp) return undefined
     let cancelled = false
     let timer = null
     let failures = 0
@@ -998,6 +1094,27 @@ export function FlowStudioPage(props = {}) {
         if (cancelled) return
         const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
         timer = setTimeout(tick, nextEventPollDelay({ failures, hidden }))
+      }
+      // 终态分支：只补拉事件；补拉失败必须继续退避重试，不能静默停。
+      if (isTerminalStatus(activeInstance && activeInstance.status)) {
+        const target = targetSeqRef.current
+        const done = await catchUpInstanceEvents(activeInstanceId, target, generation)
+        if (cancelled || !mountedRef.current) return
+        if (generation !== selectSeqRef.current) {
+          scheduleNext()
+          return
+        }
+        if (!done) {
+          failures += 1
+          if (eventsInstanceRef.current === activeInstanceId) {
+            setEventError(`终态事件尚未追平（已到 seq=${lastSeqRef.current}，目标 ${target}）：继续重试。`)
+          }
+          scheduleNext()
+          return
+        }
+        markCaughtUp(true)
+        void refreshInstances()
+        return
       }
       try {
         const data = await client.readInstanceEvents(activeInstanceId, nextEventsQuery(lastSeqRef.current))
@@ -1017,16 +1134,30 @@ export function FlowStudioPage(props = {}) {
           return
         }
         setActiveInstance(detail)
+        const targetSeq = detail && Number.isSafeInteger(detail.lastSeq) ? detail.lastSeq : 0
+        if (targetSeq > targetSeqRef.current) targetSeqRef.current = targetSeq
         if (Array.isArray(detail.pendingTasks)) setTasks(normalizeTasks(detail.pendingTasks))
         if (isTerminalStatus(detail.status)) {
-          // 先追平 detail.lastSeq 再停轮询：否则最后一批 activity/end、process/end 永远读不到。
-          await catchUpInstanceEvents(activeInstanceId, detail.lastSeq, generation)
+          // 先追平目标游标再停轮询：否则最后一批 activity/end、process/end 永远读不到。
+          const target = Math.max(targetSeq, lastSeqRef.current)
+          targetSeqRef.current = target
+          const done = await catchUpInstanceEvents(activeInstanceId, target, generation)
           if (!mountedRef.current) return
           if (generation !== selectSeqRef.current) {
             // 同一实例被重新选择（刷新）时本次追平已失效；下一轮按新世代继续。
             scheduleNext()
             return
           }
+          if (!done) {
+            // 一次暂时性失败不能永久丢掉收尾事件：保留轮询并按退避继续重试。
+            failures += 1
+            if (eventsInstanceRef.current === activeInstanceId) {
+              setEventError(`终态事件尚未追平（已到 seq=${lastSeqRef.current}，目标 ${target}）：继续重试。`)
+            }
+            scheduleNext()
+            return
+          }
+          markCaughtUp(true)
           void refreshInstances()
           return
         }
@@ -1044,7 +1175,7 @@ export function FlowStudioPage(props = {}) {
       if (timer !== null) clearTimeout(timer)
     }
   }, [activeInstanceId, activeInstance && activeInstance.status, applyEventBatch,
-    catchUpInstanceEvents, client, refreshInstances, viewKind])
+    catchUpInstanceEvents, client, eventsCaughtUp, markCaughtUp, refreshInstances, viewKind])
 
   // ── 页面隐藏 / 卸载前把最后一版草稿落盘 ──────────────────────────────────
   useEffect(() => {

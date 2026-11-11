@@ -2331,7 +2331,9 @@ class BpmnRuntime {
             delivered: false,
             reply: dispatched.reply,
             code: INSTANCE_INBOX_ERROR.REPLY_DISPATCH_IN_FLIGHT,
-            error: `回复 ${enqueued.reply.replyId} 正在另一个进程投递中；不要并发重复外发，稍后用同一 replyId 重试`,
+            error: dispatched.dispatchUnknown === true
+              ? `回复 ${enqueued.reply.replyId} 的投递权归属无法确认（跨主机 / 旧格式领取记录），Host 不按时间猜、不自动接管；为避免重复外发，请人工确认后再处理`
+              : `回复 ${enqueued.reply.replyId} 正在另一个进程投递中；不要并发重复外发，稍后用同一 replyId 重试`,
           },
         }
       }

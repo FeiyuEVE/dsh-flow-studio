@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.10）
+# 版本历史（0.1 → 0.13.11）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -696,3 +696,29 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - F1 的定向注销依赖 `git worktree remove <缺失路径>`（git 2.47.3 验证）；更老的 Git 失败时只保留登记，不会退回全仓 prune。
 - F4 的锁释放仍是「核对 owner + inode 后 unlink」，跨文件系统 / 网络盘的 inode 语义不保证。
 - 实例域工作树的物理存活跟踪是进程内记账，跨宿主重启的孤儿 agent 进程没有持久化所有权证据。
+
+## 0.13.11 — 实例域运行指标
+
+实例域现在能回答「跑了多久、调了多少、卡在谁那儿、错在哪」：单实例与跨实例两套只读接口，加详情面板与列表汇总，口径写进 `design/12`。
+
+- 两条只读路由：`GET /instances/<id>/metrics`（单实例，支持 `?asOf=` 确定性复算）与 `GET /metrics`（跨实例汇总：`definitionId`、`definitionVersion`、`from` / `to`、`status`、`groupBy=day`、`asOf`）。
+- 口径：实例墙钟（`createdAt → completedAt/asOf`）、挂起单列、节点按 `executionId` 计时并单列错误 / 取消 / 中断、人工等待（首次 wait → complete/cancel/asOf，**没有新事件也继续增长**）、agent 调用次数（提醒续跑算一次调用，不算新 attempt）、模型调用与 token（`provider + callId` 去重，四桶归一化：input 已含 cache 先拆，reasoning 不另加 total）、`finish_reminder` 逐次计数、`NODE_FINISH_MISSING` 按错误事实 + execution 去重、connector 成功率（execution 级与 attempt 级分列）与两种延迟（单次请求、含退避总耗时）。
+- **未知不是零**：没有底层观测时给 `null` 并写 `dataQuality.reasons`，`usageCoverage` 分开记 known / unknown；不把「没看见」写成 0。
+- **不双计**：同一 execution 有 `agent/usage` 时忽略 `activity/end.usage`；resume 重放不重置人工等待起点。
+- 观测量在调用收尾落账：超时、取消、未 finish 的调用仍保留已观测 usage（不再只从成功的 `activity/end` 取数）。
+- 缓存绑 `lastSeq / revision / schemaVersion`（外加 connector、资源指纹），追加事件即失效；`GET` 是纯读，**不启动 runner**，缓存可删可重建。
+- 汇总按实例 `createdAt` 选 cohort，遍历 `instances/` 下全部实例（不踩 `listInstances` 默认 limit），分位数从样本合并；损坏实例计入 `skippedInstances`，不中断整张表。
+- 没有「完成百分比」：给已执行节点数 / 当前活动 / 等待任务；业务进度只能读显式标量变量，并标注是业务指标。
+- GUI：实例详情新增指标区块，列表有汇总；`null` 渲染成「未知 / 无样本」，不给假零。
+- 文档：`docs/design/12-instance-metrics.md` 是指标口径唯一来源；`docs/reference/instance-api.md` 新增「运行指标」一节，`host-api.md` 只留旧运行域并指过去。
+
+**已知边界**
+- usage 在调用收尾批量落事件：进程硬崩溃会丢尚未 flush 的已观测 token。
+- 真实 provider 的 usage 形状用黄金样例与假适配器对齐，容器里没有跑真实 dsh / codex 宿主。
+- suspend / resume 还没有公开路由；指标已能处理 `SUSPENDED` 状态与 `instance/suspended|resumed` 事件。
+- 不做价格 / 费用推算，也不做固定阈值的健康判决。
+
+**实例域参考文档到位**
+
+- 新增 `docs/reference/instance-api.md`：定义域 + 实例域的全部 HTTP 路由、请求 / 响应字段、错误码与语义口径（状态、收件箱、worktree、connector、资源事件）。`host-api.md` 退回只描述旧运行域并一行指过去，`design/10` 保留设计记录。
+- 文档里如实标出「没有的路由」：没有 `GET /instances/<id>/connector` 读取调用记录、没有删除实例、没有 suspend / resume、没有列回复 outbox。

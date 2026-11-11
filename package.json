@@ -1,6 +1,6 @@
 {
   "name": "@feiyueve/dsh-flow-studio",
-  "version": "0.13.10",
+  "version": "0.13.11",
   "description": "DeepSeek Harness 智能体工作流编排工作室：可视化画布拖拽节点、配置每个节点的执行方式（单个 agent / 主管 + 子 agent）与角色定位、设计需求分析→方案设计→结构设计→开发→测试→代码审查的状态流转与打回循环，流程模板保存在 Host 侧，后续可直接接执行引擎与指标看板。Visual agent-workflow studio for DeepSeek Harness: a drag-and-drop canvas where every node is an agent role, a stage machine with rejection loops, and saved flow templates.",
   "type": "module",
   "main": "lib/index.js",

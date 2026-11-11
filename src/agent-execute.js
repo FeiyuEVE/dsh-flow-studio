@@ -306,6 +306,36 @@ function sleep(ms) {
 }
 
 /**
+ * 等待一次清理动作（cancel / dispose），至多 `waitMs`。
+ *
+ * 复审 F9：清理动作本身可能永不返回（适配器 bug / 进程卡死），handler 不能
+ * 因此无限挂起。超时返回 `{ timedOut: true }`；迟到的 resolve / rejection 都被
+ * 吞掉，资源占用由 runtime 的 lifecycle 继续记账（不能因为 handler 提前收口
+ * 就错误释放槽位）。
+ *
+ * @param {() => Promise<unknown>} run
+ * @param {number} waitMs
+ * @returns {Promise<{timedOut: boolean, error?: Error}>}
+ */
+function waitBounded(run, waitMs) {
+  return new Promise(resolveWait => {
+    let timer = null
+    let settled = false
+    const settle = outcome => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      resolveWait(outcome)
+    }
+    Promise.resolve().then(run).then(
+      () => settle({ timedOut: false }),
+      error => settle({ timedOut: false, error }),
+    )
+    timer = setTimeout(() => settle({ timedOut: true }), Math.max(0, waitMs))
+  })
+}
+
+/**
  * 跑完一次 agent 活动，返回 runner 契约里的结果对象。
  *
  * @param {{
@@ -386,6 +416,10 @@ export async function runAgentNode(options = {}) {
   let settledBy = null
   let timer = null
   let abortListener = null
+  // 复审 F9：清理动作（cancel / dispose）是否有界地失败；诊断信息挂到最终错误上。
+  let cancelTimedOut = false
+  let disposeTimedOut = false
+  let thrown = null
   let resolveAborted
   const aborted = new Promise(resolvePromise => { resolveAborted = resolvePromise })
   // review-0131 #3：有效时限 = 显式 options.effectiveTimeoutMs（executeAgent 解析的
@@ -420,12 +454,15 @@ export async function runAgentNode(options = {}) {
     : null
 
   const cancelHandle = async reason => {
-    if (handle === null) return
-    try {
-      await adapter.cancel(handle, reason)
-    } catch (error) {
-      log('warn', `flow-studio: 取消 agent 活动失败（节点 ${nodeId}）：${errorText(error)}`)
+    if (handle === null) return false
+    const outcome = await waitBounded(() => adapter.cancel(handle, reason), cancelGraceMs)
+    if (outcome.timedOut) {
+      cancelTimedOut = true
+      log('warn', `flow-studio: 取消 agent 活动超过 ${cancelGraceMs}ms 未返回（节点 ${nodeId}）：继续收口，执行占用保持到物理退出确认`)
+      return true
     }
+    if (outcome.error) log('warn', `flow-studio: 取消 agent 活动失败（节点 ${nodeId}）：${errorText(outcome.error)}`)
+    return false
   }
 
   /**
@@ -596,7 +633,15 @@ export async function runAgentNode(options = {}) {
       throw agentHandlerError(
         AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT,
         `活动 ${nodeId} 超过 ${configuredTimeoutMs}ms 的活动时限仍未调用 ${FINISH_TOOL_NAME} 完结（已取消适配器）`,
-        { elementId: nodeId, activityId: executionId, adapter: adapter.id, timeoutMs: configuredTimeoutMs, remainingTimeoutMs: timeoutMs, phase: 'activity' },
+        {
+          elementId: nodeId,
+          activityId: executionId,
+          adapter: adapter.id,
+          timeoutMs: configuredTimeoutMs,
+          remainingTimeoutMs: timeoutMs,
+          phase: 'activity',
+          ...(cancelTimedOut ? { cleanupPending: true, cancelPending: true } : {}),
+        },
       )
     }
 
@@ -606,7 +651,13 @@ export async function runAgentNode(options = {}) {
       throw agentHandlerError(
         AGENT_EXECUTE_ERROR.ABORTED,
         `活动 ${nodeId} 被取消（ctx.signal abort），已取消适配器`,
-        { elementId: nodeId, activityId: executionId, adapter: adapter.id, reason: 'aborted' },
+        {
+          elementId: nodeId,
+          activityId: executionId,
+          adapter: adapter.id,
+          reason: 'aborted',
+          ...(cancelTimedOut ? { cleanupPending: true, cancelPending: true } : {}),
+        },
       )
     }
 
@@ -688,6 +739,10 @@ export async function runAgentNode(options = {}) {
       ...(reminders === undefined ? {} : { reminders }),
       ...(events.length > 0 ? { events } : {}),
     })
+  } catch (error) {
+    // 记下正在冒泡的错误：finally 里的清理超时诊断要挂到同一个对象上。
+    thrown = error
+    throw error
   } finally {
     if (timer !== null) {
       clearTimeout(timer)
@@ -709,11 +764,20 @@ export async function runAgentNode(options = {}) {
       }
     }
     if (handle !== null) {
-      try {
-        await adapter.dispose(handle)
-      } catch (error) {
-        log('warn', `flow-studio: 释放 agent 句柄失败（节点 ${nodeId}）：${errorText(error)}`)
+      const outcome = await waitBounded(() => adapter.dispose(handle), cancelGraceMs)
+      if (outcome.timedOut) {
+        disposeTimedOut = true
+        log('warn', `flow-studio: 释放 agent 句柄超过 ${cancelGraceMs}ms 未返回（节点 ${nodeId}）：保留执行占用，等待适配器确认释放`)
+      } else if (outcome.error) {
+        log('warn', `flow-studio: 释放 agent 句柄失败（节点 ${nodeId}）：${errorText(outcome.error)}`)
       }
+    }
+    // 清理未确认：把可诊断标记挂到正在冒泡的错误上。成功路径仍按成功返回，
+    // 但 runtime 的 lifecycle 会继续保留槽位 / activeAgents（不误释放）。
+    if (thrown !== null && typeof thrown === 'object' && (cancelTimedOut || disposeTimedOut)) {
+      thrown.cleanupPending = true
+      if (cancelTimedOut) thrown.cancelPending = true
+      if (disposeTimedOut) thrown.disposePending = true
     }
   }
 }

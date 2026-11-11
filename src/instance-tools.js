@@ -440,8 +440,11 @@ export function createInstanceTools(deps = {}) {
           path: nullable({ type: 'string' }, '工作树路径'),
           branch: nullable({ type: 'string' }, '实例分支'),
           branchRemoval: anyJson('分支删除结果（removed / branch / reason / warning）'),
-          worktrees: { type: 'array', description: 'action=list：工作树条目', items: anyJson('单个工作树条目') },
-          orphans: { type: 'array', description: 'action=list：孤儿条目', items: anyJson('孤儿工作树') },
+          worktrees: { type: 'array', description: 'action=list：工作树条目（超过 200 条时截断，真实数量看 worktreeCount）', items: anyJson('单个工作树条目') },
+          orphans: { type: 'array', description: 'action=list：孤儿条目（超过 200 条时截断，真实数量看 orphanCount）', items: anyJson('孤儿工作树') },
+          worktreeCount: { type: 'integer', description: 'action=list：裁剪前的真实工作树数量' },
+          orphanCount: { type: 'integer', description: 'action=list：裁剪前的真实孤儿数量' },
+          truncated: { type: 'boolean', description: 'action=list：清单是否因超过 200 条被裁剪' },
           corrupt: { type: 'array', description: 'action=list：损坏的所有权记录', items: anyJson('损坏记录') },
           scannedAt: nullable({ type: 'string' }, '列表扫描时间（ISO 8601）'),
           dryRun: { type: 'boolean', description: 'action=prune：本次是否为预览' },
@@ -484,13 +487,22 @@ export function createInstanceTools(deps = {}) {
         }
         if (value.action === 'list') {
           const list = Array.isArray(value.worktrees) ? value.worktrees : []
-          const orphans = Array.isArray(value.orphans) ? value.orphans.length : 0
+          // 计数必须用裁剪前的真实数量：trimDeep 会在 200 项后追加一条省略说明，
+          // 直接拿裁剪后数组长度会把「201」当成真实数量（复审 MINOR）。
+          const total = Number.isSafeInteger(value.worktreeCount) ? value.worktreeCount : list.length
+          const orphanCount = Number.isSafeInteger(value.orphanCount)
+            ? value.orphanCount
+            : (Array.isArray(value.orphans) ? value.orphans.length : 0)
           const lines = list.slice(0, 50).map(item => (
             `- ${item.instanceId || '?'}${item.orphan === true ? '（孤儿）' : ''}：${item.path || '(无 path)'}`
               + `${item.instanceStatus ? ' · ' + item.instanceStatus : ''}`
           ))
-          const tail = list.length > 50 ? `\n…还有 ${list.length - 50} 个` : ''
-          return [{ type: 'text', text: `共 ${list.length} 个实例工作树，其中孤儿 ${orphans} 个：\n${lines.join('\n')}${tail}` }]
+          const tail = total > 50 ? `\n…还有 ${total - 50} 个` : ''
+          return [{
+            type: 'text',
+            text: `共 ${total} 个实例工作树，其中孤儿 ${orphanCount} 个`
+              + `${value.truncated === true ? '（清单已截断）' : ''}：\n${lines.join('\n')}${tail}`,
+          }]
         }
         if (value.dryRun === true) {
           return [{
@@ -579,8 +591,9 @@ export function createInstanceTools(deps = {}) {
       } else {
         method = 'POST'
         parts = ['instance-worktrees', 'prune']
-        // 默认预览；带 planHash 且未显式 dryRun:true 时视为执行。
-        const effectiveDryRun = dryRun === undefined ? planHash === undefined : dryRun
+        // 复审 F8：planHash 只证明「这是哪一份计划」，不能代替执行意图。
+        // 省略 dryRun 一律按默认 true 预览；只有显式 dryRun:false 才执行删除。
+        const effectiveDryRun = dryRun !== false
         body = { dryRun: effectiveDryRun }
         if (planHash !== undefined) body.planHash = planHash
         if (workspaceId !== undefined) body.workspaceId = workspaceId
@@ -614,7 +627,16 @@ export function createInstanceTools(deps = {}) {
           },
         )
       }
-      return trimDeep({ action, status, ...responseBody })
+      const payload = { action, status, ...responseBody }
+      if (action === 'list') {
+        // 计数在裁剪前算好：trimDeep 会截断数组并追加省略说明，裁剪后长度不是真实数量。
+        const worktreeCount = Array.isArray(responseBody.worktrees) ? responseBody.worktrees.length : 0
+        const orphanCount = Array.isArray(responseBody.orphans) ? responseBody.orphans.length : 0
+        payload.worktreeCount = worktreeCount
+        payload.orphanCount = orphanCount
+        payload.truncated = worktreeCount > MAX_ARRAY_ITEMS || orphanCount > MAX_ARRAY_ITEMS
+      }
+      return trimDeep(payload)
     },
   }
 

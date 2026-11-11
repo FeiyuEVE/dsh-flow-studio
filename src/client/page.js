@@ -559,6 +559,10 @@ export function FlowStudioPage(props = {}) {
       setCanvasStatus('ready')
       return { ok: true, markers }
     } catch (error) {
+      // 选择世代已过期：这次失败属于旧事务，不能改画布状态、不能覆盖新事务的通知。
+      if (selection !== undefined && selection !== selectSeqRef.current) {
+        return { ok: false, stale: true, reason: '已被新的选择取代' }
+      }
       const unavailable = editorUnavailableReason(editor)
       if (seq === viewSeqRef.current) {
         if (unavailable !== '') setCanvasStatus('error')
@@ -1181,6 +1185,9 @@ export function FlowStudioPage(props = {}) {
         if (editorUnavailableReason(editor) === '') setCanvasStatus('ready')
         return true
       } catch (error) {
+        // 过期导入（复审 F6 / R3）：选择世代已经前进，视图恢复 / 画布状态 / 通知都属于
+        // 旧事务，必须交给新事务落最终视图，旧导入只负责安静失败。
+        if (selection !== selectSeqRef.current || !mountedRef.current) return false
         // 回滚重建失败时编辑器进入不可用态：必须显式显示原因并降级画布状态，
         // 不能继续提示“导入成功”（复审 M6）。
         const restoreReason = error && error.restoreError ? failureMessage(error.restoreError) : ''
@@ -1192,9 +1199,10 @@ export function FlowStudioPage(props = {}) {
             + (restoreReason !== '' ? `；画布恢复失败：${restoreReason}` : '')
             + (unavailable !== '' ? '；画布不可用，请重新导入 BPMN 或刷新页面。' : ''),
         })
-        // 画布可能已经从 viewer 切到 modeler：恢复原视图。
+        // 画布可能已经从 viewer 切到 modeler：恢复原视图。恢复同样属于本次选择世代，
+        // 过期后 applyCanvasView 会直接丢弃，不会以新世代覆盖最新视图。
         if (previousView.kind === 'instance') {
-          await applyCanvasView(previousView)
+          await applyCanvasView(previousView, selection)
         }
         return false
       }

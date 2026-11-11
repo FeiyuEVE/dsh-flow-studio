@@ -1711,6 +1711,123 @@ await check('R3 A→B→C：B 的迟到恢复不得覆盖 C，最终 activeInsta
   })
 })
 
+// 15d. F6 / R3：旧导入的迟到失败不得作废最新实例选择 -------------------------
+
+/**
+ * 串行编辑器桩：applyView 按调用顺序排队，每次执行前后都按「最新 token」判过期。
+ * 坏导入会挂起队首，使后选的 C 排在其后——与真实编辑器的串行 token 队列一致。
+ */
+function createSerialEditor(hang) {
+  const editor = createEditor()
+  const requested = []
+  const applied = []
+  const queue = []
+  let running = false
+  let latestToken = 0
+  const pump = async () => {
+    if (running) return
+    running = true
+    while (queue.length > 0) {
+      const op = queue.shift()
+      try {
+        if (op.token !== latestToken) {
+          op.resolve({ ok: false, stale: true })
+          continue
+        }
+        const gate = typeof hang === 'function' ? hang(op.xml) : null
+        if (gate) await gate
+        // 排队期间可能已经有更新的视图请求：执行前再确认一次（编辑器内部 token 语义）。
+        if (op.token !== latestToken) {
+          op.resolve({ ok: false, stale: true })
+          continue
+        }
+        await editor.setViewerMode(op.viewer)
+        if (op.xml.trim() !== '') await editor.importXML(op.xml)
+        applied.push({ xml: op.xml, token: op.token })
+        op.resolve({ ok: true })
+      } catch (error) {
+        op.reject(error)
+      }
+    }
+    running = false
+  }
+  editor.applyView = request => {
+    requested.push({ xml: request.xml, token: request.token })
+    latestToken = Math.max(latestToken, request.token)
+    return new Promise((resolve, reject) => {
+      queue.push({ ...request, resolve, reject })
+      void pump()
+    })
+  }
+  editor.calls.serialRequested = requested
+  editor.calls.serialApplied = applied
+  return editor
+}
+
+await check('F6 页面：A→坏导入→C，旧导入迟到失败不得作废旧选择，最终 activeInstance=C、busy=false', async () => {
+  await withFakeTimers(async () => {
+    const gate = deferred()
+    const XML_BAD = '<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="BAD"/>'
+    const XML_C = '<?xml version="1.0" encoding="UTF-8"?><bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="C"/>'
+    const editor = createSerialEditor(xml => (xml === XML_BAD ? gate.promise : null))
+    const instanceA = { id: 'i-a', status: 'ACTIVE', lastSeq: 1, pendingTasks: [] }
+    const { client } = makeClient({
+      readInstance: async id => ({ id, status: 'ACTIVE', lastSeq: id === 'i-c' ? 5 : 2, pendingTasks: [] }),
+      readInstanceDefinition: async id => ({ id, xml: id === 'i-c' ? XML_C : XML_A }),
+      readInstanceTasks: async id => ({ id, tasks: [] }),
+      readInstanceEvents: async id => (
+        id === 'i-c'
+          ? { id, events: [event(5, 'activity/wait', { elementId: 'TC', status: 'waiting' })], lastSeq: 5 }
+          : { id, events: [event(2, 'activity/end', { elementId: 'T', status: 'completed' })], lastSeq: 2 }
+      ),
+    })
+    const mounted = await mountPage({
+      client,
+      editor,
+      props: {
+        initialDefinition: definitionA,
+        initialInstance: instanceA,
+        initialInstanceDefinition: { xml: XML_A },
+        initialEvents: [event(1, 'activity/wait', { elementId: 'T', status: 'waiting' })],
+        initialTasks: [],
+      },
+    })
+    const { probe } = mounted
+    const panel = () => findElement(probe.tree, node => node.type === InstancePanel)
+    const list = () => findElement(probe.tree, node => node.type === DefinitionList)
+    const select = id => panel().props.onSelectInstance(id)
+
+    // A 已打开；导入坏 XML：坏 XML 在编辑器队首挂起。
+    deep(editor.calls.serialApplied.map(op => op.xml), [XML_A], '初始 A 视图已应用')
+    const pendingImport = list().props.onImport({ name: 'bad.bpmn', text: async () => XML_BAD })
+    await settle(probe)
+    deep(editor.calls.serialRequested.map(op => op.xml), [XML_A, XML_BAD], '坏 XML 已进入编辑器队列并挂起')
+
+    // 导入仍挂起时选 C：C 的详情 / 事件都成功，画布提交排在坏导入之后。
+    select('i-c')
+    await settle(probe)
+    deep(editor.calls.serialRequested.map(op => op.xml), [XML_A, XML_BAD, XML_C], 'C 的画布提交排在坏导入之后')
+    eq(panel().props.activeInstance.id, 'i-a', 'C 事务未完成前仍显示 A')
+
+    // 旧导入迟到失败：不得恢复视图 / 改画布状态 / 覆盖通知，当前事务必须成功提交 C。
+    gate.reject(new Error('坏 XML 解析失败'))
+    await settle(probe)
+    eq(await pendingImport, false, '旧导入自身必须返回失败')
+    await settle(probe)
+
+    eq(panel().props.activeInstance.id, 'i-c', '最终必须显示最新选择 C（不能被过期导入作废）')
+    eq(panel().props.busy, false, '最新事务成功后 busy 必须结束')
+    eq(drawerOf(probe).props.instanceId, 'i-c', '事件缓存归属必须切到 C')
+    eq(markerState(editor, 'TC'), 'waiting', '画布 marker 必须属于 C')
+    const appliedXmls = editor.calls.serialApplied.map(op => op.xml)
+    eq(appliedXmls[appliedXmls.length - 1], XML_C, '画布最终必须是 C 的视图')
+    eq(appliedXmls.filter(xml => xml === XML_A).length, 1, '过期导入不得发起 A 的视图恢复')
+    eq(appliedXmls.includes(XML_BAD), false, '坏导入不得被应用到画布')
+    const notice = findElement(probe.tree, node => node.props && node.props['data-notice-kind'] !== undefined)
+    ok(notice === null || !textOf(notice).includes('导入失败'), '过期导入的失败通知不能覆盖当前事务')
+  })
+})
+
 // 16. F3 页面：回滚失败后成功打开定义，必须统一恢复到 ready ------------------
 
 await check('F3 页面：画布 error 后成功打开定义，保存按钮必须恢复可用', async () => {

@@ -730,6 +730,103 @@ await check('runAgentNode 直接调用：没有 probe 时也能工作（不经�
   A.equal(adapter.calls.dispose, 1)
 })
 
+// F9：cancel / dispose 永不返回也必须有界收口 ---------------------------------
+
+await check('F9 cancel 永不返回：超时有界收口 + cleanupPending，dispose 仍执行', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({}) // exited 永不 resolve
+  adapter.cancel = async (handle, reason) => {
+    adapter.calls.cancelReasons.push(reason)
+    return new Promise(() => {}) // 永不返回
+  }
+  const started = Date.now()
+  let caught = null
+  try {
+    await runAgentNode({
+      element: elementFor(),
+      ctx: { attempt: 1, executionId: 'exec-cancel-hang', variables: {}, timeoutMs: 5 },
+      adapter,
+      workspaceRoot: workspace,
+      timeoutMs: 5,
+      cancelGraceMs: 5,
+    })
+  } catch (error) {
+    caught = error
+  }
+  A.ok(caught !== null, 'cancel 永不返回时必须抛错，不能挂住调用方')
+  A.equal(caught.code, AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT)
+  A.equal(caught.cleanupPending, true, 'cancel 未确认时必须显式标记 cleanupPending')
+  A.ok(Date.now() - started < 1000, 'cancel 永不返回也必须在有界时间内收口')
+  A.equal(adapter.calls.cancelReasons.length, 1, 'cancel 必须发起一次')
+  A.equal(adapter.calls.dispose, 1, 'cancel 卡住时 dispose 仍必须发起')
+})
+
+await check('F9 abort + cancel 永不返回：BPMN_ABORTED 同样有界收口', async () => {
+  const workspace = freshWorkspace()
+  const controller = new AbortController()
+  const adapter = makeFakeAdapter({
+    run() {
+      setTimeout(() => controller.abort(), 10)
+    },
+  })
+  adapter.cancel = async (handle, reason) => {
+    adapter.calls.cancelReasons.push(reason)
+    return new Promise(() => {}) // 永不返回
+  }
+  const started = Date.now()
+  let caught = null
+  try {
+    await runAgentNode({
+      element: elementFor(),
+      ctx: { attempt: 1, executionId: 'exec-abort-hang', variables: {}, signal: controller.signal },
+      adapter,
+      workspaceRoot: workspace,
+      cancelGraceMs: 5,
+    })
+  } catch (error) {
+    caught = error
+  }
+  A.ok(caught !== null, 'abort 永不返回时必须抛错')
+  A.equal(caught.code, AGENT_EXECUTE_ERROR.ABORTED)
+  A.equal(caught.cleanupPending, true, 'cancel 未确认时必须标记 cleanupPending')
+  A.ok(Date.now() - started < 1000, 'abort + cancel 永不返回也必须有界收口')
+  A.equal(adapter.calls.dispose, 1, 'cancel 卡住时 dispose 仍必须发起')
+})
+
+await check('F9 dispose 永不返回：有界收口 + disposePending（不把 handler 挂死）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({}) // exited 永不 resolve
+  adapter.cancel = async handle => {
+    // cancel 成功并让 exited 收尾，专门暴露 dispose 无界等待。
+    handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 })
+  }
+  let disposeAttempts = 0
+  adapter.dispose = async () => {
+    disposeAttempts += 1
+    return new Promise(() => {}) // 永不返回
+  }
+  const started = Date.now()
+  let caught = null
+  try {
+    await runAgentNode({
+      element: elementFor(),
+      ctx: { attempt: 1, executionId: 'exec-dispose-hang', variables: {}, timeoutMs: 5 },
+      adapter,
+      workspaceRoot: workspace,
+      timeoutMs: 5,
+      cancelGraceMs: 5,
+    })
+  } catch (error) {
+    caught = error
+  }
+  A.ok(caught !== null, 'dispose 永不返回时 handler 仍必须返回失败')
+  A.equal(caught.code, AGENT_EXECUTE_ERROR.ACTIVITY_TIMEOUT)
+  A.equal(caught.cleanupPending, true, 'dispose 未确认时必须标记 cleanupPending')
+  A.equal(caught.disposePending, true, '必须能诊断出是 dispose 未收口')
+  A.ok(Date.now() - started < 1000, 'dispose 永不返回也必须在有界时间内收口')
+  A.equal(disposeAttempts, 1, 'dispose 必须发起一次')
+})
+
 // ---------------------------------------------------------------------------
 // 二、集成：真实 runner + runtime 的实例语义
 // ---------------------------------------------------------------------------
@@ -1032,6 +1129,31 @@ await check('集成·超时：BPMN_ACTIVITY_TIMEOUT + cancel + dispose，无 pro
   A.equal(adapter.calls.dispose, 1, '超时后必须 dispose')
   const events = await readEvents(runtime, created.id)
   A.equal(events.some(event => event.type === 'process/end'), false)
+})
+
+await check('集成·F9 dispose 永不返回：槽位 / activeAgents 仍保留（不误释放）', async () => {
+  const workspace = freshWorkspace()
+  const adapter = makeFakeAdapter({}) // exited 永不 resolve
+  adapter.cancel = async handle => {
+    handle.finish({ ok: false, code: 'NODE_FINISH_CANCELED', reminders: 0 })
+  }
+  let disposeAttempts = 0
+  adapter.dispose = async () => {
+    disposeAttempts += 1
+    return new Promise(() => {}) // dispose 永不返回
+  }
+  const runtime = await makeRuntime(registryWith(adapter), workspace, {
+    FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS: '20',
+  })
+  const started = Date.now()
+  const created = await seedAndStart(runtime, workflowXml({ processId: 'proc-cleanup-pending' }), 'flow-cleanup-pending')
+  const detail = await readInstance(runtime, created.id)
+  A.equal(detail.status, 'ACTIVE', '物理清理未确认时实例仍是 ACTIVE')
+  A.equal(detail.lastError.code, 'BPMN_ACTIVITY_TIMEOUT')
+  A.ok(Date.now() - started < 5000, 'dispose 永不返回也必须让 handler 有界收口')
+  A.equal(disposeAttempts, 1, 'dispose 必须发起一次')
+  A.equal(runtime._activeAgents.get(created.id), 1, 'dispose 未确认前必须保留 activeAgents 占用')
+  A.equal(runtime.executionLimits.snapshot().active, 1, 'dispose 未确认前必须保留执行槽位')
 })
 
 try {

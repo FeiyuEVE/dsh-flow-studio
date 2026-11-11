@@ -5,7 +5,7 @@
  * 覆盖：
  *  - 参数校验（action / instanceId / workspaceId / planHash / expectedHead / 布尔项）；
  *  - inspect / remove / branch / list / prune(dryRun) 的路由映射与结果形状；
- *  - prune 默认只预览、带 planHash 才执行、dryRun:false 缺 planHash 在本地就拒绝；
+ *  - prune 默认只预览、带 planHash 仍只预览、只有 dryRun:false 且带 planHash 才执行；
  *  - 409 PLAN_STALE / ACTIVE 的失败分流（保留服务端原因与 code）；
  *  - 结果裁剪（长字符串 2 KiB、数组上限）；
  *  - 与真实 BpmnRuntime.handle 的一致性（同一份实现，不复制业务逻辑）；
@@ -217,12 +217,44 @@ try {
     eq(result.ok, true)
     eq(result.worktrees.length, 2)
     eq(result.orphans.length, 1)
+    eq(result.worktreeCount, 2, '未裁剪时计数等于清单长度')
+    eq(result.orphanCount, 1)
+    eq(result.truncated, false)
     deep(runtime.calls[0].parts, ['instance-worktrees'])
     eq(runtime.calls[0].method, 'GET')
     eq(runtime.calls[0].search, '?workspaceId=abcdefabcdef')
   })
 
-  await check('prune：默认 dryRun:true 只预览；带 planHash 才执行', async () => {
+  await check('MINOR 裁剪计数：超过 200 条时报告裁剪前真实数量并标记 truncated', async () => {
+    const total = 250
+    const worktrees = Array.from({ length: total }, (_, index) => ({
+      instanceId: `i-${index}`,
+      path: `/managed/worktrees/abcdefabcdef/i-${index}`,
+    }))
+    const runtime = makeRuntime(async () => ({
+      status: 200,
+      body: {
+        ok: true,
+        worktrees,
+        orphans: [{ instanceId: 'i-orphan' }],
+        corrupt: [],
+        scannedAt: '2026-11-12T00:00:00.000Z',
+      },
+    }))
+    const tool = toolOf(runtime)
+    const result = await tool.execute({ action: 'list' })
+    eq(result.ok, true)
+    eq(result.worktrees.length, 201, '返回 200 条实体 + 一条省略说明')
+    eq(result.worktreeCount, total, '计数必须是裁剪前的真实数量')
+    eq(result.orphanCount, 1)
+    eq(result.truncated, true, '发生裁剪时必须显式标记 truncated')
+    const rendered = tool.output.render(result).map(item => item.text).join('')
+    ok(rendered.includes(`共 ${total} 个实例工作树`), `渲染必须报告真实数量（实际：${rendered}）`)
+    ok(rendered.includes('孤儿 1 个'))
+    ok(rendered.includes('清单已截断'), '裁剪时渲染必须说明清单被截断')
+  })
+
+  await check('F8 省略 dryRun：带 planHash 也只预览；只有 dryRun:false 才执行删除', async () => {
     const runtime = makeRuntime(async request => ({
       status: 200,
       body: request.body && request.body.dryRun === false
@@ -243,14 +275,21 @@ try {
     eq(preview.dryRun, true)
     deep(runtime.calls[0].body, { dryRun: true })
 
-    const executed = await tool.execute({ action: 'prune', planHash: 'c'.repeat(64) })
-    eq(executed.ok, true)
-    eq(executed.dryRun, false)
-    deep(runtime.calls[1].body, { dryRun: false, planHash: 'c'.repeat(64) })
+    // 复审 F8：planHash 只证明「计划身份」，不能代替执行意图；省略 dryRun 仍是预览。
+    const hashOnly = await tool.execute({ action: 'prune', planHash: 'c'.repeat(64) })
+    eq(hashOnly.ok, true)
+    eq(hashOnly.dryRun, true, '只带 planHash 不能执行删除（默认 dryRun:true）')
+    deep(runtime.calls[1].body, { dryRun: true, planHash: 'c'.repeat(64) }, '省略 dryRun 时请求体必须 dryRun:true')
 
     const explicitPreview = await tool.execute({ action: 'prune', planHash: 'c'.repeat(64), dryRun: true })
     eq(explicitPreview.dryRun, true)
     deep(runtime.calls[2].body, { dryRun: true, planHash: 'c'.repeat(64) })
+
+    // 只有显式 dryRun:false（且带 planHash）才是执行意图。
+    const executed = await tool.execute({ action: 'prune', planHash: 'c'.repeat(64), dryRun: false })
+    eq(executed.ok, true)
+    eq(executed.dryRun, false)
+    deep(runtime.calls[3].body, { dryRun: false, planHash: 'c'.repeat(64) }, '只有显式 dryRun:false 才请求执行')
   })
 
   await check('prune：dryRun:false 缺 planHash 在本地拒绝，不发请求', async () => {
@@ -269,7 +308,7 @@ try {
       body: { ok: false, code: 'INSTANCE_WORKTREE_PLAN_STALE', error: '工作区状态已变化，旧 planHash 失效，请重新预览' },
     }))
     const tool = toolOf(runtime)
-    const result = await tool.execute({ action: 'prune', planHash: 'd'.repeat(64) })
+    const result = await tool.execute({ action: 'prune', planHash: 'd'.repeat(64), dryRun: false })
     eq(result.ok, false)
     eq(result.status, 409)
     eq(result.code, 'INSTANCE_WORKTREE_PLAN_STALE')

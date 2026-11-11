@@ -784,6 +784,16 @@ class BpmnRuntime {
     }
   }
 
+  /**
+   * 能力探测（E3 模型工具用）：本 runtime 是否支持 `POST /instances` 的
+   * `workspace` / `worktree` 选项。只读、无副作用，不声明任何业务能力。
+   *
+   * @returns {{workspace: boolean, worktree: boolean}}
+   */
+  workspaceCapabilities() {
+    return { workspace: true, worktree: true }
+  }
+
   /** 释放内存中的 runner（进程退出 / 测试；不删磁盘数据、不把实例标成终态）。 */
   async dispose() {
     this._disposed = true
@@ -1279,6 +1289,21 @@ class BpmnRuntime {
     if (body.variables !== undefined && body.variables !== null && !isPlainObject(body.variables)) {
       return { status: 400, body: { ok: false, code: 'BPMN_VARIABLES_INVALID', error: 'variables 必须是 JSON 对象' } }
     }
+    // E3：工具面把调用方会话记进 startedBy（只存定位用的短字符串；GUI 不传时是 null）。
+    let startedBy = null
+    if (body.startedBy !== undefined && body.startedBy !== null) {
+      if (typeof body.startedBy !== 'string') {
+        return { status: 400, body: { ok: false, code: 'BPMN_STARTED_BY_INVALID', error: 'startedBy 必须是字符串或 null' } }
+      }
+      startedBy = body.startedBy.trim()
+      if (startedBy === '') startedBy = null
+      if (startedBy !== null && (startedBy.length > 200 || /[\u0000-\u001f\u007f]/.test(startedBy))) {
+        return {
+          status: 400,
+          body: { ok: false, code: 'BPMN_STARTED_BY_INVALID', error: 'startedBy 必须是不含控制字符的短字符串（≤200 字符）' },
+        }
+      }
+    }
     let definitionVersion
     if (body.definitionVersion !== undefined && body.definitionVersion !== null) {
       const version = typeof body.definitionVersion === 'string' && /^\d+$/.test(body.definitionVersion)
@@ -1324,6 +1349,7 @@ class BpmnRuntime {
       definitionId,
       ...(definitionVersion === undefined ? {} : { definitionVersion }),
       variables: body.variables ?? {},
+      startedBy,
       definitionsRoot: this.definitionsRoot,
       instancesRoot: this.instancesRoot,
     })
@@ -1361,6 +1387,7 @@ class BpmnRuntime {
           definitionId: started.instance.definitionId,
           definitionVersion: started.instance.definitionVersion,
           definitionHash: started.instance.definitionHash,
+          startedBy: started.instance.startedBy ?? null,
           ...(workspaceRecord === null ? {} : { workspace: this._publicWorkspaceView(workspaceRecord) }),
           recovered: false,
           ...(started.error === null ? {} : { error: { code: started.error.code, message: started.error.message } }),
@@ -1673,6 +1700,7 @@ class BpmnRuntime {
           createdAt: current.createdAt,
           updatedAt: current.updatedAt,
           completedAt: current.completedAt,
+          startedBy: current.startedBy ?? null,
           runnerStatus: ensured.runner === null ? null : ensured.runner.status(),
           recovered: ensured.recovered,
           ...(ensured.reason ? { recovery: { reason: ensured.reason, code: ensured.code ?? null } } : {}),

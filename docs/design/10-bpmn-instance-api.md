@@ -250,7 +250,7 @@ runner 内部执行态（不对外当实例状态）：
 | `done` | `COMPLETED` |
 | `blocked`（内部错误态） | `ACTIVE` + `lastError` |
 
-`instance.json` 字段：`status` / `pendingTasks[]` / `lastError|null` / `variables` / `result` / `artifacts[]`。
+`instance.json` 字段：`status` / `startedBy|null` / `pendingTasks[]` / `lastError|null` / `variables` / `result` / `artifacts[]`。
 
 ## 5 事件 kind 表
 

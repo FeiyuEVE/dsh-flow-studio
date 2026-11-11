@@ -218,6 +218,21 @@ function normalizeVariables(raw, bounds) {
 }
 
 /**
+ * 对外共享的短变量校验（E3 实例启动工具与 `flow_finish_node` 同口径）。
+ *
+ * 只接受 boolean / number / null / 短字符串；键 ≤32、单串 ≤512 Unicode 字符、
+ * 序列化后 ≤8 KiB。越限抛 `NodeFinishError(code='NODE_VARIABLES_INVALID')`，
+ * 调用方按 `error.code` 分流，不用解析中文。
+ *
+ * @param {unknown} raw
+ * @param {object} [limits] 只覆盖 `NODE_FINISH_LIMITS` 里的同名项
+ * @returns {Record<string, boolean|number|string|null>}
+ */
+export function normalizeShortVariables(raw, limits) {
+  return normalizeVariables(raw, normalizeLimits(limits))
+}
+
+/**
  * 文档路径规则（沿用 `runlog.js` 的 artifact 路径口径，长度上限按 11 §2 放宽到 1024）：
  * 非空相对路径；拒绝绝对路径、`..` / `.` 段、反斜杠、空段、NUL。
  * @param {unknown} value

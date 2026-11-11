@@ -568,6 +568,9 @@ function normalizeNow(now) {
  * @param {number} options.attempt 第几次 attempt（≥1）
  * @param {string} options.workspaceRoot 工作区根目录（文档路径的相对基准）
  * @param {object} [options.limits] 覆盖 `NODE_FINISH_LIMITS` 的部分上限
+ * @param {{captureFile: (path: string) => Promise<{sha256: string, bytes: number, contentRef: string}>}} [options.artifactStore]
+ *   可选：把文档正文按 hash 寻址保存受控副本（worktree 清理后仍可读）；只做安全读取
+ * @param {string} [options.workspaceId] 产物来源工作区（写进 artifact 来源字段）
  * @param {() => (Date|number|string)} [options.now] 时间注入（默认 `new Date()`）
  * @param {(path: string) => (Buffer|Promise<Buffer>)} [options.readFile] 字节源注入（测试用）
  * @param {(path: string) => (object|Promise<object>)} [options.stat] fs.stat 注入
@@ -585,6 +588,12 @@ export function createFinishGate(options) {
   const workspaceRoot = resolve(requireNonEmptyString(options.workspaceRoot, 'workspaceRoot'))
   const bounds = normalizeLimits(options.limits)
   const deps = resolveDeps(options)
+  const artifactStore = options.artifactStore && typeof options.artifactStore.captureFile === 'function'
+    ? options.artifactStore
+    : null
+  const workspaceId = typeof options.workspaceId === 'string' && options.workspaceId !== ''
+    ? options.workspaceId
+    : null
   const now = typeof options.now === 'function'
     ? options.now
     : () => new Date()
@@ -636,6 +645,39 @@ export function createFinishGate(options) {
     return verified
   }
 
+  /**
+   * 已登记文档的受控快照（0.13.7 C）：使用 artifact store 再安全读一次并核对 hash。
+   * 只有调用方显式注入 store 时才写快照 / 加来源字段，保持旧直调测试的 record 形状。
+   */
+  async function captureArtifacts(verified) {
+    if (artifactStore === null) return verified
+    const captured = []
+    for (const artifact of verified) {
+      let stored
+      try {
+        stored = await artifactStore.captureFile(join(workspaceRoot, artifact.path))
+      } catch (error) {
+        throw documentInvalid(
+          `文档 ${artifact.path}：保存产物快照失败（${error?.message ?? error}）`,
+          { field: 'documents', path: artifact.path, reason: 'artifact-snapshot-failed' },
+        )
+      }
+      if (!stored || stored.sha256 !== artifact.sha256 || stored.bytes !== artifact.bytes) {
+        throw documentInvalid(
+          `文档 ${artifact.path}：快照内容与校验结果不一致（校验期间文件被修改）`,
+          { field: 'documents', path: artifact.path, reason: 'artifact-changed' },
+        )
+      }
+      captured.push({
+        ...artifact,
+        contentRef: stored.contentRef,
+        executionId,
+        ...(workspaceId === null ? {} : { workspaceId }),
+      })
+    }
+    return captured
+  }
+
   async function submit(args) {
     if (state === 'aborted') {
       throw fail(
@@ -666,12 +708,21 @@ export function createFinishGate(options) {
         )
       }
       const at = normalizeNow(now)
+      const captured = await captureArtifacts(verified)
+      // 快照写入期间也可能被 abort：同样不能产生 record。
+      if (state !== 'running') {
+        throw fail(
+          NODE_FINISH_ERROR.ALREADY_SETTLED,
+          '节点完成等待在产物快照期间被中止',
+          { executionId, nodeId, attempt, reason: 'aborted' },
+        )
+      }
       const record = {
         executionId,
         nodeId,
         attempt,
         output: normalized.variables,
-        artifacts: verified.map(artifact => ({ ...artifact, nodeId, attempt, at })),
+        artifacts: captured.map(artifact => ({ ...artifact, nodeId, attempt, at })),
         summary: normalized.summary,
         at,
       }

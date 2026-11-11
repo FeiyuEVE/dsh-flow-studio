@@ -23,6 +23,7 @@ import { createHash, randomInt } from 'node:crypto'
 import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
+import { contentRefFor, hashFromContentRef } from './artifact-store.js'
 import { definitionsDir, readDefinition, readDefinitionVersion } from './definition-store.js'
 import { MAX_BATCH_EVENTS, MAX_EVENT_BYTES, checkRunId } from './runlog.js'
 import { resolveHome } from './store.js'
@@ -372,7 +373,21 @@ function normalizeArtifacts(raw) {
     if (!isPlainObject(item)) {
       throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `artifacts[${index}] 必须是对象`, { field: `artifacts[${index}]` })
     }
-    return { ...item }
+    // 0.13.7：新增 executionId / workspaceId / contentRef 来源字段；旧记录没有它们
+    // 也照常读（向后兼容），只做形状校验，不因未知字段失败。
+    const normalized = { ...item }
+    if (typeof normalized.sha256 === 'string' && /^[0-9a-f]{64}$/i.test(normalized.sha256)) {
+      normalized.sha256 = normalized.sha256.toLowerCase()
+    }
+    for (const key of ['executionId', 'workspaceId']) {
+      if (typeof normalized[key] !== 'string' || normalized[key] === '' || normalized[key].length > 128) {
+        delete normalized[key]
+      }
+    }
+    const refHash = hashFromContentRef(normalized.contentRef)
+    if (refHash === null) delete normalized.contentRef
+    else normalized.contentRef = contentRefFor(refHash)
+    return normalized
   })
   if (sizeOfJson(list, 'artifacts') > MAX_ARTIFACTS_BYTES) {
     throw new InstanceError(400, 'INSTANCE_SHAPE_INVALID', `artifacts 超过 ${MAX_ARTIFACTS_BYTES} 字节上限`, { field: 'artifacts' })

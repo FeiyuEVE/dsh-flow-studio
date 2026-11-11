@@ -41,7 +41,8 @@
  */
 
 import { Buffer } from 'node:buffer'
-import { basename, dirname, join, resolve } from 'node:path'
+import { existsSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import {
   DefinitionError,
@@ -76,6 +77,39 @@ import {
   resolveAdapterId, resolveAgentTimeoutMs, runAgentNode,
 } from './agent-execute.js'
 import { checkRunId } from './runlog.js'
+import { artifactsRootFor, createArtifactStore } from './artifact-store.js'
+import { createExecutionLimits } from './execution-limits.js'
+import {
+  CLEANUP_POLICY_SET,
+  RESOURCE_EVENT,
+  ResourceError,
+  appendResourceEvent,
+  readResourceEvents,
+  readWorkspaceSnapshot,
+  registryRootFor,
+  removeResourceRecord,
+  scanResourceRecords,
+  worktreesRootFor,
+  writeResourceRecord,
+  writeWorkspaceSnapshot,
+} from './instance-resources.js'
+import {
+  INSTANCE_WORKTREE_ERROR,
+  InstanceWorktreeError,
+  createInstanceWorktree,
+  createPrunePlan,
+  inspectInstanceWorktree,
+  listInstanceWorktrees,
+  pruneInstanceWorktrees,
+  removeInstanceBranch,
+  removeInstanceWorktree,
+} from './instance-worktree.js'
+import {
+  WORKSPACE_ALLOWLIST_ENV,
+  WORKSPACE_ERROR,
+  normalizeAllowlist,
+  resolveWorkspace,
+} from './workspace-policy.js'
 
 /** 引擎版本（计划 §10.4 的 health 字段）。 */
 export const BPMN_ENGINE_VERSION = '26.0.6'
@@ -281,6 +315,12 @@ function runnerErrorStatus(code) {
  *   httpPolicy?: object,     // HTTP connector 的全局目标策略（默认只允许 HTTPS 公网地址）
  *   httpPolicies?: object,   // 可选：networkPolicyId → 策略覆盖
  *   httpAuthResolver?: Function, // 可选：authRef → 鉴权 header（缺省读 FLOW_STUDIO_HTTP_AUTH_*）
+ *   worktreeRoot?: string,       // 实例 worktree 根（默认 <base>/worktrees）
+ *   worktreeRegistryRoot?: string, // 所有权记录根（默认 <base>/worktree-registry）
+ *   artifactRoot?: string,       // 产物快照根（默认 <base>/artifacts）
+ *   workspaceAllowlist?: string[]|string, // 工作区 allowlist（默认读 FLOW_STUDIO_WORKSPACE_ROOTS）
+ *   executionLimits?: object,    // 覆盖 execution-limits 的默认上限
+ *   worktreeRunner?: Function,   // 注入 git runner（测试用）
  * }} [options]
  * @returns {BpmnRuntime}
  */
@@ -300,6 +340,12 @@ export function createBpmnRuntime(options = {}) {
     httpPolicy: options.httpPolicy,
     httpPolicies: options.httpPolicies,
     httpAuthResolver: options.httpAuthResolver,
+    worktreeRoot: options.worktreeRoot,
+    worktreeRegistryRoot: options.worktreeRegistryRoot,
+    artifactRoot: options.artifactRoot,
+    workspaceAllowlist: options.workspaceAllowlist,
+    executionLimits: options.executionLimits,
+    worktreeRunner: options.worktreeRunner,
   })
 }
 
@@ -323,6 +369,29 @@ class BpmnRuntime {
     this.httpPolicies = isPlainObject(options.httpPolicies) ? options.httpPolicies : {}
     /** 可选：宿主凭据解析器（authRef → header 对象）；缺省读 FLOW_STUDIO_HTTP_AUTH_*。 */
     this.httpAuthResolver = typeof options.httpAuthResolver === 'function' ? options.httpAuthResolver : null
+    /** worktree 根 / 所有权记录根 / artifact 快照根（默认在 flow-studio 根下）。 */
+    this.worktreeRoot = typeof options.worktreeRoot === 'string' && options.worktreeRoot.trim() !== ''
+      ? resolve(options.worktreeRoot.trim())
+      : worktreesRootFor(this.base)
+    this.worktreeRegistryRoot = typeof options.worktreeRegistryRoot === 'string' && options.worktreeRegistryRoot.trim() !== ''
+      ? resolve(options.worktreeRegistryRoot.trim())
+      : registryRootFor(this.base)
+    this.artifactRoot = typeof options.artifactRoot === 'string' && options.artifactRoot.trim() !== ''
+      ? resolve(options.artifactRoot.trim())
+      : artifactsRootFor(this.base)
+    /** 宿主 allowlist（空 = 不限制）；写错的条目忽略，不升级成「全部允许」。 */
+    this.workspaceAllowlist = normalizeAllowlist(
+      options.workspaceAllowlist ?? this.env[WORKSPACE_ALLOWLIST_ENV] ?? '',
+    )
+    /** 产物快照 store：实例终态清理 worktree 后仍能按 hash 读回正文。 */
+    this.artifactStore = createArtifactStore({ root: this.artifactRoot })
+    /** agent 执行槽位（按真实执行占槽；人工等待 / 挂起不占）。 */
+    this.executionLimits = createExecutionLimits({
+      ...(isPlainObject(options.executionLimits) ? options.executionLimits : {}),
+      env: this.env,
+    })
+    /** 可注入 Git runner（测试 / 嵌入方）；缺省由各模块的 execFile 包装。 */
+    this.gitRunner = typeof options.worktreeRunner === 'function' ? options.worktreeRunner : undefined
     /** 每个 runtime 的 probe 缓存：同一 adapter id 只 probe 一次（成功/失败都缓存）。 */
     this._probeAdapter = createAdapterProbeCache()
 
@@ -348,12 +417,24 @@ class BpmnRuntime {
     this._agentSummaries = new Map()
     /** @type {Map<string, number>} instanceId → agent handler 失败时的提醒次数（lastError.reminders） */
     this._agentReminders = new Map()
+    /** @type {Map<string, {workspace: object|null, error: {code:string,message:string}|null}>} */
+    this._workspaces = new Map()
+    /** @type {Map<string, number>} instanceId → 正在执行的 agent 数（终态清理前必须归零） */
+    this._activeAgents = new Map()
+    /** @type {Map<string, {plan: object, createdAt: number}>} prune 预览 plan */
+    this._prunePlans = new Map()
     this._disposed = false
   }
 
   /** 数据根（便于测试 / 运维核对）。 */
   get roots() {
-    return { definitionsRoot: this.definitionsRoot, instancesRoot: this.instancesRoot }
+    return {
+      definitionsRoot: this.definitionsRoot,
+      instancesRoot: this.instancesRoot,
+      worktreeRoot: this.worktreeRoot,
+      worktreeRegistryRoot: this.worktreeRegistryRoot,
+      artifactRoot: this.artifactRoot,
+    }
   }
 
   /** 活跃实例数（只算真正在跑的：running / waiting；终态与已淘汰的不算）。 */
@@ -412,6 +493,7 @@ class BpmnRuntime {
       const body = request.body
       if (parts[0] === 'definitions') return await this._handleDefinitions(method, parts, url, body)
       if (parts[0] === 'instances') return await this._handleInstances(method, parts, url, body)
+      if (parts[0] === 'instance-worktrees') return await this._handleInstanceWorktrees(method, parts, url, body)
       return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
     } catch (error) {
       return errorResult(error)
@@ -439,6 +521,9 @@ class BpmnRuntime {
     this._lastAgentOutputs.clear()
     this._agentSummaries.clear()
     this._agentReminders.clear()
+    this._workspaces.clear()
+    this._activeAgents.clear()
+    this._prunePlans.clear()
   }
 
   // -------------------------------------------------------------------------
@@ -646,11 +731,25 @@ class BpmnRuntime {
         if (method !== 'GET') return methodNotAllowed('GET')
         return await this._readTasks(id)
       }
+      if (parts[2] === 'resource-events') {
+        if (method !== 'GET') return methodNotAllowed('GET')
+        return await this._readResourceEvents(id, url)
+      }
+      if (parts[2] === 'worktree') {
+        if (method === 'GET') return await this._readInstanceWorktree(id)
+        if (method === 'DELETE') return await this._deleteInstanceWorktree(id, body)
+        return methodNotAllowed('GET / DELETE')
+      }
       if (parts[2] === 'stop') {
         if (method !== 'POST') return methodNotAllowed('POST')
         return await this._stopInstance(id)
       }
       return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+    }
+    if (parts.length === 4 && parts[2] === 'worktree' && parts[3] === 'branch') {
+      if (method !== 'DELETE') return methodNotAllowed('DELETE')
+      if (!id) return invalidInstanceId()
+      return await this._deleteInstanceWorktreeBranch(id)
     }
     if (parts.length === 5 && parts[2] === 'tasks' && parts[4] === 'complete') {
       if (method !== 'POST') return methodNotAllowed('POST')
@@ -691,7 +790,7 @@ class BpmnRuntime {
     if (!isPlainObject(body)) {
       return {
         status: 400,
-        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ definitionId, definitionVersion?, variables? }' },
+        body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ definitionId, definitionVersion?, variables?, workspace? }' },
       }
     }
     const definitionId = checkRunId(body.definitionId)
@@ -712,6 +811,36 @@ class BpmnRuntime {
       definitionVersion = version
     }
 
+    const parsedWorkspace = this._parseWorkspaceOption(body.workspace)
+    if (parsedWorkspace.ok !== true) return parsedWorkspace.error
+    const workspaceOption = parsedWorkspace.value
+
+    // 工作区解析 / 前置条件在**实例创建之前**完成：模式 on 的非 Git 工作区直接 400，
+    // 不留下一个已建但永远起不来的实例。
+    let resolvedWorkspace = null
+    if (workspaceOption !== null) {
+      try {
+        resolvedWorkspace = await resolveWorkspace({
+          path: workspaceOption.path,
+          allowlist: this.workspaceAllowlist,
+          requireGit: false,
+          ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+        })
+      } catch (error) {
+        return workspaceErrorResult(error)
+      }
+      if (workspaceOption.worktree.mode === 'on' && resolvedWorkspace.isGit !== true) {
+        return {
+          status: 400,
+          body: {
+            ok: false,
+            code: WORKSPACE_ERROR.NOT_GIT,
+            error: `工作区不是 Git 仓库根，无法按 worktree.mode="on" 建立实例 worktree：${resolvedWorkspace.realpath}`,
+          },
+        }
+      }
+    }
+
     const instance = await createInstance({
       definitionId,
       ...(definitionVersion === undefined ? {} : { definitionVersion }),
@@ -719,6 +848,26 @@ class BpmnRuntime {
       definitionsRoot: this.definitionsRoot,
       instancesRoot: this.instancesRoot,
     })
+
+    let workspaceRecord = null
+    if (workspaceOption !== null) {
+      const prepared = await this._prepareInstanceWorkspace(instance.id, workspaceOption, resolvedWorkspace)
+      if (prepared.error !== null) {
+        // 工作区建立失败：实例尚未启动，收成 CANCELED 并保留 lastError，避免 ACTIVE 卡死。
+        await this._abortUnstartedInstance(instance.id, prepared.error)
+        return {
+          status: prepared.error.status,
+          body: {
+            ok: false,
+            id: instance.id,
+            definitionId: instance.definitionId,
+            code: prepared.error.code,
+            error: prepared.error.message,
+          },
+        }
+      }
+      workspaceRecord = prepared.workspace
+    }
 
     try {
       const started = await this._withInstance(instance.id, () => this._startInstance(instance.id))
@@ -733,6 +882,7 @@ class BpmnRuntime {
           definitionId: started.instance.definitionId,
           definitionVersion: started.instance.definitionVersion,
           definitionHash: started.instance.definitionHash,
+          ...(workspaceRecord === null ? {} : { workspace: this._publicWorkspaceView(workspaceRecord) }),
           recovered: false,
           ...(started.error === null ? {} : { error: { code: started.error.code, message: started.error.message } }),
         },
@@ -745,6 +895,159 @@ class BpmnRuntime {
         body: { ...result.body, id: instance.id, definitionId: instance.definitionId },
       }
     }
+  }
+
+  /**
+   * 解析 `POST /instances` 的 `workspace` 选项（缺省 null = 旧行为，不建 worktree）。
+   * 默认 `mode:"auto"`（非 Git 回退原目录）、`cleanup:"retain"`、`baseRef:"HEAD"`。
+   */
+  _parseWorkspaceOption(raw) {
+    if (raw === undefined || raw === null || raw === '') return { ok: true, value: null }
+    if (!isPlainObject(raw)) {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace 必须是 JSON 对象：{ path, worktree? }' } },
+      }
+    }
+    if (typeof raw.path !== 'string' || raw.path.trim() === '' || raw.path.length > 4096) {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace.path 必须是非空字符串（≤4096）' } },
+      }
+    }
+    const rawWorktree = raw.worktree
+    if (rawWorktree !== undefined && rawWorktree !== null && !isPlainObject(rawWorktree)) {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace.worktree 必须是 JSON 对象' } },
+      }
+    }
+    const worktree = isPlainObject(rawWorktree) ? rawWorktree : {}
+    const mode = worktree.mode === undefined || worktree.mode === null ? 'auto' : worktree.mode
+    if (mode !== 'auto' && mode !== 'on' && mode !== 'off') {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace.worktree.mode 只允许 auto / on / off' } },
+      }
+    }
+    const cleanup = worktree.cleanup === undefined || worktree.cleanup === null ? 'retain' : worktree.cleanup
+    if (typeof cleanup !== 'string' || !CLEANUP_POLICY_SET.has(cleanup)) {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace.worktree.cleanup 只允许 retain / on-terminal-clean' } },
+      }
+    }
+    const baseRef = worktree.baseRef === undefined || worktree.baseRef === null ? 'HEAD' : worktree.baseRef
+    if (typeof baseRef !== 'string' || baseRef.trim() === '' || baseRef !== baseRef.trim()
+      || baseRef.length > 200 || baseRef.startsWith('-') || /\s/.test(baseRef)) {
+      return {
+        ok: false,
+        error: { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_INVALID', error: 'workspace.worktree.baseRef 非法' } },
+      }
+    }
+    return { ok: true, value: { path: raw.path.trim(), worktree: { mode, baseRef, cleanup } } }
+  }
+
+  /** 建立实例工作区（worktree 或原目录回退），写冻结快照 / 所有权记录 / 资源事件。 */
+  async _prepareInstanceWorkspace(instanceId, option, resolved) {
+    let worktreeRecord = null
+    let mode = 'off'
+    if (option.worktree.mode !== 'off' && resolved.isGit === true) {
+      try {
+        worktreeRecord = await createInstanceWorktree({
+          instanceId,
+          workspace: resolved,
+          baseRef: option.worktree.baseRef,
+          cleanupPolicy: option.worktree.cleanup,
+          worktreeRoot: this.worktreeRoot,
+          ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+        })
+      } catch (error) {
+        return { workspace: null, error: workspaceErrorObject(error) }
+      }
+      mode = 'worktree'
+    }
+    const workspace = {
+      v: 1,
+      instanceId,
+      workspaceId: resolved.workspaceId,
+      mode,
+      path: resolved.path,
+      realpath: resolved.realpath,
+      repositoryRoot: resolved.repositoryRoot,
+      effectiveRoot: worktreeRecord === null ? resolved.realpath : worktreeRecord.effectiveRoot,
+      isGit: resolved.isGit === true,
+      isLinkedWorktree: resolved.isLinkedWorktree === true,
+      cleanupPolicy: option.worktree.cleanup,
+      worktree: worktreeRecord,
+      createdAt: new Date().toISOString(),
+    }
+    try {
+      await writeWorkspaceSnapshot({ instancesRoot: this.instancesRoot, instanceId, snapshot: workspace })
+      if (worktreeRecord !== null) {
+        await writeResourceRecord({ registryRoot: this.worktreeRegistryRoot, record: worktreeRecord })
+        await appendResourceEvent({
+          instancesRoot: this.instancesRoot,
+          instanceId,
+          event: {
+            type: RESOURCE_EVENT.WORKTREE_READY,
+            workspaceId: worktreeRecord.workspaceId,
+            branch: worktreeRecord.branch,
+            baseCommit: worktreeRecord.baseCommit,
+            cleanupPolicy: worktreeRecord.cleanupPolicy,
+          },
+        })
+      }
+    } catch (error) {
+      // 记录写不进去就不能假装工作区已就绪：尽量回滚刚建的树。
+      if (worktreeRecord !== null) {
+        try {
+          await removeInstanceWorktree({
+            record: worktreeRecord,
+            force: true,
+            worktreeRoot: this.worktreeRoot,
+            ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+          })
+        } catch {
+          // 回滚失败保留原错误；树的位置在错误信息里可查。
+        }
+      }
+      return { workspace: null, error: workspaceErrorObject(error) }
+    }
+    this._workspaces.set(instanceId, { workspace, error: null })
+    return { workspace, error: null }
+  }
+
+  /** 公开响应里的工作区投影（不把 artifact / 记录内部字段整份吐出）。 */
+  _publicWorkspaceView(workspace) {
+    return {
+      mode: workspace.mode,
+      workspaceId: workspace.workspaceId,
+      effectiveRoot: workspace.effectiveRoot,
+      repositoryRoot: workspace.repositoryRoot,
+      isGit: workspace.isGit === true,
+      isLinkedWorktree: workspace.isLinkedWorktree === true,
+      cleanupPolicy: workspace.cleanupPolicy,
+      worktree: workspace.worktree === null || workspace.worktree === undefined
+        ? null
+        : {
+          branch: workspace.worktree.branch,
+          baseCommit: workspace.worktree.baseCommit,
+          cleanupPolicy: workspace.worktree.cleanupPolicy,
+          resourceState: workspace.worktree.resourceState,
+        },
+    }
+  }
+
+  /** 工作区建立失败时把还没启动的实例收成 CANCELED（lastError 保留原因）。 */
+  async _abortUnstartedInstance(instanceId, error) {
+    try {
+      await this._markInstanceError(instanceId, { code: error.code, message: error.message })
+      await completeInstance(instanceId, 'CANCELED', { instancesRoot: this.instancesRoot })
+    } catch {
+      // 实例可能已被别的请求处理；不改变返回给调用方的原始错误。
+    }
+    this._workspaces.delete(instanceId)
   }
 
   /**
@@ -882,6 +1185,7 @@ class BpmnRuntime {
           status: current.status,
           variables: current.variables,
           result: current.result,
+          artifacts: Array.isArray(current.artifacts) ? current.artifacts : [],
           lastError: current.lastError ?? null,
           pendingTasks,
           lastSeq: current.lastSeq,
@@ -1167,6 +1471,7 @@ class BpmnRuntime {
       }
       throw error
     }
+    await this._maybeTerminalCleanup(id).catch(() => {})
     return {
       status: 200,
       body: {
@@ -1177,6 +1482,458 @@ class BpmnRuntime {
         pendingTasks: after.pendingTasks,
         lastSeq: after.lastSeq,
       },
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 实例工作区（worktree）路由：全部只读接口不触发 _ensureRunner
+  // -------------------------------------------------------------------------
+
+  async _readInstanceWorktree(id) {
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    const state = await this._workspaceFor(id)
+    if (state.error !== null) return workspaceErrorResult(state.error)
+    if (state.workspace === null) {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          configured: false,
+          instanceStatus: instance.status,
+          mode: null,
+          worktree: null,
+          cleanable: false,
+        },
+      }
+    }
+    const workspace = state.workspace
+    if (workspace.worktree === null || workspace.worktree === undefined) {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          id,
+          configured: true,
+          instanceStatus: instance.status,
+          mode: workspace.mode,
+          workspaceId: workspace.workspaceId,
+          effectiveRoot: workspace.effectiveRoot,
+          cleanupPolicy: workspace.cleanupPolicy,
+          worktree: null,
+          cleanable: false,
+        },
+      }
+    }
+    const inspected = await inspectInstanceWorktree({
+      record: workspace.worktree,
+      ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+      worktreeRoot: this.worktreeRoot,
+    })
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        id,
+        configured: true,
+        instanceStatus: instance.status,
+        mode: workspace.mode,
+        workspaceId: workspace.workspaceId,
+        cleanupPolicy: workspace.cleanupPolicy,
+        worktree: inspected,
+        cleanable: TERMINAL_STATUSES.has(instance.status) && inspected.cleanable === true,
+      },
+    }
+  }
+
+  async _deleteInstanceWorktree(id, body) {
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象：{ force?, removeBranch?, expectedHead? }' } }
+    }
+    const force = body?.force === true
+    const removeBranch = body?.removeBranch === true
+    let expectedHead
+    if (body?.expectedHead !== undefined && body?.expectedHead !== null) {
+      if (typeof body.expectedHead !== 'string' || !/^[0-9a-f]{40,64}$/i.test(body.expectedHead)) {
+        return { status: 400, body: { ok: false, code: 'BPMN_EXPECTED_HEAD_INVALID', error: 'expectedHead 必须是 40–64 位十六进制' } }
+      }
+      expectedHead = body.expectedHead
+    }
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    if (instance.status === 'ACTIVE' || instance.status === 'SUSPENDED') {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_WORKTREE_INSTANCE_ACTIVE',
+          error: `实例 ${id} 当前是 ${instance.status}：禁止清理工作树（force 不能越过此限制）`,
+        },
+      }
+    }
+    const state = await this._workspaceFor(id)
+    if (state.error !== null) return workspaceErrorResult(state.error)
+    if (state.workspace === null || state.workspace.worktree === null || state.workspace.worktree === undefined) {
+      return {
+        status: 404,
+        body: { ok: false, code: 'INSTANCE_WORKTREE_NOT_CONFIGURED', error: `实例 ${id} 没有登记 worktree` },
+      }
+    }
+    let result
+    try {
+      result = await removeInstanceWorktree({
+        record: state.workspace.worktree,
+        force,
+        ...(expectedHead === undefined ? {} : { expectedHead }),
+        ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+        worktreeRoot: this.worktreeRoot,
+      })
+    } catch (error) {
+      return workspaceErrorResult(error)
+    }
+    const branchRemoval = removeBranch
+      ? await this._removeInstanceBranchRecord(state.workspace.worktree)
+      : null
+    await this._recordWorktreeRemoval(id, state.workspace, result, branchRemoval)
+    if (result.removed === true || result.reason === 'not-found') {
+      try {
+        await removeResourceRecord({
+          registryRoot: this.worktreeRegistryRoot,
+          workspaceId: state.workspace.workspaceId,
+          instanceId: id,
+        })
+      } catch {
+        // 记录已删 / 锁竞争：不改变「树已删」的结论。
+      }
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        id,
+        removed: result.removed === true,
+        reason: result.reason,
+        path: result.path ?? null,
+        branch: result.branch ?? null,
+        ...(branchRemoval === null ? {} : { branchRemoval }),
+      },
+    }
+  }
+
+  async _deleteInstanceWorktreeBranch(id) {
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    if (instance.status === 'ACTIVE' || instance.status === 'SUSPENDED') {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_WORKTREE_INSTANCE_ACTIVE',
+          error: `实例 ${id} 当前是 ${instance.status}：禁止删除工作树分支`,
+        },
+      }
+    }
+    const state = await this._workspaceFor(id)
+    if (state.error !== null) return workspaceErrorResult(state.error)
+    if (state.workspace === null || state.workspace.worktree === null || state.workspace.worktree === undefined) {
+      return {
+        status: 404,
+        body: { ok: false, code: 'INSTANCE_WORKTREE_NOT_CONFIGURED', error: `实例 ${id} 没有登记 worktree 分支` },
+      }
+    }
+    const branchRemoval = await this._removeInstanceBranchRecord(state.workspace.worktree)
+    if (branchRemoval.reason === 'not-owned') {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: INSTANCE_WORKTREE_ERROR.BRANCH_NOT_OWNED,
+          error: branchRemoval.warning,
+          branchRemoval,
+        },
+      }
+    }
+    return { status: 200, body: { ok: true, id, branchRemoval } }
+  }
+
+  /** 删记录里的实例分支，并把结果写进资源事件（分支失败不抛）。 */
+  async _removeInstanceBranchRecord(record) {
+    let result
+    try {
+      result = await removeInstanceBranch({
+        record,
+        ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+      })
+    } catch (error) {
+      result = { removed: false, branch: record.branch ?? null, reason: error?.code ?? 'branch-error', warning: error?.message ?? String(error) }
+    }
+    await this._appendResourceEventSafe(record.instanceId, {
+      type: result.removed === true ? RESOURCE_EVENT.BRANCH_REMOVE : RESOURCE_EVENT.BRANCH_REMOVE_SKIPPED,
+      instanceId: record.instanceId,
+      workspaceId: record.workspaceId,
+      branch: result.branch ?? record.branch ?? null,
+      removed: result.removed === true,
+      reason: result.reason,
+      ...(result.warning === null || result.warning === undefined ? {} : { warning: result.warning }),
+    })
+    return result
+  }
+
+  async _recordWorktreeRemoval(instanceId, workspace, result, branchRemoval) {
+    await this._appendResourceEventSafe(instanceId, {
+      type: result.removed === true ? RESOURCE_EVENT.WORKTREE_REMOVE : RESOURCE_EVENT.WORKTREE_REMOVE_SKIPPED,
+      instanceId,
+      workspaceId: workspace.workspaceId,
+      branch: result.branch ?? null,
+      removed: result.removed === true,
+      reason: result.reason ?? null,
+      ...(branchRemoval === null ? {} : {
+        branchRemoved: branchRemoval.removed === true,
+        ...(branchRemoval.warning ? { branchWarning: branchRemoval.warning } : {}),
+      }),
+    })
+  }
+
+  async _appendResourceEventSafe(instanceId, event) {
+    try {
+      await appendResourceEvent({ instancesRoot: this.instancesRoot, instanceId, event })
+    } catch {
+      // 资源事件写失败不改变资源操作的结论；下一次清理仍可继续。
+    }
+  }
+
+  async _readResourceEvents(id, url) {
+    const instance = await readInstance(id, { instancesRoot: this.instancesRoot })
+    if (instance === null) return instanceNotFound(id)
+    const sinceRaw = url.searchParams.get('since')
+    let since = 0
+    if (sinceRaw !== null && sinceRaw !== '') {
+      if (!/^\d+$/.test(sinceRaw)) {
+        return { status: 400, body: { ok: false, code: 'BPMN_SEQ_INVALID', error: 'since 必须是非负整数' } }
+      }
+      since = Number(sinceRaw)
+    }
+    const { events, resourceSeq, skipped } = await readResourceEvents({
+      instancesRoot: this.instancesRoot,
+      instanceId: id,
+      since,
+    })
+    return { status: 200, body: { ok: true, id, events, resourceSeq, skipped } }
+  }
+
+  async _handleInstanceWorktrees(method, parts, url, body) {
+    if (parts.length === 1) {
+      if (method !== 'GET') return methodNotAllowed('GET')
+      return await this._listInstanceWorktrees(url)
+    }
+    if (parts.length === 2 && parts[1] === 'prune') {
+      if (method !== 'POST') return methodNotAllowed('POST')
+      return await this._pruneInstanceWorktrees(body)
+    }
+    return { status: 404, body: { ok: false, code: 'BPMN_ROUTE_NOT_FOUND', error: '未知接口' } }
+  }
+
+  async _listInstanceWorktrees(url) {
+    let workspaceId
+    const raw = url.searchParams.get('workspaceId')
+    if (raw !== null && raw !== '') {
+      if (!/^[0-9a-f]{12}$/.test(raw)) {
+        return { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_ID_INVALID', error: 'workspaceId 必须是 12 位小写十六进制' } }
+      }
+      workspaceId = raw
+    }
+    const listed = await listInstanceWorktrees({
+      worktreeRoot: this.worktreeRoot,
+      registryRoot: this.worktreeRegistryRoot,
+      instancesRoot: this.instancesRoot,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+      ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+    })
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
+        worktrees: listed.entries,
+        orphans: listed.orphans,
+        corrupt: listed.corrupt,
+        scannedAt: listed.scannedAt,
+      },
+    }
+  }
+
+  async _pruneInstanceWorktrees(body) {
+    if (body !== undefined && body !== null && !isPlainObject(body)) {
+      return { status: 400, body: { ok: false, code: 'BPMN_BODY_INVALID', error: '请求体必须是 JSON 对象' } }
+    }
+    const dryRun = body?.dryRun !== false
+    let workspaceId
+    if (body?.workspaceId !== undefined && body?.workspaceId !== null && body?.workspaceId !== '') {
+      if (typeof body.workspaceId !== 'string' || !/^[0-9a-f]{12}$/.test(body.workspaceId)) {
+        return { status: 400, body: { ok: false, code: 'BPMN_WORKSPACE_ID_INVALID', error: 'workspaceId 必须是 12 位小写十六进制' } }
+      }
+      workspaceId = body.workspaceId
+    }
+    const listed = await listInstanceWorktrees({
+      worktreeRoot: this.worktreeRoot,
+      registryRoot: this.worktreeRegistryRoot,
+      instancesRoot: this.instancesRoot,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+      ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+    })
+    const plan = createPrunePlan({ entries: listed.entries })
+    if (dryRun) {
+      const now = Date.now()
+      for (const [hash, stored] of this._prunePlans) {
+        if (now - stored.createdAt > 10 * 60 * 1000) this._prunePlans.delete(hash)
+      }
+      this._prunePlans.set(plan.planHash, { plan, createdAt: now })
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          dryRun: true,
+          planHash: plan.planHash,
+          plan,
+          removable: plan.entries.filter(entry => entry.action === 'remove').length,
+          reported: plan.entries.filter(entry => entry.action !== 'remove').length,
+        },
+      }
+    }
+    if (typeof body?.planHash !== 'string' || !/^[0-9a-f]{64}$/.test(body.planHash)) {
+      return { status: 400, body: { ok: false, code: 'INSTANCE_WORKTREE_PLAN_INVALID', error: '执行 prune 必须带预览返回的 planHash' } }
+    }
+    const stored = this._prunePlans.get(body.planHash)
+    if (stored === undefined) {
+      return {
+        status: 409,
+        body: { ok: false, code: INSTANCE_WORKTREE_ERROR.PLAN_STALE, error: 'planHash 已失效（预览已过期或服务已重启），请重新预览' },
+      }
+    }
+    if (Date.now() - stored.createdAt > 10 * 60 * 1000 || plan.planHash !== body.planHash) {
+      return {
+        status: 409,
+        body: { ok: false, code: INSTANCE_WORKTREE_ERROR.PLAN_STALE, error: '工作区状态已变化，旧 planHash 失效，请重新预览' },
+      }
+    }
+    let executed
+    try {
+      executed = await pruneInstanceWorktrees({
+        plan: stored.plan,
+        ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+        worktreeRoot: this.worktreeRoot,
+      })
+    } catch (error) {
+      return workspaceErrorResult(error)
+    }
+    this._prunePlans.delete(body.planHash)
+    for (const entry of executed.removed) {
+      const record = isPlainObject(entry.record) ? entry.record : null
+      if (record !== null) {
+        const branchRemoval = await this._removeInstanceBranchRecord(record)
+        await this._recordWorktreeRemoval(record.instanceId, { workspaceId: record.workspaceId }, { ...entry, removed: true }, branchRemoval)
+        try {
+          await removeResourceRecord({
+            registryRoot: this.worktreeRegistryRoot,
+            workspaceId: record.workspaceId,
+            instanceId: record.instanceId,
+          })
+        } catch {
+          // 记录删除失败不改变已删目录的结论。
+        }
+      }
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        dryRun: false,
+        planHash: executed.planHash,
+        removed: executed.removed,
+        skipped: executed.skipped,
+      },
+    }
+  }
+
+  /**
+   * 终态清理：`cleanup:"on-terminal-clean"` 只在 agent 进程释放、树干净、产物已保存后执行。
+   * 任何失败都只记资源事件，**不改实例状态**。
+   */
+  async _maybeTerminalCleanup(instanceId) {
+    const state = await this._workspaceFor(instanceId)
+    if (state.error !== null || state.workspace === null) return
+    const workspace = state.workspace
+    if (workspace.cleanupPolicy !== 'on-terminal-clean' || workspace.worktree === null || workspace.worktree === undefined) return
+    const released = await this._waitAgentsReleased(instanceId, 3000)
+    if (!released) {
+      await this._appendResourceEventSafe(instanceId, {
+        type: RESOURCE_EVENT.CLEANUP_SKIPPED,
+        instanceId,
+        workspaceId: workspace.workspaceId,
+        reason: 'agent-still-running',
+      })
+      return
+    }
+    const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
+    if (instance === null || !TERMINAL_STATUSES.has(instance.status)) return
+    const inspected = await inspectInstanceWorktree({
+      record: workspace.worktree,
+      ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+      worktreeRoot: this.worktreeRoot,
+    })
+    if (inspected.cleanable !== true) {
+      await this._appendResourceEventSafe(instanceId, {
+        type: RESOURCE_EVENT.CLEANUP_SKIPPED,
+        instanceId,
+        workspaceId: workspace.workspaceId,
+        reason: inspected.state,
+        ...(inspected.reasons.length > 0 ? { reasons: inspected.reasons } : {}),
+      })
+      return
+    }
+    let result
+    try {
+      result = await removeInstanceWorktree({
+        record: workspace.worktree,
+        force: false,
+        ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
+        worktreeRoot: this.worktreeRoot,
+      })
+    } catch (error) {
+      await this._appendResourceEventSafe(instanceId, {
+        type: RESOURCE_EVENT.CLEANUP_SKIPPED,
+        instanceId,
+        workspaceId: workspace.workspaceId,
+        reason: error?.code ?? 'remove-failed',
+        warning: error?.message ?? String(error),
+      })
+      return
+    }
+    const branchRemoval = await this._removeInstanceBranchRecord(workspace.worktree)
+    await this._recordWorktreeRemoval(instanceId, workspace, result, branchRemoval)
+    if (result.removed === true) {
+      try {
+        await removeResourceRecord({
+          registryRoot: this.worktreeRegistryRoot,
+          workspaceId: workspace.workspaceId,
+          instanceId,
+        })
+      } catch {
+        // 同上。
+      }
+    }
+  }
+
+  async _waitAgentsReleased(instanceId, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      if ((this._activeAgents.get(instanceId) ?? 0) === 0) return true
+      if (Date.now() >= deadline) return false
+      await new Promise(resolveWait => {
+        const timer = setTimeout(resolveWait, 25)
+        timer.unref?.()
+      })
     }
   }
 
@@ -1314,13 +2071,117 @@ class BpmnRuntime {
    * 注意：`executeAgent` 导出函数本身保持无实例状态的纯行为（测试可单独调用）；
    * 与实例相关的收口（变量合并由 runner 做、产物与 result 由本类做）在这里。
    */
+  /**
+   * 实例冻结工作区：成功时缓存；缺失 / 损坏 / 目录不可用都返回 WORKSPACE_UNAVAILABLE，
+   * **不静默回退宿主目录**。旧实例（从未写过 workspace.json、registry 里也没有记录）
+   * 才返回 `workspace:null`，保持 0.13.6 之前的行为。
+   */
+  async _workspaceFor(instanceId) {
+    const cached = this._workspaces.get(instanceId)
+    if (cached !== undefined) return cached
+    let snapshot
+    try {
+      snapshot = await readWorkspaceSnapshot({ instancesRoot: this.instancesRoot, instanceId })
+    } catch (error) {
+      return {
+        workspace: null,
+        error: {
+          code: WORKSPACE_ERROR.UNAVAILABLE,
+          message: `实例 ${instanceId} 的工作区快照损坏：${error?.message ?? error}`,
+        },
+      }
+    }
+    if (snapshot === null) {
+      // 快照丢了但所有权记录还在：说明这个实例**应当**有 worktree，不能回退宿主目录。
+      try {
+        const { records, corrupt } = await scanResourceRecords({ registryRoot: this.worktreeRegistryRoot })
+        const owned = records.some(record => record.instanceId === instanceId)
+        const damaged = corrupt.some(item => item.instanceId === instanceId)
+        if (owned || damaged) {
+          return {
+            workspace: null,
+            error: {
+              code: WORKSPACE_ERROR.UNAVAILABLE,
+              message: `实例 ${instanceId} 的 worktree 所有权记录存在但工作区快照缺失（不静默回退宿主目录）`,
+            },
+          }
+        }
+      } catch {
+        // registry 不可读：旧实例仍按无工作区处理（不把诊断失败升级成启动失败）。
+      }
+      return { workspace: null, error: null }
+    }
+    try {
+      if (!isPlainObject(snapshot) || snapshot.instanceId !== instanceId) {
+        throw new Error('快照 instanceId 不一致')
+      }
+      if (snapshot.mode !== 'worktree' && snapshot.mode !== 'off') {
+        throw new Error(`快照 mode 非法：${String(snapshot.mode)}`)
+      }
+      if (typeof snapshot.effectiveRoot !== 'string' || !isAbsolute(snapshot.effectiveRoot)) {
+        throw new Error('快照 effectiveRoot 不是绝对路径')
+      }
+      if (snapshot.mode === 'worktree'
+        && (!isPlainObject(snapshot.worktree) || snapshot.worktree.v !== 1)) {
+        throw new Error('worktree 模式下缺少冻结的 worktree 记录')
+      }
+      if (!existsSync(snapshot.effectiveRoot)) {
+        throw new Error(`工作区目录不可用：${snapshot.effectiveRoot}`)
+      }
+    } catch (error) {
+      return {
+        workspace: null,
+        error: {
+          code: WORKSPACE_ERROR.UNAVAILABLE,
+          message: `实例 ${instanceId} 的工作区不可用：${error?.message ?? error}`,
+        },
+      }
+    }
+    const state = { workspace: snapshot, error: null }
+    this._workspaces.set(instanceId, state)
+    return state
+  }
+
+  /**
+   * agent 节点 handler 的 runtime 侧包装：接适配器注册表 + probe 缓存，并记住
+   * 最后一个成功 agent 节点的输出 / 本次 activity 的 summary（11 §5）。
+   *
+   * 0.13.7 起 document root / adapter cwd 都来自**同一份冻结工作区记录**；worktree
+   * 模式下槽位按真实 agent 执行占用，执行结束（含失败 / 取消）立即释放。
+   */
   async _executeAgentFor(instanceId, element, ctx) {
+    const workspaceState = await this._workspaceFor(instanceId)
+    if (workspaceState.error !== null) {
+      throw handlerError(workspaceState.error.code, workspaceState.error.message, {
+        instanceId,
+        nodeId: element?.id ?? null,
+        activityId: ctx?.executionId ?? null,
+      })
+    }
+    const workspace = workspaceState.workspace
+    const workspaceRoot = workspace === null ? this.workspaceRoot : workspace.effectiveRoot
+    const workspaceId = workspace === null ? 'default' : workspace.workspaceId
+
+    let ticket
+    try {
+      ticket = await this.executionLimits.acquire({ workspaceId, signal: ctx?.signal })
+    } catch (error) {
+      throw handlerError(
+        typeof error?.code === 'string' && error.code !== '' ? error.code : 'EXECUTION_LIMIT_UNAVAILABLE',
+        error?.message ?? String(error),
+        { instanceId, nodeId: element?.id ?? null, workspaceId },
+      )
+    }
+    this._activeAgents.set(instanceId, (this._activeAgents.get(instanceId) ?? 0) + 1)
     let result
     try {
       result = await executeAgent(element, ctx, {
         adapters: this.adapters,
         probeAdapter: this._probeAdapter,
-        workspaceRoot: this.workspaceRoot,
+        workspaceRoot,
+        workspace,
+        workspaceId,
+        artifactStore: this.artifactStore,
         instanceId,
       })
     } catch (error) {
@@ -1340,6 +2201,11 @@ class BpmnRuntime {
         this._agentReminders.set(instanceId, error.reminders)
       }
       throw error
+    } finally {
+      ticket.release()
+      const remaining = (this._activeAgents.get(instanceId) ?? 1) - 1
+      if (remaining <= 0) this._activeAgents.delete(instanceId)
+      else this._activeAgents.set(instanceId, remaining)
     }
     // 成功执行后清掉上一次失败留下的提醒计数（lastError 随后也会被清/覆盖）。
     this._agentReminders.delete(instanceId)
@@ -1629,6 +2495,7 @@ class BpmnRuntime {
         ...(result === undefined ? {} : { result }),
       })
       this._lastAgentOutputs.delete(instanceId)
+      await this._maybeTerminalCleanup(instanceId).catch(() => {})
       return
     }
     if (status === BPMN_RUNNER_STATUS.BLOCKED) {
@@ -1762,17 +2629,50 @@ class BpmnRuntime {
     const instance = await readInstance(instanceId, { instancesRoot: this.instancesRoot })
     if (instance === null || TERMINAL_STATUSES.has(instance.status)) return
     const current = Array.isArray(instance.artifacts) ? instance.artifacts : []
-    const seen = new Set(current.map(item => `${item?.path ?? ''}\0${item?.sha256 ?? ''}`))
+    const artifactKey = item => `${item?.path ?? ''}\0${item?.sha256 ?? ''}`
+    const currentList = current.map(item => ({ ...item }))
+    const byKey = new Map(currentList.map(item => [artifactKey(item), item]))
     const added = []
+    let changed = false
+    const sourceOf = item => ({
+      ...(typeof item.executionId === 'string' && item.executionId !== '' ? { executionId: item.executionId } : {}),
+      ...(typeof item.workspaceId === 'string' && item.workspaceId !== '' ? { workspaceId: item.workspaceId } : {}),
+      ...(typeof item.contentRef === 'string' && /^(artifacts\/)?[0-9a-f]{64}$/.test(item.contentRef) ? { contentRef: item.contentRef } : {}),
+      ...(typeof item.nodeId === 'string' && item.nodeId !== '' ? { nodeId: item.nodeId } : {}),
+      ...(Number.isSafeInteger(item.attempt) && item.attempt >= 1 ? { attempt: item.attempt } : {}),
+      ...(typeof item.at === 'string' && item.at !== '' ? { at: item.at } : {}),
+    })
     for (const item of artifacts) {
       if (!isPlainObject(item)) continue
       if (typeof item.path !== 'string' || item.path === '') continue
       if (typeof item.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(item.sha256)) continue
       const sha256 = item.sha256.toLowerCase()
-      const key = `${item.path}\0${sha256}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      added.push({
+      const key = artifactKey({ path: item.path, sha256 })
+      const source = sourceOf({ ...item, sha256 })
+      const existing = byKey.get(key)
+      if (existing !== undefined) {
+        // 同 path + sha256 仍只登记一条（对外契约不变），但把每次执行的来源追加到
+        // `sources[]`，不丢失 executionId / workspaceId / contentRef 的关系。
+        const sources = Array.isArray(existing.sources) ? existing.sources.map(entry => ({ ...entry })) : []
+        const duplicate = sources.some(entry => (
+          (entry.executionId ?? '') === (source.executionId ?? '')
+          && (entry.workspaceId ?? '') === (source.workspaceId ?? '')
+          && (entry.contentRef ?? '') === (source.contentRef ?? '')
+        ))
+        if (!duplicate) {
+          sources.push(source)
+          existing.sources = sources
+          changed = true
+        }
+        for (const field of ['executionId', 'workspaceId', 'contentRef']) {
+          if (source[field] !== undefined && existing[field] !== source[field]) {
+            existing[field] = source[field]
+            changed = true
+          }
+        }
+        continue
+      }
+      const entry = {
         path: item.path,
         sha256,
         bytes: Number.isSafeInteger(item.bytes) && item.bytes >= 0 ? item.bytes : 0,
@@ -1781,10 +2681,16 @@ class BpmnRuntime {
         ...(typeof item.nodeId === 'string' && item.nodeId !== '' ? { nodeId: item.nodeId } : {}),
         ...(Number.isSafeInteger(item.attempt) && item.attempt >= 1 ? { attempt: item.attempt } : {}),
         ...(typeof item.at === 'string' && item.at !== '' ? { at: item.at } : {}),
-      })
+        ...(source.executionId === undefined ? {} : { executionId: source.executionId }),
+        ...(source.workspaceId === undefined ? {} : { workspaceId: source.workspaceId }),
+        ...(source.contentRef === undefined ? {} : { contentRef: source.contentRef }),
+        sources: [source],
+      }
+      byKey.set(key, entry)
+      added.push(entry)
     }
-    if (added.length === 0) return
-    await updateInstance(instanceId, { artifacts: [...current, ...added] }, { instancesRoot: this.instancesRoot })
+    if (added.length === 0 && changed === false) return
+    await updateInstance(instanceId, { artifacts: [...currentList, ...added] }, { instancesRoot: this.instancesRoot })
   }
 
   _nextAttempt(instanceId, event) {
@@ -1830,6 +2736,61 @@ class BpmnRuntime {
     const failures = this._eventFailures.get(instanceId) ?? []
     this._eventFailures.delete(instanceId)
     return failures
+  }
+}
+
+/**
+ * 工作区 / worktree 错误码 → HTTP 语义。
+ * 400 入参 / 403 越界 / 404 不存在 / 409 冲突（脏树、未登记、HEAD 变化、plan 过期）/
+ * 503 git 不可用 / 500 其它。
+ */
+function workspaceErrorStatus(error) {
+  if (error && Number.isInteger(error.status) && error.status >= 400 && error.status < 600) {
+    return error.status
+  }
+  const code = typeof error?.code === 'string' ? error.code : ''
+  if (code === WORKSPACE_ERROR.NOT_ALLOWED) return 403
+  if (code === WORKSPACE_ERROR.MISSING || code === WORKSPACE_ERROR.NOT_GIT
+    || code === WORKSPACE_ERROR.INVALID || code === WORKSPACE_ERROR.CWD_OUTSIDE) return 400
+  if (code === WORKSPACE_ERROR.GIT_UNAVAILABLE || code === WORKSPACE_ERROR.GIT_FAILED) return 503
+  if (code === WORKSPACE_ERROR.UNAVAILABLE || code === WORKSPACE_ERROR.CORRUPT) return 409
+  if (code === INSTANCE_WORKTREE_ERROR.INVALID || code === INSTANCE_WORKTREE_ERROR.NOT_GIT) return 400
+  if (code === INSTANCE_WORKTREE_ERROR.GIT_UNAVAILABLE) return 503
+  if (code === INSTANCE_WORKTREE_ERROR.NOT_FOUND) return 404
+  if (code === INSTANCE_WORKTREE_ERROR.DIRTY || code === INSTANCE_WORKTREE_ERROR.LOCKED
+    || code === INSTANCE_WORKTREE_ERROR.NOT_REGISTERED || code === INSTANCE_WORKTREE_ERROR.HEAD_MISMATCH
+    || code === INSTANCE_WORKTREE_ERROR.BRANCH_NOT_OWNED || code === INSTANCE_WORKTREE_ERROR.BRANCH_UNMERGED
+    || code === INSTANCE_WORKTREE_ERROR.PLAN_STALE) return 409
+  if (code === INSTANCE_WORKTREE_ERROR.CREATE_FAILED) {
+    return error?.reason === 'path-exists' || error?.reason === 'branch-conflict' ? 409 : 500
+  }
+  if (error instanceof ResourceError) return 500
+  return 500
+}
+
+/** 统一成 `{status, code, message}`，供创建前失败 / 回滚使用。 */
+function workspaceErrorObject(error) {
+  const code = typeof error?.code === 'string' && error.code !== ''
+    ? error.code
+    : 'BPMN_WORKSPACE_OPERATION_FAILED'
+  return {
+    status: workspaceErrorStatus(error),
+    code,
+    message: typeof error?.message === 'string' && error.message !== '' ? error.message : String(error),
+  }
+}
+
+function workspaceErrorResult(error) {
+  const normalized = workspaceErrorObject(error)
+  return {
+    status: normalized.status,
+    body: {
+      ok: false,
+      code: normalized.code,
+      error: normalized.message,
+      ...(error && typeof error.reason === 'string' && error.reason !== '' ? { reason: error.reason } : {}),
+      ...(error && typeof error.path === 'string' && error.path !== '' ? { path: error.path } : {}),
+    },
   }
 }
 
@@ -1995,6 +2956,11 @@ export async function executeAgent(element, ctx, options = {}) {
     ctx,
     adapter,
     workspaceRoot: options.workspaceRoot,
+    ...(options.workspace && typeof options.workspace === 'object' ? { workspace: options.workspace } : {}),
+    ...(typeof options.workspaceId === 'string' && options.workspaceId !== '' ? { workspaceId: options.workspaceId } : {}),
+    ...(options.artifactStore && typeof options.artifactStore.captureFile === 'function'
+      ? { artifactStore: options.artifactStore }
+      : {}),
     instanceId: options.instanceId,
     // 配置口径的总时限（透传给适配器 ctx.timeoutMs）与扣掉 probe 后剩余的执行预算。
     effectiveTimeoutMs,

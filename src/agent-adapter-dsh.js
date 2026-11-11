@@ -760,7 +760,11 @@ export function createDshAdapter(options = {}) {
       const nodeId = nonEmptyString(element.id) ? element.id : ''
       const reminderConfig = isPlainObject(req.reminder) ? req.reminder : {}
       const maxFires = normalizeMaxFires(reminderConfig.maxFires, defaultMaxFires)
-      const workspaceRoot = nonEmptyString(req.workspaceRoot) ? req.workspaceRoot : ''
+      const workspaceRoot = nonEmptyString(req.workspaceRoot)
+        ? req.workspaceRoot
+        : (isPlainObject(req.workspace) && nonEmptyString(req.workspace.effectiveRoot)
+          ? req.workspace.effectiveRoot
+          : '')
       const sessionId = resolveSessionId(options, runnerCtx, element)
 
       let resolveExited

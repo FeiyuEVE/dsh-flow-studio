@@ -792,7 +792,12 @@ export function createCodexAdapter(options = {}) {
   }
 
   async function start(request) {
-    const { element, ctx, finishGate, workspaceRoot, reminder } = request || {}
+    const { element, ctx, finishGate, reminder } = request || {}
+    const workspaceRoot = typeof request?.workspaceRoot === 'string' && request.workspaceRoot !== ''
+      ? request.workspaceRoot
+      : (isPlainObject(request?.workspace) && typeof request.workspace.effectiveRoot === 'string'
+        ? request.workspace.effectiveRoot
+        : '')
     const runnerCtx = isPlainObject(ctx) ? ctx : {}
 
     // m9：预 abort 不派发（在 probe / 建目录之前）。

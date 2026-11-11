@@ -38,6 +38,7 @@ import {
   ADAPTER_ERROR, AdapterError, assertFinishToolNative,
 } from './agent-adapter.js'
 import { NODE_FINISH_ERROR, createFinishGate } from './node-finish.js'
+import { WORKSPACE_ERROR, resolveNodeCwd } from './workspace-policy.js'
 
 /** 处理器错误码（runtime 把它们写进 `instance.lastError.code`）。 */
 export const AGENT_EXECUTE_ERROR = Object.freeze({
@@ -53,6 +54,10 @@ export const AGENT_EXECUTE_ERROR = Object.freeze({
   HANDLE_INVALID: 'BPMN_AGENT_HANDLE_INVALID',
   /** 适配器说成功但闸门没受理（不允许「假装完结」）。 */
   FINISH_INVALID: 'NODE_FINISH_INVALID',
+  /** 实例绑定的工作区记录缺失 / 目录不可用（不静默回退宿主目录）。 */
+  WORKSPACE_UNAVAILABLE: WORKSPACE_ERROR.UNAVAILABLE,
+  /** worktree 模式下节点 cwd 是绝对路径或 realpath 越界。 */
+  WORKSPACE_CWD_OUTSIDE: WORKSPACE_ERROR.CWD_OUTSIDE,
 })
 
 /** `flow_finish_node` 的默认工具名（11 §1：只能叫这个名字）。 */
@@ -135,6 +140,27 @@ export function resolveWorkspaceRoot(element, fallback) {
     ? node.executor.cwd.trim()
     : ''
   return resolvePath(cwd !== '' ? cwd : (nonEmptyString(fallback) ? fallback.trim() : process.cwd()))
+}
+
+/**
+ * 节点 cwd：**优先使用实例冻结的工作区记录**，替换旧 `fs:executor@cwd` 自由解析。
+ *
+ * - 有 `workspace` 记录（worktree 模式）：cwd 只允许树内相对子目录；绝对路径 /
+ *   realpath 越界抛 `WORKSPACE_CWD_OUTSIDE`；
+ * - 没有记录（旧实例 / 直调测试）：保持 `resolveWorkspaceRoot()` 行为。
+ *
+ * @param {{element:object, workspace?:object, workspaceRoot?:string}} input
+ * @returns {string}
+ */
+export function resolveRunWorkspaceRoot({ element, workspace, workspaceRoot } = {}) {
+  if (workspace && typeof workspace === 'object') {
+    const node = isPlainObject(element?.node) ? element.node : {}
+    const cwd = isPlainObject(node.executor) && nonEmptyString(node.executor.cwd)
+      ? node.executor.cwd.trim()
+      : ''
+    return resolveNodeCwd({ workspace, cwd })
+  }
+  return resolveWorkspaceRoot(element, workspaceRoot)
 }
 
 /**
@@ -287,6 +313,9 @@ function sleep(ms) {
  *   ctx: object,
  *   adapter: object,
  *   workspaceRoot?: string,
+ *   workspace?: object,     // 实例冻结的工作区记录（worktree 模式用它约束节点 cwd）
+ *   workspaceId?: string,
+ *   artifactStore?: object, // 可选：产物按 hash 寻址快照
  *   instanceId?: string,
  *   probeAdapter?: Function,
  *   effectiveTimeoutMs?: number, // 配置口径的有效时限（透传给适配器 ctx.timeoutMs）
@@ -315,7 +344,23 @@ export async function runAgentNode(options = {}) {
   const executionId = nonEmptyString(ctx.executionId)
     ? ctx.executionId
     : `${nonEmptyString(options.instanceId) ? options.instanceId : 'instance'}:${nodeId}:${attempt}`
-  const workspaceRoot = resolveWorkspaceRoot(element, options.workspaceRoot)
+  let workspaceRoot
+  try {
+    workspaceRoot = resolveRunWorkspaceRoot({
+      element,
+      workspace: options.workspace,
+      workspaceRoot: options.workspaceRoot,
+    })
+  } catch (error) {
+    throw agentHandlerError(
+      typeof error?.code === 'string' && error.code !== '' ? error.code : AGENT_EXECUTE_ERROR.WORKSPACE_UNAVAILABLE,
+      error?.message ?? String(error),
+      { elementId: nodeId, workspaceId: options.workspaceId ?? options.workspace?.workspaceId ?? null, cause: error },
+    )
+  }
+  const workspaceId = nonEmptyString(options.workspaceId)
+    ? options.workspaceId
+    : (nonEmptyString(options.workspace?.workspaceId) ? options.workspace.workspaceId : null)
 
   // 11 §3.1：提醒由适配器内部触发；这里只把每次提醒翻成 handler 事件。
   const events = []
@@ -331,6 +376,10 @@ export async function runAgentNode(options = {}) {
     nodeId,
     attempt,
     workspaceRoot,
+    ...(workspaceId === null ? {} : { workspaceId }),
+    ...(options.artifactStore && typeof options.artifactStore.captureFile === 'function'
+      ? { artifactStore: options.artifactStore }
+      : {}),
   })
 
   let handle = null
@@ -447,6 +496,16 @@ export async function runAgentNode(options = {}) {
         ctx: adapterCtx,
         finishGate: gate,
         workspaceRoot,
+        // 同一份已解析记录的只读投影：adapter 的 cwd / 文档根都从这里来。
+        ...(options.workspace && typeof options.workspace === 'object'
+          ? {
+            workspace: {
+              workspaceId: workspaceId ?? options.workspace.workspaceId ?? null,
+              mode: options.workspace.mode === 'worktree' ? 'worktree' : 'off',
+              effectiveRoot: workspaceRoot,
+            },
+          }
+          : {}),
         reminder,
       })
     } catch (error) {

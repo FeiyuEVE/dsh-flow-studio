@@ -1355,7 +1355,7 @@ async function route(req, res, env) {
 
   // 0.13：BPMN 定义域 / 实例域。
   // 鉴权 / 只读令牌 / 同源校验已在 route() 开头统一完成，这里只做分发。
-  if (parts[0] === 'definitions' || parts[0] === 'instances') {
+  if (parts[0] === 'definitions' || parts[0] === 'instances' || parts[0] === 'instance-worktrees') {
     const runtime = bpmnRuntimeFor(env)
     const body = req.method === 'GET' ? undefined : await readBody(req)
     const result = await runtime.handle({

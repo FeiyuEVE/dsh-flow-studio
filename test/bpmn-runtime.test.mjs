@@ -15,6 +15,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
@@ -206,6 +207,41 @@ function workflowXml(processId = 'proc-demo') {
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
     <bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="human1"/>
     <bpmn:sequenceFlow id="f3" sourceRef="human1" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+}
+
+/** 在 home 下建一个真实临时 Git 仓库（测试项目产物仍在 .tmp/）。 */
+function makeGitRepo(home, name = 'repo') {
+  const repo = join(home, name)
+  mkdirSync(repo, { recursive: true })
+  const git = args => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  git(['init', '-b', 'main'])
+  git(['config', 'user.email', 'test@example.com'])
+  git(['config', 'user.name', 'Test'])
+  writeFileSync(join(repo, 'README.md'), '# demo\n')
+  git(['add', '.'])
+  git(['commit', '-m', 'init'])
+  return repo
+}
+
+/** agent → end 的流程（不经过人工任务，创建后直接 COMPLETED）。 */
+function agentOnlyXml(processId = 'proc-agent-only', executorCwd = null) {
+  const executor = executorCwd === null
+    ? ''
+    : `<fs:executor kind="dsh" cwd="${executorCwd}"/>`
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-${processId}" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="${processId}" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="agent1" name="写产物">
+      <bpmn:extensionElements>
+        <fs:node nodeType="agent" adapter="dsh">${executor}</fs:node>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="end"/>
   </bpmn:process>
 </bpmn:definitions>`
 }
@@ -1552,6 +1588,384 @@ try {
       eq(raw.lastError.code, 'HTTP_STATUS_NOT_ACCEPTABLE')
     } finally {
       await new Promise(resolveClose => server.close(() => resolveClose()))
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12. 0.13.7 实例域 worktree：路由 / 终态清理 / 产物快照 / 只读不启动 runner
+  // -------------------------------------------------------------------------
+  await check('实例 worktree 路由：建立 / ACTIVE 409 / 终态删除 / 只读不启动 runner', async home => {
+    const repo = makeGitRepo(home)
+    const url = new URL('http://localhost/')
+    const makeRuntime = () => createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(),
+    })
+    const runtimeA = makeRuntime()
+    const runtimeB = makeRuntime()
+    try {
+      const saved = await runtimeA.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-wt', name: 'worktree', xml: workflowXml('proc-wt') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+
+      const created = await runtimeA.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-wt', workspace: { path: repo, worktree: { mode: 'on', cleanup: 'retain' } } },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      eq(created.body.status, 'ACTIVE', '停在人工任务，实例 ACTIVE')
+      eq(created.body.workspace.mode, 'worktree', '响应带工作区模式')
+      const id = created.body.id
+
+      const inspected = await runtimeA.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
+      eq(inspected.status, 200, JSON.stringify(inspected.body))
+      eq(inspected.body.configured, true, 'worktree 已配置')
+      eq(inspected.body.worktree.state, 'ok', '工作树检查 ok')
+      eq(inspected.body.cleanable, false, 'ACTIVE 不可清理')
+
+      const blocked = await runtimeA.handle({
+        method: 'DELETE',
+        parts: ['instances', id, 'worktree'],
+        url,
+        body: { force: true },
+      })
+      eq(blocked.status, 409, 'ACTIVE 清理 409')
+      eq(blocked.body.code, 'INSTANCE_WORKTREE_INSTANCE_ACTIVE', 'force 不能越过 ACTIVE')
+      eq((await runtimeA.handle({ method: 'PUT', parts: ['instances', id, 'worktree'], url })).status, 405, 'worktree 只支持 GET / DELETE')
+
+      // 新 runtime：GET / 列表 / prune 预览都是只读，不能懒恢复出 runner。
+      eq(runtimeB._runners.size, 0, '新 runtime 没有 runner')
+      const listed = await runtimeB.handle({ method: 'GET', parts: ['instance-worktrees'], url })
+      eq(listed.status, 200, JSON.stringify(listed.body))
+      ok(listed.body.worktrees.some(entry => entry.instanceId === id), '列表能看到实例 worktree')
+      eq(runtimeB._runners.size, 0, '列表不启动 runner')
+      const getB = await runtimeB.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
+      eq(getB.status, 200, JSON.stringify(getB.body))
+      eq(runtimeB._runners.size, 0, 'GET worktree 不启动 runner')
+      const dry = await runtimeB.handle({
+        method: 'POST',
+        parts: ['instance-worktrees', 'prune'],
+        url,
+        body: { dryRun: true },
+      })
+      eq(dry.status, 200, JSON.stringify(dry.body))
+      eq(runtimeB._runners.size, 0, 'prune 预览不启动 runner')
+      eq(dry.body.plan.entries.find(entry => entry.instanceId === id).action, 'retain', 'ACTIVE 实例在预览里只保留')
+      eq((await runtimeB.handle({ method: 'GET', parts: ['instance-worktrees', 'prune'], url })).status, 405, 'prune 只支持 POST')
+      eq((await runtimeB.handle({ method: 'GET', parts: ['instance-worktrees'], url: new URL(`http://localhost/?workspaceId=nope`) })).status, 400, 'workspaceId 校验')
+
+      const stopped = await runtimeB.handle({ method: 'POST', parts: ['instances', id, 'stop'], url })
+      eq(stopped.status, 200, JSON.stringify(stopped.body))
+      eq(stopped.body.status, 'CANCELED', '停止后终态')
+
+      const deleted = await runtimeB.handle({
+        method: 'DELETE',
+        parts: ['instances', id, 'worktree'],
+        url,
+        body: { removeBranch: true },
+      })
+      eq(deleted.status, 200, JSON.stringify(deleted.body))
+      eq(deleted.body.removed, true, '终态可删')
+      eq(deleted.body.branchRemoval.removed, true, '目录删除与分支删除独立返回')
+      const after = await runtimeB.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
+      eq(after.status, 200, JSON.stringify(after.body))
+      eq(after.body.worktree.state, 'missing', '删除后 state=missing')
+      eq(after.body.cleanable, false, '已删不可清理')
+
+      const resourceEvents = await runtimeB.handle({ method: 'GET', parts: ['instances', id, 'resource-events'], url })
+      eq(resourceEvents.status, 200, JSON.stringify(resourceEvents.body))
+      const types = resourceEvents.body.events.map(event => event.type)
+      ok(types.includes('worktree/ready'), '资源事件记录建立')
+      ok(types.includes('worktree/removed'), '资源事件记录删除')
+      ok(types.includes('worktree/branch-removed'), '资源事件记录分支删除')
+      eq(resourceEvents.body.resourceSeq >= 3, true, 'resourceSeq 独立递增')
+
+      const branchAgain = await runtimeB.handle({ method: 'DELETE', parts: ['instances', id, 'worktree', 'branch'], url })
+      eq(branchAgain.status, 200, '分支删除幂等返回 200')
+      eq(branchAgain.body.branchRemoval.removed, false, '分支已不存在')
+      eq(branchAgain.body.branchRemoval.reason, 'not-found', '分支不存在按 not-found 呈现')
+
+      // SUSPENDED 与 ACTIVE 一样禁止清理（force 不能越过）。
+      const suspended = await runtimeA.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-wt', workspace: { path: repo, worktree: { mode: 'on' } } },
+      })
+      eq(suspended.status, 201, JSON.stringify(suspended.body))
+      await instStore.updateInstance(
+        suspended.body.id,
+        { status: 'SUSPENDED' },
+        { instancesRoot: instStore.instancesDir(home) },
+      )
+      const suspendedDelete = await runtimeB.handle({
+        method: 'DELETE',
+        parts: ['instances', suspended.body.id, 'worktree'],
+        url,
+        body: { force: true },
+      })
+      eq(suspendedDelete.status, 409, 'SUSPENDED 清理 409')
+      eq(suspendedDelete.body.code, 'INSTANCE_WORKTREE_INSTANCE_ACTIVE', 'SUSPENDED 同样被挡')
+
+      // 冻结记录缺失：所有权记录还在 → WORKSPACE_UNAVAILABLE，绝不回退宿主目录。
+      const lost = await runtimeA.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-wt', workspace: { path: repo, worktree: { mode: 'on' } } },
+      })
+      eq(lost.status, 201, JSON.stringify(lost.body))
+      rmSync(join(home, 'flow-studio', 'instances', lost.body.id, 'workspace.json'))
+      const unavailable = await runtimeB.handle({ method: 'GET', parts: ['instances', lost.body.id, 'worktree'], url })
+      eq(unavailable.status, 409, '缺冻结记录 409')
+      eq(unavailable.body.code, 'WORKSPACE_UNAVAILABLE', '错误码 WORKSPACE_UNAVAILABLE（不静默回退）')
+    } finally {
+      await runtimeA.dispose()
+      await runtimeB.dispose()
+    }
+  })
+
+  await check('prune：dryRun 预览 / planHash 过期 409 / 无所有权目录只报告', async home => {
+    const repo = makeGitRepo(home)
+    const url = new URL('http://localhost/')
+    const runtime = createBpmnRuntime({ dir: store.flowsDir(home), env: {}, adapters: makeFakeAdapters() })
+    try {
+      const saved = await runtime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-terminal', name: 'terminal', xml: agentOnlyXml('proc-terminal') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+      const created = await runtime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-terminal', workspace: { path: repo, worktree: { mode: 'on', cleanup: 'retain' } } },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      eq(created.body.status, 'COMPLETED', 'agent→end 正常完成')
+      const id = created.body.id
+      const workspaceId = created.body.workspace.workspaceId
+      const worktreePath = created.body.workspace.effectiveRoot
+      const junk = join(home, 'flow-studio', 'worktrees', workspaceId, 'i-junk')
+      mkdirSync(junk, { recursive: true })
+      writeFileSync(join(junk, 'keep.txt'), 'no ownership\n')
+
+      const inspected = await runtime.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
+      eq(inspected.status, 200, JSON.stringify(inspected.body))
+      eq(inspected.body.cleanable, true, '终态干净树可清理')
+
+      const dry = await runtime.handle({ method: 'POST', parts: ['instance-worktrees', 'prune'], url, body: { dryRun: true } })
+      eq(dry.status, 200, JSON.stringify(dry.body))
+      ok(/^[0-9a-f]{64}$/.test(dry.body.planHash), '预览返回 planHash')
+      eq(dry.body.plan.entries.find(entry => entry.instanceId === id).action, 'remove', '终态实例计划删除')
+      eq(dry.body.plan.entries.find(entry => entry.instanceId === 'i-junk').action, 'report', '无所有权目录只报告')
+
+      writeFileSync(join(worktreePath, 'dirty.txt'), 'changed\n')
+      const stale = await runtime.handle({
+        method: 'POST',
+        parts: ['instance-worktrees', 'prune'],
+        url,
+        body: { dryRun: false, planHash: dry.body.planHash },
+      })
+      eq(stale.status, 409, '状态变化后旧 planHash 失效')
+      eq(stale.body.code, 'INSTANCE_WORKTREE_PLAN_STALE', '错误码说明 plan 过期')
+      ok(existsSync(worktreePath), '过期执行没有删树')
+
+      const missingHash = await runtime.handle({ method: 'POST', parts: ['instance-worktrees', 'prune'], url, body: { dryRun: false } })
+      eq(missingHash.status, 400, '执行必须带 planHash')
+
+      rmSync(join(worktreePath, 'dirty.txt'))
+      const fresh = await runtime.handle({ method: 'POST', parts: ['instance-worktrees', 'prune'], url, body: { dryRun: true } })
+      eq(fresh.status, 200, JSON.stringify(fresh.body))
+      eq(fresh.body.plan.entries.find(entry => entry.instanceId === id).action, 'remove', '恢复干净后重新可删')
+      const executed = await runtime.handle({
+        method: 'POST',
+        parts: ['instance-worktrees', 'prune'],
+        url,
+        body: { dryRun: false, planHash: fresh.body.planHash },
+      })
+      eq(executed.status, 200, JSON.stringify(executed.body))
+      ok(executed.body.removed.some(entry => entry.instanceId === id), '按计划删掉终态树')
+      ok(executed.body.skipped.some(entry => entry.instanceId === 'i-junk' && entry.reason === 'no-ownership'), '无所有权目录进 skipped')
+      ok(!existsSync(worktreePath), '终态树已删')
+      ok(existsSync(junk), '无所有权目录没有被删')
+      const replay = await runtime.handle({
+        method: 'POST',
+        parts: ['instance-worktrees', 'prune'],
+        url,
+        body: { dryRun: false, planHash: fresh.body.planHash },
+      })
+      eq(replay.status, 409, '同一 planHash 不能重放')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('workspace 策略：auto 非 Git 回退 / on 400 / allowlist 403 / 终态清理保留产物快照', async home => {
+    const repo = makeGitRepo(home)
+    const sub = join(repo, 'sub')
+    mkdirSync(sub)
+    const url = new URL('http://localhost/')
+    const plainRuntime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(),
+      workspaceAllowlist: [repo],
+    })
+    try {
+      const saved = await plainRuntime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-ws', name: 'ws', xml: workflowXml('proc-ws') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+
+      const onNonGit = await plainRuntime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-ws', workspace: { path: sub, worktree: { mode: 'on' } } },
+      })
+      eq(onNonGit.status, 400, 'on 必须建立成功')
+      eq(onNonGit.body.code, 'WORKSPACE_NOT_GIT', '非 Git 明确报 WORKSPACE_NOT_GIT')
+
+      const auto = await plainRuntime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-ws', workspace: { path: sub, worktree: { mode: 'auto' } } },
+      })
+      eq(auto.status, 201, JSON.stringify(auto.body))
+      eq(auto.body.workspace.mode, 'off', 'auto 非 Git 回退原目录')
+      eq(auto.body.workspace.worktree, null, '回退时没有 worktree 记录')
+
+      const outside = await plainRuntime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-ws', workspace: { path: home } },
+      })
+      eq(outside.status, 403, 'allowlist 外 403')
+      eq(outside.body.code, 'WORKSPACE_NOT_ALLOWED', '错误码 WORKSPACE_NOT_ALLOWED')
+
+      const missing = await plainRuntime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-ws', workspace: { path: join(home, 'missing') } },
+      })
+      eq(missing.status, 400, '不存在路径 400')
+      eq(missing.body.code, 'WORKSPACE_MISSING', '错误码 WORKSPACE_MISSING')
+    } finally {
+      await plainRuntime.dispose()
+    }
+
+    // 终态清理 + artifact 快照：agent 在树里写文档，gate 先保存快照，随后树被清理。
+    const adapter = makeFakeAdapter(async request => {
+      writeFileSync(join(request.workspaceRoot, 'out.md'), '# 产物\n')
+      // agent 自己把产物提交进它的分支：终态清理只处理「树干净」的工作树。
+      execFileSync('git', ['add', 'out.md'], { cwd: request.workspaceRoot, stdio: 'ignore' })
+      execFileSync('git', ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'artifact'], {
+        cwd: request.workspaceRoot,
+        stdio: 'ignore',
+      })
+      const submitted = await request.finishGate.submit({
+        variables: { ok: true },
+        documents: [{ path: 'out.md', kind: 'markdown', title: '产物' }],
+        summary: 'artifact',
+      })
+      return { exited: Promise.resolve({ ok: true, record: submitted.record }) }
+    })
+    const artifactRuntime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(adapter),
+      workspaceAllowlist: [repo],
+    })
+    try {
+      const saved = await artifactRuntime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-artifact', name: 'artifact', xml: agentOnlyXml('proc-artifact') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+      const created = await artifactRuntime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: {
+          definitionId: 'flow-artifact',
+          workspace: { path: repo, worktree: { mode: 'on', cleanup: 'on-terminal-clean' } },
+        },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      eq(created.body.status, 'COMPLETED', 'agent→end 完成')
+      eq(created.body.workspace.mode, 'worktree', '使用 worktree')
+      const id = created.body.id
+      const worktreePath = created.body.workspace.effectiveRoot
+      ok(!existsSync(worktreePath), 'on-terminal-clean 在终态后清理了工作树（产物已先落快照）')
+      ok(!existsSync(join(repo, 'out.md')), '主工作区没有产物文件')
+
+      const detail = await artifactRuntime.handle({ method: 'GET', parts: ['instances', id], url })
+      eq(detail.status, 200, JSON.stringify(detail.body))
+      eq(detail.body.artifacts.length, 1, '产物引用仍登记')
+      const artifact = detail.body.artifacts[0]
+      eq(artifact.path, 'out.md', '对外仍保持 path + sha256 + bytes 契约')
+      eq(typeof artifact.sha256, 'string', 'sha256 可读')
+      eq(artifact.bytes, Buffer.byteLength('# 产物\n'), 'bytes 可读')
+      ok(artifact.contentRef.startsWith('artifacts/'), 'artifact 带 contentRef')
+      eq(artifact.executionId !== undefined, true, 'artifact 带 executionId')
+      eq(artifact.workspaceId, created.body.workspace.workspaceId, 'artifact 带 workspaceId')
+      const content = await artifactRuntime.artifactStore.read(artifact.sha256)
+      eq(content.toString('utf8'), '# 产物\n', '清理后仍能按原 hash 读回产物正文')
+
+      const after = await artifactRuntime.handle({ method: 'GET', parts: ['instances', id, 'worktree'], url })
+      eq(after.body.worktree.state, 'missing', 'GET 显示树已清理')
+      const events = await artifactRuntime.handle({ method: 'GET', parts: ['instances', id, 'resource-events'], url })
+      ok(events.body.events.some(event => event.type === 'worktree/removed'), '资源事件记录终态清理')
+
+      // worktree 模式下节点 cwd 越界：零派发，实例 ACTIVE + lastError 码，不回退宿主目录。
+      const cwdAdapter = makeFakeAdapter()
+      const cwdRuntime = createBpmnRuntime({
+        dir: store.flowsDir(home),
+        env: {},
+        adapters: makeFakeAdapters(cwdAdapter),
+        workspaceAllowlist: [repo],
+      })
+      try {
+        const cwdSaved = await cwdRuntime.handle({
+          method: 'POST',
+          parts: ['definitions'],
+          url,
+          body: { id: 'flow-cwd', name: 'cwd', xml: agentOnlyXml('proc-cwd', '../outside') },
+        })
+        eq(cwdSaved.status, 201, JSON.stringify(cwdSaved.body))
+        const cwdCreated = await cwdRuntime.handle({
+          method: 'POST',
+          parts: ['instances'],
+          url,
+          body: { definitionId: 'flow-cwd', workspace: { path: repo, worktree: { mode: 'on' } } },
+        })
+        eq(cwdCreated.status, 201, JSON.stringify(cwdCreated.body))
+        eq(cwdCreated.body.error.code, 'WORKSPACE_CWD_OUTSIDE', '越界 cwd 明确失败')
+        eq(cwdAdapter.calls.length, 0, '零派发：adapter.start 未被调用')
+        eq(cwdCreated.body.status, 'ACTIVE', '失败不判死，实例仍 ACTIVE')
+      } finally {
+        await cwdRuntime.dispose()
+      }
+    } finally {
+      await artifactRuntime.dispose()
     }
   })
 

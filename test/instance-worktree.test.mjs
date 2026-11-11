@@ -13,8 +13,8 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import {
-  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
-  symlinkSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync,
+  rmSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,7 +26,7 @@ const { defaultGitRunner, resolveWorkspace } = await import('../src/workspace-po
 const {
   INSTANCE_WORKTREE_ERROR, createInstanceWorktree, createPrunePlan, inspectInstanceWorktree,
   listInstanceWorktrees, planHashOf, pruneInstanceWorktrees, removeInstanceBranch,
-  removeInstanceWorktree,
+  removeInstanceWorktree, rollbackCreatedWorktree,
 } = await import('../src/instance-worktree.js')
 const {
   readResourceRecord, writeResourceRecord,
@@ -429,6 +429,54 @@ try {
     eq(git(context.repo, ['rev-parse', '--verify', `refs/heads/${winner.branch}`]).length > 0, true, '成功者的分支仍在')
   })
 
+  await check('F1 创建后回滚：目标被移走 / 替换时零 prune、零误删', async sandbox => {
+    const context = await setup(sandbox)
+
+    // 1) 目标被移走：只报告，不 prune、不删登记 / 分支。
+    const moved = await create(context, 'i-f1-moved')
+    const movedPath = `${moved.effectiveRoot}-moved`
+    renameSync(moved.effectiveRoot, movedPath)
+    const movedLog = []
+    const movedResult = await rollbackCreatedWorktree({
+      record: moved, worktreeRoot: context.worktreeRoot, runner: recordingRunner(movedLog),
+    })
+    eq(movedResult.treeRemoved, false, '目标移走时不删树')
+    eq(movedResult.reason, 'target-missing', '原因 target-missing')
+    deep(movedLog.filter(command => command.includes('worktree prune')), [], '回滚链没有仓库级 prune')
+    ok(existsSync(movedPath), '被移走的目录仍在')
+    ok(existsSync(join(movedPath, '.git')), '被移走的目录仍是真实 worktree')
+    ok(git(context.repo, ['rev-parse', '--verify', `refs/heads/${moved.branch}`]).length > 0, '分支仍在')
+
+    // 2) 目标被普通目录替换：没有 .git 标记，不删替换目录。
+    const replaced = await create(context, 'i-f1-replaced')
+    const replacedPath = `${replaced.effectiveRoot}-moved`
+    renameSync(replaced.effectiveRoot, replacedPath)
+    mkdirSync(replaced.effectiveRoot, { recursive: true })
+    writeFileSync(join(replaced.effectiveRoot, 'keep.txt'), 'other-owner\n')
+    const replacedLog = []
+    const replacedResult = await rollbackCreatedWorktree({
+      record: replaced, worktreeRoot: context.worktreeRoot, runner: recordingRunner(replacedLog),
+    })
+    eq(replacedResult.treeRemoved, false, '替换目录不删')
+    eq(replacedResult.reason, 'not-owned', '原因 not-owned')
+    deep(replacedLog.filter(command => command.includes('worktree prune')), [], '替换路径也没有 prune')
+    eq(readFileSync(join(replaced.effectiveRoot, 'keep.txt'), 'utf8'), 'other-owner\n', '替换目录里的文件未被删')
+    ok(existsSync(replacedPath), '被移走的原树仍在')
+
+    // 3) 普通 remove 遇到路径缺失：只注销这一条登记，不发仓库级 prune。
+    const missing = await create(context, 'i-f1-missing')
+    const missingPath = `${missing.effectiveRoot}-moved`
+    renameSync(missing.effectiveRoot, missingPath)
+    const missingLog = []
+    const missingResult = await removeInstanceWorktree({
+      record: missing, worktreeRoot: context.worktreeRoot, runner: recordingRunner(missingLog),
+    })
+    eq(missingResult.removed, true, '缺失路径的这条登记可以定向注销')
+    eq(missingResult.reason, 'not-found', 'reason=not-found')
+    deep(missingLog.filter(command => command.includes('worktree prune')), [], '普通 remove 也不发仓库级 prune')
+    ok(existsSync(missingPath), '被移走的目录未被删')
+  })
+
   await check('W2 locked worktree：force:false 零 --force；显式 force 才解除保护', async sandbox => {
     const context = await setup(sandbox)
     const record = await create(context, 'i-locked')
@@ -495,6 +543,45 @@ try {
     const forced = await removeInstanceBranch({ record, force: true, runner })
     eq(forced.removed, true, '显式 force 才允许删除未证明合并的分支')
     eq(forced.forced, true, '结果标记 forced=true')
+  })
+
+  await check('F2 合并检查与删除针对同一 tip：ABA 交错不删未合并分支', async sandbox => {
+    const context = await setup(sandbox)
+    const record = await create(context, 'i-aba')
+    writeFileSync(join(record.effectiveRoot, 'work.txt'), 'unmerged work\n')
+    git(record.effectiveRoot, ['add', '.'])
+    git(record.effectiveRoot, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'unmerged'])
+    const unmergedTip = git(context.repo, ['rev-parse', `refs/heads/${record.branch}`])
+    await removeInstanceWorktree({ record, force: true, worktreeRoot: context.worktreeRoot })
+
+    // 交错：检查命令执行期间把分支临时指向已合并的 main，命令返回后恢复未合并 tip。
+    // 旧实现检查可变分支名会通过，随后 `update-ref -d <branch> <tip A>` 成功；
+    // 新实现检查捕获的 tip A，必须拒绝。
+    const log = []
+    const runner = async (argv, options) => {
+      const command = argv.join(' ')
+      log.push(command)
+      if (command.includes('merge-base') && command.includes('--is-ancestor')) {
+        git(context.repo, ['branch', '-f', record.branch, 'main'])
+        try {
+          return await defaultGitRunner(argv, options)
+        } finally {
+          git(context.repo, ['branch', '-f', record.branch, unmergedTip])
+        }
+      }
+      return await defaultGitRunner(argv, options)
+    }
+    const result = await removeInstanceBranch({ record, runner })
+    eq(result.removed, false, '交错探针必须得到未删除')
+    eq(result.reason, 'unmerged', '按捕获的 tip 判断为未合并')
+    deep(log.filter(command => command.includes('update-ref -d')), [], '未合并时零删除命令')
+    eq(git(context.repo, ['rev-parse', `refs/heads/${record.branch}`]), unmergedTip, '未合并 tip 仍在')
+
+    // 对**已合并 tip**仍可正常删：把 main 推进到该分支后删除。
+    git(context.repo, ['merge', '--ff-only', record.branch])
+    const merged = await removeInstanceBranch({ record })
+    eq(merged.removed, true, '已合并 tip 可正常删除')
+    eq(merged.forced, false, '不需要 force')
   })
 
   await check('W6 语义损坏的 instance.json：list 标 unknown，prune 只报告并拒绝执行', async sandbox => {

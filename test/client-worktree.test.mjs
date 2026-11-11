@@ -579,6 +579,7 @@ try {
       const confirm = findElement(probe.tree, node => node.props && node.props['data-wt-confirm'] === 'remove')
       ok(confirm !== null)
       ok(textOf(confirm).includes('不可撤销'))
+      ok(textOf(confirm).includes('未合并提交'), '危险确认文案覆盖强删未合并提交')
 
       // 取消 removeBranch 勾选，验证请求体跟随 UI。
       const option = findElement(probe.tree, node => node.props && node.props['data-action'] === 'worktree-remove-branch-option')

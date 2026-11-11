@@ -541,6 +541,8 @@ export function createCodexAdapter(options = {}) {
     approvalPolicy: normalizeChoice(options.approvalPolicy, APPROVAL_POLICY_SET, 'never', 'approvalPolicy'),
     model: typeof options.model === 'string' && options.model.trim() !== '' ? options.model.trim() : undefined,
     agentOptions: isPlainObject(options.agentOptions) ? options.agentOptions : undefined,
+    // 测试 / 故障注入：替换真实进程回收实现。生产不传，走下面的 killTree。
+    killImpl: typeof options.killImpl === 'function' ? options.killImpl : null,
     env: isPlainObject(options.env) ? options.env : {},
     selfTest: options.selfTest !== false,
   }
@@ -969,6 +971,9 @@ export function createCodexAdapter(options = {}) {
     let resumeChild = null
     let exitedResolve
     let exitedDone = false
+    // 物理退出是否**被确认**（子进程 exit 事件 / 根本没有 pid）。逻辑结局（exited）
+    // 可以在杀进程未生效时自行收口，但不能把物理清理也当成完成（review-0139 F3）。
+    let physicalExitConfirmed = false
     let graceTimer = null
     let forceKillTimer = null
     let disposeDone = false
@@ -1036,6 +1041,14 @@ export function createCodexAdapter(options = {}) {
      * 因为 taskkill 没有「先礼貌再强杀」的语义，且 codex 树里的 MCP server 不能留孤儿。
      */
     const killTree = (signal, target) => {
+      if (typeof settings.killImpl === 'function') {
+        try {
+          settings.killImpl(signal, target || child)
+        } catch {
+          // 注入实现自己负责；这里只保证调用点不炸。
+        }
+        return
+      }
       const pid = target && target.pid ? target.pid : child && child.pid
       if (!pid) return
       if (process.platform === 'win32') {
@@ -1281,6 +1294,7 @@ export function createCodexAdapter(options = {}) {
       state.spawnError = error
       // 没有 pid 时不会再触发 exit：立刻收口并让 hello 竞速快速失败（M2）。
       if (!mainPid) {
+        physicalExitConfirmed = true
         resolveExited({
           ok: false,
           code: 'NODE_FINISH_CHANNEL_FAILED',
@@ -1292,6 +1306,7 @@ export function createCodexAdapter(options = {}) {
     child.on('exit', (code, signal) => {
       state.exitCode = code
       state.signal = signal
+      physicalExitConfirmed = true
       // 子进程退出后，顺手收掉同一进程组里可能残留的 MCP server（只针对初始进程组；
       // 提醒续跑由 resumeChild 自己的退出路径 + 宽限清理负责，别在这里打成活跃进程组）。
       if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', child)
@@ -1339,6 +1354,14 @@ export function createCodexAdapter(options = {}) {
         return redactText(state.stderrTail)
       },
       exited,
+      /**
+       * 逻辑结局 vs 物理清理：`exited` 可以在「杀进程未生效」时有界收口，但
+       * `cleanup.disposed===false` 明确告诉 runtime 进程退出尚未确认，不能释放槽位
+       * 或清理工作目录（review-0139 F3）。只有真的看到 exit 事件才是 true。
+       */
+      get cleanup() {
+        return { disposed: physicalExitConfirmed }
+      },
       cancel: reason => cancelHandle(handle, reason),
       dispose: () => disposeHandle(handle),
     }

@@ -188,6 +188,68 @@ try {
     ok(!existsSync(lock), '接管者释放后锁文件消失')
   })
 
+  await check('F4 stale 抢占：guard 复核保证任一时刻只有一个持有者，不搬走继任锁', async home => {
+    const lock = join(home, 'guarded.lock')
+    writeFileSync(lock, `${JSON.stringify({
+      v: resources.RESOURCE_LOCK_VERSION,
+      owner: 'dead-token',
+      pid: 999999,
+      at: new Date(Date.now() - 60_000).toISOString(),
+    })}\n`)
+
+    let active = 0
+    let maxActive = 0
+    const runTask = async label => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await sleep(60)
+      active -= 1
+      return label
+    }
+
+    // B 在抢占 stale 锁前暂停；期间 A 完成抢占、建锁并开始任务。
+    // 旧协议里 B 迟到的 rename 会搬走 A 的新锁；新协议在 guard 内复核后放弃。
+    let resumeB = null
+    let signalPaused = null
+    const bGate = new Promise(resolveGate => { resumeB = resolveGate })
+    const bPaused = new Promise(resolvePaused => { signalPaused = resolvePaused })
+    let pausedOnce = false
+    const bPromise = resources.withResourceLock(lock, () => runTask('B'), {
+      ttlMs: 60_000,
+      waitMs: 5_000,
+      hooks: {
+        beforeSteal: async () => {
+          if (pausedOnce) return
+          pausedOnce = true
+          signalPaused()
+          await bGate
+        },
+      },
+    })
+    await bPaused
+
+    let signalAStarted = null
+    const aStarted = new Promise(resolveStarted => { signalAStarted = resolveStarted })
+    const aPromise = resources.withResourceLock(lock, async () => {
+      signalAStarted()
+      return await runTask('A')
+    }, { ttlMs: 60_000, waitMs: 5_000 })
+    await aStarted
+    ok(existsSync(lock), 'A 已持有锁')
+    const heldOwner = JSON.parse(readFileSync(lock, 'utf8')).owner
+    ok(typeof heldOwner === 'string' && heldOwner !== 'dead-token', '锁内容已换成 A')
+
+    resumeB()
+    await sleep(20)
+    ok(existsSync(lock), 'B 的迟到抢占没有搬走 A 的锁')
+    eq(JSON.parse(readFileSync(lock, 'utf8')).owner, heldOwner, 'A 的锁内容未被替换')
+
+    const values = await Promise.all([aPromise, bPromise])
+    deep(values.sort(), ['A', 'B'], '两个持锁任务都完成')
+    eq(maxActive, 1, '任一时刻只有一个持有者')
+    ok(!existsSync(lock), '最终锁被释放')
+  })
+
   await check('资源事件：独立 resourceSeq / since 过滤 / 终态实例仍可写（执行事件仍封口）', async home => {
     const instance = await seedInstance(home)
     const instancesRoot = store.instancesDir(home)

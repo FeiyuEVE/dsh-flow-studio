@@ -104,6 +104,7 @@ import {
   pruneInstanceWorktrees,
   removeInstanceBranch,
   removeInstanceWorktree,
+  rollbackCreatedWorktree,
 } from './instance-worktree.js'
 import {
   INSTANCE_INBOX_ERROR,
@@ -1434,12 +1435,12 @@ class BpmnRuntime {
         })
       }
     } catch (error) {
-      // 记录写不进去就不能假装工作区已就绪：尽量回滚刚建的树。
+      // 记录写不进去就不能假装工作区已就绪：回滚走**创建事务所有权证据**，
+      // 不用普通 remove（后者可能发仓库级 prune，review-0139 F1）。
       if (worktreeRecord !== null) {
         try {
-          await removeInstanceWorktree({
+          await rollbackCreatedWorktree({
             record: worktreeRecord,
-            force: true,
             worktreeRoot: this.worktreeRoot,
             ...(this.gitRunner === undefined ? {} : { runner: this.gitRunner }),
           })
@@ -2167,6 +2168,16 @@ class BpmnRuntime {
         },
       }
     }
+    if (this._executionBusy(id)) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_WORKTREE_EXECUTION_ACTIVE',
+          error: `实例 ${id} 仍有 agent 执行未确认退出（进程 / 清理未完成）：禁止清理工作树（force 不能越过此限制）`,
+        },
+      }
+    }
     const state = await this._workspaceFor(id)
     if (state.error !== null) return workspaceErrorResult(state.error)
     if (state.workspace === null || state.workspace.worktree === null || state.workspace.worktree === undefined) {
@@ -2230,6 +2241,16 @@ class BpmnRuntime {
           ok: false,
           code: 'INSTANCE_WORKTREE_INSTANCE_ACTIVE',
           error: `实例 ${id} 当前是 ${instance.status}：禁止删除工作树分支`,
+        },
+      }
+    }
+    if (this._executionBusy(id)) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_WORKTREE_EXECUTION_ACTIVE',
+          error: `实例 ${id} 仍有 agent 执行未确认退出（进程 / 清理未完成）：禁止删除工作树分支`,
         },
       }
     }
@@ -2432,6 +2453,25 @@ class BpmnRuntime {
         body: { ok: false, code: INSTANCE_WORKTREE_ERROR.PLAN_STALE, error: '工作区状态已变化，旧 planHash 失效，请重新预览' },
       }
     }
+    // 与手动 DELETE 共用执行存活检查：prune 也不能在 agent 进程 / 物理清理未确认
+    // 退出时把正在使用的树删掉（review-0139 F3）。发现占用就整体拒绝，返回可读原因。
+    const busyInstances = [...new Set(
+      stored.plan.entries
+        .filter(entry => entry.action === 'remove' && isPlainObject(entry.record))
+        .map(entry => entry.record.instanceId)
+        .filter(instanceId => typeof instanceId === 'string' && this._executionBusy(instanceId)),
+    )]
+    if (busyInstances.length > 0) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          code: 'INSTANCE_WORKTREE_EXECUTION_ACTIVE',
+          error: `以下实例仍有 agent 执行未确认退出，拒绝执行 prune：${busyInstances.join(', ')}`,
+          instanceIds: busyInstances,
+        },
+      }
+    }
     let executed
     try {
       executed = await pruneInstanceWorktrees({
@@ -2540,6 +2580,15 @@ class BpmnRuntime {
         // 同上。
       }
     }
+  }
+
+  /**
+   * 该实例是否还有**物理执行**占用：`_activeAgents` 只在确认退出后才减到 0
+   * （start 未返回 / 迟到句柄未 dispose / dispose 抛错 / cleanup.disposed=false 都保留）。
+   * 所有删除入口（手动 DELETE、分支删除、prune）都必须先问这一条（review-0139 F3）。
+   */
+  _executionBusy(instanceId) {
+    return (this._activeAgents.get(instanceId) ?? 0) > 0
   }
 
   async _waitAgentsReleased(instanceId, timeoutMs) {

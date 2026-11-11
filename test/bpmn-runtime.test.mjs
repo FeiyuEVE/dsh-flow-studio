@@ -18,7 +18,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs'
 import http from 'node:http'
 import { dirname, join, resolve } from 'node:path'
@@ -37,6 +37,7 @@ const store = await import('../src/store.js')
 const runstore = await import('../src/runstore.js')
 const instStore = await import('../src/instance-store.js')
 const { createBpmnRunner } = await import('../src/bpmn-runner.js')
+const { resolveWorkspace, defaultGitRunner } = await import('../src/workspace-policy.js')
 
 let checks = 0
 let assertions = 0
@@ -268,6 +269,10 @@ function workflowXml(processId = 'proc-demo') {
 }
 
 /** 在 home 下建一个真实临时 Git 仓库（测试项目产物仍在 .tmp/）。 */
+function gitCmd(cwd, args) {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+}
+
 function makeGitRepo(home, name = 'repo') {
   const repo = join(home, name)
   mkdirSync(repo, { recursive: true })
@@ -2162,6 +2167,127 @@ try {
       eq(runtime.executionLimits.active, 1, 'dispose 抛错 → 不释放槽位')
       await runtime._maybeTerminalCleanup(id, { waitMs: 30 })
       ok(existsSync(worktreePath), '退出未确认时仍不清理 worktree')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('F1 创建后元数据失败回滚：零仓库级 prune，移走 / 替换的目标不被删', async home => {
+    const repo = makeGitRepo(home)
+    const commands = []
+    let target = null
+    let variant = 'moved'
+    const runner = async (argv, options) => {
+      commands.push(argv.join(' '))
+      const result = await defaultGitRunner(argv, options)
+      if (argv.includes('branch') && argv.includes('-m') && target !== null) {
+        renameSync(target, `${target}-moved`)
+        if (variant === 'replaced') {
+          mkdirSync(target, { recursive: true })
+          writeFileSync(join(target, 'keep.txt'), 'other-owner\n')
+        }
+      }
+      return result
+    }
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(makeFakeAdapter()),
+      workspaceAllowlist: [repo],
+      worktreeRunner: runner,
+    })
+    try {
+      const resolved = await resolveWorkspace({ path: repo, allowlist: [repo] })
+      mkdirSync(runtime.instancesRoot, { recursive: true })
+      const option = { worktree: { mode: 'on', baseRef: 'HEAD', cleanup: 'retain' } }
+
+      // 1) 目标被移走。用普通文件占住 instances/<id>，使 workspace 快照写入确定性失败。
+      const movedId = 'i-f1-runtime-moved'
+      writeFileSync(join(runtime.instancesRoot, movedId), 'block snapshot write\n')
+      target = join(runtime.worktreeRoot, resolved.workspaceId, movedId)
+      variant = 'moved'
+      const moved = await runtime._prepareInstanceWorkspace(movedId, option, resolved)
+      eq(moved.workspace, null, '快照失败时工作区不假装就绪')
+      ok(moved.error !== null, '返回可读错误')
+      deep(commands.filter(command => command.includes('worktree prune')), [], '回滚链没有仓库级 prune')
+      ok(existsSync(`${target}-moved`), '被移走的目标目录仍在')
+      eq(gitCmd(repo, ['rev-parse', '--verify', `refs/heads/flow-instance/${movedId}`]).length > 0, true, '分支仍保留（所有权不明确时不删）')
+
+      // 2) 目标被普通目录替换：无 .git 标记，回滚不得删替换目录。
+      const replacedId = 'i-f1-runtime-replaced'
+      writeFileSync(join(runtime.instancesRoot, replacedId), 'block snapshot write\n')
+      target = join(runtime.worktreeRoot, resolved.workspaceId, replacedId)
+      variant = 'replaced'
+      const replaced = await runtime._prepareInstanceWorkspace(replacedId, option, resolved)
+      eq(replaced.workspace, null, '替换场景同样失败')
+      eq(readFileSync(join(target, 'keep.txt'), 'utf8'), 'other-owner\n', '替换目录里的文件未被删')
+      ok(existsSync(`${target}-moved`), '被移走的原树仍在')
+      deep(commands.filter(command => command.includes('worktree prune')), [], '整个回滚链零 prune')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  await check('F3 DELETE / prune：物理执行未确认退出时拒绝，归零后才允许', async home => {
+    const repo = makeGitRepo(home)
+    const url = new URL('http://localhost/')
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(makeFakeAdapter()),
+      workspaceAllowlist: [repo],
+    })
+    try {
+      const saved = await runtime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-f3', name: 'f3', xml: agentOnlyXml('proc-f3') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+      const created = await runtime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-f3', workspace: { path: repo, worktree: { mode: 'on' } } },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      eq(created.body.status, 'COMPLETED', 'agent-only 流程已结束')
+      const id = created.body.id
+      const worktreePath = created.body.workspace.effectiveRoot
+      ok(existsSync(worktreePath), 'worktree 已建立')
+
+      // 模拟 handler 已结束但物理进程 / 清理未确认：_activeAgents 仍占用。
+      runtime._activeAgents.set(id, 1)
+      const blocked = await runtime.handle({ method: 'DELETE', parts: ['instances', id, 'worktree'], url })
+      eq(blocked.status, 409, '手动 DELETE 被拒绝')
+      eq(blocked.body.code, 'INSTANCE_WORKTREE_EXECUTION_ACTIVE')
+      ok(existsSync(worktreePath), '拒绝时树还在')
+
+      const branchBlocked = await runtime.handle({ method: 'DELETE', parts: ['instances', id, 'worktree', 'branch'], url })
+      eq(branchBlocked.status, 409, '分支删除同样被拒绝')
+      eq(branchBlocked.body.code, 'INSTANCE_WORKTREE_EXECUTION_ACTIVE')
+
+      const dry = await runtime.handle({
+        method: 'POST', parts: ['instance-worktrees', 'prune'], url, body: { dryRun: true },
+      })
+      eq(dry.status, 200, JSON.stringify(dry.body))
+      const pruneBlocked = await runtime.handle({
+        method: 'POST',
+        parts: ['instance-worktrees', 'prune'],
+        url,
+        body: { dryRun: false, planHash: dry.body.planHash },
+      })
+      eq(pruneBlocked.status, 409, 'prune 执行被拒绝')
+      eq(pruneBlocked.body.code, 'INSTANCE_WORKTREE_EXECUTION_ACTIVE')
+      ok(existsSync(worktreePath), 'prune 拒绝时树还在')
+
+      // 确认退出后，同一个删除入口恢复可用。
+      runtime._activeAgents.delete(id)
+      const removed = await runtime.handle({ method: 'DELETE', parts: ['instances', id, 'worktree'], url })
+      eq(removed.status, 200, JSON.stringify(removed.body))
+      eq(removed.body.removed, true, '归零后可以删')
+      ok(!existsSync(worktreePath), '归零后树被删')
     } finally {
       await runtime.dispose()
     }

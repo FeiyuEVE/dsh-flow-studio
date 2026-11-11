@@ -453,6 +453,15 @@ function pidAlive(pid) {
   }
 }
 
+async function waitUntil(predicate, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise(resolveWait => setTimeout(resolveWait, 25))
+  }
+  return false
+}
+
 async function waitForDead(pid, timeoutMs = 8_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -970,6 +979,45 @@ async function main() {
       A.equal(await waitForDead(codexPid), true, 'codex 应被 SIGKILL 收掉')
       A.equal(await waitForDead(mcpPid), true, 'MCP server 子进程也应被收掉')
       A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('F3 杀进程未生效：exited 有界收口，但 cleanup.disposed=false（物理退出未确认）', async () => {
+      resetState()
+      const workspace = freshWorkspace('kill-not-effective')
+      // 注入「杀进程未生效」：SIGTERM / SIGKILL 都打不出去，模拟宿主无法确认退出。
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'sleep' },
+        postFinishGraceMs: 60_000,
+        killTimeoutMs: 50,
+        killImpl: () => {},
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '杀不掉的节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const codexPid = handle.pid
+      A.equal(pidAlive(codexPid), true, '进程仍在')
+      await adapter.cancel(handle, 'test-cancel')
+      const exited = await handle.exited
+      A.equal(exited.ok, false)
+      A.equal(exited.code, 'NODE_FINISH_CANCELED', '逻辑结局仍有界收口')
+      A.equal(handle.cleanup.disposed, false, '未确认物理退出：cleanup.disposed=false')
+      await adapter.dispose(handle)
+      A.equal(handle.cleanup.disposed, false, 'dispose 返回后仍不得报告已清理')
+
+      // 测试收尾：手动打真实 SIGKILL，避免留下后台进程；exit 事件会补上物理确认。
+      try {
+        process.kill(-codexPid, 'SIGKILL')
+      } catch {
+        try { process.kill(codexPid, 'SIGKILL') } catch { /* 已退出 */ }
+      }
+      A.equal(await waitForDead(codexPid), true, '测试收尾：真实进程已退出')
+      A.equal(await waitUntil(() => handle.cleanup.disposed === true, 2_000), true,
+        '真的收到 exit 事件后才更新为 disposed=true')
     })
 
     await check('M4：凭据 / socket 路径不进 handle.events / lastMessage / stdoutTail', async () => {

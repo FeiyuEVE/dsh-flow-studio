@@ -87,6 +87,7 @@ export const HOST_MODULES = [
   'instance-metrics.js',
   'instance-evidence.js',
   'agent-telemetry.js',
+  'claude-usage-ledger.js',
   'agent-adapter.js',
   'agent-adapter-dsh.js',
   'agent-adapter-codex.js',

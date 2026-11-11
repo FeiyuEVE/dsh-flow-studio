@@ -1,32 +1,56 @@
 /**
- * Agent 调用的遥测事实：调用身份、usage 归一化、可信来源标记。
+ * Agent 调用的遥测事实：调用身份、usage 归一化、结算快照、可信来源标记。
  *
- * 口径唯一来源：`docs/design/12-instance-metrics.md`（`docs/design/05-run-log.md`
- * 的四桶语义在实例域的唯一实现处）。本模块只做纯函数，不读写文件、不碰实例状态：
+ * 口径唯一来源：`docs/design/12-instance-metrics.md`。本模块只做纯函数，不读写文件、
+ * 不碰实例状态：
  *
  *   - 调用身份 = `provider + callId`。同一 callId 的多次上报是**替换**，不是累加；
- *     真实的新调用必须由适配器给新的 callId（例如 codex 每轮 `turn.completed`、
- *     dsh 每个 `attemptId`）。
- *   - 四桶归一化 `{input, cacheRead, cacheWrite, output, total}`：
- *       * 有的 provider（codex / OpenAI 风格）的 `input_tokens` 已经把缓存命中与
- *         缓存写入算在里头，必须先拆出去，不能 cacheRead 再加一遍；
- *       * 有的 provider（dsh / DeepSeek TokenUsage）四桶本来就是互斥的，不能再拆。
- *     `total` 恒等于四桶之和，保证「total 不因拆桶而变大」。
+ *     真实的新调用必须由适配器给新的 callId。
+ *   - 四桶归一化 `{input, cacheRead, cacheWrite, output, total}`，**缺失桶是 null，
+ *     不是 0**；明确上报的 0 保留为 0。`total` 只在四桶都观测到时是数字，否则 null。
+ *   - 归一化结果带 `canonical` 版本标记：指标层再次读取事件里的 usage 时**只校验、
+ *     不重算**（Codex 的 inclusive input 不会被二次扣缓存）。
  *   - `reasoning` 是 output 的子集：只记录 `0 ≤ reasoning ≤ output`，绝不另加进 total。
  *   - 不可观测不是零：没有 usage 时 `usage:null` + `trust:'unknown'` + `reason`；
- *     只有真的看到数值才标 `known`。
+ *     只有真的看到数值才标 `known`。范围结算由独立的 `agent/usage-snapshot` 承载
+ *     （不计入模型调用数）；synthetic 记录只是未知占位，也不算模型调用。
  *
  * @module @feiyueve/dsh-flow-studio/agent-telemetry
  */
 
 /** 遥测事件（由 `agent-execute` 经 handler `events[]` 透传到实例事件流）。 */
 export const AGENT_USAGE_EVENT = 'agent/usage'
+/** 范围级结算快照（result 的最终用量）：**不是**一次模型调用。 */
+export const AGENT_USAGE_SNAPSHOT_EVENT = 'agent/usage-snapshot'
 /** 一次 agent 实际启动 / 提醒续跑轮次。 */
 export const AGENT_INVOCATION_EVENT = 'agent/invocation'
+
+/**
+ * usage 数据的形状 / 覆盖语义版本。事件与指标都用它判「旧数据能不能当完整」。
+ * 历史事件没有 `observedBuckets` 时按「完整性未知」处理。
+ */
+export const USAGE_SCHEMA_VERSION = 2
+
+/** 归一化 usage 的 canonical 版本（写进 `usage.canonical`）。 */
+export const CANONICAL_USAGE_VERSION = 1
 
 /** usage 可信来源。 */
 export const USAGE_TRUST = Object.freeze({
   KNOWN: 'known',
+  UNKNOWN: 'unknown',
+})
+
+/** 观测覆盖档位（`known` 完整 / `partial` 部分 / `unknown` 全未知）。 */
+export const USAGE_COVERAGE = Object.freeze({
+  KNOWN: 'known',
+  PARTIAL: 'partial',
+  UNKNOWN: 'unknown',
+})
+
+/** 结算快照的统计作用域。 */
+export const USAGE_SCOPE = Object.freeze({
+  INVOCATION: 'invocation',
+  SESSION_CUMULATIVE: 'session-cumulative',
   UNKNOWN: 'unknown',
 })
 
@@ -45,6 +69,7 @@ export const USAGE_BUCKETS = Object.freeze(['input', 'cacheRead', 'cacheWrite', 
 
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CALL_ID_PATTERN = /^[^\u0000-\u001f]{1,256}$/
+const SNAPSHOT_SCOPE_VALUES = new Set(Object.values(USAGE_SCOPE))
 
 function isPlainObject(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -54,6 +79,11 @@ function isPlainObject(value) {
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== ''
+}
+
+function boundedString(value, max = 128) {
+  if (typeof value !== 'string' || value === '') return null
+  return value.length > max ? value.slice(0, max) : value
 }
 
 /** provider 标识归一化；非法一律 `unknown`（不猜 provider 语义）。 */
@@ -91,84 +121,188 @@ function firstInt(source, keys) {
   return undefined
 }
 
-function hasAny(source, keys) {
-  return keys.some(key => source[key] !== undefined && source[key] !== null)
-}
-
 const INPUT_KEYS = ['input', 'inputTokens', 'input_tokens']
 const OUTPUT_KEYS = ['output', 'outputTokens', 'output_tokens']
 const CACHE_READ_KEYS = ['cacheRead', 'cacheReadTokens', 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens']
-const CACHE_WRITE_KEYS = ['cacheWrite', 'cacheWriteTokens', 'cache_write_input_tokens', 'cacheWriteInputTokens']
-const REASONING_KEYS = ['reasoning', 'reasoningTokens', 'reasoning_output_tokens', 'reasoningTokens']
+// `cache_creation_input_tokens` 是 Anthropic 的字段名；放在最后，显式 cache_write 别名优先。
+const CACHE_WRITE_KEYS = ['cacheWrite', 'cacheWriteTokens', 'cache_write_input_tokens', 'cacheWriteInputTokens', 'cache_creation_input_tokens']
+const REASONING_KEYS = ['reasoning', 'reasoningTokens', 'reasoning_output_tokens']
+
+/** provider 原始 usage 里**只会出现在原始形状**的字段（判定 canonical 用）。 */
+const PROVIDER_RAW_KEYS = [
+  'inputTokens', 'input_tokens',
+  'outputTokens', 'output_tokens',
+  'cacheReadTokens', 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens',
+  'cacheWriteTokens', 'cache_write_input_tokens', 'cacheWriteInputTokens',
+  'cache_creation_input_tokens', 'reasoning_output_tokens', 'reasoningTokens',
+  'totalTokens', 'total_tokens',
+]
+const CANONICAL_KEYS = ['input', 'cacheRead', 'cacheWrite', 'output', 'total']
+
+/** 这份 usage 是否已经是 canonical 形状（带版本标记，或只含 canonical 桶键）。 */
+function looksCanonicalUsage(raw) {
+  if (!isPlainObject(raw)) return false
+  if (raw.canonical !== undefined) return true
+  if (PROVIDER_RAW_KEYS.some(key => raw[key] !== undefined)) return false
+  return CANONICAL_KEYS.some(key => key in raw)
+}
+
+/** 观测列表归一化：显式掩码优先；缺掩码时按 usage 里的数字推导。 */
+export function normalizeObservedBuckets(list, usage) {
+  const out = []
+  const source = Array.isArray(list) ? list : null
+  for (const bucket of USAGE_BUCKETS) {
+    const value = isPlainObject(usage) ? usage[bucket] : null
+    if (source === null) {
+      if (Number.isInteger(value)) out.push(bucket)
+      continue
+    }
+    if (source.includes(bucket) && Number.isInteger(value)) out.push(bucket)
+  }
+  return out
+}
+
+/**
+ * 观测覆盖档位：`known`（四桶都观测到）/ `partial`（部分）/ `unknown`（没有观测）。
+ *
+ * @param {object|null} usage
+ * @param {string[]|undefined} observedBuckets
+ * @returns {'known'|'partial'|'unknown'}
+ */
+export function usageCoverageOf(usage, observedBuckets) {
+  if (!isPlainObject(usage)) return USAGE_COVERAGE.UNKNOWN
+  const observed = normalizeObservedBuckets(observedBuckets, usage)
+  if (observed.length === 0) return USAGE_COVERAGE.UNKNOWN
+  if (observed.length === USAGE_BUCKETS.length) return USAGE_COVERAGE.KNOWN
+  return USAGE_COVERAGE.PARTIAL
+}
+
+function sumBuckets(usage) {
+  return USAGE_BUCKETS.reduce((acc, bucket) => acc + usage[bucket], 0)
+}
+
+/** canonical usage 只校验、不重算（Codex inclusive input 不在这里二次拆桶）。 */
+function normalizeCanonicalUsage(raw, provider) {
+  const usage = { input: null, cacheRead: null, cacheWrite: null, output: null, total: null, canonical: CANONICAL_USAGE_VERSION }
+  const observed = []
+  for (const bucket of USAGE_BUCKETS) {
+    const value = raw[bucket]
+    if (value === undefined || value === null) continue
+    const normalized = nonNegativeInt(value)
+    if (normalized === null) return unknownUsage(provider, USAGE_REASON.MALFORMED)
+    usage[bucket] = normalized
+    observed.push(bucket)
+  }
+  if (observed.length === 0) return unknownUsage(provider, USAGE_REASON.MALFORMED)
+  let reportedTotal = null
+  if (raw.total !== undefined && raw.total !== null) {
+    reportedTotal = nonNegativeInt(raw.total)
+    if (reportedTotal === null) return unknownUsage(provider, USAGE_REASON.MALFORMED)
+  }
+  const reasoning = nonNegativeInt(raw.reasoning)
+  if (raw.reasoning !== undefined && raw.reasoning !== null && reasoning === null) {
+    return unknownUsage(provider, USAGE_REASON.MALFORMED)
+  }
+  const complete = observed.length === USAGE_BUCKETS.length
+  if (complete) usage.total = sumBuckets(usage)
+  if (reasoning !== null && usage.output !== null && reasoning <= usage.output) usage.reasoning = reasoning
+  const totalMismatch = complete && reportedTotal !== null && reportedTotal !== usage.total
+  return {
+    trust: USAGE_TRUST.KNOWN,
+    provider,
+    usage,
+    observedBuckets: USAGE_BUCKETS.filter(bucket => observed.includes(bucket)),
+    reason: null,
+    reportedTotal,
+    totalMismatch,
+  }
+}
 
 /**
  * 归一化一份原始 usage。
  *
  * @param {object} raw
  * @param {{provider?: string, inputIncludesCache?: boolean}} [options]
- * @returns {{trust: 'known'|'unknown', provider: string, usage: null|{input:number,cacheRead:number,cacheWrite:number,output:number,total:number,reasoning?:number}, observedBuckets: string[], reason: string|null, reportedTotal: number|null}}
+ * @returns {{trust: 'known'|'unknown', provider: string, usage: null|{
+ *   input:number|null, cacheRead:number|null, cacheWrite:number|null, output:number|null,
+ *   total:number|null, canonical:number, reasoning?:number, inputInclusiveUnresolved?:boolean,
+ * }, observedBuckets: string[], reason: string|null, reportedTotal: number|null}}
  */
 export function normalizeUsage(raw, options = {}) {
   const provider = normalizeProvider(options.provider)
   if (!isPlainObject(raw)) {
     return unknownUsage(provider, USAGE_REASON.MALFORMED)
   }
+  if (looksCanonicalUsage(raw)) return normalizeCanonicalUsage(raw, provider)
+
   const rawInput = firstInt(raw, INPUT_KEYS)
   const output = firstInt(raw, OUTPUT_KEYS)
-  if (rawInput === undefined && output === undefined) {
-    return unknownUsage(provider, USAGE_REASON.MALFORMED)
-  }
-  // 只要有 input/output 其中一项，缺的另一项按 0 参与求和；但记录它「没上报」。
-  if (rawInput === null || output === null) {
-    return unknownUsage(provider, USAGE_REASON.MALFORMED)
-  }
-  const inputValue = rawInput === undefined ? 0 : rawInput
-  const outputValue = output === undefined ? 0 : output
   const cacheReadRaw = firstInt(raw, CACHE_READ_KEYS)
   const cacheWriteRaw = firstInt(raw, CACHE_WRITE_KEYS)
   const reasoningRaw = firstInt(raw, REASONING_KEYS)
-  if (cacheReadRaw === null || cacheWriteRaw === null || reasoningRaw === null) {
+  if (rawInput === null || output === null || cacheReadRaw === null || cacheWriteRaw === null || reasoningRaw === null) {
     return unknownUsage(provider, USAGE_REASON.MALFORMED)
   }
-  const reportedTotal = firstInt(raw, ['total', 'totalTokens', 'total_tokens'])
+  const inputObserved = rawInput !== undefined
+  const outputObserved = output !== undefined
+  const cacheReadObserved = cacheReadRaw !== undefined
+  const cacheWriteObserved = cacheWriteRaw !== undefined
+  if (!inputObserved && !outputObserved && !cacheReadObserved && !cacheWriteObserved) {
+    return unknownUsage(provider, USAGE_REASON.MALFORMED)
+  }
+  let reportedTotal = null
+  if (raw.total !== undefined || raw.totalTokens !== undefined || raw.total_tokens !== undefined) {
+    reportedTotal = firstInt(raw, ['total', 'totalTokens', 'total_tokens'])
+    if (reportedTotal === null) return unknownUsage(provider, USAGE_REASON.MALFORMED)
+  }
 
   const includesCache = options.inputIncludesCache !== undefined
     ? options.inputIncludesCache === true
     : providerInputIncludesCache(provider)
-  const cacheRead = cacheReadRaw ?? 0
-  const cacheWrite = cacheWriteRaw ?? 0
-  let input = inputValue
-  let cacheReadValue = cacheRead
-  let cacheWriteValue = cacheWrite
-  if (includesCache) {
-    // 上游可能给出 cached > input 的矛盾数据：先读后写截断，守住四桶之和 === total。
-    cacheReadValue = Math.min(cacheRead, inputValue)
-    cacheWriteValue = Math.min(cacheWrite, inputValue - cacheReadValue)
-    input = Math.max(0, inputValue - cacheReadValue - cacheWriteValue)
+  let input = inputObserved ? rawInput : null
+  let cacheRead = cacheReadObserved ? cacheReadRaw : null
+  let cacheWrite = cacheWriteObserved ? cacheWriteRaw : null
+  let inputInclusiveUnresolved = false
+  if (includesCache && inputObserved) {
+    if (cacheReadObserved && cacheWriteObserved) {
+      // 上游可能给出 cached > input 的矛盾数据：先读后写截断，守住四桶之和 === total。
+      cacheRead = Math.min(cacheReadRaw, rawInput)
+      cacheWrite = Math.min(cacheWriteRaw, rawInput - cacheRead)
+      input = Math.max(0, rawInput - cacheRead - cacheWrite)
+    } else {
+      // inclusive input 缺缓存组成：exclusive input 不能宣称精确（不让缓存被二次扣减）。
+      input = null
+      inputInclusiveUnresolved = true
+    }
   }
-  const total = input + cacheReadValue + cacheWriteValue + outputValue
+
+  const values = { input, cacheRead, cacheWrite, output: outputObserved ? output : null }
+  const observed = []
+  if (inputObserved && !inputInclusiveUnresolved) observed.push('input')
+  if (cacheReadObserved) observed.push('cacheRead')
+  if (cacheWriteObserved) observed.push('cacheWrite')
+  if (outputObserved) observed.push('output')
   const usage = {
-    input,
-    cacheRead: cacheReadValue,
-    cacheWrite: cacheWriteValue,
-    output: outputValue,
-    total,
+    input: values.input,
+    cacheRead: values.cacheRead,
+    cacheWrite: values.cacheWrite,
+    output: values.output,
+    total: null,
+    canonical: CANONICAL_USAGE_VERSION,
   }
-  if (reasoningRaw !== null && reasoningRaw >= 0 && reasoningRaw <= outputValue) {
+  if (inputInclusiveUnresolved) usage.inputInclusiveUnresolved = true
+  const complete = USAGE_BUCKETS.every(bucket => Number.isInteger(usage[bucket]))
+  if (complete) usage.total = sumBuckets(usage)
+  if (reasoningRaw !== null && reasoningRaw !== undefined && Number.isInteger(usage.output) && reasoningRaw <= usage.output) {
     usage.reasoning = reasoningRaw
   }
-  const observedBuckets = []
-  if (rawInput !== undefined) observedBuckets.push('input')
-  if (cacheReadRaw !== null && cacheReadRaw !== undefined) observedBuckets.push('cacheRead')
-  if (cacheWriteRaw !== null && cacheWriteRaw !== undefined) observedBuckets.push('cacheWrite')
-  if (output !== undefined) observedBuckets.push('output')
   return {
-    trust: USAGE_TRUST.KNOWN,
+    trust: observed.length > 0 ? USAGE_TRUST.KNOWN : USAGE_TRUST.UNKNOWN,
     provider,
     usage,
-    observedBuckets,
-    reason: null,
-    reportedTotal: reportedTotal === undefined ? null : reportedTotal,
+    observedBuckets: USAGE_BUCKETS.filter(bucket => observed.includes(bucket)),
+    reason: observed.length > 0 ? null : USAGE_REASON.UNAVAILABLE,
+    reportedTotal,
   }
 }
 
@@ -188,16 +322,26 @@ function unknownUsage(provider, reason, detail = undefined) {
  * 一条调用遥测记录：适配器只给原始 usage，这里统一成可落盘的事实。
  *
  * @param {{provider?: string, callId: string, usage?: object, source?: string,
- *   invocationId?: string|null, inputIncludesCache?: boolean, at?: string}} input
- * @returns {{provider: string, callId: string, trust: string, usage: object|null,
- *   observedBuckets: string[], reason: string|null, source: string|null,
- *   invocationId: string|null}}
+ *   invocationId?: string|null, sessionScopeId?: string|null, agentScope?: string|null,
+ *   observedBuckets?: string[], inputIncludesCache?: boolean, synthetic?: boolean,
+ *   provisional?: boolean}} input
+ * @returns {object}
  */
 export function createUsageCall(input = {}) {
   const provider = normalizeProvider(input.provider)
   const callId = nonEmptyString(input.callId) && CALL_ID_PATTERN.test(input.callId)
     ? input.callId
     : null
+  const flags = {
+    synthetic: input.synthetic === true,
+    provisional: input.provisional === true,
+  }
+  const scope = {
+    source: typeof input.source === 'string' && input.source !== '' ? input.source : null,
+    invocationId: boundedString(input.invocationId),
+    sessionScopeId: boundedString(input.sessionScopeId),
+    agentScope: boundedString(input.agentScope),
+  }
   if (callId === null) {
     return {
       provider,
@@ -206,23 +350,72 @@ export function createUsageCall(input = {}) {
       usage: null,
       observedBuckets: [],
       reason: USAGE_REASON.MALFORMED,
-      source: input.source ?? null,
-      invocationId: input.invocationId ?? null,
+      ...scope,
+      ...flags,
     }
   }
   const normalized = normalizeUsage(input.usage, {
     provider,
     ...(input.inputIncludesCache === undefined ? {} : { inputIncludesCache: input.inputIncludesCache }),
   })
+  const observedBuckets = normalized.usage === null
+    ? []
+    : normalizeObservedBuckets(
+      Array.isArray(input.observedBuckets) ? input.observedBuckets : undefined,
+      normalized.usage,
+    )
   return {
     provider,
     callId,
     trust: normalized.trust,
     usage: normalized.usage,
-    observedBuckets: normalized.observedBuckets,
+    observedBuckets,
     reason: normalized.reason,
-    source: typeof input.source === 'string' && input.source !== '' ? input.source : null,
-    invocationId: typeof input.invocationId === 'string' && input.invocationId !== '' ? input.invocationId : null,
+    ...scope,
+    ...flags,
+    ...(normalized.totalMismatch === true ? { totalMismatch: true } : {}),
+  }
+}
+
+/**
+ * 一条范围级结算快照。`usage` 不合法 / 无法识别时返回 `null`（调用方记诊断）。
+ *
+ * @param {{provider?: string, snapshotId: string, scope?: string, usage?: object,
+ *   observedBuckets?: string[], invocationId?: string|null, sessionScopeId?: string|null,
+ *   agentScope?: string|null, provenance?: object, inputIncludesCache?: boolean}} input
+ * @returns {object|null}
+ */
+export function createUsageSnapshot(input = {}) {
+  const provider = normalizeProvider(input.provider)
+  const snapshotId = nonEmptyString(input.snapshotId) && CALL_ID_PATTERN.test(input.snapshotId)
+    ? input.snapshotId
+    : null
+  if (snapshotId === null) return null
+  const normalized = normalizeUsage(input.usage, {
+    provider,
+    ...(input.inputIncludesCache === undefined ? {} : { inputIncludesCache: input.inputIncludesCache }),
+  })
+  if (normalized.trust !== USAGE_TRUST.KNOWN) return null
+  if (input.scope !== undefined && input.scope !== null && !SNAPSHOT_SCOPE_VALUES.has(input.scope)) return null
+  const scope = SNAPSHOT_SCOPE_VALUES.has(input.scope) ? input.scope : USAGE_SCOPE.UNKNOWN
+  const observedBuckets = normalizeObservedBuckets(
+    Array.isArray(input.observedBuckets) ? input.observedBuckets : undefined,
+    normalized.usage,
+  )
+  const provenance = isPlainObject(input.provenance) ? input.provenance : {}
+  return {
+    provider,
+    snapshotId,
+    scope,
+    invocationId: boundedString(input.invocationId),
+    sessionScopeId: boundedString(input.sessionScopeId),
+    agentScope: boundedString(input.agentScope),
+    usage: normalized.usage,
+    observedBuckets,
+    provenance: {
+      contract: boundedString(provenance.contract) ?? 'usage-snapshot-v1',
+      realCliVerified: provenance.realCliVerified === true,
+    },
   }
 }
 
@@ -251,39 +444,64 @@ export function recordUsageCall(calls, call) {
 /**
  * 汇总一组调用（已按 callId 去重后的最新值）。
  *
+ * 缺失桶汇总后仍是 `null`；`total` 只在所有调用都完整观测时才是数字。
+ *
  * @param {Iterable<object>} calls
- * @returns {{known:number, unknown:number, usage:null|object, bucketsSeen:string[], bucketsMissing:string[]}}
+ * @returns {{known:number, partial:number, unknown:number,
+ *   coverage:{known:number,partial:number,unknown:number}, usage:null|object,
+ *   bucketsSeen:string[], bucketsMissing:string[], complete:boolean}}
  */
 export function summarizeUsageCalls(calls) {
-  const sums = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 }
+  const sums = { input: null, cacheRead: null, cacheWrite: null, output: null, total: null }
+  const missing = new Set()
   const seen = new Set()
-  let known = 0
-  let unknown = 0
+  const coverage = { known: 0, partial: 0, unknown: 0 }
+  let any = false
+  let complete = true
   for (const call of calls ?? []) {
     if (!isPlainObject(call)) continue
-    if (call.trust !== USAGE_TRUST.KNOWN || !isPlainObject(call.usage)) {
-      unknown += 1
-      continue
-    }
-    known += 1
+    any = true
+    const level = usageCoverageOf(call.usage, call.observedBuckets)
+    coverage[level] += 1
+    if (level !== USAGE_COVERAGE.KNOWN) complete = false
     for (const bucket of USAGE_BUCKETS) {
-      const value = call.usage[bucket]
-      if (Number.isInteger(value) && value >= 0) sums[bucket] += value
+      const value = isPlainObject(call.usage) ? call.usage[bucket] : null
+      if (!Number.isInteger(value)) {
+        missing.add(bucket)
+        sums[bucket] = null
+        continue
+      }
+      seen.add(bucket)
+      if (!missing.has(bucket)) sums[bucket] = (sums[bucket] ?? 0) + value
     }
-    sums.total += Number.isInteger(call.usage.total) && call.usage.total >= 0
-      ? call.usage.total
-      : USAGE_BUCKETS.reduce((acc, bucket) => acc + (Number.isInteger(call.usage[bucket]) ? call.usage[bucket] : 0), 0)
-    for (const bucket of Array.isArray(call.observedBuckets) ? call.observedBuckets : []) {
-      if (USAGE_BUCKETS.includes(bucket)) seen.add(bucket)
-    }
+  }
+  const bucketsSeen = USAGE_BUCKETS.filter(bucket => seen.has(bucket))
+  const bucketsMissing = USAGE_BUCKETS.filter(bucket => !seen.has(bucket))
+  if (complete && USAGE_BUCKETS.every(bucket => Number.isInteger(sums[bucket]))) {
+    sums.total = USAGE_BUCKETS.reduce((acc, bucket) => acc + sums[bucket], 0)
   }
   return {
-    known,
-    unknown,
-    usage: known > 0 ? sums : null,
-    bucketsSeen: USAGE_BUCKETS.filter(bucket => seen.has(bucket)),
-    bucketsMissing: USAGE_BUCKETS.filter(bucket => !seen.has(bucket)),
+    known: coverage.known,
+    partial: coverage.partial,
+    unknown: coverage.unknown,
+    coverage,
+    usage: any ? sums : null,
+    bucketsSeen,
+    bucketsMissing,
+    complete: complete && bucketsMissing.length === 0,
   }
+}
+
+function readHandleList(handle, methodName, propertyName) {
+  if (!handle || typeof handle !== 'object') return []
+  let raw
+  try {
+    if (typeof handle[methodName] === 'function') raw = handle[methodName]()
+    else raw = handle[propertyName]
+  } catch {
+    return []
+  }
+  return Array.isArray(raw) ? raw : []
 }
 
 /**
@@ -291,7 +509,8 @@ export function summarizeUsageCalls(calls) {
  *
  * 约定（可选扩展，不破坏冻结接口）：
  *   - `handle.usageCalls` 是数组，或返回数组的函数；
- *   - 每条 `{ provider?, callId, usage, source? }`；
+ *   - 每条 `{ provider?, callId, usage, observedBuckets?, source?, invocationId?,
+ *     sessionScopeId?, synthetic?, provisional? }`；
  *   - 适配器不提供或没有观测到 usage 时返回 `[]`（由调用方标 unknown）。
  *
  * @param {object|null} handle
@@ -299,14 +518,8 @@ export function summarizeUsageCalls(calls) {
  * @returns {object[]} 已按 callId 去重的调用记录
  */
 export function readAdapterUsageCalls(handle, fallbackProvider = 'unknown') {
-  if (!handle || typeof handle !== 'object') return []
-  let raw
-  try {
-    raw = typeof handle.usageCalls === 'function' ? handle.usageCalls() : handle.usageCalls
-  } catch {
-    return []
-  }
-  if (!Array.isArray(raw) || raw.length === 0) return []
+  const raw = readHandleList(handle, 'usageCalls', 'usageCalls')
+  if (raw.length === 0) return []
   const deduped = new Map()
   for (const item of raw) {
     if (!isPlainObject(item)) continue
@@ -316,6 +529,11 @@ export function readAdapterUsageCalls(handle, fallbackProvider = 'unknown') {
       usage: item.usage,
       source: item.source,
       invocationId: item.invocationId,
+      sessionScopeId: item.sessionScopeId,
+      agentScope: item.agentScope,
+      synthetic: item.synthetic,
+      provisional: item.provisional,
+      ...(Array.isArray(item.observedBuckets) ? { observedBuckets: item.observedBuckets } : {}),
       ...(item.inputIncludesCache === undefined ? {} : { inputIncludesCache: item.inputIncludesCache }),
     })
     if (!nonEmptyString(call.callId)) continue
@@ -325,28 +543,98 @@ export function readAdapterUsageCalls(handle, fallbackProvider = 'unknown') {
 }
 
 /**
+ * 从适配器 handle 读取可选的结算快照（`handle.usageSnapshots` / `handle.usageSnapshots()`）。
+ *
+ * @param {object|null} handle
+ * @param {string} fallbackProvider
+ * @returns {object[]} 已校验的快照记录（同一 snapshotId 取最后一次）
+ */
+export function readAdapterUsageSnapshots(handle, fallbackProvider = 'unknown') {
+  const raw = readHandleList(handle, 'usageSnapshots', 'usageSnapshots')
+  if (raw.length === 0) return []
+  const deduped = new Map()
+  for (const item of raw) {
+    if (!isPlainObject(item)) continue
+    const snapshot = createUsageSnapshot({
+      provider: nonEmptyString(item.provider) ? item.provider : fallbackProvider,
+      snapshotId: item.snapshotId,
+      scope: item.scope,
+      usage: item.usage,
+      observedBuckets: item.observedBuckets,
+      invocationId: item.invocationId,
+      sessionScopeId: item.sessionScopeId,
+      agentScope: item.agentScope,
+      provenance: item.provenance,
+      ...(item.inputIncludesCache === undefined ? {} : { inputIncludesCache: item.inputIncludesCache }),
+    })
+    if (snapshot === null) continue
+    deduped.set(snapshot.snapshotId, snapshot)
+  }
+  return [...deduped.values()]
+}
+
+/**
  * 调用记录 → 可落盘的 `agent/usage` 事件（不含 at / elementId / activityId，
- * 由 runner 补齐）。
+ * 由 runner 补齐）。`observedBuckets` **始终**出现在事件里（空数组也写），
+ * 这样读取侧不需要从补零结果反推观测范围。
  *
  * @param {object} call
  * @returns {object}
  */
 export function usageEventForCall(call) {
+  const invocationId = boundedString(call.invocationId)
+  const sessionScopeId = boundedString(call.sessionScopeId)
+  const agentScope = boundedString(call.agentScope)
   return {
     type: AGENT_USAGE_EVENT,
-    provider: call.provider,
+    provider: normalizeProvider(call.provider),
     callId: call.callId,
     trust: call.trust,
-    ...(call.usage === null ? {} : { usage: call.usage }),
-    ...(call.reason === null ? {} : { reason: call.reason }),
-    ...(call.observedBuckets.length === 0 ? {} : { observedBuckets: [...call.observedBuckets] }),
-    ...(call.source === null ? {} : { source: call.source }),
-    ...(call.invocationId === null ? {} : { invocationId: call.invocationId }),
+    ...(call.usage === null || call.usage === undefined ? {} : { usage: call.usage }),
+    ...(call.reason === null || call.reason === undefined ? {} : { reason: call.reason }),
+    observedBuckets: Array.isArray(call.observedBuckets) ? [...call.observedBuckets] : [],
+    ...(typeof call.source === 'string' && call.source !== '' ? { source: call.source } : {}),
+    ...(invocationId === null ? {} : { invocationId }),
+    ...(sessionScopeId === null ? {} : { sessionScopeId }),
+    ...(agentScope === null ? {} : { agentScope }),
+    ...(call.synthetic === true ? { synthetic: true } : {}),
+    ...(call.provisional === true ? { provisional: true } : {}),
   }
 }
 
 /**
- * 「这次调用没有 usage」的事实事件（不是 0，是 unknown）。
+ * 结算快照 → 可落盘的 `agent/usage-snapshot` 事件。
+ *
+ * 事件保持短小：不带 callId 数组，只带范围标量与本次快照的用量。
+ *
+ * @param {object} snapshot
+ * @returns {object}
+ */
+export function usageSnapshotEventFor(snapshot) {
+  const invocationId = boundedString(snapshot.invocationId)
+  const sessionScopeId = boundedString(snapshot.sessionScopeId)
+  const agentScope = boundedString(snapshot.agentScope)
+  return {
+    type: AGENT_USAGE_SNAPSHOT_EVENT,
+    provider: normalizeProvider(snapshot.provider),
+    snapshotId: snapshot.snapshotId,
+    scope: SNAPSHOT_SCOPE_VALUES.has(snapshot.scope) ? snapshot.scope : USAGE_SCOPE.UNKNOWN,
+    usage: snapshot.usage,
+    observedBuckets: Array.isArray(snapshot.observedBuckets) ? [...snapshot.observedBuckets] : [],
+    // 合同字段始终出现（未知就是 null），读取侧不用猜「缺字段」还是「没有范围」。
+    invocationId: invocationId ?? null,
+    sessionScopeId: sessionScopeId ?? null,
+    agentScope: agentScope ?? null,
+    provenance: {
+      contract: boundedString(snapshot.provenance?.contract) ?? 'usage-snapshot-v1',
+      realCliVerified: snapshot.provenance?.realCliVerified === true,
+    },
+  }
+}
+
+/**
+ * 「这次调用没有 usage」的事实事件（不是 0，是 unknown）。`synthetic: true` 显式
+ * 标记它是未知占位记录：**不算一次已识别模型调用**。
  *
  * @param {{provider?: string, invocationId: string, callId?: string, reason?: string}} input
  * @returns {object}
@@ -364,6 +652,8 @@ export function unknownUsageEvent(input = {}) {
       : `${provider}:${invocationId ?? 'unknown'}:unobserved`,
     trust: USAGE_TRUST.UNKNOWN,
     reason: typeof input.reason === 'string' && input.reason !== '' ? input.reason : USAGE_REASON.UNAVAILABLE,
+    observedBuckets: [],
+    synthetic: true,
     ...(invocationId === null ? {} : { invocationId }),
   }
 }

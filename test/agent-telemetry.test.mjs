@@ -35,6 +35,7 @@ test('codex 黄金样例：input 含缓存，先拆再算，四桶之和 === tot
     cacheWrite: 10,
     output: 5,
     total: 105,
+    canonical: 1,
   })
   assert.deepEqual(result.observedBuckets.sort(), ['cacheRead', 'cacheWrite', 'input', 'output'])
   const sum = result.usage.input + result.usage.cacheRead + result.usage.cacheWrite + result.usage.output
@@ -58,14 +59,17 @@ test('dsh 黄金样例：四桶互斥，不再拆缓存（cacheRead 不双计）
     cacheWrite: 0,
     output: 40,
     total: 160,
+    canonical: 1,
   })
   assert.deepEqual(result.observedBuckets.sort(), ['cacheRead', 'cacheWrite', 'input', 'output'])
 })
 
 test('reasoning 是 output 子集：不另加进 total；超过 output 时丢弃', () => {
+  // 显式上报 cache_write=0：缺桶现在是 null，完整 total 必须由夹具明确给全四桶。
   const ok = normalizeUsage({
     input_tokens: 100,
     cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
     output_tokens: 40,
     reasoning_output_tokens: 30,
   }, { provider: 'codex' })
@@ -74,6 +78,8 @@ test('reasoning 是 output 子集：不另加进 total；超过 output 时丢弃
 
   const bad = normalizeUsage({
     input_tokens: 100,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
     output_tokens: 40,
     reasoning_output_tokens: 50,
   }, { provider: 'codex' })
@@ -109,10 +115,12 @@ test('不可观测 / 坏形状 → unknown，不是 0', () => {
 test('同一 provider + callId 的 usage 更新是替换不是累加', () => {
   const calls = new Map()
   recordUsageCall(calls, createUsageCall({
-    provider: 'dsh', callId: 'c-1', usage: { inputTokens: 100, outputTokens: 40 },
+    provider: 'dsh', callId: 'c-1',
+    usage: { inputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 40 },
   }))
   recordUsageCall(calls, createUsageCall({
-    provider: 'dsh', callId: 'c-1', usage: { inputTokens: 120, outputTokens: 50 },
+    provider: 'dsh', callId: 'c-1',
+    usage: { inputTokens: 120, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 50 },
   }))
   assert.equal(calls.size, 1, '同一 callId 只能有一条最新值')
   const summary = summarizeUsageCalls(calls.values())
@@ -126,16 +134,25 @@ test('同一 provider + callId 的 usage 更新是替换不是累加', () => {
 
 test('不同 callId 才累加；unknown 单独计数且不污染已知四桶', () => {
   const calls = [
-    createUsageCall({ provider: 'dsh', callId: 'c-1', usage: { inputTokens: 10, outputTokens: 1 } }),
-    createUsageCall({ provider: 'dsh', callId: 'c-2', usage: { inputTokens: 20, outputTokens: 2 } }),
+    createUsageCall({
+      provider: 'dsh', callId: 'c-1',
+      usage: { inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1 },
+    }),
+    createUsageCall({
+      provider: 'dsh', callId: 'c-2',
+      usage: { inputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2 },
+    }),
     createUsageCall({ provider: 'dsh', callId: 'c-3', usage: null }),
   ]
   const summary = summarizeUsageCalls(calls)
   assert.equal(summary.known, 2)
   assert.equal(summary.unknown, 1)
+  // M7：c-3 的 usage 完全未知 → 它的 token 可能落在任意桶，合计四桶都必须降级为
+  // null（旧断言 30/3 把未知调用当成 0 参与求和，正是缺陷本身）。
   assert.deepEqual(summary.usage, {
-    input: 30, cacheRead: 0, cacheWrite: 0, output: 3, total: 33,
+    input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
   })
+  assert.equal(summary.complete, false)
 })
 
 test('readAdapterUsageCalls：支持数组/函数，坏记录跳过，provider 可兜底', () => {
@@ -187,4 +204,76 @@ test('usage / invocation 事件形状与 provider 归一化', () => {
   assert.equal(normalizeProvider('OpenAI'), 'openai')
   assert.equal(normalizeProvider('bad provider!'), 'unknown')
   assert.equal(normalizeProvider(''), 'unknown')
+})
+
+// ── 0.14.5 M7：缺失桶 = null（不是 0），显式 0 保留，canonical 只校验不重算 ──────
+
+test('M7：只有 {input_tokens:10} 时其余桶是 null（不是 0），显式 0 保留', () => {
+  const partial = normalizeUsage({ input_tokens: 10 }, { provider: 'claude' })
+  assert.equal(partial.trust, USAGE_TRUST.KNOWN)
+  assert.deepEqual(partial.observedBuckets, ['input'])
+  assert.deepEqual(partial.usage, {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, canonical: 1,
+  }, '未上报的桶必须是 null；total 在桶不完整时未知')
+
+  const explicitZero = normalizeUsage({
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  }, { provider: 'claude' })
+  assert.equal(explicitZero.trust, USAGE_TRUST.KNOWN)
+  assert.deepEqual(explicitZero.usage, {
+    input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0, canonical: 1,
+  }, '明确上报的 0 必须保留为 0（不能被当成「未观测」）')
+  assert.deepEqual(explicitZero.observedBuckets.sort(), ['cacheRead', 'cacheWrite', 'input', 'output'])
+})
+
+test('M7：Codex inclusive input 的 canonical usage 不被二次扣缓存（105 → 不再变 85）', () => {
+  const once = normalizeUsage({
+    input_tokens: 100,
+    cached_input_tokens: 20,
+    cache_write_input_tokens: 0,
+    output_tokens: 5,
+  }, { provider: 'codex' })
+  assert.deepEqual({
+    input: once.usage.input,
+    cacheRead: once.usage.cacheRead,
+    cacheWrite: once.usage.cacheWrite,
+    output: once.usage.output,
+    total: once.usage.total,
+  }, { input: 80, cacheRead: 20, cacheWrite: 0, output: 5, total: 105 })
+  assert.equal(once.usage.canonical, 1, 'canonical 桶必须带版本标记')
+
+  // 指标层会再次调用 normalizeUsage：canonical 只校验、不重算，cacheRead 不能被再拆一次。
+  const twice = normalizeUsage(once.usage, { provider: 'codex' })
+  assert.deepEqual({
+    input: twice.usage.input,
+    cacheRead: twice.usage.cacheRead,
+    cacheWrite: twice.usage.cacheWrite,
+    output: twice.usage.output,
+    total: twice.usage.total,
+  }, { input: 80, cacheRead: 20, cacheWrite: 0, output: 5, total: 105 },
+  '二次归一化必须得到同一个 105（基线会拆成 60/20/0/5 = 85）')
+})
+
+test('M7：summarizeUsageCalls 保留 null 桶并区分 known / partial / unknown', () => {
+  const summary = summarizeUsageCalls([
+    createUsageCall({ provider: 'claude', callId: 'call-1', usage: { input_tokens: 10 } }),
+  ])
+  assert.deepEqual(summary.usage, {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null,
+  })
+  assert.equal(summary.coverage.partial, 1)
+  assert.equal(summary.coverage.known, 0)
+  assert.deepEqual(summary.bucketsMissing.sort(), ['cacheRead', 'cacheWrite', 'output'])
+  assert.equal(summary.complete, false)
+
+  const unknownSummary = summarizeUsageCalls([
+    createUsageCall({ provider: 'claude', callId: 'call-2', usage: null }),
+  ])
+  assert.equal(unknownSummary.coverage.unknown, 1)
+  assert.deepEqual(unknownSummary.usage, {
+    input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
+  })
 })

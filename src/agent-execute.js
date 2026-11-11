@@ -38,8 +38,8 @@ import {
   ADAPTER_ERROR, AdapterError, adapterUsageCapability, assertFinishToolNative,
 } from './agent-adapter.js'
 import {
-  USAGE_REASON, USAGE_SUPPORT, invocationEvent, readAdapterUsageCalls, unknownUsageEvent,
-  usageEventForCall,
+  USAGE_REASON, USAGE_SUPPORT, invocationEvent, readAdapterUsageCalls, readAdapterUsageSnapshots,
+  unknownUsageEvent, usageEventForCall, usageSnapshotEventFor,
 } from './agent-telemetry.js'
 import { NODE_FINISH_ERROR, createFinishGate } from './node-finish.js'
 import { WORKSPACE_ERROR, resolveNodeCwd } from './workspace-policy.js'
@@ -777,10 +777,19 @@ export async function runAgentNode(options = {}) {
       const usageCapability = adapterUsageCapability(adapter)
       const calls = readAdapterUsageCalls(handle, adapter.id)
       for (const call of calls) {
-        events.push(usageEventForCall({ ...call, invocationId }))
+        events.push(usageEventForCall({ ...call, invocationId: call.invocationId ?? invocationId }))
+      }
+      // 可选的结算快照（`handle.usageSnapshots`）：与调用身份分开落盘，不增加调用数。
+      // 失败路径（超时 / 取消 / 未 finish）同样要落，且必须在 dispose 之前读。
+      const snapshots = readAdapterUsageSnapshots(handle, adapter.id)
+      for (const snapshot of snapshots) {
+        events.push(usageSnapshotEventFor({
+          ...snapshot,
+          invocationId: snapshot.invocationId ?? invocationId,
+        }))
       }
       // 适配器宣称能观测却一条都没有：这是 unknown，不是 0。
-      if (calls.length === 0 && usageCapability === USAGE_SUPPORT.NATIVE) {
+      if (calls.length === 0 && snapshots.length === 0 && usageCapability === USAGE_SUPPORT.NATIVE) {
         events.push(unknownUsageEvent({
           provider: adapter.id,
           invocationId,

@@ -30,18 +30,33 @@
 import { createHash } from 'node:crypto'
 
 import {
-  USAGE_BUCKETS, USAGE_REASON, USAGE_TRUST, createUsageCall, recordUsageCall,
-  summarizeUsageCalls, usageCallKey,
+  AGENT_USAGE_SNAPSHOT_EVENT, USAGE_BUCKETS, USAGE_COVERAGE, USAGE_REASON, USAGE_SCOPE,
+  USAGE_SCHEMA_VERSION, USAGE_TRUST, createUsageCall, createUsageSnapshot, recordUsageCall,
+  usageCallKey,
 } from './agent-telemetry.js'
 
-/** 指标 JSON schema 版本；缓存与 API 都用它判失效。 */
-export const METRICS_SCHEMA_VERSION = 1
+/**
+ * 指标 JSON schema 版本；缓存与 API 都用它判失效。
+ *
+ * v2（0.14.5）：缺失桶是 `null` 而不是 0；`usageCoverage` 增加 `partial`；
+ * `observedTokens.partial`、`observedTokensPartial`、`agent.snapshots` 进入 API；
+ * 历史事件缺 `observedBuckets` 时按「完整性未知」处理。
+ */
+export const METRICS_SCHEMA_VERSION = 2
 
 /** `dataQuality.reasons` 的稳定字符串。 */
 export const METRICS_REASON = Object.freeze({
   USAGE_UNAVAILABLE: USAGE_REASON.UNAVAILABLE,
   USAGE_MALFORMED: USAGE_REASON.MALFORMED,
   USAGE_MISSING_BUCKETS: USAGE_REASON.MISSING_BUCKETS,
+  /** 有调用只观测到部分桶：允许展示已观测小计，但不给完整 total。 */
+  USAGE_PARTIAL: 'usage-partial',
+  /** 结算快照的作用域无法证明（resume / 缺范围 id）：保留原始快照，不猜 sum/max。 */
+  USAGE_SCOPE_UNKNOWN: 'usage-scope-unknown',
+  /** assistant 的 output 可能只是占位值，且没有 result 结算。 */
+  USAGE_OUTPUT_PROVISIONAL: 'usage-output-provisional',
+  /** 旧事件没有 observedBuckets：无法区分真实 0 与补零，完整性未知。 */
+  USAGE_HISTORY_MASK_MISSING: 'usage-history-mask-missing',
   LEGACY_USAGE_FALLBACK: 'legacy-usage-fallback',
   INVOCATION_UNAVAILABLE: 'agent-invocation-unavailable',
   EVENTS_SKIPPED: 'events-skipped',
@@ -330,6 +345,7 @@ export function reduceInstanceMetrics(input = {}) {
       reminders: new Set(),
       missingExecutions: new Set(),
       calls: new Map(),
+      snapshots: new Map(),
       legacyCandidates: [],
       usageExecutionIds: new Set(),
       hadActivity: false,
@@ -451,12 +467,20 @@ export function reduceInstanceMetrics(input = {}) {
         addReason(reduction, METRICS_REASON.USAGE_MALFORMED)
         continue
       }
+      // 事件显式带 observedBuckets 时以它为准；旧事件没有掩码 → 完整性未知，
+      // 不能从（可能被旧版补零的）usage 反推「已上报」。
+      const hasMask = Array.isArray(event.observedBuckets)
       const call = createUsageCall({
         provider,
         callId,
         usage: event.usage,
         source: event.source,
         invocationId: event.invocationId,
+        sessionScopeId: event.sessionScopeId,
+        agentScope: event.agentScope,
+        synthetic: event.synthetic === true,
+        provisional: event.provisional === true,
+        ...(hasMask ? { observedBuckets: event.observedBuckets } : {}),
       })
       // 事件显式说未知（即便带了形状奇怪的 usage）时以事件为准。
       if (event.trust === USAGE_TRUST.UNKNOWN || !isPlainObject(event.usage)) {
@@ -465,7 +489,32 @@ export function reduceInstanceMetrics(input = {}) {
         call.reason = nonEmptyString(event.reason) ? event.reason : METRICS_REASON.USAGE_UNAVAILABLE
         call.observedBuckets = []
       }
+      if (!hasMask) call.observedMaskMissing = true
       recordUsageCall(reduction.agent.calls, call)
+    } else if (event.type === AGENT_USAGE_SNAPSHOT_EVENT) {
+      // 结算快照：独立账本，**不计入模型调用数**。同一 snapshotId 后到的是替换。
+      reduction.agent.hadActivity = true
+      if (nonEmptyString(event.activityId)) reduction.agent.usageExecutionIds.add(event.activityId)
+      const snapshot = createUsageSnapshot({
+        provider: event.provider,
+        snapshotId: event.snapshotId,
+        scope: event.scope,
+        usage: event.usage,
+        observedBuckets: event.observedBuckets,
+        invocationId: event.invocationId,
+        sessionScopeId: event.sessionScopeId,
+        agentScope: event.agentScope,
+        provenance: event.provenance,
+      })
+      if (snapshot === null) {
+        addReason(reduction, METRICS_REASON.USAGE_MALFORMED)
+        continue
+      }
+      reduction.agent.snapshots.set(snapshot.snapshotId, {
+        ...snapshot,
+        maskMissing: !Array.isArray(event.observedBuckets),
+        seq: Number.isInteger(event.seq) ? event.seq : null,
+      })
     }
   }
 
@@ -479,6 +528,7 @@ export function reduceInstanceMetrics(input = {}) {
       usage: candidate.usage,
       source: 'activity/end.usage',
     })
+    call.observedMaskMissing = true
     recordUsageCall(reduction.agent.calls, call)
     addReason(reduction, METRICS_REASON.LEGACY_USAGE_FALLBACK)
   }
@@ -658,43 +708,23 @@ export function finalizeInstanceMetrics(reduction, asOf = new Date().toISOString
     }))
   const pendingTasks = Array.isArray(reduction.pendingTasks) ? reduction.pendingTasks : []
 
-  // ── agent usage ──────────────────────────────────────────────────────────
-  const calls = [...reduction.agent.calls.values()]
-  const usageSummary = summarizeUsageCalls(calls)
-  const invocationIds = reduction.agent.invocationIds
+  // ── agent usage（调用身份 + 结算快照 + 部分观测） ────────────────────────
+  const usage = reduceAgentUsage({
+    calls: [...reduction.agent.calls.values()],
+    snapshots: reduction.agent.snapshots,
+    invocationEventIds: reduction.agent.invocationIds,
+    hadActivity: reduction.agent.hadActivity,
+  })
+  for (const reason of usage.reasons) addReason(reduction, reason)
+
   let invocations = null
-  if (invocationIds.size > 0) {
-    invocations = invocationIds.size
-  } else if (calls.length > 0) {
-    const callInvocations = new Set(calls.map(call => call.invocationId).filter(id => nonEmptyString(id)))
-    if (callInvocations.size > 0) invocations = callInvocations.size
+  if (reduction.agent.invocationIds.size > 0) {
+    invocations = reduction.agent.invocationIds.size
+  } else if (usage.observedInvocationIds.size > 0) {
+    invocations = usage.observedInvocationIds.size
   }
   if (invocations === null && !reduction.agent.hadActivity) invocations = 0
   if (invocations === null) addReason(reduction, METRICS_REASON.INVOCATION_UNAVAILABLE)
-
-  let unknownCoverage = usageSummary.unknown
-  if (usageSummary.known === 0 && calls.length === 0) {
-    // 一次 agent 都没有 → 0 个未知调用；有 agent 但没有任何 usage 事件 → 至少
-    // 每个 invocation 都是未知，不能报 known:0 / unknown:0 说「全都零」。
-    unknownCoverage = invocations ?? (reduction.agent.hadActivity ? 1 : 0)
-  }
-  if (unknownCoverage > 0 || (reduction.agent.hadActivity && usageSummary.known === 0)) {
-    addReason(reduction, METRICS_REASON.USAGE_UNAVAILABLE)
-  }
-  if (usageSummary.known > 0 && usageSummary.bucketsMissing.length > 0) {
-    addReason(reduction, METRICS_REASON.USAGE_MISSING_BUCKETS)
-  }
-  const modelCalls = calls.length > 0 ? calls.length : (reduction.agent.hadActivity ? null : 0)
-
-  const observedTokens = usageSummary.usage === null
-    ? null
-    : {
-      input: usageSummary.usage.input,
-      cacheRead: usageSummary.usage.cacheRead,
-      cacheWrite: usageSummary.usage.cacheWrite,
-      output: usageSummary.usage.output,
-      total: usageSummary.usage.total,
-    }
 
   // ── connector ────────────────────────────────────────────────────────────
   const connector = finalizeConnector(reduction.connector.records, reduction.connector.events, reduction)
@@ -732,16 +762,14 @@ export function finalizeInstanceMetrics(reduction, asOf = new Date().toISOString
     },
     agent: {
       invocations,
-      modelCalls,
-      observedTokens,
-      usageCoverage: {
-        known: usageSummary.known,
-        unknown: unknownCoverage,
-      },
-      buckets: {
-        seen: usageSummary.bucketsSeen,
-        missing: usageSummary.bucketsMissing,
-      },
+      modelCalls: usage.modelCalls,
+      observedTokens: usage.observedTokens,
+      /** 已观测小计：完整 total 未知时也允许展示，但必须标「部分」。 */
+      observedTokensPartial: usage.observedTokensPartial,
+      usageCoverage: { ...usage.coverage },
+      buckets: { ...usage.buckets },
+      /** 结算快照计数（不是模型调用数）。 */
+      snapshots: { ...usage.snapshots },
     },
     human: {
       completedWaitMs,
@@ -776,6 +804,304 @@ export function finalizeInstanceMetrics(reduction, asOf = new Date().toISOString
       skippedResources: reduction.skippedResources,
       reasons,
     },
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// agent usage：调用身份 + 结算快照 + 部分观测（0.14.5 M2 / M7）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把一组桶单元加起来。任一单元缺该桶 → 合计 `complete:false`（值仍可作已观测小计）。
+ *
+ * @param {Array<{value:number|null, complete:boolean}>} cells
+ * @returns {{value:number|null, complete:boolean, observed:boolean}}
+ */
+function sumUsageCells(cells) {
+  let value = null
+  let complete = true
+  let observed = false
+  for (const cell of cells) {
+    if (Number.isInteger(cell?.value)) {
+      value = (value ?? 0) + cell.value
+      observed = true
+    }
+    if (!cell || cell.complete !== true) complete = false
+  }
+  return { value, complete: complete && observed, observed }
+}
+
+/**
+ * 一个「范围」的用量：先取有效结算快照的桶；快照没观测的桶才回落到该范围的调用桶。
+ * 同一范围同一桶永远只选一个来源。
+ */
+function buildUsageUnit(input) {
+  const { key, invocationId = null, sessionScopeId = null, calls = [], snapshot = null } = input
+  const cells = {}
+  for (const bucket of USAGE_BUCKETS) {
+    const snapshotValue = isPlainObject(snapshot?.usage) ? snapshot.usage[bucket] : null
+    if (Number.isInteger(snapshotValue)) {
+      cells[bucket] = { value: snapshotValue, complete: true, source: 'snapshot' }
+      continue
+    }
+    let value = null
+    let complete = calls.length > 0
+    for (const call of calls) {
+      const observed = call.trust === USAGE_TRUST.KNOWN && isPlainObject(call.usage) ? call.usage[bucket] : null
+      if (Number.isInteger(observed)) value = (value ?? 0) + observed
+      else complete = false
+    }
+    cells[bucket] = { value, complete: complete && Number.isInteger(value), source: calls.length > 0 ? 'calls' : 'none' }
+  }
+  const observedCount = USAGE_BUCKETS.filter(bucket => Number.isInteger(cells[bucket].value)).length
+  const allComplete = USAGE_BUCKETS.every(bucket => cells[bucket].complete === true && Number.isInteger(cells[bucket].value))
+  return {
+    key,
+    invocationId,
+    sessionScopeId,
+    calls,
+    snapshot,
+    cells,
+    observedCount,
+    allComplete,
+    maskMissing: calls.some(call => call.observedMaskMissing === true) || snapshot?.maskMissing === true,
+    provisional: snapshot === null && calls.some(call => call.provisional === true),
+  }
+}
+
+/** session-cumulative 范围：同一累计范围只取最新；快照未观测桶回落到该 session 的范围单元。 */
+function buildSessionUsageUnit(input) {
+  const { key, sessionScopeId, units, snapshot } = input
+  const cells = {}
+  for (const bucket of USAGE_BUCKETS) {
+    const snapshotValue = isPlainObject(snapshot?.usage) ? snapshot.usage[bucket] : null
+    if (Number.isInteger(snapshotValue)) {
+      cells[bucket] = { value: snapshotValue, complete: true, source: 'snapshot' }
+      continue
+    }
+    const summed = sumUsageCells(units.map(unit => unit.cells[bucket]))
+    cells[bucket] = { value: summed.value, complete: summed.complete, source: 'calls' }
+  }
+  const observedCount = USAGE_BUCKETS.filter(bucket => Number.isInteger(cells[bucket].value)).length
+  return {
+    key,
+    invocationId: null,
+    sessionScopeId,
+    calls: [],
+    snapshot,
+    cells,
+    observedCount,
+    allComplete: USAGE_BUCKETS.every(bucket => cells[bucket].complete === true && Number.isInteger(cells[bucket].value)),
+    maskMissing: units.some(unit => unit.maskMissing) || snapshot?.maskMissing === true,
+    provisional: false,
+  }
+}
+
+function usageUnitLevel(unit) {
+  if (unit.observedCount === 0) return USAGE_COVERAGE.UNKNOWN
+  if (!unit.allComplete || unit.maskMissing) return USAGE_COVERAGE.PARTIAL
+  return USAGE_COVERAGE.KNOWN
+}
+
+/**
+ * 把「调用桶 + 结算快照」归约成指标口径。
+ *
+ * 规则（M7 / M2）：
+ *   1. `modelCalls` = 去重后的**非 synthetic** callId 数；
+ *   2. 快照按 scope：invocation 每个 invocation 取最新；session-cumulative 同一累计范围取最新；
+ *      unknown 保留原始快照，**不按数值猜 sum/max**；
+ *   3. 有有效快照覆盖的范围用快照的桶，没有才用去重后的调用桶；同范围同桶只选一个来源；
+ *   4. 未观测桶是 null；完整 total 只在四桶完整且没有未知来源时给出；
+ *   5. 部分观测给「已观测小计」，同时把 `partial` 标出来。
+ */
+function reduceAgentUsage(input) {
+  const { calls, snapshots, invocationEventIds, hadActivity } = input
+  const realCalls = calls.filter(call => call.synthetic !== true)
+  const syntheticCalls = calls.filter(call => call.synthetic === true)
+  const snapshotList = [...(snapshots instanceof Map ? snapshots.values() : [])]
+    .sort((left, right) => (Number.isInteger(left.seq) ? left.seq : -1) - (Number.isInteger(right.seq) ? right.seq : -1))
+
+  const invocationSnapshots = new Map()
+  const cumulativeSnapshots = new Map()
+  const unknownSnapshots = []
+  for (const snapshot of snapshotList) {
+    if (snapshot.scope === USAGE_SCOPE.INVOCATION && nonEmptyString(snapshot.invocationId)) {
+      invocationSnapshots.set(snapshot.invocationId, snapshot)
+    } else if (snapshot.scope === USAGE_SCOPE.SESSION_CUMULATIVE && nonEmptyString(snapshot.sessionScopeId)) {
+      // 同一 session 的累计快照只取最新；不同 agentScope 的累计值是否重叠不可证明，
+      // 取最新比相加安全（后者会双计）。
+      cumulativeSnapshots.set(snapshot.sessionScopeId, snapshot)
+    } else {
+      // 作用域无法归属（unknown / 缺范围 id）：保留原始快照，算部分/未知。
+      unknownSnapshots.push(snapshot)
+    }
+  }
+
+  const callsByInvocation = new Map()
+  const orphanCalls = []
+  for (const call of realCalls) {
+    if (nonEmptyString(call.invocationId)) {
+      if (!callsByInvocation.has(call.invocationId)) callsByInvocation.set(call.invocationId, [])
+      callsByInvocation.get(call.invocationId).push(call)
+    } else {
+      orphanCalls.push(call)
+    }
+  }
+
+  const units = []
+  const observedInvocationIds = new Set()
+  const invocationIds = new Set([...callsByInvocation.keys(), ...invocationSnapshots.keys()])
+  for (const invocationId of invocationIds) {
+    observedInvocationIds.add(invocationId)
+    const invocationCalls = callsByInvocation.get(invocationId) ?? []
+    const snapshot = invocationSnapshots.get(invocationId) ?? null
+    const sessionScopeId = snapshot?.sessionScopeId
+      ?? invocationCalls.find(call => nonEmptyString(call.sessionScopeId))?.sessionScopeId
+      ?? null
+    units.push(buildUsageUnit({
+      key: `invocation:${invocationId}`,
+      invocationId,
+      sessionScopeId,
+      calls: invocationCalls,
+      snapshot,
+    }))
+  }
+  for (const call of orphanCalls) {
+    units.push(buildUsageUnit({
+      key: `call:${call.callId}`,
+      invocationId: null,
+      sessionScopeId: call.sessionScopeId,
+      calls: [call],
+      snapshot: null,
+    }))
+  }
+
+  // session-cumulative：同一累计范围只取最新，其覆盖的 invocation 不再单独求和。
+  const effectiveUnits = []
+  const sessions = new Map()
+  for (const unit of units) {
+    if (nonEmptyString(unit.sessionScopeId)) {
+      if (!sessions.has(unit.sessionScopeId)) sessions.set(unit.sessionScopeId, [])
+      sessions.get(unit.sessionScopeId).push(unit)
+    } else {
+      effectiveUnits.push(unit)
+    }
+  }
+  const consumedCumulative = new Set()
+  for (const snapshot of cumulativeSnapshots.values()) {
+    const sessionUnits = sessions.get(snapshot.sessionScopeId) ?? []
+    sessions.delete(snapshot.sessionScopeId)
+    consumedCumulative.add(snapshot.snapshotId)
+    effectiveUnits.push(buildSessionUsageUnit({
+      key: `session:${snapshot.sessionScopeId}`,
+      sessionScopeId: snapshot.sessionScopeId,
+      units: sessionUnits,
+      snapshot,
+    }))
+  }
+  for (const sessionUnits of sessions.values()) effectiveUnits.push(...sessionUnits)
+  for (const snapshot of cumulativeSnapshots.values()) {
+    if (!consumedCumulative.has(snapshot.snapshotId)) unknownSnapshots.push(snapshot)
+  }
+
+  const totals = {}
+  for (const bucket of USAGE_BUCKETS) totals[bucket] = { value: null, complete: true, observed: false }
+  for (const unit of effectiveUnits) {
+    for (const bucket of USAGE_BUCKETS) {
+      const cell = unit.cells[bucket]
+      const total = totals[bucket]
+      if (Number.isInteger(cell.value)) {
+        total.value = (total.value ?? 0) + cell.value
+        total.observed = true
+      }
+      if (cell.complete !== true) total.complete = false
+    }
+  }
+
+  const coverage = { known: 0, partial: 0, unknown: 0 }
+  let maskMissing = false
+  let provisional = false
+  for (const unit of effectiveUnits) {
+    coverage[usageUnitLevel(unit)] += 1
+    if (unit.maskMissing) maskMissing = true
+    if (unit.provisional) provisional = true
+  }
+  for (const snapshot of unknownSnapshots) {
+    coverage.unknown += 1
+    maskMissing = maskMissing || snapshot.maskMissing === true
+  }
+  for (const _call of syntheticCalls) coverage.unknown += 1
+
+  // 有 agent/invocation 事件但完全没有 usage 事实的轮次：未知，不是 0。
+  const coveredInvocationIds = new Set()
+  // synthetic 占位也覆盖它挂的那个 invocation（否则同一轮会被算两次未知）。
+  for (const call of calls) if (nonEmptyString(call.invocationId)) coveredInvocationIds.add(call.invocationId)
+  for (const snapshot of snapshotList) if (nonEmptyString(snapshot.invocationId)) coveredInvocationIds.add(snapshot.invocationId)
+  for (const invocationId of invocationEventIds) {
+    if (!coveredInvocationIds.has(invocationId)) coverage.unknown += 1
+  }
+  if (effectiveUnits.length === 0 && coverage.known + coverage.partial + coverage.unknown === 0 && hadActivity) {
+    coverage.unknown = 1
+  }
+
+  // unknown 快照可能携带未归属的 token，synthetic 意味着有调用没观测到 → 四桶都不能声称完整。
+  const hasUnknownSource = unknownSnapshots.length > 0 || syntheticCalls.length > 0
+  if (hasUnknownSource) {
+    for (const bucket of USAGE_BUCKETS) totals[bucket].complete = false
+  }
+
+  const bucketsSeen = USAGE_BUCKETS.filter(bucket => totals[bucket].observed)
+  const bucketsMissing = USAGE_BUCKETS.filter(bucket => !totals[bucket].observed)
+  const bucketValue = bucket => (totals[bucket].complete === true && Number.isInteger(totals[bucket].value)
+    ? totals[bucket].value
+    : null)
+  const values = {}
+  for (const bucket of USAGE_BUCKETS) values[bucket] = bucketValue(bucket)
+  const totalComplete = USAGE_BUCKETS.every(bucket => Number.isInteger(values[bucket]))
+    && !maskMissing && !hasUnknownSource
+  const anyObserved = bucketsSeen.length > 0
+  const observedTokens = anyObserved
+    ? {
+      ...values,
+      total: totalComplete ? USAGE_BUCKETS.reduce((acc, bucket) => acc + values[bucket], 0) : null,
+      partial: !totalComplete,
+    }
+    : null
+  const observedTokensPartial = anyObserved
+    ? {
+      input: totals.input.value,
+      cacheRead: totals.cacheRead.value,
+      cacheWrite: totals.cacheWrite.value,
+      output: totals.output.value,
+    }
+    : null
+
+  const reasons = []
+  if (coverage.unknown > 0) reasons.push(USAGE_REASON.UNAVAILABLE)
+  if (coverage.partial > 0) {
+    reasons.push(METRICS_REASON.USAGE_PARTIAL)
+    if (bucketsMissing.length > 0) reasons.push(METRICS_REASON.USAGE_MISSING_BUCKETS)
+  }
+  if (unknownSnapshots.length > 0) reasons.push(METRICS_REASON.USAGE_SCOPE_UNKNOWN)
+  if (provisional) reasons.push(METRICS_REASON.USAGE_OUTPUT_PROVISIONAL)
+  if (maskMissing) reasons.push(METRICS_REASON.USAGE_HISTORY_MASK_MISSING)
+
+  const modelCalls = realCalls.length > 0 ? realCalls.length : (hadActivity ? null : 0)
+  return {
+    modelCalls,
+    observedInvocationIds,
+    coverage,
+    observedTokens,
+    observedTokensPartial,
+    buckets: { seen: bucketsSeen, missing: bucketsMissing, complete: totalComplete },
+    snapshots: {
+      total: snapshotList.length,
+      invocation: invocationSnapshots.size,
+      sessionCumulative: cumulativeSnapshots.size,
+      unknown: unknownSnapshots.length,
+    },
+    reasons,
   }
 }
 
@@ -918,15 +1244,57 @@ export function createMetricsCache(options = {}) {
   }
 }
 
+/**
+ * usage / 快照事件正文指纹（0.14.5 M7）。
+ *
+ * `eventsFingerprint` 只取 `(seq|type|at)`：同一 seq/type/at 但 usage 正文不同的
+ * 事件（重放、补写、修正）会得到同一个 key。这里把调用身份、桶值、观测掩码、
+ * 快照 scope 一并摘要进缓存 key。
+ *
+ * @param {object[]} events
+ * @returns {string}
+ */
+export function usageFingerprint(events) {
+  if (!Array.isArray(events)) return ''
+  const parts = []
+  for (const event of events) {
+    if (!isPlainObject(event)) continue
+    if (event.type !== 'agent/usage' && event.type !== AGENT_USAGE_SNAPSHOT_EVENT) continue
+    const usage = isPlainObject(event.usage)
+      ? [
+        event.usage.input, event.usage.cacheRead, event.usage.cacheWrite, event.usage.output,
+        event.usage.total, event.usage.canonical,
+      ]
+      : null
+    parts.push(JSON.stringify([
+      event.type,
+      Number.isInteger(event.seq) ? event.seq : -1,
+      event.callId ?? event.snapshotId ?? '',
+      event.provider ?? '',
+      event.trust ?? '',
+      event.scope ?? '',
+      usage,
+      Array.isArray(event.observedBuckets) ? event.observedBuckets : null,
+      event.synthetic === true,
+    ]))
+  }
+  if (parts.length === 0) return ''
+  return createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex')
+}
+
 /** 缓存指纹的稳定序列化（字段固定，缺省按 0 / 空串）。 */
 export function metricsCacheKey(input = {}) {
   const source = isPlainObject(input) ? input : {}
   return JSON.stringify({
     schemaVersion: Number.isInteger(source.schemaVersion) ? source.schemaVersion : METRICS_SCHEMA_VERSION,
+    // usage 语义版本：桶为 null / partial 的规则变了就必须让旧缓存整体失效。
+    usageSchema: Number.isInteger(source.usageSchema) ? source.usageSchema : USAGE_SCHEMA_VERSION,
     lastSeq: Number.isInteger(source.lastSeq) ? source.lastSeq : 0,
     revision: Number.isInteger(source.revision) ? source.revision : 0,
     // 事件集合内容指纹：元数据没变但事件正文被补写 / 修复 → key 变化。
     events: typeof source.events === 'string' ? source.events : '',
+    // usage / 快照正文指纹：同 seq/type/at 的正文变化（重放 / 修正）也要失效。
+    usage: typeof source.usage === 'string' ? source.usage : '',
     connector: typeof source.connector === 'string' ? source.connector : '',
     resources: Number.isInteger(source.resources) ? source.resources : 0,
   })
@@ -947,8 +1315,11 @@ function emptyTotals() {
       invocationUnknown: 0,
       modelCalls: 0,
       modelCallsUnknown: 0,
-      observedTokens: null,
-      usageCoverage: { known: 0, unknown: 0 },
+      // 跨实例合计不能先初始化成 0 再忽略 null：逐桶记录「是否被某个实例判为不完整」。
+      tokenObserved: false,
+      tokenSums: { input: null, cacheRead: null, cacheWrite: null, output: null },
+      tokenIncomplete: new Set(),
+      usageCoverage: { known: 0, partial: 0, unknown: 0 },
       bucketsSeen: new Set(),
     },
     human: {
@@ -1003,19 +1374,29 @@ function mergeMetricsIntoTotals(totals, entry) {
   }
   if (Number.isFinite(agent.modelCalls)) totals.agent.modelCalls += agent.modelCalls
   else if (agent.modelCalls === null) totals.agent.modelCallsUnknown += 1
+  const hasUsageActivity = isPlainObject(agent.observedTokens)
+    || agent.modelCalls === null
+    || agent.invocations === null
+    || (Number.isFinite(agent.invocations) && agent.invocations > 0)
   if (isPlainObject(agent.observedTokens)) {
-    if (totals.agent.observedTokens === null) {
-      totals.agent.observedTokens = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 }
-    }
-    for (const bucket of [...USAGE_BUCKETS, 'total']) {
-      if (Number.isFinite(agent.observedTokens[bucket])) {
-        totals.agent.observedTokens[bucket] += agent.observedTokens[bucket]
+    totals.agent.tokenObserved = true
+    for (const bucket of USAGE_BUCKETS) {
+      const value = agent.observedTokens[bucket]
+      if (Number.isFinite(value)) {
+        totals.agent.tokenSums[bucket] = (totals.agent.tokenSums[bucket] ?? 0) + value
+      } else {
+        totals.agent.tokenIncomplete.add(bucket)
       }
     }
+  } else if (hasUsageActivity) {
+    // 实例确实跑过 agent 但没有观测到 token：它的用量可能落在任意桶。
+    totals.agent.tokenObserved = true
+    for (const bucket of USAGE_BUCKETS) totals.agent.tokenIncomplete.add(bucket)
   }
   if (isPlainObject(agent.usageCoverage)) {
-    if (Number.isFinite(agent.usageCoverage.known)) totals.agent.usageCoverage.known += agent.usageCoverage.known
-    if (Number.isFinite(agent.usageCoverage.unknown)) totals.agent.usageCoverage.unknown += agent.usageCoverage.unknown
+    for (const level of ['known', 'partial', 'unknown']) {
+      if (Number.isFinite(agent.usageCoverage[level])) totals.agent.usageCoverage[level] += agent.usageCoverage[level]
+    }
   }
   for (const bucket of Array.isArray(agent.buckets?.seen) ? agent.buckets.seen : []) {
     if (USAGE_BUCKETS.includes(bucket)) totals.agent.bucketsSeen.add(bucket)
@@ -1063,6 +1444,27 @@ function mergeMetricsIntoTotals(totals, entry) {
   return true
 }
 
+function aggregateTokensComplete(agent) {
+  return agent.tokenObserved
+    && agent.tokenIncomplete.size === 0
+    && USAGE_BUCKETS.every(bucket => Number.isInteger(agent.tokenSums[bucket]))
+}
+
+function aggregateObservedTokens(agent) {
+  if (!agent.tokenObserved) return null
+  const complete = aggregateTokensComplete(agent)
+  const values = {}
+  for (const bucket of USAGE_BUCKETS) {
+    values[bucket] = agent.tokenIncomplete.has(bucket) ? null : agent.tokenSums[bucket]
+    if (values[bucket] === undefined) values[bucket] = null
+  }
+  return {
+    ...values,
+    total: complete ? USAGE_BUCKETS.reduce((acc, bucket) => acc + values[bucket], 0) : null,
+    partial: !complete,
+  }
+}
+
 function finalizeAggregateTotals(totals) {
   const terminal = totals.connector.succeeded + totals.connector.errored + totals.connector.canceled
   return {
@@ -1081,12 +1483,16 @@ function finalizeAggregateTotals(totals) {
         ? null
         : totals.agent.invocations,
       invocationUnknown: totals.agent.invocationUnknown,
-      modelCalls: totals.agent.modelCallsUnknown > 0 && totals.agent.modelCalls === 0
-        ? null
-        : totals.agent.modelCalls,
+      modelCalls: totals.agent.modelCallsUnknown > 0 ? null : totals.agent.modelCalls,
       modelCallsUnknown: totals.agent.modelCallsUnknown,
-      observedTokens: totals.agent.observedTokens,
+      observedTokens: aggregateObservedTokens(totals.agent),
+      observedTokensPartial: totals.agent.tokenObserved ? { ...totals.agent.tokenSums } : null,
       usageCoverage: { ...totals.agent.usageCoverage },
+      buckets: {
+        seen: USAGE_BUCKETS.filter(bucket => totals.agent.bucketsSeen.has(bucket)),
+        missing: USAGE_BUCKETS.filter(bucket => !totals.agent.bucketsSeen.has(bucket)),
+        complete: aggregateTokensComplete(totals.agent),
+      },
       bucketsSeen: USAGE_BUCKETS.filter(bucket => totals.agent.bucketsSeen.has(bucket)),
     },
     human: { ...totals.human },
@@ -1266,11 +1672,13 @@ export function aggregateInstanceMetrics(input = {}) {
 export function metricsFingerprintFor(instance, options = {}) {
   return {
     schemaVersion: METRICS_SCHEMA_VERSION,
+    usageSchema: USAGE_SCHEMA_VERSION,
     lastSeq: Number.isInteger(instance?.lastSeq) ? instance.lastSeq : 0,
     revision: Number.isInteger(instance?.revision) ? instance.revision : 0,
     events: Array.isArray(options?.events)
       ? eventsFingerprint(options.events, options.skippedEvents)
       : '',
+    usage: Array.isArray(options?.events) ? usageFingerprint(options.events) : '',
     connector: typeof options?.connector === 'string' ? options.connector : '',
     resources: Number.isInteger(options?.resources) ? options.resources : 0,
   }

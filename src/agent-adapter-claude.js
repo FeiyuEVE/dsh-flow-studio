@@ -1947,8 +1947,12 @@ export function createClaudeAdapter(options = {}) {
           return
         }
         const remaining = settings.reminderLimit - state.reminders
+        // m3：`--session-id` 是本次显式传的 UUID，即使 stream-json 没给 init / session_id
+        // 事件，它也是可续跑的稳定 key（CLI 侧确实用这个 id 起过会话）。
+        const resumeSessionId = state.sessionId
+          || (flags.sessionId === true ? state.sessionIdHint : undefined)
         // 没有 resume 能力就没有提醒机制：直接 MISSING（capabilities 已如实标 unsupported）。
-        if (!resumeSupported || remaining <= 0 || !state.sessionId) {
+        if (!resumeSupported || remaining <= 0 || !resumeSessionId) {
           finishWithoutTool()
           return
         }
@@ -1964,7 +1968,7 @@ export function createClaudeAdapter(options = {}) {
             settingsPath: null,
             permissionMode: settings.permissionMode,
             model,
-            resumeSessionId: state.sessionId,
+            resumeSessionId,
             flags,
           }), 'resume', `${executionId}:invoke-r${state.reminders}`)
           await awaitProcessEnd(resumeProc)

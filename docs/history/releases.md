@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.4）
+# 版本历史（0.1 → 0.14.5）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -940,3 +940,26 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 跨主机、NFS / SMB 共享目录、以及仍按 0.14.3 及更早协议运行（不写 `owner.json`）的进程不在互斥保证内；`unknown` 所有权不会自动接管；非 Linux 平台读不到 starttime，只剩 pid 存活判定。
 - 工具面不投影 `committed` / `eventLogPending` / `eventLogGap` / `eventsHash`：要判断部分提交与事件缺口，走 HTTP 响应。
 - 未做硬挂起（停引擎 + 快照恢复）。
+
+## 0.14.5 — 适配器分帧 / 进程组与用量口径
+
+修的是 `0.14.2` Claude 适配器复审里的 7 个 MAJOR（其中 M3 / M5 / m2 / m5 在 Codex 适配器上同样存在），以及用量与指标口径。
+
+- **CLI 流分帧（M3）**：Claude 与 Codex 适配器的 stdout 都改走共享 `src/agent-cli-stream.js`（`StringDecoder` 解码、按原始字节限量、EOF flush、超长行整行丢弃并记诊断、展示 tail 与协议缓冲分离）；每个子进程独立 reader（初始 / resume 不共享半行缓冲），结算前 `await drained`（有界，超时标 `outputIncomplete`）。修掉「中文跨块变 `???`」「无尾换行丢事件」「600 KiB 合法单行被裁剪」「按 exit 而非流排空结算」。
+- **启动失败清理（M4）**：runDir 一创建就登记资源；参数构造、同步 `spawn` 异常（如 200 KB argv 的 `E2BIG`）、握手都在保护块内，失败时 abort 闸门、整组 TERM→KILL、关 channel、删目录，并附 `cleanup` / `cleanupFinal`。不再出现「start 抛错但临时目录与 MCP 监听残留」。
+- **零宽限与进程组（M5 / m1）**：完成收尾统一走 `src/agent-cli-lifecycle.js` 的进程组 supervisor；`postFinishGraceMs=0` 只跳过宽限等待，仍执行 TERM→KILL；`cancel` / `dispose` 只在**整组消失**（`kill(-pgid,0)` 抛 `ESRCH`）后撤销升级，组长先退但后代忽略 TERM 时继续升级。
+- **退出分类（M6）**：① 已受理 gate → 完成；② 取消 → `NODE_FINISH_CANCELED`；③ 无受理记录时区分启动 / 握手 / 通道 / CLI 终态错误（Claude：`NODE_FINISH_TOOL_UNAVAILABLE` 或 `CLAUDE_PROVIDER_ERROR`；Codex：`CODEX_CLI_TURN_FAILED` / `CODEX_CLI_EXIT_NONZERO`），保留脱敏原因，**不消耗提醒预算**；④ 只有正常停下且通道可用才提醒 / 续跑；⑤ 预算耗尽才是 `NODE_FINISH_MISSING`。认证失败不再伪装成「没调用完结工具」。
+- **参数与错误码（m4 / m5）**：Claude 侧建立唯一参数要求表（probe / argv / capabilities 共用），缺必需 flag 直接拒绝、start 零派发；直接 `start()` 在不可用时统一 `NODE_FINISH_TOOL_UNAVAILABLE`（原 code 放 cause）。
+- **CLI 发现（m6）**：抽 `scripts/claude-cli-discovery.mjs`（`CLAUDE_BIN` 优先 → 搜 `PATH` 并校验可执行）；PATH 里有可执行 `claude` 时 smoke 会「已尝试」并如实失败，不再误报 skipped。
+- **用量身份（M1）**：Claude 调用身份改由 `src/claude-usage-ledger.js` 按**稳定 `message.id`** 去重（`claude-message-v1:<sha256(session|agentScope|messageId)>`）；同一 message 的并行工具块是同一个模型响应，重复上报是替换不是相加；没有 `message.id` 时标 `synthetic`，不伪造确定调用数。
+- **结算快照（M2）**：`result.usage` 不再塞进调用列表，改为 `agent/usage-snapshot`（scope `invocation` / `session-cumulative` / `unknown`）：invocation 每个 scope 取最新、session-cumulative 每 session 取最新、unknown 保留原始快照且**不按数值猜 sum / max**；快照不增加 `modelCalls`。resume 后范围不可证明时为 unknown。
+- **四桶与部分观测（M7）**：缺失桶返回 `null`（不再补 0），显式 `0` 保留；`usageCoverage` 分 `known / partial / unknown`，新增 `observedTokensPartial` 与 `buckets.complete`；部分观测给已观测小计但完整 total 为 `null` 并带 reasons；canonical 只校验不重算（Codex inclusive input 不再二次扣缓存，105 不再变 85）；`METRICS_SCHEMA_VERSION` 升到 2，缓存 key 含 usage 指纹；旧事件无观测掩码 → partial + `usage-history-mask-missing`。
+- **计量不裁剪（m2）**：适配器用量账本不再被诊断缓存上限裁到 200（201 次调用全保留）；诊断单独有界并标截断。
+- **续跑用显式 session id（m3）**：`--session-id` 已显式传入时，即使 CLI 没发 init / `session_id` 事件，提醒续跑仍用该 UUID（不再直接 `NODE_FINISH_MISSING`）。
+- **文档（N1）**：README 适配器表补 Claude；design/09 · 11 · 12 区分三层证据（参数探测 / 桥自检 / 真实 CLI 握手 + finish）与结算快照口径；releases 给 0.14.2 条目加勘误。
+
+**已知边界**
+- **真实 Claude CLI 仍未验证**：本机没有 `claude` CLI，`scripts/claude-smoke.mjs` 输出 `skipped:true`（不是通过）。真实 stream-json 版本差异、`--resume` 的用量作用域、native Stop hook 装载与时序、Windows `taskkill` 回收都未实测；协议或作用域不符时指标降级为部分观测 / 未知，不推测完成或完整用量。
+- 提示词仍在 argv（本轮不切 stdin）：200 KB 提示词现在是**干净失败**（`E2BIG` → 工具不可用 + 清理），限制本身未消除。
+- 用量账本不淘汰（按唯一调用增长），极长会话内存随调用数上升。
+- 跨实例汇总只要有一个实例 usage 未知，四桶合计降级为 `null`（另给已观测小计）。

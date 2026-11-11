@@ -197,7 +197,8 @@ writeFileSync(join(stateDir, 'invocations', process.pid + '.json'), JSON.stringi
   token,
 }))
 
-out({ type: 'system', subtype: 'init', session_id: sessionId })
+// m3: init may be missing on some CLI versions; --session-id was passed explicitly, so resume can still work.
+if (process.env.FAKE_CLAUDE_SKIP_INIT !== '1') out({ type: 'system', subtype: 'init', session_id: sessionId })
 
 const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn' || mode === 'early-error'
 let transport = null
@@ -1267,6 +1268,41 @@ async function main() {
       const calls = handle.usageCalls()
       A.equal(calls.length, 2)
       A.equal(new Set(calls.map(call => call.callId)).size, 2)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('m3：已传 --session-id 但 CLI 没发 init/session_id 时，resume 仍用该 UUID 续跑', async () => {
+      resetState()
+      const workspace = freshWorkspace('no-init-resume')
+      const adapter = makeAdapter({
+        env: {
+          FAKE_CLAUDE_STATE_DIR: stateDir,
+          FAKE_CLAUDE_MODE: 'call-on-resume',
+          // 模拟 CLI 不输出 init：没有 session_id 事件，只有我们显式传的 --session-id。
+          FAKE_CLAUDE_SKIP_INIT: '1',
+        },
+      })
+      const gate = makeGate(workspace)
+      const fires = []
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '无 init 续跑节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info.count) },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(exited.reminders, 1, '缺 init 也要真的提醒一次')
+      A.deepEqual(fires, [1])
+      const all = invocations()
+      A.equal(all.length, 2, '第一次退出 + 一次 resume')
+      A.equal(all[1].isResume, true, 'resume 必须真的带 --resume')
+      const hint = all[0].sessionIdArg
+      A.equal(typeof hint, 'string', '初始进程必须显式传过 --session-id')
+      A.equal(all[1].resumeId, hint, 'resume 用初始进程传入的同一个 UUID')
+      A.equal(exited.sessionId, hint, '对外 sessionId 回落到显式 hint（不是编造的新值）')
       await adapter.dispose(handle)
       A.deepEqual(leftoverDirs(), [])
     })

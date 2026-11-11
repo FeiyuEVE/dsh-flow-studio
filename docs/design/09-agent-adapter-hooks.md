@@ -59,6 +59,8 @@ interface Capabilities {
   cancel: Capability
   team: Capability & { mode: 'native' | 'process-fanout' | 'none' }
   toolPolicy: Capability
+  /** agent 节点完结工具 flow_finish_node 的提供能力（见 11-node-finish-tool.md） */
+  finishTool: Capability
 }
 
 interface AgentAdapter {

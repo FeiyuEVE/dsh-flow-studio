@@ -1021,6 +1021,52 @@ async function main() {
         '真的收到 exit 事件后才更新为 disposed=true')
     })
 
+    await check('N2 续跑进程存活：初始进程退出不构成整个执行的退出证明', async () => {
+      resetState()
+      const workspace = freshWorkspace('resume-cleanup')
+      // killImpl 注入「回收未生效」：SIGTERM / SIGKILL 都打不出去，resume 会一直活着。
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'call-on-resume-hang' },
+        postFinishGraceMs: 60_000,
+        killTimeoutMs: 100,
+        killImpl: () => {},
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '续跑存活的节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      A.equal(await waitForFile(join(stateDir, 'resume.pid')), true, 'resume 子进程已启动')
+      const resumePid = Number(readFileSync(join(stateDir, 'resume.pid'), 'utf8'))
+      A.equal(pidAlive(resumePid), true, 'resume 正在运行')
+      // 初始 exec 已自然退出（fixture 输出 thread.started 后退出）。错误实现会在
+      // 这里把 cleanup.disposed 报成 true；正确实现必须看住仍存活的 resume。
+      A.equal(handle.cleanup.disposed, false, 'resume 存活时 disposed 必须为 false')
+      A.match(String(handle.cleanup.reason || ''), /resume/, 'cleanup 给出未退出原因')
+      A.deepEqual(handle.cleanup.pending, ['resume'], 'pending 明确列出 resume')
+
+      const startedAt = Date.now()
+      await adapter.dispose(handle)
+      A.ok(Date.now() - startedAt < 8_000, 'dispose 仍有界（不挂）')
+      A.equal(handle.cleanup.disposed, false, 'kill 未生效时 dispose 后仍不得声称已清理')
+      A.equal(pidAlive(resumePid), true, '注入的 kill 未生效：resume 仍活着')
+      const exited = await Promise.race([handle.exited, sleep(1_500).then(() => null)])
+      A.ok(exited && exited.code === 'NODE_FINISH_CANCELED', '逻辑结局仍有界收口')
+
+      // 测试收尾：真实 SIGKILL 进程组，exit 事件补上物理确认。
+      try {
+        process.kill(-resumePid, 'SIGKILL')
+      } catch {
+        try { process.kill(resumePid, 'SIGKILL') } catch { /* 已退出 */ }
+      }
+      A.equal(await waitForDead(resumePid), true, '测试收尾：resume 已退出')
+      A.equal(await waitUntil(() => handle.cleanup.disposed === true, 2_000), true,
+        '所有被跟踪进程退出后才更新 disposed=true')
+    })
+
     await check('M4：凭据 / socket 路径不进 handle.events / lastMessage / stdoutTail', async () => {
       resetState()
       const workspace = freshWorkspace('leak')

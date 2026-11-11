@@ -2172,6 +2172,77 @@ try {
     }
   })
 
+  await check('N2 resume 进程未确认退出：cleanup.disposed=false 时槽位 / _executionBusy 保持占用', async home => {
+    const repo = makeGitRepo(home)
+    const url = new URL('http://localhost/')
+    const runtime = createBpmnRuntime({
+      dir: store.flowsDir(home),
+      env: {},
+      adapters: makeFakeAdapters(),
+      workspaceAllowlist: [repo],
+    })
+    try {
+      const saved = await runtime.handle({
+        method: 'POST',
+        parts: ['definitions'],
+        url,
+        body: { id: 'flow-n2', name: 'n2', xml: workflowXml('proc-n2') },
+      })
+      eq(saved.status, 201, JSON.stringify(saved.body))
+      const created = await runtime.handle({
+        method: 'POST',
+        parts: ['instances'],
+        url,
+        body: { definitionId: 'flow-n2', workspace: { path: repo, worktree: { mode: 'on', cleanup: 'on-terminal-clean' } } },
+      })
+      eq(created.status, 201, JSON.stringify(created.body))
+      const id = created.body.id
+      const worktreePath = created.body.workspace.effectiveRoot
+
+      // 适配器如实报告：逻辑结局已收口，但 resume 子进程仍未确认退出。
+      const resumeAlive = {
+        id: 'dsh',
+        async probe() {
+          return { version: 'stub', helpDigest: 'stub' }
+        },
+        capabilities() {
+          return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' } }
+        },
+        start() {
+          return {
+            exited: Promise.resolve({
+              ok: false,
+              code: 'NODE_FINISH_CANCELED',
+              message: 'resume 子进程未确认退出',
+            }),
+            cleanup: { disposed: false, reason: '仍有 1 个 codex 子进程未确认退出（resume）' },
+          }
+        },
+        async cancel() {},
+        async dispose() {},
+      }
+      runtime.adapters = makeFakeAdapters(resumeAlive)
+      const element = { id: 'agent-n2', node: { adapter: 'dsh' } }
+      await rejects(
+        runtime._executeAgentFor(id, element, {
+          attempt: 1,
+          executionId: 'exec-n2-resume',
+          variables: {},
+        }),
+        error => error && error.code === 'BPMN_ABORTED',
+        'N2：resume 未确认退出 → handler 以 ABORTED 结束',
+      )
+      eq(runtime._activeAgents.get(id), 1, 'N2：cleanup.disposed=false 时 activeAgents 仍占用')
+      eq(runtime.executionLimits.active, 1, 'N2：cleanup.disposed=false 时执行槽位仍占用')
+      ok(runtime._executionBusy(id), 'N2：_executionBusy 仍为 true')
+      await instStore.completeInstance(id, 'CANCELED', { instancesRoot: runtime.instancesRoot })
+      await runtime._maybeTerminalCleanup(id, { waitMs: 30 })
+      ok(existsSync(worktreePath), 'N2：退出未确认时终态清理不删 worktree')
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   await check('F1 创建后元数据失败回滚：零仓库级 prune，移走 / 替换的目标不被删', async home => {
     const repo = makeGitRepo(home)
     const commands = []

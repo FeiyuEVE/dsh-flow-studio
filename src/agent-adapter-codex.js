@@ -53,13 +53,15 @@
  * @module @feiyueve/dsh-flow-studio/agent-adapter-codex
  */
 
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, promises as fsp, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
+import { createProcessGroupSupervisor } from './agent-cli-lifecycle.js'
+import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
 import {
   FINISH_CHANNEL_ENV,
   FINISH_REMINDER_TEXT,
@@ -102,6 +104,21 @@ const MODEL_PATTERN = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
 
 const SERVER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'node-finish-mcp.js')
 const HOOK_SCRIPT_NAME = 'finish-stop-hook.mjs'
+
+/**
+ * M3 分帧 / 诊断上限（review-0142b）：
+ *   - 协议单行上限按**原始字节**执行（8 MiB，与共享 reader 默认值一致）；600 KiB 的
+ *     合法单行必须能完整解析。
+ *   - `events` 是**诊断缓存**，保留 200 条并显式标记截断（`eventsTruncated`）。
+ *   - 计量账本（`usageCalls`）**不受**这个上限约束（m2）：201 轮就是 201 条调用。
+ *   - 协议错误 / 流诊断各自有界，只记位置、长度、类型；正文与凭据不落诊断。
+ */
+const EVENT_CACHE_LIMIT = 200
+const PROTOCOL_ERROR_LIMIT = 20
+const DIAGNOSTIC_LIMIT = 50
+const STREAM_MAX_LINE_BYTES = 8 * 1024 * 1024
+const MAX_TERMINAL_MESSAGE = 300
+const DEFAULT_DRAIN_TIMEOUT_MS = 5_000
 
 /**
  * Stop hook 脚本：从 stdin 读 codex 的 hook 事件，经本地完成通道问「要不要提醒」，
@@ -280,6 +297,10 @@ function nonEmptyTrimmedString(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : ''
 }
 
+function nonNegativeIntOr(value, fallback) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback
+}
+
 /**
  * 把「节点模型」解析成一个可传给 `-m` 的字符串（M6）。
  *
@@ -330,14 +351,23 @@ function normalizeChoice(value, allowed, fallback, field) {
 /**
  * 跑一次 codex 子命令（probe 用），带超时；失败收敛成结果对象，不抛异常。
  * 子进程环境同样走白名单（M5），并叠加 `options.env`（测试 / 特殊接线）。
+ *
+ * M3：stdout 解析改用共享的 `createUtf8LineReader` + `attachProcessStreams`——
+ *   - UTF-8 多字节字符跨 chunk 不再变成 U+FFFD（旧实现 `stdout += chunk`）；
+ *   - `exit` 后先等 stdout 排空（有界）再结算，合法 JSON 缺尾换行也能读到；
+ *   - 单行上限按原始字节执行，不是按展示 tail 裁剪。
  */
 function runOnce(command, args, options = {}) {
   return new Promise(resolvePromise => {
-    let stdout = ''
-    let stderr = ''
     let settled = false
     let timer = null
     let child
+    let streams = null
+    const stdoutLines = []
+    let stdoutBytes = 0
+    const drainTimeoutMs = nonNegativeIntOr(options.drainTimeoutMs, 2_000)
+    const stdout = () => stdoutLines.join('\n')
+    const stderrText = () => (streams ? streams.stderrTail() : '')
     const finish = result => {
       if (settled) return
       settled = true
@@ -350,9 +380,22 @@ function runOnce(command, args, options = {}) {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
-      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout, stderr })
+      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout: '', stderr: '' })
       return
     }
+    const stdoutReader = createUtf8LineReader({
+      onLine: line => {
+        if (stdoutBytes >= 2 * 1024 * 1024) return
+        stdoutBytes += Buffer.byteLength(line, 'utf8') + 1
+        stdoutLines.push(line)
+      },
+    })
+    streams = attachProcessStreams(child, {
+      stdoutReader,
+      stdoutTailBytes: 8 * 1024,
+      stderrTailBytes: 256 * 1024,
+      drainTimeoutMs,
+    })
     const limit = options.timeoutMs || 20_000
     timer = setTimeout(() => {
       try {
@@ -360,20 +403,31 @@ function runOnce(command, args, options = {}) {
       } catch {
         // ignore
       }
-      finish({ ok: false, code: 'TIMEOUT', stdout, stderr })
+      finish({ ok: false, code: 'TIMEOUT', stdout: stdout(), stderr: stderrText() })
     }, limit)
     timer.unref?.()
-    child.stdout?.on('data', chunk => {
-      if (stdout.length < 2 * 1024 * 1024) stdout += chunk
-    })
-    child.stderr?.on('data', chunk => {
-      if (stderr.length < 256 * 1024) stderr += chunk
-    })
     child.on('error', error => {
-      finish({ ok: false, code: error && error.code ? String(error.code) : 'SPAWN_FAILED', stdout, stderr })
+      finish({
+        ok: false,
+        code: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+        stdout: stdout(),
+        stderr: stderrText(),
+      })
     })
     child.on('exit', (code, signal) => {
-      finish({ ok: code === 0, code: code === null ? 'SIGNAL' : String(code), signal, stdout, stderr })
+      // M3：先等协议 reader 排空（有界），再按退出码结算。
+      streams.drained.then(result => {
+        finish({
+          ok: code === 0,
+          code: code === null ? 'SIGNAL' : String(code),
+          signal,
+          stdout: stdout(),
+          stderr: stderrText(),
+          outputDrained: Boolean(result && result.drained === true),
+        })
+      }, () => {
+        finish({ ok: false, code: 'DRAIN_FAILED', stdout: stdout(), stderr: stderrText() })
+      })
     })
   })
 }
@@ -498,6 +552,8 @@ function buildResumeArgs({
  * @param {number} [options.reminderLimit] 最多提醒次数（默认 3）
  * @param {number} [options.postFinishGraceMs] 工具完成后等进程自然退出的宽限（默认 5000）
  * @param {number} [options.killTimeoutMs] SIGTERM → SIGKILL 的间隔（默认 3000）
+ * @param {number} [options.drainTimeoutMs] 子进程退出后等 stdout 排空的上限（默认 5000；
+ *   超时标记 `outputIncomplete` 并记诊断，绝不无限等待）
  * @param {number} [options.helloTimeoutMs] 等 MCP server 起来的超时（默认 20000）
  * @param {number} [options.probeTimeoutMs] probe 的总超时（默认 60000；每条子命令共用这个上限）
  * @param {number} [options.probeCacheTtlMs] probe 缓存 TTL（默认 600000；0 = 不过期）
@@ -527,6 +583,7 @@ export function createCodexAdapter(options = {}) {
     killTimeoutMs: Number.isSafeInteger(options.killTimeoutMs) && options.killTimeoutMs >= 0
       ? options.killTimeoutMs
       : 3_000,
+    drainTimeoutMs: nonNegativeIntOr(options.drainTimeoutMs, DEFAULT_DRAIN_TIMEOUT_MS),
     helloTimeoutMs: Number.isSafeInteger(options.helloTimeoutMs) && options.helloTimeoutMs >= 0
       ? options.helloTimeoutMs
       : 20_000,
@@ -541,7 +598,7 @@ export function createCodexAdapter(options = {}) {
     approvalPolicy: normalizeChoice(options.approvalPolicy, APPROVAL_POLICY_SET, 'never', 'approvalPolicy'),
     model: typeof options.model === 'string' && options.model.trim() !== '' ? options.model.trim() : undefined,
     agentOptions: isPlainObject(options.agentOptions) ? options.agentOptions : undefined,
-    // 测试 / 故障注入：替换真实进程回收实现。生产不传，走下面的 killTree。
+    // 测试 / 故障注入：替换真实进程回收实现。生产不传，走共享的进程组 supervisor。
     killImpl: typeof options.killImpl === 'function' ? options.killImpl : null,
     env: isPlainObject(options.env) ? options.env : {},
     selfTest: options.selfTest !== false,
@@ -857,8 +914,29 @@ export function createCodexAdapter(options = {}) {
       )
     }
 
-    // probe 之后才决定能不能启动：不可用 CLI 抛 PROBE_INVALID，绝不先 spawn 再等满 hello 超时。
-    const probeValue = await probe()
+    // probe 之后才决定能不能启动：不可用 CLI 不 spawn，绝不等满 hello 超时。
+    // m5（review-0142b）：直接 `start()` 的不可用错误码统一成 `NODE_FINISH_TOOL_UNAVAILABLE`
+    // （冻结接口 `docs/design/11-node-finish-tool.md` §1.6）；`probe()` 自己的
+    // `ADAPTER_PROBE_INVALID` 原样保留，并作为 `cause` 挂在启动错误上，原因不丢。
+    let probeValue
+    try {
+      probeValue = await probe()
+    } catch (error) {
+      if (error && error.code === ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE) throw error
+      throw new CodexAdapterError(
+        ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        `Codex 适配器不可用（probe 未通过：${
+          error && typeof error.message === 'string' ? error.message : String(error)
+        }）：按 11 §1.6 拒绝启动，节点零派发`,
+        {
+          adapterId: CODEX_ADAPTER_ID,
+          reason: 'probe-failed',
+          nodeId: element && element.id,
+          cause: error,
+          causeCode: error && typeof error.code === 'string' ? error.code : undefined,
+        },
+      )
+    }
     const caps = capabilities()
     if (caps.finishTool !== 'native') {
       throw new CodexAdapterError(
@@ -895,7 +973,7 @@ export function createCodexAdapter(options = {}) {
         record: undefined,
         lastMessage: undefined,
         usage: undefined,
-        // 0.13.10 运行指标：每轮 `turn.completed` 一条调用记录。
+        // 0.13.10 运行指标：每轮 `turn.completed` 一条调用记录（m2：**不按诊断上限裁剪**）。
         usageCalls: [],
         usageCallSeq: 0,
         exitCode: undefined,
@@ -904,6 +982,17 @@ export function createCodexAdapter(options = {}) {
         stdoutTail: '',
         stderrTail: '',
         events: [],
+        // M3 诊断（小、有界、导出时脱敏）：协议错误 / 丢弃行 / 排空状态。
+        eventsTruncated: false,
+        protocolErrors: [],
+        protocolErrorCount: 0,
+        droppedLines: 0,
+        diagnostics: [],
+        diagnosticsTruncated: false,
+        outputDrained: null,
+        outputIncomplete: false,
+        // M6：CLI 终态错误（turn.failed / error / 非零退出）不退化成本地「没有调用工具」。
+        terminalError: null,
       }
       if (useHook) {
         hookScriptPath = join(runDir, HOOK_SCRIPT_NAME)
@@ -978,10 +1067,8 @@ export function createCodexAdapter(options = {}) {
     let resumeChild = null
     let exitedResolve
     let exitedDone = false
-    // 物理退出确认按进程组记录（见 trackGroup）：逻辑结局（exited）可以在杀进程未生效时
-    // 自行收口，但不能把物理清理也当成完成（review-0139 F3 / review-0140 N2）。
-    let graceTimer = null
-    let forceKillTimer = null
+    // 物理退出确认由共享 supervisor 记账（见 trackGroup）：逻辑结局（exited）可以在杀进程
+    // 未生效时自行收口，但不能把物理清理也当成完成（review-0139 F3 / review-0140 N2）。
     let disposeDone = false
     let cancelPromise = null
     let cancelSignalResolve
@@ -995,13 +1082,34 @@ export function createCodexAdapter(options = {}) {
       exitedResolve = resolveExited
     })
 
+    /**
+     * M5 / m1：进程组生命周期统一交给共享 supervisor（`agent-cli-lifecycle.js`）。
+     *
+     * - supervisor 的 `graceMs` 固定 0：完成后的宽限期由本适配器按 `postFinishGraceMs`
+     *   单独等待，之后交给 supervisor 做 **TERM → 等 `killTimeoutMs` → SIGKILL** 的完整
+     *   升级。旧实现在 `postFinishGraceMs=0` 时只发 TERM 就 return，忽略 TERM 的子进程
+     *   会一直活着、`exited` 永远不完成（review-0142b M5）。
+     * - 只有**整组消失**（`kill(-pgid, 0)` 得 ESRCH）才撤销升级；组长先退出不会清掉
+     *   KILL 计时器，组内后代忽略 TERM 时继续升级（review-0142b m1）。
+     */
+    const supervisor = createProcessGroupSupervisor({
+      graceMs: 0,
+      killTimeoutMs: settings.killTimeoutMs,
+      ...(settings.killImpl
+        ? {
+          killImpl: (signal, target) => settings.killImpl(
+            signal,
+            target && target.child ? target.child : target,
+          ),
+        }
+        : {}),
+    })
+
     const resolveExited = value => {
       if (exitedDone) return
       exitedDone = true
-      clearTimeout(graceTimer)
-      graceTimer = null
-      clearTimeout(forceKillTimer)
-      forceKillTimer = null
+      // m1：这里**不**撤销任何进程组升级。清理计时器归 supervisor，
+      // 只有整组消失（kill(-pgid, 0) → ESRCH）才会被它清掉。
       removeSignalListener()
       exitedResolve({
         sessionId: state.sessionId,
@@ -1038,61 +1146,6 @@ export function createCodexAdapter(options = {}) {
       }
       return value
     }
-
-    /**
-     * 杀掉 codex 的整个进程树。
-     *
-     * POSIX：负 pid 杀进程组（codex 会拉起 node-finish-mcp.js 子进程）。
-     * Windows（M8）：没有 POSIX 进程组，用 `taskkill /T /F` 连子进程一起回收；`/F` 是
-     * 因为 taskkill 没有「先礼貌再强杀」的语义，且 codex 树里的 MCP server 不能留孤儿。
-     */
-    const killTree = (signal, target) => {
-      if (typeof settings.killImpl === 'function') {
-        try {
-          settings.killImpl(signal, target || child)
-        } catch {
-          // 注入实现自己负责；这里只保证调用点不炸。
-        }
-        return
-      }
-      const pid = target && target.pid ? target.pid : child && child.pid
-      if (!pid) return
-      if (process.platform === 'win32') {
-        try {
-          spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true })
-        } catch {
-          try {
-            (target || child)?.kill?.()
-          } catch {
-            // 已经退出
-          }
-        }
-        return
-      }
-      try {
-        process.kill(-pid, signal)
-      } catch {
-        try {
-          (target || child)?.kill?.(signal)
-        } catch {
-          // 已经退出
-        }
-      }
-    }
-
-    /** 进程是否仍在运行（exitCode / signalCode 都为空才算活着）。 */
-    const childRunning = target => Boolean(target && target.pid
-      && target.exitCode === null && target.signalCode === null)
-
-    /**
-     * 完结后宽限清理的默认目标：**当前活跃执行进程**。
-     *
-     * 提醒续跑跑在独立的 `resumeChild` 里，初始 `child` 往往早就退出了——只杀初始进程
-     * 等于没杀，resume 会一直活着、`handle.exited` 等不到（#5）。resume 已退出时才回落到
-     * 初始 child（用于收掉它同组可能残留的 MCP server）。
-     */
-    const activeKillTarget = () => (childRunning(resumeChild) ? resumeChild : child)
-    const killActiveTree = signal => killTree(signal, activeKillTarget())
 
     /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
     const abortGate = reason => {
@@ -1142,73 +1195,170 @@ export function createCodexAdapter(options = {}) {
       })
     }
 
+    /**
+     * 完成后的进程组收尾（review-0142b M5）。
+     *
+     * - `postFinishGraceMs=0` 只跳过**宽限等待**，仍然执行完整的 TERM → KILL 升级
+     *   （旧实现在这里直接 return，忽略 TERM 的子进程会一直活着、`exited` 永不完成）；
+     * - 宽限计时器不再被 `resolveExited` 撤销（m1）：终止责任只属于 supervisor，
+     *   组长先退、组内后代忽略 TERM 时继续升级到 SIGKILL。
+     */
     const scheduleGraceKill = () => {
-      if (state.gateSettled || exitedDone) return
+      if (state.gateSettled || disposeDone) return
       state.gateSettled = true
-      if (settings.postFinishGraceMs === 0) {
-        killActiveTree('SIGTERM')
+      const run = () => {
+        terminateAllGroups('post-finish').catch(() => {})
+      }
+      if (!(settings.postFinishGraceMs > 0)) {
+        run()
         return
       }
-      graceTimer = setTimeout(() => {
-        graceTimer = null
-        killActiveTree('SIGTERM')
-        setTimeout(() => killActiveTree('SIGKILL'), settings.killTimeoutMs).unref?.()
-      }, settings.postFinishGraceMs)
-      graceTimer.unref?.()
+      const timer = setTimeout(run, settings.postFinishGraceMs)
+      timer.unref?.()
     }
 
     // 工具一提交成功（或闸门被 abort）就准备收尾：先让 codex 把工具结果带回给模型，
-    // 再在宽限期后收进程组。
+    // 再在宽限期后收进程组（grace=0 时立刻 TERM→KILL）。
     finishGate.result.then(() => scheduleGraceKill(), () => scheduleGraceKill())
 
-    const parseStdout = chunk => {
-      const text = String(chunk)
-      state.stdoutTail = (state.stdoutTail + text).slice(-64 * 1024)
-      let newline
-      let buffer = state.stdoutTail
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        if (line === '') continue
-        let event
-        try {
-          event = JSON.parse(line)
-        } catch {
-          continue
+    /** M3：小诊断只记位置 / 长度 / 类型；正文与凭据不会进这里。 */
+    const recordDiagnostic = entry => {
+      if (state.diagnostics.length >= DIAGNOSTIC_LIMIT) {
+        state.diagnosticsTruncated = true
+        return
+      }
+      state.diagnostics.push({ ...entry })
+    }
+    const recordProtocolError = entry => {
+      state.protocolErrorCount += 1
+      if (state.protocolErrors.length >= PROTOCOL_ERROR_LIMIT) {
+        state.diagnosticsTruncated = true
+        return
+      }
+      state.protocolErrors.push({ ...entry })
+    }
+
+    /**
+     * 单行协议事件 → state。**分帧与 UTF-8 解码由共享 reader 负责**（M3）：
+     * 这里只做 JSON 解析和业务归并，不再拼接 Buffer / 不再裁剪半行。
+     *
+     * @param {{kind:string, terminalError:object|null}} invocation 该子进程的独立记录
+     */
+    const handleProtocolLine = (invocation, line, meta) => {
+      let event
+      try {
+        event = JSON.parse(line)
+      } catch {
+        recordProtocolError({ kind: 'json-invalid', lineNo: meta && meta.lineNo, bytes: meta && meta.bytes })
+        return
+      }
+      if (!isPlainObject(event)) {
+        recordProtocolError({ kind: 'not-object', lineNo: meta && meta.lineNo, bytes: meta && meta.bytes })
+        return
+      }
+      // 诊断事件缓存有界并**显式标记截断**；计量账本不受这个上限约束（m2）。
+      if (state.events.length < EVENT_CACHE_LIMIT) state.events.push(event)
+      else state.eventsTruncated = true
+      if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
+        state.sessionId = event.thread_id
+        invocation.sessionId = event.thread_id
+      } else if (event.type === 'turn.completed' && isPlainObject(event.usage)) {
+        state.usage = event.usage
+        // 一轮就是一次模型调用；thread_id 稳定时 callId 可复现，否则用进程内序号。
+        state.usageCallSeq += 1
+        state.usageCalls.push({
+          provider: CODEX_ADAPTER_ID,
+          callId: `${state.sessionId || 'codex'}:turn-${state.usageCallSeq}`,
+          usage: { ...event.usage },
+          source: 'turn.completed',
+        })
+      } else if (event.type === 'turn.failed') {
+        // M6：CLI 终态错误必须保留，不能被吞成「agent 没调工具」。
+        const failure = isPlainObject(event.error) ? event.error : {}
+        invocation.terminalError = {
+          kind: 'turn.failed',
+          code: nonEmptyTrimmedString(failure.code) || 'turn_failed',
+          message: nonEmptyTrimmedString(failure.message) || 'codex turn.failed',
         }
-        if (!isPlainObject(event)) continue
-        if (state.events.length < 200) state.events.push(event)
-        if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
-          state.sessionId = event.thread_id
-        } else if (event.type === 'turn.completed' && isPlainObject(event.usage)) {
-          state.usage = event.usage
-          // 一轮就是一次模型调用；thread_id 稳定时 callId 可复现，否则用进程内序号。
-          state.usageCallSeq += 1
-          state.usageCalls.push({
-            provider: CODEX_ADAPTER_ID,
-            callId: `${state.sessionId || 'codex'}:turn-${state.usageCallSeq}`,
-            usage: { ...event.usage },
-            source: 'turn.completed',
-          })
-          // 事件账本有界：一轮一次调用，200 轮已远超单节点正常轮次。
-          if (state.usageCalls.length > 200) state.usageCalls.splice(0, state.usageCalls.length - 200)
-        } else if (event.type === 'item.completed' && isPlainObject(event.item)
-          && event.item.type === 'agent_message' && typeof event.item.text === 'string') {
+      } else if (event.type === 'error') {
+        invocation.terminalError = {
+          kind: 'error',
+          code: nonEmptyTrimmedString(event.code) || 'error',
+          message: nonEmptyTrimmedString(event.message) || 'codex error',
+        }
+      } else if (event.type === 'item.completed' && isPlainObject(event.item)) {
+        // 只收展示用消息；`item` 级别的错误可能是 agent 能恢复的工具错误，
+        // 不在这里判终态（终态由 turn.failed / 异常退出决定）。
+        if (event.item.type === 'agent_message' && typeof event.item.text === 'string') {
           state.lastMessage = event.item.text.slice(0, 2_000)
         }
       }
-      state.stdoutTail = buffer.length > 256 * 1024 ? buffer.slice(-256 * 1024) : buffer
     }
 
-    const attach = target => {
-      target.stdout?.on('data', parseStdout)
-      target.stderr?.on('data', chunk => {
-        state.stderrTail = (state.stderrTail + String(chunk)).slice(-8 * 1024)
+    /**
+     * 把一个子进程接到共享流 helper（M3）。
+     *
+     * 每个初始 / resume 子进程都有**自己**的 decoder、半行缓冲、行号与 `drained`：
+     * 上一进程没有尾换行的半行绝不会拼进下一进程的协议流。
+     * 展示 tail 与协议缓冲在 helper 内部分离，`stdoutTail` 上限不再破坏 JSON 解析。
+     */
+    const attachInvocation = (spawned, kind) => {
+      const invocation = {
+        kind,
+        exitCode: undefined,
+        signal: undefined,
+        sessionId: undefined,
+        terminalError: null,
+        outputDrained: null,
+      }
+      const reader = createUtf8LineReader({
+        maxLineBytes: STREAM_MAX_LINE_BYTES,
+        onLine: (line, meta) => handleProtocolLine(invocation, line, meta),
+        onDiagnostic: diag => {
+          if (diag && diag.kind === 'line-too-long') state.droppedLines += 1
+          recordProtocolError(diag)
+        },
       })
-      target.on('error', error => {
+      const streams = attachProcessStreams(spawned, {
+        stdoutReader: reader,
+        stdoutTailBytes: 64 * 1024,
+        stderrTailBytes: 8 * 1024,
+        drainTimeoutMs: settings.drainTimeoutMs,
+      })
+      invocation.streams = streams
+      invocationOf.set(spawned, invocation)
+      // 展示 tail 由 helper 的独立 decoder 维护（有界、UTF-8 安全）；这里只镜像到句柄字段。
+      spawned.stdout?.on('data', () => {
+        state.stdoutTail = streams.stdoutTail()
+      })
+      spawned.stderr?.on('data', () => {
+        state.stderrTail = streams.stderrTail()
+      })
+      spawned.on('error', error => {
         state.spawnError = error
       })
-      return target
+      return invocation
+    }
+
+    /**
+     * M3：结算前等该子进程的 stdout 排空（**有界**）。
+     * 超时只标记 `outputIncomplete` 并留一条小诊断，绝不无限等待（后代可能继承 stdout）。
+     */
+    const drainInvocation = async invocation => {
+      if (!invocation || !invocation.streams) return
+      const result = await invocation.streams.drained.catch(() => null)
+      invocation.outputDrained = Boolean(result && result.drained === true)
+      state.outputDrained = invocation.outputDrained
+      if (!invocation.outputDrained) state.outputIncomplete = true
+      try {
+        for (const entry of invocation.streams.diagnostics()) {
+          if (entry && entry.source === 'attach') {
+            recordDiagnostic({ ...entry, invocation: invocation.kind })
+          }
+        }
+      } catch {
+        // 诊断读取失败不影响结算。
+      }
     }
 
     /**
@@ -1216,26 +1366,24 @@ export function createCodexAdapter(options = {}) {
      * **进程组清理责任**，而不是只登记「组长进程」。
      *
      * 组长退出不等于进程组清空：codex 会拉起 MCP server，MCP / 工具后代可能比组长活得久。
-     * 因此记录不在 `exit` 时删除，只有 `kill(-pgid, 0)` 探针确认整组消失后才算清理完成。
+     * 责任记录由共享 supervisor 保存：只有 `kill(-pgid, 0)` 确认整组消失才移除；
      * `cleanup.disposed` 只在整个集合为空时成立。
      */
-    const trackedGroups = new Set()
-    const groupAlive = record => {
-      if (!record.exitConfirmed) return true
-      // spawn 失败（没有 pid）/ Windows 没有 POSIX 进程组：只能以组长退出为准。
-      if (record.pid === null || process.platform === 'win32') return false
-      try {
-        process.kill(-record.pid, 0)
-        return true
-      } catch (error) {
-        return Boolean(error && error.code === 'EPERM')
-      }
-    }
+    const invocationOf = new Map()
+    /** child → { kind, pid, handle, gone }；handle=null 表示 spawn 失败（没有 pid）。 */
+    const groups = new Map()
+
+    /** 仍在世的进程组记录（含组长已退出、后代仍活着的组）。 */
     const pendingGroups = () => {
+      const snapshot = supervisor.snapshot()
+      const aliveIds = new Set(snapshot.groups.filter(entry => entry.alive).map(entry => entry.id))
       const pending = []
-      for (const record of trackedGroups) {
-        if (groupAlive(record)) pending.push(record)
-        else trackedGroups.delete(record)
+      for (const record of groups.values()) {
+        if (record.handle) {
+          if (aliveIds.has(record.handle.id)) pending.push(record)
+        } else if (!record.gone) {
+          pending.push(record)
+        }
       }
       return pending
     }
@@ -1300,27 +1448,31 @@ export function createCodexAdapter(options = {}) {
     }
 
     const trackGroup = (spawned, kind) => {
-      const record = {
-        kind,
-        child: spawned,
-        pid: spawned.pid ?? null,
-        exitConfirmed: false,
+      if (!Number.isSafeInteger(spawned.pid) || spawned.pid <= 0) {
+        // spawn 失败（ENOENT 等）：没有 pid，也就没有进程组；error 之后视为已消失。
+        const record = { kind, pid: null, handle: null, gone: false }
+        spawned.once('error', () => { record.gone = true })
+        spawned.once('exit', () => { record.gone = true })
+        groups.set(spawned, record)
+        return record
       }
-      const confirmExit = () => {
-        if (record.exitConfirmed) return
-        record.exitConfirmed = true
+      const handle = supervisor.track(spawned, { label: kind })
+      const record = { kind, pid: spawned.pid, handle, gone: false }
+      groups.set(spawned, record)
+      if (state.gateSettled && !state.canceled) {
+        // 闸门 settle 之后才 spawn 的进程（极窄竞态）同样要收掉。
+        supervisor.terminateGroup(handle, 'post-finish').catch(() => {})
       }
-      // `exit` 是组长物理退出的正式证据；spawn 失败（没有 pid）不会再有 exit。
-      spawned.once('exit', () => {
-        confirmExit()
-        // 组长退出后，同组里可能还留着 MCP / 工具后代：顺手收一次。
-        if (!state.canceled && process.platform !== 'win32') killTree('SIGTERM', spawned)
-      })
-      spawned.once('error', () => {
-        if (!spawned.pid) confirmExit()
-      })
-      trackedGroups.add(record)
       return record
+    }
+
+    /** 对所有被跟踪进程组发起完整的 TERM → KILL 升级（supervisor 内部保证）。 */
+    const terminateAllGroups = reason => {
+      const jobs = []
+      for (const record of groups.values()) {
+        if (record.handle) jobs.push(supervisor.terminateGroup(record.handle, reason))
+      }
+      return Promise.all(jobs)
     }
 
     /** 有界等待所有被跟踪进程组（含组长已退出、后代仍活着的组）消失。 */
@@ -1334,12 +1486,6 @@ export function createCodexAdapter(options = {}) {
       }
     }
 
-    const killAllTrackedGroups = signal => {
-      for (const record of trackedGroups) {
-        if (record.pid) killTree(signal, record.child)
-      }
-    }
-
     const spawnCodex = (args, kind) => {
       const env = buildChildEnv([settings.env, channel.env])
       const spawned = spawn(settings.codexBin, args, {
@@ -1349,7 +1495,8 @@ export function createCodexAdapter(options = {}) {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       trackGroup(spawned, kind)
-      return attach(spawned)
+      attachInvocation(spawned, kind)
+      return spawned
     }
 
     // 每个 resume 进程一个独立 Promise；abort 时统一收掉。
@@ -1358,7 +1505,67 @@ export function createCodexAdapter(options = {}) {
       target.once('error', () => resolveWait({ code: null, signal: null }))
     })
 
-    const finishAfterNaturalExit = async () => {
+    /**
+     * M6：把一个 invocation 的退出信息分类成「CLI 终态错误」。
+     *
+     * 顺序约束（review-0142b / plan-0145）：
+     *   ① 已受理的 gate → 成功（调用方先检查）；
+     *   ② 取消 → 取消（调用方先检查）；
+     *   ③ 无受理记录时：`turn.failed` / `error` 事件 / 非零退出 / 被信号终止都是**终态错误**，
+     *      保留脱敏后的原因，不退化成 `NODE_FINISH_MISSING`，也不消耗提醒预算；
+     *   ④ 只有「正常停下（exit 0）、通道可用、无终态错误」才允许提醒 / 续跑；
+     *   ⑤ 正常停下但预算耗尽才是 `NODE_FINISH_MISSING`。
+     *
+     * @returns {{code:string, message:string, details:object}|null}
+     */
+    const terminalFailureOf = invocation => {
+      if (!invocation) return null
+      if (invocation.terminalError) {
+        const failure = invocation.terminalError
+        // `turn.failed` 是明确终态；其它 error 事件可能是 agent 能恢复的中间错误，
+        // 只有进程同时异常退出才按终态处理（plan-0145 M6：不能一见 error 就收口）。
+        const recovered = failure.kind !== 'turn.failed' && invocation.exitCode === 0
+        if (!recovered) {
+          const reason = redactText(String(failure.message)).replace(/\s+/g, ' ').slice(0, MAX_TERMINAL_MESSAGE)
+          return {
+            code: failure.kind === 'turn.failed' ? 'CODEX_CLI_TURN_FAILED' : 'CODEX_CLI_ERROR',
+            message: `Codex 报告终态错误（${failure.code}）：${reason}`,
+            details: { kind: failure.kind, cliCode: failure.code },
+          }
+        }
+      }
+      if (!Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== null) return null
+      if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
+        return {
+          code: 'CODEX_CLI_EXIT_NONZERO',
+          message: `Codex 进程以非零码退出（exit=${invocation.exitCode}），没有受理 flow_finish_node`,
+          details: { kind: 'exit', cliCode: String(invocation.exitCode) },
+        }
+      }
+      if (invocation.exitCode === null && invocation.signal) {
+        return {
+          code: 'CODEX_CLI_SIGNALED',
+          message: `Codex 进程被信号终止（${invocation.signal}），没有受理 flow_finish_node`,
+          details: { kind: 'signal', cliCode: String(invocation.signal) },
+        }
+      }
+      return null
+    }
+
+    /** 终态错误 → 有界、脱敏的失败结局（abort 闸门，不写成功 record）。 */
+    const failWithTerminalError = terminal => {
+      state.terminalError = terminal
+      abortGate('cli-terminal-error')
+      resolveExited({
+        ok: false,
+        code: terminal.code,
+        message: terminal.message,
+        ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+        ...(terminal.details ? { errorDetails: terminal.details } : {}),
+      })
+    }
+
+    const finishAfterNaturalExit = async (invocation = null) => {
       if (state.canceled) {
         abortGate('canceled')
         resolveExited({
@@ -1379,6 +1586,12 @@ export function createCodexAdapter(options = {}) {
           code: 'NODE_FINISH_CHANNEL_FAILED',
           message: `Codex 进程启动失败（${state.spawnError.code || 'unknown'}）`,
         })
+        return
+      }
+      // M6 ③：无受理记录时先分流出明确终态错误，绝不退化成 MISSING。
+      const terminal = terminalFailureOf(invocation)
+      if (terminal) {
+        failWithTerminalError(terminal)
         return
       }
       const remaining = settings.reminderLimit - state.reminders
@@ -1402,7 +1615,14 @@ export function createCodexAdapter(options = {}) {
           approvalPolicy: settings.approvalPolicy,
           model,
         }), 'resume')
+        const resumeInvocation = invocationOf.get(resumeChild) || null
         lastExit = await waitExit(resumeChild)
+        if (resumeInvocation) {
+          resumeInvocation.exitCode = lastExit.code
+          resumeInvocation.signal = lastExit.signal
+        }
+        // M3：续跑进程的 stdout 也必须排空（有界）后再判定，不能按 exit 抢跑。
+        await drainInvocation(resumeInvocation)
         resumeChild = null
         if (state.canceled) {
           abortGate('canceled')
@@ -1415,6 +1635,12 @@ export function createCodexAdapter(options = {}) {
         }
         if (finishGate.settled()) {
           await resolveFromGate()
+          return
+        }
+        // M6：续跑进程报终态错误时停止提醒，保留真实原因。
+        const resumeTerminal = terminalFailureOf(resumeInvocation)
+        if (resumeTerminal) {
+          failWithTerminalError(resumeTerminal)
           return
         }
       }
@@ -1452,11 +1678,19 @@ export function createCodexAdapter(options = {}) {
     child.on('exit', (code, signal) => {
       state.exitCode = code
       state.signal = signal
+      const invocation = invocationOf.get(child) || null
+      if (invocation) {
+        invocation.exitCode = code
+        invocation.signal = signal
+      }
       // N2：这里只确认**初始进程**退出；组责任由 trackGroup 保留到整组确认消失。
       // 续跑进程由各自 spawn 时的记录独立确认，绝不复用这个事件。
-      // 组长退出后的同组残留清理统一由 trackGroup 处理（每个 spawn 都有责任记录）。
       if (!channel.contacted && !state.canceled) earlyExitResolve?.({ code, signal })
-      finishAfterNaturalExit().catch(error => {
+      // M3：结算前先等 stdout 排空（有界）；合法 JSON 缺尾换行 / 分块写入都能收到。
+      ;(async () => {
+        await drainInvocation(invocation)
+        await finishAfterNaturalExit(invocation)
+      })().catch(error => {
         resolveExited({
           ok: false,
           code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_CHANNEL_FAILED',
@@ -1509,6 +1743,45 @@ export function createCodexAdapter(options = {}) {
       get stderrTail() {
         return redactText(state.stderrTail)
       },
+      /**
+       * M3 诊断（小、有界、导出时脱敏）：
+       *   - `protocolErrors`：畸形 JSON / 超长行等协议错误，只含位置、长度、类型；
+       *   - `droppedLines`：被整行丢弃的协议行数；
+       *   - `diagnostics`：流层诊断（例如排空超时）；
+       *   - `outputDrained` / `outputIncomplete`：结算前 stdout 是否已排空。
+       * 诊断缓存有界并标记截断，但计量账本（`usageCalls`）不受这个上限影响。
+       */
+      get protocolErrors() {
+        return redactValue(state.protocolErrors)
+      },
+      get droppedLines() {
+        return state.droppedLines
+      },
+      get diagnostics() {
+        return redactValue(state.diagnostics)
+      },
+      get diagnosticsTruncated() {
+        return state.diagnosticsTruncated === true
+      },
+      get eventsTruncated() {
+        return state.eventsTruncated === true
+      },
+      get outputDrained() {
+        return state.outputDrained
+      },
+      get outputIncomplete() {
+        return state.outputIncomplete === true
+      },
+      /** M6：最后一次观测到的 CLI 终态错误（脱敏后的 code / message）。 */
+      get terminalError() {
+        return state.terminalError
+          ? {
+            code: state.terminalError.code,
+            message: redactText(state.terminalError.message),
+            ...(state.terminalError.details ? { details: { ...state.terminalError.details } } : {}),
+          }
+          : null
+      },
       exited,
       /**
        * 逻辑结局 vs 物理清理：`exited` 可以在「杀进程未生效」时有界收口，但
@@ -1544,10 +1817,11 @@ export function createCodexAdapter(options = {}) {
      * 未确认就如实返回 `disposed:false + reason`（挂到错误对象上供调用方识别）。
      */
     const cleanupAfterStartFailure = async () => {
-      killAllTrackedGroups('SIGTERM')
-      let gone = await waitTrackedGroupsGone(settings.killTimeoutMs)
+      // M5：统一走 supervisor 的完整 TERM → KILL 升级（不是只发 TERM 就返回）。
+      const results = await terminateAllGroups('start-failure')
+      let gone = results.every(result => Boolean(result && result.gone === true))
       if (!gone) {
-        killAllTrackedGroups('SIGKILL')
+        await supervisor.disposeAll().catch(() => {})
         gone = await waitTrackedGroupsGone(1_000)
       }
       removeSignalListener()
@@ -1630,8 +1904,10 @@ export function createCodexAdapter(options = {}) {
     /**
      * 取消（幂等，第一次生效）：
      *   - abort 闸门（未 settled）→ 之后的迟到 submit 得到 `NODE_ALREADY_SETTLED`（M3）；
-     *   - 杀进程树；有界等待 `exited`，等不到也自己 resolve `NODE_FINISH_CANCELED`
-     *     （B1：绝不返回一个 pending 的 `exited`）。
+     *   - 进程组清理交给 supervisor：**整组** TERM → KILL 升级，组长先退、后代忽略 TERM
+     *     时继续升级（m1）；升级计时器不在这里撤销，只有整组消失才清；
+     *   - 有界等待 `exited`，等不到也自己 resolve `NODE_FINISH_CANCELED`（B1：绝不返回
+     *     一个 pending 的 `exited`）。
      */
     function cancelHandle(target, reason) {
       if (!target || typeof target !== 'object') {
@@ -1650,17 +1926,13 @@ export function createCodexAdapter(options = {}) {
           abortGate(state.cancelReason)
           cancelSignalResolve?.()
           // 每个 spawn 都登记过进程组：取消时把所有组一起收掉（含组长已退出的 resume 组）。
-          killAllTrackedGroups('SIGTERM')
-          forceKillTimer = setTimeout(() => {
-            forceKillTimer = null
-            killAllTrackedGroups('SIGKILL')
-          }, settings.killTimeoutMs)
-          forceKillTimer.unref?.()
+          terminateAllGroups(`canceled: ${state.cancelReason}`).catch(() => {})
         }
-        // 有界 grace：先等自然退出 / SIGKILL 生效。
+        // 有界等待：supervisor 自己会在 killTimeoutMs 后升级到 SIGKILL。
         await Promise.race([exited, sleep(settings.killTimeoutMs + 1_000)])
         if (!exitedDone) {
-          killAllTrackedGroups('SIGKILL')
+          // 兜底强制清理（幂等）：仍在登记表里的组立即 SIGKILL 并做有界确认。
+          await supervisor.disposeAll().catch(() => {})
           await Promise.race([exited, sleep(1_000)])
         }
         if (!exitedDone) {
@@ -1673,8 +1945,6 @@ export function createCodexAdapter(options = {}) {
         return exited
       })().finally(() => {
         cancelPromise = null
-        clearTimeout(forceKillTimer)
-        forceKillTimer = null
       })
       return cancelPromise
     }
@@ -1697,7 +1967,8 @@ export function createCodexAdapter(options = {}) {
         })
       }
       // 兜底：即使 codex 已经退出，也清掉所有被跟踪进程组里残留的 MCP / 工具后代。
-      killAllTrackedGroups('SIGKILL')
+      // `disposeAll` 立即 SIGKILL 并做**有界确认**；未确认的组如实保留 pending。
+      await supervisor.disposeAll().catch(() => {})
       // M1：有界等待**所有进程组**消失（组长已退出、后代仍活着的组也算未清理）。
       // 这里绝不把「发出了 SIGKILL」当成「进程已退出」——killImpl 可能没生效，
       // resume 进程也可能忽略信号并继续存活。

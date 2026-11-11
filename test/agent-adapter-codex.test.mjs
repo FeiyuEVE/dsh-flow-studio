@@ -381,6 +381,132 @@ if (mode === 'sleep') {
   if (transport && transport.pid) writeFileSync(join(stateDir, 'mcp.pid'), String(transport.pid))
   setInterval(() => {}, 1000)
   await new Promise(() => {})
+}
+// ---- review-0142b M3 / m2 / M5 / m1 / M6 的夹具（合成 stream-json + 真实子进程） ----
+
+if (mode === 'utf8') {
+  // M3：把一条合法 JSON 行**切在多字节字符中间**写出，旧实现按 Buffer 转字符串会出 U+FFFD。
+  const payload = Buffer.from(JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'item_utf8', type: 'agent_message', text: '中文消息🙂 完成' },
+  }) + '\\n', 'utf8')
+  const cut = payload.indexOf(Buffer.from('中', 'utf8')) + 1
+  process.stdout.write(payload.subarray(0, cut))
+  await new Promise(resolve => setTimeout(resolve, 40))
+  process.stdout.write(payload.subarray(cut))
+  await callTool()
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'eof-no-newline') {
+  // M3：合法 JSON 没有尾换行，只有 EOF flush 才读得到。
+  const payload = JSON.stringify({
+    type: 'turn.completed',
+    usage: { input_tokens: 11, output_tokens: 7, cached_input_tokens: 3 },
+  })
+  await new Promise(resolve => process.stdout.write(payload, resolve))
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'huge-line') {
+  // M3：600 KiB 合法单行 + 一条畸形行；协议缓冲不能被展示 tail 裁剪。
+  process.stdout.write('not json at all\\n')
+  const big = 'x'.repeat(600 * 1024)
+  const payload = Buffer.from(JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'item_big', type: 'command_execution', aggregated_output: big },
+  }) + '\\n', 'utf8')
+  for (let offset = 0; offset < payload.length; offset += 32 * 1024) {
+    const chunk = payload.subarray(offset, offset + 32 * 1024)
+    await new Promise(resolve => process.stdout.write(chunk, resolve))
+  }
+  out({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 5 } })
+  await callTool()
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'partial-line') {
+  // M3：上一进程没有尾换行的半行不得拼进 resume 的协议流。
+  if (isResume) {
+    out({ type: 'turn.completed', usage: { input_tokens: 21, output_tokens: 9 } })
+    await callTool()
+  } else {
+    await new Promise(resolve => process.stdout.write('{"type":"turn.completed","usa', resolve))
+  }
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'turn-failed') {
+  // M6：握手成功后 CLI 报终态错误（消息里带本 execution 的凭据，验证脱敏）。
+  mkdirSync(stateDir, { recursive: true })
+  await closeClient()
+  out({
+    type: 'turn.failed',
+    error: {
+      code: 'invalid_api_key',
+      message: "Incorrect API key provided: '" + (token || 'sk-test') + "'",
+    },
+  })
+  process.exit(1)
+}
+if (mode === 'exit-nonzero') {
+  // M6：非零退出 + 没有受理记录是明确的 CLi 终态错误，不能退化成 MISSING。
+  mkdirSync(stateDir, { recursive: true })
+  await closeClient()
+  process.stdout.write('codex exec failed: sandbox setup error\\n')
+  process.exit(3)
+}
+if (mode === 'many-turns') {
+  // m2：201 次模型调用；旧实现把计量账本按诊断缓存上限裁到 200。
+  for (let turn = 1; turn <= 201; turn += 1) {
+    out({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } })
+  }
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'call-then-hang') {
+  // M5：工具已受理，但进程忽略 SIGTERM 并继续运行；零宽限也必须升级 SIGKILL。
+  // 注意：宽限为 0 时 TERM（连带 MCP server）可能在工具响应回来前就到，工具调用本身
+  // 可能 reject——那不影响「闸门已受理」这个事实，夹具必须继续挂住，不能退出。
+  mkdirSync(stateDir, { recursive: true })
+  process.on('SIGTERM', () => {
+    writeFileSync(join(stateDir, 'grace-sigterm'), String(process.pid))
+  })
+  try {
+    await callTool()
+  } catch {
+    // 进程组已被 TERM：响应可能来不及回到工具调用方
+  }
+  writeFileSync(join(stateDir, 'grace-submitted'), String(process.pid))
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+if (mode === 'leader-exit-descendant') {
+  // m1：组长配合 TERM 退出，同组后代忽略 TERM；升级计时器不得被"组长已退"撤销。
+  mkdirSync(stateDir, { recursive: true })
+  const descendant = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 1; done'], { stdio: 'ignore' })
+  descendant.unref()
+  writeFileSync(join(stateDir, 'descendant.pid'), String(descendant.pid))
+  process.on('SIGTERM', () => { process.exit(0) })
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+if (mode === 'drain-stall') {
+  // M3：后代继承 stdout 并忽略 TERM，组长退出后 stdout 不会 end → 排空必须有界超时。
+  mkdirSync(stateDir, { recursive: true })
+  const holder = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 1; done'], {
+    stdio: ['ignore', 'inherit', 'ignore'],
+  })
+  holder.unref()
+  writeFileSync(join(stateDir, 'stdout-holder.pid'), String(holder.pid))
+  writeFileSync(join(stateDir, 'drain-started'), String(process.pid))
+  process.exit(0)
+}
+if (mode === 'sleep') {
+  mkdirSync(stateDir, { recursive: true })
+  if (transport && transport.pid) writeFileSync(join(stateDir, 'mcp.pid'), String(transport.pid))
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
 } else {
   await closeClient()
   process.exit(0)
@@ -1149,6 +1275,290 @@ async function main() {
       A.equal((await failure.cleanupFinal).disposed, true, '最终清理 Promise 同样报告完成')
     })
 
+    await check('M3：UTF-8 多字节字符跨 chunk 不乱码（旧实现按 Buffer 转字符串会出 U+FFFD）', async () => {
+      resetState()
+      const workspace = freshWorkspace('utf8')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'utf8' } })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: 'UTF-8 节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(handle.lastMessage, '中文消息🙂 完成', 'M3：切在多字节字符中间的 chunk 必须完整解码')
+      A.deepEqual(handle.protocolErrors, [], '合法 JSON 行不该产生协议错误')
+      await adapter.dispose(handle)
+    })
+
+    await check('M3：合法 JSON 缺尾换行 → EOF flush 后 usage / session 仍可结算', async () => {
+      resetState()
+      const workspace = freshWorkspace('eof-flush')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'eof-no-newline' }, reminderLimit: 0 })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: 'EOF 节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.code, 'NODE_FINISH_MISSING', '正常停下、预算 0 才是 MISSING')
+      A.deepEqual(
+        handle.usage,
+        { input_tokens: 11, output_tokens: 7, cached_input_tokens: 3 },
+        'M3：没有尾换行的 turn.completed 必须经 EOF flush 读到（旧实现整条丢失）',
+      )
+      A.equal(handle.usageCalls().length, 1)
+      A.equal(handle.outputIncomplete, false)
+      await adapter.dispose(handle)
+    })
+
+    await check('M3：600 KiB 合法单行完整解析；畸形行只留可诊断协议错误', async () => {
+      resetState()
+      const workspace = freshWorkspace('huge-line')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'huge-line' } })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '超大行节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const big = handle.events.find(event => event.item && event.item.id === 'item_big')
+      A.ok(big, 'M3：600 KiB 合法单行必须完整解析（旧实现被 256 KiB 缓冲裁剪后整条静默丢失）')
+      A.equal(big.item.aggregated_output.length, 600 * 1024, '分块写入的超长行不能截断')
+      A.ok(
+        handle.protocolErrors.some(entry => entry.kind === 'json-invalid'),
+        'M3：畸形行必须留下可诊断的协议错误（旧实现直接 continue，无任何痕迹）',
+      )
+      A.equal(handle.droppedLines, 0, '合法超长行不算被丢弃')
+      A.equal(handle.outputIncomplete, false)
+      await adapter.dispose(handle)
+    })
+
+    await check('M3：初始进程的半行不得拼进 resume 的协议流（每进程独立 reader）', async () => {
+      resetState()
+      const workspace = freshWorkspace('partial-line')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'partial-line' } })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '半行节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      A.equal(handle.usageCalls().length, 1, 'M3：resume 的 turn.completed 必须由它自己的 reader 解析')
+      A.equal(handle.usageCalls()[0].usage.input_tokens, 21)
+      A.ok(
+        handle.protocolErrors.some(entry => entry.kind === 'json-invalid'),
+        'M3：上一进程的残行在 EOF flush 后留下诊断，而不是悄悄拼进下一行',
+      )
+      await adapter.dispose(handle)
+    })
+
+    await check('M3：stdout 被后代持有 → 排空有界超时（outputIncomplete + 诊断），结算不挂', async () => {
+      resetState()
+      const workspace = freshWorkspace('drain-stall')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'drain-stall' },
+        reminderLimit: 0,
+        drainTimeoutMs: 150,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '排空超时节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const startedAt = Date.now()
+      const exited = await Promise.race([handle.exited, sleep(5_000).then(() => null)])
+      A.ok(exited, 'M3：stdout 不排空也必须有界收口（不能无限等）')
+      A.ok(Date.now() - startedAt < 4_000)
+      A.equal(exited.code, 'NODE_FINISH_MISSING')
+      A.equal(handle.outputIncomplete, true, 'M3：排空超时必须标记 outputIncomplete')
+      A.ok(
+        handle.diagnostics.some(entry => entry.kind === 'drain-timeout'),
+        'M3：排空超时要留下小诊断',
+      )
+      const holderPid = Number(readFileSync(join(stateDir, 'stdout-holder.pid'), 'utf8'))
+      await adapter.dispose(handle)
+      A.equal(await waitForDead(holderPid, 4_000), true, '进程组清理回收持有 stdout 的后代')
+    })
+
+    await check('M5：postFinishGraceMs=0 仍执行 TERM→KILL（旧实现只发 TERM 就 return）', async () => {
+      resetState()
+      const workspace = freshWorkspace('zero-grace')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'call-then-hang' },
+        postFinishGraceMs: 0,
+        killTimeoutMs: 60,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '零宽限节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const pid = handle.pid
+      try {
+        A.equal(
+          await waitForFile(join(stateDir, 'grace-sigterm')),
+          true,
+          '工具受理后必须发出 SIGTERM（进程会记录它并继续活着）',
+        )
+        A.equal(gate.settled(), true)
+        const exited = await Promise.race([handle.exited, sleep(3_000).then(() => null)])
+        A.ok(exited, 'M5：零宽限也必须在有界时间内结算 exited（旧实现永远挂住）')
+        A.equal(exited.ok, true, JSON.stringify(exited))
+        A.equal(exited.code, 'OK')
+        A.equal(await waitForFile(join(stateDir, 'grace-sigterm'), 2_000), true, '零宽限仍先发 SIGTERM')
+        A.equal(await waitForDead(pid, 3_000), true, 'M5：忽略 TERM 的子进程必须被升级 SIGKILL 收掉')
+      } finally {
+        try { process.kill(-pid, 'SIGKILL') } catch { /* 已退出 */ }
+        try { process.kill(pid, 'SIGKILL') } catch { /* 已退出 */ }
+      }
+      await adapter.dispose(handle)
+    })
+
+    await check('m1：组长先退、后代忽略 TERM → 升级计时器不撤销，整组被 SIGKILL 收掉', async () => {
+      resetState()
+      const workspace = freshWorkspace('leader-descendant')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'leader-exit-descendant' },
+        postFinishGraceMs: 60_000,
+        killTimeoutMs: 400,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '组长先退节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const leaderPid = handle.pid
+      A.equal(await waitForFile(join(stateDir, 'descendant.pid')), true, '后代已拉起')
+      const descendantPid = Number(readFileSync(join(stateDir, 'descendant.pid'), 'utf8'))
+      try {
+        A.equal(pidAlive(leaderPid), true)
+        A.equal(pidAlive(descendantPid), true)
+        await adapter.cancel(handle, 'test-cancel')
+        const exited = await handle.exited
+        A.equal(exited.code, 'NODE_FINISH_CANCELED')
+        A.equal(await waitForDead(leaderPid, 3_000), true, '组长配合 TERM 退出')
+        A.equal(
+          await waitForDead(descendantPid, 4_000),
+          true,
+          'm1：组长先退不得撤销升级，忽略 TERM 的后代仍必须被 SIGKILL 收掉',
+        )
+        A.equal(
+          await waitUntil(() => handle.cleanup.disposed === true, 3_000),
+          true,
+          'm1：只有整组消失后才 disposed=true',
+        )
+      } finally {
+        try { process.kill(-leaderPid, 'SIGKILL') } catch { /* 已退出 */ }
+        try { process.kill(descendantPid, 'SIGKILL') } catch { /* 已退出 */ }
+      }
+      await adapter.dispose(handle)
+    })
+
+    await check('m2：201 次模型调用全部保留（计量账本不按诊断缓存 200 裁剪）', async () => {
+      resetState()
+      const workspace = freshWorkspace('usage-ledger')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'many-turns' }, reminderLimit: 0 })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '多轮节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.code, 'NODE_FINISH_MISSING')
+      const calls = handle.usageCalls()
+      A.equal(calls.length, 201, 'm2：计量账本不能被诊断缓存上限裁到 200')
+      A.equal(
+        calls.reduce((sum, call) => sum + call.usage.input_tokens + call.usage.output_tokens, 0),
+        402,
+        'm2：完整 token 总量（201 × 2）',
+      )
+      A.equal(handle.events.length, 200, '诊断缓存仍然有界')
+      A.equal(handle.eventsTruncated, true, 'm2：诊断缓存截断必须显式标记，不能静默丢')
+      await adapter.dispose(handle)
+    })
+
+    await check('M6：握手后 turn.failed 不退化成 NODE_FINISH_MISSING，不消耗提醒，原因脱敏保留', async () => {
+      resetState()
+      const workspace = freshWorkspace('turn-failed')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'turn-failed' } })
+      const gate = makeGate(workspace)
+      const fires = []
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '终态错误节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info) },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, false)
+      A.equal(exited.code, 'CODEX_CLI_TURN_FAILED', 'M6：CLI 终态错误使用稳定 provider 错误码')
+      A.match(String(exited.message), /invalid_api_key|Incorrect API key/, 'M6：真实原因必须保留')
+      const [invocation] = invocations()
+      A.ok(invocation.token.length > 0)
+      A.equal(String(exited.message).includes(invocation.token), false, 'M6：原因里的凭据必须脱敏')
+      A.equal(exited.reminders, 0, 'M6：终态错误不消耗提醒预算')
+      A.deepEqual(fires, [], 'M6：终态错误不再提醒')
+      A.equal(invocations().length, 1, 'M6：不因终态错误再 spawn resume')
+      A.equal(gate.settled(), true, 'M6：未受理的 gate 被 abort，迟到 submit 得 NODE_ALREADY_SETTLED')
+      await A.rejects(gate.submit({ variables: {}, documents: [], summary: 'late' }), error => {
+        A.equal(error?.code, 'NODE_ALREADY_SETTLED')
+        return true
+      })
+      A.equal(String(handle.terminalError?.code || ''), 'CODEX_CLI_TURN_FAILED')
+      await adapter.dispose(handle)
+    })
+
+    await check('M6：非零退出且无受理记录 → CODEX_CLI_EXIT_NONZERO（不是 MISSING、不再提醒）', async () => {
+      resetState()
+      const workspace = freshWorkspace('exit-nonzero')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'exit-nonzero' } })
+      const gate = makeGate(workspace)
+      const fires = []
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '非零退出节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info) },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, false)
+      A.equal(exited.code, 'CODEX_CLI_EXIT_NONZERO', 'M6：非零退出保留稳定错误码')
+      A.match(String(exited.message), /exit=3/)
+      A.equal(exited.reminders, 0, 'M6：异常退出不消耗提醒预算')
+      A.deepEqual(fires, [])
+      A.equal(invocations().length, 1, 'M6：异常退出不再 spawn resume')
+      await adapter.dispose(handle)
+    })
+
     await check('M4：凭据 / socket 路径不进 handle.events / lastMessage / stdoutTail', async () => {
       resetState()
       const workspace = freshWorkspace('leak')
@@ -1296,7 +1706,16 @@ async function main() {
           workspaceRoot: workspace,
         }),
         error => {
-          A.equal(error?.code, ADAPTER_ERROR.PROBE_INVALID, '直接 start 也保留真实 probe 错误码')
+          // m5（review-0142b）：旧断言要求 start 透出 `ADAPTER_PROBE_INVALID` 是**错的**——
+          // 冻结接口（design/11 §1.6）要求启动期不可用统一成 `NODE_FINISH_TOOL_UNAVAILABLE`，
+          // probe 自己的错误码原样放进 cause，真实原因不丢。
+          A.equal(
+            error?.code,
+            ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+            'm5：直接 start 统一为 NODE_FINISH_TOOL_UNAVAILABLE',
+          )
+          A.equal(error?.details?.reason, 'probe-failed')
+          A.equal(error?.details?.cause?.code, ADAPTER_ERROR.PROBE_INVALID, 'm5：probe 原错误码放在 cause 里')
           return true
         },
       )

@@ -39,7 +39,8 @@ GUEST_PREFIX="$GUEST_ROOT/prefix"
 GUEST_DT="$GUEST_ROOT/dt"
 GUEST_LOGS="$GUEST_ROOT/logs"
 GUEST_LOG="$GUEST_LOGS/dsh-web.log"
-# 由 /health 的 dir（.../flow-studio/flows）推出 BPMN 数据根，清理时用真实根而不是硬编码。
+# 由 /health 的 dir 推出 BPMN 数据根（0.14.0 起 dir 就是 .../flow-studio；
+# 兼容旧版本里 dir=.../flow-studio/flows 的写法），清理时用真实根而不是硬编码。
 BPMN_BASE=""
 
 BASE="http://127.0.0.1:$PORT/api/flow-studio"
@@ -637,8 +638,24 @@ assert_true "$(jqr 'j.bpmn&&j.bpmn.enabled===true' <"$EVID/health.json")" "/heal
 assert_eq "$(jqr 'j.authMode' <"$EVID/health.json")" "full" "/health 的 authMode 不是 full（FLOW_STUDIO_TOKEN 未生效）"
 FLOW_DIR="$(jqr 'j.dir' <"$EVID/health.json")"
 [ -n "$FLOW_DIR" ] || die "/health 没返回 dir，推不出 BPMN 数据根"
-BPMN_BASE="$(dirname "$FLOW_DIR")"
+if [ "$(basename "$FLOW_DIR")" = "flows" ]; then
+  BPMN_BASE="$(dirname "$FLOW_DIR")"
+else
+  BPMN_BASE="$FLOW_DIR"
+fi
 ok "health: version=$VERSION ok=true bpmn.enabled=true authMode=full（数据根 $BPMN_BASE）"
+
+say "6b. 旧运行域退役（已认证 → 404）"
+# 0.14.0：/flows、/runs、/worktrees 已从 Host 删除；通过鉴权后必须是 404，
+# 不能返回兼容跳转或 405（那说明旧路由还挂着）。
+for legacy_path in /flows /runs /worktrees; do
+  legacy_code="$(get_api "$legacy_path" "$EVID/legacy$(echo "$legacy_path" | tr '/' '-').json")"
+  assert_code "$legacy_code" "旧路由 $legacy_path 应 404" 404
+done
+legacy_code="$(curl -s -m 15 -b "$JAR" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -X POST --data '{}' -o /dev/null -w '%{http_code}' "$BASE/worktrees/prune")"
+assert_code "$legacy_code" "旧路由 POST /worktrees/prune 应 404" 404
+ok "旧运行域路由全部 404（/flows、/runs、/worktrees、/worktrees/prune）"
 
 say "7. 画布 chunk（client.bpmn.js）"
 curl -s -m 15 -b "$JAR" "$ORIGIN/" -o "$EVID/index.html"

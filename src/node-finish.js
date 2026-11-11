@@ -233,7 +233,7 @@ export function normalizeShortVariables(raw, limits) {
 }
 
 /**
- * 文档路径规则（沿用 `runlog.js` 的 artifact 路径口径，长度上限按 11 §2 放宽到 1024）：
+ * 文档路径规则（沿用旧 run 事件契约的 artifact 路径口径，长度上限按 11 §2 放宽到 1024）：
  * 非空相对路径；拒绝绝对路径、`..` / `.` 段、反斜杠、空段、NUL。
  * @param {unknown} value
  * @param {number} index

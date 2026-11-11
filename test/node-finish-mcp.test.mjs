@@ -37,7 +37,8 @@ import {
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SERVER_PATH = join(repoRoot, 'src', 'node-finish-mcp.js')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
-const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'node-finish-mcp-'))
+// 前缀刻意短：finish.sock 是 unix socket，路径总长必须留在 sockaddr_un 的 108 字节以内。
+const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'nm-'))
 
 let checks = 0
 let asserts = 0

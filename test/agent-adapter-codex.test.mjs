@@ -39,7 +39,9 @@ import { admitAdapter } from '../src/agent-execute.js'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // m7：单独跑这个文件时 `.tmp` 可能还不存在（`npm test` 里靠前面的测试创建，不可依赖）。
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
-const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'agent-adapter-codex-'))
+// 前缀刻意短：codex 的 finish.sock 是 unix socket，路径总长（含中文 / 深 worktree）
+// 必须留在 sockaddr_un 的 108 字节以内；长前缀会让 spawn 前的 listen 直接 EINVAL。
+const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'cx-'))
 
 let checks = 0
 let asserts = 0

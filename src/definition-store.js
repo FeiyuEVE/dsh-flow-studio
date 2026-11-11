@@ -26,8 +26,7 @@ import {
 } from 'node:fs/promises'
 import { basename, join, resolve } from 'node:path'
 
-import { checkRunId } from './runlog.js'
-import { resolveHome } from './store.js'
+import { checkRunId, resolveHome } from './storage-contract.js'
 
 /** 与 run / flow 存储同口径。 */
 const DIR_MODE = 0o700

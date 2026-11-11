@@ -13,13 +13,14 @@
 | [README.md](README.md)（本文档目录索引） | 文档地图：每份文档一句话职责 + 读者对象 + 推荐阅读顺序 | 任何事实细节 |
 | [guide/](guide/overview.md) | 产品面指南：用户能看到什么、怎么操作、行为是什么 | 路由表、字段级契约、内部实现细节 |
 | [reference/](reference/host-api.md) | 契约：路由、参数、字段、环境变量、错误码、落盘布局 | 教学顺序、设计理由、「为什么这么定」 |
-| [history/releases.md](history/releases.md) | 逐版本变化（0.1 → 0.13.3）：新增、修复、已知边界 | 当前行为（当前行为归 guide / reference） |
+| [history/releases.md](history/releases.md) | 逐版本变化（0.1 → 0.13.x）：新增、修复、已知边界 | 当前行为（当前行为归 guide / reference） |
 | [faq.md](faq.md) | 高频问题的**短答案 + 指向 owner 的链接** | 与 owner 重复的长篇解释 |
 | [cookbook/](cookbook/release.md) | 编号步骤式 how-to，每步带可验证结果 | 设计理由、字段全表 |
 | [postmortem/](postmortem/2026-11-07-oom.md) | 事故记录体例：现象、时间线、根因链、修复、遗留 | 常规教程 |
 | [DESIGN.md](DESIGN.md) | 设计仲裁层：定位、视觉方向、布局、三个核心语义、**冲突裁决表**、验收口径 | 各分册的具体数值（数值在分册） |
 | [DESIGN-BRIEF.md](DESIGN-BRIEF.md) | 最初的设计任务书（历史输入，冻结） | 现行裁决 |
-| [design/01–08 + REVIEW.md](design/01-ia-interaction.md) | 分册数值规格、接口契约、审核记录 | 与 DESIGN.md §6 冲突的旧口径（以裁决表为准） |
+| [design/01–08 + REVIEW.md](design/01-ia-interaction.md) | **历史资料**：旧运行域时代的分册数值规格、接口契约、审核记录（0.14.0 起不更新） | 当前实例域契约（归 design/10–13） |
+| [design/09–13](design/10-bpmn-instance-api.md) | 当前契约：agent 适配器 hooks（09）、BPMN 实例 API / 事件（10）、finish 工具（11）、实例指标（12）、业务证据（13） | 旧运行域行为 |
 | [AGENTS.md](AGENTS.md)（本文件） | 文档分层税则与写作规则 | 产品事实、版本历史 |
 
 ## 2. 事实 → 归哪个 tier（查这张表再动笔）
@@ -30,12 +31,13 @@
 | 装它、跑它 | `../README.md`（安装 + 快速开始三步） | 在 README 里写发版流程 |
 | 开发命令、构建产物、测试纪律 | `../CONTRIBUTING.md` | 在 README 里列 17 个测试文件 |
 | 「发一个版本」的步骤 | `cookbook/release.md`（CONTRIBUTING 只留一句摘要与链接） | cookbook 里写测试口径 |
-| 用户点哪里、看到什么、行为如何 | `guide/` | guide 里贴 `run.json` 字段表 |
+| 用户点哪里、看到什么、行为如何 | `guide/` | guide 里贴 `instance.json` 字段表 |
 | HTTP 路由 / 模型工具 / 环境变量 / 错误码 | `reference/host-api.md` | 在 guide 里维护路由表 |
-| 流程 JSON、`run.json`、目录布局 | `reference/data-model.md` | 在 README 里保留第二份 schema |
-| 事件 kind 与字段定义 | **`design/05-run-log.md`（唯一真相源）**；`reference/run-log.md` 只写入口、用法、速查 | 把 05 的事件表复制一份到 reference |
+| 定义版本、`instance.json`、目录布局 | `reference/data-model.md` | 在 README 里保留第二份 schema |
+| 当前实例事件 kind 与字段定义 | **`design/10-bpmn-instance-api.md`（唯一真相源）**；旧 run 事件只在 `design/05` 与 `reference/run-log.md` 作历史资料 | 把 10 的事件表复制到 guide / reference |
+| 当前指标 / 证据口径 | `design/12-instance-metrics.md` / `design/13-instance-evidence.md` | 在 reference 里写第二套阈值或判定表 |
 | 某一版的改动 | `history/releases.md` | README 里写「当前版本：0.9.0 + 各版历史」 |
-| 设计数值（尺寸 / 颜色 / 比例 / 阈值） | `design/01–08` | guide 里写像素值形成第二真相 |
+| 设计数值（尺寸 / 颜色 / 比例 / 阈值） | 当前契约看 `design/12–13` 与 `DESIGN.md`；旧界面数值在 `design/01–08`（历史） | guide 里写像素值形成第二真相 |
 | 数值冲突的最终裁决 | `DESIGN.md` §6 | 分册各写一套互相矛盾的数 |
 | 为什么这么设计 / 否决了什么 | `DESIGN.md` §1–§5 或相应分册的「反例 / 参考出处」 | 在 reference 里讲心路历程 |
 | 事故与教训 | `postmortem/`（唯一允许讲故事的 tier） | 在测试注释里写完整事故报告 |
@@ -53,11 +55,11 @@
 
 ## 4. 本仓硬约束
 
-1. **`design/` 分册冻结**：`01-ia-interaction.md` … `08-state-machine.md`、`REVIEW.md` 的文件名与编号不许重排、不许改名（`PLUGINS.md`、代码注释、08 分册互相引用）。内容不许搬走；只允许修「指向 README 的引用」这类改完必然失效的链接。
-2. **事件契约唯一真相源是 `design/05-run-log.md`**。其它文档只写「契约在哪、怎么用、字段速查」，详细字段、校验规则、聚合口径一律链接过去，不复制。
+1. **`design/` 分册冻结**：`01-ia-interaction.md` … `08-state-machine.md`、`REVIEW.md` 自 0.14.0 起是**历史资料**，文件名与编号不许重排、不许改名、不许按新域重写；只允许加「历史资料」标注或修失效链接。`09–13` 是当前契约，可以随实现更新。
+2. **当前实例事件 / 指标 / 证据的唯一真相源分别是 `design/10-bpmn-instance-api.md`、`design/12-instance-metrics.md`、`design/13-instance-evidence.md`**。旧 `design/05-run-log.md` 只解释历史 run 事件；`reference/run-log.md` 的旧事件速查同样只作历史资料，不再描述当前实例事件。其它文档只写「契约在哪、怎么用、字段速查」，详细字段、校验规则、聚合口径一律链接过去，不复制。
 3. **README 不写版本历史**。历史只进 `history/releases.md`；README 的文档导航给一个入口。
 4. **设计数值冲突以 `DESIGN.md` §6 裁决表为准**。分册出现旧值时，裁决表赢；不要在两处各留一套。
-5. **一个事实一个家**：新写一段前先搜关键字（比如 `FLOW_STUDIO_TOKEN`、`sessions.json`），已有家就链接，不新开第二节。
+5. **一个事实一个家**：新写一段前先搜关键字（比如 `FLOW_STUDIO_TOKEN`、`instance.json`），已有家就链接，不新开第二节。
 6. **链接必须通**：一律用相对链接；改文件名或移动目录后，全仓扫一遍 `](` 引用。跨文件锚点按 GitHub slug 规则（小写、空格转 `-`、去标点），中文标题保留中文字符。
 7. **只描述当前行为**：历史用版本号或日期限定（如「0.8.2 起」）；不写「未来会」「已实现！」这类会腐烂的状态标注，交付状态归 `history/releases.md`。
 8. **文档不动代码**：改文档的提交不顺手改 `src/`、`test/`、`scripts/`、`package.json`、`LICENSE`、`THIRD-PARTY.md`、`cordis.patch.yml`、`locale/`。
@@ -65,7 +67,7 @@
 ## 5. 写作规则
 
 - 一段一行（源文件里一个段落占一行，靠编辑器软换行显示）；代码块、表格、列表保持原有结构。
-- 中文为主；术语固定：**节点**、**连线**、**打回**、**run**、**attempt**、**节点会话**、**supervision（run 级自审）**、**节点闹钟**、**收件箱**。英文标识符（`flow_start`、`FLOW_STUDIO_TOKEN`）保持原文。
+- 中文为主；术语固定：**定义**、**定义版本**、**实例**、**活动**、**人工任务**、**实例事件**、**收件箱**、**实例 worktree**。旧术语（**run**、**打回**、**supervision**、**节点闹钟**）只允许出现在历史资料里。英文标识符（`flow_instance_run`、`FLOW_STUDIO_TOKEN`）保持原文。
 - 强调只给会改变行为的子句；整段加粗等于没有强调。
 - 例子优先用真实值（默认 2h / 20min、600s、6 槽、15% 地板）；不给数字的地方就不要含糊地说「比较大」。
 - 外部引用给可点开的 URL，并写清「借了哪一点」；不写「参考了很多资料」。

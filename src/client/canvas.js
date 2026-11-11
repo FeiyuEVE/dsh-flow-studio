@@ -194,33 +194,3 @@ export function BpmnCanvas(props = {}) {
 
 /** 兼容别名：后续页面按「壳」命名引用时不用再改一次。 */
 export const BpmnCanvasShell = BpmnCanvas
-
-/*
- * ---------------------------------------------------------------------------
- * 0.13.3 步骤 2 临时兼容层：旧 React Flow 画布仍被 page.js 与现有测试使用，
- * 实现已移到 ./canvas-flow.js；步骤 5 页面切换到 BPMN 后、步骤 7 随旧画布一起删除。
- * 本文件顶层只做 re-export，不 import bpmn-js，也不在上层求值时访问 document。
- * ---------------------------------------------------------------------------
- */
-export {
-  FlowCanvas,
-  canConnectNodes,
-  createDragHandlers,
-  createNodeDecorator,
-  edgeAriaLabel,
-  edgeListText,
-  flowComponentTypes,
-  guardStructureEdit,
-  interactionState,
-  isEdgeActive,
-  lodText,
-  nodeAriaLabel,
-  openNodeSession,
-  sessionIdOf,
-  snapToGridEnabled,
-  stateShape,
-  studioNextEdgeType,
-  studioNodeType,
-  studioRejectEdgeType,
-  wheelPanDelta,
-} from './canvas-flow.js'

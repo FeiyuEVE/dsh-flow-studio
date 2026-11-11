@@ -7,14 +7,14 @@
 只把栈件写在 `peerDependencies` 里，而 pnpm 布局的 dsh profile **不会自动安装传递依赖的
 peerDependencies**——2026-11-11 在容器测试台实测：只声明 `bpmn-engine` 时插件 import 直接
 失败（`Cannot find package 'bpmn-moddle' imported from .../bpmn-engine/src/index.js`）。
-把它们写成直接依赖后测试台正常加载。除此之外的第三方代码（xstate、BPMN 元模型、
+把它们写成直接依赖后测试台正常加载。除此之外的第三方代码（BPMN 元模型、
 FEEL 求值、Zeebe 扩展描述符）一律**编译成单文件 ESM 提交进仓库**，不通过 npm 依赖安装，
 因此需要在这里保留完整许可文本。
 
 按形态分两类：
 
 - **npm 依赖**：上面八个 —— 不复制进本仓库，跟随 npm 安装。
-- **vendored**：`xstate`、`bpmn-moddle`、`feelin`、`zeebe-bpmn-moddle` —— 单文件 ESM 放在
+- **vendored**：`bpmn-moddle`、`feelin`、`zeebe-bpmn-moddle` —— 单文件 ESM 放在
   `src/*-vendor.js`，构建时逐字节复制到 `lib/`。其中 `bpmn-moddle` 同时是 npm 依赖
   （引擎运行期要用它）和 vendored 产物（我们自己的解析器用它与主世界隔离）——两份用途不同，
   升级时要一起核对版本。
@@ -210,47 +210,6 @@ SOFTWARE.
 ---
 
 # 二、vendored 代码（单文件 ESM，提交进仓库）
-
-## xstate@5.33.3
-
-- **用途**：流程状态机内核（节点之间的转移、守卫、打回、重放），见 `docs/design/08-state-machine.md`。
-- **来源**：[github.com/statelyai/xstate](https://github.com/statelyai/xstate)，`npm pack xstate@5.33.3`
-- **tarball shasum**：`6dc145fea93544377056cdb3f2958ef97bd99ad1`
-- **tarball integrity**：`sha512-AnDRjS/GyKHmbA1PyhVCYBqYsA7EGe3KGgeD0ht3NFsXzoz7leX/HQDFX9QlHFJ/ltLHPsgChJYwPzRvB/0b4g==`
-- **vendor 路径**：`src/xstate-vendor.js`（构建时复制到 `lib/xstate-vendor.js`）
-- **做了哪些改动**：**只做 bundle，未修改其逻辑**。打包方式
-  `esbuild --bundle --format=esm --platform=neutral`（未压缩，保留可读性便于按需打补丁）。
-  文件头部记录了版本、shasum、esbuild 版本与重新生成方式。
-- **重新生成**：`node scripts/vendor-xstate.mjs`；校验已提交产物是否与脚本一致：
-  `node scripts/vendor-xstate.mjs --check`（幂等，字节级可复现）。
-- **升级条件**：主版本升级（v6 目前在 beta）必须先跑完 `docs/design/08-state-machine.md` §9 的验收，
-  尤其是「快照不兼容 → 事件重放」这条。
-
-### License
-
-```
-The MIT License (MIT)
-
-Copyright (c) 2015 David Khourshid
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
 
 ## bpmn-moddle@10.3.1
 

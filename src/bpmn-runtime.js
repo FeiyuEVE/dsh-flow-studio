@@ -85,7 +85,7 @@ import {
   AGENT_EXECUTE_ERROR, DEFAULT_ADAPTER_ID, admitAdapter, createAdapterProbeCache,
   resolveAdapterId, resolveAgentTimeoutMs, runAgentNode,
 } from './agent-execute.js'
-import { checkRunId } from './runlog.js'
+import { checkRunId } from './storage-contract.js'
 import { DEFAULT_ARTIFACT_MAX_BYTES, artifactsRootFor, createArtifactStore } from './artifact-store.js'
 import {
   EVIDENCE_REASON,

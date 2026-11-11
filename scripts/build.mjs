@@ -4,15 +4,11 @@
  *
  *   src/client/entry.js     -> lib/client.js       （主包，factory 返回 createPlugin）
  *   src/client/bpmn/entry.js -> lib/client.bpmn.js （chunk，chunk: 'client.bpmn.js'）
- *   src/index.js            -> lib/index.js
- *   src/model.js         -> lib/model.js     （Host 与 Client 共用）
- *   src/store.js         -> lib/store.js
- *   src/runlog.js        -> lib/runlog.js    （事件契约与聚合，纯函数）
- *   src/runstore.js      -> lib/runstore.js  （run 目录读写）
- *   src/engine.js        -> lib/engine.js    （执行引擎，v0.4）
- *   src/inbox.js         -> lib/inbox.js     （流程收件箱 / 节点会话复用）
- *   src/audit.js         -> lib/audit.js     （工作流健康审计，纯函数）
- *   src/tools.js         -> lib/tools.js     （会话内启停的模型工具）
+ *   src/index.js            -> lib/index.js           （唯一 Host 入口：定义域 / 实例域）
+ *   其余 src/*.js（BPMN 运行时、存储、适配器、工具）逐字节原样拷贝到 lib/。
+ *
+ * 0.14.0 起旧运行域（flows / runs / engine / xstate / executor…）已删除，
+ * HOST_MODULES 只列当前仍存在的模块；LEGACY_HOST_MODULES 供打包测试做「零残留」断言。
  *
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  * 体积只报数（raw / gzip），不设自设上限；结构错误（缺文件、依赖错位、陈旧产物）仍硬失败。
@@ -55,13 +51,9 @@ const root = resolve(here, '..')
  * 拷贝循环、产物数量断言、src↔lib 字节比对、scripts/verify-build.mjs 全部从它派生。
  */
 export const HOST_MODULES = [
-  'xstate-vendor.js',
   'index.js',
-  'model.js',
-  'flowdir.js',
-  'store.js',
-  'runlog.js',
-  'runstore.js',
+  'storage-contract.js',
+  'node-check.js',
   'definition-store.js',
   'instance-store.js',
   'instance-resources.js',
@@ -72,28 +64,14 @@ export const HOST_MODULES = [
   'instance-tools.js',
   'artifact-store.js',
   'execution-limits.js',
-  'flowmachine.js',
-  'engine.js',
-  'node-tools.js',
-  'restart.js',
-  'runtime.js',
-  'resume.js',
-  'admission.js',
-  'worktree.js',
-  'executor.js',
   'process-output.js',
   'host-check.js',
-  'supervise.js',
-  'inbox.js',
-  'audit.js',
-  'tools.js',
   'bpmn-moddle-vendor.js',
   'feelin-vendor.js',
   'zeebe-moddle-vendor.js',
   'bpmn-moddle.js',
   'bpmn-expr.js',
   'bpmn-parse.js',
-  'bpmn-convert.js',
   'bpmn-policy.js',
   'bpmn-state.js',
   'bpmn-runner.js',
@@ -110,6 +88,35 @@ export const HOST_MODULES = [
   'agent-adapter-dsh.js',
   'agent-adapter-codex.js',
   'agent-execute.js',
+]
+
+/**
+ * 0.14.0 退役的旧运行域模块。它们**不得**出现在 lib/ 或 npm 包里；
+ * build.test.mjs 用这份清单对 tarball 做「旧模块一个都没有」的断言。
+ *
+ * 只用于测试断言与文档，不参与构建拷贝。
+ */
+export const LEGACY_HOST_MODULES = [
+  'engine',
+  'runtime',
+  'tools',
+  'supervise',
+  'worktree',
+  'inbox',
+  'runlog',
+  'runstore',
+  'flowmachine',
+  'xstate-vendor',
+  'node-tools',
+  'restart',
+  'resume',
+  'admission',
+  'audit',
+  'executor',
+  'model',
+  'store',
+  'flowdir',
+  'bpmn-convert',
 ]
 
 /** 由 esbuild 生成、不是从 src 拷贝的产物，同样计入 lib/ 产物清单。 */
@@ -147,8 +154,7 @@ const LEGACY_META_FILES = ['.build-meta.json', '.build-inputs.json']
  * 依赖泄漏的**内容特征**：不依赖任何可删除的 metadata 字段，也不只是 grep 注册字符串。
  * 每条都来自真实依赖代码或官方样式；主包混入 chunk 会同时命中多条。
  *
- * 注意：0.13.3 步骤 7 之前主包仍带旧画布 React Flow（src/client 里还在用），
- * 所以主包的禁用表只列 BPMN 栈；chunk 的 React Flow 禁用不受此影响。
+ * 0.14.0：旧 React Flow 画布已删除，主包与 chunk 都不得再出现 React Flow / @xyflow。
  */
 export const LEAK_MARKERS = {
   'client.js': [
@@ -159,6 +165,8 @@ export const LEAK_MARKERS = {
     ['bio-properties-panel 类名', /bio-properties-panel/],
     ['BPMN 主题桥接样式 --bio-surface', /--bio-surface/],
     ['内联 woff2 字体', /data:font\/woff2;base64,/],
+    ['React Flow 样式类名 react-flow__', /react-flow__/],
+    ['@xyflow 依赖标记', /@xyflow\//],
   ],
   'client.bpmn.js': [
     ['React Flow 样式类名 react-flow__', /react-flow__/],
@@ -970,9 +978,9 @@ export async function buildPlugin() {
     console.error('✗ lib/client.bpmn.js 缺少 factory')
     process.exit(1)
   }
-  // 0.13.3 步骤 2 仍保留旧 React Flow 画布（步骤 7 删除）；被 tree-shake 掉或外置都会在这里暴露。
-  if (!client.includes('react-flow__')) {
-    console.error('✗ lib/client.js 里找不到 React Flow 特征串 react-flow__（步骤 2 尚未退役，应有）')
+  // 0.14.0：旧 React Flow 画布已退役，主包里再出现它的特征串就是回潮。
+  if (client.includes('react-flow__')) {
+    console.error('✗ lib/client.js 里出现了已退役的 React Flow 特征串 react-flow__')
     process.exit(1)
   }
   // 步骤 4：官方 CSS + 内联字体只能进 chunk；主包一个字节都不该有。

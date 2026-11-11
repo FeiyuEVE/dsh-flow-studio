@@ -7,7 +7,7 @@
  * 完整溯源（版本 / npm pack shasum / integrity / 依赖闭包 / 重新生成方式），升级只要改
  * 本脚本顶部的 VENDORED 常量再跑一次。
  *
- * 一个脚本产出三个文件（和 scripts/vendor-xstate.mjs 同一套范式）：
+ * 一个脚本产出三个文件：
  *   src/bpmn-moddle-vendor.js   —— BPMN 2.0 元模型与 XML 读写（bpmn-moddle + moddle 栈）
  *   src/feelin-vendor.js        —— FEEL 表达式求值（feelin + lezer + temporal-polyfill）
  *   src/zeebe-moddle-vendor.js  —— Camunda/Zeebe 扩展描述符（纯 JSON，导出 zeebeModdle）

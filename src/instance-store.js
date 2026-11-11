@@ -25,8 +25,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 
 import { contentRefFor, hashFromContentRef } from './artifact-store.js'
 import { definitionsDir, readDefinition, readDefinitionVersion } from './definition-store.js'
-import { MAX_BATCH_EVENTS, MAX_EVENT_BYTES, checkRunId } from './runlog.js'
-import { resolveHome } from './store.js'
+import { MAX_BATCH_EVENTS, MAX_EVENT_BYTES, checkRunId, resolveHome } from './storage-contract.js'
 
 /** 与 run / flow / definition 存储同口径。 */
 const DIR_MODE = 0o700

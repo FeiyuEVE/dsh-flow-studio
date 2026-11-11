@@ -35,7 +35,8 @@ import {
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 mkdirSync(join(repoRoot, '.tmp'), { recursive: true })
-const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'node-finish-'))
+// 前缀刻意短：finish.sock 是 unix socket，路径总长必须留在 sockaddr_un 的 108 字节以内。
+const sandbox = mkdtempSync(join(repoRoot, '.tmp', 'nf-'))
 const FIXED_NOW = new Date('2026-11-11T12:34:56.789Z')
 
 let checks = 0

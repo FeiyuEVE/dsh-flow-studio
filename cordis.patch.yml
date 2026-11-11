@@ -1,4 +1,4 @@
-# dsh-flow-studio bundle patch：一行挂载 Host 插件（流程存储 + /api/flow-studio 路由）。
+# dsh-flow-studio bundle patch：一行挂载 Host 插件（BPMN 定义 / 实例存储 + /api/flow-studio 路由）。
 # Client 半边由 package.json 的 dsh.client 声明，浏览器端从同源路由取数据。
 - insert:
     - id: flow-studio

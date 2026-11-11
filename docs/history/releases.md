@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.12）
+# 版本历史（0.1 → 0.13.13）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -746,3 +746,28 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 提示词不可信边界只提高可辨识度，不构成权限控制；真实模型是否受其约束未验证。
 - N6 的跨进程等待路径只测到 store 层 claim / CAS，未做跨进程集成用例。
 - 自定义 session 投递实现如果忽略附件，属宿主实现责任；默认实现已不再静默丢弃。
+
+## 0.13.13 — 业务证据视图 + 实例域模型工具面
+
+两件事一起交付：实例详情能看**可复核的业务证据**（不再有旧的「优 / 良 / 差」总评分），对话里的 agent 也能**只用工具**跑完一条流程。
+
+**业务证据（证据视图）**
+
+- 证据仍由 `flow_finish_node.documents[]` 登记，报告正文在文件里（`schema:"flow-evidence/v1"`，`claims[].refs[]` / `findings[].refs[]`），不新增工具参数、不塞进实例变量。
+- 新增 `GET /instances/<id>/evidence`：纯读，不建 runner、不懒恢复；返回 `claims / findings / verifiedRefs / missing / conflicts / sourceExecutions / dataQuality`。实例详情新增「证据」面板。
+- 语义边界写死在实现里：`fixed` 不等于 `verified`（没有复验引用或引用 hash 对不上就不算）；hash 一致只证明**内容一致**，不证明结论正确（`conclusionVerified:false` + `valueTrust:"report-claim"`）；来源与可信级别由宿主登记决定，报告自称 `producer:"host"` 一律忽略；缺报告是 `missing`（unknown），不是「全部通过」；缺引用、hash 不匹配、同 ID 冲突都可见；不同 execution 的证据各留来源，不套用旧的「打回使前次通过全部失效」；不产出总评级、不写实例状态、不参与 admission。
+- 引用解析优先命中 `artifacts/<sha256>` 归档快照：**worktree 清理后证据仍可读且 hash 一致**；只有快照缺失才回落到工作区，并标 `artifact-snapshot-missing`。
+- 旧质量总评分整块删除：`runlog.js` 的 `computeQuality / computeStaleFails / countRework / checkEvidence / reviewEvidence / summarize().quality` 与 markdown「质量结论」段、`audit.js` 的 `quality` 字段、`index.js` 的 host 验证器、`tools.js` 里 `flow_watch` 的 quality 输出，以及对应测试。
+
+**实例域模型工具面**
+
+- 新增 8 个工具：`flow_definition_list`、`flow_definition_get`、`flow_instance_run`、`flow_instance_list`、`flow_instance_get`、`flow_instance_events`、`flow_instance_cancel`、`flow_instance_complete_task`（旧 `flow_*` 工具保留到 0.14.0 一次性删除）。
+- `flow_instance_run` 的 `variables` 与 finish 同一套短标量上限（≤32 键 / 单值 ≤512 字符 / ≤8 KiB）；`workspace` / `worktree` 复用实例域启动契约，能力缺失时明确拒绝（`WORKSPACE_POLICY_MISSING`），不静默忽略；返回 `instanceId / definitionId / definitionVersion / status / startedBy`，`startedBy` 绑定**调用方会话**并落盘，宿主重启后仍可查。
+- 读类工具等价 `GET`：查定义、实例、事件都不启动 runner、不触发懒恢复（断言 `_runners.size === 0`）；`flow_instance_events` 只回短字段，长正文给 `bodyRef` / 路径。
+- `flow_instance_complete_task` 与 GUI 同一份实现：重复完成（含终态后的重复）→ `TASK_ALREADY_COMPLETED`；与 GUI 并发提交同一任务只有一次成功。
+- 挂起 / 恢复**不交付**：`bpmn-engine@26` 没有 pause 原语，计划里已把它单列为 E4（0.14.2），不留空壳工具。
+
+**已知边界**
+- usage / 指标的「未知不是零」语义同 0.13.11；证据视图不推算任何分数。
+- 证据报告需要 agent 自己在 `flow_finish_node.documents[]` 里登记；没有登记就是 `missing`，宿主不会替它编。
+- 工具面只覆盖有真实路由支撑的能力：没有 watch、没有定时唤醒、没有自动重试。

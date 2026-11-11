@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.13.9）
+# 版本历史（0.1 → 0.13.10）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -662,3 +662,37 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - `clear-tombstone` 后实例仍没有引擎快照，后续 GET 报 `BPMN_STATE_MISSING`，不能自动续跑。
 - W4 的物理生命周期跟踪是进程内状态，跨宿主重启的孤儿 agent 进程没有持久化所有权证据。
 - 成功 `commitResult` 超时后底层写入可能迟到落成 succeeded；调用方已失败，重试会复用它、不重复发送。
+
+## 0.13.10 — 实例域收件箱 + 复审修复
+
+把「外部消息进得来、agent 回得去」搬进实例域：节点执行期间能收外部消息，agent 也能主动回一条；收件箱有幂等键、正文落盘与体积上限，投递语义按适配器如实标注。同时收掉 0.13.9 复审提出的 9 条发现（F1–F9）。
+
+**实例域收件箱**
+
+- 4 条路由：`POST /instances/<id>/messages` 受理、`GET /instances/<id>/messages` 分页（默认 50 / 上限 100）、`GET /instances/<id>/messages/<messageId>/body` 取回落盘正文、`POST /instances/<id>/messages/<messageId>/replies` 写回复 outbox。
+- 幂等：`instanceId + messageId` 加内容指纹；重复投递复用原记录，不重放、不重复注入。
+- 体积：正文 ≤ 4 KiB 直接进提示词；更大的落盘到 `inbox/bodies/` 并在提示词里给路径；超过 1 MiB 整条拒绝，一个字节都不写（不截断、不留半截文件）。
+- 消息状态机 `queued → injected / resumed / delivered / failed`：投递未确认就不会标成 delivered。每次推进最多取 5 条，剩余条数随结果返回。
+- 投递语义按适配器如实暴露：DSH 会话走 `deliverMessage`（宿主回 `deliveryUnknown` 时保持未确认）；codex 适配器明确报「不支持收件箱投递」，不静默丢弃。
+- 模型工具 `flow_instance_send_message`、`flow_instance_reply`；实例详情页新增收件箱区块（列表、发消息、回复）。
+- 执行收尾摘掉 live 表，未投递完的消息按过期处理，不会在后续会话里补投。
+
+**复审修复（F1–F9）**
+
+- F1 创建失败回滚不再跑仓库级 `git worktree prune`：改为 `rollbackCreatedWorktree` 只撤销本次创建的那一份，缺失路径走定向注销。全仓 prune 会顺带清掉**别的**缺失路径登记，属于误伤。
+- F2 合并检查与分支删除用同一个 tip：先捕获 tip、检查合并状态，删除也针对这个 tip（之前「检查的是 A、删的是 B」，能删掉别的实例分支）。
+- F3 `DELETE /instances/<id>/worktree` 与 `POST /instance-worktrees/prune` 改看**物理退出确认**：`_activeAgents` 计数、适配器 `cleanup` 标志与进程存活一起判；只看到 CANCELED 状态不再当成「已退出」。codex 适配器补了 cleanup 契约。
+- F4 锁协议收紧：抢占前先过 `.steal` guard 串行化，并在 guard 内复核 owner/inode；迟到的 rename 不再把活锁搬走。
+- F5 connector 调用记录写盘加 store 级互斥（进程内共享队列 + 跨进程 `.locks` 文件锁），generation 检查在锁内做；旧 fence 不再覆盖新世代的终态。
+- F6 过期导入失败不再顶掉最新选择：catch 先判选择世代，过期即安静返回；画布恢复调用带上世代，迟到的旧导入改不动新视图。
+- F7 容器 e2e 的挂载隔离检查改成 realpath 双向比对，symlink + 更深 bind 的双重叠组合不再漏判。
+- F8 `flow_instance_worktrees` 的 prune 只在显式 `dryRun:false` 时执行；`planHash` 只作计划身份，不再隐含「执行」意图。
+- F9 cancel / dispose 有界收口：清理动作超过 `cancelGraceMs` 只记诊断并继续收口，错误对象挂 `cleanupPending / cancelPending / disposePending`；槽位与 `_activeAgents` 仍然只在物理退出确认后释放，不误放。
+- 小项：`flow_instance_worktrees` 的计数改用裁剪前真实数量并给 `truncated` 标记（不再把 250 报成 201）；删除确认文案补「未合并提交」提示。
+
+**已知边界**
+- 收件箱的「live 表」是进程内状态：宿主重启后，未投递完的消息按过期处理，不会补投。
+- cancel / dispose 超时后仍会调 dispose 收口，此时 dispose 可能与尚未返回的 cancel 并发——适配器需要保证 dispose 幂等（内置 DSH / codex 适配器已满足）。
+- F1 的定向注销依赖 `git worktree remove <缺失路径>`（git 2.47.3 验证）；更老的 Git 失败时只保留登记，不会退回全仓 prune。
+- F4 的锁释放仍是「核对 owner + inode 后 unlink」，跨文件系统 / 网络盘的 inode 语义不保证。
+- 实例域工作树的物理存活跟踪是进程内记账，跨宿主重启的孤儿 agent 进程没有持久化所有权证据。

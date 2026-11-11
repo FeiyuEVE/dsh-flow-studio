@@ -134,7 +134,7 @@ $DSH_HOME/flow-studio/
   "definitionHash": "…", "recovered": false }
 ```
 
-- 若 start 阶段 handler 失败 / 条件非法，实例已存在，仍返回 201，`status:"failed"` 并在
+- 若 start 阶段 handler 失败 / 条件非法，实例已存在，仍返回 201，`status:"blocked"` 并在
   `error` 里带 `{code,message}`（进程失败不是「接口没建成」）；实例详情的
   `result.error.code` 保留 handler 的真实错误码（如 `BPMN_AGENT_ADAPTER_UNAVAILABLE`），
   不让 runner 外层的 `BPMN_HANDLER_FAILED` 盖掉。
@@ -145,7 +145,7 @@ $DSH_HOME/flow-studio/
 
 ### 3.5 `GET /instances`
 
-- `?definitionId=`、`?status=`（`pending|running|waiting|done|failed|aborted`）、`?limit=`
+- `?definitionId=`、`?status=`（`pending|running|waiting|blocked|done|aborted`）、`?limit=`
   （默认 200，封顶 1000）。
 - 出参：`{ok:true, instances:[{…instance.json, active:boolean}], skipped:[…]}`。
 - `active` = 当前内存注册表里是否还有该实例的 runner。
@@ -191,7 +191,7 @@ $DSH_HOME/flow-studio/
   `decidedBy` 就自动并入（不另造事件）。
 - 出参：`{ok:true, id, status, pendingTasks, lastSeq, activityId, executionId, decidedBy, recovered}`。
 - 完成 = `runner.signalTask({activityId, executionId, payload})`；返回时已跑到下一个
-  等待点 / done / failed。
+  等待点 / done / blocked。
 - 错误：400（activityId/payload 非法）、404（实例/任务不存在 = `BPMN_TASK_NOT_FOUND`）、
   409（实例终态 / 非 waiting / 失败 / 无法恢复）、500（事件或快照写入失败）。
 
@@ -212,17 +212,16 @@ $DSH_HOME/flow-studio/
 pending ──start──▶ running ──wait──▶ waiting ──signal──▶ running ──┐
                       │                 │                          ├──▶ done
                       │                 └──stop───────────────────▶ aborted
-                      ├──可修复问题（条件错/超时/handler 失败/提醒用尽/连线超限）
-                      │        └──────────────────────────────────▶ blocked ──retry──▶ running
-                      ├──引擎不可恢复（状态损坏/定义无法反序列化）──▶ failed
+                      ├──任何问题（条件错/超时/handler 失败/提醒用尽/连线超限/
+                      │   状态或定义无法反序列化等）──────────────▶ blocked ──retry──▶ running
                       └──stop─────────────────────────────────────▶ aborted
 ```
 
 - `pending`：建了实例但 runner 还没启动（`createInstance` 后、start 前）。
 - `running`：引擎正在推进（含 serviceTask handler 在飞）。
 - `waiting`：停在 userTask（或引擎的 wait 状态），`pendingTasks` 非空。
-- `blocked`：**不是 failed**。可修复/可重试的问题（条件求值错、活动超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏）把实例停在这里，带 `blockedReason{code,message,nodeId?,reminders?}`；人可通过 `POST /instances/<id>/retry` 重试当前节点或 `stop` 终止。**用户口径（2026-11-11）：不要随意把流程实例判定为失败。**
-- `done` / `failed` / `aborted`：终态，不再恢复 runner。`failed` 只留给引擎不可恢复的错误（快照/定义无法反序列化、内部结构不一致）。
+- `blocked`：**卡住，不是失败**。任何问题（条件求值错、活动/整轮超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏、快照或定义无法反序列化）都只把实例停在这里，带 `blockedReason{code,message,nodeId?,reminders?}`；人可 retry 或 stop。**用户口径（2026-11-11）：没有 `failed` 这种状态，最多就是流转卡住。**
+- `done` / `aborted`：终态（完成 / 被人终止），不再恢复 runner。
 
 与 `bpmn-runner` 五态的换算：
 
@@ -232,7 +231,6 @@ pending ──start──▶ running ──wait──▶ waiting ──signal─
 | `running` | `running` | 引擎推进中 |
 | `waiting` | `waiting` | `activity/wait` 后落 `pendingTasks` + `state.json` |
 | `done` | `done` | `process/end` → `completeInstance('done')` |
-| `failed` | `failed` | `error` → `completeInstance('failed')` |
 | —（无对应） | `aborted` | runner 没有 aborted 态；`stop()` 后由运行时收成 aborted |
 
 状态写入优先级：`error` / `process/end` 走 `completeInstance`（终态不可被后续事件改回）；
@@ -250,7 +248,7 @@ pending ──start──▶ running ──wait──▶ waiting ──signal─
 | `activity/wait` | runner | `at, elementId, activityId` | 事件 + 实例 waiting + `pendingTasks` |
 | `flow/taken` | runner | `at, flowId, from, to, condition:{expression,value}\|null` | 事件（不含状态写入） |
 | `process/end` | runner | `at, elementId, activityId` | 事件 + `completeInstance('done')` |
-| `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + `completeInstance('failed')` |
+| `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + 实例 `blocked` + `blockedReason`（**不**判失败） |
 | `agent/log` 等 | handler `events[]` | handler 自定义 | 原样透传（runner 禁止保留类型） |
 
 落盘规则：

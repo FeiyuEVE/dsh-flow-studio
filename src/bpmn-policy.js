@@ -29,6 +29,15 @@ export const ALLOWED_ACTIVITY_TYPES = Object.freeze([
 
 const ALLOWED_ACTIVITY_SET = new Set(ALLOWED_ACTIVITY_TYPES)
 
+/** 统一 BPMN 类型的写法（`bpmn:ServiceTask` / `serviceTask` → `bpmn:serviceTask`）。 */
+export function canonicalBpmnType(rawType) {
+  const type = bpmnTypeOf(rawType)
+  if (type === null) return null
+  const index = type.indexOf(':')
+  if (index < 0) return type
+  return `${type.slice(0, index + 1)}${type.charAt(index + 1).toLowerCase()}${type.slice(index + 2)}`
+}
+
 /**
  * 无执行作用的元素：允许出现在 XML 里（DI / 注释 / 数据对象 / 泳道），
  * 引擎不会因为它们跑逻辑，也不影响「谁被执行」。
@@ -124,6 +133,26 @@ export function bpmnTypeOf(rawType) {
   if (typeof rawType !== 'string' || rawType.trim() === '') return null
   const text = rawType.trim()
   return text.includes(':') ? text : `bpmn:${text.charAt(0).toUpperCase()}${text.slice(1)}`
+}
+
+/**
+ * 单个活动类型是否可执行；不可执行时返回违规项（有专用错误码的用专用码）。
+ *
+ * @param {string} rawType `bpmn:ServiceTask` / `serviceTask` / 空
+ * @param {string} elementId
+ * @returns {null | {code: string, message: string, elementId?: string}}
+ */
+export function violationForActivityType(rawType, elementId) {
+  const type = bpmnTypeOf(rawType)
+  if (type !== null && ALLOWED_ACTIVITY_SET.has(type)) return null
+  const mapped = type === null ? null : TYPE_CODES[type]
+  const id = typeof elementId === 'string' && elementId !== '' ? elementId : '?'
+  if (mapped) return violation(mapped.code, `${mapped.reason}：${id}（${type ?? '(无类型)'}）。`, { elementId })
+  return violation(
+    'BPMN_EXECUTION_UNSUPPORTED',
+    `0.13 执行白名单只允许 startEvent / endEvent / serviceTask / userTask / exclusiveGateway，当前出现 ${type ?? '(无类型)'}：${id}。`,
+    { elementId }
+  )
 }
 
 /** 违规项构造（保持字段顺序稳定，便于测试与日志）。 */

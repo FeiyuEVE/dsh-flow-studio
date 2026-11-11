@@ -156,18 +156,67 @@ import { Buffer } from 'node:buffer'
 import { EventEmitter } from 'node:events'
 
 import { Engine } from 'bpmn-engine'
+import { SequenceFlow } from 'bpmn-elements'
 import { LRUCache } from 'lru-cache'
 
 import { evaluateFeel, isFeelLanguage } from './bpmn-expr.js'
+import { FS_NAMESPACE } from './bpmn-parse.js'
+import {
+  canonicalBpmnType,
+  createRejectingExpressions,
+  violationForActivityType,
+} from './bpmn-policy.js'
+import {
+  BPMN_STATE_KIND,
+  BPMN_STATE_VERSION,
+  assertDefinitionIdentity,
+  assertDefinitionMatchesStructure,
+  assertRecoveredEngineStructure,
+  assertStructuresMatch,
+  describeExecutionStructure,
+  normalizeDefinitionIdentity,
+  readTrustedExecutionStructure,
+  validateStateEnvelope,
+} from './bpmn-state.js'
 
 /** 活跃实例默认上限（研究 §7：单实例 ≈450KB，1000 常驻 ≈435MB）。 */
 const DEFAULT_MAX_ACTIVE_INSTANCES = 100
 /** `lru-cache` 的容器上限只增不减；真正的上限由 `activeLimit` 手工裁剪执行。 */
 const LRU_PHYSICAL_MAX = 100_000
 
-/** 快照信封版本（跨版本恢复时拒绝不认识的信封）。 */
-const STATE_VERSION = 1
-const STATE_KIND = 'dsh-flow-studio/bpmn-runner-state'
+/** 快照信封版本（v2：带定义身份；v1 / 裸快照一律拒绝，不做迁移）。 */
+const STATE_VERSION = BPMN_STATE_VERSION
+const STATE_KIND = BPMN_STATE_KIND
+
+/**
+ * 可修复失败（实例进 `blocked`，不是 `failed`）的错误码。
+ *
+ * 口径（2026-11-11 用户定调）：handler 失败 / adapter 不可用 / 条件求值错 /
+ * 活动或整轮超时 / 连线超限 / 循环护栏都属于「人可以修一下再重试」的问题，
+ * 不能让实例直接判死；只有引擎不可恢复（state/定义无法反序列化、结构不一致、
+ * 内部不变量被破坏）才是 `failed`。
+ */
+const BLOCKED_FAILURE_CODES = new Set([
+  'BPMN_FLOW_TAKE_LIMIT',
+  'BPMN_LOOP_LIMIT',
+  'BPMN_ACTIVITY_TIMEOUT',
+  'BPMN_RUN_TIMEOUT',
+  'BPMN_HANDLER_FAILED',
+  'BPMN_CONDITION_INVALID',
+  'BPMN_CONDITION_NOT_BOOLEAN',
+  'BPMN_ABORTED',
+])
+
+/** 一次失败是「可重试阻塞」还是「不可恢复失败」。 */
+function classifyFailure(error) {
+  const codes = []
+  if (error && typeof error.code === 'string') codes.push(error.code)
+  if (error?.cause && typeof error.cause.code === 'string') codes.push(error.cause.code)
+  for (const code of codes) {
+    if (BLOCKED_FAILURE_CODES.has(code)) return 'blocked'
+  }
+  return 'failed'
+}
 
 /**
  * 统一事件的 type 白名单（**runner 自己生成的事件只用这些**）。
@@ -240,7 +289,7 @@ export class BpmnRunnerError extends Error {
     if (this.elementId !== undefined) payload.elementId = this.elementId
     if (this.activityId !== undefined) payload.activityId = this.activityId
     // 上限 / 循环类错误的可序列化定位字段（事件流消费方要能直接看出是哪条边、多少次）。
-    for (const key of ['flowId', 'maxTakes', 'takes', 'loopGuardMax', 'feelErrorCode']) {
+    for (const key of ['flowId', 'maxTakes', 'takes', 'attemptedTake', 'loopGuardMax', 'feelErrorCode']) {
       if (this[key] !== undefined) payload[key] = this[key]
     }
     return payload
@@ -480,9 +529,23 @@ function normalizeDefinition(raw) {
     if (node !== null && !isPlainObject(node)) {
       throw new BpmnRunnerError('BPMN_DEFINITION_INVALID', `节点 ${elementId} 的 node 必须是对象或 null`, { elementId })
     }
+    // definition-only 入口先查**原始 type**，再查生成 XML：不能先把
+    // parallelGateway 归一成普通 gateway，再让 buildBpmnXml 生成安全 XML。
+    const declaredType = typeof entry.type === 'string' && entry.type !== '' ? entry.type : TAG_BY_KIND[kind]
+    const typeViolation = violationForActivityType(declaredType, elementId)
+    if (typeViolation !== null) {
+      throw new BpmnRunnerError(typeViolation.code, typeViolation.message, { elementId })
+    }
+    if (canonicalBpmnType(declaredType) !== canonicalBpmnType(TAG_BY_KIND[kind])) {
+      throw new BpmnRunnerError(
+        'BPMN_DEFINITION_INVALID',
+        `节点 ${elementId} 的 type=${JSON.stringify(declaredType)} 与 kind=${kind}（应为 ${TAG_BY_KIND[kind]}）不一致`,
+        { elementId }
+      )
+    }
     const element = {
       id: elementId,
-      type: typeof entry.type === 'string' && entry.type !== '' ? entry.type : TAG_BY_KIND[kind],
+      type: declaredType,
       name: typeof entry.name === 'string' && entry.name !== '' ? entry.name : null,
       kind,
       node,
@@ -686,12 +749,18 @@ function buildBpmnXml(definition) {
       `sourceRef="${escapeXmlText(flow.from)}"`,
       `targetRef="${escapeXmlText(flow.to)}"`,
     ]
-    if (flow.condition) {
-      lines.push(
-        `    <bpmn:sequenceFlow ${attrs.join(' ')}><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" ` +
-          `language="${escapeXmlText(flow.condition.language)}">${escapeXmlText(flow.condition.expression)}` +
-          '</bpmn:conditionExpression></bpmn:sequenceFlow>'
-      )
+    const conditionXml = flow.condition
+      ? `<bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" ` +
+        `language="${escapeXmlText(flow.condition.language)}">${escapeXmlText(flow.condition.expression)}` +
+        '</bpmn:conditionExpression>'
+      : ''
+    // 连线次数上限必须进 XML：runtime 恢复时重新 `parseBpmn(definition.bpmn)` 建 definition，
+    // 不写进 XML 的话定义-only 实例一旦恢复就会把 fs:maxRounds 丢掉（上限被清零）。
+    const maxRoundsXml = flow.maxTakes === null || flow.maxTakes === undefined
+      ? ''
+      : `<bpmn:extensionElements><fs:maxRounds>${flow.maxTakes}</fs:maxRounds></bpmn:extensionElements>`
+    if (conditionXml !== '' || maxRoundsXml !== '') {
+      lines.push(`    <bpmn:sequenceFlow ${attrs.join(' ')}>${conditionXml}${maxRoundsXml}</bpmn:sequenceFlow>`)
     } else {
       lines.push(`    <bpmn:sequenceFlow ${attrs.join(' ')} />`)
     }
@@ -703,6 +772,7 @@ function buildBpmnXml(definition) {
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"',
     '  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+    `  xmlns:fs="${FS_NAMESPACE}"`,
     `  id="Definitions_${escapeXmlText(definition.id)}" targetNamespace="http://dsh.local/bpmn">`,
     `  <bpmn:process ${processAttrs.join(' ')}>`,
     ...lines,

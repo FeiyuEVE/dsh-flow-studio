@@ -87,10 +87,10 @@ adapter 必须把「怎么完结当前节点」写进节点提示词（不是可
 ## 7 验收（0.13.1 必须有的）
 
 1. 正常：agent 调工具 → 节点完结、`activity/end` 带 `output` 与 `artifacts`，实例变量里能看到注入的 `verdict`，网关按它路由到正确的下一条连线；
-2. 不调工具：会话正常结束 → 实例 `failed` + `NODE_FINISH_MISSING`（不是 done）；
+2. 不调工具：会话正常结束（提醒用尽）→ 实例 `blocked` + `blockedReason.code='NODE_FINISH_MISSING'`（不是 done，也没有 failed 可判）；
 3. 变量超限：塞 9 KiB 或嵌套对象 → `NODE_VARIABLES_INVALID`，节点不结束；
 4. 文档不存在 / 路径越界 / 超 5 MiB → `NODE_DOCUMENT_INVALID`；
 5. 重复调用 → `NODE_ALREADY_FINISHED`，产物索引不重复；
 6. 超时中断：工具从未调用且活动超时 → `BPMN_ACTIVITY_TIMEOUT` 且会话被 abort（不是挂住）。
-7. 提醒：agent 停下来没调工具 → 收到一次提醒并被唤醒；调用后正常完结，事件流里有 `agent/reminder`（count=1），实例**不**进 failed。
+7. 提醒：agent 停下来没调工具 → 收到一次提醒并被唤醒；调用后正常完结，事件流里有 `agent/reminder`（count=1），实例状态不变（不 blocked、不 failed）。
 8. 提醒用尽：连续 3 次停下都不调工具 → 3 条 `agent/reminder` + 实例 `blocked`（`blockedReason.code='NODE_FINISH_MISSING'`、`reminders:3`），**不是 failed**；把 maxFires 配成 0 时，第一次停下就直接 blocked。

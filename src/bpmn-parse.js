@@ -27,6 +27,7 @@ import { BpmnModdle } from './bpmn-moddle-vendor.js'
 import zeebeModdlePackage from './zeebe-moddle-vendor.js'
 
 import { assertFeelSafe, isFeelLanguage } from './bpmn-expr.js'
+import { collectRawExecutionViolations } from './bpmn-policy.js'
 
 /** 我们自己的扩展命名空间：`fs:`（Flow Studio）。 */
 export const FS_NAMESPACE = 'http://feiyueve.dev/schema/bpmn/fs/1.0'
@@ -767,6 +768,12 @@ export async function parseBpmn(xml, options = {}) {
     }
     const process = processes[0]
 
+    // 执行白名单必须查**原始 moddle 结构**：下面的归一化会丢掉不认识/不支持的
+    // 元素（scriptTask、子流程、事件定义…），等归一化之后再查就晚了。
+    for (const violation of collectRawExecutionViolations(process)) {
+      errors.push(violation)
+    }
+
     const definition = {
       id: typeof process.id === 'string' ? process.id : '',
       name: stringOrNull(process.name),
@@ -797,28 +804,6 @@ export async function parseBpmn(xml, options = {}) {
           code: 'ELEMENT_WITHOUT_ID',
           elementId: id,
           message: `BPMN 节点缺少 id，已临时命名为 ${id}（flow 无法引用它）。`,
-        })
-      }
-
-      if (type === 'bpmn:ParallelGateway') {
-        errors.push({
-          code: 'PARALLEL_GATEWAY_FORBIDDEN',
-          elementId: id,
-          message: `0.13.0 禁止 parallelGateway（上游 #204：并行汇聚 + 成环会提前通过）：${id}。`,
-        })
-      }
-      if (type === 'bpmn:InclusiveGateway') {
-        errors.push({
-          code: 'INCLUSIVE_GATEWAY_FORBIDDEN',
-          elementId: id,
-          message: `0.13.0 禁止 inclusiveGateway（与并行汇聚同源的提前通过风险）：${id}。`,
-        })
-      }
-      if (flowElement.loopCharacteristics?.$type === 'bpmn:MultiInstanceLoopCharacteristics') {
-        errors.push({
-          code: 'MULTI_INSTANCE_FORBIDDEN',
-          elementId: id,
-          message: `0.13.0 禁止 multiInstanceLoopCharacteristics（团队走节点内 fan-out，不用 BPMN 多实例）：${id}。`,
         })
       }
 

@@ -7,7 +7,8 @@
 #
 # 环境变量覆盖：TESTBED_CONTAINER（默认 dsh-testbed-bpmn）、TESTBED_PORT（默认 3110）、
 #   E2E_RUN_ID（测试用；默认「时间戳-pid」，决定本次证据子目录名）、
-#   E2E_PREFLIGHT_ONLY=1（测试用：只跑前置身份校验后退出，不做安装 / 杀进程）。
+#   E2E_PREFLIGHT_ONLY=1（测试用：只跑前置身份校验后退出；若走 bootstrap 会启动一次 dsh，
+#   但不做安装 / 杀进程）。
 #
 # 边界：
 #   - 只读宿主 dsh-web（systemctl is-active / ActiveEnterTimestamp），绝不重启、不碰宿主 ~/.dsh。
@@ -192,6 +193,28 @@ guest_ns() {
   docker exec -i "$CONTAINER" sh -c "readlink /proc/1/ns/$1" 2>/dev/null | tr -d '\r\n' || true
 }
 
+# 启动容器内 dsh（一次性插件令牌）并等到日志就绪 + 宿主端口可达。
+# 两条路径共用：前置 bootstrap（容器里没有在跑实例）与第 4 步重启。
+STARTED_HTTP_CODE=""
+start_guest_dsh() {
+  dex_sh "cd $GUEST_ROOT/workspace && setsid nohup node $GUEST_PREFIX/bin/dsh --profile web --port 3080 --no-open > $GUEST_LOG 2>&1 < /dev/null & echo started" \
+    -e FLOW_STUDIO_TOKEN="$TOKEN" >/dev/null
+  local ready=0
+  for _ in $(seq 1 80); do
+    if dex_sh "grep -q '^dsh web: http' $GUEST_LOG" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 0.5
+  done
+  [ "$ready" = "1" ] || { dex_sh "tail -40 $GUEST_LOG" || true; die "容器内 dsh 未在 40s 内启动"; }
+  local port_up=0 code=""
+  for _ in $(seq 1 40); do
+    code="$(curl -s -m 1 -o /dev/null -w '%{http_code}' "$ORIGIN/" 2>/dev/null || true)"
+    [ "$code" != "000" ] && { port_up=1; break; }
+    sleep 0.5
+  done
+  [ "$port_up" = "1" ] || die "容器内 dsh 启动后端口 $PORT 仍不可达"
+  STARTED_HTTP_CODE="$code"
+}
+
 # 容器内路径的 dev:inode（node 一定在，避免宿主 stat 与 busybox 参数差异）。
 guest_path_id() {
   docker exec -i -e "PATH=$GUEST_PREFIX/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -207,6 +230,7 @@ try {
 
 EVID_READY=0
 PREFLIGHT_OK=0
+BOOTSTRAP=0
 LOCK_KIND=""
 on_exit() {
   local rc=$1
@@ -274,8 +298,7 @@ done
 [ -z "$BAD_MAPPED" ] || die "端口映射错配：期望宿主端口 $PORT（TESTBED_PORT），但容器 $CONTAINER 的 3080 映射到了$(printf '%s' "$BAD_MAPPED")（docker port 实际：$(printf '%s' "$PORT_MAP" | tr '\n' ' ')）"
 ok "端口映射对应：容器 $CONTAINER:3080 → 宿主 $PORT（docker port：$(printf '%s' "$PORT_MAP" | tr '\n' ' ')）"
 
-curl -s -m 5 -o /dev/null "$ORIGIN/" || die "宿主端口 $PORT 不可达（$ORIGIN/）"
-ok "宿主端口 $PORT 可达"
+# 端口可达性不在这里单独要求：有实例时由下面的 303 登录证明，无实例时走 bootstrap 再等端口。
 
 # 1b. PID / NET namespace 必须与宿主隔离；共享 namespace 时 /proc 扫描与端口归属都不可信。
 PID_MODE="$(docker inspect -f '{{.HostConfig.PidMode}}' "$CONTAINER" 2>/dev/null || true)"
@@ -323,11 +346,27 @@ else
   ok "挂载隔离：宿主 $HOST_DSH_DIR 不存在，容器未挂载它（实际挂载：$(printf '%s' "$MOUNT_SOURCES" | tr '\n' ' ')）"
 fi
 
-# 1d. 监听 3080 的 PID 必须属于该容器，且就是测试台 dsh。
+# 1d. 监听 3080 的进程：有 → 必须属于该容器且是测试台 dsh；没有 → bootstrap。
 LISTENERS="$(guest_listeners || true)"
+LISTENER_COUNT="$(printf '%s' "$LISTENERS" | jqr 'Array.isArray(j)?j.length:-1')"
+case "$LISTENER_COUNT" in
+  ''|-1)
+    die "容器 $CONTAINER 内读不出 /proc 监听信息（期望读到监听 3080 的进程，实际：$(printf '%.300s' "$LISTENERS")）" ;;
+  0)
+    # 容器刚重启 / dsh 崩了 / 第一次跑：没有在跑实例，不 kill、也不拿旧日志 token 赌端口归属，
+    # 由本脚本用一次性令牌起一个，再用它的日志 token 登录 303 证明端口归属（bootstrap）。
+    say "容器 $CONTAINER 内没有监听 3080 的实例：走 bootstrap（不 kill 任何进程，由本脚本启动 dsh）"
+    start_guest_dsh
+    BOOTSTRAP=1
+    LISTENERS="$(guest_listeners || true)" ;;
+esac
 verify_guest_dsh "$LISTENERS"
 LISTENER_PIDS="$VERIFIED_PIDS"
-ok "容器内监听 3080 的进程：PID $LISTENER_PIDS（comm/cwd/cmdline 已核对属于本容器）"
+if [ "$BOOTSTRAP" = "1" ]; then
+  ok "bootstrap：容器内 dsh 已由本脚本启动，监听 3080 的 PID：$LISTENER_PIDS（身份已核对）"
+else
+  ok "容器内监听 3080 的进程：PID $LISTENER_PIDS（comm/cwd/cmdline 已核对属于本容器）"
+fi
 
 # 1e. 端口归属：用容器日志里的令牌登录，303 才能证明端口上的服务就是该容器这次启动的 dsh。
 PRE_LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_LOG 2>/dev/null | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n' || true)"
@@ -408,26 +447,12 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 [ "$OLD_GONE" = "1" ] || die "旧 dsh 进程未释放端口 $PORT"
-dex_sh "cd $GUEST_ROOT/workspace && setsid nohup node $GUEST_PREFIX/bin/dsh --profile web --port 3080 --no-open > $GUEST_LOG 2>&1 < /dev/null & echo started" \
-  -e FLOW_STUDIO_TOKEN="$TOKEN" >/dev/null
-READY=0
-for _ in $(seq 1 80); do
-  if dex_sh "grep -q '^dsh web: http' $GUEST_LOG" >/dev/null 2>&1; then READY=1; break; fi
-  sleep 0.5
-done
-[ "$READY" = "1" ] || { dex_sh "tail -40 $GUEST_LOG" || true; die "容器内 dsh 未在 40s 内启动"; }
-PORT_UP=0
-for _ in $(seq 1 40); do
-  CODE="$(curl -s -m 1 -o /dev/null -w '%{http_code}' "$ORIGIN/" 2>/dev/null || true)"
-  [ "$CODE" != "000" ] && { PORT_UP=1; break; }
-  sleep 0.5
-done
-[ "$PORT_UP" = "1" ] || die "容器内 dsh 启动后端口 $PORT 仍不可达"
+start_guest_dsh
 # 重启后端口上的服务也必须是本容器内的 dsh（防止端口被别人先占用）。
 NEW_LISTENERS="$(guest_listeners || true)"
 verify_guest_dsh "$NEW_LISTENERS"
 NEW_PIDS="$VERIFIED_PIDS"
-ok "容器内 dsh 已重启（$ORIGIN/ 返回 $CODE，监听 3080 的 PID：$NEW_PIDS）"
+ok "容器内 dsh 已重启（$ORIGIN/ 返回 $STARTED_HTTP_CODE，监听 3080 的 PID：$NEW_PIDS）"
 
 say "5. 登录换 cookie"
 LOGIN_TOKEN="$(dex_sh "grep -o 'token=[A-Za-z0-9_-]*' $GUEST_LOG 2>/dev/null | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n' || true)"
@@ -636,7 +661,7 @@ if (frozen.definitionId !== process.argv[3]) {
   || die "GET /instances/$IID/definition 未返回冻结 XML"
 ok "GET /instances/$IID/definition 返回冻结 XML（definitionVersion=$(jqr 'j.definitionVersion' <"$EVID/instance-definition.json")）"
 
-say "8b. 清理（0.13.4 的新域没有 DELETE 路由：先断言 405，再清测试台数据目录）"
+say "8b. 清理（当前新域没有 DELETE 路由：先断言 405，再清测试台数据目录）"
 DEL_INSTANCE_CODE="$(del_code "/instances/$IID")"
 assert_eq "$DEL_INSTANCE_CODE" "405" "DELETE /instances/$IID 竟然被路由接受（契约已变，请更新本脚本）"
 DEL_DEF_CODE="$(del_code "/definitions/$DEF_ID")"

@@ -40,7 +40,7 @@ bash scripts/e2e-docker.sh
 
 `scripts/e2e-docker.sh` 验的是旧运行域（`/flows`、`/runs`、打回、supervision）。0.13 的新 BPMN 域（`/definitions`、`/instances`、人工任务、画布 chunk）用单独的 `scripts/e2e-bpmn.sh` 验收：打包 → 装进 `dsh-testbed-bpmn` → 重启容器内 dsh（带一次性插件令牌）→ 换宿主登录 cookie → **只走 HTTP** 跑 `start → userTask → end`。
 
-**前置阶段先验身份、再做破坏性操作**：脚本在任何安装 / 杀进程之前，先按顺序校验容器在跑、`docker port` 的 3080 宿主端口等于 `TESTBED_PORT`、PID 与 network namespace 不与宿主共享、容器没有挂载宿主 `~/.dsh`、监听 3080 的 PID 属于该容器且是测试台 dsh（socket inode 反查 PID，再核对 `comm` / `cwd` / `cmdline`），最后用容器日志里的令牌登录一次并期望 303。任一项不匹配就直接退出并打印期望 / 实际，不碰容器。前提是测试台里已经有一个由本脚本启动的 dsh（日志在 `/testbed/logs/dsh-web.log`，里面有一行 `token=...`）。
+**前置阶段先验身份、再做破坏性操作**：脚本在任何安装 / 杀进程之前，先按顺序校验容器在跑、`docker port` 的 3080 宿主端口等于 `TESTBED_PORT`、PID 与 network namespace 不与宿主共享、容器没有挂载宿主 `~/.dsh`。之后分两种情况：容器里**已有**监听 3080 的实例时，要求该 PID 属于本容器且是测试台 dsh（socket inode 反查 PID，再核对 `comm` / `cwd` / `cmdline`），并用容器日志里的令牌登录一次、必须 303，否则拒绝；容器里**没有**监听 3080 的实例时（刚重启 / dsh 崩了 / 第一次跑）走 **bootstrap**：不 kill 任何进程，由脚本用一次性 `FLOW_STUDIO_TOKEN` 启动 dsh，等端口就绪后再用它日志里的令牌登录 303，作为端口归属的证明。任一项不匹配就直接退出并打印期望 / 实际，不碰容器。
 
 ```sh
 bash scripts/e2e-bpmn.sh
@@ -49,16 +49,16 @@ bash scripts/e2e-bpmn.sh
 它断言（按脚本打印的阶段编号）：
 
 - **0**：记录宿主 `dsh-web` 的 active 状态与启动时间作为隔离基线。
-- **1**：容器在跑、端口映射与 `TESTBED_PORT` 一致、PID / NET namespace 隔离、未挂载宿主 `~/.dsh`、监听 3080 的是本容器的 dsh、容器日志令牌登录返回 303；全部通过后才检查容器内 `git` 与 `pnpm`（缺 `git` 时只在容器里装）。
+- **1**：容器在跑、端口映射与 `TESTBED_PORT` 一致、PID / NET namespace 隔离、未挂载宿主 `~/.dsh`；已有监听 3080 的实例时校验它是本容器的 dsh 且日志令牌登录返回 303，没有实例时走 bootstrap（不 kill，由脚本启动 dsh 再登录 303）。全部通过后才检查容器内 `git` 与 `pnpm`（缺 `git` 时只在容器里装）。
 - **2**：`npm run build` → `node scripts/verify-build.mjs` → `npm pack`；tgz 内版本等于仓库 `package.json`。
 - **3**：用 `sed` 把 profile 依赖指向拷进容器的 tgz，`pnpm install`（不手工解包）；容器内版本等于仓库版本，且 `lib/client.bpmn.js` 与仓库构建产物逐字节一致。
 - **4–6**：只终止本容器内监听 3080 的 dsh（按 socket inode 反查 PID，并核对 `comm` / `cwd` / `cmdline`），然后重启并再次核对新监听进程；登录换 cookie 期望 303；`/health` 的 `version`、`ok`、`bpmn.enabled` 正确，`authMode=full` 证明插件令牌生效。
 - **7**：从 `/` 的 `__DSH_BOOT__` 取 flow-studio 入口 rev，`client.bpmn.js?rev=<rev>` 必须 200；去掉宿主追加的 `sourceMappingURL` 尾注后的正文与 `lib/client.bpmn.js` 逐字节一致且含 `bpmn-js`。
-- **8**：`POST /definitions` 存带 BPMN DI 的最小定义（`e2e-start → e2e-user-task → e2e-end`）→ 列表/详情回读 → `POST /instances` 启动 → 轮询到 `ACTIVE` + `pendingTasks` → `POST /instances/<id>/tasks/e2e-user-task/complete` → `COMPLETED`；事件流含 `activity/end` 与 `process/end`，`GET /instances/<id>/definition` 返回冻结 XML。**0.13.4 的新域没有 HTTP DELETE**（脚本断言两个 DELETE 均 405），清理改为删容器内测试台的数据目录并断言列表里不再出现。
+- **8**：`POST /definitions` 存带 BPMN DI 的最小定义（`e2e-start → e2e-user-task → e2e-end`）→ 列表/详情回读 → `POST /instances` 启动 → 轮询到 `ACTIVE` + `pendingTasks` → `POST /instances/<id>/tasks/e2e-user-task/complete` → `COMPLETED`；事件流含 `activity/end` 与 `process/end`，`GET /instances/<id>/definition` 返回冻结 XML。**当前新域没有 HTTP DELETE**（脚本断言两个 DELETE 均 405），清理改为删容器内测试台的数据目录并断言列表里不再出现。
 - **9**：无 cookie 的 `GET /instances`、只有插件令牌没有 cookie、只有 cookie 没有插件令牌的 `POST /definitions` 都必须 401/403。
 - **10**：再读宿主 `dsh-web` 的 active 状态与 `ActiveEnterTimestamp`，未变才算过。
 
-环境变量：`TESTBED_CONTAINER`（默认 `dsh-testbed-bpmn`）、`TESTBED_PORT`（默认 `3110`）、`E2E_RUN_ID`（覆盖证据子目录名）、`E2E_PREFLIGHT_ONLY=1`（只跑前置身份校验后退出，供无副作用演练）。每次运行使用独立证据目录 `.tmp/e2e-bpmn/<runId>/`（runId 含时间戳与 pid），tgz 也打在里面；旧版本平铺在 `.tmp/e2e-bpmn/` 下的文件只作兼容读取，不会被删除。`.tmp/e2e-bpmn/.e2e-bpmn.lock` 用 `flock` 串行化运行——两个运行会同时改 `lib/`、同一容器与同一端口，所以并行请求会被直接拒绝。
+环境变量：`TESTBED_CONTAINER`（默认 `dsh-testbed-bpmn`）、`TESTBED_PORT`（默认 `3110`）、`E2E_RUN_ID`（覆盖证据子目录名）、`E2E_PREFLIGHT_ONLY=1`（只跑前置身份校验后退出；若走 bootstrap 会启动一次 dsh，但不做安装 / 杀进程）。每次运行使用独立证据目录 `.tmp/e2e-bpmn/<runId>/`（runId 含时间戳与 pid），tgz 也打在里面；旧版本平铺在 `.tmp/e2e-bpmn/` 下的文件只作兼容读取，不会被删除。`.tmp/e2e-bpmn/.e2e-bpmn.lock` 用 `flock` 串行化运行——两个运行会同时改 `lib/`、同一容器与同一端口，所以并行请求会被直接拒绝。
 
 ## 3. 失败时怎么取证
 

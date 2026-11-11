@@ -331,15 +331,16 @@ runner 内部执行态（不对外当实例状态）：
 |---|---|---|
 | `adapter:"dsh"` 或缺失 | 明确失败；不创建子会话、不造假 handler | `BPMN_AGENT_ADAPTER_UNAVAILABLE`（文案说明 0.13.1 提供 AgentAdapter + hooks） |
 | 未知 adapter | 明确失败 | `BPMN_AGENT_ADAPTER_UNSUPPORTED` |
-| `adapter:"codex"/"custom"` | 复用 `src/executor.js` 的 `runExternalExecutor`；`ctx.signal` / `attempt` / `variables` / `timeoutMs` 透传 | 失败时 `EXECUTOR_*` / `BPMN_ABORTED`（runner 外层包成 `BPMN_HANDLER_FAILED`） |
+| `adapter:"dsh"/"codex"` | 注册过的适配器走 AgentAdapter + `flow_finish_node` 完结门 | 未注册 / 无注册表：`BPMN_AGENT_ADAPTER_UNAVAILABLE`（节点零派发） |
+| `adapter:"custom"` | 明确失败；custom 外部 executor 不再是 agent 完结路径 | `BPMN_AGENT_ADAPTER_UNSUPPORTED`（节点零派发） |
 | http connector | **不实现真实 HTTP**（0.13.4） | `BPMN_HTTP_NOT_IMPLEMENTED` |
 | parallel / inclusive 网关、多实例 | 解析期拒绝 | `PARALLEL_GATEWAY_FORBIDDEN` / `INCLUSIVE_GATEWAY_FORBIDDEN` / `MULTI_INSTANCE_FORBIDDEN` |
 | 人工任务 TTL | 0.13.0 不做超时策略（不自动失败） | — |
 
 `executeAgent` / `executeHttp` 签名固定为 **`(element, ctx)`** 两个参数；runner 的 ctx 是
-变量快照（`attempt` / `variables` / `signal` / `timeoutMs`）。测试注入的桩 executor
-只存在于 `createBpmnRuntime({executorRunner})` / createHandler env 的 `bpmnExecutor`，
-生产路径默认 `runExternalExecutor`。
+变量快照（`attempt` / `variables` / `signal` / `timeoutMs`）。测试注入的假 adapter 只存在于
+`createBpmnRuntime({adapters})` / createHandler env 的 `bpmnAdapters`；BPMN 域没有外部
+executor 回退路径（`custom` 与缺注册表都明确失败）。
 
 ## 9 错误码与 HTTP 语义
 

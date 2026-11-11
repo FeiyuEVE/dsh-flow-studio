@@ -5,8 +5,9 @@
  * 边界（0.13.0）：
  *   - 只做 headless 引擎 + 定义/实例 API，不碰画布（bpmn.io 在后续阶段）；
  *   - 不重写 `definition-store` / `instance-store`，只调用它们的导出函数；
- *   - 服务处理器只接外部 CLI executor（codex / custom）；`dsh` 适配器与 http
- *     connector **明确失败**，不伪造成功（错误码见下）。
+ *   - agent 节点只走注册过的 AgentAdapter（dsh / codex）+ `flow_finish_node`
+ *     完结门；`custom` 外部 executor、缺注册表的任何 adapter、http connector
+ *     **明确失败**，不伪造成功、不退回解析 CLI 输出（错误码见下）。
  *
  * 目录（计划 §2：模板域与运行实例域隔离，均与老 `flows/`、`runs/` 平级）：
  * ```
@@ -71,7 +72,6 @@ import {
   AGENT_EXECUTE_ERROR, DEFAULT_ADAPTER_ID, admitAdapter, createAdapterProbeCache,
   resolveAdapterId, resolveAgentTimeoutMs, runAgentNode,
 } from './agent-execute.js'
-import { normalizeExecutor, runExternalExecutor } from './executor.js'
 import { checkRunId } from './runlog.js'
 
 /** 引擎版本（计划 §10.4 的 health 字段）。 */
@@ -273,9 +273,7 @@ function runnerErrorStatus(code) {
  *   definitionsRoot?: string,
  *   instancesRoot?: string,
  *   maxActiveInstances?: number,
- *   executorRunner?: Function,
- *   executorNormalizer?: Function,
- *   adapters?: object,       // AgentAdapter 注册表（createAdapterRegistry()）；缺省时 dsh 明确失败
+ *   adapters?: object,       // AgentAdapter 注册表（createAdapterRegistry()）；缺省时 agent 节点明确失败
  *   workspaceRoot?: string,  // agent 节点的文档相对基准（默认 process.cwd()）
  * }} [options]
  * @returns {BpmnRuntime}
@@ -291,8 +289,6 @@ export function createBpmnRuntime(options = {}) {
     ...roots,
     env,
     maxActiveInstances: options.maxActiveInstances,
-    executorRunner: options.executorRunner,
-    executorNormalizer: options.executorNormalizer,
     adapters: options.adapters,
     workspaceRoot: options.workspaceRoot,
   })
@@ -306,9 +302,7 @@ class BpmnRuntime {
     this.instancesRoot = options.instancesRoot
     this.env = options.env
     this.maxActiveInstances = options.maxActiveInstances
-    this.executorRunner = typeof options.executorRunner === 'function' ? options.executorRunner : runExternalExecutor
-    this.executorNormalizer = typeof options.executorNormalizer === 'function' ? options.executorNormalizer : normalizeExecutor
-    /** AgentAdapter 注册表（dsh / codex）；缺省时 dsh 节点按旧接线明确失败。 */
+    /** AgentAdapter 注册表（dsh / codex）；缺省时 agent 节点明确失败（不再回退外部 executor）。 */
     this.adapters = options.adapters && typeof options.adapters.get === 'function' ? options.adapters : null
     /** agent 节点 documents 的相对基准。 */
     this.workspaceRoot = typeof options.workspaceRoot === 'string' && options.workspaceRoot.trim() !== ''
@@ -1296,9 +1290,6 @@ class BpmnRuntime {
         probeAdapter: this._probeAdapter,
         workspaceRoot: this.workspaceRoot,
         instanceId,
-        // 旧外部 CLI 逃生门（adapter=custom / 无注册表时的 codex）仍用注入的桩/真实现。
-        runExecutor: this.executorRunner,
-        normalizeExecutor: this.executorNormalizer,
       })
     } catch (error) {
       // 失败落点（如 NODE_FINISH_MISSING）也必须让提醒事件进实例事件流：
@@ -1856,17 +1847,8 @@ function versionOf(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// 服务处理器（0.13.0 范围：外部 CLI executor 薄接；其余明确失败）
+// 服务处理器（0.13.x 范围：AgentAdapter + 完结门；其余明确失败）
 // ---------------------------------------------------------------------------
-
-/**
- * 读出 handler 该用的 attempt / variables（runner 的 ctx 是快照拷贝）。
- */
-function handlerContext(ctx) {
-  const attempt = ctx && Number.isSafeInteger(ctx.attempt) && ctx.attempt >= 1 ? ctx.attempt : 1
-  const variables = ctx && isPlainObject(ctx.variables) ? ctx.variables : {}
-  return { attempt, variables }
-}
 
 function throwIfAborted(ctx) {
   if (ctx?.signal?.aborted) {
@@ -1876,26 +1858,10 @@ function throwIfAborted(ctx) {
   }
 }
 
-/** 外部 executor 的 prompt：节点提示词 + attempt / variables（下游能看见上下文）。 */
-function buildExecutorPrompt(element, ctx) {
-  const node = isPlainObject(element?.node) ? element.node : {}
-  const base = [node.prompt, node.roleCard]
-    .filter(value => typeof value === 'string' && value.trim() !== '')
-    .join('\n\n')
-    || (typeof element?.name === 'string' && element.name !== '' ? element.name : null)
-    || (typeof element?.id === 'string' ? element.id : '执行节点')
-  const { attempt, variables } = handlerContext(ctx)
-  const lines = [base, `执行上下文：attempt=${attempt}`]
-  if (Object.keys(variables).length > 0) {
-    lines.push(`变量：\n${JSON.stringify(variables)}`)
-  }
-  return lines.join('\n\n')
-}
-
 /**
  * agent 节点处理器（签名固定 `(element, ctx)`）。
  *
- * 0.13.1 A3 起：`dsh` / `codex` 等注册过的 adapter 走 **AgentAdapter + flow_finish_node
+ * `dsh` / `codex` 等**注册过**的 adapter 走 **AgentAdapter + flow_finish_node
  * 完结门**（`agent-execute.js`）：
  *
  * 1. `fs:node@adapter` 决定 adapter id（缺失默认 `dsh`；旧 `fs:executor@kind` 兜底）；
@@ -1906,17 +1872,16 @@ function buildExecutorPrompt(element, ctx) {
  * 5. 失败码原样冒泡（`NODE_FINISH_MISSING` / `NODE_VARIABLES_INVALID` / …），
  *    由 runtime 写 lastError、实例保持 ACTIVE。
  *
- * 兼容：`adapter=custom`（以及没有注册表时的 `codex`）仍走旧的 `runExternalExecutor`
- * 外部 CLI 路径——这是逃生门，不破坏 0.13.0 的既有接线。没有注册表时的 `dsh`
- * 明确报 `BPMN_AGENT_ADAPTER_UNAVAILABLE`（旧行为，不伪造成功）。
+ * 不再有外部 CLI 逃生门：`adapter=custom` 明确报 `BPMN_AGENT_ADAPTER_UNSUPPORTED`；
+ * 没有适配器注册表时任何 id（含 `codex`）都明确失败，不退回旧外部 CLI executor。
  *
- * 第三个参数是本模块内部注入点（测试用桩 executor / adapter 注册表）；公开契约仍是两个参数。
+ * 第三个参数是本模块内部注入点（测试用 adapter 注册表）；公开契约仍是两个参数。
  *
  * @param {object} element
  * @param {{attempt?: number, variables?: object, signal?: AbortSignal, timeoutMs?: number|null,
  *   executionId?: string}} ctx
- * @param {{runExecutor?: Function, normalizeExecutor?: Function, adapters?: object,
- *   probeAdapter?: Function, workspaceRoot?: string, instanceId?: string}} [options]
+ * @param {{adapters?: object, probeAdapter?: Function, workspaceRoot?: string,
+ *   instanceId?: string, log?: Function}} [options]
  * @returns {Promise<{output?: unknown, usage?: object, artifacts?: object[], summary?: string,
  *   events?: object[]}>}
  */
@@ -1926,27 +1891,33 @@ export async function executeAgent(element, ctx, options = {}) {
   const adapterId = declared ?? DEFAULT_ADAPTER_ID
   const adapters = options.adapters && typeof options.adapters.get === 'function' ? options.adapters : null
 
-  // 逃生门：custom 永远走外部 CLI executor（既有测试与运维用法）。
+  // 旧口径的逃生门：custom 曾直接走外部 CLI executor（不经过 flow_finish_node）。
+  // 新口径只认工具完结核验，custom 不再是 agent 完结路径，必须明确拒绝。
   if (adapterId === 'custom') {
-    return await executeAgentViaExecutor(element, ctx, options, 'custom')
+    throw handlerError(
+      AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
+      'agent adapter「custom」不再受支持：custom 外部 executor 不再是 agent 完结路径；'
+        + '请用注册过的 adapter（dsh/codex），节点必须调用 flow_finish_node',
+      { adapter: adapterId, elementId: element?.id ?? null },
+    )
   }
 
   if (adapters === null) {
-    // 旧接线（没有注册表）：codex 保留外部 CLI 路径；dsh / 未知 adapter 明确失败。
-    if (adapterId === 'codex') {
-      return await executeAgentViaExecutor(element, ctx, options, 'codex')
-    }
-    if (adapterId === 'dsh') {
+    // 没有注册表：任何 id 都明确失败，不回退到外部 CLI executor。
+    if (adapterId === 'dsh' || adapterId === 'codex') {
       throw handlerError(
         AGENT_EXECUTE_ERROR.ADAPTER_UNAVAILABLE,
-        '0.13.1 起 dsh 走 AgentAdapter + flow_finish_node，但当前 runtime 没有适配器注册表'
-          + '（createAdapterRegistry + createDshAdapter）；只支持外部 CLI executor（adapter=codex/custom）',
+        `${adapterId} 走 AgentAdapter + flow_finish_node，但当前 runtime 没有适配器注册表`
+          + '（createAdapterRegistry + createDshAdapter / createCodexAdapter）；'
+          + '节点必须调用 flow_finish_node 完结，不退回外部 CLI 输出',
         { adapter: adapterId, elementId: element?.id ?? null },
       )
     }
     throw handlerError(
       AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
-      `不支持的 agent adapter「${adapterId}」：没有适配器注册表时只支持 codex / custom`,
+      `不支持的 agent adapter「${adapterId}」：当前 runtime 没有适配器注册表，`
+        + '且 custom 外部 executor 不再是 agent 完结路径；请注册 dsh/codex 适配器，'
+        + '节点必须调用 flow_finish_node',
       { adapter: adapterId, elementId: element?.id ?? null },
     )
   }
@@ -1998,84 +1969,6 @@ export async function executeAgent(element, ctx, options = {}) {
     ...(remainingTimeoutMs > 0 ? { timeoutMs: remainingTimeoutMs } : {}),
     log: typeof options.log === 'function' ? options.log : undefined,
   })
-}
-
-/**
- * 旧路径：外部 CLI executor（`adapter=custom` / 无注册表时的 `codex`）。
- * 行为与 0.13.0 保持一致（便于回退与既有测试）。
- *
- * @param {object} element
- * @param {object} ctx
- * @param {{runExecutor?: Function, normalizeExecutor?: Function}} [options]
- * @param {'custom'|'codex'} adapterId
- */
-async function executeAgentViaExecutor(element, ctx, options, adapterId) {
-  const node = isPlainObject(element?.node) ? element.node : {}
-  const normalize = typeof options.normalizeExecutor === 'function' ? options.normalizeExecutor : normalizeExecutor
-  let spec
-  try {
-    spec = normalize({
-      executor: adapterId,
-      executorCommand: node.executor?.command,
-      model: node.model,
-      mode: node.team?.mode,
-    })
-  } catch (error) {
-    throw handlerError(
-      typeof error?.code === 'string' ? error.code : 'BPMN_EXECUTOR_INVALID',
-      errorText(error),
-      { elementId: element?.id ?? null, cause: error },
-    )
-  }
-
-  const runExecutor = typeof options.runExecutor === 'function' ? options.runExecutor : runExternalExecutor
-  const timeoutMs = Number.isSafeInteger(ctx?.timeoutMs) && ctx.timeoutMs > 0
-    ? ctx.timeoutMs
-    : (Number.isSafeInteger(node.executor?.timeoutMs) && node.executor.timeoutMs > 0 ? node.executor.timeoutMs : 0)
-  const result = await runExecutor({
-    spec,
-    prompt: buildExecutorPrompt(element, ctx),
-    cwd: typeof node.executor?.cwd === 'string' && node.executor.cwd.trim() !== ''
-      ? node.executor.cwd.trim()
-      : process.cwd(),
-    timeoutMs,
-    signal: ctx?.signal,
-  })
-
-  throwIfAborted(ctx)
-  if (!result || result.ok !== true) {
-    const reason = result?.reason
-    const code = typeof result?.code === 'string' && result.code !== ''
-      ? result.code
-      : reason === 'aborted'
-        ? 'BPMN_ABORTED'
-        : reason === 'timeout'
-          ? 'BPMN_EXECUTOR_TIMEOUT'
-          : reason === 'OUTPUT_LIMIT'
-            ? 'BPMN_EXECUTOR_OUTPUT_LIMIT'
-            : 'BPMN_EXECUTOR_FAILED'
-    const tail = typeof result?.tail === 'string' && result.tail !== '' ? `；stderr 尾部：${result.tail}` : ''
-    throw handlerError(
-      code,
-      `外部 executor 执行失败（${reason ?? 'unknown'}）${result?.exitCode != null ? `，退出码 ${result.exitCode}` : ''}${tail}`,
-      { elementId: element?.id ?? null, reason: reason ?? null, exitCode: result?.exitCode ?? null },
-    )
-  }
-
-  const rawEvents = Array.isArray(result.events) ? result.events : []
-  const events = rawEvents
-    .filter(event => isPlainObject(event) && typeof event.text === 'string' && event.text.trim() !== '')
-    .slice(0, 200)
-    .map(event => ({
-      type: 'agent/log',
-      kind: event.kind ?? 'log',
-      text: event.text.length > 2000 ? `${event.text.slice(0, 2000)}…` : event.text,
-    }))
-  return {
-    output: result.structured ?? result.text,
-    ...(result.usage && isPlainObject(result.usage) ? { usage: result.usage } : {}),
-    ...(events.length > 0 ? { events } : {}),
-  }
 }
 
 /**

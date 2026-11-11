@@ -158,7 +158,7 @@ interface AgentInputs {
 
 1. **抽基类**：把 `runExternalExecutor`（`executor.js:640`）的进程组、超时、字节/事件上限、临时文件回收抽成 `ProcessAdapter`；codex = `CodexAdapter`（拼 argv `executor.js:266`、解析 JSONL `executor.js:359`、usage 归一化 `:308`），claude = `ClaudeAdapter`（argv + `stream-json`），custom = `CustomAdapter`（模板 + 三通道，`executor.js:577`）。
 2. **dsh 收编**：`DshAdapter.start/resume` 直接调 `agents.create/resume` + `setup`，把现在散在 `engine.js:2298-2420` 的会话/路由逻辑移进适配器；`agentOptions` 归一化留在 runstore 侧。
-3. **兼容层**：`EXECUTORS`（`executor.js:69`）保留为 legacy 枚举；节点新字段 `adapter` 优先，旧 `executor` 经 `normalizeExecutor` 映射到 adapter id；`custom` 永久保留为逃生门，能力表如实声明「无 tool 级 hook」。
+3. **兼容层**：`EXECUTORS`（`executor.js:69`）保留为 legacy 外部进程枚举（只服务旧运行域）；节点新字段 `adapter` 优先，旧 `executor` 经 `normalizeExecutor` 映射到 adapter id；BPMN 域已删除 `custom` 逃生门——`custom` 节点明确报 `BPMN_AGENT_ADAPTER_UNSUPPORTED`，agent 完结只认 `flow_finish_node`。
 4. **能力探测**：启动时 `probe()` 记录 codex/claude 版本与 `--help` 摘要；节点要求的能力与 `capabilities()` 不符 → `plan()` 拒绝（strict）或降级（record），UI 显示降级原因。
 5. **测试**：每个适配器跑同一套 conformance（事件顺序、阻断、超时、取消、usage 口径、降级留痕）；用录制 JSONL fixture，不依赖真模型。
 

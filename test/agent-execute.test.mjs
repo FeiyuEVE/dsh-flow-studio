@@ -357,7 +357,7 @@ await check('超时：ctx.timeoutMs 到 → BPMN_ACTIVITY_TIMEOUT + cancel + dis
   A.equal(adapter.calls.dispose, 1, '超时后必须 dispose（不留僵尸）')
 })
 
-await check('节点 executor.timeoutMs：旧 executor 与新 adapter 同一时限，超时后 cancel（review-0131 #3）', async () => {
+await check('节点 executor.timeoutMs：custom 零派发，新 adapter 按节点时限超时（review-0131 #3）', async () => {
   const workspace = freshWorkspace()
   const NODE_TIMEOUT = 25
 
@@ -366,7 +366,8 @@ await check('节点 executor.timeoutMs：旧 executor 与新 adapter 同一时�
   A.equal(resolveAgentTimeoutMs({ node: { executor: { timeoutMs: NODE_TIMEOUT } } }, { timeoutMs: 40 }), 40)
   A.equal(resolveAgentTimeoutMs({ node: {} }, {}), 0)
 
-  // 旧路径：外部 executor 在 ctx.timeoutMs 缺省时使用 node.executor.timeoutMs。
+  // 回归（本次修复）：custom 不再走外部 executor —— 即使注入了 executor 桩，
+  // 也一次都不能被调用，错误码必须是 ADAPTER_UNSUPPORTED。
   const executorCalls = []
   const oldElement = {
     id: 'agent-old-timeout',
@@ -380,13 +381,25 @@ await check('节点 executor.timeoutMs：旧 executor 与新 adapter 同一时�
     executeAgent(oldElement, { attempt: 1, variables: {} }, {
       runExecutor: async options => {
         executorCalls.push(options)
-        return { ok: false, reason: 'timeout', exitCode: null, tail: 'timed out' }
+        return { ok: true, text: 'cli', structured: {}, usage: {}, exitCode: 0, events: [] }
       },
     }),
-    'BPMN_EXECUTOR_TIMEOUT',
-    '旧路径超时',
+    AGENT_EXECUTE_ERROR.ADAPTER_UNSUPPORTED,
+    'custom 必须明确拒绝',
   )
-  A.equal(executorCalls[0].timeoutMs, NODE_TIMEOUT, '旧 executor 必须收到 node.executor.timeoutMs')
+  A.equal(executorCalls.length, 0, 'custom 的 executor 桩一次都不能被调用')
+
+  // 没有注册表时 codex 同样零派发（不再回退旧 executor 路径）。
+  await rejectsCode(
+    executeAgent(
+      { id: 'agent-old-codex', node: { adapter: 'codex', executor: { kind: 'codex', timeoutMs: NODE_TIMEOUT } } },
+      { attempt: 1, variables: {} },
+      { runExecutor: async options => { executorCalls.push(options); return { ok: true } } },
+    ),
+    AGENT_EXECUTE_ERROR.ADAPTER_UNAVAILABLE,
+    '无注册表时 codex 必须明确拒绝',
+  )
+  A.equal(executorCalls.length, 0, '无注册表时 codex 的 executor 桩一次都不能被调用')
 
   // 新路径：没有全局活动超时时，节点自己的限时也必须生效并 cancel 适配器。
   const adapter = makeFakeAdapter({}) // exited 永不 resolve

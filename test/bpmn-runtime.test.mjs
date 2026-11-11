@@ -8,7 +8,7 @@
  * state.json 恢复（这正是新引擎的关键可靠性）。
  *
  * 禁止：不真跑 codex、不起 dsh 子会话、不发真实 HTTP。serviceTask 一律用注入的
- * 桩 executor；dsh adapter 只验证「明确失败」。
+ * 假 AgentAdapter（走 flow_finish_node 完结门）；无注册表 / custom 只验证「明确失败」。
  *
  * 产物落在项目 `.tmp/` 下（每个用例一个新 home，结束清理），不占系统 /tmp。
  * 运行：node test/bpmn-runtime.test.mjs
@@ -83,18 +83,58 @@ function makeCtx() {
   }
 }
 
-/** 桩 executor：不真跑 codex / custom，只证明 handler 路径被调用。 */
-function makeFakeExecutor(calls = []) {
-  return async options => {
-    calls.push(options)
-    return {
-      ok: true,
-      text: 'agent-stub-result',
-      structured: { ok: true },
-      usage: { input: 3, cacheRead: 0, cacheWrite: 0, output: 2, total: 5 },
-      exitCode: 0,
-      events: [],
-    }
+/**
+ * 桩 agent adapter：不真跑 codex / custom，只证明 handler 走的是
+ * AgentAdapter + flow_finish_node 完结门（BPMN 域已不接受外部 CLI 直出）。
+ *
+ * `behavior({ element, ctx, finishGate })` 可选：返回自定义 handle（慢节点 / 失败 /
+ * 大输出），返回 null 时走默认「提交一个成功完结记录」。
+ */
+function makeFakeAdapter(behavior = null) {
+  const calls = []
+  const adapter = {
+    id: 'dsh',
+    calls,
+    async probe() {
+      return { version: 'stub', helpDigest: 'stub' }
+    },
+    capabilities() {
+      return { finishTool: 'native', hooks: { 'turn.stop': 'emulated' } }
+    },
+    async start(request) {
+      calls.push(request)
+      if (typeof behavior === 'function') {
+        const custom = await behavior(request)
+        if (custom !== null && custom !== undefined) return custom
+      }
+      const submitted = await request.finishGate.submit({
+        variables: { ok: true },
+        documents: [],
+        summary: 'agent-stub-result',
+      })
+      return {
+        exited: Promise.resolve({
+          ok: true,
+          record: submitted.record,
+          usage: { input: 3, cacheRead: 0, cacheWrite: 0, output: 2, total: 5 },
+        }),
+      }
+    },
+    async cancel() {},
+    async dispose() {},
+  }
+  return adapter
+}
+
+/** 桩注册表：id 固定 dsh（fixture 里的 agent 节点都用 adapter="dsh"）。 */
+function makeFakeAdapters(adapter = makeFakeAdapter()) {
+  return {
+    get(id) {
+      return id === adapter.id ? adapter : undefined
+    },
+    list() {
+      return [adapter]
+    },
   }
 }
 
@@ -105,6 +145,9 @@ function makeEnv(home, opts = {}) {
     ctx: makeCtx(),
     engine: { engineName: 'stub' },
     startOptions: new Map(),
+    // fixture 的 agent 节点用 adapter="dsh"；默认给一个假的 dsh 适配器注册表。
+    // 需要验证「没有注册表」的用例显式传 bpmnAdapters: null。
+    bpmnAdapters: makeFakeAdapters(),
     ...opts,
   }
 }
@@ -153,8 +196,7 @@ function workflowXml(processId = 'proc-demo') {
     <bpmn:startEvent id="start"/>
     <bpmn:serviceTask id="agent1" name="写草稿">
       <bpmn:extensionElements>
-        <fs:node nodeType="agent" adapter="custom">
-          <fs:executor kind="custom" command="echo stub"/>
+        <fs:node nodeType="agent" adapter="dsh">
         </fs:node>
       </bpmn:extensionElements>
     </bpmn:serviceTask>
@@ -179,8 +221,7 @@ function badFeelXml() {
     <bpmn:startEvent id="start"/>
     <bpmn:serviceTask id="agent1">
       <bpmn:extensionElements>
-        <fs:node nodeType="agent" adapter="custom">
-          <fs:executor kind="custom" command="echo stub"/>
+        <fs:node nodeType="agent" adapter="dsh">
         </fs:node>
       </bpmn:extensionElements>
     </bpmn:serviceTask>
@@ -323,7 +364,7 @@ try {
   // 3. 实例定义快照：冻结 XML / 定义域新增版本或缺失都不影响 / 404 / 405
   // -------------------------------------------------------------------------
   await check('实例定义快照：定义新增版本、定义域被删后仍返回冻结 XML', async home => {
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const route = { handler: createHandler(makeEnv(home)) }
     const v1 = await seed(route)
     const instance = await startInstance(route)
 
@@ -386,8 +427,8 @@ try {
   // 4. 建实例 → serviceTask → userTask waiting + pendingTasks + 事件
   // -------------------------------------------------------------------------
   await check('实例：跑到 userTask 变 waiting，instance.json 有 pendingTasks，事件流三类齐全', async home => {
-    const calls = []
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor(calls) })) }
+    const agents = makeFakeAdapter()
+    const route = { handler: createHandler(makeEnv(home, { bpmnAdapters: makeFakeAdapters(agents) })) }
     await seed(route)
 
     const instance = await startInstance(route)
@@ -395,7 +436,7 @@ try {
     eq(instance.pendingTasks.length, 1, '必须停在人工任务上')
     eq(instance.pendingTasks[0].activityId, 'human1')
     ok(instance.lastSeq > 0, '事件必须已经落盘')
-    eq(calls.length, 1, 'serviceTask 必须调用一次外部 executor 桩')
+    eq(agents.calls.length, 1, 'serviceTask 必须派发一次 agent adapter')
 
     const raw = readInstanceJson(home, instance.id)
     eq(raw.status, 'ACTIVE')
@@ -445,7 +486,7 @@ try {
   // 4. 完成人工任务 → done + activity/end / flow/taken / process/end
   // -------------------------------------------------------------------------
   await check('人工任务完成：推进到 done，事件流含 activity/end、flow/taken、process/end', async home => {
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const route = { handler: createHandler(makeEnv(home)) }
     await seed(route)
     const instance = await startInstance(route)
 
@@ -477,7 +518,7 @@ try {
   // 5. 并发 complete：一个成功、一个 409，pendingTasks 不被写坏
   // -------------------------------------------------------------------------
   await check('并发完成：恰好一个成功、另一个 409，pendingTasks 不被写坏', async home => {
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const route = { handler: createHandler(makeEnv(home)) }
     await seed(route)
     const instance = await startInstance(route)
 
@@ -505,7 +546,7 @@ try {
   // 6. stop：aborted 终态、事件不重复、幂等
   // -------------------------------------------------------------------------
   await check('中止实例：aborted 终态，事件不新增不重复，重复 stop 幂等', async home => {
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const route = { handler: createHandler(makeEnv(home)) }
     await seed(route)
     const instance = await startInstance(route)
 
@@ -545,10 +586,11 @@ try {
   await check('懒恢复：新 runtime 丢掉注册表后 GET 能 recovered:true，并继续 complete 到 done', async home => {
     const env = {}
     const dir = store.flowsDir(home)
-    const fake = makeFakeExecutor()
+    const agents = makeFakeAdapter()
+    const fakeAdapters = makeFakeAdapters(agents)
     const url = new URL('http://localhost/')
 
-    const runtimeA = createBpmnRuntime({ dir, env, executorRunner: fake })
+    const runtimeA = createBpmnRuntime({ dir, env, adapters: fakeAdapters })
     let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-demo', name: '演示流程', xml: workflowXml() } })
     eq(res.status, 201, JSON.stringify(res.body))
     res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-demo', variables: { amount: 7 } } })
@@ -562,7 +604,7 @@ try {
     // 模拟进程重启：释放 A 的内存注册表（磁盘 state.json 保留）。
     await runtimeA.dispose()
 
-    const runtimeB = createBpmnRuntime({ dir, env, executorRunner: fake })
+    const runtimeB = createBpmnRuntime({ dir, env, adapters: fakeAdapters })
     const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', instanceId], url })
     eq(detail.status, 200, JSON.stringify(detail.body))
     eq(detail.body.recovered, true, '新 runtime 必须从 state 恢复')
@@ -654,9 +696,9 @@ try {
   })
 
   // -------------------------------------------------------------------------
-  // 8. handler 边界：dsh 明确失败 / http 明确未实现 / custom 传上下文
+  // 8. handler 边界：无注册表明确失败 / custom 零派发 / http 明确未实现
   // -------------------------------------------------------------------------
-  await check('handler 边界：dsh 报 BPMN_AGENT_ADAPTER_UNAVAILABLE，http 报 BPMN_HTTP_NOT_IMPLEMENTED', async () => {
+  await check('handler 边界：无注册表明确失败；custom 与 codex 零派发；http 未实现', async () => {
     const dshElement = { id: 'agent-dsh', node: { adapter: 'dsh', prompt: 'hi' } }
     const missingAdapter = { id: 'agent-none', node: { prompt: 'hi' } }
     const ctx = { attempt: 1, variables: { a: 1 }, signal: new AbortController().signal }
@@ -672,39 +714,85 @@ try {
     await rejects(
       () => executeHttp({ id: 'http-1', node: { http: { method: 'GET', url: 'https://example.com' } } }, ctx),
       error => error.code === 'BPMN_HTTP_NOT_IMPLEMENTED',
-      '0.13.0 不得实现真实 HTTP',
+      '0.13.4 仍不实现真实 HTTP',
     )
 
-    // custom 走注入桩：证明 ctx.attempt / variables 被带进 prompt，且没有真跑子进程。
-    const calls = []
-    const result = await executeAgent(
-      { id: 'agent-custom', name: '自定义', node: { adapter: 'custom', executor: { kind: 'custom', command: 'echo stub' } } },
-      { attempt: 2, variables: { amount: 7 }, signal: new AbortController().signal, timeoutMs: 1234 },
-      { runExecutor: makeFakeExecutor(calls) },
+    // 回归（本次修复）：custom 不再是 agent 完结路径，executor 桩一次都不能被调用。
+    const executorCalls = []
+    const executorStub = async options => {
+      executorCalls.push(options)
+      return { ok: true, text: 'cli', structured: { cli: true }, usage: {}, exitCode: 0, events: [] }
+    }
+    await rejects(
+      () => executeAgent(
+        { id: 'agent-custom', name: '自定义', node: { adapter: 'custom', executor: { kind: 'custom', command: 'echo stub' } } },
+        { attempt: 2, variables: { amount: 7 }, signal: new AbortController().signal, timeoutMs: 1234 },
+        { runExecutor: executorStub },
+      ),
+      error => {
+        eq(error.code, 'BPMN_AGENT_ADAPTER_UNSUPPORTED', 'custom 必须报 ADAPTER_UNSUPPORTED')
+        ok(error.message.includes('不再是 agent 完结路径'), '文案要说明 custom 不是完结路径')
+        ok(error.message.includes('flow_finish_node'), '文案要指向 flow_finish_node')
+        return true
+      },
+      'custom 必须明确拒绝',
     )
-    eq(calls.length, 1)
-    ok(calls[0].prompt.includes('attempt=2'), 'attempt 必须传进下游')
-    ok(calls[0].prompt.includes('amount'), 'variables 必须传进下游')
-    eq(calls[0].timeoutMs, 1234, '超时必须透传')
-    deep(result.output, { ok: true })
+    eq(executorCalls.length, 0, 'custom 的 executor 桩一次都不能被调用')
+
+    // 回归（本次修复）：没有注册表时 codex 也不再回退外部 executor。
+    await rejects(
+      () => executeAgent(
+        { id: 'agent-codex', node: { adapter: 'codex', executor: { kind: 'codex', timeoutMs: 99 } } },
+        ctx,
+        { runExecutor: executorStub },
+      ),
+      error => {
+        eq(error.code, 'BPMN_AGENT_ADAPTER_UNAVAILABLE', 'codex 无注册表必须报 ADAPTER_UNAVAILABLE')
+        ok(error.message.includes('flow_finish_node'), '文案要指向 flow_finish_node')
+        return true
+      },
+      '没有注册表时 codex 必须明确失败',
+    )
+    eq(executorCalls.length, 0, '无注册表时 codex 的 executor 桩一次都不能被调用')
+
+    // 没有注册表时未知 id 同样明确失败（不会掉进任何外部 CLI 分支）。
+    await rejects(
+      () => executeAgent({ id: 'agent-x', node: { adapter: 'claude' } }, ctx, { runExecutor: executorStub }),
+      error => error.code === 'BPMN_AGENT_ADAPTER_UNSUPPORTED',
+      '未知 adapter 必须报 ADAPTER_UNSUPPORTED',
+    )
+    eq(executorCalls.length, 0, '未知 adapter 也不能碰 executor 桩')
+
+    // 注册过的 dsh adapter 走完结门：输出来自闸门受理的 record，而不是 CLI 文本。
+    const counter = { starts: 0 }
+    const adapter = makeFakeAdapter(async ({ finishGate }) => {
+      counter.starts += 1
+      const submitted = await finishGate.submit({ variables: { via: 'finish' }, documents: [], summary: 'ok' })
+      return {
+        exited: Promise.resolve({ ok: true, record: submitted.record, usage: { total: 5 } }),
+      }
+    })
+    const result = await executeAgent(dshElement, ctx, { adapters: makeFakeAdapters(adapter) })
+    eq(counter.starts, 1, '注册过的 adapter 必须被派发一次')
+    deep(result.output, { via: 'finish' })
     eq(result.usage.total, 5)
 
-    // 已 abort 的 signal 必须尽快返回，不进入 executor。
+    // 已 abort 的 signal 必须尽快返回，不进入 adapter。
     const aborted = new AbortController()
     aborted.abort()
     await rejects(
-      () => executeAgent(dshElement, { attempt: 1, variables: {}, signal: aborted.signal }),
+      () => executeAgent(dshElement, { attempt: 1, variables: {}, signal: aborted.signal }, { adapters: makeFakeAdapters(adapter) }),
       error => error.code === 'BPMN_ABORTED',
       'abort 必须优先于 adapter 判定',
     )
+    eq(counter.starts, 1, 'abort 之后不能再派发 adapter')
   })
 
   // -------------------------------------------------------------------------
-  // 8b. 通过实例验证 dsh adapter：实例 status 仍 ACTIVE，lastError 保留真实原因
+  // 8b. 通过实例验证无注册表：实例 status 仍 ACTIVE，lastError 保留真实原因
   // -------------------------------------------------------------------------
   await check('实例里的 dsh adapter：ACTIVE + lastError.code = BPMN_AGENT_ADAPTER_UNAVAILABLE', async home => {
-    const calls = []
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor(calls) })) }
+    const route = { handler: createHandler(makeEnv(home, { bpmnAdapters: null })) }
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-dsh" targetNamespace="http://example.com/flow-studio">
   <bpmn:process id="proc-dsh" isExecutable="true">
@@ -722,15 +810,15 @@ try {
     const created = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-dsh' })
     eq(created.status, 201, JSON.stringify(created.json))
     eq(created.json.status, 'ACTIVE', '出错不改 status：实例继续 ACTIVE')
-    eq(calls.length, 0, '不得偷偷跑外部 executor')
 
     const detail = await call(route, 'GET', `${API}/instances/${created.json.id}`)
     eq(detail.status, 200)
     eq(detail.json.status, 'ACTIVE', '出错后 status 仍是 ACTIVE（不判死）')
     eq(detail.json.lastError.code, 'BPMN_AGENT_ADAPTER_UNAVAILABLE', 'lastError 必须保留 handler 的真实错误码')
-    ok(detail.json.lastError.message.includes('0.13.1'), '文案说明 dsh adapter 在 0.13.1 提供')
+    ok(detail.json.lastError.message.includes('没有适配器注册表'), '文案说明缺注册表，且不退回外部 CLI')
     const events = await call(route, 'GET', `${API}/instances/${created.json.id}/events`)
     ok(events.json.events.some(event => event.type === 'error'), 'error 事件必须留痕')
+    ok(!events.json.events.some(event => event.type === 'activity/end' && event.output !== undefined), '零派发：不得把任何 agent 输出写回事件')
     ok(!events.json.events.some(event => event.type === 'process/end'), '出错不发 process/end')
   })
 
@@ -738,14 +826,23 @@ try {
   // 9. 大输出：事件单条上限 8KB，桥接层必须裁剪而不是让实例失败
   // -------------------------------------------------------------------------
   await check('大输出：activity/end 超过 8KB 时事件被裁剪并标 truncated，实例仍能完成', async home => {
-    const hugeExecutor = async () => ({
-      ok: true,
-      text: 'x'.repeat(20000),
-      structured: { blob: 'y'.repeat(20000) },
-      usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1, total: 2 },
-      events: [],
+    const hugeAdapter = makeFakeAdapter(async ({ finishGate }) => {
+      const submitted = await finishGate.submit({
+        variables: { ok: true },
+        documents: [],
+        summary: 'ok',
+      })
+      return {
+        // 完结门的 variables 有 8KB 上限；这里用 adapter 透传的 usage 制造大事件，
+        // 验证桥接层对 activity/end 的 8KB 裁剪（不是让实例失败）。
+        exited: Promise.resolve({
+          ok: true,
+          record: submitted.record,
+          usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1, total: 2, blob: 'y'.repeat(20000) },
+        }),
+      }
     })
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: hugeExecutor })) }
+    const route = { handler: createHandler(makeEnv(home, { bpmnAdapters: makeFakeAdapters(hugeAdapter) })) }
     await seed(route)
     const instance = await startInstance(route)
     eq(instance.status, 'ACTIVE', '大输出不能把实例打挂')
@@ -766,18 +863,19 @@ try {
   // 10. A1 · 恢复失败映射：409 + 实例仍 ACTIVE + lastError（handler 调用数不变）
   // -------------------------------------------------------------------------
   await check('恢复失败：裸快照 / 结构篡改 → 409 + ACTIVE + lastError，不派发 handler', async home => {
-    const calls = []
+    const agents = makeFakeAdapter()
+    const fakeAdapters = makeFakeAdapters(agents)
     const dir = store.flowsDir(home)
     const env = {}
     const url = new URL('http://localhost/')
-    const runtimeA = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    const runtimeA = createBpmnRuntime({ dir, env, adapters: fakeAdapters })
     let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-demo', name: '演示流程', xml: workflowXml() } })
     eq(res.status, 201, JSON.stringify(res.body))
     res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-demo', variables: { amount: 7 } } })
     eq(res.status, 201, JSON.stringify(res.body))
     const instanceId = res.body.id
-    const callsAfterStart = calls.length
-    ok(callsAfterStart >= 1, '首次启动确实跑过一次 executor')
+    const callsAfterStart = agents.calls.length
+    ok(callsAfterStart >= 1, '首次启动确实派发过一次 adapter')
     await runtimeA.dispose()
 
     const statePath = join(home, 'flow-studio', 'instances', instanceId, 'state.json')
@@ -788,7 +886,7 @@ try {
       ok(envelope[field] !== undefined, `state 信封必须带 ${field}`)
     }
 
-    const newRuntime = () => createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    const newRuntime = () => createBpmnRuntime({ dir, env, adapters: fakeAdapters })
     const writeState = (state) => writeFileSync(statePath, `${JSON.stringify({ savedAt: new Date().toISOString(), state }, null, 2)}\n`)
 
     // (a) 裸 bpmn-engine 快照（里面塞一个 parallelGateway）：版本不支持。
@@ -814,7 +912,7 @@ try {
       })
       eq(complete.status, 409, '恢复失败的写操作返回 409')
       eq(complete.body.recoveryCode, 'BPMN_STATE_VERSION_UNSUPPORTED')
-      eq(calls.length, callsAfterStart, '恢复失败不得派发 handler')
+      eq(agents.calls.length, callsAfterStart, '恢复失败不得派发 handler')
       await runtime.dispose()
     }
 
@@ -839,7 +937,7 @@ try {
       })
       eq(complete.status, 409)
       eq(complete.body.recoveryCode, 'BPMN_STATE_DEFINITION_MISMATCH')
-      eq(calls.length, callsAfterStart, '结构不匹配不得派发 handler')
+      eq(agents.calls.length, callsAfterStart, '结构不匹配不得派发 handler')
       await runtime.dispose()
     }
 
@@ -858,7 +956,7 @@ try {
   // 11. A1 · 正常 sequenceFlow 条件仍按变量走对分支
   // -------------------------------------------------------------------------
   await check('正常 sequenceFlow 条件：true / false 走不同分支（ACTIVE → COMPLETED）', async home => {
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: makeFakeExecutor() })) }
+    const route = { handler: createHandler(makeEnv(home)) }
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="defs-cond" targetNamespace="http://example.com/flow-studio">
   <bpmn:process id="proc-cond" isExecutable="true">
@@ -910,11 +1008,11 @@ try {
   <bpmn:process id="proc-slow" isExecutable="true">
     <bpmn:startEvent id="start"/>
     <bpmn:serviceTask id="agent1">
-      <bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo a"/></fs:node></bpmn:extensionElements>
+      <bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh"></fs:node></bpmn:extensionElements>
     </bpmn:serviceTask>
     <bpmn:userTask id="human1"/>
     <bpmn:serviceTask id="agent2">
-      <bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo b"/></fs:node></bpmn:extensionElements>
+      <bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh"></fs:node></bpmn:extensionElements>
     </bpmn:serviceTask>
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
@@ -926,16 +1024,17 @@ try {
     let releaseSlow = null
     let slowAborted = false
     let slowStarted = false
-    const slowExecutor = async (options) => {
-      if (String(options.prompt).includes('agent2')) {
+    const slowAdapter = makeFakeAdapter(async request => {
+      if (request.element?.id === 'agent2') {
         slowStarted = true
-        options.signal?.addEventListener('abort', () => { slowAborted = true }, { once: true })
+        request.ctx.signal?.addEventListener('abort', () => { slowAborted = true }, { once: true })
         await new Promise((resolve) => { releaseSlow = resolve })
-        return { ok: true, text: 'late', structured: { late: true }, usage: {}, exitCode: 0, events: [] }
+        const submitted = await request.finishGate.submit({ variables: { late: true }, documents: [], summary: 'late' })
+        return { exited: Promise.resolve({ ok: true, record: submitted.record }) }
       }
-      return { ok: true, text: 'fast', structured: {}, usage: {}, exitCode: 0, events: [] }
-    }
-    const route = { handler: createHandler(makeEnv(home, { bpmnExecutor: slowExecutor })) }
+      return null
+    })
+    const route = { handler: createHandler(makeEnv(home, { bpmnAdapters: makeFakeAdapters(slowAdapter) })) }
     const saved = await call(route, 'POST', `${API}/definitions`, { id: 'flow-slow', name: '慢节点', xml })
     eq(saved.status, 201, JSON.stringify(saved.json))
     const created = await call(route, 'POST', `${API}/instances`, { definitionId: 'flow-slow' })
@@ -943,12 +1042,12 @@ try {
     const id = created.json.id
     eq(created.json.status, 'ACTIVE')
 
-    // complete 在飞：它会停在 agent2 的慢 executor 上并持有实例锁。
+    // complete 在飞：它会停在 agent2 的慢 adapter 上并持有实例锁。
     const completePromise = call(route, 'POST', `${API}/instances/${id}/tasks/human1/complete`, { payload: { approved: true } })
     for (let index = 0; index < 200 && !slowStarted; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5))
     }
-    ok(slowStarted, 'agent2 的慢 executor 必须已经在飞')
+    ok(slowStarted, 'agent2 的慢 adapter 必须已经在飞')
 
     // stop 不能排在慢 complete 的锁后面。
     const stopped = await Promise.race([
@@ -980,10 +1079,10 @@ try {
   // 12.3 启动/恢复竞态：异步准备期间 stop 已返回 CANCELED → 不得再派发
   // -------------------------------------------------------------------------
   await check('启动竞态：定义快照读取期间 stop → 不建 runner、零派发、实例 CANCELED', async home => {
-    const calls = []
+    const agents = makeFakeAdapter()
     const dir = store.flowsDir(home)
     const env = {}
-    const runtime = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor(calls) })
+    const runtime = createBpmnRuntime({ dir, env, adapters: makeFakeAdapters(agents) })
     const url = new URL('http://localhost/')
     try {
       const saved = await runtime.handle({
@@ -1019,14 +1118,14 @@ try {
       const stopped = await runtime.handle({ method: 'POST', parts: ['instances', id, 'stop'], url })
       eq(stopped.status, 200, JSON.stringify(stopped.body))
       eq(stopped.body.status, 'CANCELED')
-      eq(calls.length, 0, 'stop 返回时不得有派发')
+      eq(agents.calls.length, 0, 'stop 返回时不得有派发')
 
       releaseRead()
       const created = await createPromise
       eq(created.status, 201, JSON.stringify(created.body))
       eq(created.body.status, 'CANCELED', '实例必须保持 CANCELED')
       eq(created.body.error?.code, 'BPMN_INSTANCE_STOPPING', '启动必须返回明确的 stopped 结果')
-      eq(calls.length, 0, '放行后也不得派发 agent（外部副作用为零）')
+      eq(agents.calls.length, 0, '放行后也不得派发 agent（外部副作用为零）')
       eq(runtime.activeCount, 0, '不得残留 runner')
 
       const events = await runtime.handle({ method: 'GET', parts: ['instances', id, 'events'], url })
@@ -1042,8 +1141,8 @@ try {
   await check('恢复竞态：定义快照读取期间 stop → 不建 runner、不重放 agent、实例 CANCELED', async home => {
     const dir = store.flowsDir(home)
     const url = new URL('http://localhost/')
-    const callsA = []
-    const runtimeA = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor(callsA) })
+    const agentsA = makeFakeAdapter()
+    const runtimeA = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters(agentsA) })
     let id
     try {
       let res = await runtimeA.handle({
@@ -1061,7 +1160,7 @@ try {
       })
       eq(res.status, 201, JSON.stringify(res.body))
       id = res.body.id
-      eq(callsA.length, 1, '首次启动执行一次 agent，然后停在人工任务')
+      eq(agentsA.calls.length, 1, '首次启动执行一次 agent，然后停在人工任务')
       eq(res.body.status, 'ACTIVE')
     } finally {
       await runtimeA.dispose()
@@ -1072,8 +1171,8 @@ try {
     const beforeLastSeq = readInstanceJson(home, id).lastSeq
 
     // 新 runtime（模拟进程重启）：GET 触发懒恢复，在定义快照读取处暂停。
-    const callsB = []
-    const runtimeB = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor(callsB) })
+    const agentsB = makeFakeAdapter()
+    const runtimeB = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters(agentsB) })
     try {
       let releaseRead
       const readGate = new Promise(resolveGate => { releaseRead = resolveGate })
@@ -1097,7 +1196,7 @@ try {
       eq(detail.body.status, 'CANCELED')
       eq(detail.body.recovered, false, '恢复必须失败（stop 已接管）')
       eq(detail.body.recovery?.code, 'BPMN_INSTANCE_STOPPING', '恢复入口必须覆盖「尚未登记 runner」阶段')
-      eq(callsB.length, 0, '恢复不得重放 agent')
+      eq(agentsB.calls.length, 0, '恢复不得重放 agent')
       eq(runtimeB.activeCount, 0, '不得残留 runner')
 
       const raw = readInstanceJson(home, id)
@@ -1132,7 +1231,7 @@ try {
 </bpmn:definitions>`
     const dir = store.flowsDir(home)
     const url = new URL('http://localhost/')
-    const runtimeA = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor() })
+    const runtimeA = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters() })
     let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-f1', name: 'F1', xml } })
     eq(res.status, 201, JSON.stringify(res.body))
     res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-f1' } })
@@ -1164,7 +1263,7 @@ try {
     wrapper.state.engine.definitions[0].broker = foreign.engine.definitions[0].broker
     await instStore.writeInstanceState(id, wrapper.state, { home })
 
-    const runtimeB = createBpmnRuntime({ dir, env: {}, executorRunner: makeFakeExecutor() })
+    const runtimeB = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters() })
     const startedAt = Date.now()
     const detail = await Promise.race([
       runtimeB.handle({ method: 'GET', parts: ['instances', id], url }),
@@ -1195,9 +1294,9 @@ try {
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-fail" targetNamespace="http://example.com/flow-studio">
   <bpmn:process id="proc-fail" isExecutable="true">
     <bpmn:startEvent id="start"/>
-    <bpmn:serviceTask id="agent1"><bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo a"/></fs:node></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="agent1"><bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh"></fs:node></bpmn:extensionElements></bpmn:serviceTask>
     <bpmn:userTask id="human1"/>
-    <bpmn:serviceTask id="agent2"><bpmn:extensionElements><fs:node nodeType="agent" adapter="custom"><fs:executor kind="custom" command="echo b"/></fs:node></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="agent2"><bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh"></fs:node></bpmn:extensionElements></bpmn:serviceTask>
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent1"/>
     <bpmn:sequenceFlow id="f2" sourceRef="agent1" targetRef="human1"/>
@@ -1209,14 +1308,12 @@ try {
     const dir = store.flowsDir(home)
     const url = new URL('http://localhost/')
     let calls = 0
-    const executor = async () => {
+    const failingAdapter = makeFakeAdapter(async () => {
       calls += 1
-      if (calls === 1) {
-        return { ok: true, text: 'a', structured: {}, usage: {}, exitCode: 0, events: [] }
-      }
-      return { ok: false, error: 'boom', exitCode: 1, events: [] }
-    }
-    const runtimeA = createBpmnRuntime({ dir, env, executorRunner: executor })
+      if (calls === 1) return null
+      return { exited: Promise.resolve({ ok: false, code: 'NODE_FINISH_FAILED', message: 'boom' }) }
+    })
+    const runtimeA = createBpmnRuntime({ dir, env, adapters: makeFakeAdapters(failingAdapter) })
     let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-fail', name: '失败停机', xml } })
     eq(res.status, 201, JSON.stringify(res.body))
     res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-fail' } })
@@ -1241,7 +1338,7 @@ try {
     eq(stateRaw.state.pendingTasks, undefined, '墓碑快照不再带执行位置')
 
     await runtimeA.dispose()
-    const runtimeB = createBpmnRuntime({ dir, env, executorRunner: makeFakeExecutor() })
+    const runtimeB = createBpmnRuntime({ dir, env, adapters: makeFakeAdapters() })
     const detail = await runtimeB.handle({ method: 'GET', parts: ['instances', id], url })
     eq(detail.status, 200, JSON.stringify(detail.body))
     eq(detail.body.status, 'ACTIVE', 'GET 仍返回 ACTIVE')

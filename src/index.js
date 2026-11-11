@@ -133,9 +133,8 @@ function bpmnRuntimeFor(env) {
       ctx: env.ctx,
       dir: env.dir,
       env: process.env,
-      // 测试注入点：默认走真实的 runExternalExecutor（本文件不消费它，仅透传）。
-      ...(typeof env.bpmnExecutor === 'function' ? { executorRunner: env.bpmnExecutor } : {}),
-      // A3：agent 节点走 AgentAdapter + flow_finish_node；没有注册表时 dsh 明确失败。
+      // A3：agent 节点只走 AgentAdapter + flow_finish_node；没有注册表时明确失败，
+      // 不再注入外部 CLI executor（custom 逃生门已删除）。
       ...(env.bpmnAdapters && typeof env.bpmnAdapters.get === 'function' ? { adapters: env.bpmnAdapters } : {}),
       ...(typeof env.bpmnWorkspaceRoot === 'string' && env.bpmnWorkspaceRoot.trim() !== ''
         ? { workspaceRoot: env.bpmnWorkspaceRoot }

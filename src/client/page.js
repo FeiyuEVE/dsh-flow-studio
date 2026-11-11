@@ -37,6 +37,7 @@ import { clearDraft, draftDiffers, readDraft, writeDraft, DRAFT_DEBOUNCE_MS, DRA
 import { DefinitionList, definitionsFromPayload } from './flowlist.js'
 import { InstanceWorktreePanel } from './instance-worktree.js'
 import { InstanceInboxPanel } from './instance-inbox.js'
+import { InstanceMetricsPanel, MetricsSummaryPanel } from './instance-metrics.js'
 import {
   InstanceEventDrawer, focusBpmnElement, mergeInstanceEvents, nextEventPollDelay,
 } from './logdrawer.js'
@@ -1535,6 +1536,14 @@ export function FlowStudioPage(props = {}) {
       // 0.13.8：工作区 / worktree 检查与清理（面板自己读 worktree，页面只给通知与列表刷新）。
       // 0.13.10：实例详情里的「消息」区（只读列表 + 发送；长正文走鉴权正文接口）。
       panelExtras: h('div', null,
+        // 0.13.10 E1：运行指标（单实例 + 跨实例汇总）。都是纯读；不启动 runner。
+        h(InstanceMetricsPanel, {
+          client,
+          instanceId: activeInstanceId,
+          instanceStatus: activeInstance ? activeInstance.status : '',
+          notice: (kind, text) => setNotice({ kind, text }),
+        }),
+        h(MetricsSummaryPanel, { client }),
         h(InstanceInboxPanel, {
           client,
           instanceId: activeInstanceId,

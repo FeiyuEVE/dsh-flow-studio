@@ -318,6 +318,26 @@ export function instanceWorktreesPrunePath() {
   return '/instance-worktrees/prune'
 }
 
+/** `GET /instances/<id>/metrics[?asOf=ISO]`（0.13.10 实例运行指标，纯读）。 */
+export function instanceMetricsPath(id, options = {}) {
+  return withQuery(`${instancePath(id)}/metrics`, {
+    asOf: options && options.asOf,
+  })
+}
+
+/** `GET /metrics?definitionId=&definitionVersion=&from=&to=&status=&groupBy=day[&asOf=]`。 */
+export function metricsPath(options = {}) {
+  return withQuery('/metrics', {
+    definitionId: options && options.definitionId,
+    definitionVersion: options && options.definitionVersion,
+    from: options && options.from,
+    to: options && options.to,
+    status: options && options.status,
+    groupBy: options && options.groupBy,
+    asOf: options && options.asOf,
+  })
+}
+
 /** `GET /instances/<id>/resource-events[?since=N]`（worktree / 产物资源事件）。 */
 export function instanceResourceEventsPath(id, options = {}) {
   return withQuery(`${instancePath(id)}/resource-events`, {
@@ -360,6 +380,10 @@ export const api = {
   listInstanceWorktrees: options => request('GET', instanceWorktreesPath(options)),
   pruneInstanceWorktrees: body => request('POST', instanceWorktreesPrunePath(), body || {}),
   readInstanceResourceEvents: (id, options) => request('GET', instanceResourceEventsPath(id, options)),
+
+  // ── 运行指标（0.13.10 E1）──────────────────────────────────────────────
+  readInstanceMetrics: (id, options) => request('GET', instanceMetricsPath(id, options)),
+  readMetrics: options => request('GET', metricsPath(options)),
 }
 
 // ---------------------------------------------------------------------------

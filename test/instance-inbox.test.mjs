@@ -7,17 +7,24 @@
  *  - 6 条首批只确认 5 条，第 6 条仍可投递；
  *  - SUSPENDED 受理排队不唤起 agent；COMPLETED/CANCELED 拒绝新消息；
  *  - 回复 outbox：白名单目标 / CANCELED 停止 / COMPLETED 后续投 / HTTP 重试稳定 replyId；
- *  - 人工任务收消息不写完成变量。
+ *  - 人工任务收消息不写完成变量；
+ *  - 回归 B1 / M3 / M4 / M5 / M6：父目录替换不越界写、投递权不被 TTL 接管、
+ *    终态收尾不回退成功状态、空队列唤醒不丢、状态写失败不重复外发。
  *
  * 全部用假 adapter / 假实例目录，不启动 runner、不发真实网络。
  * 运行：node test/instance-inbox.test.mjs
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, realpathSync, rmSync,
+  symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
+import { hostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -150,6 +157,7 @@ function makeInbox(options = {}) {
     sessionDeliver: options.sessionDeliver,
     httpRequest: options.httpRequest,
     now: options.now,
+    bodyWriteStrategy: options.bodyWriteStrategy,
   })
 }
 
@@ -961,6 +969,442 @@ await check('工具层跨实例调用被拒（agent 会话绑定身份）', asyn
   eq(allowed.ok, true)
   eq(calls.length, 1)
   eq(calls[0].parts[1], 'i-allowed', '省略 instanceId 时落到绑定实例')
+})
+
+// 回归 B1：父目录在写入期间被换成指向工作区外的软链。Linux 用受信父目录 FD 固定
+// 写入位置，写入不会越界；交付路径校验不通过时清理本次文件、标 failed、不投递。
+await check('B1：写入期间父目录被换成软链，不越界写、不投递、标 failed', async () => {
+  const inbox = makeInbox()
+  const instance = await makeInstance()
+  const ws = mkdtempSync(join(home, 'ws-b1-swap-'))
+  const outside = mkdtempSync(join(home, 'outside-b1-swap-'))
+  const adapter = makeAdapter()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-b1-swap',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot: ws,
+  })
+  const text = `B1SWAP${'x'.repeat(4096)}`
+  const basename = `m-b1.${sha256Hex(text).slice(0, 16)}.md`
+  const dir = join(ws, '.flow-studio-inbox', instance.id)
+  const originalOpen = fsp.open
+  let fired = false
+  let writtenBeforeCleanup = false
+  fsp.open = async function (path, flags, ...rest) {
+    const targetPath = String(path)
+    if (!fired && targetPath.endsWith(`/${basename}`)) {
+      fired = true
+      fsp.open = originalOpen
+      syncBuiltinESMExports()
+      renameSync(dir, `${dir}.original`)
+      symlinkSync(outside, dir, 'dir')
+      const handle = await originalOpen.call(this, path, flags, ...rest)
+      const originalSync = handle.sync.bind(handle)
+      handle.sync = async () => {
+        if (existsSync(join(outside, basename))) writtenBeforeCleanup = true
+        return originalSync()
+      }
+      return handle
+    }
+    return originalOpen.call(this, path, flags, ...rest)
+  }
+  syncBuiltinESMExports()
+  let accepted
+  try {
+    accepted = await inbox.acceptInstanceMessage({
+      instanceId: instance.id,
+      messageId: 'm-b1',
+      target: { activityId: 'agent1', executionId: 'exec-b1-swap' },
+      text,
+    })
+  } finally {
+    fsp.open = originalOpen
+    syncBuiltinESMExports()
+  }
+  eq(fired, true, '父目录替换注入到了写入路径上')
+  eq(writtenBeforeCleanup, false, '写入没有先落到工作区外再清理')
+  eq(accepted.message.status, 'failed')
+  eq(accepted.message.delivery.code, 'MESSAGE_BODY_UNSAFE')
+  eq(adapter.calls.length, 0, '不安全物化不投递')
+  eq(readdirSync(outside).length, 0, '工作区外没有写任何文件')
+  eq(existsSync(join(`${dir}.original`, basename)), false, '本次新建的文件已清理')
+  eq(existsSync(join(dir, basename)), false)
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-b1-swap' })
+})
+
+// 回归 B1（后半）：父目录在写入期间被换走、写完再换回。写入仍落在工作区内，
+// 交付给 agent 的路径必须真实存在（旧实现 deliveredPathExists:false）。
+await check('B1：写入期间父目录换走再换回，交付路径仍真实存在且在工作区内', async () => {
+  const inbox = makeInbox()
+  const instance = await makeInstance()
+  const ws = mkdtempSync(join(home, 'ws-b1-restore-'))
+  const outside = mkdtempSync(join(home, 'outside-b1-restore-'))
+  const adapter = makeAdapter()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-b1-restore',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot: ws,
+  })
+  const text = `B1BACK${'y'.repeat(4096)}`
+  const basename = `m-b1r.${sha256Hex(text).slice(0, 16)}.md`
+  const dir = join(ws, '.flow-studio-inbox', instance.id)
+  const originalOpen = fsp.open
+  let fired = false
+  fsp.open = async function (path, flags, ...rest) {
+    const targetPath = String(path)
+    if (!fired && targetPath.endsWith(`/${basename}`)) {
+      fired = true
+      fsp.open = originalOpen
+      syncBuiltinESMExports()
+      renameSync(dir, `${dir}.original`)
+      symlinkSync(outside, dir, 'dir')
+      const handle = await originalOpen.call(this, path, flags, ...rest)
+      const originalClose = handle.close.bind(handle)
+      handle.close = async () => {
+        const result = await originalClose()
+        unlinkSync(dir)
+        renameSync(`${dir}.original`, dir)
+        return result
+      }
+      return handle
+    }
+    return originalOpen.call(this, path, flags, ...rest)
+  }
+  syncBuiltinESMExports()
+  let accepted
+  try {
+    accepted = await inbox.acceptInstanceMessage({
+      instanceId: instance.id,
+      messageId: 'm-b1r',
+      target: { activityId: 'agent1', executionId: 'exec-b1-restore' },
+      text,
+    })
+  } finally {
+    fsp.open = originalOpen
+    syncBuiltinESMExports()
+  }
+  eq(fired, true)
+  eq(accepted.message.status, 'injected', '换回后仍能安全交付')
+  eq(adapter.calls.length, 1)
+  const delivered = adapter.calls[0].message
+  ok(delivered.bodyPath, '交付带正文相对路径')
+  const deliveredAbs = join(ws, delivered.bodyPath)
+  eq(existsSync(deliveredAbs), true, '交给 agent 的路径真实存在')
+  ok(realpathSync(deliveredAbs).startsWith(`${realpathSync(ws)}/`), '交付路径在工作区内')
+  eq(readFileSync(deliveredAbs, 'utf8'), text)
+  eq(readdirSync(outside).length, 0, '工作区外没有被写入')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-b1-restore' })
+})
+
+// 降级策略（无 /proc/self/fd 的平台）：功能不退化，软链父目录仍明确拒绝。
+await check('B1：没有 /proc/self/fd 的降级策略仍安全物化并拒绝软链父目录', async () => {
+  const inbox = makeInbox({ bodyWriteStrategy: 'path' })
+  const instance = await makeInstance()
+  const ws = mkdtempSync(join(home, 'ws-b1-path-'))
+  const adapter = makeAdapter()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-b1-path',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot: ws,
+  })
+  const text = `B1PATH${'z'.repeat(4096)}`
+  const accepted = await inbox.acceptInstanceMessage({
+    instanceId: instance.id,
+    messageId: 'm-b1p',
+    target: { activityId: 'agent1', executionId: 'exec-b1-path' },
+    text,
+  })
+  eq(accepted.message.status, 'injected')
+  const delivered = adapter.calls[0].message
+  eq(readFileSync(join(ws, delivered.bodyPath), 'utf8'), text)
+  ok(realpathSync(join(ws, delivered.bodyPath)).startsWith(`${realpathSync(ws)}/`))
+
+  const second = await makeInstance()
+  const outside = mkdtempSync(join(home, 'outside-b1-path-'))
+  mkdirSync(join(ws, '.flow-studio-inbox'), { recursive: true })
+  symlinkSync(outside, join(ws, '.flow-studio-inbox', second.id), 'dir')
+  const adapter2 = makeAdapter()
+  await inbox.registerExecution({
+    instanceId: second.id, activityId: 'agent1', executionId: 'exec-b1-path-2',
+    adapterId: 'dsh', adapter: adapter2, handle: {}, workspaceRoot: ws,
+  })
+  const rejected = await inbox.acceptInstanceMessage({
+    instanceId: second.id,
+    messageId: 'm-b1p2',
+    target: { activityId: 'agent1', executionId: 'exec-b1-path-2' },
+    text: `B1PATH2${'w'.repeat(4096)}`,
+  })
+  eq(rejected.message.status, 'failed')
+  eq(rejected.message.delivery.code, 'MESSAGE_BODY_UNSAFE')
+  eq(readdirSync(outside).length, 0)
+  eq(adapter2.calls.length, 0)
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-b1-path' })
+  await inbox.finishExecution({ instanceId: second.id, executionId: 'exec-b1-path-2' })
+})
+
+// 回归 B1：正文物化写到一半失败（ENOSPC）→ 消息标 failed、不投递、不留半文件。
+await check('B1：物化写入中途失败时清理本次文件并标 failed', async () => {
+  const inbox = makeInbox()
+  const instance = await makeInstance()
+  const ws = mkdtempSync(join(home, 'ws-b1-enospc-'))
+  const adapter = makeAdapter()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-b1-enospc',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot: ws,
+  })
+  const text = `B1ENOSPC${'q'.repeat(4096)}`
+  const basename = `m-enospc.${sha256Hex(text).slice(0, 16)}.md`
+  const originalOpen = fsp.open
+  let fired = false
+  fsp.open = async function (path, flags, ...rest) {
+    const targetPath = String(path)
+    if (!fired && targetPath.endsWith(`/${basename}`)) {
+      fired = true
+      fsp.open = originalOpen
+      syncBuiltinESMExports()
+      const handle = await originalOpen.call(this, path, flags, ...rest)
+      handle.writeFile = async () => {
+        throw Object.assign(new Error('injected ENOSPC'), { code: 'ENOSPC' })
+      }
+      return handle
+    }
+    return originalOpen.call(this, path, flags, ...rest)
+  }
+  syncBuiltinESMExports()
+  let accepted
+  try {
+    accepted = await inbox.acceptInstanceMessage({
+      instanceId: instance.id,
+      messageId: 'm-enospc',
+      target: { activityId: 'agent1', executionId: 'exec-b1-enospc' },
+      text,
+    })
+  } finally {
+    fsp.open = originalOpen
+    syncBuiltinESMExports()
+  }
+  eq(fired, true)
+  eq(accepted.message.status, 'failed')
+  eq(accepted.message.delivery.code, 'MESSAGE_BODY_UNSAFE')
+  eq(adapter.calls.length, 0)
+  const dir = join(ws, '.flow-studio-inbox', instance.id)
+  eq(existsSync(dir) ? readdirSync(dir).filter(name => name.endsWith('.md')).length : 0, 0, '没有留下半文件')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-b1-enospc' })
+})
+
+// 回归 M5：旧 drain 读到空队列快照后，新消息受理触发的 drain 被并发守卫跳过；
+// pending 标志让旧 drain 在释放所有权前重新确认队列，消息不会永久 queued。
+await check('M5：空队列收尾窗口的并发唤醒不丢', async () => {
+  const instance = await makeInstance()
+  const adapter = makeAdapter()
+  const inbox = makeInbox()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-m5',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot,
+  })
+  const originalList = inbox.store.listQueuedForExecution
+  let armed = true
+  let inner = null
+  inbox.store.listQueuedForExecution = async function (...args) {
+    const snapshot = await originalList.apply(inbox.store, args)
+    if (armed) {
+      armed = false
+      inner = await inbox.acceptInstanceMessage({
+        instanceId: instance.id,
+        messageId: 'msg-late-drain',
+        target: { activityId: 'agent1', executionId: 'exec-m5' },
+        text: '晚到但必须被消费',
+      })
+    }
+    return snapshot
+  }
+  const result = await inbox.deliverQueued(instance.id, 'exec-m5')
+  eq(inner.delivery.pending, true, '并发触发设置了 pending 待处理标志')
+  eq(adapter.calls.length, 1, '旧 drain 在退出前重新确认队列并投递')
+  eq((await inbox.store.readMessage(instance.id, 'msg-late-drain')).status, 'injected')
+  eq(result.remaining, 0)
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-m5' })
+})
+
+// 回归 M6：适配器已成功接收，但成功状态写回 journal 失败。旧实现会反复选中同一条
+// queued 记录，在一次 drain 内外发 100 次；修复后只外发一次，并按「可能已投递」收口。
+await check('M6：外发成功后写回失败，不重复外发且状态看得出可能已投递', async () => {
+  const instance = await makeInstance()
+  const adapter = makeAdapter()
+  const inbox = makeInbox()
+  await inbox.registerExecution({
+    instanceId: instance.id, activityId: 'agent1', executionId: 'exec-m6',
+    adapterId: 'dsh', adapter, handle: {}, workspaceRoot,
+  })
+  const originalUpdate = inbox.store.updateMessage
+  inbox.store.updateMessage = async function (id, messageId, patch, ...args) {
+    if (patch.status === 'injected') {
+      throw Object.assign(new Error('injected journal I/O failure'), { code: 'EIO' })
+    }
+    return originalUpdate.call(inbox.store, id, messageId, patch, ...args)
+  }
+  const accepted = await inbox.acceptInstanceMessage({
+    instanceId: instance.id,
+    messageId: 'msg-m6',
+    target: { activityId: 'agent1', executionId: 'exec-m6' },
+    text: '外发一次就够了',
+  })
+  eq(adapter.calls.length, 1, '一次 drain 内只外发一次')
+  eq(accepted.message.status, 'failed')
+  eq(accepted.message.delivery.deliveryUnknown, true, '结果未知：可能已投递')
+  eq(accepted.message.delivery.code, 'MESSAGE_DELIVERY_STATE_WRITE_FAILED')
+  eq(accepted.message.delivery.reason, 'delivery-state-write-failed')
+  const again = await inbox.deliverQueued(instance.id, 'exec-m6')
+  eq(adapter.calls.length, 1, '后续 drain 也不会自动重发')
+  eq(again.remaining, 0)
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-m6' })
+})
+
+// 回归 M3：第一投递仍存活时，即使注入时钟推进 120s，第二条调用链也不能接管并重复外发。
+await check('M3：存活投递不被 120s TTL 接管，同一回复只外发一次', async () => {
+  let clock = Date.now()
+  const instance = await makeInstance()
+  const entered = deferred()
+  const gate = deferred()
+  let sends = 0
+  const config = {
+    now: () => new Date(clock),
+    replyTargets: { dest: { kind: 'session', sessionId: 'approved-session' } },
+    sessionDeliver: async () => {
+      sends += 1
+      entered.resolve()
+      await gate.promise
+      return { ok: true, deliveryUnknown: false }
+    },
+  }
+  const inbox = makeInbox(config)
+  await inbox.store.acceptMessage({
+    instanceId: instance.id,
+    messageId: 'msg-m3',
+    target: { activityId: 'agent1', executionId: 'exec-m3' },
+    text: 'x',
+    replyTargetId: 'dest',
+  })
+  await inbox.enqueueReply({ instanceId: instance.id, messageId: 'msg-m3', replyId: 'reply-m3', text: '答案' })
+  const first = inbox.dispatchReply({ instanceId: instance.id, replyId: 'reply-m3' })
+  await entered.promise
+  clock += 120001
+  const secondInbox = makeInbox(config)
+  let claimDoneResolve
+  const claimDone = new Promise(resolveClaim => { claimDoneResolve = resolveClaim })
+  const originalClaim = secondInbox.store.claimReplyDispatch.bind(secondInbox.store)
+  secondInbox.store.claimReplyDispatch = async (...args) => {
+    const claim = await originalClaim(...args)
+    claimDoneResolve(claim)
+    return claim
+  }
+  const second = secondInbox.dispatchReply({ instanceId: instance.id, replyId: 'reply-m3' })
+  const claim = await claimDone
+  eq(claim.claimed, false, '第二进程拿不到投递权（不按 TTL 接管）')
+  gate.resolve()
+  const [resultA, resultB] = await Promise.all([first, second])
+  eq(sends, 1, '只外发一次（不接受纯 TTL 接管）')
+  eq(resultA.reply.status, 'delivered')
+  eq(resultB.reply.status, 'delivered')
+  eq(resultB.reply.attempts, 1, '没有产生新 attempt')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-m3' })
+})
+
+// 回归 M3：只有旧领取者进程确认退出才接管；接管后的外发按「可能重复」记为结果未知。
+await check('M3：接管已退出领取者后按结果未知写回（不声称 exactly-once）', async () => {
+  const instance = await makeInstance()
+  let sends = 0
+  const inbox = makeInbox({
+    replyTargets: { dest: { kind: 'session', sessionId: 'approved-session' } },
+    sessionDeliver: async () => {
+      sends += 1
+      return { ok: true, deliveryUnknown: false }
+    },
+  })
+  await inbox.store.acceptReply({
+    instanceId: instance.id, messageId: 'm', replyId: 'reply-takeover', targetId: 'dest', text: 'x',
+  })
+  const child = spawnSync(process.execPath, ['-e', '0'], { stdio: 'ignore' })
+  ok(Number.isSafeInteger(child.pid) && child.pid > 0)
+  await inbox.store.updateReply(instance.id, 'reply-takeover', {
+    attempts: 1,
+    dispatch: {
+      token: 'stale-token',
+      at: new Date().toISOString(),
+      attempt: 1,
+      owner: { pid: child.pid, host: hostname(), bootId: 'dead-boot', startTime: '0' },
+    },
+  })
+  const result = await inbox.dispatchReply({ instanceId: instance.id, replyId: 'reply-takeover' })
+  eq(sends, 1)
+  eq(result.reply.status, 'delivered')
+  eq(result.reply.attempts, 2, '接管产生新的 attempt')
+  eq(result.reply.delivery.deliveryUnknown, true, '接管后不声称 exactly-once')
+  eq(result.reply.delivery.possibleDuplicate, true, '标记旧领取者可能已外发')
+  eq((await inbox.store.readReply(instance.id, 'reply-takeover')).dispatch, null, '投递权已释放')
+  await inbox.finishExecution({ instanceId: instance.id, executionId: 'exec-takeover' })
+})
+
+// 回归 M4（消息）：分页快照读到 queued 之后、收尾写入之前消息被投递成功；
+// 终态收尾必须基于锁内最新记录做条件更新，不能把 injected 回退成 failed。
+await check('M4：实例终态收尾不把快照之后投递成功的消息回退为 failed', async () => {
+  const instance = await makeInstance()
+  const inbox = makeInbox()
+  await inbox.store.acceptMessage({
+    instanceId: instance.id,
+    messageId: 'msg-fin',
+    target: { activityId: 'agent1', executionId: 'exec-fin' },
+    text: '已受理',
+  })
+  const originalList = inbox.store.listMessages
+  let injected = false
+  inbox.store.listMessages = async function (...args) {
+    const page = await originalList.apply(inbox.store, args)
+    if (!injected) {
+      injected = true
+      await inbox.store.updateMessage(instance.id, 'msg-fin', {
+        status: 'injected',
+        delivery: { kind: 'agent', at: new Date().toISOString() },
+      })
+    }
+    return page
+  }
+  const result = await inbox.finalizeInstance(instance.id, 'COMPLETED')
+  const record = await inbox.store.readMessage(instance.id, 'msg-fin')
+  eq(record.status, 'injected', '已投递消息保持 injected')
+  eq(result.messages.length, 0, '没有把已投递消息记成失败收尾')
+})
+
+// 回归 M4（回复）：CANCELED 收尾读到 queued 快照后回复被投递成功；不能回退成 skipped。
+// 同时在飞（dispatch 未清）的回复也不允许被收尾回退。
+await check('M4：CANCELED 收尾不把已投递 / 在飞回复回退为 skipped', async () => {
+  const instance = await makeInstance()
+  const inbox = makeInbox()
+  await inbox.store.acceptReply({
+    instanceId: instance.id, messageId: 'm', replyId: 'reply-race', targetId: 'dest', text: 'race',
+  })
+  await inbox.store.acceptReply({
+    instanceId: instance.id, messageId: 'm', replyId: 'reply-inflight', targetId: 'dest', text: 'inflight',
+  })
+  const claim = await inbox.store.claimReplyDispatch(instance.id, 'reply-inflight')
+  eq(claim.claimed, true)
+  const originalList = inbox.store.listReplies
+  let armed = true
+  inbox.store.listReplies = async function (...args) {
+    const list = await originalList.apply(inbox.store, args)
+    if (armed) {
+      armed = false
+      const delivered = await inbox.store.claimReplyDispatch(instance.id, 'reply-race')
+      await inbox.store.completeReplyDispatch(instance.id, 'reply-race', {
+        token: delivered.token,
+        status: 'delivered',
+        delivery: { kind: 'session', deliveryUnknown: false },
+      })
+    }
+    return list
+  }
+  await inbox.finalizeInstance(instance.id, 'CANCELED')
+  eq((await inbox.store.readReply(instance.id, 'reply-race')).status, 'delivered', '已投递回复不回退')
+  const inFlightRecord = await inbox.store.readReply(instance.id, 'reply-inflight')
+  eq(inFlightRecord.status, 'queued', '在飞回复不标 skipped')
+  ok(inFlightRecord.dispatch && inFlightRecord.dispatch.token === claim.token, '投递权保留给投递方写回')
 })
 
 rmSync(home, { recursive: true, force: true })

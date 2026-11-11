@@ -5,17 +5,23 @@
  *  - 同一 messageId 同内容幂等 / 不同内容 409；
  *  - 分页、正文 sha256 / 字节逐字节一致；
  *  - 回复 outbox 的幂等、更新与恢复；
- *  - 「重启」= 新 store 实例重放 journal（queued / outbox 可恢复）。
+ *  - 「重启」= 新 store 实例重放 journal（queued / outbox 可恢复）；
+ *  - 回归 M2 / M3 / M4：缺末尾换行的完整记录不丢、投递权不按 TTL 接管、
+ *    已投递消息 / 回复不被迟到的收尾回退。
  *
  * 产物落在项目 `.tmp/` 下，不占系统 /tmp。
  * 运行：node test/instance-message-store.test.mjs
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
+import { hostname } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -55,6 +61,11 @@ function eq(actual, expected, message) {
 function ok(value, message) {
   assertions += 1
   assert.ok(value, message)
+}
+
+function deep(actual, expected, message) {
+  assertions += 1
+  assert.deepEqual(actual, expected, message)
 }
 
 function sha256(text) {
@@ -340,6 +351,201 @@ await check('回复投递权：claim 独占、写回 CAS、迟到失败不覆盖
     delivery: { kind: 'http', deliveryUnknown: false, status: 200 },
   })
   eq((await store.readReply(claimId, 'r-2')).attempts, 2)
+})
+
+// 回归 M2：完整 JSON 只缺末尾换行的记录，重试必须先在锁内补齐换行，不能在下一次
+// 追加时被当成坏尾转存 / 截掉（已受理记录会消失）。messages 与 replies 两个 journal 都覆盖。
+for (const kind of ['message', 'reply']) {
+  await check(`M2 ${kind}：缺末尾换行的完整记录，重试不丢、下次追加不截掉`, async () => {
+    const store = storeAt()
+    const iid = `i-m2-${kind}`
+    const messageInput = { instanceId: iid, messageId: 'm-lf', target, text: '缺末尾换行' }
+    const replyInput = { instanceId: iid, messageId: 'm-lf', replyId: 'r-lf', targetId: 'dest', text: '缺末尾换行' }
+    const accept = kind === 'message'
+      ? () => store.acceptMessage(messageInput)
+      : () => store.acceptReply(replyInput)
+    await accept()
+    const journal = kind === 'message'
+      ? store.paths(iid).messages
+      : store.paths(iid).replies
+    const raw = readFileSync(journal)
+    eq(raw[raw.length - 1], 0x0a, '首次受理以换行结尾')
+    writeFileSync(journal, raw.subarray(0, raw.length - 1))
+
+    const retry = await accept()
+    eq(retry.duplicate, true, '完整记录仍然幂等命中')
+    eq(retry.record.seq, 1)
+    const repaired = readFileSync(journal)
+    eq(repaired[repaired.length - 1], 0x0a, '重试路径已补齐末尾换行')
+    eq(existsSync(`${journal}.torn`), false, '合法记录没有被当成坏尾转存')
+
+    // 下一次追加：记录必须还在，seq 连续。
+    if (kind === 'message') {
+      await store.acceptMessage({ ...messageInput, messageId: 'm-next', text: '下一条' })
+    } else {
+      await store.acceptReply({ ...replyInput, replyId: 'r-next', text: '下一条' })
+    }
+    const kept = kind === 'message'
+      ? await store.readMessage(iid, 'm-lf')
+      : await store.readReply(iid, 'r-lf')
+    ok(kept !== null, '已受理记录仍然存在')
+    const seqs = kind === 'message'
+      ? (await store.listMessages(iid)).messages.map(record => record.seq)
+      : (await store.listReplies(iid)).map(record => record.seq)
+    deep(seqs, [1, 2], '记录没有被下一次追加截掉')
+    eq(existsSync(`${journal}.torn`), false, '仍然没有坏尾转存')
+  })
+}
+
+await check('M2：journal 追加遇到短写会继续写完，不产生半行', async () => {
+  const store = storeAt()
+  const iid = 'i-m2-short-write'
+  const originalOpen = fsp.open
+  let injected = false
+  fsp.open = async function (path, flags, ...rest) {
+    const handle = await originalOpen.call(this, path, flags, ...rest)
+    if (!injected && String(path).endsWith('.jsonl') && flags === 'a') {
+      injected = true
+      const originalWrite = handle.write.bind(handle)
+      let first = true
+      handle.write = async function (buffer, offset, length, position) {
+        if (first && typeof offset === 'number' && typeof length === 'number') {
+          first = false
+          const cut = Math.max(1, Math.floor(length / 2))
+          const partial = await originalWrite(buffer, offset, cut, position)
+          return { bytesWritten: partial.bytesWritten, buffer }
+        }
+        return originalWrite(buffer, offset, length, position)
+      }
+    }
+    return handle
+  }
+  syncBuiltinESMExports()
+  try {
+    await store.acceptMessage({ instanceId: iid, messageId: 'm-short', target, text: '短写测试' })
+  } finally {
+    fsp.open = originalOpen
+    syncBuiltinESMExports()
+  }
+  eq(injected, true, '短路确实注入到 journal 追加')
+  const lines = readFileSync(store.paths(iid).messages, 'utf8').trim().split('\n')
+  eq(lines.length, 1, '只写了一行')
+  eq(JSON.parse(lines[0]).messageId, 'm-short', '短写后记录仍然是完整合法 JSON')
+})
+
+await check('M3：存活的领取者不会被纯 TTL 接管（跨进程防重复外发）', async () => {
+  let clock = Date.now()
+  const instancesRootForClock = join(home, 'clock-instances')
+  mkdirSync(instancesRootForClock, { recursive: true })
+  const store = createInstanceMessageStore({ instancesRoot: instancesRootForClock, now: () => new Date(clock) })
+  const iid = 'i-m3-live'
+  await store.acceptReply({ instanceId: iid, messageId: 'm', replyId: 'r', targetId: 'dest', text: 'x' })
+  const first = await store.claimReplyDispatch(iid, 'r')
+  eq(first.claimed, true)
+  eq(first.record.dispatch.owner.pid, process.pid, '领取记录带 host pid')
+  ok(typeof first.record.dispatch.owner.bootId === 'string' && first.record.dispatch.owner.bootId !== '')
+  clock += 120001
+  const second = await store.claimReplyDispatch(iid, 'r')
+  eq(second.claimed, false, '经过 120s 也不能接管仍存活的投递')
+  eq(second.reason, 'in-progress')
+  eq(second.ownerAlive, true)
+  eq(second.record.attempts, 1, '没有产生新的 attempt')
+})
+
+await check('M3：旧领取者进程确认退出后可以接管；旧格式 / 跨主机保持未知', async () => {
+  const store = storeAt()
+  const iid = 'i-m3-takeover'
+  await store.acceptReply({ instanceId: iid, messageId: 'm', replyId: 'r', targetId: 'dest', text: 'x' })
+  // 用一个真实退出过的子进程 pid 模拟崩溃的旧领取者。
+  const child = spawnSync(process.execPath, ['-e', '0'], { stdio: 'ignore' })
+  ok(Number.isSafeInteger(child.pid) && child.pid > 0, '拿到已退出子进程 pid')
+  await store.updateReply(iid, 'r', {
+    attempts: 1,
+    dispatch: {
+      token: 'stale-token',
+      at: new Date().toISOString(),
+      attempt: 1,
+      owner: { pid: child.pid, host: hostname(), bootId: 'dead-boot', startTime: '0' },
+    },
+  })
+  const taken = await store.claimReplyDispatch(iid, 'r')
+  eq(taken.claimed, true, 'pid 不存活时可以接管')
+  eq(taken.attempt, 2)
+  eq(taken.recovered, true, '记录为恢复接管')
+
+  // 旧格式（没有 owner）与跨主机：无法确认 → 不接管，明确 unknown。
+  const legacyId = 'i-m3-legacy'
+  await store.acceptReply({ instanceId: legacyId, messageId: 'm', replyId: 'r', targetId: 'dest', text: 'x' })
+  await store.updateReply(legacyId, 'r', {
+    dispatch: { token: 'legacy-token', at: new Date().toISOString(), attempt: 1 },
+  })
+  const legacy = await store.claimReplyDispatch(legacyId, 'r')
+  eq(legacy.claimed, false, '旧格式没有 owner 时不按时间猜')
+  eq(legacy.reason, 'in-progress')
+  eq(legacy.unknown, true)
+
+  const remoteId = 'i-m3-remote'
+  await store.acceptReply({ instanceId: remoteId, messageId: 'm', replyId: 'r', targetId: 'dest', text: 'x' })
+  await store.updateReply(remoteId, 'r', {
+    dispatch: {
+      token: 'remote-token',
+      at: new Date().toISOString(),
+      attempt: 1,
+      owner: { pid: process.pid, host: 'another-host', bootId: 'remote-boot', startTime: '0' },
+    },
+  })
+  const remote = await store.claimReplyDispatch(remoteId, 'r')
+  eq(remote.claimed, false, '跨主机无法验证存活，不接管')
+  eq(remote.unknown, true)
+})
+
+await check('M4：已投递消息不能被无条件更新回退成 failed', async () => {
+  const store = storeAt()
+  const iid = 'i-m4-message'
+  await store.acceptMessage({ instanceId: iid, messageId: 'm', target, text: '已投递' })
+  await store.updateMessage(iid, 'm', { status: 'injected', delivery: { kind: 'agent' } })
+  await rejectsCode(
+    () => store.updateMessage(iid, 'm', { status: 'failed', delivery: { kind: 'none', reason: 'instance-completed' } }),
+    'MESSAGE_STATUS_REGRESSION',
+  )
+  eq((await store.readMessage(iid, 'm')).status, 'injected', '迟到的收尾没有覆盖成功状态')
+  // 条件更新：最新状态不是期望值时拒绝（收尾先读到 queued 之后被投递成功）。
+  await rejectsCode(
+    () => store.updateMessage(iid, 'm', { status: 'failed' }, { expectStatus: 'queued' }),
+    'MESSAGE_CONDITION_FAILED',
+  )
+  // 重新排队（测试 / 重投语义）仍然允许。
+  const requeued = await store.updateMessage(iid, 'm', { status: 'queued' })
+  eq(requeued.status, 'queued')
+})
+
+await check('M4：已投递回复不能被回退；在飞回复也不允许被标 skipped', async () => {
+  const store = storeAt()
+  const iid = 'i-m4-reply'
+  await store.acceptReply({ instanceId: iid, messageId: 'm', replyId: 'r', targetId: 'dest', text: 'x' })
+  const claim = await store.claimReplyDispatch(iid, 'r')
+  eq(claim.claimed, true)
+  const inFlight = await store.skipQueuedReply(iid, 'r', { delivery: { kind: 'none', reason: 'instance-canceled' } })
+  eq(inFlight.updated, false)
+  eq(inFlight.reason, 'dispatch-in-flight', '在飞投递不被取消收尾回退')
+  eq((await store.readReply(iid, 'r')).status, 'queued')
+  await rejectsCode(
+    () => store.updateReply(iid, 'r', { status: 'skipped' }),
+    'MESSAGE_STATUS_REGRESSION',
+  )
+  await store.completeReplyDispatch(iid, 'r', {
+    token: claim.token,
+    status: 'delivered',
+    delivery: { kind: 'session', deliveryUnknown: false },
+  })
+  await rejectsCode(
+    () => store.updateReply(iid, 'r', { status: 'skipped' }),
+    'MESSAGE_STATUS_REGRESSION',
+  )
+  const after = await store.skipQueuedReply(iid, 'r', { delivery: { kind: 'none', reason: 'instance-canceled' } })
+  eq(after.updated, false)
+  eq(after.reason, 'not-queued')
+  eq((await store.readReply(iid, 'r')).status, 'delivered', '已送达回复保持 delivered')
 })
 
 rmSync(home, { recursive: true, force: true })

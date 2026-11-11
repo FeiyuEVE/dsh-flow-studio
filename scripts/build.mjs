@@ -65,6 +65,8 @@ export const HOST_MODULES = [
   'artifact-store.js',
   'execution-limits.js',
   'process-output.js',
+  'agent-cli-stream.js',
+  'agent-cli-lifecycle.js',
   'host-check.js',
   'bpmn-moddle-vendor.js',
   'feelin-vendor.js',

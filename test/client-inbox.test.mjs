@@ -10,6 +10,9 @@
  *  - 0.13.11 N10–N13：切实例隔离消息/正文/草稿/通知（世代 + 请求序号），
  *    响应丢失后的重试复用 messageId，游标分页（>50 条 / 加载更多 / 新消息高亮），
  *    手选 exact 后执行消失可改发 nextActivation。
+ *  - 0.13.13 复审 M7 / M8 / N10：重复点击当前模式不换 messageId、发送期间不能改
+ *    目标；手选 exact 目标消失但仍有其它执行时保留失效选择并要求重选；组件
+ *    卸载后在飞发送结果不再触发全局通知/刷新。
  *
  * 交互用最小 hooks 探针（真实 React createElement，hooks 同步可观测），不发真实 fetch。
  * 运行：node test/client-inbox.test.mjs
@@ -78,6 +81,7 @@ function createHarness(Component, props) {
   let tree = null
   let needsRender = false
   let hookIndex = 0
+  let unmounted = false
   const renderProps = { ...props }
 
   const ctx = {
@@ -88,11 +92,14 @@ function createHarness(Component, props) {
       return [hook.value, next => {
         const value = typeof next === 'function' ? next(hook.value) : next
         if (Object.is(value, hook.value)) return
+        // 与真实 React 一致：卸载后的 setState 是 no-op。
+        if (unmounted) return
         hook.value = value
         needsRender = true
       }]
     },
     useEffect(fn, deps) {
+      if (unmounted) return
       const index = hookIndex++
       const previous = effectCache.get(index)
       const list = Array.isArray(deps) ? deps.slice() : null
@@ -142,6 +149,14 @@ function createHarness(Component, props) {
   }
 
   async function flush(rounds = 4) {
+    if (unmounted) {
+      // 已卸载：只给在飞 Promise 落定，不再渲染、不再登记 effect。
+      for (let index = 0; index < rounds; index += 1) {
+        await Promise.resolve()
+        await new Promise(resolveTick => setTimeout(resolveTick, 0))
+      }
+      return tree
+    }
     await render()
     for (let index = 0; index < rounds; index += 1) {
       await Promise.resolve()
@@ -156,6 +171,17 @@ function createHarness(Component, props) {
   return {
     flush,
     setProps(next) { Object.assign(renderProps, next); needsRender = true },
+    // 模拟 keyed unmount：按登记顺序执行所有 effect 的 cleanup，之后的 setState 全部 no-op。
+    unmount() {
+      if (unmounted) return
+      unmounted = true
+      for (const stored of effectCache.values()) {
+        const cleanup = stored && stored.cleanup
+        if (typeof cleanup !== 'function') continue
+        stored.cleanup = null
+        try { cleanup() } catch { /* 卸载路径不抛 */ }
+      }
+    },
     get tree() { return tree },
   }
 }
@@ -781,6 +807,199 @@ await check('N13：目标模式可显式切换（当前执行 ↔ 下次激活�
   findAll(tree, node => node.props && node.props['data-action'] === 'inbox-mode-exact')[0].props.onClick()
   tree = await harness.flush()
   eq(findAll(tree, node => node.type === 'select').length, 1, '可以切回当前执行')
+})
+
+await check('M7：重复点击当前模式不重置 messageId', async () => {
+  const attempts = []
+  let loseFirst = true
+  const client = {
+    async readInstanceMessages() {
+      return {
+        messages: [], total: 0, nextCursor: null,
+        liveExecutions: [
+          { activityId: 'node', executionId: 'e1', kind: 'agent' },
+          { activityId: 'node2', executionId: 'e2', kind: 'agent' },
+        ],
+      }
+    },
+    async sendInstanceMessage(id, body) {
+      attempts.push({ id, body })
+      if (loseFirst) {
+        loseFirst = false
+        throw new Error('connection lost after accept')
+      }
+      return {
+        ok: true, duplicate: false,
+        message: { messageId: body.messageId, status: 'injected' },
+        delivery: { confirmed: [body.messageId], failed: [] },
+      }
+    },
+  }
+  const harness = createHarness(InstanceInboxPanel, inboxProps(client))
+  let tree = await harness.flush()
+  // 默认 auto 生效目标就是当前执行：点击「当前执行」不应清空 pendingId。
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-mode-exact')[0].props.onClick()
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0]
+    .props.onInput({ target: { value: 'same payload' } })
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  tree = await harness.flush()
+  eq(attempts.length, 1)
+  const firstId = attempts[0].body.messageId
+
+  // 正文与目标都没变：再次点击当前已选模式，然后重试，必须复用同一个 messageId。
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-mode-exact')[0].props.onClick()
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  tree = await harness.flush()
+  eq(attempts.length, 2)
+  eq(attempts[1].body.messageId, firstId, '点击当前模式后重试仍复用原 messageId')
+  eq(attempts[1].body.text, 'same payload')
+
+  // 只有目标变化时才换新 id（第二次成功后草稿已清空，重新输入同一份正文）。
+  findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0]
+    .props.onInput({ target: { value: 'same payload' } })
+  tree = await harness.flush()
+  findAll(tree, node => node.type === 'select')[0].props.onChange({ target: { value: 'e2' } })
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  tree = await harness.flush()
+  eq(attempts.length, 3)
+  ok(attempts[2].body.messageId !== firstId, '目标变化后换新 messageId')
+})
+
+await check('M7：发送中点击模式不改目标，成功后不残留草稿', async () => {
+  const gate = deferred()
+  const sent = []
+  const notices = []
+  const client = {
+    async readInstanceMessages() {
+      return {
+        messages: [], total: 0, nextCursor: null,
+        liveExecutions: [
+          { activityId: 'node', executionId: 'e1', kind: 'agent' },
+          { activityId: 'node2', executionId: 'e2', kind: 'agent' },
+        ],
+      }
+    },
+    async sendInstanceMessage(id, body) {
+      sent.push({ id, body })
+      return gate.promise
+    },
+  }
+  const harness = createHarness(InstanceInboxPanel, inboxProps(client, {
+    notice: (kind, text) => notices.push({ kind, text }),
+  }))
+  let tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0]
+    .props.onInput({ target: { value: 'in flight' } })
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  tree = await harness.flush()
+  eq(sent.length, 1)
+  const modeButton = findAll(tree, node => node.props && node.props['data-action'] === 'inbox-mode-exact')[0]
+  eq(modeButton.props.disabled, true, '发送期间模式按钮禁用')
+  // 即使绕过 DOM 的 disabled 直接触发，也不能改目标/清 pendingId。
+  modeButton.props.onClick()
+  tree = await harness.flush()
+  eq(findAll(tree, node => node.type === 'select')[0].props.value, 'e1', '发送期间目标不变')
+
+  gate.resolve({
+    ok: true, duplicate: false,
+    message: { messageId: sent[0].body.messageId, status: 'queued' },
+    delivery: { confirmed: [sent[0].body.messageId], failed: [] },
+  })
+  tree = await harness.flush()
+  eq(findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0].props.value, '',
+    '成功后草稿被清空，不能直接再次发送')
+  eq(notices.some(item => item.kind === 'success'), true)
+  eq(sent.length, 1, '一次逻辑提交只外发一次')
+})
+
+await check('M8：手选精确目标消失后不静默改投其他执行', async () => {
+  let live = [
+    { activityId: 'node', executionId: 'e1', kind: 'agent' },
+    { activityId: 'node2', executionId: 'e2', kind: 'agent' },
+  ]
+  const sent = []
+  const client = {
+    async readInstanceMessages() { return { messages: [], total: 0, nextCursor: null, liveExecutions: live } },
+    async sendInstanceMessage(id, body) {
+      sent.push({ id, body })
+      return { ok: true, message: { messageId: body.messageId, status: 'queued' }, delivery: { confirmed: [], failed: [] } }
+    },
+  }
+  const harness = createHarness(InstanceInboxPanel, inboxProps(client, { instanceId: 'M' }))
+  let tree = await harness.flush()
+  findAll(tree, node => node.type === 'select')[0].props.onChange({ target: { value: 'e1' } })
+  findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0]
+    .props.onInput({ target: { value: '发给 e1' } })
+  tree = await harness.flush()
+
+  // e1 结束、e2 仍在：不能悄悄把目标改成 e2。
+  live = [{ activityId: 'node2', executionId: 'e2', kind: 'agent' }]
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-refresh')[0].props.onClick()
+  tree = await harness.flush()
+  const select = findAll(tree, node => node.type === 'select')[0]
+  eq(select.props.value, '', '失效选择不自动落到 candidates[0]')
+  ok(textOfNode(tree).includes('目标已失效'), '提示目标已失效并要求重选')
+  const send = findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0]
+  eq(send.props.disabled, true, '目标失效时禁止发送')
+  send.props.onClick()
+  tree = await harness.flush()
+  eq(sent.length, 0, '未重选前不得发出任何消息')
+
+  // 显式重选 e2 后才能发送。
+  findAll(tree, node => node.type === 'select')[0].props.onChange({ target: { value: 'e2' } })
+  tree = await harness.flush()
+  eq(findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.disabled, false,
+    '显式重选后恢复可发送')
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  await harness.flush()
+  eq(sent.length, 1)
+  deep(sent[0].body.target, { activityId: 'node2', executionId: 'e2' })
+})
+
+await check('N10：unmount 后迟到发送结果不触发全局通知/刷新', async () => {
+  const gate = deferred()
+  const notices = []
+  let changed = 0
+  const sent = []
+  const client = {
+    async readInstanceMessages() {
+      return {
+        messages: [], total: 0, nextCursor: null,
+        liveExecutions: [{ activityId: 'node', executionId: 'e1', kind: 'agent' }],
+      }
+    },
+    async sendInstanceMessage(id, body) {
+      sent.push({ id, body })
+      return gate.promise
+    },
+  }
+  const harness = createHarness(InstanceInboxPanel, inboxProps(client, {
+    notice: (kind, text) => notices.push({ kind, text }),
+    onChanged: () => { changed += 1 },
+  }))
+  let tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['aria-label'] === '消息正文')[0]
+    .props.onInput({ target: { value: '卸载前发出' } })
+  tree = await harness.flush()
+  findAll(tree, node => node.props && node.props['data-action'] === 'inbox-send')[0].props.onClick()
+  tree = await harness.flush()
+  eq(sent.length, 1)
+
+  // keyed unmount（实例切换）：旧组件的在飞发送结果必须整体失效。
+  harness.unmount()
+  gate.resolve({
+    ok: true, duplicate: false,
+    message: { messageId: sent[0].body.messageId, status: 'queued' },
+    delivery: { confirmed: [sent[0].body.messageId], failed: [] },
+  })
+  await harness.flush()
+  eq(notices.length, 0, 'unmount 后旧发送结果不触发全局通知')
+  eq(changed, 0, 'unmount 后旧发送结果不触发列表刷新')
 })
 
 if (failures.length > 0) {

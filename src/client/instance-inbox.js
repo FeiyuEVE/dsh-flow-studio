@@ -14,6 +14,11 @@
  * 列表按 Host 的 nextCursor 分页（可「加载更多」），目标模式可显式切换，
  * exact 目标消失时回退到「下次激活」，一次逻辑提交固定 messageId。
  *
+ * 0.13.13 复审 M7 / M8 / N10：messageId 只由「规范化目标 + 正文」签名决定，
+ * 点击当前模式/重选目标/编辑正文都不提前丢弃 pendingId；手选 exact 目标消失时
+ * 保留失效选择并要求重选（不静默改投 candidates[0]）；组件 unmount 时使在飞
+ * 回调失效，迟到发送结果不再触发全局通知或列表刷新。
+ *
  * @module @feiyueve/dsh-flow-studio/client/instance-inbox
  */
 
@@ -127,6 +132,16 @@ function messageIdForUi() {
   const stamp = Date.now().toString(36)
   const salt = Math.random().toString(36).slice(2, 8)
   return `ui-${stamp}-${salt}`
+}
+
+/** 目标规范化签名：只包含 Host 会看到的活动 / 执行 / 投递方式。 */
+function targetSignatureOf(target) {
+  return JSON.stringify([target.activityId, target.executionId || '', target.delivery || ''])
+}
+
+/** 一次逻辑提交的签名：目标 + 正文。只有签名变化才换 messageId。 */
+function submissionSignatureOf(target, text) {
+  return JSON.stringify([target.activityId, target.executionId || '', target.delivery || '', text])
 }
 
 /** `error.data.error` 优先；没有就给通用文案。 */
@@ -250,6 +265,8 @@ export function InstanceInboxPanel(props = {}) {
   const [guard] = useState(() => ({
     instanceId: '',
     epoch: 0,
+    // keyed unmount 后置 false 并推进 epoch：旧组件在飞的回调不能再碰全局通知/刷新。
+    alive: true,
     listSeq: 0,
     listApplied: 0,
     bodySeq: 0,
@@ -262,6 +279,17 @@ export function InstanceInboxPanel(props = {}) {
   const [bodyTick, setBodyTick] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
   const [focus, setFocus] = useState({ instanceId, messageId: '' })
+
+  // 实例切换由 page.js 的 `key` 强制重挂；旧组件的列表/正文 effect cleanup 只会
+  // 停掉它们自己的请求，发送回调仍持有旧的 notice / onChanged。这里在卸载时让
+  // 世代失效，把所有在飞回调（发送成功通知、onChanged 刷新、迟到正文）一起作废。
+  useEffect(() => {
+    guard.alive = true
+    return () => {
+      guard.alive = false
+      guard.epoch += 1
+    }
+  }, [])
 
   useEffect(() => {
     const switched = guard.instanceId !== instanceId
@@ -281,7 +309,7 @@ export function InstanceInboxPanel(props = {}) {
     const epoch = guard.epoch
     const seq = ++guard.listSeq
     let cancelled = false
-    const isCurrent = () => !cancelled && guard.epoch === epoch && seq >= guard.listApplied
+    const isCurrent = () => guard.alive && !cancelled && guard.epoch === epoch && seq >= guard.listApplied
     setList(current => (current.instanceId === instanceId
       ? { ...current, loading: true, error: '' }
       : { ...emptyList(instanceId), loading: true }))
@@ -306,7 +334,7 @@ export function InstanceInboxPanel(props = {}) {
       setList(current => (current.instanceId === instanceId
         ? { ...current, loading: false, error: plan.text }
         : current))
-      if (guard.epoch === epoch && guard.instanceId === instanceId) notice(plan.kind, plan.text)
+      if (guard.alive && guard.epoch === epoch && guard.instanceId === instanceId) notice(plan.kind, plan.text)
     })
     return () => { cancelled = true }
   }, [client, instanceId, reloadTick])
@@ -348,9 +376,19 @@ export function InstanceInboxPanel(props = {}) {
   const shownTotal = Math.max(shown.total, messages.length)
   const candidates = targetCandidates(live, tasks)
   const hasCandidates = candidates.length > 0
-  const selected = candidates.find(item => item.executionId === comp.selectedExecutionId) || candidates[0] || null
-  // 手选过 exact、之后执行结束：自动回退到「下次激活」并在界面上说明。
+  // 手选的 exact 目标只按 executionId 精确匹配；找不到就是「已失效」，绝不落到 candidates[0]。
+  const explicitSelected = comp.mode === 'exact'
+    ? candidates.find(item => item.executionId === comp.selectedExecutionId) || null
+    : null
+  const selected = comp.mode === 'exact'
+    ? explicitSelected
+    : comp.mode === 'auto'
+      ? (candidates[0] || null)
+      : null
+  // 手选过 exact、之后执行结束且没有其它候选：自动回退到「下次激活」并在界面上说明。
   const fallbackToNext = comp.mode === 'exact' && !hasCandidates
+  // 手选目标消失但仍有其它执行：保留失效选择，要求用户重选（M8）。
+  const invalidExactTarget = comp.mode === 'exact' && hasCandidates && explicitSelected === null
   const targetMode = fallbackToNext
     ? 'next'
     : comp.mode === 'auto'
@@ -358,6 +396,7 @@ export function InstanceInboxPanel(props = {}) {
       : comp.mode
   const terminal = status === 'COMPLETED' || status === 'CANCELED'
   const sendable = !terminal && instanceId !== '' && comp.text.trim() !== '' && !comp.sending
+    && !invalidExactTarget
     && (targetMode === 'exact' ? selected !== null : comp.nextActivityId.trim() !== '')
 
   function updateCompose(fn) {
@@ -365,44 +404,81 @@ export function InstanceInboxPanel(props = {}) {
   }
 
   function editText(text) {
-    updateCompose(current => (current.text === text ? current : { ...current, text, pendingId: '', pendingKey: '' }))
+    if (comp.sending) return
+    // 不在这里丢弃 pendingId：messageId 是否复用由发送时的「目标 + 正文」签名决定，
+    // 失败后编辑再改回原文也能安全重试同一条提交。
+    updateCompose(current => (current.text === text ? current : { ...current, text }))
   }
 
   function chooseMode(nextMode) {
+    if (comp.sending) return
     if (nextMode === 'exact' && !hasCandidates) return
-    updateCompose(current => (current.mode === nextMode && current.pendingId === ''
-      ? current
-      : { ...current, mode: nextMode, pendingId: '', pendingKey: '' }))
+    // 目标没变就完全 no-op：重复点击当前已选模式不能清 pendingId。
+    const currentTarget = targetOf()
+    const nextTarget = nextMode === 'exact'
+      ? (selected === null ? null : { activityId: selected.activityId, executionId: selected.executionId })
+      : (comp.nextActivityId.trim() === ''
+        ? null
+        : { activityId: comp.nextActivityId.trim(), delivery: 'nextActivation' })
+    const sameTarget = currentTarget === null || nextTarget === null
+      ? currentTarget === nextTarget
+      : targetSignatureOf(currentTarget) === targetSignatureOf(nextTarget)
+    if (targetMode === nextMode && sameTarget) return
+    updateCompose(current => {
+      if (current.instanceId !== instanceId || current.sending) return current
+      if (nextMode === 'next') return current.mode === 'next' ? current : { ...current, mode: 'next' }
+      // 切回「当前执行」：保留仍然存在的显式选择，否则落到第一个候选（模式切换本身
+      // 就是用户动作，但仍不会把已失效的旧选择静默换成另一个执行）。
+      const keep = current.selectedExecutionId !== ''
+        && candidates.some(item => item.executionId === current.selectedExecutionId)
+      if (keep) return current.mode === 'exact' ? current : { ...current, mode: 'exact' }
+      const first = candidates[0]
+      if (!first) return current
+      return { ...current, mode: 'exact', selectedExecutionId: first.executionId }
+    })
   }
 
   function chooseExecution(executionId) {
-    updateCompose(current => ({ ...current, mode: 'exact', selectedExecutionId: executionId, pendingId: '', pendingKey: '' }))
+    if (comp.sending) return
+    updateCompose(current => {
+      if (current.instanceId !== instanceId || current.sending) return current
+      if (current.mode === 'exact' && current.selectedExecutionId === executionId) return current
+      return { ...current, mode: 'exact', selectedExecutionId: executionId }
+    })
   }
 
   function editNextActivityId(value) {
-    updateCompose(current => ({ ...current, nextActivityId: value, pendingId: '', pendingKey: '' }))
+    if (comp.sending) return
+    updateCompose(current => (current.nextActivityId === value
+      ? current
+      : { ...current, nextActivityId: value }))
   }
 
   function targetOf() {
-    return targetMode === 'exact'
-      ? { activityId: selected.activityId, executionId: selected.executionId }
-      : { activityId: comp.nextActivityId.trim(), delivery: 'nextActivation' }
+    if (targetMode === 'exact') {
+      return selected === null
+        ? null
+        : { activityId: selected.activityId, executionId: selected.executionId }
+    }
+    const activityId = comp.nextActivityId.trim()
+    return activityId === '' ? null : { activityId, delivery: 'nextActivation' }
   }
 
   async function send() {
-    if (!sendable || selected === null && targetMode === 'exact') return
-    const epoch = guard.epoch
+    if (!sendable || comp.sending) return
     const target = targetOf()
+    if (target === null) return
+    const epoch = guard.epoch
     const text = comp.text
     // 一次逻辑提交 = 内容 + 目标 + messageId。响应丢失后的重试必须复用同一个
-    // messageId；只有内容/目标变了（pendingKey 不匹配）才生成新 id。
-    const signature = JSON.stringify([target.activityId, target.executionId || '', target.delivery || '', text])
+    // messageId；只有规范化签名变了才生成新 id。
+    const signature = submissionSignatureOf(target, text)
     const reuse = comp.pendingId !== '' && comp.pendingKey === signature
     const messageId = reuse ? comp.pendingId : messageIdForUi()
     updateCompose(current => ({ ...current, sending: true, pendingId: messageId, pendingKey: signature }))
     try {
       const data = await client.sendInstanceMessage(instanceId, { messageId, target, text })
-      if (guard.epoch !== epoch || guard.instanceId !== instanceId) return
+      if (!guard.alive || guard.epoch !== epoch || guard.instanceId !== instanceId) return
       const message = isObject(data) && isObject(data.message) ? data.message : {}
       const delivery = isObject(data) && isObject(data.delivery) ? data.delivery : null
       const failed = delivery && Array.isArray(delivery.failed) ? delivery.failed.length : 0
@@ -426,12 +502,12 @@ export function InstanceInboxPanel(props = {}) {
       setReloadTick(tick => tick + 1)
       onChanged()
     } catch (error) {
-      if (guard.epoch !== epoch || guard.instanceId !== instanceId) return
+      if (!guard.alive || guard.epoch !== epoch || guard.instanceId !== instanceId) return
       // 草稿与 pendingId 都保留：同一个 messageId + 同一份内容可以直接重试。
       const plan = inboxFailurePlan('send', error)
       notice(plan.kind, plan.text)
     } finally {
-      if (guard.epoch === epoch && guard.instanceId === instanceId) {
+      if (guard.alive && guard.epoch === epoch && guard.instanceId === instanceId) {
         updateCompose(current => (current.sending ? { ...current, sending: false } : current))
       }
     }
@@ -442,7 +518,7 @@ export function InstanceInboxPanel(props = {}) {
     const epoch = guard.epoch
     const seq = guard.listSeq
     const startCursor = shown.nextCursor
-    const isCurrent = () => guard.epoch === epoch && guard.listSeq === seq
+    const isCurrent = () => guard.alive && guard.epoch === epoch && guard.listSeq === seq
     setList(current => (current.instanceId === instanceId ? { ...current, loadingMore: true, error: '' } : current))
     try {
       const result = await readMessagePages(client, instanceId, { cursor: startCursor, isCurrent })
@@ -482,13 +558,15 @@ export function InstanceInboxPanel(props = {}) {
   const shownBody = bodyView !== null && bodyView.instanceId === instanceId ? bodyView : null
   const sendHint = terminal
     ? '实例已结束：不再受理新消息。'
-    : fallbackToNext
-      ? '原选中的执行已结束：已自动改发「下次激活」，填写节点 id 即可发送。'
-      : targetMode === 'exact'
-        ? `将发给当前 ${selected.label}（${selected.activityId}）。`
-        : hasCandidates
-          ? '将发给节点的下一次激活（需填写节点 id）。'
-          : '当前没有活执行：默认发给节点的下一次激活。'
+    : invalidExactTarget
+      ? '原选中的执行已结束：目标已失效，请重新选择目标（不会自动改投其他执行）。'
+      : fallbackToNext
+        ? '原选中的执行已结束：已自动改发「下次激活」，填写节点 id 即可发送。'
+        : targetMode === 'exact'
+          ? `将发给当前 ${selected.label}（${selected.activityId}）。`
+          : hasCandidates
+            ? '将发给节点的下一次激活（需填写节点 id）。'
+            : '当前没有活执行：默认发给节点的下一次激活。'
 
   return h('section', {
     className: 'fs-inbox',
@@ -588,7 +666,7 @@ export function InstanceInboxPanel(props = {}) {
         className: 'fs-btn sm ' + (targetMode === 'exact' ? 'primary' : 'ghost'),
         'data-action': 'inbox-mode-exact',
         'aria-pressed': targetMode === 'exact',
-        disabled: !hasCandidates,
+        disabled: !hasCandidates || comp.sending,
         onClick: () => chooseMode('exact'),
       }, '当前执行'),
       h('button', {
@@ -596,6 +674,7 @@ export function InstanceInboxPanel(props = {}) {
         className: 'fs-btn sm ' + (targetMode === 'next' ? 'primary' : 'ghost'),
         'data-action': 'inbox-mode-next',
         'aria-pressed': targetMode === 'next',
+        disabled: comp.sending,
         onClick: () => chooseMode('next'),
       }, '下次激活')),
     targetMode === 'exact'
@@ -605,8 +684,14 @@ export function InstanceInboxPanel(props = {}) {
         'aria-label': '消息目标',
         disabled: comp.sending || terminal,
         onChange: event => chooseExecution(event.target.value),
-      }, candidates.map(item => h('option', { key: item.executionId, value: item.executionId },
-        `${item.label} · ${item.activityId}`)))
+      }, [
+        selected === null
+          ? h('option', { key: '__reselect', value: '', disabled: true },
+            invalidExactTarget ? '目标已失效，请重新选择' : '请选择目标')
+          : null,
+        ...candidates.map(item => h('option', { key: item.executionId, value: item.executionId },
+          `${item.label} · ${item.activityId}`)),
+      ])
       : h('input', {
         className: 'fs-inbox-target',
         type: 'text',

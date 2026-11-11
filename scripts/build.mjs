@@ -17,24 +17,30 @@
  * 产物可复现：同样的 src 打出来的 lib 字节相同（除 esbuild 版本差异）。
  * 体积只报数（raw / gzip），不设自设上限；结构错误（缺文件、依赖错位、陈旧产物）仍硬失败。
  *
+ * 构建末尾写出 lib/build-meta.json：schemaVersion + inputsHash（源码/脚本/锁文件/依赖内容）
+ * + 每个生成产物的 bytes/gzipBytes/sha256 + 输入清单。verify-build.mjs 只读它也能判断
+ * 「眼前这份 lib 是不是当前输入的产物」，不需要 mtime，也不允许缺 meta 时静默跳过。
+ *
  * 门禁：lib/ 是 .gitignore 排除的构建产物，包里一个 js 都没有过、也发过陈旧 lib。
  * 所以构建末尾会核对三件事 —— 清单非空、lib/ 的 .js 集合与清单完全一致、每个
  * Host 模块与 src/ 逐字节相同；任何一项不符都非零退出。模块清单一律用下面的
  * HOST_MODULES 派生，不再写第二份（scripts/verify-build.mjs 也从这里 import）。
  */
 
+import { createHash } from 'node:crypto'
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
 import { createRequire } from 'node:module'
 import { gzipSync } from 'node:zlib'
-import { dirname, resolve } from 'node:path'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { buildBpmnAssets } from './build-bpmn-assets.mjs'
@@ -95,6 +101,143 @@ export const GENERATED_MODULES = ['client.js', 'client.bpmn.js']
 
 /** lib/ 下应当存在的全部 .js（Host 模块 + 生成产物）。 */
 export const EXPECTED_LIB_MODULES = [...HOST_MODULES, ...GENERATED_MODULES]
+
+/** 构建元数据文件名：放在 lib/ 内（随包发布），不落到仓库根。 */
+export const BUILD_META_FILE = 'build-meta.json'
+
+/** 元数据 schema 版本；verify-build.mjs 只接受这个值，不做向后兼容猜测。 */
+export const BUILD_META_SCHEMA_VERSION = 1
+
+/** 参与构建的脚本：scripts/build*.mjs 全部纳入输入哈希（新增构建助手自动覆盖）。 */
+const BUILD_SCRIPT_PATTERN = /^build.*\.mjs$/
+
+/** 参与构建的清单文件：依赖版本与锁文件内容都进输入哈希。 */
+const BUILD_MANIFEST_FILES = ['package.json', 'package-lock.json']
+
+/** 旧版构建留下的元数据（0.13.3 之前）；构建时清掉，避免旧字段混进包里。 */
+const LEGACY_META_FILES = ['.build-meta.json', '.build-inputs.json']
+
+/**
+ * 依赖泄漏的**内容特征**：不依赖任何可删除的 metadata 字段，也不只是 grep 注册字符串。
+ * 每条都来自真实依赖代码或官方样式；主包混入 chunk 会同时命中多条。
+ *
+ * 注意：0.13.3 步骤 7 之前主包仍带旧画布 React Flow（src/client 里还在用），
+ * 所以主包的禁用表只列 BPMN 栈；chunk 的 React Flow 禁用不受此影响。
+ */
+export const LEAK_MARKERS = {
+  'client.js': [
+    ['bpmn-js 包名', /bpmn-js/],
+    ['diagram-js 包名', /diagram-js/],
+    ['官方属性面板包名', /bpmn-js-properties-panel/],
+    ['@bpmn-io 作用域', /@bpmn-io/],
+    ['bio-properties-panel 类名', /bio-properties-panel/],
+    ['BPMN 主题桥接样式 --bio-surface', /--bio-surface/],
+    ['内联 woff2 字体', /data:font\/woff2;base64,/],
+  ],
+  'client.bpmn.js': [
+    ['React Flow 样式类名 react-flow__', /react-flow__/],
+    ['@xyflow 依赖标记', /@xyflow\//],
+  ],
+}
+
+/** 按文件类型返回命中的泄漏特征标签；无泄漏返回空数组。 */
+export function findLeakMarkers(file, source) {
+  const markers = LEAK_MARKERS[file] ?? []
+  return markers.filter(([, pattern]) => pattern.test(source)).map(([label]) => label)
+}
+
+/** 统一成正斜杠，保证 Windows / Linux 的输入清单路径写法一致。 */
+function toPosixPath(file) {
+  return file.split('\\').join('/')
+}
+
+/** 一个 Buffer 的 sha256（十六进制小写）。 */
+function sha256Hex(data) {
+  return createHash('sha256').update(data).digest('hex')
+}
+
+/** 递归列出目录下全部文件（相对 rootDir，正斜杠），调用方负责排序。 */
+function walkFiles(rootDir, relDir) {
+  const absDir = resolve(rootDir, relDir)
+  if (!existsSync(absDir)) return []
+  const out = []
+  for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+    const relPath = `${relDir}/${entry.name}`
+    if (entry.isDirectory()) out.push(...walkFiles(rootDir, relPath))
+    else out.push(relPath)
+  }
+  return out
+}
+
+/**
+ * 收集一次构建的完整输入清单，并逐文件算 sha256。
+ *
+ * 覆盖三部分：
+ *   1. 源码树 + 构建脚本 + package.json / package-lock.json（目录整体扫描，新增/删除都变）；
+ *   2. esbuild 自身的 package.json（构建工具版本）；
+ *   3. esbuild metafile 记录的实际打包输入（含 node_modules 里的依赖文件内容）。
+ *
+ * 这样 verify-build.mjs 不需要跑 esbuild，也能判断「当前输入还是不是产出这份 lib 的那份输入」。
+ * strict=true 时缺文件直接抛错（构建路径）；verify 传 false，把缺失记成 sha256='missing'
+ * 由它给出可读错误。
+ *
+ * @param {string} [rootDir] 仓库根目录
+ * @param {string[]} [bundledPaths] esbuild metafile 的 inputs 键
+ * @param {{strict?: boolean}} [options]
+ * @returns {Array<{path: string, bytes: number, sha256: string}>} 按 path 排序
+ */
+export function collectBuildInputs(rootDir = root, bundledPaths = [], options = {}) {
+  const { strict = true } = options
+  const entries = []
+  const seen = new Set()
+
+  const addEntry = relPath => {
+    const normalized = toPosixPath(relPath)
+    if (seen.has(normalized)) return
+    seen.add(normalized)
+    const abs = resolve(rootDir, normalized)
+    if (!existsSync(abs)) {
+      if (strict) throw new Error(`构建输入缺失：${normalized}`)
+      entries.push({ path: normalized, bytes: -1, sha256: 'missing' })
+      return
+    }
+    const data = readFileSync(abs)
+    entries.push({ path: normalized, bytes: data.length, sha256: sha256Hex(data) })
+  }
+
+  // 1) 源码树 / 构建脚本 / 清单：按目录整体扫描，新增文件也会改变 inputsHash。
+  for (const rel of walkFiles(rootDir, 'src').sort()) addEntry(rel)
+  const scriptsDir = resolve(rootDir, 'scripts')
+  if (existsSync(scriptsDir)) {
+    const buildScripts = readdirSync(scriptsDir)
+      .filter(name => BUILD_SCRIPT_PATTERN.test(name))
+      .sort()
+    for (const name of buildScripts) addEntry(`scripts/${name}`)
+  }
+  for (const rel of BUILD_MANIFEST_FILES) addEntry(rel)
+
+  // 2) 构建工具本身：esbuild 版本变了，产物可能变，输入哈希必须跟着变。
+  try {
+    const esbuildPkg = createRequire(import.meta.url).resolve('esbuild/package.json')
+    addEntry(relative(rootDir, esbuildPkg))
+  } catch {
+    // esbuild 没装时构建本来就跑不起来；这里不掩盖构建路径的错误。
+  }
+
+  // 3) esbuild 实际读过的依赖文件（metafile inputs，含 src 与 node_modules）。
+  for (const raw of [...new Set(bundledPaths)].sort()) addEntry(raw)
+
+  return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+}
+
+/** 输入清单的稳定哈希：path + 字节数 + 内容 sha256，排序后逐行喂给 sha256。 */
+export function hashInputManifest(entries) {
+  const hash = createHash('sha256')
+  for (const entry of [...entries].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    hash.update(`${entry.path}\0${entry.bytes}\0${entry.sha256}\n`)
+  }
+  return hash.digest('hex')
+}
 
 /** 两个 Buffer 首个不同字节的下标；完全相同返回两者长度的最小值。 */
 function firstDiffIndex(a, b) {
@@ -168,6 +311,11 @@ export async function buildPlugin() {
   const libDir = resolve(root, 'lib')
   mkdirSync(libDir, { recursive: true })
 
+  // 旧版构建留下的元数据不再使用：不清掉的话它会被 npm pack 一起带进包里。
+  for (const name of LEGACY_META_FILES) {
+    rmSync(resolve(libDir, name), { force: true })
+  }
+
   // 步骤 4：先内联官方 CSS/字体，生成 chunk 可 import 的样式字符串。
   // 生成物是构建产物（src/client/bpmn/assets.generated.js，.gitignore 排除）。
   const assets = buildBpmnAssets(root)
@@ -189,6 +337,8 @@ export async function buildPlugin() {
     format: 'cjs',
     platform: 'browser',
     target: 'es2022',
+    // metafile 里的输入路径固定相对仓库根，输入哈希才能跨 cwd 稳定复现。
+    absWorkingDir: root,
     // React 由宿主模块表提供（createPlugin 里 bindReact(require('react'))）。
     // esbuild 的 external 会连 `react` 的子路径一起外置，所以 react/jsx-runtime 必须用
     // alias 指到真实文件再打进产物 —— 宿主模块表不保证有 jsx-runtime。
@@ -312,7 +462,18 @@ export async function buildPlugin() {
     console.error(`✗ 画布 chunk 里混进了 React Flow（旧画布不属于 chunk）：\n  ${xyflowInChunk.join('\n  ')}`)
     process.exit(1)
   }
-  console.log(`✓ 主包不含 bpmn-js / @bpmn-io 重依赖；chunk 不含 React Flow`)
+  // 依赖图之外再做一层内容特征检查：即使 metafile 被换掉，混进来的真实代码也会命中这些串。
+  const mainLeaks = findLeakMarkers('client.js', client)
+  if (mainLeaks.length > 0) {
+    console.error(`✗ 主包内容命中画布依赖特征（应只进 chunk）：${mainLeaks.join('、')}`)
+    process.exit(1)
+  }
+  const chunkLeaks = findLeakMarkers('client.bpmn.js', chunk)
+  if (chunkLeaks.length > 0) {
+    console.error(`✗ 画布 chunk 内容命中 React Flow 特征：${chunkLeaks.join('、')}`)
+    process.exit(1)
+  }
+  console.log(`✓ 主包不含 bpmn-js / @bpmn-io 重依赖；chunk 不含 React Flow（依赖图 + 内容特征双重检查）`)
 
   // 产物自检：lib/ 里所有相对 import 必须能在 lib/ 内解析。
   // 0.5.0 就是因为漏拷 audit.js / tools.js，插件在容器里直接 404 —— 那次靠 e2e 才发现，
@@ -372,14 +533,40 @@ export async function buildPlugin() {
   }
   console.log(`✓ src ↔ lib 逐字节一致（${HOST_MODULES.length} 个 Host 模块）`)
 
-  // 打包输入清单留个痕，便于核对产物由哪些源文件构成；按产物分别记录归属。
-  const inputs = [...new Set([...mainInputs, ...chunkInputs])]
-  writeFileSync(resolve(libDir, '.build-inputs.json'), `${JSON.stringify(inputs, null, 2)}\n`)
-  writeFileSync(resolve(libDir, '.build-meta.json'), `${JSON.stringify({
-    'client.js': { raw: mainSize.raw, gzip: mainSize.gzip, inputs: mainInputs },
-    'client.bpmn.js': { raw: chunkSize.raw, gzip: chunkSize.gzip, inputs: chunkInputs },
+  // ---- 构建元数据：把「这份产物」和「产出它的输入」一起钉死 ----------------------
+  // verify-build.mjs 只读这份文件 + 磁盘字节即可回答三个问题：
+  //   ① 产物是不是当前输入的产物（inputsHash）；② 产物字节有没有被换（sha256）；
+  //   ③ 每个产物由哪些依赖构成（inputs，仅供人工核对，不是唯一判据）。
+  const outputs = [
+    {
+      file: 'client.js',
+      bytes: mainSize.raw,
+      gzipBytes: mainSize.gzip,
+      sha256: sha256Hex(readFileSync(resolve(libDir, 'client.js'))),
+      inputs: mainInputs,
+    },
+    {
+      file: 'client.bpmn.js',
+      bytes: chunkSize.raw,
+      gzipBytes: chunkSize.gzip,
+      sha256: sha256Hex(readFileSync(resolve(libDir, 'client.bpmn.js'))),
+      inputs: chunkInputs,
+    },
+  ]
+  const inputEntries = collectBuildInputs(root, [...new Set([...mainInputs, ...chunkInputs])])
+  const inputsHash = hashInputManifest(inputEntries)
+  writeFileSync(resolve(libDir, BUILD_META_FILE), `${JSON.stringify({
+    schemaVersion: BUILD_META_SCHEMA_VERSION,
+    generator: 'scripts/build.mjs',
+    generatedAt: new Date().toISOString(),
+    inputsHash,
+    inputs: inputEntries,
+    outputs,
   }, null, 2)}\n`)
-  console.log(`✓ 记录了 ${inputs.length} 个打包输入（按产物区分写进 lib/.build-meta.json）`)
+  console.log(
+    `✓ 写出 lib/${BUILD_META_FILE}：inputsHash=${inputsHash.slice(0, 12)}…（${inputEntries.length} 个输入文件），`
+    + `2 个产物已绑定字节数与 sha256`,
+  )
 }
 // 只在被直接执行时构建；被 verify-build.mjs / 测试 import 时保持纯函数，不产生副作用。
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)

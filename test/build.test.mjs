@@ -37,8 +37,9 @@ import {
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { gzipSync } from 'node:zlib'
 
-import { HOST_MODULES, GENERATED_MODULES, EXPECTED_LIB_MODULES } from '../scripts/build.mjs'
+import { BUILD_META_FILE, GENERATED_MODULES, HOST_MODULES, EXPECTED_LIB_MODULES } from '../scripts/build.mjs'
 
 let checks = 0
 /** 统计断言数（用户要求回报断言数）。 */
@@ -279,14 +280,24 @@ try {
   })
 
   await check('tarball 里两个产物的元数据存在，且依赖归属无泄漏', async () => {
-    A.ok(files.includes('lib/.build-meta.json'), 'tarball 含 lib/.build-meta.json')
-    const meta = JSON.parse(readFileSync(join(packageDir, 'lib', '.build-meta.json'), 'utf8'))
-    A.ok(meta['client.js'], '元数据含主包')
-    A.ok(meta['client.bpmn.js'], '元数据含 chunk')
-    A.equal(meta['client.js'].raw, readFileSync(join(packageDir, 'lib/client.js')).length, '主包 raw 大小与产物一致')
-    A.equal(meta['client.bpmn.js'].raw, readFileSync(join(packageDir, 'lib/client.bpmn.js')).length, 'chunk raw 大小与产物一致')
-    const mainInputs = meta['client.js'].inputs ?? []
-    const chunkInputs = meta['client.bpmn.js'].inputs ?? []
+    A.ok(files.includes(`lib/${BUILD_META_FILE}`), `tarball 含 lib/${BUILD_META_FILE}`)
+    A.ok(!files.includes('lib/.build-meta.json'), 'tarball 不含旧版 lib/.build-meta.json')
+    const meta = JSON.parse(readFileSync(join(packageDir, 'lib', BUILD_META_FILE), 'utf8'))
+    A.equal(meta.schemaVersion, 1, '元数据 schemaVersion 为 1')
+    A.match(meta.inputsHash, /^[0-9a-f]{64}$/, '元数据有合法 inputsHash')
+    A.ok(Array.isArray(meta.inputs) && meta.inputs.length > 0, '元数据有非空输入清单')
+    A.ok(Array.isArray(meta.outputs) && meta.outputs.length === GENERATED_MODULES.length, '元数据恰好覆盖两个生成产物')
+    for (const file of GENERATED_MODULES) {
+      const output = meta.outputs.find(entry => entry.file === file)
+      A.ok(output, `元数据含产物 ${file}`)
+      const data = readFileSync(join(packageDir, 'lib', file))
+      A.equal(output.bytes, data.length, `${file} 的 bytes 与产物一致`)
+      A.equal(output.sha256, sha256(data), `${file} 的 sha256 与产物一致`)
+      A.equal(output.gzipBytes, gzipSync(data, { level: 9 }).length, `${file} 的 gzipBytes 与产物一致`)
+      A.ok(Array.isArray(output.inputs), `${file} 的 inputs 是数组`)
+    }
+    const mainInputs = meta.outputs.find(entry => entry.file === 'client.js').inputs
+    const chunkInputs = meta.outputs.find(entry => entry.file === 'client.bpmn.js').inputs
     A.ok(
       !mainInputs.some(input => /node_modules\/(?:bpmn-js|diagram-js|bpmn-js-properties-panel|@bpmn-io)\//.test(input)),
       '主包依赖图不含 bpmn-js / diagram-js / 官方属性面板',
@@ -318,20 +329,152 @@ try {
     )
   })
 
-  await check('干净检出里 build 之后 verify-build 通过（src ↔ lib 一致 + main 入口存在）', async () => {
+  const libDir = join(checkout, 'lib')
+  const metaPath = join(libDir, BUILD_META_FILE)
+  const mainPath = join(libDir, 'client.js')
+  const chunkPath = join(libDir, 'client.bpmn.js')
+
+  await check('干净检出里 build 之后 verify-build 通过（输入绑定 + 产物哈希 + factory 可执行）', async () => {
     const result = mustRun('node', ['scripts/verify-build.mjs'], checkout, 'verify-build.mjs')
     A.match(result.stdout, /逐字节一致/, 'verify-build 报告逐字节一致')
     A.match(result.stdout, /main 入口存在/, 'verify-build 报告 main 入口存在')
+    A.match(result.stdout, /输入绑定一致/, 'verify-build 报告输入绑定一致')
+    A.match(result.stdout, /factory 可执行/, 'verify-build 报告 factory 可执行')
+    A.match(result.stdout, /依赖归属/, 'verify-build 报告依赖归属')
   })
 
-  await check('反例一：lib 陈旧时 verify-build 非零退出并点名文件', async () => {
-    appendFileSync(join(checkout, 'lib', 'supervise.js'), '\n// stale-lib-simulated\n')
+  // 反例都在这份干净产物上做，做完必须恢复，避免互相污染。
+  const pristine = {
+    main: readFileSync(mainPath),
+    chunk: readFileSync(chunkPath),
+    meta: readFileSync(metaPath),
+  }
+
+  /** 恢复两个生成产物与构建元数据。 */
+  function restoreBundles() {
+    writeFileSync(mainPath, pristine.main)
+    writeFileSync(chunkPath, pristine.chunk)
+    writeFileSync(metaPath, pristine.meta)
+  }
+
+  /** 按当前磁盘字节重算 outputs 的 bytes / sha256 / gzipBytes：模拟「篡改产物后再伪造元数据」。 */
+  function forgeMeta() {
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    for (const output of meta.outputs) {
+      const data = readFileSync(join(libDir, output.file))
+      output.bytes = data.length
+      output.sha256 = sha256(data)
+      output.gzipBytes = gzipSync(data, { level: 9 }).length
+    }
+    writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`)
+  }
+
+  /**
+   * 把真实 chunk 的 bundle 主体换进主包：保留主包的注册形状（id/factory），
+   * 但 factory 里跑的是 1.98MB 的真实 BPMN 代码 —— 模拟依赖泄漏。
+   * 不拼接 chunk 的注册头（否则旧的「主包不能带 chunk 字段」字符串检查会先拦住，
+   * 测不到泄漏判据本身）。
+   * @returns {number} 注入后的主包字节数
+   */
+  function injectChunkIntoMain() {
+    const mainSource = pristine.main.toString('utf8')
+    const chunkSource = pristine.chunk.toString('utf8')
+    const startMarker = 'var module = { exports: {} }; var exports = module.exports;'
+    const mainStart = mainSource.indexOf(startMarker) + startMarker.length
+    const chunkStart = chunkSource.indexOf(startMarker) + startMarker.length
+    const mainEnd = mainSource.lastIndexOf('return module.exports.createPlugin(require);')
+    const chunkEnd = chunkSource.lastIndexOf('return module.exports;')
+    A.ok(mainStart > startMarker.length && chunkStart > startMarker.length, '找到两个 bundle 的主体起点')
+    A.ok(mainEnd >= 0 && chunkEnd >= 0, '找到两个 bundle 的 footer 边界')
+    const mixed = mainSource.slice(0, mainStart) + chunkSource.slice(chunkStart, chunkEnd) + mainSource.slice(mainEnd)
+    A.ok(!mixed.includes("chunk: 'client.bpmn.js'"), '注入后主包里没有 chunk 注册字面量（旧字符串检查不会误拦截）')
+    writeFileSync(mainPath, mixed)
+    return Buffer.byteLength(mixed)
+  }
+
+  await check('反例一：lib/supervise.js 陈旧时 verify-build 非零退出并点名文件', async () => {
+    const supervisePath = join(libDir, 'supervise.js')
+    const original = readFileSync(supervisePath)
+    appendFileSync(supervisePath, '\n// stale-lib-simulated\n')
     const stale = run('node', ['scripts/verify-build.mjs'], checkout)
     A.ok(!stale.ok, '陈旧 lib 让 verify-build 非零退出')
     A.match(`${stale.stdout}${stale.stderr}`, /lib\/supervise\.js/, '报错里点名陈旧文件 lib/supervise.js')
+    writeFileSync(supervisePath, original)
   })
 
-  await check('反例二：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
+  await check('反例二：主包 factory 改成 return null（并伪造 meta 使字节自洽）必须被打回', async () => {
+    const original = pristine.main.toString('utf8')
+    const tampered = original.replace('return module.exports.createPlugin(require);', 'return null;')
+    A.notEqual(tampered, original, '主包 factory 已被改成返回 null')
+    writeFileSync(mainPath, tampered)
+    forgeMeta()
+    const result = run('node', ['scripts/verify-build.mjs'], checkout)
+    A.ok(!result.ok, 'factory 不可用时 verify-build 非零退出')
+    A.match(`${result.stdout}${result.stderr}`, /factory|插件对象/, '报错指向 factory / 插件对象')
+    restoreBundles()
+  })
+
+  await check('反例三：主包混入真实 BPMN chunk 代码并删除 meta，必须同时因泄漏与缺元数据失败', async () => {
+    const injectedBytes = injectChunkIntoMain()
+    A.ok(injectedBytes > pristine.main.length, `主包确实混入了 chunk 字节（${injectedBytes} 字节）`)
+    rmSync(metaPath, { force: true })
+    const result = run('node', ['scripts/verify-build.mjs'], checkout)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '混入 chunk 且缺 meta 时 verify-build 非零退出')
+    A.match(output, /依赖泄漏/, '报错指出依赖泄漏')
+    A.match(output, /build-meta\.json 缺失/, '报错指出构建元数据缺失')
+    restoreBundles()
+  })
+
+  await check('反例四：混入 chunk 并伪造 meta（输出哈希自洽）仍必须因依赖泄漏被打回', async () => {
+    const injectedBytes = injectChunkIntoMain()
+    A.ok(injectedBytes > 1_500_000, `注入后的主包约 2MB（真实 BPMN bundle 量级，实际 ${injectedBytes} 字节）`)
+    forgeMeta()
+    const result = run('node', ['scripts/verify-build.mjs'], checkout)
+    const output = `${result.stdout}${result.stderr}`
+    A.ok(!result.ok, '伪造 meta 也不能让混入 chunk 的主包通过')
+    A.match(output, /依赖泄漏/, '依赖泄漏判定不依赖可删除的 metadata 字段')
+    restoreBundles()
+  })
+
+  await check('反例五：两个生成产物各自被改动都必须被点名（不能只覆盖 supervise.js）', async () => {
+    for (const file of GENERATED_MODULES) {
+      const path = join(libDir, file)
+      writeFileSync(path, Buffer.concat([readFileSync(path), Buffer.from('\n')]))
+      const result = run('node', ['scripts/verify-build.mjs'], checkout)
+      const output = `${result.stdout}${result.stderr}`
+      A.ok(!result.ok, `${file} 被改动后 verify-build 非零退出`)
+      A.match(output, new RegExp(`lib/${file.replace(/\./g, '\\.')}`), `报错点名 lib/${file}`)
+      A.match(output, /sha256|大小/, `${file} 的字节哈希/大小不一致被报出`)
+      writeFileSync(path, file === 'client.js' ? pristine.main : pristine.chunk)
+    }
+    const recovered = run('node', ['scripts/verify-build.mjs'], checkout)
+    A.ok(recovered.ok, '恢复两个产物后 verify-build 再次通过')
+  })
+
+  await check('反例六：源码输入变化（修改 / 新增）而产物未重建必须被打回', async () => {
+    const stylePath = join(checkout, 'src/client/styles.js')
+    const originalStyle = readFileSync(stylePath)
+    appendFileSync(stylePath, '\n/* stale-input-probe */\n')
+    const changed = run('node', ['scripts/verify-build.mjs'], checkout)
+    const changedOutput = `${changed.stdout}${changed.stderr}`
+    A.ok(!changed.ok, '修改 src 后 verify-build 非零退出')
+    A.match(changedOutput, /输入已变化/, '报错指出输入已变化')
+    A.match(changedOutput, /src\/client\/styles\.js/, '报错点名被修改的源文件')
+    writeFileSync(stylePath, originalStyle)
+
+    const probePath = join(checkout, 'src/__stale_probe__.js')
+    writeFileSync(probePath, '// stale input probe\n')
+    const added = run('node', ['scripts/verify-build.mjs'], checkout)
+    A.ok(!added.ok, '新增 src 文件后 verify-build 非零退出')
+    A.match(`${added.stdout}${added.stderr}`, /新增 1 个/, '报错指出新增了输入文件')
+    rmSync(probePath, { force: true })
+
+    const recovered = run('node', ['scripts/verify-build.mjs'], checkout)
+    A.ok(recovered.ok, '恢复输入后 verify-build 再次通过')
+  })
+
+  await check('反例七：没有 prepack（--ignore-scripts）就一个 js 都没有，正例断言会拦住', async () => {
     rmSync(join(checkout, 'lib'), { recursive: true, force: true })
     const packDir2 = join(work, 'pack-no-scripts')
     mkdirSync(packDir2, { recursive: true })

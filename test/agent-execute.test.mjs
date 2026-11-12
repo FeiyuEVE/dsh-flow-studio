@@ -127,6 +127,8 @@ function makeFakeAdapter(behavior = {}) {
     async start(request) {
       calls.starts += 1
       calls.startRequests.push(request)
+      // 0.14.6：模拟「握手前失败」——start 直接抛错，调用方拿不到 handle。
+      if (behavior.startError) throw behavior.startError
       let resolveExited
       const exited = new Promise(resolvePromise => { resolveExited = resolvePromise })
       const handle = {
@@ -1306,6 +1308,52 @@ await check('usage 快照：只有 synthetic 未知记录时仍保留 synthetic 
   A.equal(usage.length, 1)
   A.equal(usage[0].trust, 'unknown')
   A.equal(usage[0].synthetic, true, '未知占位必须显式标 synthetic')
+})
+
+// 0.14.6 M2 残余：start 在返回 handle 之前失败时，适配器把已观测的 usage / 结算快照
+// 挂在错误载体上，executor 也要落盘——不能因为「没有 handle」就丢掉已观测用量。
+await check('usage 快照：握手前失败（无 handle）时，失败载体上的已观测 usage/snapshot 也落盘', async () => {
+  const workspace = freshWorkspace()
+  const observedBuckets = ['input', 'cacheRead', 'cacheWrite', 'output']
+  const startError = Object.assign(new Error('handshake failed before ready'), {
+    code: 'CLAUDE_TOOL_UNAVAILABLE',
+    usageCalls: () => [{
+      provider: 'claude',
+      callId: 'claude-message-v1:pre-handle',
+      usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11, canonical: 1 },
+      observedBuckets,
+      source: 'assistant',
+      provisional: true,
+    }],
+    usageSnapshots: () => [{
+      provider: 'claude',
+      snapshotId: 'claude-result-v1:pre-handle',
+      scope: 'invocation',
+      usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40, canonical: 1 },
+      observedBuckets,
+      provenance: { contract: 'claude-result-usage-v1', realCliVerified: false },
+    }],
+  })
+  const adapter = makeFakeAdapter({
+    capabilities: { finishTool: 'native', hooks: { 'turn.stop': 'native' }, usage: 'native' },
+    startError,
+  })
+  const failure = await executeAgent(elementFor(), {
+    attempt: 1, executionId: 'exec-pre-handle', variables: {}, timeoutMs: 500,
+  }, { adapters: registryWith(adapter), workspaceRoot: workspace }).catch(error => error)
+
+  A.equal(failure.code, 'CLAUDE_TOOL_UNAVAILABLE', '启动失败的错误码原样保留')
+  A.equal(adapter.calls.handles.length, 0, '前置：确实没有 handle')
+  A.ok(Array.isArray(failure.events), '失败载体上的已观测事件必须带出来')
+  const usage = failure.events.filter(event => event.type === 'agent/usage')
+  A.equal(usage.length, 1, '已观测调用不能丢')
+  A.equal(usage[0].callId, 'claude-message-v1:pre-handle')
+  A.equal(usage[0].usage.total, 11)
+  A.equal(usage[0].provisional, true, 'provisional 标记必须保留到事件')
+  const snapshots = failure.events.filter(event => event.type === 'agent/usage-snapshot')
+  A.equal(snapshots.length, 1, '结算快照也不能只留在适配器内存里')
+  A.equal(snapshots[0].usage.total, 40)
+  A.equal(snapshots[0].invocationId, 'exec-pre-handle:invoke-1', '快照挂到本次 invocation')
 })
 
 try {

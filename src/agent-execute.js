@@ -773,15 +773,26 @@ export async function runAgentNode(options = {}) {
     // 0.13.10 运行指标：**任何结局**（成功 / 超时 / 取消 / 未 finish / 抛错）都把
     // 已观测 usage 与调用身份落到事件账本。不能只在 activity/end 上取数——超时与
     // 未 finish 的调用根本没有 activity/end。dispose 之前读，避免适配器清空句柄状态。
-    if (handle !== null) {
+    //
+    // 0.14.6 M2 残余：start 在返回 handle 之前失败时，句柄不存在，但适配器可能已经把
+    // 已观测的 usage / 结算快照挂在错误载体上（`error.usageCalls` / `error.usageSnapshots`，
+    // startFailure 包装后位于 `failure.cause`）。失败路径同样要把它们落盘。
+    let usageSource = handle
+    if (usageSource === null && failure !== null && typeof failure === 'object') {
+      const carrier = failure.cause && typeof failure.cause === 'object' ? failure.cause : failure
+      const hasCalls = typeof carrier.usageCalls === 'function' || Array.isArray(carrier.usageCalls)
+      const hasSnapshots = typeof carrier.usageSnapshots === 'function' || Array.isArray(carrier.usageSnapshots)
+      if (hasCalls || hasSnapshots) usageSource = carrier
+    }
+    if (usageSource !== null) {
       const usageCapability = adapterUsageCapability(adapter)
-      const calls = readAdapterUsageCalls(handle, adapter.id)
+      const calls = readAdapterUsageCalls(usageSource, adapter.id)
       for (const call of calls) {
         events.push(usageEventForCall({ ...call, invocationId: call.invocationId ?? invocationId }))
       }
-      // 可选的结算快照（`handle.usageSnapshots`）：与调用身份分开落盘，不增加调用数。
-      // 失败路径（超时 / 取消 / 未 finish）同样要落，且必须在 dispose 之前读。
-      const snapshots = readAdapterUsageSnapshots(handle, adapter.id)
+      // 可选的结算快照（`usageSource.usageSnapshots`）：与调用身份分开落盘，不增加调用数。
+      // 失败路径（超时 / 取消 / 未 finish / 握手前失败）同样要落，且必须在 dispose 之前读。
+      const snapshots = readAdapterUsageSnapshots(usageSource, adapter.id)
       for (const snapshot of snapshots) {
         events.push(usageSnapshotEventFor({
           ...snapshot,
@@ -789,7 +800,9 @@ export async function runAgentNode(options = {}) {
         }))
       }
       // 适配器宣称能观测却一条都没有：这是 unknown，不是 0。
-      if (calls.length === 0 && snapshots.length === 0 && usageCapability === USAGE_SUPPORT.NATIVE) {
+      // 只有「已经拿到 handle」的轮次才把「宣称能观测却一条都没有」记成 unknown 占位；
+      // 握手前失败没有真实的启动轮次，不伪造调用事实。
+      if (handle !== null && calls.length === 0 && snapshots.length === 0 && usageCapability === USAGE_SUPPORT.NATIVE) {
         events.push(unknownUsageEvent({
           provider: adapter.id,
           invocationId,

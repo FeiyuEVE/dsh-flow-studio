@@ -43,6 +43,15 @@ const A = {
   },
 }
 
+/** 正例断言：秘密消失、可识别前缀保留、二次脱敏幂等。 */
+function expectRedacted(raw, { secrets = [], markers = [] } = {}, label = '') {
+  const out = redactText(raw)
+  for (const secret of secrets) A.ok(!out.includes(secret), `${label}：秘密必须抹掉（实际 ${out}）`)
+  for (const marker of markers) A.ok(out.includes(marker), `${label}：应保留可识别前缀 ${marker}（实际 ${out}）`)
+  A.equal(redactText(out), out, `${label}：二次脱敏必须幂等`)
+  return out
+}
+
 async function check(name, fn) {
   await fn()
   checks += 1
@@ -107,6 +116,142 @@ await check('N9：Authorization 的 Basic / Token 方案与 Bearer 同口径脱�
   // host-check.redactSensitiveText / engine.redactArguments 同口径，收窄会在三处
   // 产生分叉。方向安全（多抹），不影响证据可读性以外的东西。
   A.equal(redactText('Basic usage'), 'Basic [REDACTED]', '已知误伤：保持三处同口径，不为它收窄规则')
+})
+
+await check('redactText：AWS Access Key / secret access key 脱敏并保留前缀', () => {
+  const access = expectRedacted('credential AKIAIOSFODNN7EXAMPLE used', {
+    secrets: ['IOSFODNN7EXAMPLE'],
+    markers: ['AKIA[REDACTED]'],
+  }, 'AWS access key')
+  A.equal(access, 'credential AKIA[REDACTED] used')
+
+  const secret = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+  A.equal(secret.length, 40, '夹具必须是真实的 40 字符形态')
+  const out = expectRedacted(`AWS_SECRET_ACCESS_KEY=${secret}`, {
+    secrets: [secret],
+    markers: ['AWS_SECRET_ACCESS_KEY="[REDACTED]"'],
+  }, 'AWS secret key')
+  A.equal(out, 'AWS_SECRET_ACCESS_KEY="[REDACTED]"')
+
+  // 反例：短值 / 不同前缀 / 多出字符都不该命中原规则。
+  A.equal(redactText('AKIA1234'), 'AKIA1234')
+  A.equal(redactText('BKIAIOSFODNN7EXAMPLE'), 'BKIAIOSFODNN7EXAMPLE')
+  A.equal(redactText('AWS_SECRET_ACCESS_KEY=too-short'), 'AWS_SECRET_ACCESS_KEY=too-short')
+})
+
+await check('redactText：PEM 私钥块整体脱敏，公钥块不误伤', () => {
+  // body 故意短于通用规则 5 的 32 字符下限：只有 PEM 规则能整块抹掉它，
+  // 这样「撤掉 PEM 规则」的变异才会真的变红（否则会被通用规则兜底掩盖）。
+  const pem = [
+    '-----BEGIN RSA PRIVATE KEY-----',
+    'short-key-material-42',
+    '-----END RSA PRIVATE KEY-----',
+  ].join('\n')
+  const out = expectRedacted(pem, {
+    secrets: ['short-key-material-42'],
+    markers: ['-----BEGIN RSA PRIVATE KEY-----', '[REDACTED]', '-----END RSA PRIVATE KEY-----'],
+  }, 'PEM 私钥')
+  A.equal(out, [
+    '-----BEGIN RSA PRIVATE KEY-----',
+    '[REDACTED]',
+    '-----END RSA PRIVATE KEY-----',
+  ].join('\n'), '私钥块体必须整体替换，头尾保留')
+  A.ok(!out.includes('short-key-material-42'))
+
+  // 反例：公钥不是私钥凭据；短 body 也不会被规则 4 顺手抹掉。
+  const pub = ['-----BEGIN PUBLIC KEY-----', 'MIIBIjANBgkq', '-----END PUBLIC KEY-----'].join('\n')
+  A.equal(redactText(pub), pub, '公钥块不得被当成私钥脱敏')
+})
+
+await check('redactText：GitHub 经典 / fine-grained 令牌脱敏并保留前缀', () => {
+  const classic = `ghp_${'Ab3'.repeat(12)}`
+  expectRedacted(`token ${classic} end`, {
+    secrets: [classic.slice(4)],
+    markers: ['ghp_[REDACTED]'],
+  }, 'ghp_')
+  const pat = `github_pat_${'a'.repeat(22)}_${'B3'.repeat(30)}`
+  expectRedacted(`token ${pat} end`, {
+    secrets: ['B3B3B3'],
+    markers: ['github_pat_[REDACTED]'],
+  }, 'github_pat_')
+  A.equal(redactText('ghp_short123'), 'ghp_short123')
+  A.equal(redactText('github_pat_short'), 'github_pat_short')
+})
+
+await check('redactText：Slack xox* / xapp- 令牌脱敏并保留前缀', () => {
+  const bot = `xoxb-${'123456789012-'.repeat(2)}abcdefghijklmnop`
+  expectRedacted(bot, { secrets: ['abcdefghijklmnop'], markers: ['xoxb-[REDACTED]'] }, 'xoxb')
+  const app = `xapp-1-${'A1234567890-'.repeat(2)}1234567890123`
+  expectRedacted(app, { secrets: ['1234567890123'], markers: ['xapp-[REDACTED]'] }, 'xapp')
+  A.equal(redactText('xoxb-short'), 'xoxb-short')
+  A.equal(redactText('xapp-tiny'), 'xapp-tiny')
+})
+
+await check('redactText：GitLab / Google / Stripe 令牌脱敏并保留前缀', () => {
+  const glpat = `glpat-${'aB3dE5fG7hI9jK1lM3nO'}`
+  expectRedacted(glpat, {
+    secrets: ['aB3dE5fG7hI9jK1lM3nO'],
+    markers: ['glpat-[REDACTED]'],
+  }, 'glpat')
+  A.equal(redactText('glpat-short'), 'glpat-short')
+
+  const google = `AIza${'A'.repeat(35)}`
+  expectRedacted(google, { secrets: ['A'.repeat(35)], markers: ['AIza[REDACTED]'] }, 'Google API key')
+  A.equal(redactText('AIza'), 'AIza')
+  A.equal(redactText('AIzaSyShortValue'), 'AIzaSyShortValue')
+
+  for (const prefix of ['sk_live_', 'rk_live_']) {
+    const payload = 'aB3dE5fG7hI9jK1lM3nO5pQ7'
+    expectRedacted(`${prefix}${payload}`, {
+      secrets: [payload],
+      markers: [`${prefix}[REDACTED]`],
+    }, prefix)
+  }
+  A.equal(redactText('sk_live_short'), 'sk_live_short')
+  const testKey = `sk_test_${'a'.repeat(12)}`
+  A.equal(redactText(testKey), testKey, 'sk_test_ 不是本规则目标，短值也不得被通用规则误伤')
+})
+
+await check('redactText：JWT 三段式整体脱敏并保留 eyJ 前缀', () => {
+  const jwt = [
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+    'eyJzdWIiOiIxMjM0NTY3ODkwIn0',
+    'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+  ].join('.')
+  expectRedacted(`Authorization: ${jwt}`, {
+    secrets: [jwt.split('.')[2]],
+    markers: ['eyJ[REDACTED]'],
+  }, 'JWT')
+  A.equal(redactText('eyJhbGci.eyJzdWIi'), 'eyJhbGci.eyJzdWIi', '两段不是 JWT，不得误伤')
+  A.equal(redactText('eyJust-a-word'), 'eyJust-a-word')
+})
+
+await check('redactText：数据库 / 消息连接串的 user:pass 脱敏，保留 scheme 与 host', () => {
+  for (const scheme of ['postgres', 'postgresql', 'mysql', 'mongodb', 'redis', 'amqp']) {
+    const raw = `${scheme}://app:s3cretP4ss@db.internal:5432/app`
+    const out = expectRedacted(raw, {
+      secrets: ['s3cretP4ss'],
+      markers: [`${scheme}://[REDACTED]@db.internal`],
+    }, scheme)
+    A.equal(out, `${scheme}://[REDACTED]@db.internal:5432/app`)
+  }
+  A.equal(redactText('redis://cache.internal:6379/0'), 'redis://cache.internal:6379/0',
+    '没有密码的连接串不得被抹')
+  A.equal(redactText('mysql://user@host/db'), 'mysql://user@host/db', '没有密码的连接串不得被抹')
+  A.equal(redactText('https://user:pass@host/path'), 'https://user:pass@host/path',
+    '不在名单内的 scheme 不误伤')
+})
+
+await check('redactText：新增规则与既有规则组合、整体幂等', () => {
+  const ghp = `ghp_${'Ab3'.repeat(12)}`
+  const glpat = `glpat-${'aB3dE5fG7hI9jK1lM3nO'}`
+  const out = redactText(`Authorization: Bearer ${ghp} token=${glpat} password=hunter2`)
+  A.ok(!out.includes(ghp.slice(4)), '组合场景不得泄露 GitHub 令牌')
+  A.ok(!out.includes('aB3dE5fG7hI9jK1lM3nO'), '组合场景不得泄露 GitLab 令牌')
+  A.ok(!out.includes('hunter2'), '既有 key=value 规则不得失效')
+  A.match(out, /Bearer ghp_\[REDACTED\]/, 'Bearer 规则不得吞掉新规则保留的前缀')
+  A.match(out, /token=glpat-\[REDACTED\]/, 'key=value 规则不得二次抹掉已脱敏前缀')
+  A.equal(redactText(out), out, '组合规则必须整体幂等')
 })
 
 await check('redactDeep：嵌套对象 / 数组 / 非字符串原样 / 循环引用安全', () => {

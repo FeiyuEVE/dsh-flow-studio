@@ -27,6 +27,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createAdapterRegistry } from './agent-adapter.js'
+import { createAcpAdapter } from './agent-adapter-acp.js'
 import { createClaudeAdapter } from './agent-adapter-claude.js'
 import { createCodexAdapter } from './agent-adapter-codex.js'
 import { createDshAdapter } from './agent-adapter-dsh.js'
@@ -67,7 +68,7 @@ const BASE = '/api/flow-studio'
 
 /**
  * AgentAdapter 注册表（0.13.1 A3）：`dsh` 用宿主 agents 服务注册会话级工具；
- * `codex` / `claude` 用自带 MCP stdio server（CLI 没装 / 未登录时 probe 会失败，但
+ * `codex` / `claude` / `acp` 用自带 MCP stdio server（CLI 没装 / 未登录时 probe 会失败，但
  * **不能**因此让插件加载失败——不可用只在节点 admission 阶段拒绝那个节点）。
  *
  * 用环境变量 / 外部注入覆盖时以 `env.bpmnAdapters` 为准（测试与嵌入方使用）。
@@ -84,6 +85,12 @@ function buildAgentAdapters(ctx, log, adapterTmpRoot) {
     // 0.14.2 G：Claude Code 适配器。真实 CLI 通道未在本机验收（无 claude CLI）；
     // probe 不通过时该 adapter 在 admission 阶段被拒绝，不影响其它 adapter 与面板。
     ['claude', () => createClaudeAdapter({
+      ...(typeof adapterTmpRoot === 'string' && adapterTmpRoot.trim() !== '' ? { tmpRoot: adapterTmpRoot } : {}),
+    })],
+    // 0.15.0 ACP：配置**只**来自宿主环境变量 FLOW_STUDIO_ACP_CONFIG（P3 的
+    // parseAcpConfig 在工厂内读取；非法 JSON / 未知键不会拖垮插件加载，只在
+    // admission 阶段拒绝 ACP 节点）。默认 adapter 仍是 dsh，不新增实例内配置入口。
+    ['acp', () => createAcpAdapter({
       ...(typeof adapterTmpRoot === 'string' && adapterTmpRoot.trim() !== '' ? { tmpRoot: adapterTmpRoot } : {}),
     })],
   ]
@@ -615,7 +622,7 @@ export function apply(ctx) {
   const bpmnEnv = {
     dir,
     ctx,
-    // 0.13.1 A3 / 0.14.2 G：agent 节点由 AgentAdapter 执行（dsh / codex / claude）；
+    // 0.13.1 A3 / 0.14.2 G / 0.15.0 ACP：agent 节点由 AgentAdapter 执行（dsh / codex / claude / acp）；
     // 某个 CLI 不可用不影响插件加载。
     bpmnAdapters: buildAgentAdapters(ctx, log, join(dir, '.tmp')),
   }

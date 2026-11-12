@@ -123,6 +123,11 @@ if (argv[0] === '--help') {
   const allowedToolsLine = process.env.FAKE_CLAUDE_HELP_ALIAS === '1'
     ? '  --allowed-tools <tools...>        Tools that execute without prompting'
     : '  --allowedTools <tools...>         Tools that execute without prompting'
+  // MAJOR-1：probe 走的是 runOnce 里的 reader，不是主协议 reader——用一条 9 MiB 的
+  // --help 行（必需参数只存在于这一行）证明那一路的上限同样必须是 32 MiB。
+  const hugeAllowedToolsLine = process.env.FAKE_CLAUDE_HELP_HUGE === '1'
+    ? '  --allowedTools <tools...>         ' + 'x'.repeat(9 * 1024 * 1024)
+    : null
   const helpLines = [
     'Usage: claude [options] [prompt]',
     '',
@@ -136,12 +141,13 @@ if (argv[0] === '--help') {
     '  --session-id <uuid>               Use a specific session ID',
     '  --permission-mode <mode>          default | acceptEdits | plan | auto | dontAsk | bypassPermissions',
     '  --permission-prompts <mode>       host | none',
-    allowedToolsLine,
+    hugeAllowedToolsLine || allowedToolsLine,
     '  --disallowedTools <tools...>      Tools to disallow',
     '  --model <model>                   Model for the session',
     '',
   ].filter(line => !dropFlags.some(flag => line.includes(flag)))
-  process.stdout.write(helpLines.join('\\n'))
+  // 超长 help 行必须等 stdout 真正排空再退出，否则 9 MiB 行会被裁成半截（假 CLI 自身缺陷）。
+  await new Promise(resolveWrite => process.stdout.write(helpLines.join('\\n'), resolveWrite))
   process.exit(0)
 }
 
@@ -644,6 +650,47 @@ if (mode === 'auth-fail-exit0') {
       content: [ { type: 'text', text: 'invalid API credential' } ],
     },
   })
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'result-no-subtype') {
+  // MAJOR-3：CLI 确实发出了 result（is_error:false）但**缺 subtype**。旧分类用
+  // 「没有字符串 subtype」近似「没有 result」，于是把 assistant 错误误判成 provider 错误。
+  // 正确语义：有 result 就不是 assistant-only 失败 → 走正常停下路径。
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'authentication_failed',
+    message: {
+      id: 'msg_result_no_subtype',
+      usage: usageA,
+      content: [ { type: 'text', text: '认证失败但随后仍然给出了 result' } ],
+    },
+  })
+  out({
+    type: 'result',
+    session_id: sessionId,
+    is_error: false,
+    num_turns: 1,
+    result: 'result 没有 subtype',
+  })
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'big-result') {
+  // MAJOR-1：约 9 MiB 的**合法**终态事件（result 本身很大，不是 protocol error）。
+  // 8 MiB 行界会整行丢弃 → 没有 result → 误判 NODE_FINISH_MISSING。
+  assistantEvent(usageA, '大 result 之前的正常消息。')
+  const hugeLine = JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    session_id: sessionId,
+    is_error: true,
+    num_turns: 1,
+    errors: ['authentication_failed'],
+    result: '9MiB terminal event '.repeat(480 * 1024),
+  }) + '\\n'
+  await new Promise(resolveWrite => process.stdout.write(hugeLine, resolveWrite))
   await closeClient()
   process.exit(0)
 }
@@ -1370,6 +1417,52 @@ async function main() {
       A.equal(invocations().length, 2, '初始 + 一次 resume')
       await adapter.dispose(handle)
       A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('MAJOR-1：9 MiB 合法终态 result 事件必须通过（适配器实际行界 32 MiB，不是 8 MiB）', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('big-result', {
+        overrides: { reminderLimit: 0 },
+      })
+      A.equal(handle.diagnostics.droppedLines, 0,
+        '9 MiB 合法行不能被整行丢弃（基线：droppedLines=1）')
+      A.equal(handle.diagnostics.outputIncomplete, false)
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE,
+        'result 被读到 → provider 错误；基线被丢弃 → NODE_FINISH_MISSING')
+      A.equal(exited.error?.code, 'authentication_failed')
+      A.equal(exited.error?.subtype, 'error_during_execution')
+      A.equal(exited.reminders, 0, 'provider 错误不消耗提醒预算')
+      A.equal(invocations().length, 1, '不提醒 / 不续跑')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('MAJOR-3：result 存在即不是 assistant-only 失败（无 subtype 也不能误判 provider 错误）', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('result-no-subtype', {
+        overrides: { reminderLimit: 0 },
+      })
+      A.equal(exited.ok, false)
+      A.equal(exited.code, 'NODE_FINISH_MISSING',
+        '有 result（无 subtype）→ 正常停下路径；旧实现按「无字符串 subtype = 无 result」误判 CLAUDE_PROVIDER_ERROR')
+      A.notEqual(exited.code, CLAUDE_PROVIDER_ERROR_CODE)
+      A.equal(exited.reminders, 0)
+      A.equal(exited.error, undefined, 'assistant 错误 + 真实 result 不能当成终态 provider 错误')
+      A.equal(invocations().length, 1, '预算 0 → 不续跑')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('MAJOR-1：probe 的 --help reader 同样按 32 MiB 收行（9 MiB 单行里的必需参数不能丢）', async () => {
+      resetState()
+      const adapter = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_HELP_HUGE: '1' },
+      })
+      const probe = await adapter.probe()
+      A.equal(probe.flags.allowedTools, '--allowedTools',
+        '9 MiB help 行里的 --allowedTools 必须被读到；基线：整行丢弃 → PROBE_INVALID(cli-flags-missing)')
+      A.equal(probe.flags.print, true)
     })
 
     await check('Native Stop hook：提醒一次后调用工具 → 成功；hook 用尽 → MISSING 且只有一个进程', async () => {

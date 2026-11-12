@@ -870,6 +870,36 @@ async function main() {
     A.deepEqual(leftoverDirs(), [])
   })
 
+  await check('0.15.2 B1：diagnostics.probe 的结构化敏感键整体脱敏（与 codex/claude 共用 redactStructured）', async () => {
+    const s = scenario({ prompts: [{ kind: 'finish' }] })
+    const adapter = makeAdapter(s, {
+      probeResult: {
+        ...FAKE_PROBE,
+        env: {
+          password: 'hunter2',
+          auth: 'hunter2',
+          token2: 'hunter2',
+          nested: { api_key: 'hunter2' },
+        },
+        // 敏感键名下的对象也整体替换，不保留值形态。
+        credentials: { password: 'hunter2' },
+        note: 'keep-me',
+      },
+    })
+    const { handle } = await startDirect(adapter)
+    const outcome = await withTimeout(handle.exited, 20_000, 'redaction outcome')
+    A.equal(outcome.ok, true, JSON.stringify(outcome))
+    const diagnostics = handle.diagnostics
+    A.equal(diagnostics.probe.env.password, '[REDACTED]')
+    A.equal(diagnostics.probe.env.auth, '[REDACTED]')
+    A.equal(diagnostics.probe.env.token2, '[REDACTED]')
+    A.equal(diagnostics.probe.env.nested.api_key, '[REDACTED]')
+    A.equal(diagnostics.probe.credentials, '[REDACTED]', '敏感键下的对象整体替换（不保留值形态）')
+    A.equal(diagnostics.probe.note, 'keep-me', '普通字段不得误改')
+    A.equal(JSON.stringify(diagnostics).includes('hunter2'), false, 'diagnostics 不得泄漏 hunter2')
+    await disposeHandle(handle)
+  })
+
   await check('成功收尾：cleanup.disposed / cleanupFinal / MCP server 进程全部确认', async () => {
     const s = scenario({ prompts: [{ kind: 'finish' }] })
     const adapter = makeAdapter(s)

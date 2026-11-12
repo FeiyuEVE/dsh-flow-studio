@@ -231,6 +231,49 @@ if (mode === 'leak-deep') {
   })
 }
 
+if (mode === 'redaction-scan') {
+  // 0.15.2 B1/B3/M1/M2/m1：结构化键名 + 文本写法都必须出现在 handle.events 导出面上。
+  out({
+    type: 'item.completed',
+    item: {
+      id: 'item_env',
+      type: 'command_execution',
+      command: 'env',
+      aggregated_output: 'structured',
+      structured: {
+        env: {
+          password: 'hunter2',
+          auth: 'hunter2',
+          token2: 'hunter2',
+          nested: { api_key: 'hunter2' },
+        },
+      },
+    },
+  })
+  const text = [
+    'B3a=' + JSON.stringify(JSON.stringify({ password: 'hunter2' })),
+    'B3b=' + JSON.stringify({ msg: 'password="say \\\\"hunter2\\\\""' }),
+    'M1a=secret_key=hunter2',
+    'M1b=access_key=hunter2',
+    'M1c=private_key=hunter2',
+    'M1d=pwd=hunter2',
+    'M1e=pass_word=hunter2',
+    'M1f=passphrase=hunter2',
+    'M2a=password: &pw hunter2',
+    'M2b=password: !!str hunter2',
+    'M2c=password: # note\\n  hunter2',
+    'm1a=config["password"]=hunter2',
+    'm1b=["password","hunter2"]',
+    'm1c=password=&#34;hunter2&#34;',
+    'm1d=token=ApiKey hunter2',
+    'm1e=token=SSWS hunter2',
+  ].join(' | ')
+  out({ type: 'item.completed', item: { id: 'item_text', type: 'agent_message', text } })
+  await callTool()
+  await closeClient()
+  process.exit(0)
+}
+
 async function callTool() {
   const result = await client.callTool({
     name: 'flow_finish_node',
@@ -1837,6 +1880,41 @@ async function main() {
       A.equal(eventsText.includes(invocation.token), false, '#9：12 层嵌套里的凭据不能出现在 handle.events')
       A.ok(eventsText.includes('level_11'), '深层事件确实被收进 events（不是整条丢了）')
       A.ok(eventsText.includes('[redacted:depth]'), '#9：超深子树必须替换成截断占位符')
+      await adapter.dispose(handle)
+    })
+
+    await check('0.15.2 B1/B3/M1/M2/m1：handle.events 结构化凭据与文本写法全部脱敏', async () => {
+      resetState()
+      const workspace = freshWorkspace('redaction-scan')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'redaction-scan' }, reminderLimit: 0 })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '脱敏扫描节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const eventsText = JSON.stringify(handle.events)
+      const leakAt = eventsText.indexOf('hunter2')
+      A.equal(leakAt, -1, `handle.events 不得泄漏 hunter2：${leakAt < 0 ? '' : eventsText.slice(Math.max(0, leakAt - 120), leakAt + 40)}`)
+      // B1：结构化键名整值替换（旧本地 redactValue 只对字符串脱敏，这里会原样导出）。
+      const structuredEvent = handle.events.find(event => event.item && event.item.id === 'item_env')
+      A.ok(structuredEvent, '结构化事件必须进 handle.events')
+      A.equal(structuredEvent.item.structured.env.password, '[REDACTED]')
+      A.equal(structuredEvent.item.structured.env.auth, '[REDACTED]')
+      A.equal(structuredEvent.item.structured.env.token2, '[REDACTED]')
+      A.equal(structuredEvent.item.structured.env.nested.api_key, '[REDACTED]')
+      A.equal(structuredEvent.item.aggregated_output, 'structured', '普通字段不得误改')
+      // B3 / M1 / M2 / m1：文本写法在同一导出面上也必须抹掉。
+      for (const marker of ['B3a', 'B3b', 'M1a', 'M2c', 'm1b', 'm1d']) {
+        A.ok(eventsText.includes(marker), `夹具确实带上了 ${marker}（证明不是整条丢失）`)
+      }
+      A.ok(eventsText.includes('[REDACTED]'), '导出面必须出现脱敏标记')
+      // lastMessage 与 events 同一套规则。
+      A.equal(String(handle.lastMessage).includes('hunter2'), false, 'lastMessage 不得泄漏')
       await adapter.dispose(handle)
     })
 

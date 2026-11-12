@@ -6,9 +6,10 @@
  *   1. `redactText`：共享的凭据脱敏规则（规则 0–5）。规则 4 / 2 的取值用线性扫描器，
  *      能识别 JSON / shell 转义、三引号、词内拼接、全角分隔符、箭头、YAML 块标量与
  *      反斜杠续行；不靠正则描述「值在哪里结束」。
- *   2. `redactDeep`：对事件对象 / 数组 / 字符串做递归脱敏；键数、深度、循环引用都有界。
- *      敏感键名（token / password / apiKey…）的值不再只看形态，未知值直接抹成
- *      `[REDACTED]`。
+ *   2. `isSensitiveKeyName` / `redactStructured`（0.15.2）：文本赋值与结构化对象的**同一套**
+ *      键名判据（分词 + 敏感词表 + 误伤豁免），敏感键名下的值整体替换成 `[REDACTED]`；
+ *      三个 CLI 适配器都走这一实现，不再各自维护「只对字符串脱敏」的本地副本。
+ *      `redactDeep` 是保留 0.15.1 导出契约（`[TRUNCATED]` 占位符）的兼容包装。
  *   3. `createBoundedOutput`：按 **原始 UTF-8 字节**（decode 之前）累计收到多少字节，
  *      只保留前 `maxBytes` 个字节的文本；事件条数受 `maxEvents` 约束。累计计数
  *      `receivedBytes` 单调递增，不因保留字符被淘汰而回退。超过上限时只接受剩余部分
@@ -47,6 +48,9 @@ const REDACT_MAX_KEYS = 64
 /** 递归脱敏的最大深度。 */
 const REDACT_MAX_DEPTH = 8
 
+/** ≤1 MiB 的字符串不做「≥64 KiB 连续串预抹」的阈值（见 redactStringValue）。 */
+const REDACT_OVERSIZE_TEXT_BYTES = 1024 * 1024
+
 /** 递归遇到循环引用 / 超深对象时的占位符（绝不把未脱敏的深层对象原样透出）。 */
 const REDACT_TRUNCATED = '[TRUNCATED]'
 
@@ -66,13 +70,6 @@ export const SENSITIVE_KEY_NAME_SOURCE = '(?:token|password|passwd|secret|api[_-
 
 /** 命令行标志位前缀 + 键名（`--token` / `-password` 等）。 */
 const FLAG_NAME_SOURCE = `--?${SENSITIVE_KEY_NAME_SOURCE}`
-
-/**
- * 规则 4（赋值）使用的键名子集：比标志位名单窄，避免把 `AWS_SECRET_ACCESS_KEY=…`
- * 这类**复合名**里的 `ACCESS_KEY` 当成独立键（0.15.0 之前就是这样，短占位值不会被抹）。
- * 标志位走 `FLAG_NAME_SOURCE`，两者共用 {@link SENSITIVE_KEY_NAME_SOURCE} 的命名口径。
- */
-const ASSIGNED_KEY_NAME_SOURCE = '(?:token|password|passwd|secret|api[_-]?key|authorization)'
 
 /**
  * 赋值分隔符：`=` / `:` / 全角 `＝` `：` / 箭头 `=>` `->`（前后允许空白）。
@@ -192,6 +189,60 @@ function isFullyRedactedValue(value) {
 }
 
 /**
+ * PEM 私钥块的**有界**替换（0.15.2 / M5）。
+ *
+ * 0.15.1 用非贪婪正则 `-----BEGIN …-----[\s\S]*?-----END …-----`：`END` 不存在时每个
+ * `BEGIN` 都一路扫到文末再失败，重复 N 个 `BEGIN` 就是 O(N²)（7 KiB 1 ms → 105 KiB
+ * 100 ms → 1 MiB 约 10 s）。不可信子进程输出能借此长时间阻塞事件循环。
+ *
+ * 现在只在 BEGIN 头之后 {@link PEM_END_WINDOW} 字节内找 END：
+ *   - 窗口内找到：块体替换成 `[REDACTED]`，保留可识别的 BEGIN/END 头；
+ *   - 窗口内没有：认定这是残缺 / 伪造块，**从该 BEGIN 到文末整段替换成 `[REDACTED]`
+ *     并停止扫描**（安全方向，同时保证整体线性）；
+ *   - 非私钥类型（PUBLIC KEY / CERTIFICATE / 其它）跳过，不误伤。
+ *
+ * 复杂度：每处理一个完整块只做一次 ≤8 KiB 的 `indexOf`，所有块的扫描区间不重叠，
+ * 最坏 O(n)；无 END 的输入在第一个 BEGIN 处就收口。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+const PEM_BEGIN_MARKER = '-----BEGIN '
+const PEM_PRIVATE_TYPE_PATTERN = /^(?:[A-Z0-9]+ )?PRIVATE KEY$/
+const PEM_END_WINDOW = 8 * 1024
+
+function redactPemBlocks(text) {
+  let index = text.indexOf(PEM_BEGIN_MARKER)
+  if (index === -1) return text
+  let out = ''
+  let cursor = 0
+  while (index !== -1) {
+    const typeStart = index + PEM_BEGIN_MARKER.length
+    const typeEnd = text.indexOf('-----', typeStart)
+    if (typeEnd === -1) break
+    const type = text.slice(typeStart, typeEnd)
+    if (type.length === 0 || type.length > 64 || !PEM_PRIVATE_TYPE_PATTERN.test(type)) {
+      index = text.indexOf(PEM_BEGIN_MARKER, typeEnd + 5)
+      continue
+    }
+    const endMarker = `-----END ${type}-----`
+    const windowStart = typeEnd + 5
+    const hit = text.indexOf(endMarker, windowStart)
+    const end = hit !== -1 && hit + endMarker.length <= Math.min(text.length, windowStart + PEM_END_WINDOW)
+      ? hit + endMarker.length
+      : -1
+    if (end === -1) {
+      // 窗口内没有 END：残缺 / 伪造块，整段到文末替换并停止（安全方向 + 线性）。
+      return out + text.slice(cursor, index) + '[REDACTED]'
+    }
+    out += text.slice(cursor, index) + `-----BEGIN ${type}-----\n[REDACTED]\n${endMarker}`
+    cursor = end
+    index = text.indexOf(PEM_BEGIN_MARKER, end)
+  }
+  return out === '' ? text : out + text.slice(cursor)
+}
+
+/**
  * 有界片段上的完整脱敏规则（规则 0–5）。
  *
  * @param {unknown} raw
@@ -202,11 +253,8 @@ function redactSegment(raw) {
   // 0) 显式凭据形态（0.14.7）。这类规则必须先于通用规则执行，否则会被规则 5 的
   //    「≥32 连续可疑字符」整段替换成 `[REDACTED]`、丢掉可识别前缀。输出统一保留前缀
   //    （`ghp_[REDACTED]` / `AKIA[REDACTED]` 等），便于排障；且二次执行不再匹配，保持幂等。
-  //    PEM 私钥块：保留 BEGIN/END 头（能看出密钥类型），块体整体抹掉。
-  text = text.replace(
-    /-----BEGIN ((?:[A-Z0-9]+ )?PRIVATE KEY)-----[\s\S]*?-----END \1-----/g,
-    '-----BEGIN $1-----\n[REDACTED]\n-----END $1-----',
-  )
+  //    PEM 私钥块：保留 BEGIN/END 头（能看出密钥类型），块体整体抹掉；有界线性扫描（M5）。
+  text = redactPemBlocks(text)
   // AWS Access Key ID：`AKIA` + 固定 16 位大写/数字；两侧词边界防止把更长标识切一半。
   text = text.replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA[REDACTED]')
   // AWS secret access key：只认显式 `…secret…access…key=` 形态，值限 base64 字符且
@@ -261,6 +309,8 @@ function redactSegment(raw) {
   //    也可能根本没收尾；还可能是 JSON / shell 转义、三引号、YAML 块标量、反斜杠续行。
   //    扫描器按「键 + 分隔符 + 值」逐段取值，整值替换成 `"[REDACTED]"`。
   text = redactAssignedValues(text)
+  // 4b) JSON 键值对数组：`["password","hunter2"]`（m1）。没有 `=` / `:`，单独一遍。
+  text = redactJsonPairValues(text)
   // 5) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
   //    与 host-check.redactSensitiveText 的兼容差异：
   //      a. 必须至少跨两类字符才判敏感（见上方说明）；
@@ -320,6 +370,158 @@ function normalizeKeyName(name) {
   return String(name ?? '').replace(/["'\s]/g, '').toLowerCase()
 }
 
+// ---------------------------------------------------------------------------
+// 敏感键名判定（0.15.2：文本赋值与结构化键名共用同一实现）
+// ---------------------------------------------------------------------------
+
+/**
+ * 键名里不携带语义的字符：零宽空格 / 零宽连接符 / 方向控制 / BOM / 软连字符。
+ * 攻击者可以把 `pass\u200Bword` 写成「看起来一样但正则不命中」的键名。
+ */
+const KEY_IGNORABLE_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/g
+
+/** 中文 / 日文里直接成词的敏感键（在归一化后的整串上做子串判定）。 */
+const SENSITIVE_CJK_WORDS = [
+  '密码', '密碼', '密钥', '金钥', '金鑰', '令牌', '口令', '凭证', '憑證', '凭据',
+]
+
+/**
+ * 逐词命中表（归一化后的小写 ASCII 词）。
+ *
+ * 0.15.1 的 `SENSITIVE_KEY_SUFFIXES` 只做后缀匹配，`credential` / `auth` / `pwd` /
+ * `passphrase` / `token2` / `passwordHash` / 中文键全部绕过（复审 M3）。这里改成
+ * 「分词 + 词表」：`passwordHash` 先被拆成 `password` / `hash`，`token2` 拆成
+ * `token` / `2`，`pass_word` 拆成 `pass` / `word` 后仍按子串判据命中 `password`。
+ */
+const SENSITIVE_KEY_WORDS = new Set([
+  'password', 'passwords', 'passwd', 'pwd', 'passphrase', 'passphrases', 'passcode',
+  'secret', 'secrets', 'token', 'tokens', 'apikey', 'credential', 'credentials',
+  'cred', 'auth', 'authorization', 'authorisation', 'privatekey', 'accesskey',
+  'secretkey', 'authkey', 'sessionkey', 'sshkey', 'cookie', 'cookies', 'bearer',
+  'jwt', 'otp', 'key',
+])
+
+/**
+ * 子串判据：词里只要出现这些片段就按凭据处理。`apikey` / `privatekey` 这类
+ * 全小写连写词靠它命中；单独一个 `key` 词则连同 `_` / `-` / camelCase 分词后的
+ * `api_key` / `access-key` / `secretKey` 一起命中。
+ */
+const SENSITIVE_KEY_FRAGMENTS = [
+  'password', 'passwd', 'passphrase', 'secret', 'token', 'credential',
+  'apikey', 'privatekey', 'accesskey', 'secretkey', 'authkey', 'sessionkey',
+  'sshkey', 'key',
+]
+
+/**
+ * 误伤豁免词（复审要求显式列出并写进测试）。
+ *
+ * 这些词里含 `key` / `token` / `secret` 片段，但都不是凭据：
+ *   - 输入设备 / 键盘布局 / 文档概念：`keyboard`、`keyspace`、`keyword`、`keynote`、
+ *     `keystone`、`keyframe`、`keypress`、`keydown`、`keyup`、`hotkey`、`keycode`、
+ *     `keymap`；
+ *   - 动物 / 饮品等英文常用词：`monkey`、`donkey`、`turkey`、`hockey`、`whiskey`；
+ *   - 公开材料：`publickey`、`pubkey`（公钥不是秘密）；
+ *   - 解析器术语：`tokenizer`、`tokenizers`、`tokenize`、`tokenized`、`tokenizing`、
+ *     `tokenization`；
+ *   - 其它常见非凭据词：`secretary`、`secretaries`、`secretion`、`passwordless`。
+ *
+ * 注意豁免是**逐词**生效：`monkeyToken` 拆成 `monkey` + `token`，`monkey` 被豁免后
+ * 仍会被 `token` 命中——豁免不会给复合键开后门。
+ */
+const SENSITIVE_KEY_EXEMPT_WORDS = new Set([
+  'keyboard', 'keyboards', 'keyspace', 'keyspaces', 'keyword', 'keywords',
+  'keynote', 'keynotes', 'keystone', 'keyframe', 'keyframes', 'keypress', 'keydown',
+  'keyup', 'hotkey', 'hotkeys', 'keycode', 'keymap',
+  'monkey', 'monkeys', 'donkey', 'donkeys', 'turkey', 'turkeys', 'hockey', 'whiskey',
+  'publickey', 'pubkey',
+  'tokenizer', 'tokenizers', 'tokenize', 'tokenized', 'tokenizing', 'tokenization',
+  'secretary', 'secretaries', 'secretion', 'passwordless',
+])
+
+/** 解码 `\u0070` / `\x70` / `&#112;` / `&#x70;` / `&quot;` 形式的键名。 */
+function decodeEscapedKeyName(raw) {
+  const decodeCodePoint = (text, hex, radix) => {
+    const codePoint = Number.parseInt(hex, radix)
+    if (!Number.isSafeInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return text
+    try {
+      return String.fromCodePoint(codePoint)
+    } catch {
+      return text
+    }
+  }
+  return String(raw ?? '')
+    .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (match, hex) => decodeCodePoint(match, hex, 16))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (match, hex) => decodeCodePoint(match, hex, 16))
+    .replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => decodeCodePoint(match, hex, 16))
+    .replace(/&#x([0-9a-fA-F]{1,6});/gi, (match, hex) => decodeCodePoint(match, hex, 16))
+    .replace(/&#([0-9]{1,7});/g, (match, dec) => decodeCodePoint(match, dec, 10))
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+}
+
+/**
+ * 键名分词：camelCase / PascalCase / snake_case / kebab-case / 数字边界。
+ *
+ * @param {string} name
+ * @returns {string[]}
+ */
+function splitKeyNameWords(name) {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/(\p{L})(\p{N})/gu, '$1 $2')
+    .replace(/(\p{N})(\p{L})/gu, '$1 $2')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .toLowerCase()
+    .split(/\s+/u)
+    .filter(Boolean)
+}
+
+/**
+ * 判断对象键名 / 赋值左侧的键名是否敏感（**唯一实现**，文本规则与结构化规则共用）。
+ *
+ * 0.15.2 之前有两套口径：文本赋值只认 6 个键名（M1），`redactDeep` 只做后缀匹配
+ * （M3），三个适配器的本地 `redactValue` 则完全不看键名（B1）。三处现在都走这里。
+ *
+ * 判定顺序：
+ *   1. 解码转义（`\u0070assword`）、NFKC 归一（全角 → 半角）、去掉零宽控制字符；
+ *   2. 中文敏感词直接子串命中（`用户密码` 这类复合词）；
+ *   3. 分词后逐词判：豁免词跳过 → 词表精确命中 → 敏感片段子串命中。
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isSensitiveKeyName(name) {
+  const decoded = decodeEscapedKeyName(name)
+    .replace(KEY_IGNORABLE_PATTERN, '')
+    .normalize('NFKC')
+    .toLowerCase()
+  if (decoded === '') return false
+  for (const word of SENSITIVE_CJK_WORDS) {
+    if (decoded.includes(word)) return true
+  }
+  const words = splitKeyNameWords(decoded)
+  // 整串豁免（`publicKey` 分词后是 `public` + `key`，但它是公开材料，不是秘密）。
+  if (SENSITIVE_KEY_EXEMPT_WORDS.has(words.join(''))) return false
+  for (const word of words) {
+    if (SENSITIVE_KEY_EXEMPT_WORDS.has(word)) continue
+    if (SENSITIVE_KEY_WORDS.has(word)) return true
+    for (const fragment of SENSITIVE_KEY_FRAGMENTS) {
+      if (word.includes(fragment)) return true
+    }
+  }
+  // 分隔符把敏感词切断的复合键（`pass_word` / `secret_key` / `access-key`）：
+  // 把「非豁免词」重新拼起来再判一次，这样 `keyboard_layout` 不会因为 `key` 被误伤。
+  const significant = words.filter(word => !SENSITIVE_KEY_EXEMPT_WORDS.has(word))
+  if (significant.length > 1) {
+    const compact = significant.join('')
+    for (const fragment of SENSITIVE_KEY_FRAGMENTS) {
+      if (compact.includes(fragment)) return true
+    }
+  }
+  return false
+}
+
 /**
  * 命令行标志位取值与替换（线性扫描，见规则 2 的说明）。
  *
@@ -361,25 +563,157 @@ function redactFlagValues(text) {
 }
 
 /**
+ * 赋值分隔符：`=>` / `->` 必须排在 `=` 前（否则只会吃掉 `=`，`>` 变成值的一部分）。
+ * `g` 正则用于**从左到右**找分隔符；键名/值都交给扫描器，不再由正则描述。
+ */
+const ASSIGN_SEPARATOR_GLOBAL = /=>|->|[:=＝：]/g
+
+/** 键名字符（ASCII）：字母 / 数字 / `_` / `-` / `.` / `$`。 */
+function isAsciiKeyNameChar(char) {
+  const code = char.charCodeAt(0)
+  return (code >= 0x30 && code <= 0x39)
+    || (code >= 0x41 && code <= 0x5a)
+    || (code >= 0x61 && code <= 0x7a)
+    || char === '_'
+    || char === '-'
+    || char === '.'
+    || char === '$'
+}
+
+/** 键名反向扫描的最大长度：超过这个长度的「键」必然不是配置键，直接放弃。 */
+const KEY_NAME_SCAN_MAX = 128
+
+/** 命令行标志位是否由规则 2 全权处理（要求**完整**名字，`token-file` 不算 `token`）。 */
+const FULL_SENSITIVE_FLAG_PATTERN = new RegExp(`^(?:${SENSITIVE_KEY_NAME_SOURCE})$`, 'i')
+
+/** 去掉键名两侧的引号与 JSON 转义（`\"password\"` / `['password']`）。 */
+function stripKeyNameWrapping(raw) {
+  let text = String(raw ?? '').trim()
+  text = text.replace(/^\\*["']/, '').replace(/["']\\*$/, '')
+  return text.trim()
+}
+
+/**
+ * 从一个赋值分隔符**向左**读键名，并判定它是否敏感（0.15.2：与结构化键名同一判据）。
+ *
+ * 覆盖形态：
+ *   - `password=` / `pass_word=` / `passwordHash=` / `token2=` / `密码：`；
+ *   - `"password":` / `'password':`；
+ *   - JSON 转义 `\"password\":` 与双重转义 `\\\"password\\\":`（B3：键名容错反斜杠）；
+ *   - 方括号索引 `config["password"]=`（m1）；
+ *   - `\u0070assword=` / `&#112;assword=` / 零宽 / 全角键名（m1）。
+ *
+ * 命令行标志位（`--token=`）不在这里处理：规则 2 的输出形态不同，而且
+ * `--token-file=` 这类**更长**的参数名不能被当成 `--token`（既有反例锁）。
+ *
+ * @param {string} text
+ * @param {number} separatorStart
+ * @returns {null|{key:string}}
+ */
+function readSensitiveKeyBefore(text, separatorStart) {
+  let keyEnd = separatorStart - 1
+  while (keyEnd >= 0 && (text[keyEnd] === ' ' || text[keyEnd] === '\t')) keyEnd -= 1
+  if (keyEnd < 0) return null
+
+  // 方括号索引：config["password"] / obj['pass_word'] / config[\"password\"]
+  if (text[keyEnd] === ']') {
+    // 有界回扫：不用 `lastIndexOf`——恶意输入里大量 `]=` 会让每次回扫都走到文首（O(n²)）。
+    let open = -1
+    for (let cursor = keyEnd - 1, steps = 0; cursor >= 0 && steps < KEY_NAME_SCAN_MAX; cursor -= 1, steps += 1) {
+      if (text[cursor] === '[') {
+        open = cursor
+        break
+      }
+      if (text[cursor] === '\n' || text[cursor] === ']') break
+    }
+    if (open === -1) return null
+    const inner = stripKeyNameWrapping(text.slice(open + 1, keyEnd))
+    if (inner === '' || inner.length > KEY_NAME_SCAN_MAX) return null
+    return isSensitiveKeyName(inner) ? { key: inner } : null
+  }
+
+  // 值侧收尾引号（含 JSON 的 `\"` / `\\\"`）：跳过引号与紧挨着的反斜杠。
+  if (text[keyEnd] === '"' || text[keyEnd] === "'") {
+    keyEnd -= 1
+    while (keyEnd >= 0 && text[keyEnd] === '\\') keyEnd -= 1
+  }
+
+  let scan = keyEnd
+  let scanned = 0
+  while (scan >= 0 && scanned < KEY_NAME_SCAN_MAX) {
+    const char = text[scan]
+    if (isAsciiKeyNameChar(char) || char.charCodeAt(0) >= 0x80) {
+      scan -= 1
+      scanned += 1
+      continue
+    }
+    // 键名里的 Unicode 转义：`\u0070assword`（反斜杠不是普通键名字符，只认 \u / \x）。
+    if (char === '\\' && (text[scan + 1] === 'u' || text[scan + 1] === 'x')) {
+      scan -= 1
+      scanned += 1
+      continue
+    }
+    break
+  }
+  if (scan === keyEnd) return null
+  let rawKey = text.slice(scan + 1, keyEnd + 1)
+
+  // 开引号 + 前面的反斜杠（JSON 转义）不参与键名判定。
+  let beforeKey = scan
+  if (text[beforeKey] === '"' || text[beforeKey] === "'") {
+    beforeKey -= 1
+    while (beforeKey >= 0 && text[beforeKey] === '\\') beforeKey -= 1
+  }
+
+  // CLI 标志位：`-password` / `--password` 交给规则 2（输出形态不同）；
+  // `--token-file` 这类更长参数名既不归规则 2、也不能按 `token` 吞掉后面的值。
+  const dashes = /^-+/.exec(rawKey)
+  if (dashes !== null) {
+    const flagName = rawKey.slice(dashes[0].length)
+    if (flagName === '') return null
+    if (FULL_SENSITIVE_FLAG_PATTERN.test(flagName)) return null
+    if (flagName.includes('-')) return null
+    rawKey = flagName
+  } else if (beforeKey >= 0 && text[beforeKey] === '-') {
+    return null
+  }
+
+  if (rawKey === '' || rawKey.length > KEY_NAME_SCAN_MAX) return null
+  return isSensitiveKeyName(rawKey) ? { key: rawKey } : null
+}
+
+/**
  * 敏感键赋值的取值与替换（线性扫描，见规则 4 的说明）。
+ *
+ * 0.15.2：键名判定从「6 个键名的正则」改成 {@link readSensitiveKeyBefore} +
+ * {@link isSensitiveKeyName}，与结构化脱敏共用同一份词表；因此 `secret_key` /
+ * `access_key` / `private_key` / `pwd` / `pass_word` / `passphrase` / `credential` /
+ * `auth` / `token2` / `passwordHash` 与中文键都能命中（M1 / M3）。
  *
  * @param {string} text
  * @returns {string}
  */
 function redactAssignedValues(text) {
-  const pattern = new RegExp(
-    `(["']?(${ASSIGNED_KEY_NAME_SOURCE})["']?\\s*(?:=>|->|[:=＝：])\\s*)`,
-    'gi',
-  )
+  const pattern = ASSIGN_SEPARATOR_GLOBAL
+  pattern.lastIndex = 0
   let out = ''
   let cursor = 0
   let match
   while ((match = pattern.exec(text)) !== null) {
-    const prefix = match[1]
-    const valueStart = match.index + prefix.length
-    const parsed = parseAssignedValue(text, valueStart, { key: normalizeKeyName(match[2]) })
-    if (parsed === null) continue
-    out += text.slice(cursor, match.index) + prefix
+    const separatorStart = match.index
+    const separatorEnd = separatorStart + match[0].length
+    if (separatorEnd <= cursor) {
+      pattern.lastIndex = cursor
+      continue
+    }
+    const keyInfo = readSensitiveKeyBefore(text, separatorStart)
+    if (keyInfo === null) continue
+    let valueStart = separatorEnd
+    while (valueStart < text.length && (text[valueStart] === ' ' || text[valueStart] === '\t')) valueStart += 1
+    if (valueStart >= text.length) continue
+    const parsed = parseAssignedValue(text, valueStart)
+    if (parsed === null || parsed.end <= valueStart) continue
+    out += text.slice(cursor, valueStart)
     if (parsed.keep) {
       out += text.slice(valueStart, parsed.end)
     } else if (parsed.replacement !== undefined) {
@@ -399,6 +733,62 @@ function redactAssignedValues(text) {
 }
 
 /**
+ * JSON 键值对数组：`["password","hunter2"]` / `[\"password\",\"hunter2\"]`（m1）。
+ *
+ * 这种形态没有 `=` / `:`，走不到赋值扫描器；只替换值字符串，键保留（结构不变）。
+ * 反斜杠前缀与引号必须成对：`[\"key\", \"value\"]` 的收尾引号也带同样的反斜杠前缀。
+ */
+const JSON_PAIR_PREFIX_PATTERN = /\[\s*(\\*)(["'])([^"'\\]{1,80})\1\2\s*,\s*/g
+const JSON_PAIR_VALUE_OPEN_PATTERN = /(\s*)(\\*)(["'])/y
+
+function redactJsonPairValues(text) {
+  if (text.indexOf('[') === -1) return text
+  const pattern = JSON_PAIR_PREFIX_PATTERN
+  pattern.lastIndex = 0
+  let out = ''
+  let cursor = 0
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const key = match[3]
+    if (!isSensitiveKeyName(key)) continue
+    JSON_PAIR_VALUE_OPEN_PATTERN.lastIndex = pattern.lastIndex
+    const open = JSON_PAIR_VALUE_OPEN_PATTERN.exec(text)
+    if (open === null) continue
+    const quote = open[3]
+    const escape = open[2]
+    let index = JSON_PAIR_VALUE_OPEN_PATTERN.lastIndex
+    let close = -1
+    while (index < text.length) {
+      if (text[index] !== quote) {
+        index += 1
+        continue
+      }
+      let run = 0
+      while (index - run - 1 >= 0 && text[index - run - 1] === '\\') run += 1
+      if (run === escape.length) {
+        close = index
+        break
+      }
+      index += 1
+    }
+    if (close === -1) break
+    const trailing = close + 1
+    let after = trailing
+    while (after < text.length && (text[after] === ' ' || text[after] === '\t')) after += 1
+    if (text[after] !== ']') {
+      pattern.lastIndex = trailing
+      continue
+    }
+    out += text.slice(cursor, JSON_PAIR_VALUE_OPEN_PATTERN.lastIndex) + '[REDACTED]'
+    // 收尾引号自己的反斜杠前缀（`\"` 里的 `\`）要保留，cursor 回退 escape.length。
+    cursor = close - escape.length
+    pattern.lastIndex = trailing
+  }
+  return cursor === 0 ? text : out + text.slice(cursor)
+}
+
+
+/**
  * 扫描一个带引号的值（`start` 是引号后的第一个字符）。
  *
  * 两种模式：
@@ -415,15 +805,58 @@ function redactAssignedValues(text) {
 function scanQuotedValue(text, start, quote, escapedOpen) {
   let index = start
   if (escapedOpen) {
+    // B3：转义引号开头的值是**一层 JSON 序列化之后**的字符串。收尾引号不能只看
+    // 「`\` + 引号」——值里可能还有 `\\\"`（转义反斜杠 + 转义引号），1 个反斜杠的
+    // 收尾标记和 3 个反斜杠的内嵌引号必须靠**连续反斜杠奇偶**区分（奇数 = 转义）。
+    let backslashes = 0
     while (index < text.length) {
-      if (text[index] === '\\') {
-        if (text[index + 1] === quote) {
+      const char = text[index]
+      if (char === '\\') {
+        const next = text[index + 1]
+        if (next === undefined) {
+          return { end: text.length, bodyEnd: text.length, closed: false }
+        }
+        // `\uXXXX` 按一个「解码后的字符」处理：它可能解码成引号或反斜杠。
+        if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(text.slice(index + 2, index + 6))) {
+          const decoded = String.fromCharCode(Number.parseInt(text.slice(index + 2, index + 6), 16))
+          if (decoded === '\\') {
+            backslashes += 1
+            index += 6
+            continue
+          }
+          if (decoded === quote) {
+            if (backslashes % 2 === 1) {
+              backslashes = 0
+              index += 6
+              continue
+            }
+            return { end: index + 6, bodyEnd: index, closed: true }
+          }
+          backslashes = 0
+          index += 6
+          continue
+        }
+        if (next === '\\') {
+          backslashes += 1
+          index += 2
+          continue
+        }
+        if (next === quote) {
+          if (backslashes % 2 === 1) {
+            backslashes = 0
+            index += 2
+            continue
+          }
           return { end: index + 2, bodyEnd: index, closed: true }
         }
-        // `\n` / `\t` / `\\` / `\"`（非收尾）都按两个字符的转义序列跳过。
+        backslashes = 0
         index += 2
         continue
       }
+      if (char === quote && backslashes % 2 === 0) {
+        return { end: index + 1, bodyEnd: index, closed: true }
+      }
+      backslashes = 0
       index += 1
     }
     return { end: text.length, bodyEnd: text.length, closed: false }
@@ -544,7 +977,97 @@ function parseYamlBlockValue(text, start) {
 }
 
 /**
- * `Authorization: ApiKey <credential>` / `SSWS <credential>` 这类裸方案名。
+ * 已知认证方案词（大小写不敏感）。
+ *
+ * 规则 1 只覆盖 `Bearer` / `Basic` / `Token`；赋值右侧仍可能出现 `ApiKey` / `SSWS`
+ * 这类方案词（m1：`token=ApiKey hunter2`）。认出来以后保留方案名、只抹凭据，
+ * 而不是把 `ApiKey` 当值替换掉、把真正的 `hunter2` 留在后面。
+ */
+const AUTH_SCHEME_WORDS = new Set([
+  'bearer', 'basic', 'token', 'apikey', 'ssws', 'digest', 'negotiate', 'ntlm',
+  'hawk', 'oauth', 'oauth2', 'aws4-hmac-sha256', 'sigv4',
+])
+
+/**
+ * YAML 值修饰符：`&anchor` / `!!tag` / `!tag` / `# 注释`（M2）。
+ *
+ * `password: &pw hunter2` / `password: !!str hunter2` 的真实值在修饰符之后；
+ * `password: # note\n  hunter2` 的值在**下一行缩进**里。返回真实值的起点；
+ * 只有注释且后面没有缩进行时返回 `null`（没有值，不改动）。
+ *
+ * @param {string} text
+ * @param {number} start
+ * @returns {null|number}
+ */
+function skipYamlValueModifiers(text, start) {
+  let index = start
+  while (index < text.length) {
+    const char = text[index]
+    if (char === ' ' || char === '\t') {
+      index += 1
+      continue
+    }
+    if (char === '&' || char === '!') {
+      // 只跳过真正的 YAML 修饰符（`&pw` / `!!str` / `!tag`）；`&#34;` 是 HTML 实体，
+      // 不是 anchor，必须留给 HTML 实体引号解析（m1）。
+      const rest = text.slice(index, index + 2)
+      if (char === '&' && (rest[1] === '#' || rest[1] === undefined || /\s/.test(rest[1]))) break
+      if (char === '!' && (rest[1] === '=' || rest[1] === undefined)) break
+      index += 1
+      while (index < text.length && !isValueDelimiter(text[index])) index += 1
+      continue
+    }
+    if (char === '#') {
+      const lineEnd = text.indexOf('\n', index)
+      if (lineEnd === -1) return null
+      let next = lineEnd + 1
+      let indent = 0
+      while (next < text.length && (text[next] === ' ' || text[next] === '\t')) {
+        next += 1
+        indent += 1
+      }
+      // 没有缩进 = 下一行是同级键，注释后面根本没有值。
+      if (indent === 0) return null
+      index = next
+      continue
+    }
+    break
+  }
+  return index
+}
+
+/** HTML 实体引号（`&#34;` / `&quot;` 等）。 */
+const HTML_QUOTE_ENTITIES = [
+  { quote: '"', tokens: ['&#34;', '&#x22;', '&quot;'] },
+  { quote: "'", tokens: ['&#39;', '&#x27;', '&apos;'] },
+]
+const HTML_QUOTE_ENTITY_PATTERN = /^(?:&#34;|&#x22;|&quot;|&#39;|&#x27;|&apos;)/i
+
+/**
+ * 解析 HTML 实体引号包裹的值（m1：`password=&#34;hunter2&#34;`）。
+ *
+ * @param {string} text
+ * @param {number} start
+ * @returns {null | {end:number, keep:boolean, quote:string}}
+ */
+function parseHtmlEntityQuotedValue(text, start) {
+  const open = HTML_QUOTE_ENTITY_PATTERN.exec(text.slice(start, start + 8))
+  if (open === null) return null
+  const entity = HTML_QUOTE_ENTITIES.find(entry => entry.tokens.some(
+    token => token.toLowerCase() === open[0].toLowerCase(),
+  ))
+  if (entity === undefined) return null
+  const bodyStart = start + open[0].length
+  const closing = new RegExp(entity.tokens.join('|'), 'gi')
+  closing.lastIndex = bodyStart
+  const hit = closing.exec(text)
+  const end = hit === null ? text.length : hit.index + hit[0].length
+  const inner = hit === null ? text.slice(bodyStart) : text.slice(bodyStart, hit.index)
+  return { end, keep: isFullyRedactedValue(inner), quote: entity.quote }
+}
+
+/**
+ * `Authorization: ApiKey <credential>` / `token=SSWS <credential>` 这类裸方案名。
  *
  * 已知方案（Bearer / Basic / Token）由规则 1 先处理；这里覆盖规则 1 不认识的方案名，
  * 保留方案名、只把凭据抹掉。凭据已经是完整脱敏产物时原样放行（保持幂等）。
@@ -553,13 +1076,13 @@ function parseYamlBlockValue(text, start) {
  * @param {number} start
  * @returns {null | {end:number, keep:boolean, quote:null, replacement?:string}}
  */
-function parseAuthorizationValue(text, start) {
+function parseSchemeValue(text, start) {
   const first = text[start]
   if (first === '"' || first === "'" || first === '\\' || first === '|' || first === '>') return null
   let cursor = start
   while (cursor < text.length && !isValueDelimiter(text[cursor])) cursor += 1
   const scheme = text.slice(start, cursor)
-  if (!/^[A-Za-z][A-Za-z0-9._-]*$/.test(scheme)) return null
+  if (!/^[A-Za-z][A-Za-z0-9._-]*$/.test(scheme) || !AUTH_SCHEME_WORDS.has(scheme.toLowerCase())) return null
   if (cursor >= text.length) return null
   let credentialStart = cursor
   while (credentialStart < text.length && (text[credentialStart] === ' ' || text[credentialStart] === '\t')) {
@@ -578,54 +1101,65 @@ function parseAuthorizationValue(text, start) {
 /**
  * 解析一个敏感键后面的值，返回值的结束位置与「是否可以原样保留」。
  *
- * 覆盖（0.15.1）：
+ * 覆盖（0.15.2）：
+ *   - YAML 修饰符 `&anchor` / `!!tag` / `!tag` / `# 注释` + 下一行缩进值（M2）；
  *   - 普通引号 / 单引号，允许跨行、TAB、反斜杠转义；
- *   - 转义引号开头（`\"` / `\'`，JSON 序列化后的文本），按转义序列理解 `\n` / `\t` / `\\`；
+ *   - 转义引号开头（`\"` / `\'`，JSON 序列化后的文本），收尾按连续反斜杠奇偶判定（B3）；
+ *   - HTML 实体引号（`&#34;` / `&quot;`，m1）；
  *   - 三引号（`"""` / `'''`）；
  *   - 引号闭合后的词内拼接（shell / SQL 双写单引号）；
  *   - YAML 块标量；
  *   - 反斜杠续行；
- *   - `Authorization:` 的裸方案名。
+ *   - 裸方案名（`ApiKey` / `SSWS` 等，m1；不再是只有 `authorization` 键才处理）。
  *
  * @param {string} text
  * @param {number} start
- * @param {{key?:string}} [options]
+ * @param {{header?:boolean}} [options]
  * @returns {null | {end:number, keep:boolean, quote:string|null, escaped?:boolean, replacement?:string}}
  */
 function parseAssignedValue(text, start, options = {}) {
   if (start >= text.length) return null
-  const yaml = parseYamlBlockValue(text, start)
-  if (yaml !== null) return yaml
-  if (options.key === 'authorization') {
-    const authorization = parseAuthorizationValue(text, start)
-    if (authorization !== null) return authorization
+  // HTML 实体引号先判：`&#34;` 以 `&` 开头，不能先被 YAML anchor 跳过（m1）。
+  const htmlAtStart = parseHtmlEntityQuotedValue(text, start)
+  if (htmlAtStart !== null) return htmlAtStart
+  const afterModifiers = skipYamlValueModifiers(text, start)
+  if (afterModifiers === null) return null
+  const valueStart = afterModifiers
+  const yaml = parseYamlBlockValue(text, valueStart)
+  if (yaml !== null) {
+    // YAML 块标量的结束位置相对真实值；把起点之外的修饰符也算进替换区间。
+    return { ...yaml, end: yaml.end }
   }
+  const scheme = parseSchemeValue(text, valueStart)
+  if (scheme !== null) return scheme
 
-  const first = text[start]
+  const first = text[valueStart]
   if (first === '"' || first === "'") {
-    if (text.startsWith(first.repeat(3), start)) {
-      const closeAt = text.indexOf(first.repeat(3), start + 3)
+    if (text.startsWith(first.repeat(3), valueStart)) {
+      const closeAt = text.indexOf(first.repeat(3), valueStart + 3)
       const end = closeAt === -1 ? text.length : closeAt + 3
-      const inner = closeAt === -1 ? text.slice(start + 3) : text.slice(start + 3, closeAt)
+      const inner = closeAt === -1 ? text.slice(valueStart + 3) : text.slice(valueStart + 3, closeAt)
       return { end, keep: isFullyRedactedValue(inner), quote: first }
     }
-    const segment = scanQuotedValue(text, start + 1, first, false)
+    const segment = scanQuotedValue(text, valueStart + 1, first, false)
     const wordEnd = consumeWordTail(text, segment.end)
-    const inner = text.slice(start + 1, segment.bodyEnd)
+    const inner = text.slice(valueStart + 1, segment.bodyEnd)
     const keep = wordEnd === segment.end && (isFullyRedactedValue(inner) || isAuthSchemeWord(inner))
     return { end: wordEnd, keep, quote: first }
   }
-  if (first === '\\' && (text[start + 1] === '"' || text[start + 1] === "'")) {
-    const quote = text[start + 1]
-    const segment = scanQuotedValue(text, start + 2, quote, true)
-    const inner = text.slice(start + 2, segment.bodyEnd)
+  if (first === '\\' && (text[valueStart + 1] === '"' || text[valueStart + 1] === "'")) {
+    const quote = text[valueStart + 1]
+    const segment = scanQuotedValue(text, valueStart + 2, quote, true)
+    const inner = text.slice(valueStart + 2, segment.bodyEnd)
     const keep = isFullyRedactedValue(inner) || isAuthSchemeWord(inner)
     return { end: segment.end, keep, quote, escaped: true }
   }
+  const html = parseHtmlEntityQuotedValue(text, valueStart)
+  if (html !== null) return html
 
-  const end = scanBareValue(text, start, options.header === true)
-  if (end === start) return null
-  const value = text.slice(start, end)
+  const end = scanBareValue(text, valueStart, options.header === true)
+  if (end === valueStart) return null
+  const value = text.slice(valueStart, end)
   return { end, keep: isFullyRedactedValue(value) || isAuthSchemeWord(value), quote: null }
 }
 
@@ -639,51 +1173,57 @@ function isAuthSchemeWord(value) {
   return /^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))
 }
 
-/**
- * 敏感键名的后缀判据（camelCase / snake_case / kebab-case 归一后比较）。
- *
- * 0.15.1：`redactDeep` 不再只看值形态——`{ token: 'opaque-value' }` 这种键名明确、
- * 值却不像凭据的字段也必须脱敏。归一化会去掉 `_` / `-` / `.`，因此 `apiKey`、
- * `api_key`、`API-KEY` 得到同一个 `apikey`。
- */
-const SENSITIVE_KEY_SUFFIXES = [
-  'token', 'tokens', 'password', 'passwd', 'secret', 'apikey', 'credentials',
-  'cookie', 'authorization', 'authkey', 'accesskey', 'secretkey', 'privatekey',
-  'sshkey', 'sessionkey',
-]
+/** 不是普通对象（Map / Set / Buffer / Date / TypedArray / 类实例）的叶子原样返回。 */
+function isPlainObject(value) {
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
 
 /**
- * 判断对象键名是否敏感（按键名而不是按值）。
+ * 单个字符串的脱敏：共享文本规则 +（可选）本 execution 的精确秘密替换。
  *
- * @param {string} key
- * @returns {boolean}
+ * `capOversize` 默认按字符串长度决定：≤1 MiB 关闭「≥64 KiB 连续串预抹」——
+ * 那是为超大输入避开 V8 爆栈的兜底，但会把 600 KiB 的合法 `x…x` 长串整段替换；
+ * 规则 5 仍按跨类字符判敏感。传入 true / false 可强制打开 / 关闭。
+ *
+ * @param {string} text
+ * @param {{capOversize?:boolean|'auto', secrets?:string[]}} options
+ * @returns {string}
  */
-function isSensitiveObjectKey(key) {
-  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, '')
-  if (normalized === '') return false
-  return SENSITIVE_KEY_SUFFIXES.some(suffix => normalized === suffix || normalized.endsWith(suffix))
+function redactStringValue(text, options) {
+  const capOversize = options.capOversize === true || options.capOversize === false
+    ? options.capOversize
+    : text.length > REDACT_OVERSIZE_TEXT_BYTES
+  let out = redactText(text, { capOversize })
+  for (const secret of options.secrets) {
+    if (typeof secret === 'string' && secret !== '') out = out.split(secret).join('[redacted]')
+  }
+  return out
 }
 
 /** 递归脱敏的内部实现：`seen` 只在当前路径上标记，离开时删除（共享引用不算环）。 */
-function redactWalk(value, depth, seen) {
-  if (typeof value === 'string') return redactText(value)
+function redactStructuredWalk(value, depth, seen, options) {
+  if (typeof value === 'string') return redactStringValue(value, options)
   if (value === null || typeof value !== 'object') return value
   // 深度 / 循环：返回占位符，绝不把更深的对象原样透出。
-  if (depth >= REDACT_MAX_DEPTH) return REDACT_TRUNCATED
-  if (seen.has(value)) return REDACT_TRUNCATED
+  if (depth >= options.maxDepth) return options.placeholder
+  if (seen.has(value)) return options.placeholder
+  // 非普通对象是**非字符串叶子**：Map / Set / Buffer / Date / TypedArray / 类实例一律
+  // 原样返回（不做深拷贝、也不遍历）。只有数组与普通对象会被递归。
+  if (!Array.isArray(value) && !isPlainObject(value)) return value
   seen.add(value)
   try {
     if (Array.isArray(value)) {
       const out = []
-      const max = Math.min(value.length, REDACT_MAX_KEYS)
+      const max = Math.min(value.length, options.maxKeys)
       for (let index = 0; index < max; index += 1) {
-        out.push(redactWalk(value[index], depth + 1, seen))
+        out.push(redactStructuredWalk(value[index], depth + 1, seen, options))
       }
       return out
     }
     const out = {}
     const keys = Object.keys(value)
-    const max = Math.min(keys.length, REDACT_MAX_KEYS)
+    const max = Math.min(keys.length, options.maxKeys)
     for (let index = 0; index < max; index += 1) {
       const key = keys[index]
       let item
@@ -693,12 +1233,13 @@ function redactWalk(value, depth, seen) {
         // getter 抛错：跳过这一项，不把执行器带崩。
         continue
       }
-      if (isSensitiveObjectKey(key)) {
-        // 键名已经声明这是凭据：值再像普通文本也不放行；仅保留已知的完整脱敏形态。
-        out[key] = typeof item === 'string' && isFullyRedactedValue(item) ? item : '[REDACTED]'
+      if (isSensitiveKeyName(key)) {
+        // 键名已经声明这是凭据：值再像普通文本也不放行，**整体**替换成 [REDACTED]
+        // （不保留 `ghp_[REDACTED]` 之类的值形态，避免下游误以为还能看到部分凭据）。
+        out[key] = '[REDACTED]'
         continue
       }
-      out[key] = redactWalk(item, depth + 1, seen)
+      out[key] = redactStructuredWalk(item, depth + 1, seen, options)
     }
     return out
   } finally {
@@ -707,16 +1248,58 @@ function redactWalk(value, depth, seen) {
 }
 
 /**
- * 递归脱敏任意事件对象 / 数组 / 字符串。
+ * 递归脱敏任意事件对象 / 数组 / 字符串（三个适配器的**唯一**结构化脱敏出口）。
  *
- * 约束：键数 ≤ `REDACT_MAX_KEYS`（64）、深度 ≤ `REDACT_MAX_DEPTH`（8）、循环引用安全
- * （WeakSet，按当前路径检测）；数字 / 布尔 / null 等非字符串原样返回。
+ * 行为：
+ *   - 字符串：走 {@link redactText}（转义 / 引号 / 键值 / 超长串）；
+ *   - 敏感键名（{@link isSensitiveKeyName}）：值**整体**替换成 `[REDACTED]`，不递归、
+ *     不保留值形态——`{ env: { password: { nested: 'x' } } }` 也是 `[REDACTED]`；
+ *   - 数组 / 普通对象：深拷贝并递归；键数 ≤ `maxKeys`（默认 64）；
+ *   - 非字符串叶子：数字 / 布尔 / null / Map / Set / Buffer / Date / TypedArray /
+ *     类实例**原样返回**（不拷贝、不遍历；Buffer 内容不会当文本脱敏）；
+ *   - 深度达到 `maxDepth`（默认 8）或循环引用：`[redacted:depth]`；
+ *   - `capOversize`：`true` / `false` 强制开 / 关文本预抹；省略时按单串 >1 MiB 自动开启；
+ *   - `secrets`：本 execution 的精确秘密（通道凭据 / socket 路径 / runDir / 显式 env），
+ *     在共享文本规则之后做字面量替换。
+ *
+ * @param {unknown} value
+ * @param {{capOversize?:boolean, maxDepth?:number, maxKeys?:number, secrets?:string[]}} [options]
+ * @returns {unknown}
+ */
+export function redactStructured(value, options = {}) {
+  return redactStructuredWalk(value, 0, new WeakSet(), {
+    maxDepth: Number.isSafeInteger(options.maxDepth) && options.maxDepth > 0
+      ? options.maxDepth
+      : REDACT_MAX_DEPTH,
+    maxKeys: Number.isSafeInteger(options.maxKeys) && options.maxKeys > 0
+      ? options.maxKeys
+      : REDACT_MAX_KEYS,
+    placeholder: '[redacted:depth]',
+    capOversize: options.capOversize,
+    secrets: Array.isArray(options.secrets)
+      ? options.secrets.filter(secret => typeof secret === 'string' && secret !== '')
+      : [],
+  })
+}
+
+/**
+ * 递归脱敏任意事件对象 / 数组 / 字符串（0.15.1 的兼容出口）。
+ *
+ * 与 {@link redactStructured} 共用同一实现与键名判据（0.15.2 起 `credential` / `auth` /
+ * `pwd` / `passphrase` / `token2` / `passwordHash` / 中文键都命中），差别只有两点：
+ * 占位符沿用 `[TRUNCATED]`（既有导出契约），且文本预抹保持 `redactText` 默认口径。
  *
  * @param {unknown} value
  * @returns {unknown}
  */
 export function redactDeep(value) {
-  return redactWalk(value, 0, new WeakSet())
+  return redactStructuredWalk(value, 0, new WeakSet(), {
+    maxDepth: REDACT_MAX_DEPTH,
+    maxKeys: REDACT_MAX_KEYS,
+    placeholder: REDACT_TRUNCATED,
+    capOversize: true,
+    secrets: [],
+  })
 }
 
 /** 找到一个 Buffer 里「完整的 UTF-8 前缀」长度：末尾不完整的多字节序列会被裁掉。 */

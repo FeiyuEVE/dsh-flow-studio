@@ -79,7 +79,7 @@ import {
   defaultTmpRoot,
   verifyFinishBridge,
 } from './node-finish-mcp.js'
-import { redactText as redactSharedText } from './process-output.js'
+import { redactStructured, redactText as redactSharedText } from './process-output.js'
 
 /** 适配器 id（注册表 / 运行日志 / admission / 事件 provider 都用它）。 */
 export const ACP_ADAPTER_ID = 'acp'
@@ -1093,20 +1093,14 @@ export function createAcpAdapter(options = {}) {
       ...Object.values(config.env).filter(value => typeof value === 'string' && value.length >= 4),
     ].filter(value => typeof value === 'string' && value !== '')
 
-    /** 脱敏后的深拷贝（诊断出口；绝不返回原始对象）。 */
-    const redactValue = (value, depth = 0) => {
-      if (typeof value === 'string') {
-        let text = value
-        for (const secret of redactSecrets()) text = text.split(secret).join('[redacted]')
-        return redactSharedText(text)
-      }
-      if (typeof value !== 'object' || value === null) return value
-      if (depth > 8) return '[redacted:depth]'
-      if (Array.isArray(value)) return value.map(item => redactValue(item, depth + 1))
-      const output = {}
-      for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
-      return output
-    }
+    /**
+     * 脱敏后的深拷贝（诊断出口；绝不返回原始对象）。
+     *
+     * 与 codex / claude 适配器共用 `redactStructured`：结构化深拷贝 + 敏感键名下的值
+     * 整体替换 + 共享文本规则；0.15.1 的本地实现只对字符串脱敏、不看键名（B1），
+     * `handle.diagnostics` 里任何结构化凭据字段都会原样导出，已删除。
+     */
+    const redactValue = value => redactStructured(value, { secrets: redactSecrets() })
 
     const cleanupSnapshot = () => {
       const groupSnapshot = supervisor.snapshot()

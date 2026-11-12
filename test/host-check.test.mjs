@@ -764,6 +764,45 @@ await check('validateNodeCheck 错误定位：field 精确到 check 子字段', 
   assert.equal(validateNodeCheck({ command: 'true', reportPath: '/abs' }).field, 'reportPath')
 })
 
+await check('0.15.2：导出的 redactSensitiveText 覆盖新键名 / 双重 JSON / YAML 修饰符 / 方括号索引 / JSON 对（共享规则）', () => {
+  const cases = [
+    'secret_key=hunter2',
+    'access_key=hunter2',
+    'private_key=hunter2',
+    'pwd=hunter2',
+    'pass_word=hunter2',
+    'passphrase=hunter2',
+    'credential=hunter2',
+    'auth=hunter2',
+    'token2=hunter2',
+    'passwordHash=hunter2',
+    JSON.stringify(JSON.stringify({ password: 'hunter2' })),
+    JSON.stringify({ msg: 'password="say \\"hunter2\\""' }),
+    'password: &pw hunter2',
+    'password: !!str hunter2',
+    'password: # note\n  hunter2',
+    'config["password"]=hunter2',
+    '["password","hunter2"]',
+    'password=&#34;hunter2&#34;',
+    'token=ApiKey hunter2',
+    'token=SSWS hunter2',
+  ]
+  for (const raw of cases) {
+    const out = redactSensitiveText(raw)
+    assert.equal(out.includes('hunter2'), false, `共享脱敏不得泄漏：${raw} → ${out}`)
+    assert.equal(redactSensitiveText(out), out, `共享脱敏必须幂等：${out}`)
+  }
+  // 非敏感内容不得误伤（host-check 的报告副本会整段展示）。
+  for (const raw of [
+    'aws_region=us-east-1',
+    'keyboard=hhkb',
+    'normal text without secrets',
+    'cat --token-file reports/unit.json',
+  ]) {
+    assert.equal(redactSensitiveText(raw), raw, `不得误伤：${raw}`)
+  }
+})
+
 rmSync(root, { recursive: true, force: true })
 
 if (failures.length > 0) {

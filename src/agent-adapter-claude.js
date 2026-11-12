@@ -94,7 +94,7 @@ import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
 import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
 import { attachProcessStreams, createUtf8LineReader, DEFAULT_MAX_LINE_BYTES } from './agent-cli-stream.js'
 import { createClaudeUsageLedger } from './claude-usage-ledger.js'
-import { redactText as redactSharedText } from './process-output.js'
+import { redactStructured } from './process-output.js'
 import {
   FINISH_CHANNEL_ENV,
   FINISH_REMINDER_TEXT,
@@ -1589,36 +1589,28 @@ export function createClaudeAdapter(options = {}) {
       }
 
       /**
-       * 导出前脱敏：本 execution 的凭据、socket 路径与 runDir 都替换成占位符。
-       * 深度超过 8 层的子树一律替换成占位符——**绝不返回原对象**。
+       * 本 execution 的精确秘密（通道凭据 / socket / runDir）：共享规则之外再做字面量替换。
        */
-      const redactText = text => {
-        // 0.15.1：先走共享文本规则（JSON 转义 / 引号 / 键值 / 超长串），再做本 execution
-        // 的精确秘密替换。handle.events / lastMessage 也走这里，和终态结果面同一套规则。
-        // ≤1 MiB 的文本关掉「≥64 KiB 连续串预抹」：那是为超大输入避开 V8 爆栈的兜底，
-        // 但会把 600 KiB 的合法 x…x 长串整段替换；规则 5 仍按跨类字符判敏感。
-        const value = typeof text === 'string' ? text : String(text)
-        let output = redactSharedText(value, { capOversize: value.length > 1024 * 1024 })
-        const secrets = [channel.credential, channel.socketPath, runDir]
-        for (const secret of secrets) {
-          if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')
-        }
-        return output
-      }
-      const redactValue = (value, depth = 0) => {
-        if (typeof value === 'string') return redactText(value)
-        const tooDeep = depth > 8
-        if (Array.isArray(value)) {
-          return tooDeep ? '[redacted:depth]' : value.map(item => redactValue(item, depth + 1))
-        }
-        if (isPlainObject(value)) {
-          if (tooDeep) return '[redacted:depth]'
-          const output = {}
-          for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
-          return output
-        }
-        return value
-      }
+      const executionSecrets = () => [channel.credential, channel.socketPath, runDir]
+        .filter(secret => typeof secret === 'string' && secret !== '')
+
+      /**
+       * 导出前脱敏（M4 / B1）：所有导出面共用一个入口。
+       *
+       * `redactStructured` 做结构化深拷贝 + **敏感键名下的值整体替换** + 共享文本规则，
+       * 再叠加本 execution 的精确秘密替换。`handle.events` / `lastMessage` /
+       * `diagnostics` / `protocolErrors` 全部走它；0.15.1 的本地 `redactValue` 只对
+       * 字符串脱敏、不看键名，`handle.events` 里的 `{"env":{"password":"hunter2"}}`
+       * 会原样导出（B1），已删除。
+       */
+      const redactValue = value => redactStructured(value, {
+        secrets: executionSecrets(),
+        // 协议事件缓存上限 200 条：结构化副本不能被共享默认的 64 键上限裁掉。
+        maxKeys: MAX_PROTOCOL_EVENTS,
+      })
+
+      /** 单字符串出口（tail / 诊断消息）：与结构化出口同一套规则。 */
+      const redactText = text => redactValue(typeof text === 'string' ? text : String(text))
       const boundText = (value, limit = MAX_ERROR_TEXT) =>
         redactText(value === undefined || value === null ? '' : String(value)).slice(0, limit)
       /**
@@ -1628,13 +1620,10 @@ export function createClaudeAdapter(options = {}) {
        * 秘密替换（通道凭据 / socket / runDir）→ UTF-8 字节截断并标记。既有 `redactText`
        * 只做第三步之前的一半工作，不能单独用于 provider 错误文本。
        */
-      const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => {
-        let text = redactSharedText(value === undefined || value === null ? '' : String(value))
-        for (const secret of [channel.credential, channel.socketPath, runDir]) {
-          if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[redacted]')
-        }
-        return truncateUtf8Bytes(text, limit)
-      }
+      const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => truncateUtf8Bytes(
+        redactText(value === undefined || value === null ? '' : String(value)),
+        limit,
+      )
       /**
        * 展示 tail：先合并各进程的（已按上限+余量保留的）tail → **整段脱敏** →
        * 再按字节取尾。顺序不能反（0.15.1）：先 `slice(-limit)` 会把键名切掉，值就裸奔。

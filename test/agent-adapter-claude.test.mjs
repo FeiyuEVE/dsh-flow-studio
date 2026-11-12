@@ -477,6 +477,62 @@ if (mode === 'leak') {
   await closeClient()
   process.exit(0)
 }
+if (mode === 'redaction-scan') {
+  // 0.15.2 B1/B3/M1/M2/m1：结构化 tool_use input + 文本写法都必须出现在 handle.events 上。
+  const b3a = JSON.stringify(JSON.stringify({ password: 'hunter2' }))
+  const b3b = JSON.stringify({ msg: 'password="say \\\\"hunter2\\\\""' })
+  const text = [
+    'B3a=' + b3a,
+    'B3b=' + b3b,
+    'M1a=secret_key=hunter2',
+    'M1b=access_key=hunter2',
+    'M1c=private_key=hunter2',
+    'M1d=pwd=hunter2',
+    'M1e=pass_word=hunter2',
+    'M1f=passphrase=hunter2',
+    'M2a=password: &pw hunter2',
+    'M2b=password: !!str hunter2',
+    'M2c=password: # note\\n  hunter2',
+    'm1a=config["password"]=hunter2',
+    'm1b=["password","hunter2"]',
+    'm1c=password=&#34;hunter2&#34;',
+    'm1d=token=ApiKey hunter2',
+    'm1e=token=SSWS hunter2',
+  ].join(' | ')
+  out({
+    type: 'assistant',
+    ...(emitSession ? { session_id: sessionId } : {}),
+    parent_tool_use_id: null,
+    message: {
+      id: 'msg_redaction_scan',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-5',
+      content: [
+        { type: 'text', text },
+        {
+          type: 'tool_use',
+          id: 'tool_env',
+          name: 'env',
+          input: {
+            env: {
+              password: 'hunter2',
+              auth: 'hunter2',
+              token2: 'hunter2',
+              nested: { api_key: 'hunter2' },
+            },
+          },
+        },
+      ],
+      usage: usageA,
+    },
+  })
+  await callTool('脱敏扫描')
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
+
 if (mode === 'usage-then-hang') {
   assistantEvent(usageA, '先花掉一次调用，然后卡住。')
   await hangForever()
@@ -1762,6 +1818,43 @@ async function main() {
       A.match(String(handle.lastMessage), /\[redacted\]/i)
       A.equal(String(handle.stdoutTail).includes(invocation.token), false)
       A.equal(String(handle.stderrTail).includes(invocation.token), false)
+      await adapter.dispose(handle)
+    })
+
+    await check('0.15.2 B1/B3/M1/M2/m1：handle.events 结构化 tool_use 凭据与文本写法全部脱敏', async () => {
+      resetState()
+      const workspace = freshWorkspace('redaction-scan')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'redaction-scan' },
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '脱敏扫描节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, true, JSON.stringify(exited))
+      const eventsText = JSON.stringify(handle.events)
+      const leakAt = eventsText.indexOf('hunter2')
+      A.equal(leakAt, -1, `handle.events 不得泄漏 hunter2：${leakAt < 0 ? '' : eventsText.slice(Math.max(0, leakAt - 120), leakAt + 40)}`)
+      // B1：tool_use input 是结构化对象；旧本地 redactValue 只对字符串脱敏，会原样导出。
+      const assistant = handle.events.find(event => event.type === 'assistant')
+      A.ok(assistant, 'assistant 事件必须进 handle.events')
+      const toolUse = assistant.message.content.find(block => block.type === 'tool_use')
+      A.ok(toolUse, 'tool_use 块必须在事件里')
+      A.equal(toolUse.input.env.password, '[REDACTED]')
+      A.equal(toolUse.input.env.auth, '[REDACTED]')
+      A.equal(toolUse.input.env.token2, '[REDACTED]')
+      A.equal(toolUse.input.env.nested.api_key, '[REDACTED]')
+      // B3 / M1 / M2 / m1：文本写法在同一导出面上也必须抹掉。
+      for (const marker of ['B3a', 'B3b', 'M1a', 'M2c', 'm1b', 'm1d']) {
+        A.ok(eventsText.includes(marker), `夹具确实带上了 ${marker}（证明不是整条丢失）`)
+      }
+      A.ok(eventsText.includes('[REDACTED]'), '导出面必须出现脱敏标记')
+      A.equal(String(handle.lastMessage).includes('hunter2'), false, 'lastMessage 不得泄漏')
       await adapter.dispose(handle)
     })
 

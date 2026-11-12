@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict'
 
 import {
-  createBoundedOutput, redactDeep, redactText,
+  createBoundedOutput, isSensitiveKeyName, redactDeep, redactStructured, redactText,
 } from '../src/process-output.js'
 
 let checks = 0
@@ -182,7 +182,11 @@ await check('redactText：AWS Access Key / secret access key 脱敏并保留前�
   // 反例：短值 / 不同前缀 / 多出字符都不该命中原规则。
   A.equal(redactText('AKIA1234'), 'AKIA1234')
   A.equal(redactText('BKIAIOSFODNN7EXAMPLE'), 'BKIAIOSFODNN7EXAMPLE')
-  A.equal(redactText('AWS_SECRET_ACCESS_KEY=too-short'), 'AWS_SECRET_ACCESS_KEY=too-short')
+  // 0.15.2：键名本身就是敏感名（ACCESS_KEY 命中新的键名词表），不再按值的长度放行；
+  // 原断言「短占位值不会被抹」与复审 M1 的要求冲突，已改成安全方向。
+  A.equal(redactText('AWS_SECRET_ACCESS_KEY=too-short'), 'AWS_SECRET_ACCESS_KEY="[REDACTED]"')
+  A.equal(redactText('aws_region=too-short'), 'aws_region=too-short', '非敏感键名不得误伤')
+  A.equal(redactText('keyboard=too-short'), 'keyboard=too-short', '豁免词不得误伤（M1 豁免）')
 })
 
 await check('redactText：PEM 私钥块整体脱敏，公钥块不误伤', () => {
@@ -538,7 +542,9 @@ await check('redactText：JSON / shell 转义、三引号、词内拼接、全�
     ['password => "hunter2"', 'password => "[REDACTED]"'],
     ['password -> hunter2', 'password -> "[REDACTED]"'],
     ['password: |\n  hunter2', 'password: "[REDACTED]"'],
-    ['password: >-\n\thunter2\nnext_key: ok', 'password: "[REDACTED]"\nnext_key: ok'],
+    // 下一行键名用 `next_field`：0.15.2 起 `key` 本身是敏感词，`next_key` 会被按键名
+    // 脱敏，无法再用它验证「块标量之后的下一行没被吞」。
+    ['password: >-\n\thunter2\nnext_field: ok', 'password: "[REDACTED]"\nnext_field: ok'],
     ['Authorization: ApiKey hunter2', 'Authorization: ApiKey [REDACTED]'],
     ['Authorization: SSWS hunter2', 'Authorization: SSWS [REDACTED]'],
     ['password="hunter2[REDACTED]"', 'password="[REDACTED]"'],
@@ -578,4 +584,227 @@ await check('redactDeep：敏感键名按键脱敏，JSON 序列化后的事件�
   A.equal(out.serialized, '{"msg":"password=\\"[REDACTED]\\""}', '序列化事件文本不得泄漏')
   A.ok(!JSON.stringify(out).includes('hunter2'), '整个事件副本里不得出现 hunter2')
   A.equal(JSON.stringify(redactDeep(out)), JSON.stringify(out), '整体二次脱敏必须幂等')
+})
+
+// ---------------------------------------------------------------------------
+// 0.15.2：B1 结构化键名 / B3 双重 JSON / M1 M3 键名集合 / M2 YAML 修饰符 /
+//          M5 PEM 有界 / m1 方括号 / JSON 键值对 / HTML 实体 / 方案词 / 转义键名
+// ---------------------------------------------------------------------------
+
+await check('0.15.2 M1/M3：isSensitiveKeyName 覆盖复审列出的全部键名', () => {
+  const sensitive = [
+    'password', 'passwd', 'pwd', 'pass_word', 'passphrase', 'secret', 'secret_key',
+    'access_key', 'private_key', 'apiKey', 'API-KEY', 'api_key', 'credential',
+    'credentials', 'auth', 'authorization', 'token', 'token2', 'passwordHash',
+    'sessionKey', 'ssh_key', 'cookie', '身份证密码', '密码', '密钥', '令牌', '口令',
+    // m1：全角 / 零宽 / Unicode 转义 / HTML 数字实体的键名
+    'ｐａｓｓｗｏｒｄ', 'pass\u200Bword', '\\u0070assword', '&#112;assword',
+  ]
+  for (const name of sensitive) {
+    assert.equal(isSensitiveKeyName(name), true, `键名必须判敏感：${JSON.stringify(name)}`)
+  }
+  // 误伤豁免：`keyboard` / `keyspace` / `monkey` 这类含 key 的常见词不能当凭据。
+  const innocent = [
+    'message', 'count', 'value', 'name', 'type', 'author', 'credit',
+    'keyboard', 'keyspace', 'monkey', 'donkey', 'turkey', 'hockey', 'whiskey',
+    'hotkey', 'keynote', 'keyword', 'keyframe', 'keypress', 'publicKey', 'pub_key',
+    'tokenizer', 'tokenize', 'secretary', 'passwordless', '',
+  ]
+  for (const name of innocent) {
+    assert.equal(isSensitiveKeyName(name), false, `非凭据键名不得误伤：${JSON.stringify(name)}`)
+  }
+  // 豁免是逐词生效：复合键里剩下的敏感词仍然命中。
+  assert.equal(isSensitiveKeyName('monkeyToken'), true, 'monkey 豁免不能给 Token 开后门')
+  assert.equal(isSensitiveKeyName('keyboard_secret'), true, 'keyboard 豁免不能给 secret 开后门')
+})
+
+await check('0.15.2 B1：redactStructured 敏感键值整体替换，非字符串叶子原样', () => {
+  const input = {
+    item: {
+      structured: {
+        env: {
+          password: 'hunter2',
+          auth: 'hunter2',
+          token2: 'hunter2',
+          nested: { api_key: 'hunter2' },
+        },
+      },
+    },
+    message: 'normal text',
+    count: 3,
+    flag: true,
+    nothing: null,
+  }
+  const out = redactStructured(input)
+  assert.notEqual(out, input, '必须返回新对象，不原地改调用方数据')
+  assert.notEqual(out.item, input.item, '嵌套对象也必须深拷贝')
+  const env = out.item.structured.env
+  assert.equal(env.password, '[REDACTED]')
+  assert.equal(env.auth, '[REDACTED]')
+  assert.equal(env.token2, '[REDACTED]')
+  assert.equal(env.nested.api_key, '[REDACTED]')
+  assert.equal(out.message, 'normal text', '普通键值不得误改')
+  assert.equal(out.count, 3)
+  assert.equal(out.flag, true)
+  assert.equal(out.nothing, null)
+  assert.equal(JSON.stringify(out).includes('hunter2'), false, '整个结构化副本不得出现 hunter2')
+  // 敏感键下的对象也整体替换，不保留值形态（不与值形状协商）。
+  assert.equal(redactStructured({ auth: { nested: 'hunter2' } }).auth, '[REDACTED]')
+  assert.equal(redactStructured({ password: ['hunter2'] }).password, '[REDACTED]')
+  // 非字符串叶子：Map / Set / Buffer / Date 原样返回（不遍历、不拷贝）。
+  const map = new Map([['password', 'hunter2']])
+  const set = new Set(['hunter2'])
+  const buffer = Buffer.from('hunter2')
+  const date = new Date(0)
+  const leaves = redactStructured({ map, set, buffer, date })
+  assert.equal(leaves.map, map, 'Map 是非字符串叶子，原样返回')
+  assert.equal(leaves.set, set, 'Set 是非字符串叶子，原样返回')
+  assert.equal(leaves.buffer, buffer, 'Buffer 是非字符串叶子，原样返回')
+  assert.equal(leaves.date, date, 'Date 是非字符串叶子，原样返回')
+  // 深度：达到 maxDepth 的子树用占位符，绝不返回原对象。
+  let deep = { password: 'hunter2' }
+  for (let index = 0; index < 12; index += 1) deep = { next: deep }
+  const deepOut = redactStructured(deep)
+  assert.equal(JSON.stringify(deepOut).includes('hunter2'), false)
+  assert.equal(JSON.stringify(deepOut).includes('[redacted:depth]'), true)
+  assert.equal(JSON.stringify(redactStructured(deepOut)), JSON.stringify(deepOut), '二次脱敏幂等')
+  // secrets：本 execution 的精确秘密（与三个适配器同一入口）。
+  assert.equal(
+    redactStructured({ text: 'runDir=/tmp/abc/secret' }, { secrets: ['/tmp/abc/secret'] }).text,
+    'runDir=[redacted]',
+  )
+  // capOversize='auto'：≤1 MiB 的合法长串不被预抹（600 KiB x…x 保持长度）。
+  const long = 'x'.repeat(600 * 1024)
+  assert.equal(redactStructured({ text: long }).text.length, 600 * 1024, '≤1 MiB 长串不得被预抹')
+})
+
+await check('0.15.2 M3：redactDeep 的键名判据覆盖 credential / auth / pwd / passphrase / token2 / passwordHash / 中文键', () => {
+  const out = redactDeep({
+    credential: 'hunter2',
+    auth: 'hunter2',
+    pwd: 'hunter2',
+    passphrase: 'hunter2',
+    token2: 'hunter2',
+    passwordHash: 'hunter2',
+    '密码': 'hunter2',
+    normal: 'hunter2-not-sensitive-key',
+  })
+  for (const key of ['credential', 'auth', 'pwd', 'passphrase', 'token2', 'passwordHash']) {
+    assert.equal(out[key], '[REDACTED]', `${key} 键必须整体脱敏`)
+  }
+  assert.equal(out['密码'], '[REDACTED]', '中文键名必须脱敏')
+  // 值形态不像凭据的普通文本也不得因为键名放行（键名声明了它就是凭据）。
+  assert.equal(JSON.stringify(out).includes('hunter2-not-sensitive-key'), true, '普通键不受影响')
+})
+
+await check('0.15.2 B3：双重 JSON 序列化与 \\\\" 转义反斜杠奇偶', () => {
+  // B3-1：JSON.stringify(JSON.stringify(...)) → 键序列化成 \"password\"。
+  const doubleJson = JSON.stringify(JSON.stringify({ password: 'hunter2' }))
+  const outDouble = redactText(doubleJson)
+  assert.equal(outDouble.includes('hunter2'), false, `双重 JSON 不得泄漏：${outDouble}`)
+  assert.equal(redactText(outDouble), outDouble, '双重 JSON 脱敏必须幂等')
+  // B3-2：值里同时有转义反斜杠 + 转义引号（\\\\"），旧实现把收尾引号提前。
+  const tripleEscaped = JSON.stringify({ msg: 'password="say \\"hunter2\\""' })
+  const outTriple = redactText(tripleEscaped)
+  assert.equal(outTriple.includes('hunter2'), false, `\\\\" 不得提前收尾：${outTriple}`)
+  assert.equal(redactText(outTriple), outTriple, '转义反斜杠脱敏必须幂等')
+})
+
+await check('0.15.2 M1：文本赋值的键名集合与结构化共用（secret_key / access_key / private_key / pwd / pass_word / passphrase / credential / auth / token2 / passwordHash）', () => {
+  const cases = [
+    'secret_key=hunter2',
+    'access_key=hunter2',
+    'private_key=hunter2',
+    'pwd=hunter2',
+    'pass_word=hunter2',
+    'passphrase=hunter2',
+    'credential=hunter2',
+    'auth=hunter2',
+    'token2=hunter2',
+    'passwordHash=hunter2',
+    '密码：hunter2',
+    'secret_key = "hunter2"',
+  ]
+  for (const raw of cases) {
+    const out = redactText(raw)
+    assert.equal(out.includes('hunter2'), false, `M1 键名必须脱敏：${raw} → ${out}`)
+    assert.equal(redactText(out), out, `M1 脱敏必须幂等：${raw}`)
+  }
+  // 非敏感键名不得误伤（避免把普通日志整段吃掉）。
+  for (const raw of ['aws_region=us-east-1', 'keyboard=hhkb', 'author=alice', 'credit=10']) {
+    assert.equal(redactText(raw), raw, `非敏感键名不得误伤：${raw}`)
+  }
+})
+
+await check('0.15.2 M2：YAML anchor / tag / 注释后换行值都取真实值', () => {
+  const cases = [
+    ['password: &pw hunter2', 'password: "[REDACTED]"'],
+    ['password: !!str hunter2', 'password: "[REDACTED]"'],
+    ['password: !custom hunter2', 'password: "[REDACTED]"'],
+    ['password: &pw "hunter2"', 'password: "[REDACTED]"'],
+    ['password: # note\n  hunter2', 'password: "[REDACTED]"'],
+    ['password: # note\n  hunter2\nnext_field: ok', 'password: "[REDACTED]"\nnext_field: ok'],
+  ]
+  for (const [raw, expected] of cases) {
+    const out = redactText(raw)
+    assert.equal(out, expected, `M2 YAML 修饰符必须脱敏：${JSON.stringify(raw)} → ${JSON.stringify(out)}`)
+    assert.equal(out.includes('hunter2'), false)
+    assert.equal(redactText(out), out, 'M2 脱敏必须幂等')
+  }
+})
+
+await check('0.15.2 m1：方括号索引 / JSON 键值对数组 / HTML 实体 / 非 known 方案词', () => {
+  const cases = [
+    ['config["password"]=hunter2', 'config["password"]="[REDACTED]"'],
+    ["config['pass_word']=hunter2", "config['pass_word']=\"[REDACTED]\""],
+    ['["password","hunter2"]', '["password","[REDACTED]"]'],
+    ['["password", "hunter2"]', '["password", "[REDACTED]"]'],
+    ['[\\"password\\",\\"hunter2\\"]', '[\\"password\\",\\"[REDACTED]\\"]'],
+    ['password=&#34;hunter2&#34;', 'password="[REDACTED]"'],
+    ['password=&quot;hunter2&quot;', 'password="[REDACTED]"'],
+    ['token=ApiKey hunter2', 'token=ApiKey [REDACTED]'],
+    ['token=SSWS hunter2', 'token=SSWS [REDACTED]'],
+    ['password=&#39;hunter2&#39;', 'password="[REDACTED]"'],
+  ]
+  for (const [raw, expected] of cases) {
+    const out = redactText(raw)
+    assert.equal(out, expected, `m1 写法必须脱敏：${JSON.stringify(raw)} → ${JSON.stringify(out)}`)
+    assert.equal(redactText(out), out, 'm1 脱敏必须幂等')
+  }
+  // 非敏感键名的 JSON 对 / 方括号索引不得误伤。
+  assert.equal(redactText('["name","alice"]'), '["name","alice"]')
+  assert.equal(redactText('config["cursor"]=42'), 'config["cursor"]=42')
+})
+
+await check('0.15.2 M5：PEM 无 END 的重复 BEGIN 线性有界（7 KiB / 105 KiB / 1 MiB）', () => {
+  const unit = '-----BEGIN PRIVATE KEY-----'
+  const build = kib => unit.repeat(Math.max(1, Math.ceil(kib * 1024 / unit.length)))
+  const measure = (kib) => {
+    const raw = build(kib)
+    const startedAt = performance.now()
+    const out = redactText(raw)
+    return { kib, inputBytes: raw.length, ms: performance.now() - startedAt, out }
+  }
+  const small = measure(7)
+  const medium = measure(105)
+  const large = measure(1024)
+  for (const result of [small, medium, large]) {
+    assert.equal(result.out, '[REDACTED]', `${result.kib} KiB 残留 BEGIN 必须整段替换`)
+  }
+  // 旧实现是平方增长：105 KiB 约 100 ms，1 MiB 约 10 s。现在窗口固定 8 KiB。
+  assert.ok(medium.ms < 100, `105 KiB 必须在 100 ms 内（实际 ${medium.ms.toFixed(2)} ms）`)
+  assert.ok(large.ms < 250, `1 MiB 必须在 250 ms 内（实际 ${large.ms.toFixed(2)} ms）`)
+  assert.ok(
+    large.ms < Math.max(100, medium.ms * 30),
+    `不得平方增长：105 KiB ${medium.ms.toFixed(2)} ms → 1 MiB ${large.ms.toFixed(2)} ms`,
+  )
+  // 完整块仍然保留可识别的 BEGIN/END 头（幂等）。
+  const complete = [
+    '-----BEGIN RSA PRIVATE KEY-----',
+    'short-key-material-42',
+    '-----END RSA PRIVATE KEY-----',
+  ].join('\n')
+  const completeOut = redactText(complete)
+  assert.equal(completeOut, '-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n-----END RSA PRIVATE KEY-----')
+  assert.equal(redactText(completeOut), completeOut, '完整 PEM 脱敏必须幂等')
 })

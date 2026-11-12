@@ -92,7 +92,7 @@ import { fileURLToPath } from 'node:url'
 
 import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
 import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
-import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
+import { attachProcessStreams, createUtf8LineReader, DEFAULT_MAX_LINE_BYTES } from './agent-cli-stream.js'
 import { createClaudeUsageLedger } from './claude-usage-ledger.js'
 import { redactText as redactSharedText } from './process-output.js'
 import {
@@ -155,8 +155,14 @@ export const CLAUDE_PROVIDER_ERROR_CODE = 'CLAUDE_PROVIDER_ERROR'
  */
 export const CLAUDE_ARGV_TOO_LARGE_CODE = 'CLAUDE_ARGV_TOO_LARGE'
 
-/** stream-json 单行上限（原始字节）；600 KiB 的合法事件必须原样通过。 */
-const CLAUDE_MAX_LINE_BYTES = 8 * 1024 * 1024
+/**
+ * stream-json 单行上限（原始字节）：**共享默认值 32 MiB**。
+ *
+ * 不能在本适配器里另写 8 MiB：resume / 大会话的单条 result（含完整结果正文）会
+ * 超过 8 MiB，整行丢弃后 result 消失，provider 错误被误判成 `NODE_FINISH_MISSING`。
+ * 9 MiB 级合法事件必须通过；probe 的 `--help` 也走同一个上限。
+ */
+const CLAUDE_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 /** 展示用 stdout tail 上限。 */
 const CLAUDE_STDOUT_TAIL_BYTES = 64 * 1024
 /** 展示用 stderr tail 上限。 */
@@ -1533,6 +1539,10 @@ export function createClaudeAdapter(options = {}) {
           resumed: false,
           exitCode: undefined,
           signal: undefined,
+          // A2：**显式**记录本次 invocation 是否收到过 result 事件。分类不能拿
+          // 「没有字符串 subtype」近似「没有 result」——CLI 会发 `{type:"result",
+          // is_error:false}` 而不带 subtype。
+          resultSeen: false,
           resultSubtype: undefined,
           resultIsError: false,
         },
@@ -1758,6 +1768,8 @@ export function createClaudeAdapter(options = {}) {
             state.assistantError = boundText(event.error, 160)
           }
         } else if (event.type === 'result') {
+          // A2：result 的存在性是**独立事实**，与 subtype 是否字符串无关。
+          state.invocation.resultSeen = true
           state.resultSubtype = typeof event.subtype === 'string' ? event.subtype : undefined
           state.resultIsError = event.is_error === true
           state.invocation.resultSubtype = state.resultSubtype
@@ -1808,6 +1820,8 @@ export function createClaudeAdapter(options = {}) {
           resumed: proc.resumed,
           exitCode: undefined,
           signal: undefined,
+          // A2：按 invocation 重置（不能跨 resume 复用）。
+          resultSeen: false,
           resultSubtype: undefined,
           resultIsError: false,
         }
@@ -1941,12 +1955,14 @@ export function createClaudeAdapter(options = {}) {
           }
         } else if (invocation.exitCode === 0
           && invocation.resultIsError !== true
-          && typeof invocation.resultSubtype !== 'string'
+          && invocation.resultSeen !== true
           && typeof state.assistantError === 'string' && state.assistantError !== '') {
-          // A2：只有 assistant 消息带 error（如 authentication_failed）、**没有 result 事件**、
-          // 退出码 0。这是 provider 侧的执行错误，不是「agent 正常停下但没调工具」：
-          // 不能落 MISSING、也不能提醒一个认证已经失败的 CLI。只有「没有任何错误」的
-          // 正常停下才走提醒 / MISSING 分支（两者不能合并）。
+          // A2：只有 assistant 消息带 error（如 authentication_failed）、**本次 invocation
+          // 没有收到任何 result 事件**、退出码 0。这是 provider 侧的执行错误，不是「agent
+          // 正常停下但没调工具」：不能落 MISSING、也不能提醒一个认证已经失败的 CLI。
+          // 判断必须用显式 `resultSeen`：CLI 会发 `{type:"result",is_error:false}` 而没有
+          // subtype，拿「没有字符串 subtype」近似「没有 result」会把这种情况误判成 provider
+          // 错误（有 result 就不是 assistant-only 失败）。
           terminal = {
             code: 'cli-assistant-error',
             subtype: state.assistantError,

@@ -428,6 +428,20 @@ if (mode === 'huge-line') {
   await closeClient()
   process.exit(0)
 }
+if (mode === 'huge-turn-failed') {
+  // MAJOR-1：约 9 MiB 的**合法**终态事件（turn.failed.message 很大，不是畸形行）。
+  // 8 MiB 行界会整行丢弃 → 没有 turn.failed → 误判 NODE_FINISH_MISSING。
+  mkdirSync(stateDir, { recursive: true })
+  await closeClient()
+  const line = JSON.stringify({
+    type: 'turn.failed',
+    // 用带空白的正文（≈9.8 MiB）：合法事件，且不会撞上 redactText 规则 5 的
+    // 「单个超长连续串」已知 V8 栈溢出（那是 process-output.js 的独立问题）。
+    error: { code: 'invalid_api_key', message: '9MiB terminal event '.repeat(480 * 1024) },
+  }) + '\\n'
+  await new Promise(resolveWrite => process.stdout.write(line, resolveWrite))
+  process.exit(0)
+}
 if (mode === 'partial-line') {
   // M3：上一进程没有尾换行的半行不得拼进 resume 的协议流。
   if (isResume) {
@@ -1367,6 +1381,29 @@ async function main() {
       A.equal(handle.droppedLines, 0, '合法超长行不算被丢弃')
       A.equal(handle.outputIncomplete, false)
       await adapter.dispose(handle)
+    })
+
+    await check('MAJOR-1：9 MiB 合法 turn.failed 事件必须通过（适配器实际行界 32 MiB，不是 8 MiB）', async () => {
+      resetState()
+      const workspace = freshWorkspace('huge-turn-failed')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'huge-turn-failed' }, reminderLimit: 0 })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '超大终态事件节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(handle.droppedLines, 0, '9 MiB 合法行不能被整行丢弃（基线：droppedLines=1）')
+      A.equal(handle.outputIncomplete, false)
+      A.equal(exited.code, 'CODEX_CLI_TURN_FAILED',
+        'turn.failed 被读到 → 终态错误；基线被丢弃 → NODE_FINISH_MISSING')
+      A.match(exited.message, /invalid_api_key/, 'CLI 错误码必须保留')
+      A.equal(invocations().length, 1, '不提醒 / 不续跑')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
     })
 
     await check('M3：初始进程的半行不得拼进 resume 的协议流（每进程独立 reader）', async () => {

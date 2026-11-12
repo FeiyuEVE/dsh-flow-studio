@@ -61,7 +61,7 @@ import { fileURLToPath } from 'node:url'
 
 import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
 import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
-import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
+import { attachProcessStreams, createUtf8LineReader, DEFAULT_MAX_LINE_BYTES } from './agent-cli-stream.js'
 import {
   FINISH_CHANNEL_ENV,
   FINISH_REMINDER_TEXT,
@@ -130,8 +130,9 @@ const HOOK_SCRIPT_NAME = 'finish-stop-hook.mjs'
 
 /**
  * M3 分帧 / 诊断上限（review-0142b）：
- *   - 协议单行上限按**原始字节**执行（8 MiB，与共享 reader 默认值一致）；600 KiB 的
- *     合法单行必须能完整解析。
+ *   - 协议单行上限按**原始字节**执行，取**共享默认值 32 MiB**（不在这里另写 8 MiB）；
+ *     9 MiB 级的合法单行（大会话 / 大 turn.failed）必须能完整解析，不能整行丢弃后
+ *     把终态错误误判成 `NODE_FINISH_MISSING`。
  *   - `events` 是**诊断缓存**，保留 200 条并显式标记截断（`eventsTruncated`）。
  *   - 计量账本（`usageCalls`）**不受**这个上限约束（m2）：201 轮就是 201 条调用。
  *   - 协议错误 / 流诊断各自有界，只记位置、长度、类型；正文与凭据不落诊断。
@@ -139,7 +140,7 @@ const HOOK_SCRIPT_NAME = 'finish-stop-hook.mjs'
 const EVENT_CACHE_LIMIT = 200
 const PROTOCOL_ERROR_LIMIT = 20
 const DIAGNOSTIC_LIMIT = 50
-const STREAM_MAX_LINE_BYTES = 8 * 1024 * 1024
+const STREAM_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 const MAX_TERMINAL_MESSAGE = 300
 /**
  * F2：终态错误最终 UTF-8 字节上限（code / 详情 / message 都不超过它）。

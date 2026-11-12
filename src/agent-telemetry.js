@@ -318,13 +318,20 @@ function unknownUsage(provider, reason, detail = undefined) {
   }
 }
 
+/** 允许 synthetic 未知占位显式透传的 reason（只这两个，不扩枚举）。 */
+const UNKNOWN_REASON_PASSTHROUGH = new Set([USAGE_REASON.UNAVAILABLE, USAGE_REASON.MALFORMED])
+
 /**
  * 一条调用遥测记录：适配器只给原始 usage，这里统一成可落盘的事实。
  *
- * @param {{provider?: string, callId: string, usage?: object, source?: string,
+ * `reason` 只对 **synthetic 且 usage 为 null** 的未知占位生效，且只接受
+ * `usage-unavailable` / `usage-malformed`：适配器能区分「没有能力」与「给了坏形状」，
+ * 但这条透传不能覆盖真实坏数值（usage 不是 null 时仍走归一化结论）。
+ *
+ * @param {{provider?: string, callId: string, usage?: object|null, source?: string,
  *   invocationId?: string|null, sessionScopeId?: string|null, agentScope?: string|null,
  *   observedBuckets?: string[], inputIncludesCache?: boolean, synthetic?: boolean,
- *   provisional?: boolean}} input
+ *   provisional?: boolean, reason?: string}} input
  * @returns {object}
  */
 export function createUsageCall(input = {}) {
@@ -364,13 +371,19 @@ export function createUsageCall(input = {}) {
       Array.isArray(input.observedBuckets) ? input.observedBuckets : undefined,
       normalized.usage,
     )
+  const usageAbsent = input.usage === null || input.usage === undefined
+  const explicitReason = typeof input.reason === 'string' ? input.reason : null
+  const reason = flags.synthetic && usageAbsent && explicitReason !== null
+    && UNKNOWN_REASON_PASSTHROUGH.has(explicitReason)
+    ? explicitReason
+    : normalized.reason
   return {
     provider,
     callId,
     trust: normalized.trust,
     usage: normalized.usage,
     observedBuckets,
-    reason: normalized.reason,
+    reason,
     ...scope,
     ...flags,
     ...(normalized.totalMismatch === true ? { totalMismatch: true } : {}),
@@ -536,6 +549,7 @@ export function readAdapterUsageCalls(handle, fallbackProvider = 'unknown') {
       agentScope: item.agentScope,
       synthetic: item.synthetic,
       provisional: item.provisional,
+      reason: item.reason,
       ...(Array.isArray(item.observedBuckets) ? { observedBuckets: item.observedBuckets } : {}),
       ...(item.inputIncludesCache === undefined ? {} : { inputIncludesCache: item.inputIncludesCache }),
     })

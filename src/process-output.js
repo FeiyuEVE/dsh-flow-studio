@@ -65,118 +65,74 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
  *
  * 保持纯函数：host-check 等调用方都需要它不依赖 fs / 存储层，反向 import 会形成环。
  *
- * 实现分两层：{@link redactSegment} 是完整的规则管线（只在有界片段上跑）；本函数负责
- * **分段**——按行切分（行是语义完整的单位，quoted 值 / Authorization 头通常在同一行），
- * 每段 ≤ {@link REDACT_MAX_SEGMENT}。单行本身就超长时，退一步按「引号外的空白」切词；
- * 仍超长的无空白串整段判成 `[REDACTED]`（这类串本来就会命中规则 4 的多类字符判定）。
+ * 超大输入不切语义：先把「长度超过 {@link REDACT_MAX_RUN} 的可疑字符连续串」整体替换成
+ * `[REDACTED]`（线性扫描，零正则），再让完整规则管线 {@link redactSegment} 在**整段文本**
+ * 上跑一次。
  *
- * 为什么不能只按空白切：`password="…; hunter2"` 这种引号内含空白的值会被劈成两半，
- * 后半段逃过 key=value 规则（0.14.8 复审实测泄漏）。所以词法上只在**引号未被打开**
- * 时把空白当分隔符；引号打开的前提是紧跟在 `=` / `:` 后面（值开头）。
+ * 为什么不能分段：分段必须选切点，而任何切点都可能落在一个敏感值里面
+ * （`password= "…; hunter2"`、引号未闭合的值、跨行赋值……），0.14.8 / 0.14.9 两轮复审
+ * 各抓到一种切法泄漏。现在不切：正则始终能看到完整上下文，代价只是把超长串提前抹掉
+ * （它本来就会命中规则 4，同时这一步也避开了 V8 正则在超长匹配上爆栈）。
  *
  * @param {unknown} raw
  * @returns {string}
  */
 export function redactText(raw) {
   const text = typeof raw === 'string' ? raw : String(raw ?? '')
-  if (text.length <= REDACT_MAX_SEGMENT) return redactSegment(text)
+  return redactSegment(capOversizeRuns(text))
+}
+
+/** 单次正则匹配允许的最大可疑串长度；超出的串先被整段抹掉，避免 V8 爆栈。 */
+const REDACT_MAX_RUN = 64 * 1024
+
+/**
+ * 判断字符是否属于规则 4 的「可疑连续串」字符集 `[A-Za-z0-9_+/=.-]`。
+ *
+ * 只认 ASCII：与规则 4 的正则字符集逐字一致，避免中文 / emoji 把串切碎造成覆盖差异。
+ *
+ * @param {number} code
+ * @returns {boolean}
+ */
+function isSuspiciousCode(code) {
+  return (code >= 0x30 && code <= 0x39)
+    || (code >= 0x41 && code <= 0x5a)
+    || (code >= 0x61 && code <= 0x7a)
+    || code === 0x5f
+    || code === 0x2b
+    || code === 0x2f
+    || code === 0x3d
+    || code === 0x2e
+    || code === 0x2d
+}
+
+/**
+ * 抹掉超长可疑串（线性扫描，零正则）。
+ *
+ * 只处理长度 > {@link REDACT_MAX_RUN} 的连续串：它们必然命中规则 4，也正是会让 V8 正则
+ * 爆栈的输入；其余文本原样保留，不做任何切分。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function capOversizeRuns(text) {
+  if (text.length <= REDACT_MAX_RUN) return text
   let out = ''
-  let buffer = ''
-  const flush = () => {
-    if (buffer !== '') {
-      out += redactSegment(buffer)
-      buffer = ''
-    }
-  }
+  let cursor = 0
   let index = 0
   while (index < text.length) {
-    const newline = text.indexOf('\n', index)
-    const lineEnd = newline === -1 ? text.length : newline + 1
-    const line = text.slice(index, lineEnd)
-    index = lineEnd
-    if (line.length > REDACT_MAX_SEGMENT) {
-      flush()
-      let lineBuffer = ''
-      const lineFlush = () => {
-        if (lineBuffer !== '') {
-          out += redactSegment(lineBuffer)
-          lineBuffer = ''
-        }
-      }
-      for (const piece of splitOversizeLine(line)) {
-        if (piece === '[REDACTED]') {
-          lineFlush()
-          out += '[REDACTED]'
-          continue
-        }
-        if (lineBuffer.length + piece.length > REDACT_MAX_SEGMENT) lineFlush()
-        lineBuffer += piece
-      }
-      lineFlush()
-      continue
-    }
-    if (buffer.length + line.length > REDACT_MAX_SEGMENT) flush()
-    buffer += line
-  }
-  flush()
-  return out
-}
-
-/**
- * 把「单行超长」的文本切成词（引号内的空白不算分隔符）。
- *
- * 唯一会返回 `'[REDACTED]'` 的情况是某个词本身超过 {@link REDACT_MAX_SEGMENT}——
- * 这种无空白超长串按规则 4 的语义就该整体抹掉，同时避开正则在超长匹配上爆栈。
- *
- * @param {string} line
- * @returns {string[]}
- */
-function splitOversizeLine(line) {
-  const pieces = []
-  let index = 0
-  while (index < line.length) {
-    const start = index
-    let quote = null
-    while (index < line.length) {
-      const code = line.charCodeAt(index)
-      if (quote === null && isWhitespaceCode(code)) break
-      const char = line[index]
-      if (char === '"' || char === "'") {
-        if (quote === null) {
-          const previous = index > 0 ? line[index - 1] : ''
-          if (previous === '=' || previous === ':') quote = char
-        } else if (quote === char) {
-          quote = null
-        }
-      }
+    if (!isSuspiciousCode(text.charCodeAt(index))) {
       index += 1
-    }
-    if (index === start) {
-      let wsEnd = index
-      while (wsEnd < line.length && isWhitespaceCode(line.charCodeAt(wsEnd))) wsEnd += 1
-      pieces.push(line.slice(start, wsEnd))
-      index = wsEnd
       continue
     }
-    const token = line.slice(start, index)
-    pieces.push(token.length > REDACT_MAX_SEGMENT ? '[REDACTED]' : token)
+    let end = index
+    while (end < text.length && isSuspiciousCode(text.charCodeAt(end))) end += 1
+    if (end - index > REDACT_MAX_RUN) {
+      out += text.slice(cursor, index) + '[REDACTED]'
+      cursor = end
+    }
+    index = end
   }
-  return pieces
-}
-
-/**
- * 超大文本的分段阈值（UTF-16 码元数，0.14.8）。
- *
- * 动机：V8 的正则在**单次超长匹配**上会抛 `RangeError: Maximum call stack size exceeded`
- * （实测：一条 ≥6 MiB、不含空白的连续串，`/[A-Za-z0-9_+/=.-]{32,}/` 直接爆栈）。0.14.7
- * 把单行上限提到 32 MiB 之后，一段约 9 MiB、没有空白的事件正文就能在脱敏阶段把适配器
- * 打崩，进而被误报成通道失败。分段后每次只让正则在 ≤256 KiB 的片段上工作。
- */
-const REDACT_MAX_SEGMENT = 256 * 1024
-
-/** 与分段边界一致的空白判定（不含 Unicode 全角空格，保持与既有词法口径一致）。 */
-function isWhitespaceCode(code) {
-  return code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c || code === 0x0d || code === 0x20
+  return cursor === 0 ? text : out + text.slice(cursor)
 }
 
 /**
@@ -273,6 +229,15 @@ function redactSegment(raw) {
   })
   // 3) sk- 开头的 API key（保留前缀给排查看，值抹掉）
   text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
+  // 4a) 引号未闭合的赋值（0.14.10）：`password="…` 没有收尾引号时，规则 4 的引号分支
+  //     匹配不上、无引号分支又会在空白 / 分号处停下，残余内容会泄漏（0.14.9 复审实测
+  //     `password="ghp_…; hunter2` → 留下 `; hunter2`）。这里把「赋值后紧跟引号、到行尾
+  //     都没有同种收尾引号」的整段值抹掉；正常闭合的值不会命中（$ 在引号前不成立），
+  //     仍交给规则 4 处理。
+  text = text.replace(
+    /((?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)(["'])[^"'\n]*$/gim,
+    '$1[REDACTED]',
+  )
   // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
   text = text.replace(
     // N7（复核2）：值必须排除 NUL / C0 控制字节 / DEL，否则 `token=<canary>\0tail`

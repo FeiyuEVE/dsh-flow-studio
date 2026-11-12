@@ -462,8 +462,20 @@ await check('redactText：分段边界不能把引号内的敏感值切开（0.1
   const red = redactText(withQuoted)
   A.ok(!red.includes('hunter2'), '多行文本里的引号值同样不得泄漏')
 
-  // 引号不闭合的脏输入：不能崩，也不能把秘密原样留下。
-  const unbalanced = 'A'.repeat(262_090) + '1 password="ghp_' + 'A'.repeat(36)
+  // 引号不闭合的脏输入：不能崩，也不能把秘密原样留下（0.14.9 复审实测残留 `; hunter2`）。
+  const unbalanced = 'A'.repeat(262_090) + '1 password="ghp_' + 'A'.repeat(36) + '; hunter2'
   const odd = redactText(unbalanced)
   A.ok(!odd.includes('A'.repeat(36)), '引号未闭合时令牌本身仍要被抹掉')
+  A.ok(!odd.includes('hunter2'), '引号未闭合时残余秘密也不能留下')
+
+  // 等号后带空格（0.14.9 复审实测：分段器只在引号紧邻 `=` 时认引号，于是又被切开）。
+  const spaced = 'A'.repeat(262_089) + '1 password= "ghp_' + 'A'.repeat(36) + '; hunter2"'
+  const spacedOut = redactText(spaced)
+  A.ok(!spacedOut.includes('hunter2'), '等号后带空格的赋值同样要整值抹掉')
+  A.ok(spacedOut.endsWith('password= "[REDACTED]"'), '保留等号后的空格与引号形态')
+
+  // 值跨过分段边界、且没被引号包住（0.14.9 旧探针：`password= hunter2` 跨边界泄漏）。
+  const loose = 'A'.repeat(262_089) + '1 password= hunter2'
+  const looseOut = redactText(loose)
+  A.ok(!looseOut.includes('hunter2'), '跨边界的裸值也必须被抹掉')
 })

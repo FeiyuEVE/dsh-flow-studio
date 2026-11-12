@@ -82,6 +82,32 @@ function tailRetentionBytes(limit) {
   return limit + Math.max(TAIL_REDACT_MARGIN_MIN_BYTES, limit)
 }
 
+/** 头部被截断且整窗没有换行时的有界占位符（这类「一条超长无换行行」本就不可读）。 */
+const TRUNCATED_TAIL_MARKER = '[REDACTED]'
+
+/**
+ * 渲染展示 tail：先处理「头部被截断」的半截行，再脱敏，最后按展示上限截尾。
+ *
+ * 窗口只保留尾部，键名可能在窗口之外；如果窗口起点落在某个敏感值内部，尾部的
+ * `"; hunter2"` 这类片段没有键可匹配，规则 5 也未必能识别（0.15.1 复审的
+ * N=140_000 / 300_000 泄漏）。因此**头部被截断时不再导出可疑的半截行**：
+ *   - 窗口里有换行：丢弃第一个 `
+` 之前的半截首行（含换行），其余照常脱敏；
+ *   - 窗口里没有换行：整段替换成 {@link TRUNCATED_TAIL_MARKER}，不导出原文；
+ *   - 窗口没被截断：行为完全不变（先脱敏再截尾）。
+ *
+ * @param {string} text
+ * @param {boolean} headTruncated
+ * @param {number} limit
+ * @returns {string}
+ */
+function renderTail(text, headTruncated, limit) {
+  if (!headTruncated) return trimTextToBytes(redactText(text), limit)
+  const newline = text.indexOf('\n')
+  if (newline === -1) return TRUNCATED_TAIL_MARKER
+  return trimTextToBytes(redactText(text.slice(newline + 1)), limit)
+}
+
 /** 退出后等待 stdout 排空的默认上限（5s）。 */
 const DEFAULT_DRAIN_TIMEOUT_MS = 5000
 
@@ -448,7 +474,26 @@ export function attachProcessStreams(child, options = {}) {
   const stderrTailDecoder = new StringDecoder('utf8')
   let stdoutTailText = ''
   let stderrTailText = ''
+  /** 保留窗口的头部是否被裁掉过：一旦裁过就永远为 true。 */
+  let stdoutHeadTruncated = false
+  let stderrHeadTruncated = false
   const ownDiagnostics = []
+
+  /**
+   * 追加一段解码文本到保留窗口；窗口溢出时置 `headTruncated` 并只保留尾部。
+   *
+   * @param {string} current
+   * @param {string} piece
+   * @param {number} max
+   * @param {() => void} markTruncated
+   * @returns {string}
+   */
+  function retainTail(current, piece, max, markTruncated) {
+    const combined = current + piece
+    // 字符数 > max 必然字节数 > max；否则再按 UTF-8 字节精确判断。
+    if (combined.length > max || Buffer.byteLength(combined, 'utf8') > max) markTruncated()
+    return trimTextToBytes(combined, max)
+  }
 
   let settled = false
   let disposed = false
@@ -496,9 +541,11 @@ export function attachProcessStreams(child, options = {}) {
     if (disposed) return
     try {
       // 展示 tail 用独立的 decoder，按字节有界；与协议缓冲完全分离。
-      stdoutTailText = trimTextToBytes(
-        stdoutTailText + stdoutTailDecoder.write(chunk),
+      stdoutTailText = retainTail(
+        stdoutTailText,
+        stdoutTailDecoder.write(chunk),
         stdoutRetentionBytes,
+        () => { stdoutHeadTruncated = true },
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -513,9 +560,11 @@ export function attachProcessStreams(child, options = {}) {
   function onStderrData(chunk) {
     if (disposed) return
     try {
-      stderrTailText = trimTextToBytes(
-        stderrTailText + stderrTailDecoder.write(chunk),
+      stderrTailText = retainTail(
+        stderrTailText,
+        stderrTailDecoder.write(chunk),
         stderrRetentionBytes,
+        () => { stderrHeadTruncated = true },
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -532,7 +581,12 @@ export function attachProcessStreams(child, options = {}) {
   function finishStdout() {
     if (disposed) return
     try {
-      stdoutTailText = trimTextToBytes(stdoutTailText + stdoutTailDecoder.end(), stdoutRetentionBytes)
+      stdoutTailText = retainTail(
+        stdoutTailText,
+        stdoutTailDecoder.end(),
+        stdoutRetentionBytes,
+        () => { stdoutHeadTruncated = true },
+      )
     } catch {
       // decoder.end() 不应失败；展示 tail 失败不影响协议行。
     }
@@ -547,7 +601,12 @@ export function attachProcessStreams(child, options = {}) {
   function finishStderr() {
     if (disposed) return
     try {
-      stderrTailText = trimTextToBytes(stderrTailText + stderrTailDecoder.end(), stderrRetentionBytes)
+      stderrTailText = retainTail(
+        stderrTailText,
+        stderrTailDecoder.end(),
+        stderrRetentionBytes,
+        () => { stderrHeadTruncated = true },
+      )
     } catch {
       // 同上
     }
@@ -617,11 +676,10 @@ export function attachProcessStreams(child, options = {}) {
   return {
     drained,
     stdoutTail() {
-      // 先整段脱敏、再截到展示上限：切点落在值中间也不会露出裸值。
-      return trimTextToBytes(redactText(stdoutTailText), stdoutTailBytes)
+      return renderTail(stdoutTailText, stdoutHeadTruncated, stdoutTailBytes)
     },
     stderrTail() {
-      return trimTextToBytes(redactText(stderrTailText), stderrTailBytes)
+      return renderTail(stderrTailText, stderrHeadTruncated, stderrTailBytes)
     },
     diagnostics() {
       const merged = ownDiagnostics.map(entry => ({ ...entry }))

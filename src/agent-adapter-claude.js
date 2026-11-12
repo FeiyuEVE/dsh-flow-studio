@@ -1636,8 +1636,12 @@ export function createClaudeAdapter(options = {}) {
         return truncateUtf8Bytes(text, limit)
       }
       /**
-       * 展示 tail：先合并各进程的（已按上限+余量保留的）原始窗口 → **整段脱敏** →
+       * 展示 tail：先合并各进程的（已按上限+余量保留的）tail → **整段脱敏** →
        * 再按字节取尾。顺序不能反（0.15.1）：先 `slice(-limit)` 会把键名切掉，值就裸奔。
+       *
+       * 这里不需要额外的 `headTruncated` 判定：每个 `streams.stdoutTail()` 已经处理过
+       * 自己窗口的半截首行（有换行就丢首行 / 无换行整段 `[REDACTED]`），而本函数是
+       * **先脱敏、后截尾**——截出来的新半截行里不可能再有未脱敏的值。
        */
       const streamsTail = (picker, limit) => truncateTailUtf8Bytes(
         redactText(spawnedProcesses.map(proc => (proc.streams ? picker(proc.streams) : '')).join('')),

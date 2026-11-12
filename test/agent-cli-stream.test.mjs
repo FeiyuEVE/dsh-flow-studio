@@ -339,7 +339,7 @@ test('真实子进程：stdout 行交付、stderr tail 独立、drained 在 stdo
 
 test('展示 tail 有界且 UTF-8 安全，完整行交付不受 tail 上限影响', async () => {
   const { reader, lines } = makeReader()
-  const payload = JSON.stringify({ big: '汉'.repeat(2000) })
+  const payload = JSON.stringify({ big: '汉'.repeat(1000) })
   const script = `process.stdout.write(${JSON.stringify(`${payload}\n`)})`
   const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
   const attach = attachProcessStreams(child, {
@@ -352,7 +352,7 @@ test('展示 tail 有界且 UTF-8 安全，完整行交付不受 tail 上限影�
     const drained = await attach.drained
     assert.deepEqual(drained, { drained: true, timedOut: false })
     assert.equal(lines.length, 1)
-    assert.equal(JSON.parse(lines[0].line).big.length, 2000, '完整行必须交付，不受 tail 上限影响')
+    assert.equal(JSON.parse(lines[0].line).big.length, 1000, '完整行必须交付，不受 tail 上限影响')
 
     const tail = attach.stdoutTail()
     assert.ok(tail.length > 0)
@@ -389,6 +389,80 @@ test('tail 先整段脱敏再截尾：键名落在展示上限之外也不得泄
     assert.ok(!stderrTail.includes('hunter2'), `stderr tail 不得泄漏（实际 ${JSON.stringify(stderrTail)}）`)
     assert.match(stderrTail, /\[REDACTED\]/, 'stderr tail 应包含脱敏标记')
     assert.ok(Buffer.byteLength(stderrTail, 'utf8') <= 32, 'stderr tail 仍按展示上限有界')
+  } finally {
+    attach.dispose()
+    await waitExit(child)
+  }
+})
+
+test('tail 头部被截断且有换行：丢弃半截首行，保留后续完整行（0.15.1 复审）', async () => {
+  const { reader } = makeReader()
+  // 5000 个 A 远大于 stdout 保留窗口（64 + 4096），窗口起点落在值内部：
+  // 保留下来的半截行是 `; hunter2"\nnormal-line-1\nnormal-line-2\n`。
+  const payload = `password="${'A'.repeat(5000)}; hunter2"\nnormal-line-1\nnormal-line-2\n`
+  const script = "process.stdin.on('data', chunk => { process.stdout.write(chunk); process.stderr.write(chunk) }); process.stdin.resume()"
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const attach = attachProcessStreams(child, {
+    stdoutReader: reader,
+    stdoutTailBytes: 64,
+    stderrTailBytes: 32,
+    drainTimeoutMs: 3000,
+  })
+  child.stdin.end(payload)
+  try {
+    assert.deepEqual(await attach.drained, { drained: true, timedOut: false })
+    const stdoutTail = attach.stdoutTail()
+    const stderrTail = attach.stderrTail()
+    for (const [route, tail, limit] of [['stdout', stdoutTail, 64], ['stderr', stderrTail, 32]]) {
+      assert.equal(tail.includes('hunter2'), false, `${route} tail 不得泄漏半截行里的秘密：${JSON.stringify(tail)}`)
+      assert.equal(tail.includes('password='), false, `${route} tail 的半截首行必须整行丢弃`)
+      assert.match(tail, /normal-line-2/, `${route} tail 应保留后续完整行`)
+      assert.ok(Buffer.byteLength(tail, 'utf8') <= limit, `${route} tail 仍按上限有界`)
+    }
+  } finally {
+    attach.dispose()
+    await waitExit(child)
+  }
+})
+
+test('tail 头部被截断且没有换行：整段替换成 [REDACTED]，不导出原文片段（0.15.1 复审）', async () => {
+  const { reader } = makeReader()
+  const payload = `password="${'A'.repeat(5000)}; hunter2"`
+  const script = "process.stdin.on('data', chunk => { process.stdout.write(chunk); process.stderr.write(chunk) }); process.stdin.resume()"
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const attach = attachProcessStreams(child, {
+    stdoutReader: reader,
+    stdoutTailBytes: 64,
+    stderrTailBytes: 32,
+    drainTimeoutMs: 3000,
+  })
+  child.stdin.end(payload)
+  try {
+    assert.deepEqual(await attach.drained, { drained: true, timedOut: false })
+    assert.equal(attach.stdoutTail(), '[REDACTED]', 'stdout 无换行的截断窗口必须整段标记')
+    assert.equal(attach.stderrTail(), '[REDACTED]', 'stderr 无换行的截断窗口必须整段标记')
+  } finally {
+    attach.dispose()
+    await waitExit(child)
+  }
+})
+
+test('tail 未被截断时不误伤：完整小于窗口的正常多行输出原样保留（0.15.1 复审）', async () => {
+  const { reader } = makeReader()
+  const payload = 'line-1\nline-2\nline-3\n'
+  const script = "process.stdin.on('data', chunk => { process.stdout.write(chunk); process.stderr.write(chunk) }); process.stdin.resume()"
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const attach = attachProcessStreams(child, {
+    stdoutReader: reader,
+    stdoutTailBytes: 64,
+    stderrTailBytes: 32,
+    drainTimeoutMs: 3000,
+  })
+  child.stdin.end(payload)
+  try {
+    assert.deepEqual(await attach.drained, { drained: true, timedOut: false })
+    assert.equal(attach.stdoutTail(), payload, '未截断的 stdout tail 必须原样保留')
+    assert.equal(attach.stderrTail(), payload, '未截断的 stderr tail 必须原样保留')
   } finally {
     attach.dispose()
     await waitExit(child)

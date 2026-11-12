@@ -491,11 +491,53 @@ function splitKeyNameWords(name) {
  * @param {unknown} name
  * @returns {boolean}
  */
+/**
+ * 「用量计数 / 上限」维度词（0.15.2 复审回归：token 计数不是凭据）。
+ *
+ * `inputTokens` / `output_tokens` / `maxTokens` / `tokenCount` 出现在
+ * `handle.events` / `terminalError.details` / usage 诊断里，是**可观测性数据**；
+ * 把它们整值抹成 `[REDACTED]` 会让用量与诊断直接丢失。
+ */
+const TOKEN_COUNT_DIMENSION_WORDS = new Set([
+  'input', 'output', 'cached', 'cache', 'read', 'write', 'reasoning', 'thought',
+  'total', 'prompt', 'completion', 'audio', 'image', 'max', 'min', 'limit', 'used',
+  'usage', 'remaining', 'reserved', 'budget', 'count', 'number', 'num',
+])
+
+/** token / tokens 本身不是维度，只用来定位「这是 token 相关键」。 */
+const TOKEN_WORD_SET = new Set(['token', 'tokens'])
+
+/**
+ * 判断分词后的键名是否是「token 计数 / 上限」而不是凭据。
+ *
+ * 豁免判据（必须**逐词**满足，避免放宽到 token 前缀）：
+ *   1. 含 `token` / `tokens`；
+ *   2. 其余每个词都在 {@link TOKEN_COUNT_DIMENSION_WORDS} 里——
+ *      `access` / `refresh` / `id` / `api` / `secret` / `session` 等一律不豁免；
+ *   3. 至少有一个计数维度词（裸 `tokens` 不豁免）；
+ *   4. token 是末词（即 `tokens` 复数）或末词是计数/上限维度——
+ *      `tokenCount` / `tokensUsed` / `tokenLimit` / `limit_tokens` / `max_tokens`；
+ *      `token2` 的数字词不是维度 → 仍按凭据处理。
+ *
+ * @param {string[]} words
+ * @returns {boolean}
+ */
+function isTokenCountKeyName(words) {
+  if (words.length < 2) return false
+  if (!words.some(word => TOKEN_WORD_SET.has(word))) return false
+  if (words.some(word => !TOKEN_WORD_SET.has(word) && !TOKEN_COUNT_DIMENSION_WORDS.has(word))) return false
+  if (!words.some(word => TOKEN_COUNT_DIMENSION_WORDS.has(word))) return false
+  const last = words[words.length - 1]
+  if (TOKEN_WORD_SET.has(last)) return true
+  return TOKEN_COUNT_DIMENSION_WORDS.has(last)
+}
+
 export function isSensitiveKeyName(name) {
+  // 注意：**先分词再小写**。camelCase 边界（`inputTokens` → `input` / `Tokens`）依赖
+  // 大写字母；先 toLowerCase 会把 `inputTokens` 压成一个词，计数豁免就失效。
   const decoded = decodeEscapedKeyName(name)
     .replace(KEY_IGNORABLE_PATTERN, '')
     .normalize('NFKC')
-    .toLowerCase()
   if (decoded === '') return false
   for (const word of SENSITIVE_CJK_WORDS) {
     if (decoded.includes(word)) return true
@@ -503,6 +545,9 @@ export function isSensitiveKeyName(name) {
   const words = splitKeyNameWords(decoded)
   // 整串豁免（`publicKey` 分词后是 `public` + `key`，但它是公开材料，不是秘密）。
   if (SENSITIVE_KEY_EXEMPT_WORDS.has(words.join(''))) return false
+  // token 计数 / 上限（`inputTokens` / `tokenCount` / `max_tokens`）不是凭据；
+  // 真正的 token 凭据（`accessToken` / `refresh_token` / `token2` / `idToken`）不豁免。
+  if (isTokenCountKeyName(words)) return false
   for (const word of words) {
     if (SENSITIVE_KEY_EXEMPT_WORDS.has(word)) continue
     if (SENSITIVE_KEY_WORDS.has(word)) return true

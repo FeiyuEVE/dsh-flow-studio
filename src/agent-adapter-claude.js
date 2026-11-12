@@ -229,6 +229,8 @@ function probeFlagsOf(probeValue) {
     permissionMode: pick('permissionMode', probe.permissionModeFlag),
     permissionPrompts: pick('permissionPrompts'),
     allowedTools: pick('allowedTools'),
+    // A1：可选参数（不在要求表里）。CLI 不认识时只是不传，不拒绝启动。
+    disallowedTools: pick('disallowedTools', probe.disallowedTools),
     model: pick('model'),
     verbose: pick('verbose'),
   }
@@ -696,6 +698,9 @@ function buildClaudeArgs({
   }
   if (model) args.push('--model', model)
   args.push(resolveAllowedToolsFlag(flags), CLAUDE_FINISH_MCP_TOOL_NAME)
+  // A1：非交互运行里没人回答 AskUserQuestion——支持该参数的 CLI 直接禁用提问工具。
+  // CLI 不支持（probe 未确认）时不传，绝不假装禁用（capabilities.evidence 会如实标注）。
+  if (flags && flags.disallowedTools === true) args.push('--disallowedTools', 'AskUserQuestion')
   // 无人可答权限询问：不让 -p 卡在一个不会有人回答的提示上。旧版本不认识就别加。
   if (flags && flags.permissionPrompts === true) args.push('--permission-prompts', 'none')
   return args
@@ -797,6 +802,8 @@ export function createClaudeAdapter(options = {}) {
       allowedTools: /--allowedTools\b/.test(text)
         ? '--allowedTools'
         : (/--allowed-tools\b/.test(text) ? '--allowed-tools' : false),
+      // A1：可选。CLI 不支持时 argv 不传，capabilities evidence 如实标未支持。
+      disallowedTools: /--disallowedTools\b/.test(text),
       model: /--model\b/.test(text),
       verbose: /--verbose\b/.test(text),
     }
@@ -895,6 +902,8 @@ export function createClaudeAdapter(options = {}) {
       requiredFlags: requiredFlags.map(entry => entry.key),
       missingFlags: [],
       allowedToolsFlag: resolveAllowedToolsFlag(flags),
+      // A1：可选参数探测结果，start 决定要不要拼 --disallowedTools。
+      disallowedTools: flags.disallowedTools === true,
       printMode: flags.print,
       outputFormat: flags.outputFormat,
       mcpConfig,
@@ -991,6 +1000,13 @@ export function createClaudeAdapter(options = {}) {
         'turn.stop': hooksContinueEvidence(probeValue, hookLevel),
         messages: ['claude -p 没有可去重的轮次中投递通道：capabilities().messages=unsupported'],
         parameters: parametersEvidence(flags, missingFlags),
+        // A1：提问工具在非交互运行里没有人能回答。只有 probe 确认 CLI 认识
+        // --disallowedTools 才真的禁用；否则如实标「未禁用」，不假装支持。
+        nonInteractive: flags.disallowedTools === true
+          ? '--disallowedTools AskUserQuestion：probe 已从 claude --help 确认该参数，'
+            + '非交互运行不会等待提问工具的回答'
+          : 'probe 未确认 --disallowedTools：CLI 不支持时**不传**该参数，'
+            + '提问工具在非交互运行中未被禁用（不谎称已禁用）',
         usage: ['assistant 事件 message.usage（input / cache_creation / cache_read / output 互斥）→'
           + ' claude-usage-ledger 按稳定 message.id 去重（一处调用一条记录）',
         'result.usage 是**范围级结算快照**（agent/usage-snapshot，scope=invocation / '

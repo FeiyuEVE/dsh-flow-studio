@@ -137,6 +137,7 @@ if (argv[0] === '--help') {
     '  --permission-mode <mode>          default | acceptEdits | plan | auto | dontAsk | bypassPermissions',
     '  --permission-prompts <mode>       host | none',
     allowedToolsLine,
+    '  --disallowedTools <tools...>      Tools to disallow',
     '  --model <model>                   Model for the session',
     '',
   ].filter(line => !dropFlags.some(flag => line.includes(flag)))
@@ -711,6 +712,7 @@ const FAKE_FLAGS = Object.freeze({
   permissionMode: true,
   permissionPrompts: true,
   allowedTools: true,
+  disallowedTools: true,
   model: true,
   verbose: true,
 })
@@ -1127,6 +1129,72 @@ async function main() {
       A.equal((await handle.cleanupFinal).disposed, true)
       A.deepEqual(leftoverDirs(), [], '临时 MCP 配置目录必须被清理')
       A.equal(existsSync(invocation.mcpConfigPath), false, 'MCP 配置文件已删除')
+    })
+
+
+    await check('A1 非交互禁用提问工具：probe 确认 --disallowedTools 时 argv 带 AskUserQuestion；不支持时不传且能力如实标注', async () => {
+      resetState()
+      const workspace = freshWorkspace('disallowed-tools')
+      const adapter = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        reminderLimit: 0,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'never' },
+      })
+      const probe = await adapter.probe()
+      A.equal(probe.disallowedTools, true, 'fake --help 里确认 --disallowedTools')
+      A.equal(adapter.capabilities().finishTool, 'native', '可选参数不影响工具通道')
+      A.match(adapter.capabilities().evidence.nonInteractive, /--disallowedTools AskUserQuestion/,
+        'capabilities evidence 必须写明提问工具被禁用')
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '禁用提问节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const [supported] = invocations()
+      const flagIndex = supported.argv.indexOf('--disallowedTools')
+      A.ok(flagIndex >= 0, 'argv 必须带 --disallowedTools')
+      A.equal(supported.argv[flagIndex + 1], 'AskUserQuestion', '值必须是 AskUserQuestion')
+      await handle.exited
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+
+      // CLI 不认识该参数：probe 仍可用（不是必需参数），argv 不传，evidence 如实标未支持。
+      resetState()
+      const workspace2 = freshWorkspace('no-disallowed-tools')
+      const adapter2 = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        reminderLimit: 0,
+        env: {
+          FAKE_CLAUDE_STATE_DIR: stateDir,
+          FAKE_CLAUDE_MODE: 'never',
+          FAKE_CLAUDE_DROP_FLAG: '--disallowedTools',
+        },
+      })
+      const probe2 = await adapter2.probe()
+      A.equal(probe2.disallowedTools, false, '--help 没有该参数时 probe 结果如实为 false')
+      A.equal(adapter2.capabilities().finishTool, 'native', '可选参数缺失不影响 finishTool')
+      A.match(adapter2.capabilities().evidence.nonInteractive, /未确认 --disallowedTools/,
+        '不支持时 capabilities 必须如实降级标注')
+      const gate2 = makeGate(workspace2)
+      const handle2 = await adapter2.start({
+        element: { id: 'agent-1', name: '旧 CLI 节点' },
+        ctx: {},
+        finishGate: gate2,
+        workspaceRoot: workspace2,
+        reminder: { onFire: () => {} },
+      })
+      const [unsupported] = invocations()
+      A.ok(!unsupported.argv.includes('--disallowedTools'), 'CLI 不支持时绝不能传该参数')
+      await handle2.exited
+      await adapter2.dispose(handle2)
+      A.deepEqual(leftoverDirs(), [])
     })
 
 

@@ -1095,7 +1095,7 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 
 ## 0.15.1 — 脱敏层转义感知、先脱敏再截尾，闭合复审的 13 类新写法
 
-0.15.0 的独立复审（第五轮）确认终态结果面对**旧**写法已干净（76/76），但新造出的 13 类写法仍会泄漏 `hunter2`，诊断导出面另有系统性缺陷。0.15.1 只动脱敏相关代码与测试，不改 ACP 适配器行为、不改版本号。
+0.15.0 的独立复审（第五轮）确认终态结果面对**旧**写法已干净（76/76），但新造出的 13 类写法仍会泄漏 `hunter2`，诊断导出面另有系统性缺陷。0.15.1 只动脱敏相关代码与测试；同批还修了 ACP 复审的三条 MINOR（见本节末），因此它既是补丁版本也改了 ACP 的权限应答行为。
 
 - **取值扫描器补上转义感知**：赋值分隔符后出现 `\"` / `\'` 时按「引号已打开」处理，收尾标记也是 `\"` / `\'`；值内 `\n` / `\t` / `\\` 是转义序列，不是真正的换行 / 反斜杠；未闭合的转义引号把剩余文本都算作值。`JSON.stringify({msg:'password="…; hunter2"'})` 这类**序列化后**的文本不再泄漏。
 - **先脱敏再截断**：`attachProcessStreams` 的 `stdoutTail` / `stderrTail` 不再边收边按 64 KiB / 8 KiB 切；收流时保留「上限 + 余量」的原始窗口（余量与上限同量级，至少 4 KiB），导出时先整段 `redactText` 再按展示上限截尾。`agent-adapter-claude` 的合并 tail 也改成「合并 → 脱敏 → 按字节取尾」，不再是 `slice(-limit)` 之后才脱敏。
@@ -1113,4 +1113,19 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - **清理不变量补回归锁**：新增「killImpl 空操作 + 进程忽略 TERM」用例，断言 `cleanup.disposed === false`、`pending` 含该 pid、`cleanupFinal` 如实报超时。把 cleanup 快照改成恒 `disposed:true` 的变异现在会被测试拦红——此前该变异在 ACP 套件里存活（31 组 / 196 断言全绿）。
 - 顺手：删掉 probe 收尾里只有注释的空 `if`；修正 `acp-client` 头注释（坏 JSON-RPC 外壳由 `violate()` 抛错并关闭连接，只有 update 内壳才计数丢弃）。
 
-**已知边界**：tail 的余量是「与上限同量级」的固定窗口；头部被截断的窗口按上述语义处理（有换行丢首行 / 无换行整段 `[REDACTED]`），因此长于窗口的单个值不会再有尾部片段逃逸，代价是被截断窗口的首行诊断信息不再导出。YAML 块标量整块替换成 `"[REDACTED]"`（保留块尾换行），不再保留 `|` 指示符。`Authorization` 的裸方案名按「方案词 + 一个凭据」解析，方案词保留；无方案词时仍整值替换。真实 Claude / Codex CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。
+**已知边界**：tail 的余量是「与上限同量级」的固定窗口；头部被截断的窗口按上述语义处理（有换行丢首行 / 无换行整段 `[REDACTED]`），代价是被截断窗口的首行诊断信息不再导出。**该不变式只对单行值成立**：值内部含真实换行时，第一个 `\n` 可能落在值里，剩余片段仍会逃逸——0.15.2 用「未配对引号整行替换 + 行边界判定」补上（见该版本条目）。YAML 块标量整块替换成 `"[REDACTED]"`（保留块尾换行），不再保留 `|` 指示符。`Authorization` 的裸方案名按「方案词 + 一个凭据」解析，方案词保留；无方案词时仍整值替换。真实 Claude / Codex CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。
+
+## 0.15.2 — 结构化脱敏、tail 跨行重同步与 PEM 有界
+
+0.15.1 的独立复审判**不可发布**：终态结果面又出现 3 个 BLOCKER（结构化事件原样带凭据、tail 跨行值逃逸、双重 JSON 序列化）与 5 个 MAJOR。这一版只修脱敏与诊断导出面，不改 ACP 协议行为。
+
+- **结构化值真正走键名脱敏（B1/M3）**：`process-output` 导出 `redactStructured()` 与 `isSensitiveKeyName()`，三个适配器删掉本地「只对字符串跑 `redactText`」的 `redactValue`，`handle.events` / `lastMessage` / `protocolErrors` / `diagnostics` / `terminalError.details` 统一走同一实现。键名先做转义解码、NFKC、去零宽，再按 camel / snake / kebab 分词，命中敏感词表（`password` / `passwd` / `pwd` / `passphrase` / `secret` / `token` / `key` / `apikey` / `credential` / `auth` / `authorization` / `privatekey` / `accesskey` / `密码` / `密钥` / `令牌` / `口令` 等）时**整值替换**；豁免表覆盖 `keyboard` / `keyspace` / `hotkey` / `monkey` / `publicKey` / `keyword` / `tokenizer` 这类含敏感片段但非凭据的常见词。`redactDeep` 保留为同一 walker 的兼容包装。
+- **文本赋值的键名判据同一套（M1）**：不再用 6 个键名的正则，而是「找分隔符 → 向左读键名 → 共享判据」，`secret_key` / `access_key` / `private_key` / `pwd` / `pass_word` / `passphrase` / `credential` 等现在都脱敏。
+- **双重 JSON 与转义反斜杠奇偶（B3）**：键名容错 `\"password\"` 形态；值收尾引号按**连续反斜杠奇偶**判定（偶数收尾、奇数视为转义）。`JSON.stringify(JSON.stringify({password:'hunter2'}))` 与 `password="say \\"hunter2\\""` 现在都整值抹掉。
+- **YAML 修饰符（M2）**：分隔符后的 `&anchor` / `!!tag` / `!tag` / `# 注释` 先跳过再取真实值，注释换行后的缩进值同样脱敏。
+- **tail 跨行重同步（B2/M4）**：头部被截断时按行重同步——窗口起点恰好落在行边界就保留完整首行；否则丢掉半截首行；其余每一行脱敏后若含**未配对的未转义引号**（跨行值的续行正是这种形状）整行替换成 `[REDACTED]`；处理后为空一律返回 `[REDACTED]`，不再出现「tail 变空串、诊断完全消失」。未截断路径行为不变。
+- **PEM 由平方变线性（M5）**：`-----BEGIN …` 之后只在 8 KiB 窗口内找 END，找不到就整段到文末替换成 `[REDACTED]` 并停止扫描。无 END 的重复 BEGIN（7 KiB / 105 KiB / 1 MiB）从 1.1 ms / 115 ms / ~10 s 量级降到 2.9 ms / 3.4 ms / 9.0 ms。
+- **小口径补齐（m1/m2）**：方括号索引（`config["password"]=`）、JSON 键值对数组（`["password","hunter2"]`）、HTML 实体引号（`&#34;` / `&quot;`）、非 `Bearer/Basic/Token` 的方案词（`ApiKey` / `SSWS`）都整值抹掉；ACP 入站权限 id 去重集合从 256 提到 4096，溢出后遇到集合外 id 一律 fail-closed 回 `cancelled`（不再调用决策），新增 `permissionIdEvictions` / `permissionUnknownIds` 计数与诊断。
+- **回归与变异**：新增结构化事件、双重 JSON、转义奇偶、键名集合、YAML 修饰符、PEM 时长、tail 跨行（LF / CRLF / 未闭合转义引号）与行边界、ACP 去重容量等用例；变异验证——键名判据退回 `password` 单词、去掉反斜杠奇偶、PEM 改回扫到文末、去掉结构化整值替换、去掉 JSON 键值对数组、去掉未配对引号整行替换、去掉行边界判定、去重容量改回 256——全部被拦红。全量 `npm test`、`node scripts/build.mjs && node scripts/verify-build.mjs`、容器 e2e 均通过。
+
+**已知边界**：结构化只递归数组与普通对象，`Map` / `Set` / `Buffer` / `Date` / TypedArray / 类实例按「非字符串叶子原样」处理；键名是启发式，裸 `key` 片段会误伤 `next_key` / `cache_key` 这类复合名（安全方向，`--token-file` 仍不吞值）；序列化层级歧义时选择继续扫描到行尾 / 文末（过抹不泄漏）；URL 百分号编码键名与西里尔 homoglyph 未做映射；`AWS_SECRET_ACCESS_KEY=too-short` 从「不脱敏」改为「脱敏」属收紧。真实 Claude / Codex CLI、真实 `codex-acp` 模型调用、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。

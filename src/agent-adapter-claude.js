@@ -1790,6 +1790,9 @@ export function createClaudeAdapter(options = {}) {
        */
       const spawnClaude = (args, kind, invocationId) => {
         state.spawnArgv = args
+        // A2：assistant 错误属于**本次 invocation**，不能跨 resume 复用——否则一次
+        // 瞬时错误 + 后续干净退出会被误判成 provider 错误，把 MISSING 分支吞掉。
+        state.assistantError = undefined
         const proc = {
           kind,
           invocationId,

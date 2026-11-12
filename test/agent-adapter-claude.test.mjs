@@ -647,6 +647,27 @@ if (mode === 'auth-fail-exit0') {
   await closeClient()
   process.exit(0)
 }
+if (mode === 'stale-assistant-error') {
+  // A2 残余：初始轮有一次瞬时 assistant 错误但 result 成功；续跑轮干净退出（无事件）。
+  // assistant 错误属于单次 invocation，不能跨 resume 复用。
+  if (isResume) {
+    await closeClient()
+    process.exit(0)
+  }
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'rate_limit_error',
+    message: {
+      id: 'msg_transient',
+      usage: usageA,
+      content: [ { type: 'text', text: '一次瞬时错误' } ],
+    },
+  })
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
 if (mode === 'error') {
   // M6：握手成功后 CLI 自己报终态错误（认证失败 + result error + 退出码 1）。
   out({
@@ -1336,6 +1357,18 @@ async function main() {
       A.equal(exited2.reminders, 1, '干净停下仍消耗提醒预算')
       A.deepEqual(fires, [1])
       await adapter2.dispose(handle2)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('A2 残余：assistant 瞬时错误不能跨 invocation 复用（续跑干净退出仍是 MISSING）', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('stale-assistant-error', {
+        overrides: { reminderLimit: 1 },
+      })
+      A.equal(exited.code, 'NODE_FINISH_MISSING',
+        '初始轮 result 成功、续跑轮无错误 → MISSING（不能复用上一轮的 assistant 错误）')
+      A.equal(exited.reminders, 1, '干净停下仍消耗这一轮提醒预算')
+      A.equal(invocations().length, 2, '初始 + 一次 resume')
+      await adapter.dispose(handle)
       A.deepEqual(leftoverDirs(), [])
     })
 

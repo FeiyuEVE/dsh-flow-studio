@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.6）
+# 版本历史（0.1 → 0.14.7）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -997,3 +997,26 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 指标对「范围覆盖关系」只能降级：同一 invocation 多份快照 / 同 session 多 provider 累计快照保留事实并标 `partial`，不猜相加或取最大。
 - 终态错误脱敏依赖共享规则 + 本执行精确秘密；未知格式的秘密仍可能漏过。runtime 的 8 KiB 事件裁剪是另一层，不替代脱敏。
 - 真实 Claude CLI 仍未验证（本机无 CLI）；Windows / 非 Linux 的 `flock`、`/proc`、进程组清理未实测；实例写入仍无 fsync，只保证进程崩溃下的 seq 空洞语义。
+
+## 0.14.7 — 适配器加固（借开源配方，自己重写）
+
+第三轮闭环复审两侧均判「可验收」之后的一轮小步加固：全部补丁的**思路**来自开源项目 multica 的工程配方（它不驱动我们的协议、许可证也不允许逐字复制，所以一律按「重写等价实现」落地），外加本轮复审提出的三条残余。
+
+- **Claude 适配器**
+  - 非交互运行加 `--disallowedTools AskUserQuestion`（CLI 不支持该 flag 时不传、并在 capabilities 里如实标注），避免 agent 在无人应答的通道里等人回答。
+  - CLI 退出码 0、但流里只报 `authentication_failed` 时归为 `CLAUDE_PROVIDER_ERROR`，不再落 `NODE_FINISH_MISSING`、不再消耗提醒预算；「agent 自己停下没调工具」与「provider 认证失败」彻底分开。
+  - assistant 级瞬时错误只属于本次 invocation，不再跨 resume 复用（否则一次瞬时错误 + 后续干净退出会被误判成 provider 错误）。
+  - 同步 spawn 参数过大（E2BIG）给独立错误码 `CLAUDE_ARGV_TOO_LARGE` + 可操作 hint（Unix E2BIG；Windows `ERROR_FILENAME_EXCED_RANGE` 分支已写、未真机实测）。
+- **流分帧**（`agent-cli-stream`）
+  - 单行上限 8 MiB → **32 MiB**、初始缓冲 1 MiB；超长行仍整条丢弃，但**后续行继续可读**；诊断串剥 C0 控制字符且不切断 UTF-8 多字节字符；CRLF 行尾剥离（含 EOF 冲刷）。
+- **凭据脱敏**（`process-output`）
+  - 补 AWS Access/Secret、PEM 私钥块、GitHub（经典 + fine-grained）、Slack、GitLab、Google、Stripe、JWT、连接串；保留可识别前缀、幂等、不误伤形似文本。
+- **Codex 适配器**：同步 spawn E2BIG → `CODEX_ARGV_TOO_LARGE` + hint；清理行为保持（runDir / MCP server / listener 全零）。
+- **运行时**：创建/准备阶段**抛异常**也收成 `CANCELED`（与「返回错误」分支一致），owner / preparing 照旧释放。
+- **测试**：修掉 `node-finish-mcp` 在 `TMPDIR=<repo>/.tmp` 下的假红（断言改为「默认临时根不得**恰好**是仓库根」，不再要求必须在仓库外），并把测试内 mkdtemp 前缀压短，避免 unix socket 路径超过 108 字节。
+
+**已知边界**
+- Windows 的 `ERROR_FILENAME_EXCED_RANGE (206)` 分支与进程清理未真机实测。
+- 32 MiB 仍是硬上限：超限行仍整条丢弃（只留诊断），只是阈值更高；单条 32 MiB 行会短暂占用内存。
+- 脱敏规则按标准令牌长度/形态收紧：非标准长度的 `ghp_` / `glpat-` / `xapp-` 等可能漏抹；带 `=` padding 的 JWT 只抹内容、标记后可能残留 `=`。
+- 真实 Claude CLI 仍未验证（本机无 CLI，测试明确 SKIP）。

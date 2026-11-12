@@ -31,7 +31,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  createClaudeAdapter, CLAUDE_ADAPTER_ID, CLAUDE_PROVIDER_ERROR_CODE,
+  createClaudeAdapter, CLAUDE_ADAPTER_ID, CLAUDE_ARGV_TOO_LARGE_CODE, CLAUDE_PROVIDER_ERROR_CODE,
 } from '../src/agent-adapter-claude.js'
 import {
   normalizeUsage, readAdapterUsageCalls, readAdapterUsageSnapshots, usageEventForCall, usageSnapshotEventFor,
@@ -1819,7 +1819,7 @@ async function main() {
       A.deepEqual(leftoverDirs(), [])
     })
 
-    await check('M4 同步 spawn 异常（E2BIG）：TOOL_UNAVAILABLE + cleanup，目录/channel/listener 不残留', async () => {
+    await check('A3 命令行过长（E2BIG）→ 独立 CLAUDE_ARGV_TOO_LARGE + 可操作 hint + cleanup；ENOENT 仍走原错误码', async () => {
       resetState()
       const workspace = freshWorkspace('e2big')
       const adapter = makeAdapter({ env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call' } })
@@ -1838,15 +1838,53 @@ async function main() {
         failure = error
       }
       A.ok(failure, '参数超限必须失败而不是只留下资源')
-      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
-      A.equal(failure.details.reason, 'spawn-failed')
+      A.equal(failure.code, CLAUDE_ARGV_TOO_LARGE_CODE,
+        '命令行过长必须有独立错误码（基线：NODE_FINISH_TOOL_UNAVAILABLE）')
+      A.equal(failure.details.reason, 'argv-too-large')
       A.equal(failure.details.cause, 'E2BIG')
-      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir / socket（基线：目录仍在）')
+      A.match(failure.message, /命令行超长/, 'message 要点明命令行超长')
+      A.match(failure.message, /提示词|变量/, 'message 要指出大块输入')
+      A.match(failure.details.hint, /documents/, 'hint 要给出可操作出路：改用文档')
+      A.match(failure.details.hint, /缩短/, 'hint 要给出可操作出路：缩短输入')
+      A.ok(!failure.message.includes('没有建立 flow_finish_node 通道'),
+        '不能和「CLI 没有工具通道」混淆')
+      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir / socket')
       A.ok(failure.cleanup && typeof failure.cleanup === 'object')
       A.equal(failure.cleanup.disposed, true, 'cleanup 必须如实报告已释放')
+      A.equal(failure.cleanup.pendingResources, undefined, '资源登记表（runDir / channel / listener）无残留')
       A.equal((await failure.cleanupFinal).disposed, true)
       A.equal(gate.settled(), true, '启动失败必须 abort gate')
       A.equal(invocations().length, 0, '同步 spawn 失败 → 零派发')
+
+      // 非回归：普通 spawn 失败（ENOENT）仍走 TOOL_UNAVAILABLE + spawn-failed，不套用 ARGV_TOO_LARGE。
+      resetState()
+      const workspace2 = freshWorkspace('spawn-enoent')
+      const missingBin = join(sandbox, 'no-such-claude-for-spawn')
+      const adapter2 = makeAdapter({
+        claudeBin: missingBin,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call' },
+      })
+      const gate2 = makeGate(workspace2)
+      let failure2 = null
+      try {
+        await adapter2.start({
+          element: { id: 'agent-1', name: 'ENOENT 节点' },
+          ctx: {},
+          finishGate: gate2,
+          workspaceRoot: workspace2,
+        })
+      } catch (error) {
+        failure2 = error
+      }
+      A.ok(failure2, '不存在的可执行文件必须失败')
+      A.equal(failure2.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        '普通 spawn 失败保持 TOOL_UNAVAILABLE（不回归）')
+      A.equal(failure2.details.reason, 'spawn-failed')
+      A.equal(failure2.details.cause, 'ENOENT')
+      A.equal(failure2.cleanup.disposed, true)
+      A.deepEqual(leftoverDirs(), [], 'ENOENT 同样不能残留资源')
+      A.equal(gate2.settled(), true)
+      A.equal(invocations().length, 0)
     })
 
     await check('M5 零宽限：grace=0 只跳过等待，TERM→KILL 仍执行并完成结算', async () => {

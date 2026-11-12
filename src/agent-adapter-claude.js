@@ -148,6 +148,13 @@ const MODEL_PATTERN = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
  */
 export const CLAUDE_PROVIDER_ERROR_CODE = 'CLAUDE_PROVIDER_ERROR'
 
+/**
+ * A3：命令行过长（Linux `E2BIG`；Windows `ERROR_FILENAME_EXCED_RANGE` / errno 206，
+ * Windows 未实测）。它是**启动前**的输入规模问题，不是「CLI 没有工具通道」，
+ * 所以给独立错误码与可操作 hint。
+ */
+export const CLAUDE_ARGV_TOO_LARGE_CODE = 'CLAUDE_ARGV_TOO_LARGE'
+
 /** stream-json 单行上限（原始字节）；600 KiB 的合法事件必须原样通过。 */
 const CLAUDE_MAX_LINE_BYTES = 8 * 1024 * 1024
 /** 展示用 stdout tail 上限。 */
@@ -268,6 +275,54 @@ function truncateUtf8Bytes(text, limit) {
 function resolveAllowedToolsFlag(flags) {
   const value = flags && typeof flags === 'object' ? flags.allowedTools : undefined
   return value === '--allowed-tools' ? '--allowed-tools' : '--allowedTools'
+}
+
+/**
+ * A3：这个 spawn 失败是不是「命令行太长」？
+ *
+ * - Linux / POSIX：`E2BIG`（单个 argv 元素超过 MAX_ARG_STRLEN=128 KiB，或总长超 ARG_MAX）；
+ * - Windows：`ERROR_FILENAME_EXCED_RANGE`（Win32 错误号 206，CreateProcess 命令行超限），
+ *   Node 侧以 `code` / `errno` 的形式之一出现。**Windows 路径未实测**，只按错误号形状
+ *   归类；未命中时仍走原来的 `NODE_FINISH_TOOL_UNAVAILABLE`，不会误吞普通启动失败。
+ */
+function isArgvTooLargeError(error) {
+  if (!error || typeof error !== 'object') return false
+  return error.code === 'E2BIG'
+    || error.code === 'ERROR_FILENAME_EXCED_RANGE'
+    || error.errno === 206
+}
+
+/**
+ * A3：命令行过长的独立错误（与「CLI 没有工具通道」区分）。
+ *
+ * 清理由 start 的统一失败路径负责；这里只把「是什么问题、怎么办」说清楚。
+ */
+function argvTooLargeError({ error, args }) {
+  const cause = error && error.code
+    ? String(error.code)
+    : (error && error.errno !== undefined ? `ERRNO_${error.errno}` : 'ARGV_TOO_LARGE')
+  const argvList = Array.isArray(args) ? args : []
+  const promptBytes = argvList[0] === '-p' && typeof argvList[1] === 'string'
+    ? Buffer.byteLength(argvList[1], 'utf8')
+    : 0
+  const argvBytes = argvList.reduce((sum, arg) => sum + Buffer.byteLength(String(arg), 'utf8') + 1, 0)
+  const hint = '把大段正文写进工作区文件，用 flow_finish_node 的 documents 引用；'
+    + '或缩短 element.node.prompt / ctx.variables 后重试'
+  return new ClaudeAdapterError(
+    CLAUDE_ARGV_TOO_LARGE_CODE,
+    `Claude 启动命令行超长（${cause}）：提示词或变量过大（prompt ${promptBytes} 字节，`
+      + `argv 合计 ${argvBytes} 字节），进程未能启动。${hint}。`
+      + '这是输入规模问题，不是「CLI 没有工具通道」。',
+    {
+      adapterId: CLAUDE_ADAPTER_ID,
+      field: 'spawn',
+      reason: 'argv-too-large',
+      cause,
+      hint,
+      promptBytes,
+      argvBytes,
+    },
+  )
 }
 
 /** 解析出的最低主版本：1.x 的 `--mcp-config` / `-p` 行为与本适配器假设不同。 */
@@ -1460,6 +1515,7 @@ export function createClaudeAdapter(options = {}) {
         exitCode: undefined,
         signal: undefined,
         spawnError: null,
+        spawnArgv: null,
         events: [],
         // 0.14.5 M3 / M6 诊断（小、有界；与用量账本分开）
         protocolErrors: 0,
@@ -1729,9 +1785,11 @@ export function createClaudeAdapter(options = {}) {
        *   - 独立 `createUtf8LineReader` + `attachProcessStreams`（M3）；
        *   - 进程组 supervisor（M5 / m1）；
        *   - 资源登记表里的 stream dispose。
-       * 同步 spawn 异常（E2BIG 等）转成 TOOL_UNAVAILABLE，由外层 protect 清理（M4）。
+       * 同步 spawn 异常：命令行过长（E2BIG / Windows 206）→ `CLAUDE_ARGV_TOO_LARGE`；
+       * 其它启动失败仍转成 TOOL_UNAVAILABLE。两者都由外层 protect 清理（M4）。
        */
       const spawnClaude = (args, kind, invocationId) => {
+        state.spawnArgv = args
         const proc = {
           kind,
           invocationId,
@@ -1764,6 +1822,9 @@ export function createClaudeAdapter(options = {}) {
             stdio: ['ignore', 'pipe', 'pipe'],
           })
         } catch (error) {
+          // A3：命令行过长是输入规模问题，给独立错误码 + 可操作 hint；普通 spawn
+          // 失败（ENOENT / EACCES …）保持原有 TOOL_UNAVAILABLE，不混为一谈。
+          if (isArgvTooLargeError(error)) throw argvTooLargeError({ error, args })
           throw new ClaudeAdapterError(
             ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
             `Claude 进程无法启动（${error && error.code ? error.code : 'SPAWN_FAILED'}）：`
@@ -2321,6 +2382,10 @@ export function createClaudeAdapter(options = {}) {
           // 握手前就失败（CS：exit 分支之前先 abort gate 会导致后续误判——这里在
           // gate 尚未 settle 时统一抛 TOOL_UNAVAILABLE，gate 已 settle 则交给退出结算）。
           if (!finishGate.settled()) {
+            // A3：异步 spawn 失败也要认出命令行过长（与同步抛错的分类保持一致）。
+            if (outcome === 'spawn-failed' && isArgvTooLargeError(state.spawnError)) {
+              throw argvTooLargeError({ error: state.spawnError, args: state.spawnArgv })
+            }
             const cause = state.terminalError
               || (state.assistantError ? { code: state.assistantError, message: '' } : null)
             const reason = outcome === 'spawn-failed'

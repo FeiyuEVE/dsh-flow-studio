@@ -74,6 +74,28 @@ import { redactText as redactSharedText } from './process-output.js'
 /** 适配器 id（注册表 / 运行日志 / admission 都用它）。 */
 export const CODEX_ADAPTER_ID = 'codex'
 
+/**
+ * C1：argv / 单参数超过内核上限时的**独立错误码**。
+ *
+ * 与 `NODE_FINISH_TOOL_UNAVAILABLE` 区分开：那个码表示「工具通道不可用」（CLI 缺失、
+ * MCP 握手失败…），用同样大的提示词重试永远不会成功；这里则是提示词 / variables /
+ * `settings.env` 太大，调用方该改输入而不是换通道。
+ *
+ * Linux/macOS 同步 spawn 抛 `E2BIG`（Linux 单参数 `MAX_ARG_STRLEN=128 KiB`）；
+ * Windows 的等价失败是 `ERROR_FILENAME_EXCED_RANGE`(206)。**Windows 分支未在真机
+ * 实测**，只按 Node 暴露的 `errno`/`code` 形状兜住，行为以 Linux CI 为准。
+ * 目前只在**同步** spawn 抛错路径识别；若某个平台把 206 异步上报（child `error`
+ * 事件），仍会落到 `NODE_FINISH_TOOL_UNAVAILABLE`（Windows 未实测，待真机确认）。
+ */
+export const CODEX_ARGV_TOO_LARGE = 'CODEX_ARGV_TOO_LARGE'
+
+/** `CODEX_ARGV_TOO_LARGE` 的可操作提示（message 与 details.hint 共用一份说法）。 */
+export const CODEX_ARGV_TOO_LARGE_HINT = '提示词或环境变量过大：把长文写进工作区文件（或文档 / 附件），'
+  + '在提示词里只引用路径；或缩短节点提示词、roleCard、ctx.variables。'
+  + '这不是工具通道不可用，按原样重试不会成功'
+  + '（Linux/macOS 单参数上限 MAX_ARG_STRLEN=128 KiB；Windows 等价失败为 '
+  + 'ERROR_FILENAME_EXCED_RANGE(206)，Windows 分支未在真机实测）。'
+
 /** 默认最多提醒次数（11 §3.1：默认 3 次）。 */
 export const CODEX_REMINDER_LIMIT = 3
 
@@ -305,6 +327,24 @@ function nonEmptyTrimmedString(value) {
 
 function nonNegativeIntOr(value, fallback) {
   return Number.isSafeInteger(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * C1：判断同步 spawn 抛出的错误是否属于「argv / 单参数太大」。
+ *
+ * - Linux/macOS：`E2BIG`（Linux `MAX_ARG_STRLEN=128 KiB`，200 KB 提示词即触发）；
+ * - Windows：等价失败是 `ERROR_FILENAME_EXCED_RANGE`(206)。Node 可能把它暴露成
+ *   `code:'UNKNOWN'` + `errno:206`，也可能保留字面 code，这里两种形状都认。
+ *   **Windows 分支未在真机实测**，仅做保守兜底；真机验证前不得宣称已验证。
+ *
+ * @param {unknown} error spawn 同步异常
+ * @returns {boolean}
+ */
+function isArgvTooLargeError(error) {
+  if (!error || typeof error !== 'object') return false
+  if (error.code === 'E2BIG' || error.code === 'ERROR_FILENAME_EXCED_RANGE') return true
+  // libuv 在 Windows 上把 Win32 错误码映射进 errno；正负两种写法都兜住。
+  return error.errno === 206 || error.errno === -206
 }
 
 /**
@@ -1814,15 +1854,32 @@ export function createCodexAdapter(options = {}) {
       }), 'initial')
     } catch (error) {
       const cleanupOutcome = await cleanupAfterStartFailure()
+      const cause = error && error.code ? String(error.code) : 'SPAWN_FAILED'
+      // C1：argv/单参数超限是**输入问题**，不是「工具通道不可用」——给独立错误码与
+      // 可操作 hint；清理行为与其它启动失败完全一致（runDir / MCP server / listener 全零）。
+      if (isArgvTooLargeError(error)) {
+        throw attachCleanup(attachUsage(new CodexAdapterError(
+          CODEX_ARGV_TOO_LARGE,
+          `Codex 无法启动：命令行参数超过系统上限（${cause}），节点零派发。`
+            + CODEX_ARGV_TOO_LARGE_HINT,
+          {
+            adapterId: CODEX_ADAPTER_ID,
+            field: 'spawn',
+            reason: 'argv-too-large',
+            cause,
+            hint: CODEX_ARGV_TOO_LARGE_HINT,
+          },
+        )), cleanupOutcome)
+      }
       throw attachCleanup(attachUsage(new CodexAdapterError(
         ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
-        `Codex 进程无法启动（${error && error.code ? error.code : 'SPAWN_FAILED'}）：`
+        `Codex 进程无法启动（${cause}）：`
           + '参数或环境不可用，节点零派发',
         {
           adapterId: CODEX_ADAPTER_ID,
           field: 'spawn',
           reason: 'spawn-failed',
-          cause: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+          cause,
         },
       )), cleanupOutcome)
     }

@@ -175,6 +175,47 @@ test('readAdapterUsageCalls：支持数组/函数，坏记录跳过，provider �
   assert.deepEqual(readAdapterUsageCalls({ usageCalls: () => { throw new Error('boom') } }), [])
 })
 
+test('P2：synthetic 且 usage=null 时显式 unknown 原因透传；非法原因/真实坏数值不覆盖', () => {
+  const unavailable = createUsageCall({
+    provider: 'acp', callId: 'acp-unknown:1', usage: null, synthetic: true, reason: 'usage-unavailable',
+  })
+  assert.equal(unavailable.trust, USAGE_TRUST.UNKNOWN)
+  assert.equal(unavailable.reason, 'usage-unavailable', '适配器声明的 usage-unavailable 必须透传')
+  assert.deepEqual(unavailable.observedBuckets, [])
+
+  const malformed = createUsageCall({
+    provider: 'acp', callId: 'acp-unknown:2', usage: null, synthetic: true, reason: USAGE_REASON.MALFORMED,
+  })
+  assert.equal(malformed.reason, 'usage-malformed')
+
+  const invalid = createUsageCall({
+    provider: 'acp', callId: 'acp-unknown:3', usage: null, synthetic: true, reason: 'made-up-reason',
+  })
+  assert.equal(invalid.reason, USAGE_REASON.MALFORMED, '非法 reason 回落到现规则')
+
+  const notSynthetic = createUsageCall({
+    provider: 'acp', callId: 'acp-unknown:4', usage: null, reason: 'usage-unavailable',
+  })
+  assert.equal(notSynthetic.reason, USAGE_REASON.MALFORMED, '只有 synthetic 未知占位能透传')
+
+  // 给了真实但没有形状的 usage：不能拿 reason 覆盖「数值坏掉」的结论。
+  const badNumbers = createUsageCall({
+    provider: 'acp', callId: 'acp-unknown:5', usage: { inputTokens: -1 }, synthetic: true, reason: 'usage-unavailable',
+  })
+  assert.equal(badNumbers.reason, USAGE_REASON.MALFORMED)
+
+  const viaRead = readAdapterUsageCalls({
+    usageCalls: [{
+      provider: 'acp', callId: 'acp-unknown:6', usage: null, synthetic: true, reason: 'usage-unavailable',
+    }],
+  })
+  assert.equal(viaRead.length, 1)
+  assert.equal(viaRead[0].reason, 'usage-unavailable', '读取适配器账本时 reason 不能被丢掉')
+  const event = usageEventForCall(viaRead[0])
+  assert.equal(event.reason, 'usage-unavailable', '事件里必须保留 unknown 原因')
+  assert.equal(event.synthetic, true)
+})
+
 test('usage / invocation 事件形状与 provider 归一化', () => {
   const call = createUsageCall({
     provider: 'Dsh', callId: 's:1', usage: { inputTokens: 3, outputTokens: 2 },

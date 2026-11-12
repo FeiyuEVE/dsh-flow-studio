@@ -219,39 +219,19 @@ function redactSegment(raw) {
     /\b(Bearer|Basic|Token)\s+((?:"[A-Za-z0-9._~+/=-]*\[REDACTED\][^"]*"|'[A-Za-z0-9._~+/=-]*\[REDACTED\][^']*'|[A-Za-z0-9._~+/=-]*\[REDACTED\]|"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,}))/gi,
     (match, scheme, credential) => (isFullyRedactedValue(credential) ? match : `${scheme} [REDACTED]`),
   )
-  // 2) 敏感标志位：`--token <值>` / `--api-key=<值>` 等空格或等号分隔形态
-  //    （N3 接线）。参数名必须完整（名字后只接受空白或 `=`），所以 `--token-file` /
-  //    `--tokenize` 的后续正常文件名不会被吞；值只吃一个 shell 词，引号内可含空格。
-  text = text.replace(SECRET_FLAG, (match, lead, flag, separator, doubleQuoted, singleQuoted) => {
-    if (doubleQuoted !== undefined) return `${lead}${flag}${separator}"[REDACTED]"`
-    if (singleQuoted !== undefined) return `${lead}${flag}${separator}'[REDACTED]'`
-    return `${lead}${flag}${separator}[REDACTED]`
-  })
+  // 2) 敏感标志位：`--token <值>` / `--api-key=<值>`。参数名必须完整（名字后只接受
+  //    空白或 `=`），所以 `--token-file` / `--tokenize` 的后续正常文件名不会被吞。
+  //    值同样交给扫描器：引号内可以跨行 / 含 TAB / 带转义引号 / 没有收尾引号，正则版
+  //    会在这里各截断一种（与规则 4 同源问题）。
+  text = redactFlagValues(text)
   // 3) sk- 开头的 API key（保留前缀给排查看，值抹掉）
   text = text.replace(/\bsk-[A-Za-z0-9_-]{4,}/g, 'sk-[REDACTED]')
-  // 4a) 引号未闭合的赋值（0.14.10）：`password="…` 没有收尾引号时，规则 4 的引号分支
-  //     匹配不上、无引号分支又会在空白 / 分号处停下，残余内容会泄漏（0.14.9 复审实测
-  //     `password="ghp_…; hunter2` → 留下 `; hunter2`）。这里把「赋值后紧跟引号、到行尾
-  //     都没有同种收尾引号」的整段值抹掉；正常闭合的值不会命中（$ 在引号前不成立），
-  //     仍交给规则 4 处理。
-  text = text.replace(
-    /((?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)(["'])[^"'\n]*$/gim,
-    '$1[REDACTED]',
-  )
-  // 4) key: value / key=value / "key": "value" 形式（；，也算分隔符，中文句子里的多组凭据才不会漏）
-  text = text.replace(
-    // N7（复核2）：值必须排除 NUL / C0 控制字节 / DEL，否则 `token=<canary>\0tail`
-    // 会把 `\0tail` 一起吞进 [REDACTED]，输出因此丢失非凭据字节。
-    /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"\x00-\x1F\x7F]*"|'[^'\x00-\x1F\x7F]*'|[^\s,;&}；，\x00-\x1F\x7F]+)/gi,
-    (match, prefix, value) => {
-      if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
-      // 规则 0 产出的带前缀标记（`ghp_[REDACTED]`、`glpat-[REDACTED]`）原样放行，
-      // 避免 key=value 规则把前缀二次抹掉，也保证整体幂等。只放行**整体**脱敏的
-      // 形态：标记之后还有残余字符（部分脱敏）必须继续按敏感值整值处理（MAJOR-2）。
-      if (isFullyRedactedValue(value)) return match
-      return `${prefix}"[REDACTED]"`
-    },
-  )
+  // 4) 敏感键赋值：`token=…` / `password: …` / `"api_key": "…"`。
+  //    这里**不用正则**完成取值：敏感值可能带引号、引号内可能跨行 / 带 TAB / 含转义引号，
+  //    也可能根本没收尾（0.14.8 / 0.14.9 / 0.14.10 三轮复审各抓到一种被正则截断的写法）。
+  //    扫描器按「键 + 分隔符 + 值」逐段取值：带引号就一路走到同种未转义引号（或文本末尾），
+  //    否则走到空白 / 常见分隔符；整值替换成 `"[REDACTED]"`，不让后半段留在外面。
+  text = redactAssignedValues(text)
   // 5) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
   //    与 host-check.redactSensitiveText 的兼容差异：
   //      a. 必须至少跨两类字符才判敏感（见上方说明）；
@@ -287,6 +267,130 @@ function isPathLikeRun(match) {
   if (parts.length < 2) return false
   if (parts[0] === '') parts.shift()
   return parts.length > 0 && parts.every(part => part !== '' && /^[A-Za-z0-9._~-]+$/.test(part))
+}
+
+/**
+ * 命令行标志位取值与替换（线性扫描，见规则 2 的说明）。
+ *
+ * 与规则 4 共用 {@link parseAssignedValue}：带引号时允许跨行 / TAB / 转义，没闭合就把
+ * 剩余文本都算作值；替换时保留原来的引号风格。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function redactFlagValues(text) {
+  const pattern = /(^|[^A-Za-z0-9_-])(--?(?:token|password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|auth[_-]?token|secret[_-]?key|private[_-]?key|credentials?|authorization|cookie|session[_-]?key|ssh[_-]?key))(\s*=\s*|\s+)/gi
+  let out = ''
+  let cursor = 0
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const prefix = `${match[1]}${match[2]}${match[3]}`
+    const valueStart = match.index + prefix.length
+    const parsed = parseAssignedValue(text, valueStart)
+    if (parsed === null) continue
+    out += text.slice(cursor, match.index) + prefix
+    if (parsed.keep) {
+      out += text.slice(valueStart, parsed.end)
+    } else if (parsed.quote === '"') {
+      out += '"[REDACTED]"'
+    } else if (parsed.quote === "'") {
+      out += "'[REDACTED]'"
+    } else {
+      out += '[REDACTED]'
+    }
+    cursor = parsed.end
+    pattern.lastIndex = parsed.end
+  }
+  return out + text.slice(cursor)
+}
+
+/**
+ * 敏感键赋值的取值与替换（线性扫描，见规则 4 的说明）。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function redactAssignedValues(text) {
+  const pattern = /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)/gi
+  let out = ''
+  let cursor = 0
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const prefix = match[0]
+    const valueStart = match.index + prefix.length
+    const parsed = parseAssignedValue(text, valueStart)
+    if (parsed === null) continue
+    out += text.slice(cursor, match.index) + prefix
+    if (parsed.keep) {
+      out += text.slice(valueStart, parsed.end)
+    } else {
+      out += '"[REDACTED]"'
+    }
+    cursor = parsed.end
+    // 从值后面继续：值内部即使再出现 `password=` 也不重复处理（保持一次替换的语义）。
+    pattern.lastIndex = parsed.end
+  }
+  return out + text.slice(cursor)
+}
+
+/**
+ * 解析一个敏感键后面的值，返回值的结束位置与「是否可以原样保留」。
+ *
+ * 带引号时允许跨行、TAB、反斜杠转义；没有收尾引号就把剩余文本都算作值（安全方向）。
+ *
+ * @param {string} text
+ * @param {number} start
+ * @returns {null | {end: number, keep: boolean}}
+ */
+function parseAssignedValue(text, start) {
+  if (start >= text.length) return null
+  const first = text[start]
+  if (first === '"' || first === "'") {
+    let index = start + 1
+    let escaped = false
+    let closed = false
+    while (index < text.length) {
+      const char = text[index]
+      if (escaped) {
+        escaped = false
+        index += 1
+        continue
+      }
+      if (char === '\\') {
+        escaped = true
+        index += 1
+        continue
+      }
+      index += 1
+      if (char === first) {
+        closed = true
+        break
+      }
+    }
+    const inner = closed ? text.slice(start + 1, index - 1) : text.slice(start + 1)
+    return { end: index, keep: isFullyRedactedValue(inner) || isAuthSchemeWord(inner), quote: first }
+  }
+  let index = start
+  while (index < text.length) {
+    const code = text.charCodeAt(index)
+    if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c || code === 0x0d) break
+    const char = text[index]
+    if (char === ',' || char === ';' || char === '&' || char === '}' || char === '；' || char === '，') break
+    index += 1
+  }
+  if (index === start) return null
+  const value = text.slice(start, index)
+  return { end: index, keep: isFullyRedactedValue(value) || isAuthSchemeWord(value), quote: null }
+}
+
+/**
+ * `Authorization: Bearer` / `Basic` / `Token` 这类「方案词」不是凭据本身，留给规则 1 处理。
+ *
+ * @param {string} value
+ * @returns {boolean}
+ */
+function isAuthSchemeWord(value) {
+  return /^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))
 }
 
 /** 递归脱敏的内部实现：`seen` 只在当前路径上标记，离开时删除（共享引用不算环）。 */

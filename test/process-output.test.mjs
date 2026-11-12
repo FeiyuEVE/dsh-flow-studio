@@ -479,3 +479,30 @@ await check('redactText：分段边界不能把引号内的敏感值切开（0.1
   const looseOut = redactText(loose)
   A.ok(!looseOut.includes('hunter2'), '跨边界的裸值也必须被抹掉')
 })
+
+await check('redactText：敏感值扫描器覆盖多行 / 转义 / 引号嵌套 / 标志位（0.14.10 复审 6 变体）', () => {
+  const P = 'A'.repeat(262_089) + '1 '
+  const G = 'ghp_' + 'A'.repeat(36)
+  const variants = [
+    `${P}password="${G};\nhunter2"`, // 闭合但值内含换行
+    `${P}password="${G}; it's hunter2`, // 未闭合双引号，内含单引号
+    `${P}token='${G}; say "hunter2`, // 未闭合单引号，内含双引号
+    `${P}password="${G}; say \\"; hunter2"`, // 值内含转义引号
+    `${P}password="${G};\nhunter2`, // 未闭合且跨行
+    `${P}password="${G};\thunter2"`, // 值内含 TAB
+  ]
+  for (const raw of variants) {
+    const out = redactText(raw)
+    A.ok(!out.includes('hunter2'), `不得泄漏（实际尾部 ${JSON.stringify(out.slice(-40))}）`)
+  }
+  // 标志位（--token / --api-key）同样走扫描器：引号内跨行 / 转义 / 未闭合都不能漏。
+  for (const raw of [
+    `${P}--token "${G};\nhunter2"`,
+    `${P}--token='${G}; say "hunter2`,
+    `${P}--api-key "${G}; say \\"; hunter2"`,
+  ]) {
+    A.ok(!redactText(raw).includes('hunter2'), '标志位的引号值同样不得泄漏')
+  }
+  // 正常闭合的单引号值仍整值替换（保持既有输出形态）。
+  A.equal(redactText("token='secret-value-42'"), 'token="[REDACTED]"')
+})

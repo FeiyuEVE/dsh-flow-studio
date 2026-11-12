@@ -32,7 +32,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createFinishGate } from '../src/node-finish.js'
-import { createCodexAdapter, CODEX_ADAPTER_ID } from '../src/agent-adapter-codex.js'
+import {
+  CODEX_ADAPTER_ID, CODEX_ARGV_TOO_LARGE, CODEX_ARGV_TOO_LARGE_HINT, createCodexAdapter,
+} from '../src/agent-adapter-codex.js'
 import { ADAPTER_ERROR, assertFinishToolNative, validateAdapter } from '../src/agent-adapter.js'
 import { readAdapterUsageCalls } from '../src/agent-telemetry.js'
 import { admitAdapter } from '../src/agent-execute.js'
@@ -1582,7 +1584,7 @@ async function main() {
       await adapter.dispose(handle)
     })
 
-    await check('M4 残余：同步 spawn E2BIG → TOOL_UNAVAILABLE + cleanup，目录/channel/listener 不残留', async () => {
+    await check('C1：同步 spawn E2BIG → 命名错误 CODEX_ARGV_TOO_LARGE + 可操作 hint + cleanup 不残留', async () => {
       resetState()
       const workspace = freshWorkspace('e2big')
       const adapter = makeAdapter()
@@ -1601,15 +1603,56 @@ async function main() {
         failure = error
       }
       A.ok(failure, '参数超限必须失败而不是只留下资源')
-      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
-      A.equal(failure.details.reason, 'spawn-failed')
+      // C1：E2BIG 不是「工具通道不可用」，必须有自己的命名错误码（基线：通用 TOOL_UNAVAILABLE）。
+      A.equal(failure.code, CODEX_ARGV_TOO_LARGE)
+      A.equal(failure.name, 'CodexAdapterError')
+      A.equal(failure.details.reason, 'argv-too-large')
       A.equal(failure.details.cause, 'E2BIG', '同步 spawn 的 E2BIG 必须保留为 cause')
+      A.equal(typeof failure.details.hint, 'string')
+      A.equal(failure.details.hint, CODEX_ARGV_TOO_LARGE_HINT, 'hint 与导出的常量同一份说法')
+      A.match(failure.details.hint, /提示词|环境变量/, 'hint 必须点名过大的来源')
+      A.match(failure.details.hint, /文档|文件/, 'hint 必须给出可操作出口（改用文件 / 文档）')
+      A.match(failure.details.hint, /Windows/, 'hint / 注释要交代 Windows 同义错误（未实测需写明）')
+      A.match(failure.details.hint, /未.*实测|未实测/, 'Windows 分支未实测必须如实标注')
+      A.equal(failure.message.includes('CODEX_ARGV_TOO_LARGE') || failure.message.includes('参数超过系统上限'), true,
+        'message 要能直接看出是参数超限，不是通道不可用')
       A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir（基线：目录留在 tmpRoot）')
       A.ok(failure.cleanup && typeof failure.cleanup === 'object', '失败错误带物理清理信号')
       A.equal(failure.cleanup.disposed, true, 'cleanup 必须如实报告已释放（基线：无 cleanup）')
       A.equal((await failure.cleanupFinal).disposed, true)
       A.equal(gate.settled(), true, '启动失败必须 abort gate（基线：gate 未中止）')
       A.equal(invocations().length, 0, '同步 spawn 失败 → 零派发')
+    })
+
+    await check('C1 不回归：普通 spawn 失败（ENOENT）仍是 NODE_FINISH_TOOL_UNAVAILABLE', async () => {
+      resetState()
+      const workspace = freshWorkspace('spawn-enoent-c1')
+      const adapter = makeAdapter({
+        codexBin: join(sandbox, 'no-such-codex-c1'),
+        env: {},
+        helloTimeoutMs: 10_000,
+      })
+      const gate = makeGate(workspace)
+      const started = Date.now()
+      let failure = null
+      try {
+        await adapter.start({
+          element: { id: 'agent-1', name: 'ENOENT 节点' },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'ENOENT 必须失败')
+      // 只有参数超限才用新码：CLI 缺失 / 环境问题仍走「工具通道不可用」。
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.notEqual(failure.code, 'CODEX_ARGV_TOO_LARGE')
+      A.equal(failure.details.reason, 'spawn-failed')
+      A.equal(failure.details.cause, 'ENOENT')
+      A.ok(Date.now() - started < 5_000, 'ENOENT 不能等满 helloTimeoutMs')
+      A.equal(invocations().length, 0, 'spawn 失败零派发')
     })
 
     await check('M6 残余 b：闸门已受理后的迟到 cancel 不能覆盖成功结果', async () => {

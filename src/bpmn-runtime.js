@@ -1569,7 +1569,26 @@ class BpmnRuntime {
   async _finishCreateInstance(instance, workspaceOption, resolvedWorkspace) {
     let workspaceRecord = null
     if (workspaceOption !== null) {
-      const prepared = await this._prepareInstanceWorkspace(instance.id, workspaceOption, resolvedWorkspace)
+      // C2：准备函数「返回 error」和「抛异常」必须同一条收口——实例已建出来，
+      // 还没启动；只把返回错误收成 CANCELED 的话，异常路径会留下 ACTIVE 空壳。
+      // 作用域仅限这一段准备调用：首次启动 / 定义不可执行等其它异常仍按原逻辑处理。
+      let prepared
+      try {
+        prepared = await this._prepareInstanceWorkspace(instance.id, workspaceOption, resolvedWorkspace)
+      } catch (error) {
+        const failure = workspaceErrorObject(error)
+        await this._abortUnstartedInstance(instance.id, failure)
+        return {
+          status: failure.status,
+          body: {
+            ok: false,
+            id: instance.id,
+            definitionId: instance.definitionId,
+            code: failure.code,
+            error: failure.message,
+          },
+        }
+      }
       if (prepared.error !== null) {
         // 工作区建立失败：实例尚未启动，收成 CANCELED 并保留 lastError，避免 ACTIVE 卡死。
         await this._abortUnstartedInstance(instance.id, prepared.error)

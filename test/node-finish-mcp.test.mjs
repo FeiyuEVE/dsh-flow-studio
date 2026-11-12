@@ -22,7 +22,7 @@ import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve, sep } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -345,10 +345,15 @@ async function main() {
     const previous = process.env.FLOW_STUDIO_TMP
     try {
       delete process.env.FLOW_STUDIO_TMP
-      A.equal(defaultTmpRoot().startsWith(repoRoot + sep), false, '默认根不能落在插件安装目录 / 仓库目录')
-      A.equal(defaultTmpRoot(), resolve(join(tmpdir(), 'flow-studio')), '无环境变量时用 os.tmpdir()/flow-studio')
-      // 用一个**短**根：Unix socket 路径有 108 字节上限，长中文仓库路径会 EINVAL。
-      const customRoot = mkdtempSync(join(tmpdir(), 'fs-mcp-tmp-'))
+      // C3：TMPDIR 指向仓库下的临时子目录（本项目约定的 .tmp/）是合法配置，不能假红。
+      // 真正要拦的回归是「默认根退化成仓库根 / 插件安装目录（两者在本仓库同路径）」。
+      const defaultRoot = resolve(defaultTmpRoot())
+      A.notEqual(defaultRoot, repoRoot, '默认根不能恰好是仓库根 / 插件安装目录')
+      A.equal(defaultRoot, resolve(join(tmpdir(), 'flow-studio')), '无环境变量时用 os.tmpdir()/flow-studio')
+      // 用一个**短**根：Unix socket 路径有 108 字节上限（含结尾 NUL），深层 worktree
+      // 下 TMPDIR 本身就可能接近上限。前缀压到最短，保证 `<root>/fs-bridge-*/finish.sock`
+      // 仍能 listen；长中文仓库路径 + 长前缀会直接 EINVAL。
+      const customRoot = mkdtempSync(join(tmpdir(), 't-'))
       try {
         process.env.FLOW_STUDIO_TMP = customRoot
         A.equal(defaultTmpRoot(), resolve(customRoot), 'FLOW_STUDIO_TMP 覆盖默认根')
@@ -380,7 +385,7 @@ async function main() {
       '',
     ].join('\n'))
     process.env.HOST_SECRET_SENTINEL = `sentinel-${Math.random().toString(16).slice(2)}`
-    const shortRoot = mkdtempSync(join(tmpdir(), 'fs-mcp-env-'))
+    const shortRoot = mkdtempSync(join(tmpdir(), 'e-'))
     try {
       const result = await verifyFinishBridge({
         tmpRoot: shortRoot,
@@ -404,7 +409,7 @@ async function main() {
   await check('m9：verifyFinishBridge 对挂住的 MCP server 有超时（不挂死调用方）', async () => {
     const hangServer = join(sandbox, 'hang-mcp-server.mjs')
     writeFileSync(hangServer, 'setInterval(() => {}, 1000)\n')
-    const shortRoot = mkdtempSync(join(tmpdir(), 'fs-mcp-hang-'))
+    const shortRoot = mkdtempSync(join(tmpdir(), 'h-'))
     try {
       const started = Date.now()
       const result = await verifyFinishBridge({ tmpRoot: shortRoot, serverPath: hangServer, timeoutMs: 800 })

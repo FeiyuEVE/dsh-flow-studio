@@ -93,6 +93,33 @@ function positiveIntOr(value, fallback) {
 /** 敏感标志位规则实例（`replace` 会重置 `lastIndex`，模块内串行调用安全）。 */
 const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
 
+/**
+ * 「值**整体**已是脱敏产物」的形态：可选的已知前缀 + `[REDACTED]`，此外什么都不许有。
+ *
+ * MAJOR-2（0.14.8）：旧实现只看 `value.includes('[REDACTED]')`，于是部分脱敏的值
+ * （`ghp_[REDACTED];hunter2`）也被当成「已脱敏」整值放行，标记之后的残余秘密泄漏。
+ * 前缀上限 24 字符覆盖既有产物（`github_pat_` / `glpat-` / `xoxb-` / `AIza` / `sk-` 等）。
+ */
+const FULLY_REDACTED_PATTERN = /^[A-Za-z0-9_-]{0,24}\[REDACTED\]$/
+
+/**
+ * 判断一个值（可能带外层单 / 双引号）是否**完整**的脱敏产物。
+ *
+ * 只放行 `[REDACTED]` / `ghp_[REDACTED]` 这类完整形态；标记前后还有任何其它字符
+ * 都算「部分脱敏」，调用方必须按敏感值整值处理。
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isFullyRedactedValue(value) {
+  let text = String(value)
+  const quote = text[0]
+  if ((quote === '"' || quote === "'") && text.length >= 2 && text.endsWith(quote)) {
+    text = text.slice(1, -1)
+  }
+  return FULLY_REDACTED_PATTERN.test(text)
+}
+
 export function redactText(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '')
   // 0) 显式凭据形态（0.14.7）。这类规则必须先于通用规则执行，否则会被规则 5 的
@@ -137,10 +164,12 @@ export function redactText(raw) {
   //    的 key:value 规则——那条只把 `Basic` 当值抹掉，真正的 base64 凭据反而原样留下，
   //    还把外层字符串改坏。现在与 host-check.redactSensitiveText 同口径。
   //    规则 0 已把凭据换成 `ghp_[REDACTED]` 这类带前缀的标记；这里把标记形态纳入
-  //    候选并原样放行，否则只吃掉 `ghp_`、把之前保留的前缀二次抹掉。
+  //    候选并放行，否则只吃掉 `ghp_`、把之前保留的前缀二次抹掉。引号形态允许标记
+  //    之后还有残余字符（`"ghp_[REDACTED];hunter2"`），这样「部分脱敏」能被整值
+  //    覆盖，而不是只匹配到标记、把残余秘密留在引号里。
   text = text.replace(
-    /\b(Bearer|Basic|Token)\s+((?:"[A-Za-z0-9._~+/=-]*\[REDACTED\]"|'[A-Za-z0-9._~+/=-]*\[REDACTED\]'|[A-Za-z0-9._~+/=-]*\[REDACTED\]|"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,}))/gi,
-    (match, scheme, credential) => (credential.includes('[REDACTED]') ? match : `${scheme} [REDACTED]`),
+    /\b(Bearer|Basic|Token)\s+((?:"[A-Za-z0-9._~+/=-]*\[REDACTED\][^"]*"|'[A-Za-z0-9._~+/=-]*\[REDACTED\][^']*'|[A-Za-z0-9._~+/=-]*\[REDACTED\]|"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,}))/gi,
+    (match, scheme, credential) => (isFullyRedactedValue(credential) ? match : `${scheme} [REDACTED]`),
   )
   // 2) 敏感标志位：`--token <值>` / `--api-key=<值>` 等空格或等号分隔形态
   //    （N3 接线）。参数名必须完整（名字后只接受空白或 `=`），所以 `--token-file` /
@@ -160,8 +189,9 @@ export function redactText(raw) {
     (match, prefix, value) => {
       if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
       // 规则 0 产出的带前缀标记（`ghp_[REDACTED]`、`glpat-[REDACTED]`）原样放行，
-      // 避免 key=value 规则把前缀二次抹掉，也保证整体幂等。
-      if (String(value).includes('[REDACTED]')) return match
+      // 避免 key=value 规则把前缀二次抹掉，也保证整体幂等。只放行**整体**脱敏的
+      // 形态：标记之后还有残余字符（部分脱敏）必须继续按敏感值整值处理（MAJOR-2）。
+      if (isFullyRedactedValue(value)) return match
       return `${prefix}"[REDACTED]"`
     },
   )

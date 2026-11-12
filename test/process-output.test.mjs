@@ -118,6 +118,52 @@ await check('N9：Authorization 的 Basic / Token 方案与 Bearer 同口径脱�
   A.equal(redactText('Basic usage'), 'Basic [REDACTED]', '已知误伤：保持三处同口径，不为它收窄规则')
 })
 
+// MAJOR-2（0.14.8）：旧实现用 `value.includes('[REDACTED]')` 判断「这个值已经脱敏」，
+// 于是**部分脱敏**（标记前后还有其它字符）的值被整值放行。最直接的泄漏形态是
+// `password="ghp_<36位>;hunter2"`：规则 0 先产出 `ghp_[REDACTED]`，key=value 规则
+// 看到值里含标记就原样返回，引号内 `;hunter2` 留在输出里。
+// 正确判据是「值（去掉外层引号后）**整体**就是脱敏产物」，否则一律按敏感值处理。
+await check('redactText：部分脱敏不整值放行，标记后的残余秘密必须抹掉（MAJOR-2）', () => {
+  const cases = [
+    // 复审给出的最小复现。
+    [`password="ghp_${'A'.repeat(36)};hunter2"`, 'password="[REDACTED]"', 'hunter2'],
+    // 已经是「部分脱敏」的文本（不依赖规则 0 的产物）也必须整值抹掉。
+    ['password=ghp_[REDACTED]hunter2', 'password="[REDACTED]"', 'hunter2'],
+    // 其它前缀在同一路径上：glpat / sk- / 引号形态。
+    [`token='glpat-${'aB3dE5fG7hI9jK1lM3nO'};hunter2'`, 'token="[REDACTED]"', 'hunter2'],
+    [`api_key="sk-${'aB3dE5fG7hI9jK1lM3nO5pQ7'};hunter2"`, 'api_key="[REDACTED]"', 'hunter2'],
+    // 规则 1（Bearer）：引号内的部分脱敏同样不能整值放行。
+    [`Authorization: Bearer "ghp_${'A'.repeat(36)};hunter2"`, 'Authorization: Bearer [REDACTED]', 'hunter2'],
+  ]
+  for (const [raw, expected, secret] of cases) {
+    const out = redactText(raw)
+    A.ok(!out.includes(secret), `标记后的残余秘密必须抹掉（实际 ${out}）`)
+    A.equal(out, expected, `部分脱敏必须整值替换：${out}`)
+    A.equal(redactText(out), out, `整值替换后必须保持幂等（实际 ${out}）`)
+  }
+})
+
+// 「完整已脱敏」必须原样放行：否则二次脱敏会把规则 0 保留的可识别前缀二次抹掉。
+await check('redactText：完整已脱敏形态原样放行，连接串不受新判据影响', () => {
+  const preserved = [
+    'password="[REDACTED]"',
+    "token='glpat-[REDACTED]'",
+    'api_key=sk-[REDACTED]',
+    'AWS_SECRET_ACCESS_KEY="[REDACTED]"',
+    'Authorization: Bearer ghp_[REDACTED]',
+    'Authorization: Bearer "github_pat_[REDACTED]"',
+    'x-api-key: AIza[REDACTED]',
+  ]
+  for (const raw of preserved) {
+    A.equal(redactText(raw), raw, `完整已脱敏形态不得被二次处理：${raw}`)
+  }
+  // 连接串走独立规则（`scheme://[REDACTED]@host`），不属于 key=value 的值，保持原样。
+  const conn = 'postgres://user:hunter2@db.internal:5432/app'
+  const out = redactText(conn)
+  A.equal(out, 'postgres://[REDACTED]@db.internal:5432/app', '连接串只抹 user:pass')
+  A.equal(redactText(out), out, '连接串脱敏后必须幂等')
+})
+
 await check('redactText：AWS Access Key / secret access key 脱敏并保留前缀', () => {
   const access = expectRedacted('credential AKIAIOSFODNN7EXAMPLE used', {
     secrets: ['IOSFODNN7EXAMPLE'],

@@ -21,6 +21,7 @@ import test from 'node:test'
 import {
   attachProcessStreams,
   createUtf8LineReader,
+  DEFAULT_INITIAL_LINE_BUFFER_BYTES,
   DEFAULT_MAX_LINE_BYTES,
 } from '../src/agent-cli-stream.js'
 
@@ -65,8 +66,9 @@ function isAlive(pid) {
   }
 }
 
-test('默认行长上限是 8 MiB', () => {
-  assert.equal(DEFAULT_MAX_LINE_BYTES, 8 * 1024 * 1024)
+test('默认行长上限是 32 MiB，初始行缓冲至少 1 MiB', () => {
+  assert.equal(DEFAULT_MAX_LINE_BYTES, 32 * 1024 * 1024)
+  assert.ok(DEFAULT_INITIAL_LINE_BUFFER_BYTES >= 1024 * 1024)
 })
 
 test('UTF-8 多字节字符逐字节 write 仍完整交付；旧 Buffer 拼接会乱码（对照）', () => {
@@ -127,6 +129,27 @@ test('600 KiB 合法单行：整块写入与 32 KiB 分块写入都完整交付'
   }
 })
 
+test('小上限下：小于上限的长行完整读回，初始缓冲可被覆盖', () => {
+  const line = JSON.stringify({ payload: 'x'.repeat(300), n: 1 })
+  assert.ok(Buffer.byteLength(line) > 256, '夹具必须明显长于常见 chunk')
+  for (const options of [
+    { maxLineBytes: 512 },
+    { maxLineBytes: 512, initialLineBufferBytes: 16 },
+  ]) {
+    const { reader, lines, diagnostics } = makeReader(options)
+    // 分块写入，确保跨多次 append、需要增长缓冲。
+    for (let offset = 0; offset < line.length; offset += 64) {
+      reader.write(line.slice(offset, offset + 64))
+    }
+    reader.write('\n')
+    reader.end()
+
+    assert.equal(lines.length, 1)
+    assert.equal(lines[0].line, line, '小于上限的长行必须完整读回')
+    assert.equal(diagnostics.length, 0, '合法行不得产生诊断')
+  }
+})
+
 test('超长行整行丢弃、只记一条诊断，后续行不受污染', () => {
   const { reader, lines, diagnostics } = makeReader({ maxLineBytes: 1024 })
   const overlong = 'a'.repeat(2000)
@@ -144,6 +167,24 @@ test('超长行整行丢弃、只记一条诊断，后续行不受污染', () =>
   assert.ok(!lines.some(entry => entry.line.includes('aaaa')), '超长行后半段不得作为 JSON 行交付')
 })
 
+test('超长行丢弃后读取器继续：连续多个超长行之后仍能读后续行', () => {
+  const { reader, lines, diagnostics } = makeReader({ maxLineBytes: 64 })
+  reader.write('a'.repeat(40))
+  reader.write('a'.repeat(40)) // 跨 write 累计到 80 > 64
+  reader.write('\n{"after":1}\n')
+  reader.write(`${'b'.repeat(200)}\n`)
+  reader.write('{"after":2}\n')
+  reader.end()
+
+  assert.deepEqual(lines.map(entry => entry.line), ['{"after":1}', '{"after":2}'])
+  assert.deepEqual(
+    diagnostics.map(diag => [diag.kind, diag.lineNo, diag.bytes]),
+    [['line-too-long', 1, 80], ['line-too-long', 3, 200]],
+    '每条超长行各记一条诊断，行号与字节数准确',
+  )
+  assert.equal(reader.stats().droppedLines, 2)
+})
+
 test('BOM 剥离、CRLF 归一、空行 / 纯空白行跳过', () => {
   const { reader, lines, diagnostics } = makeReader()
   reader.write(Buffer.from('\uFEFF{"a":1}\r\n\r\n   \r\n{"b":2}\r\n', 'utf8'))
@@ -152,6 +193,14 @@ test('BOM 剥离、CRLF 归一、空行 / 纯空白行跳过', () => {
   assert.deepEqual(lines.map(entry => entry.line), ['{"a":1}', '{"b":2}'])
   assert.equal(lines[1].meta.lineNo, 4, 'lineNo 是物理行号，跳过的空行也占行号')
   assert.equal(diagnostics.length, 0)
+  assert.ok(lines.every(entry => !entry.line.includes('\r')), 'CRLF 的 \\r 必须剥掉')
+
+  // EOF flush 路径同样要剥 CRLF 的 \r（最后一行没有尾换行）。
+  const eof = makeReader()
+  eof.reader.write('{"c":3}\r\n{"d":4}\r')
+  eof.reader.end()
+  assert.deepEqual(eof.lines.map(entry => entry.line), ['{"c":3}', '{"d":4}'])
+  assert.ok(eof.lines.every(entry => !entry.line.includes('\r')), 'EOF flush 也不得带 \\r')
 })
 
 test('两个 reader 实例互不污染（初始进程 + resume 进程）', () => {
@@ -189,6 +238,33 @@ test('onLine 抛错转成诊断，流继续交付后续行', () => {
   assert.match(diagnostics[0].message, /handler failed/)
   assert.ok(!diagnostics[0].message.includes('sk-should-not-leak'), '诊断摘要必须脱敏')
   assert.ok(diagnostics[0].message.length <= 256)
+})
+
+test('诊断摘要剥掉 C0 控制字符（保留 \\t / \\n），且不切断 UTF-8 多字节字符', () => {
+  const diagnostics = []
+  let call = 0
+  const reader = createUtf8LineReader({
+    onLine: () => {
+      call += 1
+      if (call === 1) throw new Error('bad\u0000\u0007\u001b\tline\nend')
+      // 255 个 ASCII + 一个 emoji（代理对）+ 1 个字符：按码元截断会留下半个 emoji。
+      throw new Error(`${'x'.repeat(255)}😀y`)
+    },
+    onDiagnostic: diag => diagnostics.push(diag),
+  })
+  reader.write('boom\nalso\n')
+  reader.end()
+
+  assert.equal(diagnostics.length, 2)
+  const [controls, astral] = diagnostics.map(diag => diag.message)
+  assert.equal(controls, 'bad\tline\nend', 'C0 控制字符剥掉，\\t 与 \\n 保留')
+  assert.ok(!/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(controls))
+
+  assert.ok([...astral].length <= 256, '摘要按码点有界')
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(astral), '不得留下孤立高代理')
+  assert.ok(!/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(astral), '不得留下孤立低代理')
+  assert.equal(Buffer.from(astral, 'utf8').toString('utf8'), astral, '诊断串必须能原样编码回 UTF-8')
+  assert.ok(!astral.includes('\uFFFD'), '不得出现替换字符（半个多字节字符）')
 })
 
 test('诊断有界：超过上限后只计数不再保留', () => {

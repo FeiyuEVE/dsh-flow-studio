@@ -35,8 +35,23 @@ import { StringDecoder } from 'node:string_decoder'
 
 import { redactText } from './process-output.js'
 
-/** 单行默认字节上限：8 MiB。 */
-export const DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
+/**
+ * 单行默认字节上限：32 MiB。
+ *
+ * Codex 长线程 / resume 时，单条 JSON 记录（含完整历史 / 大工具输出）会超过 8 MiB；
+ * 8 MiB 会把合法事件整行丢掉，因此按社区常见的 32 MiB 口径放宽。
+ * 测试可用小值覆盖：`createUtf8LineReader({ maxLineBytes })`。
+ */
+export const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024
+
+/**
+ * 行缓冲的初始容量：1 MiB。
+ *
+ * 常规协议事件在同一个缓冲里追加，避免每个 chunk 都重新分配 / Buffer.concat；
+ * 超过初始容量时按几何增长（上限仍是 `maxLineBytes`），行交付后回落到初始容量，
+ * 不让偶发的大行长期占着内存。测试可用 `initialLineBufferBytes` 覆盖。
+ */
+export const DEFAULT_INITIAL_LINE_BUFFER_BYTES = 1024 * 1024
 
 /** 保留的诊断条数上限。 */
 const DEFAULT_MAX_DIAGNOSTICS = 200
@@ -61,10 +76,67 @@ function nonNegativeIntOr(value, fallback) {
   return Number.isSafeInteger(value) && value >= 0 ? value : fallback
 }
 
-/** 脱敏 + 截断，诊断里只允许出现这个摘要。 */
+/**
+ * C0 控制字符（保留 `\t` 与 `\n`）。
+ *
+ * 诊断串来自子进程 / 任意错误对象，可能带 NUL、BEL、ESC 等控制字节；原样写进日志
+ * 会污染终端、也会让结构化输出的阅读者（人 / 模型）看到乱码。只剥 C0，不碰普通文本。
+ */
+const C0_CONTROL_PATTERN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g
+
+/**
+ * 去掉孤立代理项。
+ *
+ * JS 字符串按 UTF-16 码元存储；`String.prototype.slice` 可能把 emoji 的代理对切成
+ * 一半，编码成 UTF-8 时变成 U+FFFD（半个多字节字符）。诊断摘要必须保证 UTF-8 合法，
+ * 因此先清掉落单的代理项。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripLoneSurrogates(text) {
+  let out = ''
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += text[index] + text[index + 1]
+        index += 1
+      }
+      // 孤立高代理：丢弃。
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      // 孤立低代理：丢弃。
+    } else {
+      out += text[index]
+    }
+  }
+  return out
+}
+
+/**
+ * 按**码点**截断（不按码元），保证不切断代理对。
+ *
+ * @param {string} text
+ * @param {number} maxCodePoints
+ * @returns {string}
+ */
+function truncateCodePoints(text, maxCodePoints) {
+  let out = ''
+  let count = 0
+  for (const char of text) {
+    if (count >= maxCodePoints) break
+    out += char
+    count += 1
+  }
+  return out
+}
+
+/** 脱敏 + 清洗控制字符 + 按码点截断，诊断里只允许出现这个摘要。 */
 function sanitizeSummary(value) {
   const text = value === undefined || value === null ? '' : String(value)
-  return redactText(text).slice(0, DIAGNOSTIC_SUMMARY_MAX)
+  const cleaned = stripLoneSurrogates(text.replace(C0_CONTROL_PATTERN, ''))
+  return truncateCodePoints(redactText(cleaned), DIAGNOSTIC_SUMMARY_MAX)
 }
 
 /** 按**字节**上限裁剪字符串尾部，且不切断代理对 / 多字节字符。 */
@@ -102,7 +174,8 @@ function toBuffer(input) {
  * UTF-8 安全、按行分帧、EOF flush、有界诊断的流读取器。
  *
  * @param {object} [options]
- * @param {number} [options.maxLineBytes=8388608] 单行原始字节上限；超限整行丢弃。
+ * @param {number} [options.maxLineBytes=33554432] 单行原始字节上限；超限整行丢弃。
+ * @param {number} [options.initialLineBufferBytes=1048576] 行缓冲初始容量（按需增长）。
  * @param {number} [options.maxDiagnostics=200] 保留的诊断条数上限（超出只计数）。
  * @param {(line: string, meta: { lineNo: number, bytes: number }) => void} [options.onLine]
  *   每交付一行调用一次；`lineNo` 是物理行号（空行也占号），`bytes` 是原始字节数。
@@ -123,8 +196,14 @@ export function createUtf8LineReader(options = {}) {
 
   const decoder = new StringDecoder('utf8')
 
-  // 当前行（尚未遇到换行）的原始字节片段。
-  let lineChunks = []
+  // 行缓冲：单块可增长 Buffer，初始容量取 min(选项, maxLineBytes)。常规事件在同一块里
+  // 追加，避免每个 chunk 一次 realloc；只有超长行才需要增长。
+  const initialLineBufferBytes = Math.min(
+    positiveIntOr(options.initialLineBufferBytes, DEFAULT_INITIAL_LINE_BUFFER_BYTES),
+    maxLineBytes,
+  )
+  const EMPTY_BUFFER = Buffer.alloc(0)
+  let lineBuffer = null // 容量 >= lineBytes；行交付后可能保留以便复用
   let lineBytes = 0 // 当前行已累计的原始字节数（不含换行）
   let lineNo = 0 // 已结束的物理行数；当前行号 = lineNo + 1
   let overlong = false // 当前行已超限，正在丢弃直到下一个换行
@@ -162,11 +241,12 @@ export function createUtf8LineReader(options = {}) {
   }
 
   function resetLine() {
-    lineChunks = []
     lineBytes = 0
     overlong = false
     overlongBytes = 0
     stats.pendingBytes = 0
+    // 偶发大行把容量撑大后回收，避免长进程长期占着几十 MiB。
+    if (lineBuffer !== null && lineBuffer.length > initialLineBufferBytes) lineBuffer = null
   }
 
   function dropOverlongLine() {
@@ -201,6 +281,11 @@ export function createUtf8LineReader(options = {}) {
     deliverLine(text, bytes)
   }
 
+  /** 当前行已累计字节的只读视图（空行返回共享空 Buffer）。 */
+  function currentLineBuffer() {
+    return lineBytes === 0 ? EMPTY_BUFFER : lineBuffer.subarray(0, lineBytes)
+  }
+
   function pushSegment(segment) {
     if (segment.length === 0) return
     if (overlong) {
@@ -208,17 +293,26 @@ export function createUtf8LineReader(options = {}) {
       stats.pendingBytes = overlongBytes
       return
     }
-    lineBytes += segment.length
-    if (lineBytes > maxLineBytes) {
-      // 超限：丢掉已累计片段，后续字节只计数、不再进入行缓冲。
+    const needed = lineBytes + segment.length
+    if (needed > maxLineBytes) {
+      // 超限：丢掉已累计片段，后续字节只计数、不再进入行缓冲；下一个换行后恢复。
       overlong = true
-      overlongBytes = lineBytes
-      lineChunks = []
+      overlongBytes = needed
       lineBytes = 0
+      lineBuffer = null
       stats.pendingBytes = overlongBytes
       return
     }
-    lineChunks.push(Buffer.from(segment))
+    if (lineBuffer === null) lineBuffer = Buffer.allocUnsafe(initialLineBufferBytes)
+    if (needed > lineBuffer.length) {
+      // 几何增长，但不超过 maxLineBytes；needed 必然 <= maxLineBytes。
+      const grown = Math.min(maxLineBytes, Math.max(needed, lineBuffer.length * 2))
+      const next = Buffer.allocUnsafe(grown)
+      lineBuffer.copy(next, 0, 0, lineBytes)
+      lineBuffer = next
+    }
+    segment.copy(lineBuffer, lineBytes)
+    lineBytes = needed
     stats.pendingBytes = lineBytes
   }
 
@@ -230,10 +324,7 @@ export function createUtf8LineReader(options = {}) {
       if (overlong) {
         dropOverlongLine()
       } else {
-        const raw = lineChunks.length === 1
-          ? lineChunks[0]
-          : Buffer.concat(lineChunks, lineBytes)
-        finishLine(raw)
+        finishLine(currentLineBuffer())
       }
       start = index + 1
     }
@@ -257,10 +348,8 @@ export function createUtf8LineReader(options = {}) {
       ended = true
       if (overlong) {
         dropOverlongLine()
-      } else if (lineBytes > 0 || lineChunks.length > 0) {
-        const raw = lineChunks.length === 1
-          ? lineChunks[0]
-          : Buffer.concat(lineChunks, lineBytes)
+      } else if (lineBytes > 0) {
+        const raw = currentLineBuffer()
         let text = decoder.write(raw)
         text += decoder.end()
         if (text.endsWith('\r')) text = text.slice(0, -1)

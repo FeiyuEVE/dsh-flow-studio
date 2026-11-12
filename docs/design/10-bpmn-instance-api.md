@@ -270,6 +270,9 @@ runner 内部执行态（不对外当实例状态）：
 | `instance/resumed` | runtime（恢复路由） | `at, status:"ACTIVE", reason?` | 事件 + `status=ACTIVE`；同样是元数据先提交、正文随后追加（恢复不推进、不派发） |
 | `error` | runner | `at, elementId?, activityId?, error:{code,message,elementId?,activityId?}` | 事件 + 实例 `lastError`（**status 仍是 ACTIVE**） |
 | `agent/log` 等 | handler `events[]` | handler 自定义 | 原样透传（runner 禁止保留类型） |
+| `activity/output` | ACP adapter（handler `events[]` / `ctx.emit`） | `provider, text, messageId?, truncated?` | 仅事件；详细字段见 [§5.1](#51-acp-适配器事件) |
+| `tool/start` / `tool/update` / `tool/end` | ACP adapter（同上） | `provider, toolCallId, title?, toolKind?, status?, contentCount?, locationCount?, partial?, truncated?` | 仅事件；同一 `toolCallId` 的 start / end 各至多一次 |
+| `agent/permission` | ACP adapter（同上） | `provider, requestId, toolCallId?, decision, optionId?` | 仅事件；每次权限请求恰好一条 |
 
 落盘规则：
 
@@ -283,6 +286,22 @@ runner 内部执行态（不对外当实例状态）：
   `truncated:true`；仍超限则退化成只保留 `type/at/elementId/activityId` 的最小事件。
   事件流是观测面，不能因为 agent 输出大就让实例失败。
 - 0.13.0 **不写** `task/wait` 事件：人工任务等待就是 `activity/wait`，避免同一事实两条记录。
+
+### 5.1 ACP 适配器事件
+
+本节是 ACP 适配器三个业务事件 `type` 与字段的**唯一真相源**；适配器行为、probe、权限与清理见 [14 · ACP 适配器](14-acp-adapter.md)。这些事件都不是 runner 保留类型，由 handler 的 `events[]` / `ctx.emit` 原样透传；runner 补齐 `at` / `elementId` / `activityId`，adapter 保证单条 ≤4 KiB，store 的 8 KiB 上限仍适用。
+
+共同身份：`{ type, provider:'acp', sessionId?, invocationId? }`。`sessionId` 在 `session/new` 返回后出现；`invocationId` 与 `agent/invocation` 对齐（初始轮 `<executionId>:invoke-1`，第 N 次提醒续跑 `<executionId>:invoke-rN`）。
+
+| `type` | 字段 | 语义 |
+|---|---|---|
+| `activity/output` | `text`、`messageId?`、`truncated?` | agent 文本输出。只收 `agent_message_chunk` 的 `content.type:"text"`；整轮暂存、轮末 flush，按 UTF-8 切成 ≤2 KiB 的片段逐条发出；单 execution 原始文本预算 64 KiB，超额整轮丢弃并只发一条 `text:"…[truncated]"`、`truncated:true` |
+| `tool/start` | `toolCallId`、`title?`、`toolKind?`、`status?`、`contentCount?`、`locationCount?` | 第一次看到某个 `toolCallId` 的 `tool_call`。`toolKind` 只取 `read` / `edit` / `delete` / `move` / `search` / `execute` / `think` / `fetch` / `switch_mode` / `other` 之一；`status` 只取 `pending` / `in_progress` / `completed` / `failed` |
+| `tool/update` | 同上，另可带 `partial?` | 同一 `toolCallId` 的后续更新；`content` / `locations` 整体替换，只投影为 `contentCount` / `locationCount`，不保留正文；孤立 update（没有 start）标 `partial:true`，不伪造 start |
+| `tool/end` | 同上，另可带 `partial?` | `status` 首次变成 `completed` / `failed` 时发一次；每个 id 至多一次。每 turn 最多跟踪 256 个 id，溢出只记计数 |
+| `agent/permission` | `requestId`、`toolCallId?`、`decision`、`optionId?` | 权限请求的最终决策。`decision` 只取 `allow` / `deny` / `cancelled`；`optionId` 只在 `allow` / `deny` 时出现，原样回传选中的选项 id |
+
+可选字段为 `undefined` / `null` 时省略；`title` ≤256 字节，`toolKind` / 模式等短字符串 ≤64 字节，`sessionId` / `invocationId` / `toolCallId` / `messageId` / `optionId` ≤128 字节。非业务变体（thought、plan、config、commands、session-info、mode、usage、notice、compaction、未知 kind）不产生实例事件，只进 `handle.diagnostics().events` 的有界摘要；`_auth/status_update` 与所有 `_meta` 完全忽略。
 
 ## 6 环境变量与 health
 

@@ -1075,6 +1075,32 @@ runner 内部执行态不写进 `status`：`idle` / `running` / `waiting` 都映
 
 `src/instance-store.js` 还有一组**只对内部调用方**（生命周期路由 / 运行时）生效的约束码，HTTP 路由不会直接把它们抛给调用方：`INSTANCE_SUSPENDED_IMMUTABLE`（挂起期间用 `updateInstance` 写回 `ACTIVE`）、`INSTANCE_LIFECYCLE_USE_ROUTE`（用 `updateInstance` 把非挂起实例改成 `SUSPENDED`，状态迁移只走生命周期路由）、`INSTANCE_EXPECTED_STATUS_REQUIRED`（`appendInstanceEvents` 带 `status` 却没带 `expectedStatus`）、`INSTANCE_PATCH_INVALID`（`metaPatch` 只允许 `lastError` / `pendingTasks` / `executionFailure`）、`INSTANCE_EVENT_APPEND_FAILED`（元数据已提交、事件正文追加失败，带 `committed:true` / `eventLogPending:true` / `firstSeq` / `lastSeq` / `status` / `revision` / `eventLogError`）、`INSTANCE_METADATA_WRITE_FAILED`（元数据本身没写成，`committed:false`）。生命周期路由会把 CAS 冲突翻译成 409 `INSTANCE_LIFECYCLE_CONFLICT`、把 `committed:true` 翻译成 200 + `eventLogPending`；其余照常抛。`src/instance-owner.js` 的 `INSTANCE_OWNED_ELSEWHERE` / `INSTANCE_OWNER_UNKNOWN` 同样只在内部使用，runtime 把它们投影成上表的 `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_OWNER_UNKNOWN`。另外 `INSTANCE_NOT_ACTIVE`（409）只出现在挂起 / 首次启动的防御路径里：四个状态中 `SUSPENDED` 走 `INSTANCE_ALREADY_SUSPENDED`、终态走 `BPMN_INSTANCE_TERMINAL`，正常协议不会触发它。
 
+### ACP 适配器错误码
+
+以下码由 `src/acp-client.js` / `src/acp-policy.js` / `src/agent-adapter-acp.js` 产生，出现在 agent 节点的 `lastError.code`、`error` 事件、`handle.exited` 的 `outcome.code`，或启动失败的错误对象上；HTTP 路由不会直接返回它们。适配器的决策、生命周期与证据分层见 [14 · ACP 适配器](../design/14-acp-adapter.md)。
+
+| code | 触发 | 语义 / 去向 |
+|---|---|---|
+| `ACP_CONFIG_INVALID` | `FLOW_STUDIO_ACP_CONFIG` 非法 JSON、未知键、类型 / 值域错误 | 输入错误；`start` 直接拒绝，不包装成「工具不可用」，零派发。配置表在 [Host 接口 · ACP 适配器配置](host-api.md#acp-适配器配置) |
+| `ACP_MODE_UNAVAILABLE` | `session/new` 没有 `availableModes`、目标 mode 不在其中，或 `session/set_mode` 失败 | 不回退更宽的模式，零 prompt；`lastError` 保留该码 |
+| `ACP_AUTH_REQUIRED` | JSON-RPC `-32000` | agent 需要先登录 / 认证；零 prompt 或握手失败 |
+| `ACP_SESSION_NOT_FOUND` | JSON-RPC `-32002` | session 不存在；清理阶段 `session/close` 的失败只作诊断（`-32002` 视为已关闭） |
+| `ACP_PROTOCOL_ERROR` | 非法 JSON-RPC 外壳 / `-32700` / `-32600` / `-32601` / `-32602`、版本不是 v1、缺 `agentInfo` 或 `sessionId`、未知 `stopReason`、入站单行超过 32 MiB、连接已关闭 | 协议不可继续；部分场景关闭整条连接并让全部 pending 失败 |
+| `ACP_PROVIDER_ERROR` | 其它 RPC 错误（含 `-32603`）、`stopReason:"refusal"`、未分类异常 | agent / provider 侧终态错误；不消耗提醒预算 |
+| `ACP_LIMIT_REACHED` | `stopReason:"max_tokens"` / `"max_turn_requests"` | 本轮预算耗尽，节点没有完结；不重试、不提醒 |
+| `ACP_REQUEST_TIMEOUT` | 控制请求（initialize / new / set_mode / close）超过时限 | 超时即收口连接，全部 pending 统一失败；hello / discovery 等代理侧等待超时归 probe / start 的 `ADAPTER_PROBE_INVALID` / `NODE_FINISH_TOOL_UNAVAILABLE`，prompt 本身不设单请求超时 |
+| `ACP_PROCESS_EXITED` | stdio EOF、子进程异常退出 | 进程已不可用；清理结束并保留真实退出码 / signal（脱敏后） |
+| `NODE_FINISH_CANCELED` | JSON-RPC `-32800`、`stopReason:"cancelled"`、显式 `cancel()`、启动前已 abort、`dispose()` 强制收口 | 执行器把它映射成 `BPMN_ABORTED`，不原样进 `lastError`；已受理的成功结果优先 |
+| `ADAPTER_INVALID` | `start` 缺 `finishGate` / `workspaceRoot`、`cancel` / `dispose` 缺 handle 等 | 适配器调用形状错误；节点不派发 |
+| `ADAPTER_PROBE_INVALID` | probe 失败：配置不可用、桥自检失败、hello 超时、discovery 缺失、模式不可用、spawn 失败、socket 路径过长、预算耗尽 | `details.reason` 保留真实分类（`ACP_CONFIG_INVALID` / `config-invalid` / `bridge-failed` / `agent-mcp-not-contacted` / `agent-mcp-not-discovered` / `mode-unavailable` / `spawn-failed` / `socket-path-too-long` / `probe-timeout` / `agent-exited` / `handshake-failed` 等）；executor 的 admission 再包装成 `NODE_FINISH_TOOL_UNAVAILABLE` |
+| `NODE_FINISH_TOOL_UNAVAILABLE` | probe 未达到 `finishTool:'native'`、spawn 失败、finish MCP 未被 agent 拉起 / 未 discovery、socket 路径超限、工具握手前失败 | 节点零派发，不退回「猜文本」；`lastError` 保留该码 |
+| `NODE_FINISH_CHANNEL_FAILED` | finish channel 创建失败、凭据 / IPC 错误、`invoke('remind')` 失败 | 节点没有完结；不是模型侧错误 |
+| `NODE_FINISH_MISSING` | 提醒次数用尽（默认 3 次）仍未调用 `flow_finish_node` | 实例保持 `ACTIVE`，写 `lastError` 与 `error` 事件；不是适配器崩溃 |
+| `NODE_FINISH_ABORTED` | gate 被 abort 且拿不到更具体的原因 | 兜底完结失败码 |
+| `ACP_MESSAGE_DELIVERY_UNSUPPORTED` | 适配器 `deliverMessage()` 的固定返回 | `ok:false` / `unsupported:true` / `deliveryUnknown:true`；inbox 因 `capabilities().messages:'unsupported'` 在调用前就记 `MESSAGE_DELIVERY_UNSUPPORTED`，正常入站流程不会走到这个码 |
+
+`ADAPTER_PROBE_INVALID` 的 `details.reason` 是诊断分类，不是第二套对外错误码；调用方按 `code` 分支，不要把 `reason` 当稳定 API。活动 deadline 到点由执行器报 `BPMN_ACTIVITY_TIMEOUT`，不是在飞 prompt 报 `ACP_REQUEST_TIMEOUT`。
+
 ## 延伸阅读
 
 - 设计记录与阶段边界：[design/10 · BPMN 实例 API](../design/10-bpmn-instance-api.md)

@@ -190,17 +190,8 @@ async function connectMcpServers(servers) {
   }
 }
 
-/** 发请求给 client（权限等），返回 client 的响应。 */
-function sendClientRequest(method, params) {
-  const id = state.nextRequestId
-  state.nextRequestId += 1
-  return new Promise(resolveRequest => {
-    state.pendingAgentRequests.set(id, resolveRequest)
-    send({ jsonrpc: '2.0', id, method, params })
-  })
-}
-
-async function requestPermission(step) {
+/** 权限请求参数（步骤可覆盖选项 / toolCallId）。 */
+function permissionParams(step) {
   const options = Array.isArray(step.options) && step.options.length > 0
     ? step.options
     : [
@@ -208,7 +199,7 @@ async function requestPermission(step) {
       { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
       { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
     ]
-  const response = await sendClientRequest('session/request_permission', {
+  return {
     sessionId: state.sessionId,
     toolCall: {
       toolCallId: step.toolCallId || 'perm-tool-1',
@@ -217,12 +208,42 @@ async function requestPermission(step) {
       status: 'pending',
     },
     options,
+  }
+}
+
+/**
+ * 发请求给 client（权限等），返回 client 的响应。
+ *
+ * 显式传 `explicitId` 可复用同一个 JSON-RPC id（重复 id 探针）；
+ * 同一 id 的多个 waiter 按响应到达顺序逐个结算，便于分别观察每条应答。
+ */
+function sendClientRequest(method, params, explicitId) {
+  const id = explicitId === undefined ? state.nextRequestId : explicitId
+  if (explicitId === undefined) state.nextRequestId += 1
+  return new Promise(resolveRequest => {
+    const waiters = state.pendingAgentRequests.get(id)
+    if (Array.isArray(waiters)) waiters.push(resolveRequest)
+    else state.pendingAgentRequests.set(id, [resolveRequest])
+    send({ jsonrpc: '2.0', id, method, params })
   })
+}
+
+function outcomeOf(response) {
   const outcome = response && response.outcome ? response.outcome : {}
-  log('permission-response', {
-    requestId: state.nextRequestId - 1,
+  return {
     outcome: typeof outcome.outcome === 'string' ? outcome.outcome : 'unknown',
     optionId: typeof outcome.optionId === 'string' ? outcome.optionId : null,
+  }
+}
+
+async function requestPermission(step, explicitId) {
+  const id = explicitId === undefined ? state.nextRequestId : explicitId
+  const response = await sendClientRequest('session/request_permission', permissionParams(step), explicitId)
+  const outcome = outcomeOf(response)
+  log('permission-response', {
+    requestId: id,
+    outcome: outcome.outcome,
+    optionId: outcome.optionId,
   })
   return response
 }
@@ -237,8 +258,8 @@ function promptUsage(step) {
 /**
  * 一轮 prompt 的脚本：
  *   finish / finish-invalid-then-valid / text / toolcall-fake / permission /
- *   permission-after-cancel / cancel-tail / cancel-ignore / provider-error /
- *   refusal / max-tokens / hang
+ *   permission-after-cancel / permission-after-finish / permission-duplicate /
+ *   cancel-tail / cancel-ignore / provider-error / refusal / max-tokens / hang
  */
 async function runPromptStep(id, step) {
   const usage = promptUsage(step)
@@ -328,6 +349,35 @@ async function runPromptStep(id, step) {
         if (usage !== undefined) notify({ sessionUpdate: 'usage_update', used: 999, size: 100000 })
         finishWithUsage('cancelled')
       }
+      return
+    }
+    case 'permission-after-finish': {
+      // gate 已受理（finish 工具成功）后的关停窗口内再发权限请求：
+      // 结局已定，任何请求都必须回 cancelled，不得按策略授权。
+      const result = await callFinish(DEFAULT_FINISH_ARGS)
+      log('finish-tool-result', { isError: result?.isError === true })
+      await sleep(Number.isSafeInteger(step.permissionDelayMs) ? step.permissionDelayMs : 50)
+      const response = await requestPermission({ ...step, toolCallId: 'perm-after-finish' })
+      log('permission-after-finish-response', outcomeOf(response))
+      await sleep(Number.isSafeInteger(step.resultDelayMs) ? step.resultDelayMs : (config.resultDelayMs || 0))
+      finishWithUsage('end_turn')
+      return
+    }
+    case 'permission-duplicate': {
+      // 同一个 JSON-RPC id 连发两条权限请求：对端等两条应答，客户端必须都回，
+      // 但同一 id 只允许一次有效决策（第二次固定 cancelled）。
+      const requestId = Number.isSafeInteger(step.requestId) ? step.requestId : 4242
+      const params = permissionParams({ ...step, toolCallId: 'perm-duplicate' })
+      const [first, second] = await Promise.all([
+        sendClientRequest('session/request_permission', params, requestId),
+        sendClientRequest('session/request_permission', params, requestId),
+      ])
+      log('permission-duplicate-response', {
+        requestId,
+        outcomes: [outcomeOf(first), outcomeOf(second)],
+      })
+      await sleep(Number.isSafeInteger(step.resultDelayMs) ? step.resultDelayMs : 0)
+      finishWithUsage('end_turn')
       return
     }
     case 'cancel-tail': {
@@ -514,8 +564,12 @@ function dispatch(message) {
   if (Object.hasOwn(message, 'id')) {
     const waiter = state.pendingAgentRequests.get(message.id)
     if (waiter) {
-      state.pendingAgentRequests.delete(message.id)
-      waiter(message.result !== undefined ? message.result : { error: message.error })
+      // 同一 id 可能登记了多个 waiter（重复 id 探针）：按到达顺序一次结算一个。
+      const waiters = Array.isArray(waiter) ? waiter : [waiter]
+      const next = waiters.shift()
+      if (waiters.length === 0) state.pendingAgentRequests.delete(message.id)
+      else state.pendingAgentRequests.set(message.id, waiters)
+      next(message.result !== undefined ? message.result : { error: message.error })
     }
   }
 }
@@ -560,6 +614,9 @@ if (config.ignoreTerm === true) {
   process.on('SIGTERM', () => {
     log('sigterm-ignored')
   })
+  // 「忽略 TERM」的 agent 同时不因 stdin EOF / 事件循环排空而自然退出：
+  // 保留一个活跃句柄，只有 SIGKILL（或测试自己收尾）才能让它消失。
+  setInterval(() => {}, 1000)
 }
 
 if (config.spawnStubbornChild === true) {

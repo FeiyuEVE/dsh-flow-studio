@@ -18,7 +18,8 @@
  *   - SDK 的 `ClientApp` 构造时最先注册 `SessionUpdateRouter`，它对每条
  *     `session/update` 做封闭 union 的 `zod.parse`，未知变体抛错后经
  *     `console.error` 旁路输出；万条坏 update 就是万行日志。截获层先校验外壳、
- *     投递 P3，坏壳只计数丢弃，SDK 根本看不到。
+ *     投递 P3：`session/update` 内壳非法只计数丢弃；坏 JSON-RPC 外壳则由
+ *     `violate()` 抛错并关闭整条连接，SDK 两者都看不到。
  *   - SDK 的 `Connection.handleResponse` 对**没有匹配请求**的响应执行
  *     `console.error("Got response to unknown request", response.id)` —— 直接把
  *     原始 id 写进日志。截获层记录「我们发出过的请求 id（含原类型，≤64）」，
@@ -38,6 +39,12 @@
  *   - `session/cancel` 是通知不是请求；P4 用 `notify()` 发，且**不** abort 本地
  *     prompt promise，以便收到 `stopReason:"cancelled"`。
  *
+ * 权限请求（入站反向请求）的 id 去重契约：**每个请求 id 恰好一次有效决策**。
+ * 同一 id 再次到达时不调用 `onPermission`，直接回
+ * `{outcome:{outcome:'cancelled'}}`（对端仍能收到一条应答，不会悬挂），
+ * 只计 `permissionDuplicates` 并记一条 `permission-duplicate` 诊断；去重集合有界
+ * （{@link MAX_PERMISSION_REQUEST_IDS} 条，超出淘汰最早插入项）。
+ *
  * 返回句柄约定：
  *   - `request(method, params, { timeoutMs })`：`timeoutMs` 省略时用 `requestTimeoutMs`
  *     （默认 120s）；`0` = 不设超时。超时的那个请求与**全部**其它 pending 一起以
@@ -49,7 +56,8 @@
  *     `closedReason` / `signal.reason`。
  *   - `stats`：只读计数快照（`requests` / `updatesDelivered` / `updatesRejected` /
  *     `notificationsDropped` / `strayResponses` / `duplicateResponses` /
- *     `permissionRequests` / `callbackFailures` / `diagnostics*` / `pending` / `closed`），
+ *     `permissionRequests` / `permissionDuplicates` / `callbackFailures` / `diagnostics*` /
+ *     `pending` / `closed`），
  *     供 P4 观测与诊断，不可反向驱动状态。
  *   - 已知 SDK 行为：`session/close` / `session/delete` 的 `-32002` 被 SDK 归一成成功 `{}`。
  *
@@ -93,6 +101,9 @@ const MAX_ERROR_CHARS = 400
 
 /** 追踪的 id 集合上限（请求 id / 已应答 id / 已见响应 id 各自独立）。 */
 const MAX_TRACKED_IDS = 64
+
+/** 入站权限请求 id 去重集合上限；同一 id 只允许一次有效决策。 */
+const MAX_PERMISSION_REQUEST_IDS = 256
 
 const SESSION_UPDATE_METHOD = 'session/update'
 const CANCEL_REQUEST_METHOD = '$/cancel_request'
@@ -182,9 +193,9 @@ function errorMessage(error) {
 }
 
 /** 有界集合写入：超过上限时淘汰最早插入的一项。 */
-function rememberBounded(set, value) {
+function rememberBounded(set, value, limit = MAX_TRACKED_IDS) {
   if (set.has(value)) return
-  if (set.size >= MAX_TRACKED_IDS) {
+  if (set.size >= limit) {
     const oldest = set.values().next().value
     set.delete(oldest)
   }
@@ -219,7 +230,8 @@ function asWebWritable(value, label) {
  * @param {WritableStream<Uint8Array>|import('node:stream').Writable} options.output client → agent 字节流
  * @param {(params: object) => void} [options.onUpdate] `session/update` 的 params（外壳已校验，同步投递，异常收敛）
  * @param {(context: {params: object, requestId: unknown, signal: AbortSignal}) => object} [options.onPermission]
- *   同步返回 ACP permission response；抛异常 / 形状不对一律按 cancelled 处理
+ *   同步返回 ACP permission response；抛异常 / 形状不对一律按 cancelled 处理。
+ *   同一 `requestId` 只会调用一次：重复 id 直接回 cancelled，不进入回调。
  * @param {(summary: {code: string, message: string}) => void} [options.onDiagnostic] 有界诊断
  * @param {number} [options.maxMessageBytes] 单行上限（默认 32 MiB，测试可注入小值）
  * @param {number} [options.requestTimeoutMs] 单请求默认超时（默认 120s；`0` = 不设）
@@ -258,6 +270,7 @@ export async function openAcpClient(options = {}) {
     strayResponses: 0,
     duplicateResponses: 0,
     permissionRequests: 0,
+    permissionDuplicates: 0,
     callbackFailures: 0,
     diagnosticsSeen: 0,
     diagnosticsEmitted: 0,
@@ -276,6 +289,11 @@ export async function openAcpClient(options = {}) {
   const seenResponseIds = new Set()
   /** 已应答过的请求 id（诊断用途，暂未参与路由，保留给 P4 观察）。 */
   const answeredRequestIds = new Set()
+  /**
+   * 入站权限请求 id（有界）：每个 id 恰好一次有效决策。
+   * 重复 id 仍回一条 cancelled 应答，但不再调用 onPermission、不产生第二条事件。
+   */
+  const permissionRequestIds = new Set()
 
   const diagnosticsByCode = new Map()
 
@@ -478,6 +496,14 @@ export async function openAcpClient(options = {}) {
   const permissionHandler = context => {
     counters.permissionRequests += 1
     const { params, requestId, signal } = context ?? {}
+    // 每个请求 id 恰好一次有效决策：重复 id 只回一条 cancelled（对端不悬挂），
+    // 不再调用 onPermission，也不产生第二条 agent/permission 事件。
+    if (isJsonRpcId(requestId) && permissionRequestIds.has(requestId)) {
+      counters.permissionDuplicates += 1
+      diagnose('permission-duplicate', '同一权限请求 id 重复到达：只回 cancelled，不再调用 onPermission')
+      return cancelledPermission()
+    }
+    if (isJsonRpcId(requestId)) rememberBounded(permissionRequestIds, requestId, MAX_PERMISSION_REQUEST_IDS)
     if (typeof onPermission !== 'function') return cancelledPermission()
     let response
     try {
@@ -511,6 +537,7 @@ export async function openAcpClient(options = {}) {
     }
     sentRequestIds.clear()
     answeredRequestIds.clear()
+    permissionRequestIds.clear()
     seenResponseIds.clear()
     resolveClosed()
   })

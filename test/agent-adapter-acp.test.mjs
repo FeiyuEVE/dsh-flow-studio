@@ -596,6 +596,48 @@ async function main() {
     A.equal(handle.cleanup.disposed, true)
   })
 
+  await check('同一权限请求 id 重复到达：只一次有效决策，重复回 cancelled（1 条事件）', async () => {
+    const s = scenario({ prompts: [{ kind: 'permission-duplicate', requestId: 4242 }] })
+    const adapter = makeAdapter(s)
+    const { handle, events } = await startDirect(adapter)
+    const outcome = await withTimeout(handle.exited, 20_000, 'duplicate permission outcome')
+    A.equal(outcome.ok, true)
+    const duplicate = logEvents(s.logPath, 'permission-duplicate-response')[0]
+    A.equal(duplicate.requestId, 4242)
+    A.deepEqual(duplicate.outcomes.map(item => item.outcome), ['selected', 'cancelled'],
+      '首条按策略决策，重复 id 固定 cancelled')
+    A.equal(duplicate.outcomes[0].optionId, 'reject-once')
+    A.equal(duplicate.outcomes[1].optionId, null)
+    const permissionEvents = events.filter(event => event.type === 'agent/permission')
+    A.equal(permissionEvents.length, 1, '重复 id 不产生第二条 agent/permission 事件')
+    A.equal(permissionEvents[0].decision, 'deny')
+    A.equal(handle.diagnostics.client.permissionRequests, 2, '两条请求都到达客户端层')
+    A.equal(handle.diagnostics.client.permissionDuplicates, 1)
+    await disposeHandle(handle)
+    A.equal(handle.cleanup.disposed, true)
+  })
+
+  await check('gate 已受理后尾窗内的权限请求一律 cancelled（不按策略授权）', async () => {
+    for (const policy of ['allow', 'deny']) {
+      const s = scenario({ prompts: [{ kind: 'permission-after-finish', permissionDelayMs: 50 }] })
+      const adapter = makeAdapter(s, { permissionPolicy: policy })
+      const { handle, gate, events } = await startDirect(adapter)
+      const outcome = await withTimeout(handle.exited, 20_000, `${policy} after-finish outcome`)
+      A.equal(outcome.ok, true, 'gate 已受理：节点仍成功')
+      A.equal(gate.settled(), true, '权限请求发生在 gate 已 seal 之后')
+      const finishResult = logEvents(s.logPath, 'finish-tool-result')[0]
+      A.equal(finishResult.isError, false, 'finish 工具已成功（结局已定）')
+      const permission = logEvents(s.logPath, 'permission-after-finish-response')[0]
+      A.equal(permission.outcome, 'cancelled', `${policy}：结局已定后一律 cancelled`)
+      A.equal(permission.optionId, null)
+      const permissionEvents = events.filter(event => event.type === 'agent/permission')
+      A.equal(permissionEvents.length, 1)
+      A.equal(permissionEvents[0].decision, 'cancelled', '事件 decision 也是 cancelled')
+      await disposeHandle(handle)
+      A.equal(handle.cleanup.disposed, true)
+    }
+  })
+
   await check('cancel 后继续读 500ms 尾响应：usage snapshot 不丢', async () => {
     const s = scenario({
       prompts: [{
@@ -645,6 +687,44 @@ async function main() {
     A.equal(calls[0].synthetic, true)
     A.equal(calls[0].usage, null)
     A.equal(calls[0].reason, 'usage-unavailable')
+    await disposeHandle(handle)
+  })
+
+  await check('杀进程不生效 + 忽略 TERM：cleanup.disposed=false / pending 含 pid / cleanupFinal 超时', async () => {
+    const s = scenario({
+      prompts: [{ kind: 'cancel-ignore' }],
+      ignoreCancel: true,
+      ignoreTerm: true,
+    })
+    // killImpl 空操作：SIGTERM / SIGKILL 都打不出去；ignoreTerm / ignoreCancel 让
+    // 假 agent 继续活着。清理快照必须如实报告「物理退出未确认」，不能恒 disposed:true。
+    const adapter = makeAdapter(s, { killTimeoutMs: 50, killImpl: () => {} })
+    const { handle } = await startDirect(adapter)
+    const pid = handle.pid
+    A.equal(Number.isSafeInteger(pid), true, '拿到初始进程 pid')
+    await waitForLog(s.logPath, 'prompt', 'prompt 开始')
+    const cancelPromise = handle.cancel('kill-not-effective')
+    const outcome = await withTimeout(handle.exited, 20_000, 'kill-not-effective outcome')
+    A.equal(outcome.code, 'NODE_FINISH_CANCELED', '逻辑结局仍有界收口')
+    await withTimeout(cancelPromise, 10_000, 'cancel promise')
+    A.equal(pidAlive(pid), true, '注入的 killImpl 未真的杀进程')
+    const snapshot = handle.cleanup
+    A.equal(snapshot.disposed, false, '未确认物理退出：cleanup.disposed=false')
+    A.ok(Array.isArray(snapshot.pending) && snapshot.pending.includes(`initial:${pid}`),
+      `pending 必须包含该 pid（实际：${JSON.stringify(snapshot.pending)}）`)
+    const final = await withTimeout(handle.cleanupFinal, 15_000, 'cleanupFinal')
+    A.equal(final.disposed, false, 'cleanupFinal 不得谎报已清理')
+    A.equal(final.timedOut, true, 'cleanupFinal 超时如实报告')
+    A.ok(String(final.reason).includes('超时'), 'reason 写明超时')
+
+    // 测试收尾：真实 SIGKILL，避免留下后台进程。
+    try {
+      process.kill(-pid, 'SIGKILL')
+    }
+    catch {
+      try { process.kill(pid, 'SIGKILL') } catch { /* 已退出 */ }
+    }
+    A.equal(await waitForDead(pid), true, '测试收尾：真实进程已退出')
     await disposeHandle(handle)
   })
 

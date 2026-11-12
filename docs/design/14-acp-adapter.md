@@ -59,7 +59,8 @@
 - 配置默认 `mode:'workspace-write'`、`permissionPolicy:'deny'`。`mode` 只控制 agent 自己的执行策略，`session/request_permission` 是逐请求兜底，两者不能互相替代。
 - `deny` 只在选项里找 `reject_once`，`allow` 只找 `allow_once`；匹配到就原样回传该 `optionId`，没有匹配、请求已取消或 session 不匹配一律回 `{outcome:{outcome:'cancelled'}}`。
 - **永不**选择 `allow_always` / `reject_always`，也**不读** `option.name` 推断授权；取消态全部 `cancelled`，不等人。
-- 每个权限请求恰好一次应答；取消后到达的请求同样回 `cancelled`。每次决策投影成 `agent/permission` 事件，字段见 [10 · ACP 适配器事件](10-bpmn-instance-api.md#51-acp-适配器事件)。
+- 每个权限请求恰好一次应答；每个请求 id 恰好一次有效决策（一次 `onPermission` 回调 / 一条 `agent/permission` 事件）。同一 JSON-RPC id 重复到达时仍回一条应答（避免对端 pending 悬挂），但固定回 `{outcome:{outcome:'cancelled'}}`，不再触发策略判定，只计 `permissionDuplicates` + `permission-duplicate` 诊断；去重集合有界（256 条）。
+- 结局已定（gate 已受理或已 abort）或已进入关停流程后，任何权限请求一律 `{outcome:{outcome:'cancelled'}}`，`agent/permission` 事件的 `decision` 为 `cancelled`：`finishTailGrace` 尾窗内到达的请求也不会再按 `allow` / `deny` 策略授权。取消后到达的请求同样回 `cancelled`。每次决策投影成 `agent/permission` 事件，字段见 [10 · ACP 适配器事件](10-bpmn-instance-api.md#51-acp-适配器事件)。
 - ACP 客户端**不是 OS 沙箱**：`deny` 不等于隔离 agent 已有配置、hooks 或自带工具；安全边界仍是受信任的启动命令 / 环境与 agent 自身的沙箱。
 
 ## 6 清理与取消

@@ -619,7 +619,6 @@ export function createAcpAdapter(options = {}) {
     let supervisor = null
     let resources = null
     const exitState = { exited: false, code: undefined, signal: undefined, error: undefined }
-    let failure = null
 
     try {
       probeDir = ensurePrivateDir(await fsp.mkdtemp(join(settings.tmpRoot, 'fs-acp-probe-')))
@@ -794,7 +793,6 @@ export function createAcpAdapter(options = {}) {
       }
     }
     catch (error) {
-      failure = error
       if (error instanceof AcpAdapterError && error.code === ADAPTER_ERROR.PROBE_INVALID) throw error
       throw probeInvalid(
         exitState.exited ? 'agent-exited' : 'handshake-failed',
@@ -807,10 +805,9 @@ export function createAcpAdapter(options = {}) {
       )
     }
     finally {
-      // 只有成功结果才允许写缓存；失败 / 被 invalidate 的迟到结果都不写。
-      if (failure === null && generation !== probeGeneration) {
-        // 让调用方拿到结果，但绝不让它复活缓存。
-      }
+      // 这里没有缓存写入动作：probe() 外层按 generation 决定是否写缓存
+      // （见 probe() 的 generation 校验）。失败 / 被 invalidate 的迟到结果只回给
+      // 调用方，绝不回写缓存；成功但已 invalidate 的结果同样只回调用方。
       try {
         client?.close(new AcpClientError(ACP_PROCESS_EXITED, 'ACP probe 收尾', { reason: 'probe-cleanup' }))
       }
@@ -1177,6 +1174,16 @@ export function createAcpAdapter(options = {}) {
           reason: `最终清理盯守失败：${errorText(error)}`,
         })
       })
+    }
+
+    /** gate 是否已 seal（已受理成功或已 abort）；查询失败按「未定」处理。 */
+    const gateSettled = () => {
+      try {
+        return finishGate.settled() === true
+      }
+      catch {
+        return false
+      }
     }
 
     const abortGate = reason => {
@@ -1581,9 +1588,13 @@ export function createAcpAdapter(options = {}) {
           }
         },
         onPermission: ({ params, requestId }) => {
+          // 结局已定（gate 已受理或已 abort）或已进入关停流程后，任何权限请求一律
+          // cancelled：不按策略授权，不产生 allow/deny 决策事件。显式 cancel 之外，
+          // finishTailGrace 尾窗内到达的请求也必须走这条路径。
+          const outcomeDecided = state.canceled || state.stopping || state.gateAccepted || gateSettled()
           const decision = chooseAcpPermission(params, {
             policy: config.permissionPolicy,
-            cancelled: state.canceled,
+            cancelled: outcomeDecided,
             sessionId: state.sessionId ?? '',
           })
           const selected = decision.outcome.outcome === 'selected'

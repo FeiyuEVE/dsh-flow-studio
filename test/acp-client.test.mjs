@@ -462,6 +462,43 @@ test('同 id 的反向权限请求与我们的响应互不冲突，回调拿到�
   assert.equal(consoleCalls.length, 0)
 })
 
+test('同一权限请求 id 重复到达：只一次有效决策，重复 id 回 cancelled 且只一条诊断', async t => {
+  const harness = createHarness()
+  const consoleCalls = captureConsole(t)
+  const { client, diagnostics, permissions } = await openClient(harness, {}, t)
+
+  const prompt = client.request('session/prompt', { sessionId: 's1', prompt: [] })
+  const outbound = await findOut(harness, message => message.method === 'session/prompt', 'prompt 出向请求')
+  const permissionId = outbound.id + 7
+  const params = {
+    sessionId: 's1',
+    toolCall: { toolCallId: 'tool-dup', title: '写文件', kind: 'edit', status: 'pending' },
+    options: [
+      { optionId: 'allow_once', name: '允许一次', kind: 'allow_once' },
+      { optionId: 'reject_once', name: '拒绝本次', kind: 'reject_once' },
+    ],
+  }
+  harness.send({ jsonrpc: '2.0', id: permissionId, method: 'session/request_permission', params })
+  harness.send({ jsonrpc: '2.0', id: permissionId, method: 'session/request_permission', params })
+
+  // 两条请求都要有应答（否则对端 pending 悬挂），但同一个 id 只允许一次有效决策。
+  await waitFor(
+    () => harness.received.filter(message => message.id === permissionId && message.result?.outcome).length === 2,
+    '两条权限应答',
+  )
+  const replies = harness.received.filter(message => message.id === permissionId && message.result?.outcome)
+  assert.deepEqual(replies[0].result, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
+  assert.deepEqual(replies[1].result, CANCELLED_PERMISSION)
+  assert.equal(permissions.length, 1, '重复 id 不再调用 onPermission')
+  assert.equal(client.stats.permissionRequests, 2)
+  assert.equal(client.stats.permissionDuplicates, 1)
+  assert.equal(diagnostics.filter(summary => summary.code === 'permission-duplicate').length, 1)
+  assert.equal(consoleCalls.length, 0)
+
+  harness.send({ jsonrpc: '2.0', id: outbound.id, result: { stopReason: 'end_turn' } })
+  assert.deepEqual(await prompt, { stopReason: 'end_turn' })
+})
+
 test('未知反向 request 回 -32601，连接继续可用', async t => {
   const harness = createHarness()
   const consoleCalls = captureConsole(t)

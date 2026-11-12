@@ -153,11 +153,18 @@ try {
     const lock = join(home, 'test.lock')
     let releaseHolder = null
     const holderGate = new Promise(resolveGate => { releaseHolder = resolveGate })
+    // 持有信号必须来自「回调真正进入」：只看到锁文件出现不够——文件是 flock 的
+    // inode 锚点，可能在持有者拿到内核锁之前就已创建。踩这个坑时，「锁被占用时
+    // 超时」会在慢机器/并发负载下偶发失败（竞争者抢在 flock 生效前进入）。
+    let holderAcquired = null
+    const holderEntered = new Promise(resolveEntered => { holderAcquired = resolveEntered })
     const holder = resources.withResourceLock(lock, async () => {
+      holderAcquired()
       await holderGate
       return 'A'
     }, { waitMs: 2_000 })
-    ok(await waitUntil(() => existsSync(lock)), '持有者已建锁文件')
+    await holderEntered
+    ok(existsSync(lock), '持有者已建锁文件')
     await rejectsCode(
       () => resources.withResourceLock(lock, async () => 'never', { waitMs: 80 }),
       resources.RESOURCE_ERROR.LOCK_TIMEOUT,
@@ -198,10 +205,14 @@ try {
     // 活持有者期间，再写一个「pid 不存在」的内容也不会让别人抢进来：互斥在内核层。
     let releaseHolder = null
     const holderGate = new Promise(resolveGate => { releaseHolder = resolveGate })
+    let holderAcquired = null
+    const holderEntered = new Promise(resolveEntered => { holderAcquired = resolveEntered })
     const holder = resources.withResourceLock(lock, async () => {
+      holderAcquired()
       await holderGate
     }, { waitMs: 2_000 })
-    ok(await waitUntil(() => existsSync(lock)), '持有者已获取')
+    await holderEntered
+    ok(existsSync(lock), '持有者已获取')
     writeFileSync(lock, `${JSON.stringify({ v: 1, owner: 'fake-dead', pid: 999_999 })}\n`)
     await rejectsCode(
       () => resources.withResourceLock(lock, async () => 'intruder', { waitMs: 100 }),
@@ -297,11 +308,15 @@ await withResourceLock(lockPath, async () => {
     const lock = join(home, 'successor.lock')
     let releaseA = null
     const gateA = new Promise(resolveGate => { releaseA = resolveGate })
+    let aAcquired = null
+    const aEntered = new Promise(resolveEntered => { aAcquired = resolveEntered })
     const a = resources.withResourceLock(lock, async () => {
+      aAcquired()
       await gateA
       return 'A'
     }, { waitMs: 2_000 })
-    ok(await waitUntil(() => existsSync(lock)), 'A 持有锁文件')
+    await aEntered
+    ok(existsSync(lock), 'A 持有锁文件')
 
     let bEntered = null
     const bEnteredSignal = new Promise(resolveEntered => { bEntered = resolveEntered })

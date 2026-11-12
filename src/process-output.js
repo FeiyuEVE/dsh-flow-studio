@@ -57,41 +57,82 @@ function positiveIntOr(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback
 }
 
+/** 敏感标志位规则实例（`replace` 会重置 `lastIndex`，模块内串行调用安全）。 */
+const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
+
 /**
- * 文本脱敏（0.11 R3）。
+ * 文本脱敏（0.11 R3；0.14.8 起支持超大输入）。
  *
  * 保持纯函数：host-check 等调用方都需要它不依赖 fs / 存储层，反向 import 会形成环。
- * 规则 4 与旧执行链曾保持同口径；旧链退役后这里只维护这一份。
  *
- * 覆盖：
- *   0. 显式凭据形态（保留可识别前缀）：PEM 私钥块、AWS Access Key / secret access key、
- *      GitHub / Slack / GitLab / Google / Stripe 令牌、三段 JWT、数据库 / 消息连接串
- *      的 user:pass；
- *   1. `Authorization: Bearer <token>`；
- *   2. `sk-...` API key（保留前缀，值抹掉）；
- *   3. `key: value` / `key=value` / `"key": "value"`（token / password / secret / api_key / authorization）；
- *   4. ≥32 个连续可疑字符（哈希 / JWT 片段 / 裸 token）。
- *
- * **规则 4 与 engine 的已知兼容差异（0.11 R3，需同步知晓）**：
- * engine 对任意 ≥32 的连续可疑字符一律脱敏；这里额外要求该串**同时包含至少两类字符**
- * （大写 / 小写 / 数字 / 符号 `_+/=.-`），并且对「路径形态」（含 `/` 且每段只含
- * `A-Za-z0-9._~-`，绝对 / 相对都算）的连续串放行。原因是既有 executor 自检同时依赖两件事：
- *   - `'x'.repeat(1500) + 'y'.repeat(1000)` 这种纯同类填充串验证 stderr 尾部裁剪；
- *   - `echo {prompt}` 原样回显 `/…/.tmp/…/pwned` 这类 ≥32 字符绝对路径，验证 prompt
- *     注入载荷没有被执行。
- * 若按 engine 原规则，前者被整体替换成 `[REDACTED]` 让尾部长度断言失去意义，后者会把
- * 路径中间整段抹掉、让「载荷原样输出」变成误报；连带 custom 答案里的 `src/…/长文件名.ts`
- * 也会被破坏。真实凭据（Bearer / sk- / key=value / 大小写数字混合的哈希、JWT 片段）仍然
- * 由规则 1–3 或「多类字符」覆盖；纯小写 / 纯数字 / 纯符号长填充串不按秘密处理。
- * 规则 1–3 与 engine 逐字一致，规则 4 的 `[A-Za-z0-9_+/=.-]{32,}` 候选范围也一致，只在
- * 替换前多做了「字符类别」与「路径形态」两次判断。**改 engine 规则 4 时必须同步这里
- * （或反向收敛为共享实现）。**
+ * 实现分两层：{@link redactSegment} 是完整的规则管线（只在有界片段上跑）；本函数负责
+ * **分段**——先按空白切出「词」，把长度超过 {@link REDACT_MAX_SEGMENT} 的整段无空白串
+ * 直接判成 `[REDACTED]`（这类串本来就会命中规则 4 的多类字符判定），再把其余词按顺序
+ * 装箱成 ≤256 KiB 的片段逐段脱敏。凭据本身不含空白，所以不会因为分段被劈成两半。
  *
  * @param {unknown} raw
  * @returns {string}
  */
-/** 敏感标志位规则实例（`replace` 会重置 `lastIndex`，模块内串行调用安全）。 */
-const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
+export function redactText(raw) {
+  const text = typeof raw === 'string' ? raw : String(raw ?? '')
+  if (text.length <= REDACT_MAX_SEGMENT) return redactSegment(text)
+  const pieces = []
+  let index = 0
+  while (index < text.length) {
+    let end = index
+    while (end < text.length && !isWhitespaceCode(text.charCodeAt(end))) end += 1
+    if (end === index) {
+      let wsEnd = index
+      while (wsEnd < text.length && isWhitespaceCode(text.charCodeAt(wsEnd))) wsEnd += 1
+      pieces.push({ kind: 'ws', text: text.slice(index, wsEnd) })
+      index = wsEnd
+      continue
+    }
+    const token = text.slice(index, end)
+    pieces.push(token.length > REDACT_MAX_SEGMENT ? { kind: 'giant' } : { kind: 'token', text: token })
+    index = end
+  }
+  let out = ''
+  let buffer = ''
+  const flush = () => {
+    if (buffer !== '') {
+      out += redactSegment(buffer)
+      buffer = ''
+    }
+  }
+  for (const piece of pieces) {
+    if (piece.kind === 'giant') {
+      flush()
+      out += '[REDACTED]'
+      continue
+    }
+    if (piece.kind === 'ws' && piece.text.length > REDACT_MAX_SEGMENT) {
+      flush()
+      out += piece.text
+      continue
+    }
+    if (buffer.length + piece.text.length > REDACT_MAX_SEGMENT) flush()
+    buffer += piece.text
+  }
+  flush()
+  return out
+}
+
+
+/**
+ * 超大文本的分段阈值（UTF-16 码元数，0.14.8）。
+ *
+ * 动机：V8 的正则在**单次超长匹配**上会抛 `RangeError: Maximum call stack size exceeded`
+ * （实测：一条 ≥6 MiB、不含空白的连续串，`/[A-Za-z0-9_+/=.-]{32,}/` 直接爆栈）。0.14.7
+ * 把单行上限提到 32 MiB 之后，一段约 9 MiB、没有空白的事件正文就能在脱敏阶段把适配器
+ * 打崩，进而被误报成通道失败。分段后每次只让正则在 ≤256 KiB 的片段上工作。
+ */
+const REDACT_MAX_SEGMENT = 256 * 1024
+
+/** 与分段边界一致的空白判定（不含 Unicode 全角空格，保持与既有词法口径一致）。 */
+function isWhitespaceCode(code) {
+  return code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c || code === 0x0d || code === 0x20
+}
 
 /**
  * 「值**整体**已是脱敏产物」的形态：可选的已知前缀 + `[REDACTED]`，此外什么都不许有。
@@ -120,7 +161,13 @@ function isFullyRedactedValue(value) {
   return FULLY_REDACTED_PATTERN.test(text)
 }
 
-export function redactText(raw) {
+/**
+ * 有界片段上的完整脱敏规则（规则 0–5）。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function redactSegment(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '')
   // 0) 显式凭据形态（0.14.7）。这类规则必须先于通用规则执行，否则会被规则 5 的
   //    「≥32 连续可疑字符」整段替换成 `[REDACTED]`、丢掉可识别前缀。输出统一保留前缀

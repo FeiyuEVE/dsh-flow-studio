@@ -431,3 +431,19 @@ await check('createBoundedOutput：tail 按字节从尾部取，起点落在半�
   A.equal(out.tail(), '中', 'tail 默认使用 maxTail（4 字节）')
   A.equal(out.tail(100), '中', 'tail 请求超过 maxTail 时仍受 maxTail 约束')
 })
+
+await check('redactText：超大输入分段脱敏，不因正则爆栈（0.14.8）', () => {
+  // 动机：V8 对「单次超长匹配」会抛 RangeError；0.14.7 把单行上限提到 32 MiB 后，
+  // 一段约 9 MiB、没有任何空白的事件正文会在脱敏阶段把适配器打崩。分段后必须不再崩。
+  const plain = redactText('x'.repeat(6 * 1024 * 1024))
+  A.equal(plain, '[REDACTED]', '整段无空白超长串整体抹掉')
+  const token = redactText('ghp_' + 'A'.repeat(6 * 1024 * 1024))
+  A.equal(token, '[REDACTED]', '超长令牌整段抹掉、不残留载荷')
+
+  const big = ('padding word '.repeat(200_000)) + 'ghp_' + 'A'.repeat(36) + ' tail'
+  const out = redactText(big)
+  A.ok(!out.includes('A'.repeat(36)), '大文本里的 GitHub 令牌仍被抹掉')
+  A.ok(out.startsWith('padding word '), '普通大文本保持原样')
+  A.ok(out.endsWith(' tail'), '尾部普通文本保持原样')
+  A.equal(redactText(out), out, '大文本整体幂等')
+})

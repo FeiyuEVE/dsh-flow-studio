@@ -1106,4 +1106,11 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - **既有缺陷收口**：`process-output` 里从未使用的 `SECRET_FLAG` 与对 `host-check` 的死 import 删掉，敏感键名改成 `process-output` 导出的 `SENSITIVE_KEY_NAME_SOURCE` 单一来源、由 `host-check` 反向复用；模块头注释同步改对。`host-check.redactSensitiveText`（导出 API，`runHostCheck` 目前在 src 无调用者）改为直接复用 `redactText`，不再留旧正则副本。`redactDeep` 增加键名判据：`token` / `password` / `apiKey` / `clientSecret` 等键的未知值直接 `[REDACTED]`，不再只看值形态。
 - **回归与变异**：新增 15 条写法用例（修复前 15/15 泄漏，修复后 0/15）、tail 跨上限用例、headTruncated 三种情形（有换行丢首行 / 无换行整段 `[REDACTED]` / 未截断不误伤），以及 adapter 的 `handle.events` 赋值型秘密断言；复审的 N=70_000 / 140_000 / 300_000 探针在 stdout 与 stderr 上均 0 泄漏，正常多行 tail 保留最后若干完整行。变异验证——去掉转义感知、把 tail 改回先切后脱敏、放开任意 marker 前缀、去掉 headTruncated 判定——均被测试拦红。全量 `npm test` 通过，`node scripts/build.mjs && node scripts/verify-build.mjs` 通过。9 MiB / 31 MiB 输入实测 396 / 1235 ms（混合敏感值样本 510 / 1554 ms），无 `RangeError`。
 
+**同批的 ACP 复审三条 MINOR**
+
+- **入站权限请求按 id 去重**：同一 JSON-RPC id 重放 `session/request_permission` 时仍回一条应答（否则对端 pending 挂住），但固定 `{outcome:{outcome:'cancelled'}}`、不再调用权限决策、不再产生第二条 `agent/permission` 事件；新增 `permissionDuplicates` 计数与 `permission-duplicate` 诊断。口径是「每个请求 id 恰好一次有效决策」。
+- **结局已定后一律 `cancelled`**：gate 已受理、已 abort、或已进入关停流程后，`finishTailGrace`（默认 5s）窗口内到达的权限请求不再按策略授权，统一回 `cancelled`，`agent/permission` 的 `decision` 也是 `cancelled`。判定直接用真实 gate 的 `settled()` 与既有 `canceled` / `stopping` / `gateAccepted`，没有新造影子状态。
+- **清理不变量补回归锁**：新增「killImpl 空操作 + 进程忽略 TERM」用例，断言 `cleanup.disposed === false`、`pending` 含该 pid、`cleanupFinal` 如实报超时。把 cleanup 快照改成恒 `disposed:true` 的变异现在会被测试拦红——此前该变异在 ACP 套件里存活（31 组 / 196 断言全绿）。
+- 顺手：删掉 probe 收尾里只有注释的空 `if`；修正 `acp-client` 头注释（坏 JSON-RPC 外壳由 `violate()` 抛错并关闭连接，只有 update 内壳才计数丢弃）。
+
 **已知边界**：tail 的余量是「与上限同量级」的固定窗口；头部被截断的窗口按上述语义处理（有换行丢首行 / 无换行整段 `[REDACTED]`），因此长于窗口的单个值不会再有尾部片段逃逸，代价是被截断窗口的首行诊断信息不再导出。YAML 块标量整块替换成 `"[REDACTED]"`（保留块尾换行），不再保留 `|` 指示符。`Authorization` 的裸方案名按「方案词 + 一个凭据」解析，方案词保留；无方案词时仍整值替换。真实 Claude / Codex CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。

@@ -1,6 +1,6 @@
 {
   "name": "@feiyueve/dsh-flow-studio",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "DeepSeek Harness 的 BPMN 智能体工作流工作室：可视化建模流程定义（BPMN 2.0 + Zeebe 扩展属性），以实例方式启动 / 查看 / 取消运行，完成人工待办，查看实例事件、运行指标与业务证据，并管理实例级 git worktree。Visual BPMN agent-workflow studio for DeepSeek Harness: model process definitions, run and inspect instances, complete human tasks, and review events, metrics, evidence, and per-instance worktrees.",
   "type": "module",
   "main": "lib/index.js",

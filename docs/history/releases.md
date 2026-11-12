@@ -1013,7 +1013,7 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
   - 补 AWS Access/Secret、PEM 私钥块、GitHub（经典 + fine-grained）、Slack、GitLab、Google、Stripe、JWT、连接串；保留可识别前缀、幂等、不误伤形似文本。
 - **Codex 适配器**：同步 spawn E2BIG → `CODEX_ARGV_TOO_LARGE` + hint；清理行为保持（runDir / MCP server / listener 全零）。
 - **运行时**：创建/准备阶段**抛异常**也收成 `CANCELED`（与「返回错误」分支一致），owner / preparing 照旧释放。
-- **测试**：修掉 `node-finish-mcp` 在 `TMPDIR=<repo>/.tmp` 下的假红（断言改为「默认临时根不得**恰好**是仓库根」，不再要求必须在仓库外），并把测试内 mkdtemp 前缀压短，避免 unix socket 路径超过 108 字节。
+- **测试**：修掉 `node-finish-mcp` 在 `TMPDIR=<repo>/.tmp` 下的假红（断言改为「默认临时根不得**恰好**是仓库根」，不再要求必须在仓库外），并把测试内 mkdtemp 前缀压短，避免 unix socket 路径超过 108 字节；修掉 `instance-resources` 锁用例在并发负载下的假红——持有信号改为「回调真正进入」，而不是「锁文件出现」（锁文件是 flock 的 inode 锚点，可能在持有者拿到内核锁之前就已创建；3 路 CPU 压测下旧版 6 次里复现 1 次）。
 
 **已知边界**
 - Windows 的 `ERROR_FILENAME_EXCED_RANGE (206)` 分支与进程清理未真机实测。

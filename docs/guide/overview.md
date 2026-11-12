@@ -12,7 +12,7 @@ dsh-flow-studio 是 DeepSeek Harness 的 **BPMN 智能体工作流工作室**：
 
 - **定义即 BPMN**：流程是 BPMN 2.0 XML，支持 Zeebe 风格扩展属性（agent 类型、adapter、prompt、team、skills）。XML 导入保留；画布由 BPMN Modeler + 属性面板驱动。
 - **定义版本不可变**：每次保存产生新版本；实例启动时钉住 `definitionVersion + definitionHash` 并复制定义快照。定义改版只影响之后启动的实例。
-- **agent 节点只走适配器 + 完结门**：`dsh` / `codex` 两种 AgentAdapter。节点会话必须调用 `flow_finish_node`；没有调用就失败（`NODE_FINISH_MISSING`），不存在旧 executor 的直出回退。
+- **agent 节点只走适配器 + 完结门**：`dsh` / `codex` / `claude` / `acp` 四种 AgentAdapter。节点会话必须调用 `flow_finish_node`；没有调用就失败（`NODE_FINISH_MISSING`），不存在旧 executor 的直出回退。
 - **人工任务**：`userTask` 进入 `pendingTasks`；页面或模型工具完成待办后继续流转。人工等待不是实例状态。
 - **实例状态只有四个**：`ACTIVE` / `COMPLETED` / `SUSPENDED` / `CANCELED`；执行错误用 `lastError` 表达。
 - **运行可观测**：事件按 `seq` 增量拉取；指标与业务证据分别按 [design/12](../design/12-instance-metrics.md)、[design/13](../design/13-instance-evidence.md) 聚合，未知一律不是零。

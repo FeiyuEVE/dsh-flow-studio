@@ -1069,3 +1069,26 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 变异验证：把取值器改回「引号内遇换行即停」→ 多行用例立刻红；撤掉超长串预抹 → `RangeError` 用例红。
 
 **已知边界**：不带引号的值按 shell 语义在 `;` / `,` / `&` / `}` 处终止（`--token a;b` 的 `b` 属于另一个词）；控制字节不再终止值（整段抹掉，安全方向）；超过 64 KiB 的连续可疑串整段判 `[REDACTED]`；真实 Claude/Codex CLI、Windows 206、异步 spawn E2BIG 仍未验证。
+
+## 0.15.0 — ACP 适配器（Agent Client Protocol v1）
+
+**ACP 适配器（P1–P6）**
+
+- 新增第四种 AgentAdapter `adapter:"acp"`：把 ACP agent（首发 `@agentclientprotocol/codex-acp@2.6.0`）当 stdio 协议对端，用官方 `@agentclientprotocol/sdk@2.6.0` 的 `ndJsonStream` / `client` 做 NDJSON 分帧与双向请求，**不自写 JSON-RPC 路由**；单条消息上限 32 MiB。连接层在 `src/acp-client.js`。
+- 配置只有宿主环境变量 `FLOW_STUDIO_ACP_CONFIG`（`command` / `args` / `env` / `mode` / `permissionPolicy`，默认 `codex-acp` / `[]` / `{}` / `workspace-write` / `deny`）；不新增 HTTP 路由、BPMN 字段或实例内配置，默认适配器仍是 `dsh`，灰度入口只有节点显式写 `adapter:"acp"`。完整配置表在 `docs/reference/host-api.md`。
+- **完结只认 gate 受理**：`session/new` 的 `mcpServers` 让 agent 自己拉起插件自带的 `node-finish-mcp.js`，模型必须真的调用 `flow_finish_node`；`stopReason:"end_turn"` 只表示本轮结束。`end_turn` 且未受理时在同一连接 / session 再发 reminder prompt（emulated，默认 3 次），用尽 → `NODE_FINISH_MISSING`；provider 终态错误（`refusal` / 预算停止）不消耗提醒预算。
+- **probe 四层证据**：① v1 协商（`initialize` + `session/new` + `session/set_mode`）、② 本地桥自检（`verifyFinishBridge`）、③ agent 侧 `firstContact`（hello）+ `discovered`（tools/list）、④ 模型真实调用 finish。只有 ①②③ 同时成立，`capabilities().finishTool` 才是 `native`，否则 admission 零派发（`NODE_FINISH_TOOL_UNAVAILABLE`）。probe 成功结果缓存 10 分钟，只存能力投影与 `helpDigest`，不存凭据。
+- **默认最小权限**：`permissionPolicy:'deny'` 只选 `reject_once`、`'allow'` 只选 `allow_once`，永不选 `always`，也不按选项名推断授权；目标 mode 必须真实出现在 `availableModes`，否则 `ACP_MODE_UNAVAILABLE`，不回退更宽模式、不派 prompt。
+- **事件面**：`activity/output`（整轮暂存、轮末 flush、按 UTF-8 切 ≤2 KiB、单执行 64 KiB 预算）、`tool/start|update|end`（每 turn 最多 256 个 id）、`agent/permission`（每次请求恰好一条）。其它 `session/update` 变体只进有界诊断摘要，不让 agent 输出撑大事件流。
+- **用量**：`acp-usage-ledger.js` 只对精确匹配 `codex-acp 2.6.0` 的 agent 解释 prompt usage——codex-acp 已按本轮差分并扣掉缓存，账本直接记 `scope:'invocation'`，**不再做相邻差分**；缺桶是 `null` 不补 0；profile 未验证或响应缺 usage → 一条 synthetic unknown（`usage-unavailable` / `usage-malformed`），不造 0。`usage_update.used/size` 只进诊断。
+- **错误码**：`ACP_CONFIG_INVALID` / `ACP_MODE_UNAVAILABLE` / `ACP_AUTH_REQUIRED`（`-32000`）/ `ACP_SESSION_NOT_FOUND`（`-32002`）/ `ACP_PROTOCOL_ERROR` / `ACP_PROVIDER_ERROR` / `ACP_LIMIT_REACHED` / `ACP_REQUEST_TIMEOUT` / `ACP_PROCESS_EXITED` / `NODE_FINISH_CANCELED`（`-32800`）/ `ACP_MESSAGE_DELIVERY_UNSUPPORTED`；全集与触发条件在 `docs/reference/instance-api.md`。
+- **清理与取消**：`cancel(reason)` 幂等——先封 gate、发 `session/cancel`、500ms 尾窗收账、关连接、整组 `TERM → KILL`；`dispose()` 未确认整组退出时如实报 `cleanup.disposed=false`，不靠 leader 退出假释放。私有目录 0700、socket 0600，Unix socket 路径超限按 finish 工具不可用拒绝，**不退到 `/tmp`**。
+- **打包**：`HOST_MODULES` 增 5 个 ACP 模块；SDK 与 zod 不 vendor、不 bundle，运行时从插件 `node_modules` 解析；`THIRD-PARTY.md` 登记 `@agentclientprotocol/sdk`（Apache-2.0）与 `zod`（MIT）。
+- **文档**：新增 `docs/design/14-acp-adapter.md`；事件字段、配置表、用量 profile、错误码分别落在各自 owner（`design/10` §5.1、`reference/host-api.md`、`design/12` §3.1、`reference/instance-api.md`），14 号文只做索引。
+
+**验证与已知边界**
+
+- 全量 `npm test` 通过；ACP 集成测试 11 组 / 100 条断言（真实 runtime + fake ACP agent + 真实 MCP finish 通道），打包测试 3 组 / 152 条断言（build → verify-build → `npm pack` → 隔离目录 `npm install --omit=dev` → 密封导入安装副本）。
+- 变异验证：漏 `HOST_MODULES` 条目 → build / verify-build 与打包测试红；SDK 移入 `devDependencies` → 打包测试红；默认适配器改成 `codex` → 集成测试红。
+- **未验收**：真实 `codex-acp 2.6.0` 的模型调用与 finish（第 ④ 层）没跑——`scripts/acp-smoke.mjs` 默认只做 probe（①②③），`--prompt` 才跑真实调用，缺 CLI 时输出 `skipped:true`（不是通过）；18 帧真实报文重放不含 `flow_finish_node`、`mcpServers` 为空，不构成 MCP 完结证据，`capabilities().evidence.realChannel` 固定写未验证。真实 Claude CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。
+- 打包测试依赖本机 `bubblewrap` 与可安装依赖（约 17s），在完全离线的环境里会失败而不是静默跳过。

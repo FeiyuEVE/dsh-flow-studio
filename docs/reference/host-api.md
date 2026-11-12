@@ -42,10 +42,10 @@
     "write": true,
     "workspaceAllowlist": { "configured": false, "count": 0 }
   },
-  "version": "0.14.0",
+  "version": "0.15.0",
   "schemaVersion": 1,
   "bpmn": { "enabled": true, "engine": "26.0.6", "definitions": 0, "instances": 0, "active": 0 },
-  "adapters": ["codex", "dsh"],
+  "adapters": ["acp", "claude", "codex", "dsh"],
   "skills": true
 }
 ```

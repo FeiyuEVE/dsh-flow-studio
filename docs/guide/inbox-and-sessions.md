@@ -35,7 +35,7 @@ POST /api/flow-studio/instances/<instanceId>/messages
 
 回复 outbox 状态：`queued` / `delivered` / `failed` / `skipped`（`skipped` 只在实例取消时出现）。
 
-投递是否 exactly-once **不由收件箱声称**：只有适配器显式返回 `deliveryUnknown:false` 才记 `exactlyOnce:true`；dsh 与 codex 都不满足。
+投递是否 exactly-once **不由收件箱声称**：只有适配器显式返回 `deliveryUnknown:false` 才记 `exactlyOnce:true`；现有四种适配器（dsh / codex / claude / acp）都不满足。
 
 ## 回复通道
 

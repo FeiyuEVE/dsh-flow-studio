@@ -10,15 +10,16 @@
 - **定义版本不可变**：每次保存产生一个新版本；实例钉住启动时的定义版本与内容哈希，定义改版不会改写已有实例。
 - **实例生命周期**：启动 / 查看 / 事件增量轮询 / 取消；状态只有 `ACTIVE`、`COMPLETED`、`SUSPENDED`、`CANCELED`，执行错误写 `lastError` 而不是伪造 `failed`。
 - **人工任务**：`userTask` 进入待办；页面或模型工具 `flow_instance_complete_task` 提交结果后继续流转。
-- **agent 节点只走适配器 + 完结门**：`dsh` / `codex` / `claude` 三种 AgentAdapter；节点会话必须调用 `flow_finish_node` 提交结论与证据，没有旧 executor 的直出回退。
+- **agent 节点只走适配器 + 完结门**：`dsh` / `codex` / `claude` / `acp` 四种 AgentAdapter；节点会话必须调用 `flow_finish_node` 提交结论与证据，没有旧 executor 的直出回退。
 
 | 适配器 | 完结工具通道 | 提醒机制 | 证据状态 |
 |---|---|---|---|
 | `dsh` | 子 agent 会话里注册 `flow_finish_node`（native） | `agent/steer` 唤醒（native） | 自动化 + 真实 DSH 会话 |
 | `codex` | 本次 `codex exec` 的 `-c mcp_servers.*` 指向插件自带 MCP server | `codex exec resume`（emulated）；显式 native Stop hook | 参数探测 + 桥自检 + 真实 CLI 跑通 |
 | `claude` | 本次 `claude -p` 的 `--mcp-config` + `--strict-mcp-config` 指向同一个 MCP server | `claude -p --resume`（emulated）；显式 native Stop hook | **参数探测 + 桥自检已验；真实 Claude CLI 未验证**（见下） |
+| `acp` | ACP agent 自己拉起 `session/new` 的 `mcpServers` 里的 `flow_finish` MCP server（ACP 客户端不代理 MCP 流量） | 同一连接 / session 再发 reminder prompt（emulated，最多 3 次） | **协议协商 + 桥自检 + fake agent 集成已验；真实 `codex-acp` 模型调用与 finish 未验证**（见下） |
 
-「证据状态」分三层，不要混为一谈：**① 参数探测**（`--version` / `--help` 的参数面）、**② 桥自检**（我们自己的 MCP stdio server 往返）、**③ 真实 CLI 握手 + finish**（真实 CLI 是否拉起 server、模型是否真的调用工具）。Claude 只做到 ①②：本机没有 `claude` CLI，`node scripts/claude-smoke.mjs` 会给出 `skipped:true`（**不是通过**）。
+「证据状态」分三层，不要混为一谈：**① 参数探测 / 协议协商**（`--version` / `--help` 的参数面；ACP 是 `initialize` + `session/new` + 模式可用）、**② 桥自检**（我们自己的 MCP stdio server 往返）、**③ 真实 CLI 握手 + finish**（真实 CLI 是否拉起 server、模型是否真的调用工具）。Claude 只做到 ①②：本机没有 `claude` CLI，`node scripts/claude-smoke.mjs` 会给出 `skipped:true`（**不是通过**）。ACP 做到 ①②，并在 fake agent 上验了完整闭环；第 ③ 层（真实 `codex-acp` 的模型调用与 finish）仍未验证，`node scripts/acp-smoke.mjs` 默认只做 probe，`--prompt` 才跑真实调用（缺 CLI 时输出 `skipped:true`，同样**不是通过**）。
 - **运行可观测**：实例事件 append-only 落盘；token / 指标 / 业务证据按独立契约聚合（见 design/12、design/13）。
 - **实例级 git worktree**：运行可选独立 worktree，支持 inspect / remove / branch / list / prune，孤儿可单独清理。
 - **模板存在本机**：`$DSH_HOME/flow-studio/definitions/` 与 `instances/`，换浏览器、换设备都还在。

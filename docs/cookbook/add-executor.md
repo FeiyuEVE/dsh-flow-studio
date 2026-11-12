@@ -1,6 +1,6 @@
 # 怎么加一种 agent 适配器（历史：外部执行器）
 
-> **历史资料。** 0.14.0 起旧运行域与它的 `executor`（`dsh` / `codex` / `custom`）已删除；节点不再能通过 `executorCommand` 在宿主 `sh -c` 里执行任意命令。当前只有 AgentAdapter（`dsh` / `codex`）这条路径，且每个 agent 节点必须调用 `flow_finish_node` 完结。本页只用于追溯旧实现，不要按它改当前代码。
+> **历史资料。** 0.14.0 起旧运行域与它的 `executor`（`dsh` / `codex` / `custom`）已删除；节点不再能通过 `executorCommand` 在宿主 `sh -c` 里执行任意命令。当前只有 AgentAdapter（`dsh` / `codex` / `claude` / `acp`）这条路径，且每个 agent 节点必须调用 `flow_finish_node` 完结。本页只用于追溯旧实现，不要按它改当前代码。
 
 ## 当前正确入口
 

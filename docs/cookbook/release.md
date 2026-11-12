@@ -74,7 +74,7 @@ npm view @feiyueve/dsh-flow-studio version
 2. 核对容器内 `node -p "require('<profile>/node_modules/@feiyueve/dsh-flow-studio/package.json').version"` 等于发布版本。
 3. 逐文件对账：私源 tgz 解出的 `lib/*.js` 与容器内安装产物 byte-for-byte 一致（`sha256sum` 两边对比）。
 4. 跑端到端：`bash scripts/e2e-bpmn.sh`，看到 `BPMN 域容器验收通过`。
-5. 查 `/health`：`version` 是新版本、`bpmn.enabled=true`、`adapters` 含 dsh / codex、`auth` 符合预期。
+5. 查 `/health`：`version` 是新版本、`bpmn.enabled=true`、`adapters` 含 dsh / codex / claude / acp、`auth` 符合预期。
 
 ## 8. 登记
 

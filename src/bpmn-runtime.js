@@ -1545,14 +1545,23 @@ class BpmnRuntime {
       instancesRoot: this.instancesRoot,
     })
 
-    // MAJOR-4：从 workspace / 定义准备开始一直到首次 start 收口，都算「创建中」。
-    // 这段窗口里挂起会让首次启动被 SUSPENDED 拒绝，而准备又已经完成——实例既没有
-    // runner 也没有可恢复快照，resume 之后永远 BPMN_STATE_MISSING。这里让它 BUSY。
+    // MAJOR-4 残余 + NEW-1：所有权必须**在准备之前**登记。
+    //
+    // 0.14.4 只用进程内 `_preparing` 计数挡同进程挂起；跨进程的 `suspend` 看不到它，
+    // 于是「准备中」窗口能被打断（创建 409 NOT_ACTIVE、实例永远 STATE_MISSING）。
+    // 方案：实例目录一建好就写 owner.json（`claimInstanceOwner` 走跨进程 flock 互斥），
+    // 别的进程 `_suspendBusy` 看到活 owner → 409 kind:owner。准备失败 / 首次启动被拒
+    // 时交还自己写的那份，绝不留下「占着所有权却不执行」的空壳。
     this._bumpPreparing(instance.id, 1)
+    let keepOwner = false
     try {
-      return await this._finishCreateInstance(instance, workspaceOption, resolvedWorkspace)
+      await this._claimOwner(instance.id)
+      const result = await this._finishCreateInstance(instance, workspaceOption, resolvedWorkspace)
+      keepOwner = result.status === 201
+      return result
     } finally {
       this._bumpPreparing(instance.id, -1)
+      if (!keepOwner) await this._releaseOwner(instance.id).catch(() => {})
     }
   }
 
@@ -1774,12 +1783,39 @@ class BpmnRuntime {
     else this._pendingEventCommits.delete(instanceId)
   }
 
-  /** 登记本 runtime 的执行所有权（写 `owner.json`）。 */
+  /**
+   * 登记本 runtime 的执行所有权（写 `owner.json`）。
+   *
+   * NEW-1：`claimInstanceOwner` 现在在跨进程 flock 临界区里判定并写入；拿不到
+   * （别的活进程持有 / 记录无法确认）就抛 409 业务码。调用方必须在恢复、signal、
+   * adapter 派发**之前**处理这个错误——「先读一遍再写」不算互斥。
+   */
   async _claimOwner(instanceId) {
-    const claimed = await claimInstanceOwner(instanceId, {
-      instancesRoot: this.instancesRoot,
-      owner: selfOwner(this.runtimeId),
-    })
+    let claimed
+    try {
+      claimed = await claimInstanceOwner(instanceId, {
+        instancesRoot: this.instancesRoot,
+        owner: selfOwner(this.runtimeId),
+      })
+    } catch (error) {
+      if (error?.code === 'INSTANCE_OWNED_ELSEWHERE') {
+        throw new BpmnRuntimeError(
+          409,
+          'BPMN_INSTANCE_ACTIVE_ELSEWHERE',
+          `实例 ${instanceId} 的执行所有权被另一个活进程持有（pid ${error.owner?.pid ?? '?'} @ ${error.owner?.host ?? '?'}），本次不恢复、不派发`,
+          { instanceId, owner: error.owner ?? null },
+        )
+      }
+      if (error?.code === 'INSTANCE_OWNER_UNKNOWN') {
+        throw new BpmnRuntimeError(
+          409,
+          'BPMN_OWNER_UNKNOWN',
+          `实例 ${instanceId} 的执行所有权记录无法确认（坏 JSON / 跨主机）：为安全起见不恢复、不派发；请人工核对 owner.json`,
+          { instanceId, owner: error.owner ?? null },
+        )
+      }
+      throw error
+    }
     this._ownedInstances.add(instanceId)
     return claimed
   }
@@ -1796,6 +1832,36 @@ class BpmnRuntime {
     } catch {
       return false
     }
+  }
+
+  /**
+   * 恢复 / 准备没有产出可用 runner 时交还所有权。
+   *
+   * 只做过准备的进程不能继续占着实例：owner 活着时别的进程既不能执行也不能挂起
+   * （`_suspendBusy` 409），会变成事实上的死锁。仍留有 runner 的路径不释放。
+   */
+  async _releaseOwnerIfIdle(instanceId) {
+    if (this._runners.has(instanceId)) return false
+    return await this._releaseOwner(instanceId)
+  }
+
+  /**
+   * 把内存 runner 从缓存里摘掉并停掉：磁盘才是权威事实。
+   *
+   * 用于「已确认失败」（`executionFailure` 落盘）与「准备完成但准入被拒」——这些
+   * runner 不能再被当成与磁盘一致的缓存（复审 NEW-3 / MAJOR-1 残余）。
+   */
+  async _dropRunner(instanceId) {
+    const runner = this._runners.get(instanceId)
+    if (runner === undefined) return false
+    this._runners.delete(instanceId)
+    this._suppressWait.delete(instanceId)
+    try {
+      await runner.stop()
+    } catch {
+      // 释放路径不抛：磁盘上的 state 仍可被新进程恢复。
+    }
+    return true
   }
 
   /**
@@ -2632,6 +2698,31 @@ class BpmnRuntime {
       }
       const ensured = await this._ensureRunner(instance)
       if (ensured.runner === null) {
+        // 准备期间被挂起（准入复查发现磁盘已 SUSPENDED）：与入口判定同口径，明确告诉调用方
+        // 「先 resume」，而不是含糊的 NOT_RECOVERABLE。
+        if (ensured.code === 'BPMN_STATE_SUSPENDED') {
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              code: 'INSTANCE_SUSPENDED',
+              error: `实例 ${id} 已挂起（SUSPENDED），挂起期间不能完成人工任务；先 POST /instances/${id}/resume 再完成`,
+            },
+          }
+        }
+        // MAJOR-3 残余（契约）：已落盘的执行失败在冷恢复路径必须与热 runner 同口径——
+        // `BPMN_INSTANCE_BLOCKED` + `recoveryCode`（失败码），而不是 NOT_RECOVERABLE。
+        if (ensured.blocked === true) {
+          return {
+            status: 409,
+            body: {
+              ok: false,
+              code: 'BPMN_INSTANCE_BLOCKED',
+              error: `实例 ${id} 的执行已停下（lastError），不能再完成任务`,
+              ...(ensured.code ? { recoveryCode: ensured.code } : {}),
+            },
+          }
+        }
         return {
           status: 409,
           body: {
@@ -2646,9 +2737,16 @@ class BpmnRuntime {
       // runner 内部 blocked = 这个实例的执行已经停下（error 事件已发、lastError 已写）：
       // 实例 status 仍是 ACTIVE，但不能再完成人工任务。
       if (runner.status() === BPMN_RUNNER_STATUS.BLOCKED) {
+        const blockedCode = this._runnerErrors.get(id)?.code
+          ?? (typeof instance.lastError?.code === 'string' && instance.lastError.code !== '' ? instance.lastError.code : null)
         return {
           status: 409,
-          body: { ok: false, code: 'BPMN_INSTANCE_BLOCKED', error: `实例 ${id} 的执行已停下（lastError），不能再完成任务` },
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_BLOCKED',
+            error: `实例 ${id} 的执行已停下（lastError），不能再完成任务`,
+            ...(blockedCode !== null ? { recoveryCode: blockedCode } : {}),
+          },
         }
       }
       if (runner.status() !== 'waiting') {
@@ -2681,6 +2779,44 @@ class BpmnRuntime {
       if (decidedBy !== null && effectivePayload.decidedBy === undefined) {
         effectivePayload.decidedBy = decidedBy
       }
+
+      // MAJOR-1 残余（最后一道准入）：准备 / 恢复是异步的，真正派发之前必须从**磁盘**
+      // 再读一次生命周期事实。准备期间别的进程已经提交的 SUSPENDED / 终态在这里拦下，
+      // 绝不进入 `runner.signalTask`（否则下游 agent 被派发、事件被 store 闸门丢掉，
+      // 内存 runner 已 done、磁盘仍留待办）。
+      const admission = await readInstance(id, { instancesRoot: this.instancesRoot })
+      if (admission === null) return instanceNotFound(id)
+      if (this._stopping.has(id)) {
+        return {
+          status: 409,
+          body: { ok: false, code: 'BPMN_INSTANCE_STOPPING', error: `实例 ${id} 正在停止，本次任务完成未被采纳` },
+        }
+      }
+      if (TERMINAL_STATUSES.has(admission.status)) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'BPMN_INSTANCE_TERMINAL',
+            error: `实例 ${id} 已结束（${admission.status}），本次任务完成未被采纳`,
+          },
+        }
+      }
+      if (admission.status === 'SUSPENDED') {
+        // 已恢复但不能再推进：从缓存摘掉并停掉，不能继续当 runner 缓存用；所有权交还，
+        // 让 resume 之后的下一次请求重新取得准入。
+        await this._dropRunner(id)
+        await this._releaseOwner(id)
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            code: 'INSTANCE_SUSPENDED',
+            error: `实例 ${id} 已挂起（SUSPENDED），挂起期间不能完成人工任务；本次任务完成未被采纳，先 POST /instances/${id}/resume 再完成`,
+          },
+        }
+      }
+
       let signalError = null
       try {
         await runner.signalTask({ activityId: task.activityId, executionId: task.executionId, payload: effectivePayload })
@@ -3019,8 +3155,24 @@ class BpmnRuntime {
   }
 
   /**
-   * 生命周期状态 + 事件一次提交：`appendInstanceEvents` 的 `status` 选项在同一次
-   * `instance.json` 写入里改状态，事件行随后追加（崩溃只会留下 seq 空洞）。
+   * 生命周期事件 + 状态的**一次提交**（`appendInstanceEvents` 的 `status` 选项在同一次
+   * `instance.json` 写入里改状态，事件行随后追加）。
+   *
+   * 抽成方法只为让测试能注入 store 的「本次提交事实」契约（见 NEW-2 测试）；生产路径
+   * 就是 store 的直调。**不要**在这里根据磁盘状态推断提交结果。
+   */
+  async _appendLifecycleEvent(instanceId, event, options) {
+    return await appendInstanceEvents(instanceId, 'process', 1, event, options)
+  }
+
+  /**
+   * 生命周期状态 + 事件一次提交。
+   *
+   * NEW-2：**只认 store 给出的本次提交事实**。`appendInstanceEvents` 在「元数据已提交、
+   * 事件正文追加失败」时抛带 `committed:true / eventLogPending:true / lastSeq` 的错误；
+   * 只有 `error.committed === true` 才按「已提交、事件日志待补」返回 200。其它失败一律
+   * 原样抛——绝不因为「磁盘最终状态等于目标状态」就认领别人的提交（那会把 B 的 resume
+   * 当成 A 的提交，还会替 B 编造 reason）。
    */
   async _commitLifecycleStatus(instance, status, eventType, reason, timeKey, expectedStatus) {
     const at = new Date().toISOString()
@@ -3032,7 +3184,7 @@ class BpmnRuntime {
     }
     let appended
     try {
-      appended = await appendInstanceEvents(instance.id, 'process', 1, event, {
+      appended = await this._appendLifecycleEvent(instance.id, event, {
         instancesRoot: this.instancesRoot,
         status,
         expectedStatus,
@@ -3057,15 +3209,14 @@ class BpmnRuntime {
             ok: false,
             code: error.code,
             error: error.reason ?? error.message,
+            // 文档契约要求两个字段都带；store 的 InstanceError 两个都有。
+            expectedStatus: error.expectedStatus ?? expectedStatus ?? null,
             actualStatus: error.actualStatus ?? null,
           },
         }
       }
-      // MAJOR-5：状态与事件不是一次写盘——状态已提交、事件追加失败时，磁盘才是事实。
-      // 重新读一次：磁盘已是目标状态就按「已提交、事件日志待补」返回 200，不再让调用方
-      // 误以为迁移没发生；事件正文缺失由读侧 eventLogGap 暴露（不重复补写、不伪造）。
-      const current = await readInstance(instance.id, { instancesRoot: this.instancesRoot })
-      if (current !== null && current.status === status) {
+      // 部分提交：只有 store 明确报告「本次元数据已提交」才如实返回 200。
+      if (error?.committed === true) {
         return {
           status: 200,
           body: {
@@ -3073,10 +3224,10 @@ class BpmnRuntime {
             id: instance.id,
             status,
             reason: reason ?? null,
-            lastSeq: current.lastSeq,
+            lastSeq: Number.isSafeInteger(error.lastSeq) ? error.lastSeq : null,
             [timeKey]: at,
             committed: true,
-            eventLogPending: true,
+            eventLogPending: error.eventLogPending === true,
             eventLogError: error?.code ?? error?.message ?? errorText(error),
           },
         }
@@ -4073,17 +4224,32 @@ class BpmnRuntime {
     }
     const ownedByMe = mine && ownerInfo.state === 'alive'
 
-    const cached = this._runners.get(instance.id)
-    if (cached !== undefined && cached.status() !== 'idle') {
-      // 同一进程内 `_suspended` 闩已删除：谁下一次执行，谁就重新拿回所有权。
-      if (!ownedByMe) await this._claimOwner(instance.id)
-      return { runner: cached, recovered: false }
+    // NEW-1 / MAJOR-1 残余：**在恢复 / 派发之前**真正拿到所有权。
+    //
+    // 0.14.4 在 runner 建好之后才 claim，且 claim 是无条件覆盖：准备窗口里别的进程
+    // 可以 suspend，两个进程也能各写一份 owner 后各自派发。现在 claim 走跨进程
+    // flock 互斥，拿不到就在这里返回 409（runner=null），recover / adapter 一步都不走。
+    if (!ownedByMe) {
+      try {
+        await this._claimOwner(instance.id)
+      } catch (error) {
+        if (error instanceof BpmnRuntimeError) {
+          return {
+            runner: null,
+            recovered: false,
+            reason: error.message,
+            code: error.code,
+            ...(isPlainObject(error.owner) ? { owner: error.owner } : {}),
+          }
+        }
+        throw error
+      }
     }
-    if (cached !== undefined) this._runners.delete(instance.id)
 
-    // 已确认的执行失败是「恢复禁止标记」：必须在读旧快照 / 重放之前拦下。
-    // 墓碑（state.json）可能还没来得及写，不能把错误事实的可靠性押在第二次写入上。
+    // NEW-3：已确认的失败事实优先于**任何**缓存 runner。失败标记一旦落盘，
+    // 旧 runner 不能再被当缓存使用（否则 complete 会走缓存返回 200 / COMPLETED）。
     if (isPlainObject(instance.executionFailure)) {
+      await this._dropRunner(instance.id)
       // `lastError` 可能是更精确的收口错误（handler 的 cause code），与墓碑同一口径。
       const code = (typeof instance.lastError?.code === 'string' && instance.lastError.code !== '')
         ? instance.lastError.code
@@ -4093,9 +4259,11 @@ class BpmnRuntime {
       const message = (typeof instance.lastError?.message === 'string' && instance.lastError.message !== '')
         ? instance.lastError.message
         : (typeof instance.executionFailure.message === 'string' ? instance.executionFailure.message : '执行已确认失败')
+      await this._releaseOwnerIfIdle(instance.id)
       return {
         runner: null,
         recovered: false,
+        blocked: true,
         reason: `实例因执行失败已不可恢复（${code}）：${message}。`
           + '这是已落盘的失败事实，不能自动重放旧执行位置；人工处置：retry / mark-* 只解除 connector 调用记录限制，'
           + '当前实例仍不能继续；若要移除失败标记与墓碑，请用 POST /instances/<id>/connector/<recordId>/resolve '
@@ -4105,15 +4273,23 @@ class BpmnRuntime {
       }
     }
 
+    const cached = this._runners.get(instance.id)
+    if (cached !== undefined && cached.status() !== 'idle') {
+      return { runner: cached, recovered: false }
+    }
+    if (cached !== undefined) this._runners.delete(instance.id)
+
     let state
     try {
       state = await readInstanceState(instance.id, { instancesRoot: this.instancesRoot })
     } catch (error) {
+      await this._releaseOwnerIfIdle(instance.id)
       throw new BpmnRuntimeError(500, 'BPMN_STATE_READ_FAILED', `读取实例 ${instance.id} 的 state.json 失败：${errorText(error)}`, {
         instanceId: instance.id,
       })
     }
     if (state === null || state === undefined) {
+      await this._releaseOwnerIfIdle(instance.id)
       return {
         runner: null,
         recovered: false,
@@ -4127,6 +4303,7 @@ class BpmnRuntime {
       const code = typeof state.unrecoverable.code === 'string' && state.unrecoverable.code !== ''
         ? state.unrecoverable.code
         : 'BPMN_STATE_UNRECOVERABLE'
+      await this._releaseOwnerIfIdle(instance.id)
       return {
         runner: null,
         recovered: false,
@@ -4140,13 +4317,26 @@ class BpmnRuntime {
       }
     }
 
-    const snapshot = await this._readDefinitionSnapshot(instance.id)
+    let snapshot
+    try {
+      snapshot = await this._readDefinitionSnapshot(instance.id)
+    } catch (error) {
+      await this._releaseOwnerIfIdle(instance.id)
+      throw error
+    }
     if (snapshot === null) {
+      await this._releaseOwnerIfIdle(instance.id)
       throw new BpmnRuntimeError(500, 'INSTANCE_SNAPSHOT_MISSING', `实例 ${instance.id} 的定义快照缺失`, {
         instanceId: instance.id,
       })
     }
-    const parsed = await parseBpmn(snapshot.xml)
+    let parsed
+    try {
+      parsed = await parseBpmn(snapshot.xml)
+    } catch (error) {
+      await this._releaseOwnerIfIdle(instance.id)
+      throw error
+    }
     // 恢复准备也是异步的：stop 在读取/解析期间同样可能已经返回 CANCELED。
     // 这里到 runner 创建之间没有 await，复查必须同步完成（review-0131 #1）。
     const stoppedWhilePreparing = this._latchBlockForPrepare(instance.id)
@@ -4159,23 +4349,50 @@ class BpmnRuntime {
       }
     }
     if (!parsed.ok) {
+      await this._releaseOwnerIfIdle(instance.id)
       throw new BpmnRuntimeError(500, 'BPMN_DEFINITION_INVALID', `实例 ${instance.id} 的定义快照未通过 BPMN 校验`, {
         errors: parsed.errors,
       })
     }
 
-    const runner = this._newRunner(parsed.definition, snapshot.xml, instance.id, instance.variables, {
-      definitionId: snapshot.definitionId,
-      definitionVersion: snapshot.definitionVersion,
-    })
-    this._runners.set(instance.id, runner)
+    // MAJOR-1 残余：准备完成、真正派发之前，从**磁盘**重新取得准入。
+    //
+    // 准备（state / 定义快照 / 解析）是异步的；期间别的进程可能已经提交 SUSPENDED
+    // 或终态。仍然拿进入 `_ensureRunner` 时的旧快照建 runner / recover / 派发，会让
+    // 事件被 store 闸门丢掉，内存 runner 与磁盘分裂（复审 O dispatch_after_suspend）。
+    const admission = await readInstance(instance.id, { instancesRoot: this.instancesRoot })
+    if (admission !== null && TERMINAL_STATUSES.has(admission.status)) {
+      await this._releaseOwnerIfIdle(instance.id)
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例 ${instance.id} 在准备期间已是终态 ${admission.status}，本次不恢复、不派发`,
+        code: null,
+      }
+    }
+    if (admission !== null && admission.status === 'SUSPENDED') {
+      await this._releaseOwnerIfIdle(instance.id)
+      return {
+        runner: null,
+        recovered: false,
+        reason: `实例 ${instance.id} 在准备期间被挂起（SUSPENDED）：本次不恢复、不派发，等 resume 后再推进`,
+        code: 'BPMN_STATE_SUSPENDED',
+      }
+    }
+
+    let runner
     try {
-      if (!ownedByMe) await this._claimOwner(instance.id)
+      runner = this._newRunner(parsed.definition, snapshot.xml, instance.id, instance.variables, {
+        definitionId: snapshot.definitionId,
+        definitionVersion: snapshot.definitionVersion,
+      })
     } catch (error) {
-      this._runners.delete(instance.id)
-      await runner.stop().catch(() => {})
+      // 同进程 runner 活跃表冲突（BPMN_INSTANCE_ID_CONFLICT）等：本次没产出 runner，
+      // 不能把所有权留在自己手上（否则别的进程会一直看到活 owner 却没人执行）。
+      await this._releaseOwnerIfIdle(instance.id)
       throw error
     }
+    this._runners.set(instance.id, runner)
     // recover 会重放一次 activity/wait（runner 坑 g）：按 state 里已知的 executionId 去重。
     const pending = Array.isArray(state?.pendingTasks) ? state.pendingTasks : []
     this._suppressWait.set(instance.id, new Set(
@@ -4191,6 +4408,7 @@ class BpmnRuntime {
       } catch {
         // 恢复失败时 stop 只是清活跃表；失败不影响「不可恢复」结论。
       }
+      await this._releaseOwnerIfIdle(instance.id)
       const code = typeof error?.code === 'string' ? error.code : 'BPMN_STATE_RECOVER_FAILED'
       const reason = `state 不可恢复：${errorText(error)}`
       // 快照/定义无法反序列化或结构不一致 = 引擎不可恢复：实例卡住（blocked），

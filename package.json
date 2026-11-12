@@ -58,6 +58,7 @@
     "url": "https://github.com/FeiyuEVE/dsh-flow-studio/issues"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "2.6.0",
     "@modelcontextprotocol/sdk": "1.32.2",
     "bpmn-elements": "^18.1.1",
     "bpmn-engine": "26.0.6",
@@ -65,6 +66,7 @@
     "debug": "^4.4.3",
     "lru-cache": "^11.5.3",
     "moddle-context-serializer": "^6.0.2",
-    "smqp": "^15.0.0"
+    "smqp": "^15.0.0",
+    "zod": "4.6.7"
   }
 }

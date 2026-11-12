@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.5）
+# 版本历史（0.1 → 0.14.6）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -963,3 +963,37 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 提示词仍在 argv（本轮不切 stdin）：200 KB 提示词现在是**干净失败**（`E2BIG` → 工具不可用 + 清理），限制本身未消除。
 - 用量账本不淘汰（按唯一调用增长），极长会话内存随调用数上升。
 - 跨实例汇总只要有一个实例 usage 未知，四桶合计降级为 `null`（另给已观测小计）。
+
+**勘误（0.14.6）**
+
+- 「启动失败清理（M4）」里「参数构造、同步 `spawn` 异常、握手都在保护块内」只对 Claude 成立：本版 Codex 的同步 `spawn` 仍在保护块外，`E2BIG` 会残留 runDir / MCP server / listener。0.14.6 把 Codex 对齐 Claude。
+- 「退出分类（M6）」的编号顺序与实现不符：两端先判 `state.canceled` 再判 `finishGate.settled()`，已受理 gate 后的迟到 cancel 会把成功改写成 `NODE_FINISH_CANCELED`；Claude 被信号终止（SIGKILL）仍会提醒后落 `NODE_FINISH_MISSING`。0.14.6 改为「受理优先」，并补 `cli-signaled` / `CODEX_CLI_SIGNALED`。
+- 「结算快照（M2）」的三条承诺本版未完全成立：`start()` 在返回 handle 前失败时已观测 usage 丢失；`provisional` 调用仍可能被标完整；快照范围键缺 provider / agentScope，同 invocation 的 main / subagent 会互相覆盖；unknown `snapshotId` 跨执行撞 key。0.14.6 修正这些口径。
+- 「四桶与部分观测（M7）」本版仍未把 `observedBuckets` 当权威、也未把「有轮次完全没观测到」计入不完整；0.14.6 修正。
+- Codex / Claude 终态错误本版只做本执行 token 精确替换与字符截断，不覆盖 Bearer / `sk-` / 通用 `token=`，也不按 UTF-8 字节限长；Codex 的 `failure.code` 未清洗。0.14.6 统一脱敏与 ≤1000 字节上限。
+
+## 0.14.6 — 所有权互斥、读侧一致性与终态错误口径
+
+修的是 0.14.5 闭环复审留下的挂起 / 所有权、读侧一致性、用量范围与错误出口问题。
+
+- **所有权互斥（NEW-1）**：`claimInstanceOwner()` / `releaseInstanceOwner()` 的「读旧记录 → 判定 → 原子替换 / 删除」整段跑在 `instances/.locks/<instanceId>.lock` 的内核 `flock` 临界区里（复用 `instance-resources.js` 的宿主 fd 实现，helper 死亡 fail-closed），最多等 10 秒。两个进程不再同时从「没有 owner」各写一份。活进程持有 → 409 `INSTANCE_OWNED_ELSEWHERE`（投影 `BPMN_INSTANCE_ACTIVE_ELSEWHERE`）；坏 JSON / 跨主机 → 409 `INSTANCE_OWNER_UNKNOWN`（投影 `BPMN_OWNER_UNKNOWN`）；只有可验证 `gone` 才接管。存活判定修正为：pid 存活但读不到 starttime 按 `alive` 保守处理（不再说成 `unknown`）。
+- **准备窗口与派发前准入（MAJOR-1 / MAJOR-4 残余）**：`POST /instances` 在 `createInstance()` 之后、workspace 准备与首次启动之前 claim，准备失败 / 首次启动被拒在 `finally` 交还；懒恢复在读 state / 定义、建 runner、`recover` 之前 claim。解析完成、建 runner 之前从磁盘重读准入（终态 / `SUSPENDED` → 不恢复、不派发、交还所有权）；`complete` 在 `signalTask()` 之前再读一次（`SUSPENDED` → 409 `INSTANCE_SUSPENDED` 并摘掉 / 停止缓存 runner；`_stopping` / 终态 → `BPMN_INSTANCE_STOPPING` / `BPMN_INSTANCE_TERMINAL`），本轮零派发。
+- **失败事实优先于缓存 runner（NEW-3）**：`_ensureRunner` 先 claim，再看 `executionFailure`；标记落盘后缓存 runner 会被摘掉并停止，`complete` 409 `BPMN_INSTANCE_BLOCKED` + `recoveryCode`。
+- **冷恢复错误口径（MAJOR-3 残余）**：冷恢复命中已落盘失败事实时，`resume` 之后的 `complete` 与热 runner 同口径返回 409 `BPMN_INSTANCE_BLOCKED` + `recoveryCode`（取 `lastError.code` / `executionFailure.code`），不再返回 `BPMN_INSTANCE_NOT_RECOVERABLE`。后者仍用于 state 缺失、墓碑、定义损坏、外部所有权等无法重建 runner 的情形。
+- **生命周期提交事实（NEW-2）**：`appendInstanceEvents` 用 store 的 `InstanceError` 自证阶段——`INSTANCE_EVENT_APPEND_FAILED`（`committed:true` / `eventLogPending:true` / `firstSeq` / `lastSeq` / `status` / `revision` / `eventLogError`）与 `INSTANCE_METADATA_WRITE_FAILED`（`committed:false`）。路由**只认 `error.committed === true`** 才返回 200 + `committed` / `eventLogPending` / `eventLogError`，不再用「磁盘最终状态 == 目标状态」认领别的请求的提交。`INSTANCE_LIFECYCLE_CONFLICT` 的 409 响应同时带 `expectedStatus` / `actualStatus`（此前路由丢了 `expectedStatus`）。
+- **读侧一致性（MINOR-1 残余）**：`readInstanceSnapshot()` 固定已分配水位 `allocated = instance.lastSeq`，只返回 `seq <= allocated`；分片前后 `stat()` 复核 `size` / `mtimeMs`，加上 `seq > allocated` / 范围内缺失，做 3 次有界重试。`GET /events` 的 `lastSeq` 改为**连续可见水位**（第一个缺口之前），不再拿本批最大 seq 当可消费游标；`eventLogGap{allocated, visible, missing?, skipped?, unstable?, retries}` 显式报告缺口 / 不稳定。缺口之后的可见事件仍会返回，`?since=lastSeq` 不会跳过缺失 seq，但可能重复返回已见事件。`eventsHash` 改为规范化事件全文的 sha256（不再只 `seq/type/at` 等少数字段）。
+- **指标缓存与归约（M7 / M2 / F1 / F3）**：事件集合指纹改为**规范化事件全文的 sha256**，同 `seq/type/at` 但 `elementId` / usage 桶 / scope 被修正也会换 key；缓存 key 另含 usage 指纹。`observedBuckets` 成为权威掩码（不在掩码里的桶是 `null`，补零不能算已观测）；`provisional` 调用 / 范围不计完整，完整 total 为 `null` 并带 `usage-output-provisional`。范围键改为 `provider + sessionScopeId + agentScope`（+ `invocationId`）；同 invocation 的 main / subagent 快照、同 session 不同 provider 的累计快照不再互相覆盖，覆盖关系不可证明时保留事实并降级 `partial` + `usage-scope-unknown`。快照去重键改为 `provider + snapshotId`；unknown `snapshotId` 带执行作用域 + 账本 nonce，跨执行不再撞名。
+- **Claude 用量（M1 残余）**：迟到的 `session_id` 会把此前未绑定 session 的调用**重键合并**，同一 `message.id` 不会因为 init 晚到变成两次调用。
+- **失败载体的用量（M2 残余）**：适配器 `start()` 在返回 handle 之前失败时，把已观测调用 / 快照挂到错误对象的 `usageCalls` / `usageSnapshots`；`agent-execute` 从 `failure.cause` 读取并落 `agent/usage` / `agent/usage-snapshot`。握手前失败不写 synthetic 占位，不伪造调用事实。
+- **Codex 启动清理（M4 残余）**：runDir 一创建就进资源 registry；写 hook、建 channel / listener、构造参数、同步 `spawn`（含 `E2BIG`）、握手都在保护块内，失败时 abort 闸门、整组 TERM→KILL、关 channel / 撤 listener / 删 runDir，并附 `cleanup` / `cleanupFinal`。
+- **终态错误（M6 残余 + F2）**：Claude 被信号终止 → `CLAUDE_PROVIDER_ERROR`，`error.code` 形如 `cli-signaled`，0 提醒；Codex 补 `CODEX_CLI_SIGNALED` / `CODEX_CLI_ERROR`，与 `CODEX_CLI_TURN_FAILED` / `CODEX_CLI_EXIT_NONZERO` 并列，`errorDetails:{kind, cliCode}`。两端都改为**闸门已受理优先于迟到 cancel**：cancel 只负责进程清理，不改写成功结果。终态错误统一走共享 `redactText` + 本执行精确秘密替换 + UTF-8 字节上限（Claude `code` / `subtype` ≤200 字节、`message` ≤1000 字节；Codex `cliCode` ≤200 字节、`reason` ≤300 字节、`message` ≤1000 字节），超出带 `…[truncated]` 标记。
+- **`sessionId` 诚实性（m3 残余）**：probe 不支持 `--session-id`、CLI 也不报 session 时，`handle.sessionId` / `exited.sessionId` 返回 `undefined`，不再返回一个从未传给 CLI 的随机 UUID；没有可续跑 id 时按 `NODE_FINISH_MISSING` 收口。
+
+**已知边界**
+
+- 所有权互斥只在同机、本地文件系统、所有进程都使用 0.14.6+ 协议时成立；跨主机、NFS / SMB、旧协议进程不在保证内；没有 util-linux `flock` 的平台降级为进程内队列。
+- `createInstance()` 落盘到 `owner.json` 落盘之间仍有极短窗口，本版不承诺跨进程挂起不会插进这段窗口；`owner.json` 为 `unknown` 时不自动接管，需要人工核对。
+- 读侧缺口之后的可见事件仍会返回：`?since=lastSeq` 是「不跳过」而不是「不重复」；持久缺口要人工核对分片。指标读侧仍用全量事件 + `instance.lastSeq` / 坏行数判完整性，不消费 `GET /events` 的连续游标。
+- 指标对「范围覆盖关系」只能降级：同一 invocation 多份快照 / 同 session 多 provider 累计快照保留事实并标 `partial`，不猜相加或取最大。
+- 终态错误脱敏依赖共享规则 + 本执行精确秘密；未知格式的秘密仍可能漏过。runtime 的 8 KiB 事件裁剪是另一层，不替代脱敏。
+- 真实 Claude CLI 仍未验证（本机无 CLI）；Windows / 非 Linux 的 `flock`、`/proc`、进程组清理未实测；实例写入仍无 fsync，只保证进程崩溃下的 seq 空洞语义。

@@ -24,7 +24,7 @@
 |---|---|---|
 | `agent/invocation` | `invocationId`、`provider`、`phase`（`start` / `reminder`）、`count?`、`attempt?` | 一次真实启动或提醒续跑轮次；初始轮 `invocationId=<executionId>:invoke-1`，第 N 次提醒续跑 `<executionId>:invoke-rN` |
 | `agent/usage` | `provider`、`callId`、`trust`（`known` / `unknown`）、`usage?`、`reason?`、`invocationId?`、`source?`、`observedBuckets?`、`provisional?`、`synthetic?` | 一条模型调用观测；同一 `provider + callId` 后到的事件**替换**前一条 |
-| `agent/usage-snapshot` | `provider`、`snapshotId`、`scope`（`invocation` / `session-cumulative` / `unknown`）、`usage`、`observedBuckets`、`invocationId?`、`sessionScopeId?`、`agentScope?`、`provenance` | **范围级结算**（如 Claude `result.usage`）：不是一次模型调用、不增加 `modelCalls`；同一 `snapshotId` 取最新。resume 后范围不可证明时 `scope=unknown`，指标只能标未知，不按数值猜 sum / max |
+| `agent/usage-snapshot` | `provider`、`snapshotId`、`scope`（`invocation` / `session-cumulative` / `unknown`）、`usage`、`observedBuckets`、`invocationId?`、`sessionScopeId?`、`agentScope?`、`provenance` | **范围级结算**（如 Claude `result.usage`）：不是一次模型调用、不增加 `modelCalls`；去重键是 **`provider + snapshotId`**（0.14.6；`snapshotId` 只在单账本内唯一，跨 provider / 跨执行会撞名）。resume 后范围不可证明时 `scope=unknown`，指标只能标未知，不按数值猜 sum / max；unknown 的 `snapshotId` 带执行作用域 + 账本 nonce，不再每份都叫 `unknown:1` |
 | `agent/reminder` | `count`、`maxFires?` | `turn.stop` 每次实际触发一次提醒（0.13.1 已有事件） |
 | `http/attempt` | `invocationId`、`attempt`、`method`、`origin`、`path` | HTTP connector 真正发出请求前 |
 | `http/result` | `invocationId`、`attempt?`、`status?`、`durationMs?`、`reused?` | 单次 HTTP 尝试的结果 / 复用结果 |
@@ -35,6 +35,8 @@
 - `callId` 由适配器分配：codex 每轮 `turn.completed` 一个，dsh 每个 `attemptId` 一个；Claude 由 `claude-usage-ledger.js` 给出稳定身份 `claude-message-v1:<sha256(session|agentScope|message.id)>`（同一 `message.id` 的并行工具块是**同一个**模型响应，重复上报替换而不相加；没有 `message.id` 时标 `synthetic`，不伪造确定调用数）。真实的新调用必须有新 `callId`；同一次调用的重复上报是替换，不是第二次调用。
 - **调用与结算分开**：调用记录只描述模型响应与已观测桶；`result.usage` 这类范围级累计值走 `agent/usage-snapshot`，不塞进调用列表（否则会虚增 `modelCalls` 或制造错误归属）。同一范围、同一桶只选一个来源：有效结算快照覆盖该范围对应桶，没有结算桶时才用去重后的 assistant 观测。
 - **快照必须自证范围**：`provenance.realCliVerified` 只有真实 CLI 实测才允许为 `true`；Claude 账本当前固定写 `false`（**真实 Claude CLI 未验证**，见 design/09 的证据层次），快照的作用域不因此被当作已知。
+- **迟到的 session 身份要重键合并（0.14.6）**：Claude 的 `session_id` 可能晚于第一个 assistant 事件到达。账本在第一次确定 session 身份时，把此前按未绑定 session 记录的调用**重键**到确定身份；同一 `message.id` 与后到记录合并成一条（保留后到值，旧记录只补未观测桶），不会因为 init 晚到就算两次调用。
+- **失败也要落用量（0.14.6）**：`start()` 在返回 handle 之前失败时，适配器把已观测调用 / 快照挂在错误载体的 `usageCalls` / `usageSnapshots` 上；`agent-execute` 从 `failure.cause` 读取同一份载体，照常写 `agent/usage` / `agent/usage-snapshot`。只有拿到 handle 的轮次才在「宣称能观测却一条都没有」时写 unknown 占位，握手前失败不伪造调用事实。
 - `executionId` 是节点计时 / 人工等待 / 消息投递的主键；`attempt`（元素第几次激活）不承担计时职责。
 
 ## 3 四桶归一化
@@ -51,6 +53,8 @@
 | 已有四桶的输入 | `input` / `cacheRead` / `cacheWrite` / `output` | 视为已归一，不二次拆分 |
 
 数据矛盾（`cached > input`）时按原始 input 截断（先读后写），守住「四桶之和 === total」这条不变量；坏数值（负数、字符串、NaN）整条 usage 标 `unknown`，不把坏值当 0。
+
+**观测掩码是权威（0.14.6）**：事件带 `observedBuckets` 时，不在掩码里的桶即使 `usage` 对象里有 `0` 也是**未观测**（输出 `null`），不能把补零当真实值；只有历史事件缺掩码时才从数值反推，并标 `usage-history-mask-missing`。`provisional:true`（assistant 的 `output` 可能只是响应开始时的占位值、还没有 `result` 结算）时，桶值可以展示，但该调用 / 范围不计「完整」，完整 total 为 `null` 并带 `usage-output-provisional`。
 
 ## 4 指标表
 
@@ -82,9 +86,11 @@
 ## 5 去重与不双计
 
 1. **usage 按 `provider + callId` 替换**：同一调用重试 / 后到的更完整 usage 覆盖前值；不同 callId 才累加。
-2. **调用事件与 `activity/end.usage` 只取一处**：某个 execution 已有 `agent/usage` 事件时，`activity/end.usage` 一律忽略；只有该 execution 完全没有调用事件时才兜底，并在 `dataQuality.reasons` 记 `legacy-usage-fallback`。
-3. **reminder 每次触发计一次**：`agent/reminder` 是事实；`agent/invocation` 的 reminder 轮次只用于 agent 调用次数，不重复算 token。
-4. **NODE_FINISH_MISSING 按 execution 去重**：重复 `error` 事件、`lastError` 与事件同时存在，都只算一个 execution。
+2. **范围键包含 `provider + sessionScopeId + agentScope`（+ `invocationId`）**：不同范围不互相覆盖。同一 `invocationId` 出现 main / subagent 两份快照、或同一 `sessionScopeId` 出现不同 provider 的累计快照时，覆盖关系不可证明：保留全部事实、各自成范围，并整体降级为 `partial` + `usage-scope-unknown`，不能把「最后到达」当成完整总量。
+3. **快照按 `provider + snapshotId` 去重**：同 `snapshotId` 的不同 provider 是两条事实；scope=unknown 的快照用带执行作用域 / 账本 nonce 的 id，跨执行不覆盖。
+4. **调用事件与 `activity/end.usage` 只取一处**：某个 execution 已有 `agent/usage` 事件时，`activity/end.usage` 一律忽略；只有该 execution 完全没有调用事件时才兜底，并在 `dataQuality.reasons` 记 `legacy-usage-fallback`。
+5. **reminder 每次触发计一次**：`agent/reminder` 是事实；`agent/invocation` 的 reminder 轮次只用于 agent 调用次数，不重复算 token。
+6. **NODE_FINISH_MISSING 按 execution 去重**：重复 `error` 事件、`lastError` 与事件同时存在，都只算一个 execution。
 
 ## 6 汇总
 
@@ -98,9 +104,11 @@
 
 ## 7 缓存与读取边界
 
-- 缓存只缓存**事件侧归约**，指纹 = `schemaVersion + lastSeq + revision + 事件集合内容指纹`（另加 connector 记录指纹与 `resourceSeq`）。事件或实例事实一变，指纹变 → 自动重算；缓存可整体清空并重建，权威永远是事件与实例事实。
-- 事件集合内容指纹（0.14.4）取「条数 + 最大 seq + 坏行数 + `(seq|type|at)` 序列的 sha256」，不序列化整条事件。它专门覆盖「元数据没变、事件正文被补写」：生命周期 / 执行事件都是先提交 `lastSeq` / `revision` 再追加正文，只按元数据做 key 会命中事件尚不完整时算出的旧值。
+- 缓存只缓存**事件侧归约**，指纹 = `schemaVersion + usageSchema + lastSeq + revision + 事件集合内容指纹 + usage 指纹`（另加 connector 记录指纹与 `resourceSeq`）。事件或实例事实一变，指纹变 → 自动重算；缓存可整体清空并重建，权威永远是事件与实例事实。
+- 事件集合内容指纹（0.14.6）是**规范化事件全文的 sha256**：键排序后的整条事件都进来（`seq` / `type` / `at` / `activityId` / `elementId` / `from` / `to` / `status` / `error` / `usage` / `observedBuckets` / `provisional` / `scope` 等），不再只取 `(seq|type|at)`。同一 `seq` / `type` / `at` 但 `elementId`、桶值或快照 scope 被修正时 key 必须变。它专门覆盖「元数据没变、事件正文被补写 / 修正」：生命周期 / 执行事件都是先提交 `lastSeq` / `revision` 再追加正文，只按元数据做 key 会命中事件尚不完整时算出的旧值。
+- usage 还有一层独立的正文指纹（`usageFingerprint`，0.14.5 起）：调用身份、桶值、观测掩码、快照 scope / provider 一起摘要，作为事件全文指纹的补充，不替代它。
 - 归约自己报告 `complete:false`（缺已公布 seq、或有坏行）时**不写入缓存**：补写之后即使 key 相同也必须重算，不能返回窗口期算出的残缺值。
+- 指标读侧仍按 `readInstanceEvents()` 读全部事件，用 `instance.lastSeq` 与 `throughSeq` / 坏行数判 `complete`；它不消费 `GET /events` 的连续可见游标。`GET /events` 的固定已分配水位 / 有界重试 / `eventLogGap` 口径归 [实例域接口 · events](../reference/instance-api.md#get-instancesidevents)。
 - `asOf` 只参与最终投影（墙钟终点、当前等待、活跃 execution 的 `elapsedMs`），所以**没有新事件时人工等待仍会按 `asOf` 增长**，不会冻结在最后一个事件时间。
 - 两个指标 GET 都是**纯读**：不调用 `_ensureRunner()`、不恢复 runner、不因看页面推进实例。
 - `?asOf=` 是给离线复算 / 测试对账用的确定性入口；不传则用请求时刻。

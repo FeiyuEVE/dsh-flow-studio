@@ -237,7 +237,7 @@ $DSH_HOME/flow-studio/
 
 - **没有 `failed`，也没有 `blocked`/「卡住」状态**。用户口径（2026-11-11）：卡住不具备通用性，属于业务自己判别，引擎不做这个状态。
 - `SUSPENDED` 的进入条件（0.14.3 引入 quiesce 式软挂起，0.14.4 扩到「准备窗口 / 未完成事件提交 / 跨进程执行所有权」）：实例 `ACTIVE` 且没有在飞活动——没有在跑 agent、runner 不在执行、没有排队中的事件提交、实例不在首次创建 / 工作区准备窗口、connector 记录里没有 `started` / `sent` / `unknown`、也没有另一个活进程持有执行所有权。任一未结算 → 409 `INSTANCE_SUSPEND_BUSY`，不改状态、不写事件。挂起写 `instance/suspended`（含 `reason`），保留 `pendingTasks`，不杀 runner、不重放；之后 `_ensureRunner()` 跳过、`complete` 409 `INSTANCE_SUSPENDED`、入站消息排队、`GET` 不因读而恢复。字段级契约（`activities[]` 的 kind / 字段）归 [实例域接口 · 挂起 / 恢复](../reference/instance-api.md#挂起与恢复)。
-- `SUSPENDED` 的离开条件：`POST /instances/<id>/resume` 置回 `ACTIVE` + 写 `instance/resumed`（不主动跑，下一次推进沿用懒恢复；只翻磁盘事实、不检查执行所有权）；`POST /instances/<id>/stop` 直接收成 `CANCELED`。`SUSPENDED` 是受保护状态：期间执行事件追加、引擎快照写入、`COMPLETED` 收口都被拒，状态也不能被晚到写入改回 `ACTIVE`（错误事实通道除外，见 [§10](#10-并发模型0144)）。终态不可逆，`COMPLETED` / `CANCELED` 上挂起 / 恢复一律 409。
+- `SUSPENDED` 的离开条件：`POST /instances/<id>/resume` 置回 `ACTIVE` + 写 `instance/resumed`（不主动跑，下一次推进沿用懒恢复；只翻磁盘事实、不检查执行所有权）；`POST /instances/<id>/stop` 直接收成 `CANCELED`。`SUSPENDED` 是受保护状态：期间执行事件追加、引擎快照写入、`COMPLETED` 收口都被拒，状态也不能被晚到写入改回 `ACTIVE`（错误事实通道除外，见 [§10](#10-并发模型01440146)）。终态不可逆，`COMPLETED` / `CANCELED` 上挂起 / 恢复一律 409。
 - `running` / `waiting` 不是状态：它们是 runner 的内部执行态，不写进 `instance.json.status`；「在等人」用 `ACTIVE` + `pendingTasks` 非空表达。
 - 引擎内部出错（条件求值错、活动/整轮超时、handler 失败、adapter 不可用、提醒用尽、连线超限/循环护栏）时：`status` **保持 `ACTIVE` 不变**，同时写 `lastError{code,message,nodeId?,activityId?,retries?}` 并发 `error` 事件；是否重试/终止/继续，由业务或人决定，引擎不替它判「卡住」。
 - 终态只有 `COMPLETED` 与 `CANCELED`。
@@ -313,21 +313,33 @@ runner 内部执行态（不对外当实例状态）：
 1. 读 `instance.json`；终态 → **不恢复**，返回 `recovered:false` + 终态原因。
 2. `status:"SUSPENDED"` → **不恢复**，返回 `recovered:false` + `BPMN_STATE_SUSPENDED`、`runnerStatus:null`；
    `pendingTasks` 仍按磁盘事实返回。读挂起实例不会创建 runner，更不会推进（0.14.3）。
-3. 执行所有权被另一个**活着**的进程持有 → **不恢复**，`recovered:false` +
-   `BPMN_INSTANCE_ACTIVE_ELSEWHERE`；所有权记录读不出 / 无法确认（跨主机、坏 JSON）→
+3. 读 `owner.json`：被另一个**活着**的进程持有 → **不恢复**，`recovered:false` +
+   `BPMN_INSTANCE_ACTIVE_ELSEWHERE`；所有权记录读不出 / 无法确认（跨主机、坏 JSON、`state:"unknown"`）→
    `BPMN_OWNER_UNKNOWN`。两种情况都保守拒绝，不靠时间猜（0.14.4）。
-4. `instance.json.executionFailure` 存在 → **不恢复**：这是已确认执行失败的恢复禁止标记，
-   在读写引擎快照之前就拦下（墓碑可能还没写成），`recovery.code` 取 `lastError.code`（缺省
-   `executionFailure.code`）。
-5. 读 `state.json`；缺失/空 → 返回 `recovered:false` + `BPMN_STATE_MISSING` 原因
-   （GET 200；写操作 409 `BPMN_INSTANCE_NOT_RECOVERABLE`）。
-6. 读实例自己的 `definition.bpmn`，重新 `parseBpmn` 得到 definition；
+4. **claim 执行所有权**（0.14.6）：除非磁盘记录已属于本 runtime 且 `alive`，否则调用
+   `claimInstanceOwner()` 在 `instances/.locks/<instanceId>.lock` 的内核 `flock` 临界区里
+   重新读旧记录、判定、原子替换；拿不到就按 `INSTANCE_OWNED_ELSEWHERE` /
+   `INSTANCE_OWNER_UNKNOWN` 拒绝，投影成第 3 步的两个恢复码。claim 在读 state / 定义、
+   建 runner、`recover` **之前**完成；此时还没有任何派发。
+5. `instance.json.executionFailure` 存在 → **不恢复**：先摘掉并停止缓存 runner，再交还本进程的
+   `owner.json`（失败标记落盘后缓存 runner 不能再当一致缓存），返回 `blocked:true`；
+   `recovery.code` 取 `lastError.code`（缺省 `executionFailure.code`）。实例 `resume` 之后，`complete`
+   冷路径 409 `BPMN_INSTANCE_BLOCKED` + `recoveryCode`，与热 runner 同口径（仍 `SUSPENDED` 时先返回 `INSTANCE_SUSPENDED`）。
+6. 到此才看内存缓存：`_runners` 里有非 `idle` 的 runner → 直接复用（不再读 state / 定义、不 `recover`）。
+7. 读 `state.json`；缺失/空 → 返回 `recovered:false` + `BPMN_STATE_MISSING` 原因
+   （GET 200；写操作 409 `BPMN_INSTANCE_NOT_RECOVERABLE`），并交还所有权。
+8. `state.json` 带 `unrecoverable` 墓碑 → 不恢复，`recovery.code` 取墓碑错误码（缺省
+   `BPMN_STATE_UNRECOVERABLE`）；交还所有权。
+9. 读实例自己的 `definition.bpmn`，重新 `parseBpmn` 得到 definition；
    快照损坏 → 500，不拿定义域的最新版来冒充。
-7. 新建 `createBpmnRunner({definition, xml, instanceId, services, …})` 并 `recover(state)`；
-   `state` 不是 `running/stopped` → `BPMN_STATE_NOT_RESUMABLE`，返回不可恢复原因。
-   建 runner 的同时登记执行所有权（`owner.json`，见 [§10](#10-并发模型0144)）。
-8. 恢复成功后：事件流、`pendingTasks`、变量、状态都回到磁盘上的事实；
-   `recovered:true` 只表示**本次请求**重建了 runner；后续请求命中内存注册表返回 `false`。
+10. 准备完成、建 runner / `recover` **之前**，从磁盘重新读一次 `instance.json` 准入（0.14.6）：
+    终态 → 不恢复、不派发（交还所有权）；`SUSPENDED` → 不恢复、不派发，
+    `BPMN_STATE_SUSPENDED`（交还所有权）。准备期间别的进程提交的挂起 / 终态在这里被拦下。
+11. 新建 `createBpmnRunner({definition, xml, instanceId, services, …})` 并 `recover(state)`；
+    `state` 不是 `running/stopped` → `BPMN_STATE_NOT_RESUMABLE`，返回不可恢复原因并交还所有权。
+12. 恢复成功后：事件流、`pendingTasks`、变量、状态都回到磁盘上的事实；
+    `recovered:true` 只表示**本次请求**重建了 runner；后续请求命中内存注册表返回 `false`。
+    所有权已在第 4 步登记，不再写第二遍。
 
 `resume` 只改状态 + 写事件，**不建 runner**；恢复后的第一次 `complete` / `GET` 推进才走上面的懒恢复。
 
@@ -365,28 +377,31 @@ executor 回退路径（`custom` 与缺注册表都明确失败）。
 | 400 | `BPMN_XML_INVALID` / `BPMN_DEFINITION_ID_INVALID` / `BPMN_BODY_INVALID` / `BPMN_VERSION_INVALID` / `BPMN_PAYLOAD_INVALID` / `INSTANCE_INVALID_ID` | 入参或 XML 不合法 |
 | 404 | `DEFINITION_NOT_FOUND` / `DEFINITION_VERSION_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `BPMN_TASK_NOT_FOUND` / `BPMN_ROUTE_NOT_FOUND` | 开关关着 / 资源不存在 |
 | 405 | `BPMN_METHOD_NOT_ALLOWED` | 方法不匹配 |
-| 409 | `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_NOT_RECOVERABLE` / `DEFINITION_VERSION_IMMUTABLE` / `DEFINITION_STALE` / `INSTANCE_VERSION_CONFLICT` / `INSTANCE_SUSPEND_BUSY` / `INSTANCE_SUSPENDED` / `INSTANCE_LIFECYCLE_CONFLICT` | 版本/并发/状态冲突（后三个是 0.14.4 的挂起语义，见 [§10](#10-并发模型0144)） |
+| 409 | `BPMN_INSTANCE_TERMINAL` / `BPMN_INSTANCE_NOT_WAITING` / `BPMN_INSTANCE_NOT_RECOVERABLE` / `BPMN_INSTANCE_BLOCKED` / `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_OWNER_UNKNOWN` / `DEFINITION_VERSION_IMMUTABLE` / `DEFINITION_STALE` / `INSTANCE_VERSION_CONFLICT` / `INSTANCE_SUSPEND_BUSY` / `INSTANCE_SUSPENDED` / `INSTANCE_LIFECYCLE_CONFLICT` | 版本 / 并发 / 状态冲突；挂起、执行所有权与冷恢复语义见 [§10](#10-并发模型01440146) |
 | 500 | `BPMN_EVENT_WRITE_FAILED` / `BPMN_STATE_WRITE_FAILED` / `BPMN_DEFINITION_INVALID` / `INSTANCE_CORRUPT` / `INSTANCE_SNAPSHOT_MISSING` / `INSTANCE_SNAPSHOT_CORRUPT` | 落盘或数据损坏（不静默） |
 | 503 | `BPMN_HANDLER_MISSING` / `BPMN_LRU_EVICT_UNSNAPSHOTTED` / `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_RUNTIME_DISPOSED` | 引擎不可用 |
 
 开关关着时即使请求带只读令牌也返回 404（不是 403）：功能不存在，不是权限问题。
 
-## 10 并发模型（0.14.4）
+## 10 并发模型（0.14.4–0.14.6）
 
 0.14.3 的挂起只解决了「单 runtime、正常收口」这一条路径；0.14.4 补的是**多进程 / 交错提交**下的账户一致。四条机制各管一件事，不能互相替代。
 
 ### 10.1 条件提交（CAS）
 
-- 生命周期迁移（`instance/suspended` / `instance/resumed`）必须带**期望状态**：`appendInstanceEvents(..., {status, expectedStatus})`。带 `status` 不带 `expectedStatus` → 400 `INSTANCE_EXPECTED_STATUS_REQUIRED`（内部约束）；锁内比对失败 → 409 `INSTANCE_LIFECYCLE_CONFLICT`（带 `expectedStatus` / `actualStatus`），**零写入**：不分配 seq、不写事件行、不涨 `revision`。
+- 生命周期迁移（`instance/suspended` / `instance/resumed`）必须带**期望状态**：`appendInstanceEvents(..., {status, expectedStatus})`。带 `status` 不带 `expectedStatus` → 400 `INSTANCE_EXPECTED_STATUS_REQUIRED`（内部约束）；锁内比对失败 → 409 `INSTANCE_LIFECYCLE_CONFLICT`（带 `expectedStatus` / `actualStatus`），**零写入**：不分配 seq、不写事件行、不涨 `revision`。0.14.6 起路由把这两个字段都原样投影进 409 响应（此前 store 有 `expectedStatus`、路由只回 `actualStatus`）。
 - 为什么不能「读一次状态再写」：写锁只覆盖单次写入，读—判断—写在两个进程之间仍有窗口。把期望状态带进同一次锁内比对，才能保证「一个迁移只发生一次」。两个进程同时挂起，只有一个赢；`stop` 抢先收口成终态时挂起拿 `BPMN_INSTANCE_TERMINAL` 而不是写一条挂起事件。
 - 状态迁移只走生命周期路由：`updateInstance` 把 `SUSPENDED` 改回 `ACTIVE` → `INSTANCE_SUSPENDED_IMMUTABLE`；把非挂起实例改成 `SUSPENDED` → `INSTANCE_LIFECYCLE_USE_ROUTE`。这条限制没有「调用方自觉」的余地——绕过路由直接写 store 也会被拒。
 
 ### 10.2 执行所有权（跨进程）
 
 - 谁建出 runner（首次启动或懒恢复）谁在实例目录写 `owner.json`（`{pid, host, bootId, startTime, runtimeId, since}`）；实例进入终态或 runtime `dispose` 时只删 `runtimeId` 相同的记录。本地锁、计数、内存集合都只覆盖单进程，**不能**当作跨进程执行互斥。
-- 存活判定按可验证事实分三态：`alive`（同主机 + pid 存活 + `/proc/<pid>/stat` 的 starttime 对得上）、`gone`（pid 不存在 / starttime 变了 / 同 pid 但 bootId 不同）、`unknown`（跨主机、旧格式、坏 JSON、读不到 `/proc`）。只有 `gone` 允许接管；`unknown` 一律保守拒绝——**不按时间 TTL 猜**，因为「过了 N 秒」不能证明对方真的不在了。
+- **0.14.6 起 claim / release 本身是跨进程互斥的**：`claimInstanceOwner()` / `releaseInstanceOwner()` 的「读旧记录 → 判定 → 原子 rename / 删除」整段跑在 `instances/.locks/<instanceId>.lock` 的内核 `flock` 临界区里（复用 `instance-resources.js` 的宿主 fd 原语；helper 死亡 fail-closed），最多等 10 秒。0.14.4 的「读一遍再无条件写」正是审查里两个进程各写一份 owner、各派发一次的根因。
+- **登记时机**：`POST /instances` 在 `createInstance()` 返回后、workspace 准备与首次启动**之前** claim，准备失败 / 首次启动被拒时在 `finally` 里交还；懒恢复在读 state / 定义、建 runner、`recover` **之前** claim，准备完成后还要从磁盘重读一次准入（§10.6）。因此准备窗口内的跨进程挂起看到的是活 owner，不再依赖对方进程内的 `preparing` 计数。`createInstance()` 落盘到 `owner.json` 落盘之间的极短窗口不在保证内。
+- 存活判定按可验证事实分三态：`alive`（同主机 + pid 存活 + `/proc/<pid>/stat` 的 starttime 对得上；pid 存活但读不到 starttime 也按 `alive` 保守处理）、`gone`（pid 不存在 / starttime 变了 / 同 pid 但 bootId 不同）、`unknown`（跨主机、旧格式、坏 JSON、pid 非法）。只有 `gone` 允许接管；`unknown` 一律保守拒绝——**不按时间 TTL 猜**，因为「过了 N 秒」不能证明对方真的不在了。
+- 拿不到所有权时：活进程持有 → 内部 409 `INSTANCE_OWNED_ELSEWHERE`，投影成 `BPMN_INSTANCE_ACTIVE_ELSEWHERE`；记录无法确认 → 409 `INSTANCE_OWNER_UNKNOWN`，投影成 `BPMN_OWNER_UNKNOWN`。两条路径都在 `recover` / `signalTask` / adapter 之前退出。同进程其它 runtime 允许接管（`runtimeId` 不同但 `pid` 相同），由进程内活跃表的 `BPMN_INSTANCE_ID_CONFLICT` → 503 兜底。
 - 效果：别的活进程持有时，挂起 409（`activities[]` 的 `kind:"owner"` 点名 pid / host / since），懒恢复拒绝建第二个 runner（`recovery.code` = `BPMN_INSTANCE_ACTIVE_ELSEWHERE` / `BPMN_OWNER_UNKNOWN`）。这解决的是「A 在跑、B 挂起成功，随后 A 继续推进」的原始缺陷：B 现在根本挂不上；即使挂上了，A 的事件写入也会被 store 闸门挡掉（§10.3）。
-- 限定：同机、本地文件系统、所有进程都使用 0.14.4 及以后的协议。跨主机、NFS / SMB 共享目录、不写 `owner.json` 的旧进程都在保证外。非 Linux 平台读不到 starttime，只剩 pid 存活判定（pid 复用可能误判 `alive`，方向偏保守）。
+- 限定：同机、本地文件系统、所有进程都使用 0.14.6 及以后（claim 互斥）的协议。跨主机、NFS / SMB 共享目录、不写 `owner.json` 的旧进程都在保证外；没有 util-linux `flock` 的平台降级为进程内队列，跨进程互斥不成立。非 Linux 平台读不到 starttime，只剩 pid 存活判定（pid 复用可能误判 `alive`，方向偏保守）。
 
 ### 10.3 事件提交闸门（`SUSPENDED` 是受保护状态）
 
@@ -403,8 +418,8 @@ executor 回退路径（`custom` 与缺注册表都明确失败）。
 ### 10.4 部分提交语义
 
 - `appendInstanceEvents` 是两阶段写入：**①** 在实例锁内把状态 / `lastSeq` / `eventCount` / `revision` / `metaPatch` 一次原子写进 `instance.json`；**②** 再追加事件正文到分片。两步之间崩溃或失败只会留下「已分配 seq、正文缺失」的空洞（不重复、不覆盖）。
-- 生命周期路由遇到第 ② 步失败时**不用 500 撒谎**：重新读一次磁盘，状态已是目标值就返回 200 + `committed:true` + `eventLogPending:true` + `eventLogError`；状态没写进去才抛错。调用方据此区分「迁移发生了、事件正文待补」与「迁移没发生」。
-- 缺失正文不自动补写：补写会把「重试」变成「重放」，而生命周期迁移已经生效。读侧用可见水位（`lastSeq`）与 `eventLogGap` 暴露空洞，指标用 `event-log-gap` / `events-skipped` 降完整性。
+- 生命周期路由遇到第 ② 步失败时**不用 500 撒谎**，也不用「磁盘最终状态 == 目标状态」推断提交：store 用两个内部错误码自证阶段——`INSTANCE_EVENT_APPEND_FAILED`（`committed:true` / `eventLogPending:true` / `firstSeq` / `lastSeq` / `status` / `revision` / `eventLogError`）与 `INSTANCE_METADATA_WRITE_FAILED`（`committed:false`）。路由**只认 `error.committed === true`**，返回 200 + `committed:true` + `eventLogPending:true` + `eventLogError`，`lastSeq` 取错误里的本次已分配水位；没有本次提交事实就照常抛错，绝不把别的请求的提交认成自己的。
+- 缺失正文不自动补写：补写会把「重试」变成「重放」，而生命周期迁移已经生效。读侧用**连续可见水位**（`lastSeq`）与 `eventLogGap{allocated, visible, missing?, skipped?, unstable?, retries}` 暴露空洞，指标用 `event-log-gap` / `events-skipped` 降完整性。
 - 崩溃语义的边界：实例写入没有 fsync，这里保证的是**进程崩溃**留下的 seq 空洞语义，不承诺整机断电后的持久性。
 
 ### 10.5 软挂起的边界
@@ -414,5 +429,15 @@ executor 回退路径（`custom` 与缺注册表都明确失败）。
 - 不杀 runner、不做新快照、不冻结引擎内部状态；恢复依赖最后在等待点 / 运行中收口时写的 `state.json`。
 - **不暂停计时器**：活动超时 / 整轮超时照常计时并触发，走错误事实通道。
 - 不冻结平台侧 I/O：已进入 adapter 的消息投递无法回滚（如实记 `delivered` 并标 `deliveredWhileSuspended`），回复外发走 outbox、不在执行闸门内，HTTP connector 也没有跨进程派发屏障。
-- 判忙是**检查点判定**：锁外先判、锁内复核，但「判忙通过」与「提交挂起」之间仍可能刚好开始一个活动；跨进程也看不到对方的 `preparing` 计数（它是进程内事实），极端交错下挂起可能插进首次创建窗口，恢复后实例没有可恢复快照（`BPMN_STATE_MISSING`），需要人工处置。
+- 判忙是**检查点判定**：锁外先判、锁内复核，但「判忙通过」与「提交挂起」之间仍可能刚好开始一个活动。首次创建在 workspace 准备前先登记所有权，所以跨进程在准备窗口看到的是 `kind:"owner"`，不再依赖对方的 `preparing` 计数；`createInstance()` 落盘到 `owner.json` 落盘之间仍有极短窗口，极端交错下挂起仍可能插进首次创建，恢复后实例没有可恢复快照（`BPMN_STATE_MISSING`），需要人工处置。
 - 字段级契约与「保证 / 不保证」清单归 [实例域接口 · 挂起能保证什么 / 不保证什么](../reference/instance-api.md#挂起能保证什么--不保证什么)；这里只记录机制与取舍。
+
+### 10.6 派发前准入与冷恢复错误口径（0.14.6）
+
+0.14.4 的所有权检查发生在 runner 建好之后，且 `_ensureRunner` 用进入时的旧快照继续 recover / 派发；准备窗口里别的进程提交的 `SUSPENDED` 只挡事件写入，挡不住下游 agent。0.14.6 把准入前置并补了最后一公里：
+
+- **claim 先于准备**：懒恢复在读 state / 定义、建 runner、`recover` 之前完成跨进程 claim（§10.2）；创建路径在 workspace 准备之前 claim。拿不到所有权直接返回，不进入 handler。
+- **准备完成后重读磁盘**：解析完定义、建 runner 之前重新 `readInstance()`；终态 → 不恢复、不派发并交还所有权；`SUSPENDED` → `BPMN_STATE_SUSPENDED`、不恢复、不派发并交还所有权。准备期间别的进程提交的挂起 / 终态在这里被拦下。
+- **`complete` 的最后一道准入**：真正 `runner.signalTask()` 之前再从磁盘读一次；`SUSPENDED` → 409 `INSTANCE_SUSPENDED`，同时摘掉并停止缓存 runner、交还所有权；`_stopping` → 409 `BPMN_INSTANCE_STOPPING`；终态 → 409 `BPMN_INSTANCE_TERMINAL`。本轮零派发。
+- **失败事实优先于缓存 runner**：`_ensureRunner` 先 claim，再看 `executionFailure`；一旦落盘，缓存 runner 会被摘掉并停止，`complete` 返回 409 `BPMN_INSTANCE_BLOCKED` + `recoveryCode`（取 `lastError.code` / `executionFailure.code`）。冷恢复路径与热 runner 同码，不再退化成 `BPMN_INSTANCE_NOT_RECOVERABLE`。其它不可恢复情形（state 缺失、墓碑、定义损坏、外部所有权）仍返回 `BPMN_INSTANCE_NOT_RECOVERABLE` + `recoveryCode`。
+- **读侧同时收紧**：`GET /events` 用固定已分配水位 + 分片 size/mtime 复核 + 3 次有界重试；`lastSeq` 是连续可见水位（不是本批最大 seq），缺口带 `eventLogGap{allocated, visible, missing?, skipped?, unstable?, retries}`。字段级契约归 [实例域接口 · events](../reference/instance-api.md#get-instancesidevents)。

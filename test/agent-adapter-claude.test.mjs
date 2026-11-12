@@ -632,6 +632,21 @@ if (mode === 'cancel-tree') {
   setInterval(() => {}, 1000)
   await new Promise(() => {})
 }
+if (mode === 'auth-fail-exit0') {
+  // A2：握手成功后只有 assistant 消息带 error，**没有 result 事件**，退出码 0。
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'authentication_failed',
+    message: {
+      id: 'msg_auth_exit0',
+      usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 },
+      content: [ { type: 'text', text: 'invalid API credential' } ],
+    },
+  })
+  await closeClient()
+  process.exit(0)
+}
 if (mode === 'error') {
   // M6：握手成功后 CLI 自己报终态错误（认证失败 + result error + 退出码 1）。
   out({
@@ -1283,6 +1298,44 @@ async function main() {
         'resume 用同一 session id')
       A.ok(all.slice(1).every(invocation => invocation.hasStopHook === false), 'resume 路径不注入 Stop hook')
       await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('A2 只有 assistant authentication_failed + exit 0（无 result）→ CLAUDE_PROVIDER_ERROR、0 提醒；干净停下仍是 MISSING', async () => {
+      const { adapter, handle, gate, exited } = await runClaudeMode('auth-fail-exit0')
+      A.equal(exited.ok, false)
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE,
+        'assistant 报认证失败是 provider 错误，不是「agent 停下没调工具」')
+      A.equal(exited.reminders, 0, 'provider 错误不消耗提醒预算')
+      A.equal(exited.error?.code, 'cli-assistant-error')
+      A.equal(exited.error?.subtype, 'authentication_failed', 'reason 必须保留 authentication_failed')
+      A.match(exited.message, /authentication_failed/)
+      A.equal(invocations().length, 1, '不提醒 / 不续跑')
+      A.equal(gate.settled(), true)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+
+      // 对照：没有任何错误的「停下但没调工具」仍然 MISSING + 提醒预算（不许合并两个分支）。
+      resetState()
+      const workspace = freshWorkspace('clean-stop')
+      const adapter2 = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'never' },
+        reminderLimit: 1,
+      })
+      const gate2 = makeGate(workspace)
+      const fires = []
+      const handle2 = await adapter2.start({
+        element: { id: 'agent-1', name: '干净停下节点' },
+        ctx: {},
+        finishGate: gate2,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info.count) },
+      })
+      const exited2 = await handle2.exited
+      A.equal(exited2.code, 'NODE_FINISH_MISSING', '干净停下必须仍是 MISSING')
+      A.equal(exited2.reminders, 1, '干净停下仍消耗提醒预算')
+      A.deepEqual(fires, [1])
+      await adapter2.dispose(handle2)
       A.deepEqual(leftoverDirs(), [])
     })
 

@@ -36,8 +36,9 @@
  *   - 退出分类（0.14.5 M6）：① gate 已受理 → 完成；② 取消 → 取消；③ 无受理记录时，
  *     握手前失败 → `NODE_FINISH_TOOL_UNAVAILABLE`（带原原因），握手后 CLI 明确终态错误
  *     → 稳定错误码 `CLAUDE_PROVIDER_ERROR`（脱敏 code / subtype / message，**不消耗提醒
- *     预算**）；④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；⑤ 预算耗尽才是
- *     `NODE_FINISH_MISSING`；
+ *     预算**；含只有 assistant 消息带 `error`、无 result、退出码 0 的情形，如
+ *     `authentication_failed`）；④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；
+ *     ⑤ 预算耗尽才是 `NODE_FINISH_MISSING`；
  *   - 沙箱 / 权限：Claude Code 没有 codex `-s` 那种 OS 沙箱；本适配器默认
  *     `--permission-mode acceptEdits`（允许写文件 / 只读命令，其它 shell 命令会被拒绝），
  *     可用 `settings.permissionMode` 显式改成 `auto` / `dontAsk` / `bypassPermissions` 等。
@@ -1873,6 +1874,19 @@ export function createClaudeAdapter(options = {}) {
             code: (state.terminalError && state.terminalError.code) || 'cli-result-error',
             subtype: invocation.resultSubtype,
             message: (state.terminalError && state.terminalError.message) || '',
+          }
+        } else if (invocation.exitCode === 0
+          && invocation.resultIsError !== true
+          && typeof invocation.resultSubtype !== 'string'
+          && typeof state.assistantError === 'string' && state.assistantError !== '') {
+          // A2：只有 assistant 消息带 error（如 authentication_failed）、**没有 result 事件**、
+          // 退出码 0。这是 provider 侧的执行错误，不是「agent 正常停下但没调工具」：
+          // 不能落 MISSING、也不能提醒一个认证已经失败的 CLI。只有「没有任何错误」的
+          // 正常停下才走提醒 / MISSING 分支（两者不能合并）。
+          terminal = {
+            code: 'cli-assistant-error',
+            subtype: state.assistantError,
+            message: `assistant 消息报告 ${state.assistantError}（没有 result 事件）`,
           }
         } else if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
           terminal = {

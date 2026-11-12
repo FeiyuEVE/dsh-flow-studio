@@ -277,6 +277,15 @@ function truncateUtf8Bytes(text, limit) {
   return `${output}${marker}`
 }
 
+/** 按 UTF-8 字节取尾部（起点落在续字节上时向后对齐），用于展示 tail。 */
+function truncateTailUtf8Bytes(text, limit) {
+  const buffer = Buffer.from(typeof text === 'string' ? text : String(text ?? ''), 'utf8')
+  if (buffer.length <= limit) return buffer.toString('utf8')
+  let start = buffer.length - limit
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1
+  return buffer.subarray(start).toString('utf8')
+}
+
 /** 实际要拼进 argv 的 `--allowedTools` 别名（probe 确认了哪个就用哪个）。 */
 function resolveAllowedToolsFlag(flags) {
   const value = flags && typeof flags === 'object' ? flags.allowedTools : undefined
@@ -1584,7 +1593,12 @@ export function createClaudeAdapter(options = {}) {
        * 深度超过 8 层的子树一律替换成占位符——**绝不返回原对象**。
        */
       const redactText = text => {
-        let output = typeof text === 'string' ? text : String(text)
+        // 0.15.1：先走共享文本规则（JSON 转义 / 引号 / 键值 / 超长串），再做本 execution
+        // 的精确秘密替换。handle.events / lastMessage 也走这里，和终态结果面同一套规则。
+        // ≤1 MiB 的文本关掉「≥64 KiB 连续串预抹」：那是为超大输入避开 V8 爆栈的兜底，
+        // 但会把 600 KiB 的合法 x…x 长串整段替换；规则 5 仍按跨类字符判敏感。
+        const value = typeof text === 'string' ? text : String(text)
+        let output = redactSharedText(value, { capOversize: value.length > 1024 * 1024 })
         const secrets = [channel.credential, channel.socketPath, runDir]
         for (const secret of secrets) {
           if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')
@@ -1621,8 +1635,17 @@ export function createClaudeAdapter(options = {}) {
         }
         return truncateUtf8Bytes(text, limit)
       }
-      const streamsTail = (picker, limit) => redactText(
-        spawnedProcesses.map(proc => (proc.streams ? picker(proc.streams) : '')).join('').slice(-limit),
+      /**
+       * 展示 tail：先合并各进程的（已按上限+余量保留的）tail → **整段脱敏** →
+       * 再按字节取尾。顺序不能反（0.15.1）：先 `slice(-limit)` 会把键名切掉，值就裸奔。
+       *
+       * 这里不需要额外的 `headTruncated` 判定：每个 `streams.stdoutTail()` 已经处理过
+       * 自己窗口的半截首行（有换行就丢首行 / 无换行整段 `[REDACTED]`），而本函数是
+       * **先脱敏、后截尾**——截出来的新半截行里不可能再有未脱敏的值。
+       */
+      const streamsTail = (picker, limit) => truncateTailUtf8Bytes(
+        redactText(spawnedProcesses.map(proc => (proc.streams ? picker(proc.streams) : '')).join('')),
+        limit,
       )
 
       /** 小、有界的流诊断（与计量账本分开；计量绝不按诊断上限裁剪）。 */

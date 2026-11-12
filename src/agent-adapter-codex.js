@@ -1286,7 +1286,12 @@ export function createCodexAdapter(options = {}) {
      * 深度超过 8 层的子树一律替换成 `[redacted:depth]`——**绝不返回原对象**（#9）。
      */
     const redactText = text => {
-      let output = typeof text === 'string' ? text : String(text)
+      // 0.15.1：先走共享文本规则（JSON 转义 / 引号 / 键值 / 超长串），再做本 execution
+      // 的精确秘密替换。handle.events / lastMessage 也走这里，和终态结果面同一套规则。
+      // ≤1 MiB 的文本关掉「≥64 KiB 连续串预抹」：那是为超大输入避开 V8 爆栈的兜底，
+      // 但会把 600 KiB 的合法 x…x 长串整段替换；规则 5 仍按跨类字符判敏感。
+      const value = typeof text === 'string' ? text : String(text)
+      let output = redactSharedText(value, { capOversize: value.length > 1024 * 1024 })
       const secrets = [channel.credential, channel.socketPath, runDir]
       for (const secret of secrets) {
         if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')

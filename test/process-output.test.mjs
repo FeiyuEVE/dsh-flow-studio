@@ -506,3 +506,76 @@ await check('redactText：敏感值扫描器覆盖多行 / 转义 / 引号嵌套
   // 正常闭合的单引号值仍整值替换（保持既有输出形态）。
   A.equal(redactText("token='secret-value-42'"), 'token="[REDACTED]"')
 })
+
+// ---------------------------------------------------------------------------
+// 0.15.1：转义感知 / 先脱敏再截断 / 13 种新写法
+// ---------------------------------------------------------------------------
+
+await check('redactText：JSON / shell 转义、三引号、词内拼接、全角、箭头、YAML、裸方案、SQL、续行（0.15.1）', () => {
+  const G = `ghp_${'A'.repeat(36)}`
+  // 序列化后的文本：引号变成 `\"`，值里的换行变成 `\n`。按旧实现会在这里截断。
+  const jsonEscaped = JSON.stringify({ msg: `password="${G}; hunter2"` })
+  A.equal(
+    redactText(jsonEscaped),
+    '{"msg":"password=\\"[REDACTED]\\""}',
+    `JSON 序列化后的赋值必须整值抹掉（实际 ${redactText(jsonEscaped)}）`,
+  )
+  A.equal(
+    redactText(JSON.stringify({ msg: 'password="x; hunter2"' })),
+    '{"msg":"password=\\"[REDACTED]\\""}',
+    '没有规则 0 前缀时也必须抹掉 JSON 转义值',
+  )
+
+  // [原始文本, 期望输出]——每条都同时检查「秘密消失」与「二次脱敏幂等」。
+  const cases = [
+    ['password="""hunter2"""', 'password="[REDACTED]"'],
+    ["password='''hunter2'''", 'password="[REDACTED]"'],
+    ['password="abc"hunter2', 'password="[REDACTED]"'],
+    ['password=""hunter2', 'password="[REDACTED]"'],
+    ['password：hunter2', 'password："[REDACTED]"'],
+    ['password＝hunter2', 'password＝"[REDACTED]"'],
+    ['--token：hunter2', '--token：[REDACTED]'],
+    ['password => "hunter2"', 'password => "[REDACTED]"'],
+    ['password -> hunter2', 'password -> "[REDACTED]"'],
+    ['password: |\n  hunter2', 'password: "[REDACTED]"'],
+    ['password: >-\n\thunter2\nnext_key: ok', 'password: "[REDACTED]"\nnext_key: ok'],
+    ['Authorization: ApiKey hunter2', 'Authorization: ApiKey [REDACTED]'],
+    ['Authorization: SSWS hunter2', 'Authorization: SSWS [REDACTED]'],
+    ['password="hunter2[REDACTED]"', 'password="[REDACTED]"'],
+    ["password='it''s hunter2'", 'password="[REDACTED]"'],
+    ['password= \\\n  hunter2', 'password= "[REDACTED]"'],
+    ['password=\\"hunter2', 'password=\\"[REDACTED]\\"'],
+  ]
+  for (const [raw, expected] of cases) {
+    const out = redactText(raw)
+    A.equal(out, expected, `写法必须整值脱敏：${JSON.stringify(raw)} → ${JSON.stringify(out)}`)
+    A.ok(!out.includes('hunter2'), `不得泄漏 hunter2：${JSON.stringify(out)}`)
+    A.equal(redactText(out), out, `脱敏后必须幂等：${JSON.stringify(out)}`)
+  }
+
+  // 对照：`hunter2` 是另一个 query 参数，不是 token 的值 → 必须保留（不过度脱敏）。
+  A.equal(redactText('?token=secret&hunter2'), '?token="[REDACTED]"&hunter2',
+    '另一个 query 参数不属于敏感值，不得被吞')
+})
+
+await check('redactDeep：敏感键名按键脱敏，JSON 序列化后的事件文本同样脱敏（0.15.1）', () => {
+  const input = {
+    token: 'opaque-value',
+    apiKey: 'a1b2c3',
+    nested: { password: 'hunter2' },
+    message: 'normal text',
+    count: 3,
+    already: 'ghp_[REDACTED]',
+    serialized: JSON.stringify({ msg: 'password="x; hunter2"' }),
+  }
+  const out = redactDeep(input)
+  A.equal(out.token, '[REDACTED]', 'token 键的未知值必须整体脱敏')
+  A.equal(out.apiKey, '[REDACTED]', 'apiKey 键的未知值必须整体脱敏')
+  A.equal(out.nested.password, '[REDACTED]', '嵌套对象的敏感键同样按键脱敏')
+  A.equal(out.message, 'normal text', '普通键值不得被误改')
+  A.equal(out.count, 3, '普通数字保持原样')
+  A.equal(out.already, 'ghp_[REDACTED]', '已知的完整脱敏形态原样保留')
+  A.equal(out.serialized, '{"msg":"password=\\"[REDACTED]\\""}', '序列化事件文本不得泄漏')
+  A.ok(!JSON.stringify(out).includes('hunter2'), '整个事件副本里不得出现 hunter2')
+  A.equal(JSON.stringify(redactDeep(out)), JSON.stringify(out), '整体二次脱敏必须幂等')
+})

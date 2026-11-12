@@ -86,26 +86,72 @@ function tailRetentionBytes(limit) {
 const TRUNCATED_TAIL_MARKER = '[REDACTED]'
 
 /**
- * 渲染展示 tail：先处理「头部被截断」的半截行，再脱敏，最后按展示上限截尾。
+ * 判断一行是否含**未配对的未转义引号**（0.15.2 / B2）。
+ *
+ * 跨行值（引号内含真实换行 / CRLF / 未闭合转义引号）被窗口从中间截断后，续行就是
+ * 「半个值」：它可能以 `  hunter2"` 这种没有键名的形状开头，`redactText` 的赋值规则
+ * 匹配不到，规则 5 也未必识别。判据取「双引号或单引号各自的未转义计数为奇数」——
+ * 值跨行时开放引号留在窗口外，续行只剩一个孤立的闭合引号（或反过来）。
+ *
+ * 反斜杠转义不计数（`\"` 是值里的内容，不是定界符），因此 `\"x"` 这种「一个转义
+ * 引号 + 一个未转义引号」仍按 1 个未转义引号处理，而 `\"ok\"` 不会被误判。
+ *
+ * 这是**只用于截断窗口**的有界启发式：普通（未截断）tail 不走它，避免把正常引号
+ * 文本误伤成 `[REDACTED]`。
+ *
+ * @param {string} line
+ * @returns {boolean}
+ */
+function hasUnpairedQuote(line) {
+  let doubleQuotes = 0
+  let singleQuotes = 0
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    if (char === '\\') {
+      // 跳过被转义的下一个字符（`\\` / `\"` / `\'`），含行尾孤立反斜杠。
+      index += 1
+      continue
+    }
+    if (char === '"') doubleQuotes += 1
+    else if (char === "'") singleQuotes += 1
+  }
+  return doubleQuotes % 2 === 1 || singleQuotes % 2 === 1
+}
+
+/**
+ * 渲染展示 tail：先处理「头部被截断」的半截行，再按行脱敏 / 重同步，最后截尾。
  *
  * 窗口只保留尾部，键名可能在窗口之外；如果窗口起点落在某个敏感值内部，尾部的
  * `"; hunter2"` 这类片段没有键可匹配，规则 5 也未必能识别（0.15.1 复审的
- * N=140_000 / 300_000 泄漏）。因此**头部被截断时不再导出可疑的半截行**：
- *   - 窗口里有换行：丢弃第一个 `
-` 之前的半截首行（含换行），其余照常脱敏；
- *   - 窗口里没有换行：整段替换成 {@link TRUNCATED_TAIL_MARKER}，不导出原文；
+ * N=140_000 / 300_000 泄漏）。因此**头部被截断时按行重同步**（0.15.2 / B2）：
+ *   - 窗口起点**不在行边界**时，第一个 `\n` 之前是半截首行，整行丢弃（含换行）；
+ *   - 其余每一行先 `redactText`；含未配对未转义引号的整行替换成
+ *     {@link TRUNCATED_TAIL_MARKER}——跨行值的续行正是这种形状；
+ *   - 窗口起点**恰好在行边界**（首行本来就完整，M4）时保留首行，只对真正半截的
+ *     首行应用上面的丢弃规则；
+ *   - 处理后为空一律返回 {@link TRUNCATED_TAIL_MARKER}（绝不能返回空串，否则诊断
+ *     完全消失）；
  *   - 窗口没被截断：行为完全不变（先脱敏再截尾）。
  *
  * @param {string} text
- * @param {boolean} headTruncated
+ * @param {{ headTruncated: boolean, atLineBoundary: boolean }} state
  * @param {number} limit
  * @returns {string}
  */
-function renderTail(text, headTruncated, limit) {
-  if (!headTruncated) return trimTextToBytes(redactText(text), limit)
-  const newline = text.indexOf('\n')
-  if (newline === -1) return TRUNCATED_TAIL_MARKER
-  return trimTextToBytes(redactText(text.slice(newline + 1)), limit)
+function renderTail(text, state, limit) {
+  if (!state.headTruncated) return trimTextToBytes(redactText(text), limit)
+  const lines = text.split('\n')
+  // 起点在行边界时首行完整；否则首行是从某个值 / 行中间切出来的半截，整行丢弃。
+  const firstKept = state.atLineBoundary ? 0 : 1
+  const kept = []
+  for (let index = firstKept; index < lines.length; index += 1) {
+    const redacted = redactText(lines[index])
+    kept.push(hasUnpairedQuote(redacted) ? TRUNCATED_TAIL_MARKER : redacted)
+  }
+  const processed = kept.join('\n')
+  if (processed.length === 0) return TRUNCATED_TAIL_MARKER
+  const trimmed = trimTextToBytes(processed, limit)
+  return trimmed.length === 0 ? TRUNCATED_TAIL_MARKER : trimmed
 }
 
 /** 退出后等待 stdout 排空的默认上限（5s）。 */
@@ -474,25 +520,39 @@ export function attachProcessStreams(child, options = {}) {
   const stderrTailDecoder = new StringDecoder('utf8')
   let stdoutTailText = ''
   let stderrTailText = ''
-  /** 保留窗口的头部是否被裁掉过：一旦裁过就永远为 true。 */
-  let stdoutHeadTruncated = false
-  let stderrHeadTruncated = false
+  /**
+   * 保留窗口状态（0.15.2 / B2 + M4）：
+   *   - `headTruncated`：头部是否被裁掉过；一旦裁过就永远为 true。
+   *   - `atLineBoundary`：**第一个被保留的字节是否紧跟在一个 `\n` 之后**，即窗口起点
+   *     恰好落在完整行边界。每次真正裁剪时重算（裁剪后窗口仍是后缀，旧值只在没再
+   *     裁剪时继续成立）。
+   */
+  const stdoutTailState = { headTruncated: false, atLineBoundary: false }
+  const stderrTailState = { headTruncated: false, atLineBoundary: false }
   const ownDiagnostics = []
 
   /**
-   * 追加一段解码文本到保留窗口；窗口溢出时置 `headTruncated` 并只保留尾部。
+   * 追加一段解码文本到保留窗口；窗口溢出时只保留尾部并更新状态。
+   *
+   * `atLineBoundary` 由「被裁掉的最后一个字符是不是 `\n`」判定：`trimTextToBytes`
+   * 返回的是 `combined` 的后缀，`combined.length - kept.length` 就是裁掉的码元数，
+   * 因此 `combined[cut - 1] === '\n'` 等价于「保留的第一字节紧跟换行」（M4）。
    *
    * @param {string} current
    * @param {string} piece
    * @param {number} max
-   * @param {() => void} markTruncated
+   * @param {{ headTruncated: boolean, atLineBoundary: boolean }} state
    * @returns {string}
    */
-  function retainTail(current, piece, max, markTruncated) {
+  function retainTail(current, piece, max, state) {
     const combined = current + piece
     // 字符数 > max 必然字节数 > max；否则再按 UTF-8 字节精确判断。
-    if (combined.length > max || Buffer.byteLength(combined, 'utf8') > max) markTruncated()
-    return trimTextToBytes(combined, max)
+    if (combined.length <= max && Buffer.byteLength(combined, 'utf8') <= max) return combined
+    const kept = trimTextToBytes(combined, max)
+    const cut = combined.length - kept.length
+    state.headTruncated = true
+    state.atLineBoundary = cut > 0 && combined.charCodeAt(cut - 1) === 0x0a
+    return kept
   }
 
   let settled = false
@@ -545,7 +605,7 @@ export function attachProcessStreams(child, options = {}) {
         stdoutTailText,
         stdoutTailDecoder.write(chunk),
         stdoutRetentionBytes,
-        () => { stdoutHeadTruncated = true },
+        stdoutTailState,
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -564,7 +624,7 @@ export function attachProcessStreams(child, options = {}) {
         stderrTailText,
         stderrTailDecoder.write(chunk),
         stderrRetentionBytes,
-        () => { stderrHeadTruncated = true },
+        stderrTailState,
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -585,7 +645,7 @@ export function attachProcessStreams(child, options = {}) {
         stdoutTailText,
         stdoutTailDecoder.end(),
         stdoutRetentionBytes,
-        () => { stdoutHeadTruncated = true },
+        stdoutTailState,
       )
     } catch {
       // decoder.end() 不应失败；展示 tail 失败不影响协议行。
@@ -605,7 +665,7 @@ export function attachProcessStreams(child, options = {}) {
         stderrTailText,
         stderrTailDecoder.end(),
         stderrRetentionBytes,
-        () => { stderrHeadTruncated = true },
+        stderrTailState,
       )
     } catch {
       // 同上
@@ -676,10 +736,10 @@ export function attachProcessStreams(child, options = {}) {
   return {
     drained,
     stdoutTail() {
-      return renderTail(stdoutTailText, stdoutHeadTruncated, stdoutTailBytes)
+      return renderTail(stdoutTailText, stdoutTailState, stdoutTailBytes)
     },
     stderrTail() {
-      return renderTail(stderrTailText, stderrHeadTruncated, stderrTailBytes)
+      return renderTail(stderrTailText, stderrTailState, stderrTailBytes)
     },
     diagnostics() {
       const merged = ownDiagnostics.map(entry => ({ ...entry }))

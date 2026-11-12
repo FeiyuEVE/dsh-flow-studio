@@ -175,6 +175,23 @@ function findOut(harness, predicate, label, timeoutMs) {
   return waitFor(() => harness.received.find(predicate), label, timeoutMs)
 }
 
+/** 入站权限请求的公共 params（与真实 ACP 形状一致）。 */
+function permissionParams(toolCallId = 'tool-1') {
+  return {
+    sessionId: 's1',
+    toolCall: { toolCallId, title: '写文件', kind: 'edit', status: 'pending' },
+    options: [
+      { optionId: 'allow_once', name: '允许一次', kind: 'allow_once' },
+      { optionId: 'reject_once', name: '拒绝本次', kind: 'reject_once' },
+    ],
+  }
+}
+
+/** 某个权限 id 已写出的应答（按到达顺序）。 */
+function permissionReplies(harness, id) {
+  return harness.received.filter(message => message.id === id && message.result?.outcome)
+}
+
 // ---------------------------------------------------------------------------
 // 1. 生命周期：close 幂等 / pending 全部失败 / 关闭后拒绝新请求
 // ---------------------------------------------------------------------------
@@ -497,6 +514,73 @@ test('同一权限请求 id 重复到达：只一次有效决策，重复 id 回
 
   harness.send({ jsonrpc: '2.0', id: outbound.id, result: { stopReason: 'end_turn' } })
   assert.deepEqual(await prompt, { stopReason: 'end_turn' })
+})
+
+test('257 个不同权限 id 之后重放最老 id：仍按重复处理，不再返回 selected（0.15.2 m2）', async t => {
+  const harness = createHarness()
+  const consoleCalls = captureConsole(t)
+  const { client, permissions } = await openClient(harness, {}, t)
+
+  // 复审 m2 的场景：旧去重集合容量 256，257 个不同 id 之后最老 id 已被淘汰，
+  // 重放会被当成新请求再调一次 onPermission、再回一条 selected。
+  const base = 900_000
+  const count = 257
+  for (let index = 0; index < count; index += 1) {
+    harness.send({ jsonrpc: '2.0', id: base + index, method: 'session/request_permission', params: permissionParams(`tool-${index}`) })
+  }
+  await waitFor(() => permissionReplies(harness, base + count - 1).length === 1, '257 个不同 id 的首轮应答', 10_000)
+  assert.equal(permissions.length, count, '容量内每个不同 id 都应拿到一次有效决策')
+  assert.deepEqual(permissionReplies(harness, base)[0].result, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
+
+  // 重放最老 id：必须只回 cancelled，且不再调用 onPermission。
+  harness.send({ jsonrpc: '2.0', id: base, method: 'session/request_permission', params: permissionParams('tool-replay') })
+  await waitFor(() => permissionReplies(harness, base).length === 2, '重放最老 id 的应答', 10_000)
+  const replies = permissionReplies(harness, base)
+  assert.deepEqual(replies[1].result, CANCELLED_PERMISSION, '重放最老 id 不得再返回 selected')
+  assert.equal(permissions.length, count, '重放不得再调用 onPermission')
+  assert.equal(client.stats.permissionRequests, count + 1)
+  assert.equal(client.stats.permissionDuplicates, 1)
+  assert.equal(client.stats.permissionIdEvictions, 0, '257 个 id 远未到 4096 容量，不应淘汰')
+  assert.equal(consoleCalls.length, 0)
+})
+
+test('权限 id 去重容量边界：4096 个不同 id 都有效，溢出后未知 / 重放老 id 一律 cancelled（0.15.2 m2）', async t => {
+  const harness = createHarness()
+  const consoleCalls = captureConsole(t)
+  const { client, permissions } = await openClient(harness, {}, t)
+
+  const base = 100_000
+  const capacity = 4096
+  for (let index = 0; index < capacity; index += 1) {
+    harness.send({ jsonrpc: '2.0', id: base + index, method: 'session/request_permission', params: permissionParams(`cap-${index}`) })
+  }
+  await waitFor(() => permissionReplies(harness, base + capacity - 1).length === 1, '4096 个不同 id 的应答', 20_000)
+  assert.equal(permissions.length, capacity, '容量内 4096 个不同 id 都应拿到有效决策')
+  assert.equal(client.stats.permissionIdEvictions, 0, '未到容量上限前不淘汰')
+
+  // 第 4097 个不同 id：触发一次淘汰（该请求本身仍拿到有效决策）。
+  harness.send({ jsonrpc: '2.0', id: base + capacity, method: 'session/request_permission', params: permissionParams('overflow-trigger') })
+  await waitFor(() => permissionReplies(harness, base + capacity).length === 1, '触发淘汰的应答', 20_000)
+  assert.deepEqual(permissionReplies(harness, base + capacity)[0].result, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
+  assert.equal(permissions.length, capacity + 1)
+  assert.equal(client.stats.permissionIdEvictions, 1, '容量满时淘汰最早插入项')
+
+  // 溢出后一个集合外的新 id：无法区分「全新」与「被淘汰后重放」→ fail-closed。
+  const unknownId = base + capacity + 1
+  harness.send({ jsonrpc: '2.0', id: unknownId, method: 'session/request_permission', params: permissionParams('after-overflow') })
+  await waitFor(() => permissionReplies(harness, unknownId).length === 1, '溢出后未知 id 的应答', 20_000)
+  assert.deepEqual(permissionReplies(harness, unknownId)[0].result, CANCELLED_PERMISSION, '溢出后集合外 id 必须回 cancelled')
+  assert.equal(permissions.length, capacity + 1, '溢出后未知 id 不得调用 onPermission')
+
+  // 重放最早被淘汰的 id（复审 m2 场景放大到容量边界）：同样 cancelled，绝不 selected。
+  harness.send({ jsonrpc: '2.0', id: base, method: 'session/request_permission', params: permissionParams('replay-evicted') })
+  await waitFor(() => permissionReplies(harness, base).length === 2, '重放被淘汰 id 的应答', 20_000)
+  const replayed = permissionReplies(harness, base)
+  assert.deepEqual(replayed[0].result, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
+  assert.deepEqual(replayed[1].result, CANCELLED_PERMISSION, '被淘汰后重放的老 id 不得再拿到 selected')
+  assert.equal(permissions.length, capacity + 1, '重放被淘汰 id 不得再调用 onPermission')
+  assert.equal(client.stats.permissionUnknownIds, 2, '溢出后的未知 id 与重放老 id 都计为 unknown')
+  assert.equal(consoleCalls.length, 0)
 })
 
 test('未知反向 request 回 -32601，连接继续可用', async t => {

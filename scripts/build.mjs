@@ -92,6 +92,11 @@ export const HOST_MODULES = [
   'agent-adapter-dsh.js',
   'agent-adapter-codex.js',
   'agent-adapter-claude.js',
+  'acp-client.js',
+  'acp-usage-ledger.js',
+  'acp-events.js',
+  'acp-policy.js',
+  'agent-adapter-acp.js',
   'agent-execute.js',
 ]
 

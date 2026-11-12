@@ -238,13 +238,19 @@ test('m2：201 次调用全保留；同 ID 更新后仍是 201 次（402 → 403
   assert.equal(ledger.usageCalls().length, 201, '计量账本不能被诊断缓存上限裁到 200')
   const before = metricsFor(ledger, { invocationId: 'inv-1' })
   assert.equal(before.agent.modelCalls, 201)
-  assert.equal(before.agent.observedTokens.total, 402, '201 次 × 2 token 必须完整保留')
+  // M2 残余：这 201 条都只是 assistant 观测（没有 result 结算），总量可以展示为
+  // 「已观测小计」，但不能宣称完整 total（旧断言 total=402 把占位值当结案）。
+  assert.equal(before.agent.observedTokens.total, null, '未结算的 assistant 不能给完整 total')
+  assert.deepEqual(before.agent.observedTokensPartial, { input: 201, cacheRead: 0, cacheWrite: 0, output: 201 },
+    '201 次 × 2 token 的已观测小计必须完整保留')
 
   ledger.recordAssistant(assistantEvent('msg-0', { output_tokens: 2 }))
   assert.equal(ledger.usageCalls().length, 201, '更新同 ID 不增加调用数')
   const after = metricsFor(ledger, { invocationId: 'inv-1' })
   assert.equal(after.agent.modelCalls, 201)
-  assert.equal(after.agent.observedTokens.total, 403, '旧值被替换：200×2 + (1+2)')
+  assert.equal(after.agent.observedTokens.total, null)
+  assert.deepEqual(after.agent.observedTokensPartial, { input: 201, cacheRead: 0, cacheWrite: 0, output: 202 },
+    '旧值被替换：200×1 + 2 = 202 output（201 input）')
 })
 
 test('跨实例汇总区分 null / partial：缺失桶不补 0，未知实例让合计降级', () => {
@@ -330,4 +336,88 @@ test('事件序列化后重放（写盘 → 读回 → 归约）与内存一致�
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+// ── 0.14.6 M1 残余 / M2 残余 / F3 ───────────────────────────────────────────
+
+test('0.14.6 M1：assistant 先到、session_id 后到 → 同一 message.id 重键合并，不重复计数', () => {
+  const ledger = createClaudeUsageLedger()
+  const usage = { input_tokens: 10, output_tokens: 30, ...CLAUDE_ZERO_CACHE }
+  // 第一条 assistant 没有 session_id（Claude 的 init 可能晚到）。
+  ledger.recordAssistant({ type: 'assistant', message: { id: 'msg-late', role: 'assistant', content: [], usage } })
+  assert.equal(ledger.usageCalls().length, 1)
+  assert.equal(ledger.usageCalls()[0].sessionScopeId ?? null, null, '先记录时 session 身份还不知道')
+
+  // session_id 到达后，同一个 message.id 必须重键到同一调用，而不是新增一条。
+  ledger.recordAssistant({ type: 'assistant', session_id: 'sess-late', message: { id: 'msg-late', role: 'assistant', content: [], usage } })
+  const calls = ledger.usageCalls()
+  assert.equal(calls.length, 1, '同一 message.id 只能有 1 次调用（基线：2 次）')
+  assert.deepEqual(bucketValues(calls[0].usage), { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 },
+    '用量是替换/并集，不是累加成 80')
+  assert.equal(calls[0].sessionScopeId, 'sess-late', '重键后身份使用确定的 session')
+
+  const metrics = metricsFor(ledger, { invocationId: 'inv-late' })
+  assert.equal(metrics.agent.modelCalls, 1)
+  // 没有 result 结算 → total 不完整，但已观测小计必须是 40（不是 80）。
+  assert.equal(metrics.agent.observedTokens.total, null)
+  assert.deepEqual(metrics.agent.observedTokensPartial, { input: 10, cacheRead: 0, cacheWrite: 0, output: 30 })
+})
+
+test('0.14.6 M1：晚绑 session 时多个未绑定调用各自重键，不合并成一次', () => {
+  const ledger = createClaudeUsageLedger()
+  const usage = { input_tokens: 1, output_tokens: 1, ...CLAUDE_ZERO_CACHE }
+  ledger.recordAssistant({ type: 'assistant', message: { id: 'msg-a', usage } })
+  ledger.recordAssistant({ type: 'assistant', message: { id: 'msg-b', usage } })
+  assert.equal(ledger.usageCalls().length, 2)
+  ledger.recordAssistant({ type: 'assistant', session_id: 'sess-late', message: { id: 'msg-b', usage: { output_tokens: 2 } } })
+  const calls = ledger.usageCalls()
+  assert.equal(calls.length, 2, '不同 message.id 仍是两次调用')
+  assert.ok(calls.every(call => call.sessionScopeId === 'sess-late'), '两条都已重键')
+})
+
+test('0.14.6 M2：四桶齐全但 provisional 的 assistant 没有 result → 指标不标完整', () => {
+  const ledger = createClaudeUsageLedger({ sessionScopeId: 'sess-1' })
+  ledger.recordAssistant(assistantEvent('msg-1', { input_tokens: 10, output_tokens: 1, ...CLAUDE_ZERO_CACHE }))
+  const metrics = metricsFor(ledger, { invocationId: 'inv-1' })
+  assert.equal(metrics.agent.observedTokens.input, 10)
+  assert.equal(metrics.agent.observedTokens.output, 1, '占位值保留，不走失也不当结案')
+  assert.equal(metrics.agent.observedTokens.total, null, '没有 result 结算时不能宣称完整 11')
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 1, unknown: 0 })
+  assert.ok(metrics.dataQuality.reasons.includes('usage-output-provisional'))
+})
+
+test('0.14.6 F3：unknown snapshotId 带执行作用域——两个账本不再撞同一个 id', () => {
+  const run = (invocationId, input) => {
+    const ledger = createClaudeUsageLedger({ sessionScopeId: 'sess-1', invocationId })
+    ledger.recordResult(resultEvent({ input_tokens: input, output_tokens: 0, ...CLAUDE_ZERO_CACHE }), {
+      invocationId, sessionScopeId: 'sess-1', resumed: true,
+    })
+    assert.equal(ledger.snapshots().length, 1)
+    assert.equal(ledger.snapshots()[0].scope, 'unknown')
+    return ledger
+  }
+  const 第一轮 = run('exec-1:invoke-1', 10)
+  const 第二轮 = run('exec-2:invoke-1', 30)
+  const ids = [...第一轮.snapshots(), ...第二轮.snapshots()].map(snapshot => snapshot.snapshotId)
+  assert.equal(new Set(ids).size, 2, '两次独立执行的 unknown 快照必须各自唯一')
+
+  // 落到同一实例事件流后归约：两份 unknown 事实都要保留，不能去重成 1 份。
+  const firstEvents = eventsFromLedger(第一轮, { invocationId: 'exec-1:invoke-1' })
+  const events = [
+    ...firstEvents,
+    ...eventsFromLedger(第二轮, { invocationId: 'exec-2:invoke-1' }).map(event => ({
+      ...event,
+      seq: event.seq + firstEvents.length,
+    })),
+  ]
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact({ lastSeq: events.length, eventCount: events.length }),
+    events,
+    asOf: iso(60_000),
+  })
+  assert.equal(metrics.agent.snapshots.total, 2, '磁盘两份 unknown 快照，指标不能只剩 1 份')
+  assert.equal(metrics.agent.snapshots.unknown, 2)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 0, unknown: 2 })
+  assert.equal(metrics.agent.observedTokens, null)
 })

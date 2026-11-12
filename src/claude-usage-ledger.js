@@ -6,11 +6,14 @@
  *   - **调用身份**：一个 assistant 事件是一个模型响应，但同一 `message.id` 的多个
  *     stream 事件（并行工具块）是**同一个响应**。callId 用
  *     `claude-message-v1:<sha256(sessionKey | agentScope | messageId)>` 做稳定身份；
- *     同身份重复上报是「已上报桶的替换」，不是相加。
+ *     同身份重复上报是「已上报桶的替换」，不是相加。session 身份可能晚于第一个
+ *     assistant 事件到达（init 乱序）：第一次确定时把此前记录的调用**重键并合并**，
+ *     同一 `message.id` 不会因此变成两次调用。
  *   - **结算快照**：`result` 事件的 usage 是**范围级结算**，不是第 N 次调用。它单独
  *     产出 `agent/usage-snapshot`，按 scope 归约（invocation / session-cumulative /
  *     unknown）；resume 后范围不可证明时 scope=unknown，保留原始快照让指标层降级，
- *     不猜 sum / max。
+ *     不猜 sum / max。unknown 的 snapshotId 带执行 / 调用范围与账本 nonce，跨执行不会
+ *     撞成同一个 key。
  *   - **不裁剪计量**：账本按唯一调用增长（Map），诊断单独限长；不会像诊断缓存那样
  *     裁到 200 条。
  *   - **未知不是零**：assistant 的 output 可能只是响应开始时的占位值，标记
@@ -25,7 +28,7 @@
  * @module @feiyueve/dsh-flow-studio/claude-usage-ledger
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 
 import {
   USAGE_BUCKETS, USAGE_SCOPE, USAGE_TRUST, normalizeObservedBuckets, normalizeProvider, normalizeUsage,
@@ -81,6 +84,8 @@ export function createClaudeUsageLedger(options = {}) {
   const defaultInvocationId = boundedString(options.invocationId)
   const defaultAgentScope = boundedString(options.agentScope)
   const configuredSessionScopeId = boundedString(options.sessionScopeId)
+  /** 账本唯一 nonce：unknown 快照没有稳定外部范围时用它区分不同执行。 */
+  const ledgerNonce = randomBytes(8).toString('hex')
 
   /** callId → 调用记录（Map 不裁剪；计量账本不能用诊断缓存上限）。 */
   const calls = new Map()
@@ -102,11 +107,59 @@ export function createClaudeUsageLedger(options = {}) {
     diagnostics.push({ code })
   }
 
+  /**
+   * session 身份第一次确定时，把此前按 `UNSCOPED_SESSION` 记下的调用**重键**到确定身份，
+   * 同一 `message.id` 与后到记录合并成一条（M1 残余：不能因为 init 晚到就算两次）。
+   */
+  function rebindUnscopedCalls() {
+    const sessionKey = boundSessionKey
+    if (!nonEmptyString(sessionKey)) return
+    const sessionScopeId = boundedString(sessionKey)
+    for (const [oldKey, record] of [...calls.entries()]) {
+      if (record.sessionKey !== UNSCOPED_SESSION) continue
+      // 没有 message.id 的 synthetic 记录本来就是唯一 id 且不可去重，保持原样。
+      if (record.synthetic === true || !nonEmptyString(record.messageId)) continue
+      const newKey = resolveCallId(sessionKey, record.agentScope ?? 'main', record.messageId)
+      if (newKey === oldKey) continue
+      const target = calls.get(newKey)
+      calls.delete(oldKey)
+      record.callId = newKey
+      record.sessionKey = sessionKey
+      record.sessionScopeId = sessionScopeId
+      if (target === undefined) {
+        calls.set(newKey, record)
+        continue
+      }
+      // target 是后到的同一次调用：保留后到值，旧记录只补 target 还没观测到的桶。
+      if (record.usage !== null && (target.usage === null || target.trust !== USAGE_TRUST.KNOWN)) {
+        target.usage = copyUsage(record.usage)
+        target.observedBuckets = [...record.observedBuckets]
+        target.trust = record.trust
+        target.reason = record.reason
+      } else if (record.usage !== null && target.usage !== null) {
+        for (const bucket of record.observedBuckets) {
+          if (target.observedBuckets.includes(bucket)) continue
+          if (!Number.isInteger(record.usage[bucket])) continue
+          target.usage[bucket] = record.usage[bucket]
+          target.observedBuckets = USAGE_BUCKETS.filter(
+            name => target.observedBuckets.includes(name) || name === bucket,
+          )
+        }
+        recomputeTotal(target.usage)
+      }
+      if (record.provisional === true) target.provisional = true
+      calls.set(newKey, target)
+    }
+  }
+
   function resolveSessionKey(event) {
     const observed = nonEmptyString(event?.session_id)
       ? event.session_id
       : (nonEmptyString(event?.sessionId) ? event.sessionId : null)
-    if (boundSessionKey === null && observed !== null) boundSessionKey = boundedString(observed)
+    if (boundSessionKey === null && observed !== null) {
+      boundSessionKey = boundedString(observed)
+      rebindUnscopedCalls()
+    }
     if (boundSessionKey !== null && observed !== null && observed !== boundSessionKey) {
       // 晚到 / 冲突的 session 事件不能让已记录的调用换键，只留诊断。
       diagnose('session-mismatch')
@@ -279,7 +332,14 @@ export function createClaudeUsageLedger(options = {}) {
       snapshotId = `claude-result-v1:cum:${sha256Hex(`${sessionKey}\u0000${agentScope}`)}`
     } else {
       unknownSnapshotSeq += 1
-      snapshotId = `claude-result-v1:unknown:${unknownSnapshotSeq}`
+      // F3：scope=unknown 的 snapshotId 必须带执行 / 调用作用域（缺范围时用账本 nonce），
+      // 否则每个账本都从 unknown:1 开始，跨执行会把不同快照覆盖成一份。
+      const scopeSeed = nonEmptyString(invocationId)
+        ? invocationId
+        : (nonEmptyString(sessionKey) && sessionKey !== UNSCOPED_SESSION
+          ? sessionKey
+          : (defaultInvocationId ?? ledgerNonce))
+      snapshotId = `claude-result-v1:unknown:${sha256Hex(`${scopeSeed}\u0000${agentScope}\u0000${ledgerNonce}`).slice(0, 24)}:${unknownSnapshotSeq}`
     }
     const previous = snapshots.get(snapshotId)
     if (previous !== undefined && isPlainObject(previous.usage)) {

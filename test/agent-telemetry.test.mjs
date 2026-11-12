@@ -277,3 +277,18 @@ test('M7：summarizeUsageCalls 保留 null 桶并区分 known / partial / unknow
     input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
   })
 })
+
+test('0.14.6 M2：provisional 调用即使四桶齐全，summarizeUsageCalls 也不得标完整', () => {
+  const call = createUsageCall({
+    provider: 'claude',
+    callId: 'call-provisional',
+    provisional: true,
+    usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11 },
+  })
+  assert.equal(call.provisional, true)
+  assert.deepEqual(call.observedBuckets, ['input', 'cacheRead', 'cacheWrite', 'output'])
+  const summary = summarizeUsageCalls([call])
+  assert.equal(summary.complete, false, '未结算的占位 output 不能算完整')
+  assert.equal(summary.coverage.known, 1, '覆盖档位仍如实说四桶都观测过')
+  assert.equal(summary.usage.total, null)
+})

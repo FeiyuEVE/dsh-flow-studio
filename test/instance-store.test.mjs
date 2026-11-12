@@ -11,6 +11,8 @@ import { createHash } from 'node:crypto'
 import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -704,6 +706,194 @@ await check('0.14.4 recordExecutionFailure：挂起下写一条 error + lastErro
     error => error.status === 409 && error.code === 'INSTANCE_SUSPENDED',
     'allowWhileSuspended 只接受 error 事件',
   )
+})
+
+// ── 0.14.6 NEW-2：两阶段写入的提交事实（store 侧契约） ─────────────────────
+// 元数据已提交、事件正文追加失败时，异常必须自己说明「哪一步成功了」，
+// 不能只抛一个裸 fs 错误让 runtime 用「磁盘最终状态 == 目标状态」去认领提交。
+await check('NEW-2 契约：元数据已提交、事件正文追加失败 → InstanceError 带 committed/eventLogPending/lastSeq/eventLogError', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-append-fail')
+  const first = await store.appendInstanceEvents(instance.id, 'task-a', 1, [activity(1)], { home })
+  const committed = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'))
+  eq(committed.lastSeq, first.lastSeq, '前置：第一条事件已提交')
+
+  // 真实故障：分片路径被目录占住 → 元数据写完后 open('a') 得到 EISDIR。
+  // 用新的 activity 分片，避免破坏第一条已提交事件的可读性。
+  const shard = join(dir, 'events', 'task-b', '1.jsonl')
+  mkdirSync(shard, { recursive: true })
+
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'task-b', 1, [activity(2)], { home }),
+    error => {
+      ok(error instanceof store.InstanceError, '必须是 InstanceError，不是裸 fs 错误')
+      eq(error.committed, true, '本次请求的元数据写入已经提交')
+      eq(error.eventLogPending, true, '事件正文待补')
+      eq(error.lastSeq, committed.lastSeq + 1, 'lastSeq 是本次已分配水位')
+      eq(error.firstSeq, committed.lastSeq + 1, 'firstSeq 是本次区间起点')
+      eq(error.status, 'ACTIVE', '错误里带本次提交后的实例状态')
+      ok(typeof error.eventLogError === 'string' && error.eventLogError !== '', 'eventLogError 可诊断')
+      const payload = error.toPayload()
+      eq(payload.committed, true, '通用错误载荷也带提交事实')
+      eq(payload.eventLogPending, true)
+      eq(payload.lastSeq, committed.lastSeq + 1)
+      return true
+    },
+    'appendInstanceEvents 在部分提交时必须抛带契约字段的 InstanceError',
+  )
+
+  const after = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'))
+  eq(after.lastSeq, committed.lastSeq + 1, '元数据事实已推进（不能因为事件失败回滚）')
+  eq(after.status, 'ACTIVE')
+  const events = await store.readInstanceEvents(instance.id, { home })
+  eq(events.length, 1, '事件正文确实没有落盘')
+  eq(events[0].seq, 1)
+})
+
+await check('NEW-2 契约：生命周期迁移部分提交 → 错误里 status/new lastSeq 与磁盘一致', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-lifecycle-fail')
+  const shard = join(dir, 'events', 'process', '1.jsonl')
+  mkdirSync(shard, { recursive: true })
+  const before = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'))
+  eq(before.lastSeq, 0)
+
+  await rejects(
+    () => store.appendInstanceEvents(instance.id, 'process', 1, [{ type: 'instance/suspended' }], {
+      home, status: 'SUSPENDED', expectedStatus: 'ACTIVE',
+    }),
+    error => {
+      ok(error instanceof store.InstanceError)
+      eq(error.committed, true)
+      eq(error.eventLogPending, true)
+      eq(error.lastSeq, 1)
+      eq(error.status, 'SUSPENDED', '本次迁移的目标状态已经写入元数据')
+      return true
+    },
+  )
+  const after = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'))
+  eq(after.status, 'SUSPENDED', '磁盘状态以元数据这次成功写入为准')
+  eq(after.lastSeq, 1)
+})
+
+await check('NEW-2 契约：元数据本身没写成功 → committed:false（不冒领提交）', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-meta-fail')
+  const path = join(dir, 'instance.json')
+  const before = readFileSync(path)
+  const originalRename = fsp.rename
+  let failed = false
+  fsp.rename = async (from, to) => {
+    if (to === path && !failed) {
+      failed = true
+      throw Object.assign(new Error('injected metadata rename failure'), { code: 'EIO' })
+    }
+    return originalRename(from, to)
+  }
+  syncBuiltinESMExports()
+  try {
+    await rejects(
+      () => store.appendInstanceEvents(instance.id, 'task-a', 1, [activity(1)], { home }),
+      error => {
+        ok(error instanceof store.InstanceError, '仍抛 InstanceError，调用方只认一种错误来源')
+        eq(error.committed, false, '本次请求没有提交任何元数据')
+        eq(error.eventLogPending, false, '没有分配 seq，也就没有待补事件')
+        ok(typeof error.eventLogError === 'string' && error.eventLogError.includes('EIO'), '保留底层失败原因')
+        return true
+      },
+    )
+  } finally {
+    fsp.rename = originalRename
+    syncBuiltinESMExports()
+  }
+  ok(readFileSync(path).equals(before), '元数据字节不变')
+  const events = await store.readInstanceEvents(instance.id, { home })
+  eq(events.length, 0, '事件正文也不得写')
+})
+
+// ── 0.14.6 MINOR-1 残余：跨分片一致性读取与可消费水位 ─────────────────────
+function shardSeqs(events) {
+  return events.map(event => event.seq).filter(seq => Number.isSafeInteger(seq))
+}
+
+await check('MINOR-1：跨分片读取期间追加 → 有界重试后返回一致快照，游标不跳过漏掉的事件', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-cross-shard')
+  await store.appendInstanceEvents(instance.id, 'human1', 1, [activity(1), activity(2), activity(3)], { home })
+  await store.appendInstanceEvents(instance.id, 'proc', 1, [activity(4), activity(5), activity(6)], { home })
+
+  const procShard = join(dir, 'events', 'proc', '1.jsonl')
+  const originalRead = fsp.readFile
+  let entered = null
+  let release = null
+  const gate = new Promise(resolveGate => { release = resolveGate })
+  const gated = new Promise(resolveEntered => { entered = resolveEntered })
+  let once = true
+  fsp.readFile = async (file, ...args) => {
+    if (file === procShard && once) {
+      once = false
+      // 此时元数据与 human1 分片已经被第一轮读过；proc 分片还没读。
+      entered()
+      await gate
+    }
+    return originalRead(file, ...args)
+  }
+  syncBuiltinESMExports()
+
+  let snapshot
+  try {
+    const reading = store.readInstanceSnapshot(instance.id, { home })
+    await gated
+    const missed = await store.appendInstanceEvents(instance.id, 'human1', 1, [activity(7)], { home })
+    const visible = await store.appendInstanceEvents(instance.id, 'proc', 1, [activity(8)], { home })
+    eq(missed.lastSeq, 7)
+    eq(visible.lastSeq, 8)
+    release()
+    snapshot = await reading
+  } finally {
+    fsp.readFile = originalRead
+    syncBuiltinESMExports()
+  }
+
+  eq(snapshot.lastSeq, 8, '重试后游标推进到一致水位')
+  eq(snapshot.gap, null, '一致快照没有缺口')
+  deep(shardSeqs(snapshot.events), [1, 2, 3, 4, 5, 6, 7, 8], '不能漏掉 seq 7 却返回 seq 8')
+  const instanceNow = await store.readInstance(instance.id, { home })
+  eq(instanceNow.lastSeq, 8)
+})
+
+await check('MINOR-1：allocated 范围内真有中段缺失 → 有界重试后 gap 暴露，游标停在连续水位', async ({ home }) => {
+  const { instance, dir } = await seed(home, 'flow-middle-gap')
+  await store.appendInstanceEvents(instance.id, 'human1', 1, [activity(1), activity(2), activity(3)], { home })
+  await store.appendInstanceEvents(instance.id, 'proc', 1, [activity(4), activity(5), activity(6)], { home })
+  await store.appendInstanceEvents(instance.id, 'human1', 1, [activity(7), activity(8)], { home })
+
+  // 模拟「seq 7 已分配但正文永久丢失」：从 human1 分片里删掉 seq=7 那一行。
+  const shard = join(dir, 'events', 'human1', '1.jsonl')
+  const lines = readFileSync(shard, 'utf8').trim().split('\n')
+  const kept = lines.filter(line => JSON.parse(line).seq !== 7)
+  eq(kept.length, lines.length - 1)
+  writeFileSync(shard, `${kept.join('\n')}\n`)
+
+  let shardReads = 0
+  const originalRead = fsp.readFile
+  fsp.readFile = async (file, ...args) => {
+    if (file === shard || file.endsWith('/proc/1.jsonl')) shardReads += 1
+    return originalRead(file, ...args)
+  }
+  syncBuiltinESMExports()
+  let snapshot
+  try {
+    snapshot = await store.readInstanceSnapshot(instance.id, { home })
+  } finally {
+    fsp.readFile = originalRead
+    syncBuiltinESMExports()
+  }
+
+  eq(snapshot.watermark, 6, '可消费游标只到第一个缺口之前')
+  eq(snapshot.lastSeq, 6, '绝不能把混合时刻的最大 seq（8）当游标')
+  eq(snapshot.gap.allocated, 8)
+  eq(snapshot.gap.visible, 8, 'gap.visible 是实际可见最大 seq，供诊断')
+  deep(snapshot.gap.missing, [7])
+  ok(shardReads >= 6, `缺失时必须有界重读分片（实际 ${shardReads} 次）`)
+  // 中段缺失时事件本体仍如实返回（8 可见），但游标与 gap 已经说清不能消费到 8。
+  deep(shardSeqs(snapshot.events), [1, 2, 3, 4, 5, 6, 8])
 })
 
 console.log(`\n${checks} 组通过（${assertions} 条断言）`)

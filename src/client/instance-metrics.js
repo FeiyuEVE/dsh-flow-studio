@@ -24,7 +24,7 @@ export const METRICS_REASON_TEXT = Object.freeze({
   'usage-malformed': 'usage 字段形状不可识别',
   'usage-missing-buckets': '四桶里有些桶从未上报',
   'usage-partial': '部分调用只观测到部分桶（完整 total 未知，展示的是已观测小计）',
-  'usage-scope-unknown': '结算快照的作用域不可证明（resume / 缺范围 id），未按数值猜总量',
+  'usage-scope-unknown': '结算快照的作用域不可证明（resume / 缺范围 id / 不同 provider·agent 范围重叠），未按数值猜总量',
   'usage-output-provisional': 'assistant 的 output 可能只是占位值，且没有 result 结算',
   'usage-history-mask-missing': '旧事件没有观测掩码，无法区分真实 0 与补零（完整性未知）',
   'legacy-usage-fallback': 'token 来自旧 activity/end.usage 兜底',

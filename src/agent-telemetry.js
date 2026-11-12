@@ -464,6 +464,9 @@ export function summarizeUsageCalls(calls) {
     const level = usageCoverageOf(call.usage, call.observedBuckets)
     coverage[level] += 1
     if (level !== USAGE_COVERAGE.KNOWN) complete = false
+    // provisional（assistant output 占位、没有 result 结算）不能算完整调用；
+    // 覆盖档位仍如实说「四桶都观测过」，但 total 不能当最终值。
+    if (call.provisional === true) complete = false
     for (const bucket of USAGE_BUCKETS) {
       const value = isPlainObject(call.usage) ? call.usage[bucket] : null
       if (!Number.isInteger(value)) {

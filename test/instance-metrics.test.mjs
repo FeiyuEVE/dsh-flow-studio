@@ -657,3 +657,265 @@ test('M7：指标缓存 key 包含 usage schema 与快照指纹', () => {
   assert.equal(parsed.schemaVersion, 2, 'M7 要求 METRICS_SCHEMA_VERSION 升到 2')
   assert.equal(parsed.usageSchema, 2)
 })
+
+// ── 0.14.6：正文指纹 / 观测掩码 / provisional / 快照范围（F1、F3、M2、M7 残余） ──
+
+const ALL_BUCKETS = ['input', 'cacheRead', 'cacheWrite', 'output']
+
+test('0.14.6 正文指纹：只改事件正文（elementId / usage），同 seq/type/at 也必须换缓存 key', () => {
+  const fact = instanceFact({ lastSeq: 1, revision: 3 })
+  const body = (extra) => [event(1, 'agent/usage', 0, {
+    elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+    callId: 'call-1', trust: 'known', observedBuckets: ALL_BUCKETS,
+    usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11 },
+    ...extra,
+  })]
+
+  assert.notEqual(eventsFingerprint(body({})), eventsFingerprint(body({ elementId: 'agent2' })),
+    'elementId 参与归约，必须进指纹')
+  assert.notEqual(eventsFingerprint(body({})), eventsFingerprint(body({ usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 } })),
+    'usage 正文参与归约，必须进指纹')
+
+  const cache = createMetricsCache()
+  const firstEvents = body({ elementId: 'human1' })
+  const firstKey = metricsFingerprintFor(fact, { events: firstEvents })
+  const first = cache.get(firstKey, () => computeInstanceMetrics({ instance: fact, events: firstEvents, asOf: iso(1_000) }))
+  assert.equal(first.hit, false)
+  assert.equal(first.value.agent.observedTokens.total, 11)
+
+  // 同 seq/type/at，只把 usage 正文改成结算后的值（缓存 key 必须变，不能返回旧的 11）。
+  const repairedEvents = body({ usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 } })
+  const repairedKey = metricsFingerprintFor(fact, { events: repairedEvents })
+  assert.notEqual(metricsCacheKey(repairedKey), metricsCacheKey(firstKey), '缓存 key 必须包含正文指纹')
+  const repaired = cache.get(repairedKey, () => computeInstanceMetrics({ instance: fact, events: repairedEvents, asOf: iso(1_000) }))
+  assert.equal(repaired.hit, false, '正文变了不能命中旧缓存')
+  assert.equal(repaired.value.agent.observedTokens.total, 40)
+  assert.equal(cache.size, 2, '两个不同正文各自缓存')
+})
+
+test('0.14.6 M7：observedBuckets 是权威掩码——补零的四桶也不能算已观测', () => {
+  const padded = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', observedBuckets: ['input'],
+        // 旧版补零形状：usage 四桶都是整数，但掩码只说观测到 input。
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, total: 15 },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.deepEqual(padded.agent.observedTokens, {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, partial: true,
+  }, '不在掩码里的桶是 null/未观测，即使 usage 对象里有 0')
+  assert.deepEqual(padded.agent.buckets.seen, ['input'])
+  assert.deepEqual(padded.agent.buckets.missing, ['cacheRead', 'cacheWrite', 'output'])
+  assert.equal(padded.agent.usageCoverage.partial, 1)
+  assert.equal(padded.agent.usageCoverage.known, 0)
+
+  // 快照同样以掩码为准：usage 里有 0 / 数值，不在掩码里的桶不能变成「已观测」。
+  const snapshot = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/usage-snapshot', 0, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        snapshotId: 'snap-1', scope: 'invocation',
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 },
+        observedBuckets: ['input'],
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.deepEqual(snapshot.agent.observedTokens, {
+    input: 10, cacheRead: null, cacheWrite: null, output: null, total: null, partial: true,
+  })
+  assert.equal(snapshot.agent.usageCoverage.known, 0)
+  assert.equal(snapshot.agent.usageCoverage.partial, 1)
+
+  // 历史事件没有掩码：保持现有 partial 语义（数值可展示，完整 total 未知）。
+  const legacy = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/usage', 0, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'legacy-1', trust: 'known',
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, total: 15 },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(legacy.agent.observedTokens.total, null)
+  assert.equal(legacy.agent.observedTokens.partial, true)
+  assert.ok(legacy.dataQuality.reasons.includes('usage-history-mask-missing'))
+})
+
+test('0.14.6 M2：provisional 的 assistant 四桶齐全、没有 result → 不能标完整', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', provisional: true, observedBuckets: ALL_BUCKETS,
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11 },
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.observedTokens.input, 10, '已观测的 input 照常展示')
+  assert.equal(metrics.agent.observedTokens.output, 1, '占位 output 保留观测值，不是 0')
+  assert.equal(metrics.agent.observedTokens.total, null, '占位 output 不能被当成结案总量')
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 1, unknown: 0 })
+  assert.ok(metrics.dataQuality.reasons.includes('usage-output-provisional'))
+
+  // result 结算快照把四桶都盖住后才允许完整。
+  const settled = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', provisional: true, observedBuckets: ALL_BUCKETS,
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11 },
+      }),
+      event(3, 'agent/usage-snapshot', 20, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        snapshotId: 'snap-1', scope: 'invocation', agentScope: 'main', sessionScopeId: 'sess-1',
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 },
+        observedBuckets: ALL_BUCKETS,
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.deepEqual(settled.agent.observedTokens, {
+    input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40, partial: false,
+  })
+  assert.deepEqual(settled.agent.usageCoverage, { known: 1, partial: 0, unknown: 0 })
+})
+
+test('0.14.6 M2：快照只覆盖部分桶时，回落调用的 provisional 桶仍不完整', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        callId: 'call-1', trust: 'known', provisional: true, observedBuckets: ALL_BUCKETS,
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, total: 11 },
+      }),
+      event(3, 'agent/usage-snapshot', 20, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-1', provider: 'claude',
+        snapshotId: 'snap-1', scope: 'invocation', agentScope: 'main', sessionScopeId: 'sess-1',
+        usage: { input: 10 }, observedBuckets: ['input'],
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.observedTokens.input, 10)
+  assert.equal(metrics.agent.observedTokens.total, null, '部分覆盖 + provisional 不能完整')
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.equal(metrics.agent.usageCoverage.partial, 1)
+  assert.ok(metrics.dataQuality.reasons.includes('usage-output-provisional'))
+})
+
+test('0.14.6 M7：有 invocation 完全没有 usage → 其它范围的总量也不能宣称完整', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/invocation', 0, { elementId: 'agent1', activityId: 'e1', invocationId: 'inv-known', provider: 'claude' }),
+      event(2, 'agent/usage', 10, {
+        elementId: 'agent1', activityId: 'e1', invocationId: 'inv-known', provider: 'claude',
+        callId: 'call-1', trust: 'known', observedBuckets: ALL_BUCKETS,
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 30, total: 40 },
+      }),
+      event(3, 'agent/invocation', 20, { elementId: 'agent2', activityId: 'e2', invocationId: 'inv-unobserved', provider: 'claude' }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.observedTokens.input, null, '存在未观测轮次时桶值也不能声称精确')
+  assert.equal(metrics.agent.observedTokensPartial.input, 10, '已观测小计仍展示')
+  assert.equal(metrics.agent.observedTokens.total, null, '存在完全未观测的轮次 → 完整总量未知')
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 1, partial: 0, unknown: 1 })
+})
+
+test('0.14.6 F1：同 invocation 的 main/subagent 快照不能互相覆盖后再标完整', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/usage-snapshot', 0, {
+        elementId: 'agent1', activityId: 'e1', provider: 'claude', invocationId: 'inv-1',
+        sessionScopeId: 'sess-1', agentScope: 'main',
+        snapshotId: 'snap-main', scope: 'invocation',
+        usage: { input: 40, cacheRead: 0, cacheWrite: 0, output: 0, total: 40 },
+        observedBuckets: ALL_BUCKETS,
+      }),
+      event(2, 'agent/usage-snapshot', 10, {
+        elementId: 'agent1', activityId: 'e1', provider: 'claude', invocationId: 'inv-1',
+        sessionScopeId: 'sess-1', agentScope: 'sub',
+        snapshotId: 'snap-sub', scope: 'invocation',
+        usage: { input: 5, cacheRead: 0, cacheWrite: 0, output: 0, total: 5 },
+        observedBuckets: ALL_BUCKETS,
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.snapshots.total, 2, '不同 agentScope 的快照必须都保留')
+  assert.notEqual(metrics.agent.observedTokensPartial.input, 5, '不能被后到的 5 覆盖成 5')
+  assert.equal(metrics.agent.observedTokensPartial.input, 45, '两个范围都保留（相加作为已观测小计）')
+  assert.equal(metrics.agent.observedTokens.total, null, '覆盖关系不可证明 → 不能声称 45 是完整总量')
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 2, unknown: 0 })
+  assert.ok(metrics.dataQuality.reasons.includes('usage-scope-unknown'))
+})
+
+test('0.14.6 F1：同 sessionScopeId 的不同 provider 累计快照不能互相覆盖后再标完整', () => {
+  const snapshot = (seq, provider, input, snapshotId) => event(seq, 'agent/usage-snapshot', seq * 10, {
+    elementId: 'agent1', activityId: 'e1', provider, sessionScopeId: 'sess-1', agentScope: 'main',
+    snapshotId, scope: 'session-cumulative',
+    usage: { input, cacheRead: 0, cacheWrite: 0, output: 0, total: input },
+    observedBuckets: ALL_BUCKETS,
+  })
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      snapshot(1, 'claude', 40, 'snap-claude'),
+      snapshot(2, 'dsh', 5, 'snap-dsh'),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.snapshots.sessionCumulative, 2, '不同 provider 的累计快照不能只保留 1 份')
+  assert.equal(metrics.agent.observedTokensPartial.input, 45)
+  assert.equal(metrics.agent.observedTokens.total, null)
+  assert.equal(metrics.agent.observedTokens.partial, true)
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 2, unknown: 0 })
+  assert.ok(metrics.dataQuality.reasons.includes('usage-scope-unknown'))
+})
+
+test('0.14.6 F3：快照去重键包含 provider——同 snapshotId 的不同 provider 是两条事实', () => {
+  const metrics = computeInstanceMetrics({
+    instance: instanceFact(),
+    events: [
+      event(1, 'agent/usage-snapshot', 0, {
+        elementId: 'agent1', activityId: 'e1', provider: 'claude',
+        snapshotId: 'claude-result-v1:unknown:shared:1', scope: 'unknown',
+        usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 0, total: 10 },
+        observedBuckets: ALL_BUCKETS,
+      }),
+      event(2, 'agent/usage-snapshot', 10, {
+        elementId: 'agent1', activityId: 'e1', provider: 'dsh',
+        snapshotId: 'claude-result-v1:unknown:shared:1', scope: 'unknown',
+        usage: { input: 30, cacheRead: 0, cacheWrite: 0, output: 0, total: 30 },
+        observedBuckets: ALL_BUCKETS,
+      }),
+    ],
+    asOf: iso(1_000),
+  })
+  assert.equal(metrics.agent.snapshots.total, 2, 'provider + snapshotId 才是去重键')
+  assert.equal(metrics.agent.snapshots.unknown, 2)
+  assert.equal(metrics.agent.observedTokens, null, 'unknown 范围不能给确定总量')
+  assert.deepEqual(metrics.agent.usageCoverage, { known: 0, partial: 0, unknown: 2 })
+})

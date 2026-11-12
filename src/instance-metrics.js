@@ -223,12 +223,24 @@ function executionDuration(execution, event) {
   return msSince(execution.startedAtMs, execution.endedAtMs)
 }
 
+/** 键排序的规范化 JSON：同一事件内容永远得到同一段文本（不受键插入顺序影响）。 */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  if (value === undefined) return 'null'
+  return JSON.stringify(value)
+}
+
 /**
- * 事件集合的内容指纹（0.14.4 MINOR-1）。
+ * 事件集合的内容指纹（0.14.4 MINOR-1；0.14.6 覆盖正文）。
  *
- * 只取**能反映事件集合变化的最小摘要**：条数 + 最大 seq + 坏行数 +
- * `(seq|type|at)` 序列的 sha256。不读事件正文、不序列化整条事件，成本与
- * 「事件条数」线性且常数很小。
+ * 对**规范化事件全文**做 sha256：`seq / type / at / activityId / elementId / from / to /
+ * status / error / usage / observedBuckets / provisional / scope …` 等所有参与归约的
+ * 字段都在里面。只取 `(seq|type|at)` 会让「同 seq/type/at、正文被修正」命中旧缓存
+ * （例如 `elementId`、`usage` 桶值变化）；每实例一次线性扫描的代价可以接受。
  *
  * 用途：缓存指纹必须能区分「事件追加失败只写了元数据」与「事件随后被补写」——
  * 这两种情况下 `instance.lastSeq / revision` 可以完全一样，只靠元数据会命中
@@ -240,15 +252,11 @@ function executionDuration(execution, event) {
  */
 export function eventsFingerprint(events, skippedEvents = 0) {
   const list = Array.isArray(events) ? events : []
-  const rows = list.map((value, index) => {
-    const event = isPlainObject(value) ? value : {}
-    return {
-      index,
-      seq: Number.isInteger(event.seq) ? event.seq : -1,
-      type: typeof event.type === 'string' ? event.type : '',
-      at: typeof event.at === 'string' ? event.at : '',
-    }
-  })
+  const rows = list.map((value, index) => ({
+    index,
+    seq: isPlainObject(value) && Number.isInteger(value.seq) ? value.seq : -1,
+    canonical: canonicalJson(value),
+  }))
   // 与 reduce 一致：先按 seq、再按原顺序，保证同一集合不同入参顺序得到同一指纹。
   rows.sort((left, right) => (left.seq - right.seq) || (left.index - right.index))
   let maxSeq = -1
@@ -256,7 +264,7 @@ export function eventsFingerprint(events, skippedEvents = 0) {
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index]
     if (row.seq > maxSeq) maxSeq = row.seq
-    parts[index] = `${row.seq}|${row.type}|${row.at}`
+    parts[index] = row.canonical
   }
   const digest = createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex')
   const skipped = Number.isSafeInteger(skippedEvents) && skippedEvents > 0 ? skippedEvents : 0
@@ -341,7 +349,8 @@ export function reduceInstanceMetrics(input = {}) {
       interruptedWaitMs: 0,
     },
     agent: {
-      invocationIds: new Set(),
+      // invocationId → provider：判断「未观测轮次」是否已被同 provider 的累计快照覆盖。
+      invocationIds: new Map(),
       reminders: new Set(),
       missingExecutions: new Set(),
       calls: new Map(),
@@ -448,10 +457,11 @@ export function reduceInstanceMetrics(input = {}) {
   for (const event of events) {
     if (event.type === 'agent/invocation') {
       reduction.agent.hadActivity = true
+      const provider = nonEmptyString(event.provider) ? event.provider : 'unknown'
       const id = nonEmptyString(event.invocationId)
         ? event.invocationId
         : `event:${Number.isInteger(event.seq) ? event.seq : reduction.agent.invocationIds.size}`
-      reduction.agent.invocationIds.add(id)
+      reduction.agent.invocationIds.set(id, provider)
     } else if (event.type === 'agent/reminder') {
       reduction.agent.hadActivity = true
       const key = Number.isInteger(event.count) && event.count > 0
@@ -510,7 +520,9 @@ export function reduceInstanceMetrics(input = {}) {
         addReason(reduction, METRICS_REASON.USAGE_MALFORMED)
         continue
       }
-      reduction.agent.snapshots.set(snapshot.snapshotId, {
+      // F3：snapshotId 只在单账本内唯一，跨执行 / 跨 provider 会撞车；
+      // 指标去重键必须带上 provider，不能把两条不同事实合成一条。
+      reduction.agent.snapshots.set(`${snapshot.provider}\u0000${snapshot.snapshotId}`, {
         ...snapshot,
         maskMissing: !Array.isArray(event.observedBuckets),
         seq: Number.isInteger(event.seq) ? event.seq : null,
@@ -832,27 +844,93 @@ function sumUsageCells(cells) {
   return { value, complete: complete && observed, observed }
 }
 
+/** 快照的某个桶是否**被观测到**：显式掩码是权威；历史无掩码事件才从数值反推。 */
+function observedSnapshotBucket(snapshot, bucket) {
+  if (!isPlainObject(snapshot?.usage)) return null
+  const value = snapshot.usage[bucket]
+  if (!Number.isInteger(value)) return null
+  if (snapshot.maskMissing !== true && Array.isArray(snapshot.observedBuckets)
+    && !snapshot.observedBuckets.includes(bucket)) {
+    return null
+  }
+  return value
+}
+
+/** 调用的某个桶是否被观测到：掩码里没有的桶即使 usage 有 0 也不算观测。 */
+function observedCallBucket(call, bucket) {
+  if (!isPlainObject(call) || call.trust !== USAGE_TRUST.KNOWN || !isPlainObject(call.usage)) return null
+  const value = call.usage[bucket]
+  if (!Number.isInteger(value)) return null
+  if (call.observedMaskMissing !== true && Array.isArray(call.observedBuckets)
+    && !call.observedBuckets.includes(bucket)) {
+    return null
+  }
+  return value
+}
+
+/** 范围身份：provider + sessionScopeId + agentScope（+ invocationId 由调用方拼）。 */
+function usageScopeIdentity(provider, sessionScopeId, agentScope) {
+  return `${nonEmptyString(provider) ? provider : 'unknown'}\u0000${sessionScopeId ?? ''}\u0000${agentScope ?? ''}`
+}
+
+function callScopeIdentity(call) {
+  return usageScopeIdentity(call?.provider, call?.sessionScopeId, call?.agentScope)
+}
+
+function invocationSnapshotIdentity(snapshot) {
+  return `${usageScopeIdentity(snapshot.provider, snapshot.sessionScopeId, snapshot.agentScope)}\u0000${snapshot.invocationId}`
+}
+
+function sessionSnapshotIdentity(snapshot) {
+  return usageScopeIdentity(snapshot.provider, snapshot.sessionScopeId, snapshot.agentScope)
+}
+
 /**
  * 一个「范围」的用量：先取有效结算快照的桶；快照没观测的桶才回落到该范围的调用桶。
  * 同一范围同一桶永远只选一个来源。
+ *
+ * 0.14.6 修正：
+ *   - 掩码是权威：不在 `observedBuckets` 里的桶保持 `null`，即使 usage 对象里有 0；
+ *   - `provisional` 调用（assistant output 占位、还没有 result 结算）**不得标完整**；
+ *   - `ambiguous`：范围覆盖关系不可证明（如同一 invocation 出现 main / subagent 两份
+ *     快照），保留两份事实但整体降级为 partial。
  */
 function buildUsageUnit(input) {
-  const { key, invocationId = null, sessionScopeId = null, calls = [], snapshot = null } = input
+  const {
+    key, invocationId = null, sessionScopeId = null, agentScope = null, provider = null,
+    calls = [], snapshot = null, ambiguous = false,
+  } = input
+  const callsWithMask = calls.filter(call => isPlainObject(call))
   const cells = {}
+  let provisional = false
   for (const bucket of USAGE_BUCKETS) {
-    const snapshotValue = isPlainObject(snapshot?.usage) ? snapshot.usage[bucket] : null
+    const snapshotValue = observedSnapshotBucket(snapshot, bucket)
     if (Number.isInteger(snapshotValue)) {
       cells[bucket] = { value: snapshotValue, complete: true, source: 'snapshot' }
       continue
     }
     let value = null
-    let complete = calls.length > 0
-    for (const call of calls) {
-      const observed = call.trust === USAGE_TRUST.KNOWN && isPlainObject(call.usage) ? call.usage[bucket] : null
-      if (Number.isInteger(observed)) value = (value ?? 0) + observed
-      else complete = false
+    let complete = callsWithMask.length > 0
+    let observedHere = false
+    for (const call of callsWithMask) {
+      const observed = observedCallBucket(call, bucket)
+      if (Number.isInteger(observed)) {
+        value = (value ?? 0) + observed
+        observedHere = true
+      }
+      if (call.provisional === true) {
+        // assistant 的 output 可能只是响应开始时的占位值：值可以展示（不是 0），
+        // 但整个范围的 total 不能当最终结算（由 usageUnitLevel / totalComplete 降级）。
+        provisional = true
+      } else if (!Number.isInteger(observed)) {
+        complete = false
+      }
     }
-    cells[bucket] = { value, complete: complete && Number.isInteger(value), source: calls.length > 0 ? 'calls' : 'none' }
+    cells[bucket] = {
+      value,
+      complete: complete && Number.isInteger(value),
+      source: observedHere ? 'calls' : 'none',
+    }
   }
   const observedCount = USAGE_BUCKETS.filter(bucket => Number.isInteger(cells[bucket].value)).length
   const allComplete = USAGE_BUCKETS.every(bucket => cells[bucket].complete === true && Number.isInteger(cells[bucket].value))
@@ -860,27 +938,32 @@ function buildUsageUnit(input) {
     key,
     invocationId,
     sessionScopeId,
-    calls,
+    agentScope,
+    provider,
+    calls: callsWithMask,
     snapshot,
     cells,
     observedCount,
     allComplete,
-    maskMissing: calls.some(call => call.observedMaskMissing === true) || snapshot?.maskMissing === true,
-    provisional: snapshot === null && calls.some(call => call.provisional === true),
+    maskMissing: callsWithMask.some(call => call.observedMaskMissing === true) || snapshot?.maskMissing === true,
+    provisional,
+    ambiguous,
   }
 }
 
 /** session-cumulative 范围：同一累计范围只取最新；快照未观测桶回落到该 session 的范围单元。 */
 function buildSessionUsageUnit(input) {
-  const { key, sessionScopeId, units, snapshot } = input
+  const { key, sessionScopeId, agentScope = null, provider = null, units, snapshot, ambiguous = false } = input
   const cells = {}
+  let provisional = false
   for (const bucket of USAGE_BUCKETS) {
-    const snapshotValue = isPlainObject(snapshot?.usage) ? snapshot.usage[bucket] : null
+    const snapshotValue = observedSnapshotBucket(snapshot, bucket)
     if (Number.isInteger(snapshotValue)) {
       cells[bucket] = { value: snapshotValue, complete: true, source: 'snapshot' }
       continue
     }
     const summed = sumUsageCells(units.map(unit => unit.cells[bucket]))
+    if (units.some(unit => unit.provisional === true)) provisional = true
     cells[bucket] = { value: summed.value, complete: summed.complete, source: 'calls' }
   }
   const observedCount = USAGE_BUCKETS.filter(bucket => Number.isInteger(cells[bucket].value)).length
@@ -888,32 +971,40 @@ function buildSessionUsageUnit(input) {
     key,
     invocationId: null,
     sessionScopeId,
+    agentScope,
+    provider,
     calls: [],
     snapshot,
     cells,
     observedCount,
     allComplete: USAGE_BUCKETS.every(bucket => cells[bucket].complete === true && Number.isInteger(cells[bucket].value)),
     maskMissing: units.some(unit => unit.maskMissing) || snapshot?.maskMissing === true,
-    provisional: false,
+    provisional,
+    ambiguous: ambiguous || units.some(unit => unit.ambiguous === true),
   }
 }
 
 function usageUnitLevel(unit) {
   if (unit.observedCount === 0) return USAGE_COVERAGE.UNKNOWN
-  if (!unit.allComplete || unit.maskMissing) return USAGE_COVERAGE.PARTIAL
+  if (unit.ambiguous || !unit.allComplete || unit.maskMissing || unit.provisional) {
+    return USAGE_COVERAGE.PARTIAL
+  }
   return USAGE_COVERAGE.KNOWN
 }
 
 /**
  * 把「调用桶 + 结算快照」归约成指标口径。
  *
- * 规则（M7 / M2）：
+ * 规则（M7 / M2 / F1 / F3）：
  *   1. `modelCalls` = 去重后的**非 synthetic** callId 数；
- *   2. 快照按 scope：invocation 每个 invocation 取最新；session-cumulative 同一累计范围取最新；
+ *   2. 范围键 = `provider + sessionScopeId + agentScope (+ scope / invocationId)`；
+ *      不同范围**不能互相覆盖**。覆盖关系不可证明（同一 invocation 的 main/subagent、
+ *      同一 session 的不同 provider 累计快照）时保留全部事实但降级为 partial；
+ *   3. invocation scope 每个范围取最新；session-cumulative 同一累计范围取最新；
  *      unknown 保留原始快照，**不按数值猜 sum/max**；
- *   3. 有有效快照覆盖的范围用快照的桶，没有才用去重后的调用桶；同范围同桶只选一个来源；
- *   4. 未观测桶是 null；完整 total 只在四桶完整且没有未知来源时给出；
- *   5. 部分观测给「已观测小计」，同时把 `partial` 标出来。
+ *   4. 有有效快照覆盖的范围用快照的桶，没有才用去重后的调用桶；同范围同桶只选一个来源；
+ *   5. 未观测桶是 null；掩码没覆盖的桶是 null；provisional 桶不计完整；
+ *      完整 total 只在四桶完整、没有未知来源且范围无歧义时给出。
  */
 function reduceAgentUsage(input) {
   const { calls, snapshots, invocationEventIds, hadActivity } = input
@@ -927,17 +1018,18 @@ function reduceAgentUsage(input) {
   const unknownSnapshots = []
   for (const snapshot of snapshotList) {
     if (snapshot.scope === USAGE_SCOPE.INVOCATION && nonEmptyString(snapshot.invocationId)) {
-      invocationSnapshots.set(snapshot.invocationId, snapshot)
+      // 键包含 provider / session / agentScope：不同范围不能互相覆盖（F1）。
+      invocationSnapshots.set(invocationSnapshotIdentity(snapshot), snapshot)
     } else if (snapshot.scope === USAGE_SCOPE.SESSION_CUMULATIVE && nonEmptyString(snapshot.sessionScopeId)) {
-      // 同一 session 的累计快照只取最新；不同 agentScope 的累计值是否重叠不可证明，
-      // 取最新比相加安全（后者会双计）。
-      cumulativeSnapshots.set(snapshot.sessionScopeId, snapshot)
+      // 同一累计范围（provider + session + agentScope）只取最新；跨范围不互相覆盖。
+      cumulativeSnapshots.set(sessionSnapshotIdentity(snapshot), snapshot)
     } else {
       // 作用域无法归属（unknown / 缺范围 id）：保留原始快照，算部分/未知。
       unknownSnapshots.push(snapshot)
     }
   }
 
+  // 调用按 invocationId 分桶，再按完整范围身份分桶；同一 invocation 的多个范围不合并。
   const callsByInvocation = new Map()
   const orphanCalls = []
   for (const call of realCalls) {
@@ -948,23 +1040,64 @@ function reduceAgentUsage(input) {
       orphanCalls.push(call)
     }
   }
+  const snapshotsByInvocation = new Map()
+  for (const snapshot of invocationSnapshots.values()) {
+    if (!snapshotsByInvocation.has(snapshot.invocationId)) snapshotsByInvocation.set(snapshot.invocationId, [])
+    snapshotsByInvocation.get(snapshot.invocationId).push(snapshot)
+  }
 
   const units = []
   const observedInvocationIds = new Set()
-  const invocationIds = new Set([...callsByInvocation.keys(), ...invocationSnapshots.keys()])
+  let scopeAmbiguous = false
+  const invocationIds = new Set([...callsByInvocation.keys(), ...snapshotsByInvocation.keys()])
   for (const invocationId of invocationIds) {
     observedInvocationIds.add(invocationId)
     const invocationCalls = callsByInvocation.get(invocationId) ?? []
-    const snapshot = invocationSnapshots.get(invocationId) ?? null
-    const sessionScopeId = snapshot?.sessionScopeId
-      ?? invocationCalls.find(call => nonEmptyString(call.sessionScopeId))?.sessionScopeId
-      ?? null
+    const invocationSnapshotList = snapshotsByInvocation.get(invocationId) ?? []
+    const callIdentities = new Set(invocationCalls.map(callScopeIdentity))
+    if (invocationSnapshotList.length > 1) {
+      // 同一 invocationId 的多份快照（provider / agentScope 不同）：覆盖关系不可证明。
+      // 每份快照单独成范围，调用也单独成范围，避免把它们相加后宣称完整。
+      scopeAmbiguous = true
+      for (const snapshot of invocationSnapshotList) {
+        units.push(buildUsageUnit({
+          key: `invocation:${invocationSnapshotIdentity(snapshot)}`,
+          invocationId,
+          sessionScopeId: snapshot.sessionScopeId ?? null,
+          agentScope: snapshot.agentScope ?? null,
+          provider: snapshot.provider ?? null,
+          snapshot,
+          ambiguous: true,
+        }))
+      }
+      if (invocationCalls.length > 0) {
+        for (const identity of callIdentities) {
+          const scopedCalls = invocationCalls.filter(call => callScopeIdentity(call) === identity)
+          units.push(buildUsageUnit({
+            key: `calls:${invocationId}:${identity}`,
+            invocationId,
+            calls: scopedCalls,
+            ambiguous: true,
+          }))
+        }
+      }
+      continue
+    }
+    const snapshot = invocationSnapshotList[0] ?? null
+    const ambiguous = callIdentities.size > 1
+    if (ambiguous) scopeAmbiguous = true
+    const identity = snapshot === null
+      ? (callIdentities.size === 1 ? [...callIdentities][0] : `multi:${invocationId}`)
+      : usageScopeIdentity(snapshot.provider, snapshot.sessionScopeId, snapshot.agentScope)
     units.push(buildUsageUnit({
-      key: `invocation:${invocationId}`,
+      key: `invocation:${identity}\u0000${invocationId}`,
       invocationId,
-      sessionScopeId,
+      sessionScopeId: snapshot?.sessionScopeId ?? invocationCalls.find(call => nonEmptyString(call.sessionScopeId))?.sessionScopeId ?? null,
+      agentScope: snapshot?.agentScope ?? invocationCalls.find(call => nonEmptyString(call.agentScope))?.agentScope ?? null,
+      provider: snapshot?.provider ?? invocationCalls[0]?.provider ?? null,
       calls: invocationCalls,
       snapshot,
+      ambiguous,
     }))
   }
   for (const call of orphanCalls) {
@@ -972,39 +1105,62 @@ function reduceAgentUsage(input) {
       key: `call:${call.callId}`,
       invocationId: null,
       sessionScopeId: call.sessionScopeId,
+      agentScope: call.agentScope ?? null,
+      provider: call.provider ?? null,
       calls: [call],
       snapshot: null,
     }))
   }
 
-  // session-cumulative：同一累计范围只取最新，其覆盖的 invocation 不再单独求和。
+  // session-cumulative：同 provider + session + agentScope 的累计范围消费同范围的 invocation
+  // 单元；同 session 其它范围（不同 provider / agentScope）不能互相覆盖，标歧义。
   const effectiveUnits = []
   const sessions = new Map()
   for (const unit of units) {
     if (nonEmptyString(unit.sessionScopeId)) {
-      if (!sessions.has(unit.sessionScopeId)) sessions.set(unit.sessionScopeId, [])
-      sessions.get(unit.sessionScopeId).push(unit)
+      const identity = usageScopeIdentity(unit.provider, unit.sessionScopeId, unit.agentScope)
+      if (!sessions.has(identity)) sessions.set(identity, [])
+      sessions.get(identity).push(unit)
     } else {
       effectiveUnits.push(unit)
     }
   }
-  const consumedCumulative = new Set()
+  const cumulativeSessions = new Set()
+  const cumulativeUnitsBySession = new Map()
   for (const snapshot of cumulativeSnapshots.values()) {
-    const sessionUnits = sessions.get(snapshot.sessionScopeId) ?? []
-    sessions.delete(snapshot.sessionScopeId)
-    consumedCumulative.add(snapshot.snapshotId)
-    effectiveUnits.push(buildSessionUsageUnit({
-      key: `session:${snapshot.sessionScopeId}`,
+    const identity = sessionSnapshotIdentity(snapshot)
+    cumulativeSessions.add(identity)
+    const sessionUnits = sessions.get(identity) ?? []
+    sessions.delete(identity)
+    const unit = buildSessionUsageUnit({
+      key: `session:${identity}`,
       sessionScopeId: snapshot.sessionScopeId,
+      agentScope: snapshot.agentScope ?? null,
+      provider: snapshot.provider ?? null,
       units: sessionUnits,
       snapshot,
-    }))
+    })
+    effectiveUnits.push(unit)
+    if (!cumulativeUnitsBySession.has(snapshot.sessionScopeId)) {
+      cumulativeUnitsBySession.set(snapshot.sessionScopeId, [])
+    }
+    cumulativeUnitsBySession.get(snapshot.sessionScopeId).push(unit)
   }
-  for (const sessionUnits of sessions.values()) effectiveUnits.push(...sessionUnits)
-  for (const snapshot of cumulativeSnapshots.values()) {
-    if (!consumedCumulative.has(snapshot.snapshotId)) unknownSnapshots.push(snapshot)
+  // 同一 sessionScopeId 出现多份累计快照（不同 provider / agentScope）：覆盖关系不可证明。
+  for (const group of cumulativeUnitsBySession.values()) {
+    if (group.length <= 1) continue
+    scopeAmbiguous = true
+    for (const unit of group) unit.ambiguous = true
   }
-
+  for (const [identity, sessionUnits] of sessions.entries()) {
+    if (cumulativeSessions.has(identity)) continue
+    // 同一 sessionScopeId 下还有没被累计快照覆盖的范围：累计值与它们是否重叠不可证明。
+    if ([...cumulativeSessions].some(key => key.split('\u0000')[1] === identity.split('\u0000')[1])) {
+      scopeAmbiguous = true
+      for (const unit of sessionUnits) unit.ambiguous = true
+    }
+    effectiveUnits.push(...sessionUnits)
+  }
   const totals = {}
   for (const bucket of USAGE_BUCKETS) totals[bucket] = { value: null, complete: true, observed: false }
   for (const unit of effectiveUnits) {
@@ -1026,6 +1182,7 @@ function reduceAgentUsage(input) {
     coverage[usageUnitLevel(unit)] += 1
     if (unit.maskMissing) maskMissing = true
     if (unit.provisional) provisional = true
+    if (unit.ambiguous) scopeAmbiguous = true
   }
   for (const snapshot of unknownSnapshots) {
     coverage.unknown += 1
@@ -1038,15 +1195,29 @@ function reduceAgentUsage(input) {
   // synthetic 占位也覆盖它挂的那个 invocation（否则同一轮会被算两次未知）。
   for (const call of calls) if (nonEmptyString(call.invocationId)) coveredInvocationIds.add(call.invocationId)
   for (const snapshot of snapshotList) if (nonEmptyString(snapshot.invocationId)) coveredInvocationIds.add(snapshot.invocationId)
-  for (const invocationId of invocationEventIds) {
-    if (!coveredInvocationIds.has(invocationId)) coverage.unknown += 1
+  let unobservedInvocations = 0
+  // session-cumulative 快照按范围结算，可能已经覆盖同 provider 的轮次（轮次事件本身不
+  // 携带 sessionScopeId，无法逐一对上）；有同 provider 的累计范围时不再把该轮单独算未知。
+  const cumulativeProviders = new Set([...cumulativeSnapshots.values()].map(snapshot => snapshot.provider))
+  const invocationEntries = invocationEventIds instanceof Map
+    ? [...invocationEventIds.entries()]
+    : [...invocationEventIds].map(id => [id, null])
+  for (const [invocationId, provider] of invocationEntries) {
+    if (coveredInvocationIds.has(invocationId)) continue
+    if (provider !== null && cumulativeProviders.has(provider)) continue
+    coverage.unknown += 1
+    unobservedInvocations += 1
   }
   if (effectiveUnits.length === 0 && coverage.known + coverage.partial + coverage.unknown === 0 && hadActivity) {
     coverage.unknown = 1
   }
 
-  // unknown 快照可能携带未归属的 token，synthetic 意味着有调用没观测到 → 四桶都不能声称完整。
-  const hasUnknownSource = unknownSnapshots.length > 0 || syntheticCalls.length > 0
+  // 未知来源会让四桶都不能声称完整：unknown 快照 / synthetic 占位 / 完全未观测的轮次 /
+  // 范围覆盖关系有歧义。已知值仍可作为「已观测小计」展示。
+  const hasUnknownSource = unknownSnapshots.length > 0
+    || syntheticCalls.length > 0
+    || unobservedInvocations > 0
+    || scopeAmbiguous
   if (hasUnknownSource) {
     for (const bucket of USAGE_BUCKETS) totals[bucket].complete = false
   }
@@ -1059,7 +1230,7 @@ function reduceAgentUsage(input) {
   const values = {}
   for (const bucket of USAGE_BUCKETS) values[bucket] = bucketValue(bucket)
   const totalComplete = USAGE_BUCKETS.every(bucket => Number.isInteger(values[bucket]))
-    && !maskMissing && !hasUnknownSource
+    && !maskMissing && !hasUnknownSource && !provisional
   const anyObserved = bucketsSeen.length > 0
   const observedTokens = anyObserved
     ? {
@@ -1083,7 +1254,7 @@ function reduceAgentUsage(input) {
     reasons.push(METRICS_REASON.USAGE_PARTIAL)
     if (bucketsMissing.length > 0) reasons.push(METRICS_REASON.USAGE_MISSING_BUCKETS)
   }
-  if (unknownSnapshots.length > 0) reasons.push(METRICS_REASON.USAGE_SCOPE_UNKNOWN)
+  if (unknownSnapshots.length > 0 || scopeAmbiguous) reasons.push(METRICS_REASON.USAGE_SCOPE_UNKNOWN)
   if (provisional) reasons.push(METRICS_REASON.USAGE_OUTPUT_PROVISIONAL)
   if (maskMissing) reasons.push(METRICS_REASON.USAGE_HISTORY_MASK_MISSING)
 

@@ -13,6 +13,9 @@
  *     定义后续被改 / 被删都不影响本实例（读定义正文一律读快照，不回头问定义域）；
  *   - `seq` 由本模块分配：先在实例锁内把 `lastSeq` 原子写进 instance.json，再追加事件行，
  *     进程中途被杀只会留下「已分配未落盘」的 seq 空洞，**绝不重复**；
+ *   - 两阶段写入的提交事实由 `appendInstanceEvents` 的 InstanceError 自己说明：
+ *     元数据已提交、事件正文追加失败 → `committed:true` / `eventLogPending:true` /
+ *     `lastSeq` / `eventLogError`；元数据没写成功 → `committed:false`；
  *   - 目录 0700、文件 0600；坏 JSON / 坏形状抛结构化错误，不写半截。
  *
  * @module @feiyueve/dsh-flow-studio/instance-store
@@ -99,6 +102,11 @@ export class InstanceError extends Error {
     if (this.field) payload.field = this.field
     if (this.expectedVersion !== undefined) payload.expectedVersion = this.expectedVersion
     if (this.actualVersion !== undefined) payload.actualVersion = this.actualVersion
+    // NEW-2：两阶段写入的提交事实也要能进通用错误载荷，调用方不用读堆栈。
+    if (this.committed !== undefined) payload.committed = this.committed
+    if (this.eventLogPending !== undefined) payload.eventLogPending = this.eventLogPending
+    if (this.lastSeq !== undefined) payload.lastSeq = this.lastSeq
+    if (this.eventLogError !== undefined) payload.eventLogError = this.eventLogError
     return payload
   }
 }
@@ -201,6 +209,15 @@ async function writeTextAtomic(path, text) {
 
 async function writeJsonAtomic(path, value) {
   await writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`)
+}
+
+/** 底层 fs 失败的稳定短描述（进 InstanceError 的 eventLogError / 诊断字段）。 */
+function describeError(error, max = 500) {
+  if (!error || typeof error !== 'object') return String(error)
+  const code = typeof error.code === 'string' && error.code !== '' ? error.code : null
+  const message = typeof error.message === 'string' && error.message !== '' ? error.message : null
+  const text = code === null ? (message ?? String(error)) : (message === null ? code : `${code}: ${message}`)
+  return text.length > max ? `${text.slice(0, max)}…` : text
 }
 
 async function readJson(path, maxBytes = MAX_INSTANCE_BYTES) {
@@ -1189,20 +1206,66 @@ export async function appendInstanceEvents(id, activityId, attempt, rawEvents, o
       updatedAt: now,
     }, loc.id)
     // ① 先原子分配 seq 区间：instance.json 写不进去就整批不写。
-    await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), next)
+    // 失败时**明确告诉调用方没有提交**（committed:false），不要让它靠磁盘现状猜。
+    try {
+      await writeJsonAtomic(join(loc.dir, INSTANCE_FILE), next)
+    } catch (error) {
+      if (error instanceof InstanceError) throw error
+      throw new InstanceError(
+        500,
+        'INSTANCE_METADATA_WRITE_FAILED',
+        `实例 ${loc.id} 的元数据写入失败，本次事件批次未提交（未分配 seq）`,
+        {
+          committed: false,
+          eventLogPending: false,
+          firstSeq: current.lastSeq + 1,
+          lastSeq: current.lastSeq,
+          status: current.status,
+          activityId: activity,
+          attempt: attemptNo,
+          eventLogError: describeError(error),
+          cause: error,
+        },
+      )
+    }
 
     // ② 再追加事件行；文件末尾是半行时先补换行。
+    // NEW-2 契约：走到这里元数据已经提交（seq 已分配）。事件正文失败必须抛
+    // 带 committed:true / eventLogPending:true / lastSeq / eventLogError 的 InstanceError，
+    // 调用方据此区分「本次迁移已发生、事件正文待补」与「本次迁移没发生」——不能再用
+    // 「磁盘最终状态 == 目标状态」认领，那会把**别的进程**的提交算成自己的。
     const shard = join(loc.dir, EVENTS_DIR, activity, `${attemptNo}.jsonl`)
-    await ensureDir(join(loc.dir, EVENTS_DIR, activity))
-    const prefix = await needsLeadingNewline(shard) ? '\n' : ''
-    const text = assigned.map(item => `${item.line}\n`).join('')
-    const handle = await open(shard, 'a', FILE_MODE)
     try {
-      await handle.writeFile(`${prefix}${text}`, 'utf8')
-    } finally {
-      await handle.close()
+      await ensureDir(join(loc.dir, EVENTS_DIR, activity))
+      const prefix = await needsLeadingNewline(shard) ? '\n' : ''
+      const text = assigned.map(item => `${item.line}\n`).join('')
+      const handle = await open(shard, 'a', FILE_MODE)
+      try {
+        await handle.writeFile(`${prefix}${text}`, 'utf8')
+      } finally {
+        await handle.close()
+      }
+      await chmod(shard, FILE_MODE).catch(() => {})
+    } catch (error) {
+      if (error instanceof InstanceError) throw error
+      throw new InstanceError(
+        500,
+        'INSTANCE_EVENT_APPEND_FAILED',
+        `实例 ${loc.id} 的元数据已提交（lastSeq=${lastSeq}），但事件正文追加失败：${describeError(error, 200)}`,
+        {
+          committed: true,
+          eventLogPending: true,
+          firstSeq,
+          lastSeq,
+          status: next.status,
+          revision: next.revision,
+          activityId: activity,
+          attempt: attemptNo,
+          eventLogError: describeError(error),
+          cause: error,
+        },
+      )
     }
-    await chmod(shard, FILE_MODE).catch(() => {})
 
     return {
       instanceId: loc.id,
@@ -1231,42 +1294,31 @@ function decorateEvents(events, { skipped = 0, shards = 0 } = {}) {
 }
 
 /**
- * 读一个实例的全部事件，按 seq 升序合并所有分片。
+ * 单次分片扫描：按 seq 升序合并所有分片，并收集读侧诊断。
  *
- * 读侧宽容：坏行（半行 / 手改坏）跳过而不是整批失败，跳过条数挂在返回数组的
- * 不可枚举属性 `skipped` 上。实例不存在返回 null。
- *
- * @param {string} id
- * @param {{ home?: string, instancesRoot?: string }} [options]
- * @returns {Promise<object[] | null>}
+ * `changed`：读取期间分片被改过（size / mtime 复核不一致，或 stat / read 失败）。
+ * 快照读取用它判断「这批事件是不是同一时刻的一致视图」，不把混合时刻的结果当游标。
  */
-export async function readInstanceEvents(id, options = {}) {
-  const loc = locate(instancesRootOf(options), id)
-  if (!loc) return null
-  try {
-    const info = await stat(loc.dir)
-    if (!info.isDirectory()) return null
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null
-    throw error
-  }
+async function readEventsAt(loc) {
   const eventsRoot = join(loc.dir, EVENTS_DIR)
   let activityDirs = []
   try {
     activityDirs = await readdir(eventsRoot, { withFileTypes: true })
   } catch (error) {
-    if (error && error.code === 'ENOENT') return decorateEvents([])
+    if (error && error.code === 'ENOENT') return { entries: [], skipped: 0, shards: 0, changed: false }
     throw error
   }
   const merged = []
   let skipped = 0
   let shards = 0
+  let changed = false
   for (const activityEntry of activityDirs) {
     if (!activityEntry.isDirectory() || activityEntry.name.startsWith('.')) continue
     let files = []
     try {
       files = await readdir(join(eventsRoot, activityEntry.name), { withFileTypes: true })
     } catch {
+      changed = true
       continue
     }
     for (const fileEntry of files) {
@@ -1275,12 +1327,29 @@ export async function readInstanceEvents(id, options = {}) {
       if (!match) continue
       shards += 1
       const path = join(eventsRoot, activityEntry.name, fileEntry.name)
+      let before = null
+      try {
+        before = await stat(path)
+      } catch {
+        changed = true
+      }
       let text = ''
       try {
         text = await readFile(path, 'utf8')
       } catch {
         skipped += 1
+        changed = true
         continue
+      }
+      let after = null
+      try {
+        after = await stat(path)
+      } catch {
+        changed = true
+      }
+      if (before === null || after === null
+        || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+        changed = true
       }
       for (const line of text.split('\n')) {
         if (line.trim() === '') continue
@@ -1306,8 +1375,34 @@ export async function readInstanceEvents(id, options = {}) {
     }
   }
   merged.sort((a, b) => (a.seq - b.seq) || String(a.file).localeCompare(String(b.file)))
-  const events = merged.map(item => item.event)
-  return decorateEvents(events, { skipped, shards })
+  return { entries: merged, skipped, shards, changed }
+}
+
+/**
+ * 读一个实例的全部事件，按 seq 升序合并所有分片。
+ *
+ * 读侧宽容：坏行（半行 / 手改坏）跳过而不是整批失败，跳过条数挂在返回数组的
+ * 不可枚举属性 `skipped` 上。实例不存在返回 null。
+ *
+ * 注意：这是**无水位边界**的原始读取（不保证跨分片同一时刻）；需要可消费游标的
+ * 调用方用 {@link readInstanceSnapshot}。
+ *
+ * @param {string} id
+ * @param {{ home?: string, instancesRoot?: string }} [options]
+ * @returns {Promise<object[] | null>}
+ */
+export async function readInstanceEvents(id, options = {}) {
+  const loc = locate(instancesRootOf(options), id)
+  if (!loc) return null
+  try {
+    const info = await stat(loc.dir)
+    if (!info.isDirectory()) return null
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
+  }
+  const scan = await readEventsAt(loc)
+  return decorateEvents(scan.entries.map(item => item.event), { skipped: scan.skipped, shards: scan.shards })
 }
 
 /**
@@ -1322,73 +1417,134 @@ function isExecutionTombstone(state) {
   return isPlainObject(state.unrecoverable)
 }
 
+/** 快照读取的有界重试次数：读期间分片变化 / 水位范围内缺事件时重读。 */
+const SNAPSHOT_READ_ATTEMPTS = 3
+
 /**
  * 读一份**一致的实例快照**（供读侧游标 / 指标用）。
  *
- * 区别于 `readInstance` + `readInstanceEvents` 的两次独立读取：
- *   - `lastSeq` / `watermark` 只到**实际可见事件的最大 seq**，永远不会大于事件正文；
- *   - `instance.lastSeq > 可见最大 seq`（分配了 seq、事件行还没落盘 / 半行 / 缺行）时，
- *     返回 `gap: { allocated, visible, missing }` 而不是抛错；
- *   - `eventsHash` 是事件内容（seq + type + at + 关键字段）的 sha256，供缓存指纹用。
+ * 一致性口径（0.14.6 MINOR-1 残余）：
+ *   1. 快照开始时固定**已分配水位** `allocated = instance.lastSeq`，读完所有分片后
+ *      只保留 `seq <= allocated` 的事件——分片里后到的事件不能混进这一份视图；
+ *   2. 读期间分片变化（size / mtime 复核）或 `allocated` 范围内有缺失 → 有界重试
+ *      （{@link SNAPSHOT_READ_ATTEMPTS} 次）；仍不一致时如实给出
+ *      `gap: { allocated, visible, missing, unstable? }`；
+ *   3. `lastSeq` / `watermark` 是**连续可见水位**（第一个缺口之前），绝不把混合时刻
+ *      的最大 seq 当成可消费游标；`gap.visible` 另存实际可见最大 seq 供诊断。
  *
  * @param {string} id
  * @param {{ home?: string, instancesRoot?: string }} [options]
  * @returns {Promise<null | {instance: object, events: object[], lastSeq: number,
- *   watermark: number, eventsHash: string, gap: object|null, skipped: number, shards: number}>}
+ *   watermark: number, eventsHash: string, gap: object|null, skipped: number, shards: number,
+ *   readAttempts: number}>}
  */
 export async function readInstanceSnapshot(id, options = {}) {
-  const instance = await readInstance(id, options)
-  if (instance === null) return null
-  const events = (await readInstanceEvents(id, options)) ?? decorateEvents([])
-  const seqs = []
-  for (const event of events) {
-    if (Number.isSafeInteger(event.seq) && event.seq >= 0) seqs.push(event.seq)
+  const loc = locate(instancesRootOf(options), id)
+  if (!loc) return null
+  try {
+    const info = await stat(loc.dir)
+    if (!info.isDirectory()) return null
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null
+    throw error
   }
-  seqs.sort((a, b) => a - b)
-  const watermark = seqs.length === 0 ? 0 : seqs[seqs.length - 1]
-  const visibleSet = new Set(seqs)
-  const missing = []
-  for (let seq = 1; seq <= instance.lastSeq; seq += 1) {
-    if (!visibleSet.has(seq)) missing.push(seq)
+
+  let last = null
+  let attempts = 0
+  for (let attempt = 0; attempt < SNAPSHOT_READ_ATTEMPTS; attempt += 1) {
+    attempts = attempt + 1
+    const instance = await readInstance(id, options)
+    if (instance === null) return null
+    const allocated = Number.isSafeInteger(instance.lastSeq) && instance.lastSeq >= 0 ? instance.lastSeq : 0
+    const scan = await readEventsAt(loc)
+    // 分片里出现 > allocated 的 seq：元数据在水位读取之后又前进了，这一轮不是一致视图。
+    const overflow = scan.entries.some(item => Number.isSafeInteger(item.seq) && item.seq > allocated)
+    const bounded = scan.entries.filter(item => !Number.isSafeInteger(item.seq) || item.seq <= allocated)
+    const visibleSet = new Set()
+    let maxVisible = 0
+    for (const item of bounded) {
+      if (!Number.isSafeInteger(item.seq) || item.seq < 1) continue
+      visibleSet.add(item.seq)
+      if (item.seq > maxVisible) maxVisible = item.seq
+    }
+    const missing = []
+    let watermark = 0
+    let contiguous = true
+    for (let seq = 1; seq <= allocated; seq += 1) {
+      if (!visibleSet.has(seq)) {
+        contiguous = false
+        missing.push(seq)
+      } else if (contiguous) {
+        watermark = seq
+      }
+    }
+    const latest = await readInstance(id, options)
+    if (latest === null) return null
+    const latestAllocated = Number.isSafeInteger(latest.lastSeq) && latest.lastSeq >= 0 ? latest.lastSeq : 0
+    const stable = latestAllocated === allocated && !scan.changed && !overflow
+    last = {
+      instance: latest,
+      allocated,
+      events: bounded.map(item => item.event),
+      skipped: scan.skipped,
+      shards: scan.shards,
+      missing,
+      watermark,
+      maxVisible,
+      stable,
+    }
+    if (stable && missing.length === 0) break
   }
-  const skipped = Number.isSafeInteger(events.skipped) ? events.skipped : 0
-  const gap = instance.lastSeq > watermark || skipped > 0 || missing.length > 0
+
+  const gapNeeded = last.missing.length > 0
+    || last.skipped > 0
+    || !last.stable
+    || last.allocated > last.watermark
+  const gap = gapNeeded
     ? {
-      allocated: instance.lastSeq,
-      visible: watermark,
-      ...(missing.length === 0 ? {} : { missing }),
-      ...(skipped === 0 ? {} : { skipped }),
+      allocated: last.allocated,
+      visible: last.maxVisible,
+      ...(last.missing.length === 0 ? {} : { missing: last.missing }),
+      ...(last.skipped === 0 ? {} : { skipped: last.skipped }),
+      ...(last.stable ? {} : { unstable: true }),
+      retries: Math.max(0, attempts - 1),
     }
     : null
   return {
-    instance,
-    events,
-    // 游标只到可见事件，避免 since=lastSeq 跳过尚未落盘的事件正文。
-    lastSeq: watermark,
-    watermark,
-    eventsHash: eventsHashOf(events),
+    instance: last.instance,
+    events: last.events,
+    // 游标只到连续可见事件，避免 since=lastSeq 跳过尚未落盘 / 永久缺失的事件正文。
+    lastSeq: last.watermark,
+    watermark: last.watermark,
+    eventsHash: eventsHashOf(last.events),
     gap,
-    skipped,
-    shards: Number.isSafeInteger(events.shards) ? events.shards : 0,
+    skipped: last.skipped,
+    shards: last.shards,
+    readAttempts: attempts,
   }
 }
 
-/** 事件内容指纹：只取稳定字段（seq / type / at / 关联 id / error / status）。 */
+/** 键排序的规范化 JSON：同一事件内容永远得到同一段文本（不受键插入顺序影响）。 */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  if (value === undefined) return 'null'
+  return JSON.stringify(value)
+}
+
+/**
+ * 事件内容指纹：**对规范化事件全文做 sha256**（seq / type / at / elementId / usage /
+ * observedBuckets / error 等所有实际参与归约的字段都覆盖）。
+ *
+ * 只摘要少量字段会让「同 seq/type/at、正文被修正」命中旧内容指纹（MINOR-1 残余）；
+ * 每实例一次线性扫描的代价可以接受。
+ */
 function eventsHashOf(events) {
   const lines = []
-  for (const event of events) {
-    lines.push(JSON.stringify({
-      seq: Number.isSafeInteger(event?.seq) ? event.seq : null,
-      type: typeof event?.type === 'string' ? event.type : null,
-      at: typeof event?.at === 'string' ? event.at : null,
-      activityId: typeof event?.activityId === 'string' ? event.activityId : null,
-      elementId: typeof event?.elementId === 'string' ? event.elementId : null,
-      from: typeof event?.from === 'string' ? event.from : null,
-      to: typeof event?.to === 'string' ? event.to : null,
-      status: typeof event?.status === 'string' ? event.status : null,
-      error: isPlainObject(event?.error) ? event.error : null,
-    }))
-  }
+  for (const event of events) lines.push(canonicalJson(event))
   return sha256(lines.join('\n'))
 }
 

@@ -31,7 +31,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
-  createClaudeAdapter, CLAUDE_ADAPTER_ID, CLAUDE_PROVIDER_ERROR_CODE,
+  createClaudeAdapter, CLAUDE_ADAPTER_ID, CLAUDE_ARGV_TOO_LARGE_CODE, CLAUDE_PROVIDER_ERROR_CODE,
 } from '../src/agent-adapter-claude.js'
 import {
   normalizeUsage, readAdapterUsageCalls, readAdapterUsageSnapshots, usageEventForCall, usageSnapshotEventFor,
@@ -137,6 +137,7 @@ if (argv[0] === '--help') {
     '  --permission-mode <mode>          default | acceptEdits | plan | auto | dontAsk | bypassPermissions',
     '  --permission-prompts <mode>       host | none',
     allowedToolsLine,
+    '  --disallowedTools <tools...>      Tools to disallow',
     '  --model <model>                   Model for the session',
     '',
   ].filter(line => !dropFlags.some(flag => line.includes(flag)))
@@ -631,6 +632,42 @@ if (mode === 'cancel-tree') {
   setInterval(() => {}, 1000)
   await new Promise(() => {})
 }
+if (mode === 'auth-fail-exit0') {
+  // A2：握手成功后只有 assistant 消息带 error，**没有 result 事件**，退出码 0。
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'authentication_failed',
+    message: {
+      id: 'msg_auth_exit0',
+      usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 },
+      content: [ { type: 'text', text: 'invalid API credential' } ],
+    },
+  })
+  await closeClient()
+  process.exit(0)
+}
+if (mode === 'stale-assistant-error') {
+  // A2 残余：初始轮有一次瞬时 assistant 错误但 result 成功；续跑轮干净退出（无事件）。
+  // assistant 错误属于单次 invocation，不能跨 resume 复用。
+  if (isResume) {
+    await closeClient()
+    process.exit(0)
+  }
+  out({
+    type: 'assistant',
+    session_id: sessionId,
+    error: 'rate_limit_error',
+    message: {
+      id: 'msg_transient',
+      usage: usageA,
+      content: [ { type: 'text', text: '一次瞬时错误' } ],
+    },
+  })
+  resultEvent(usageResultFinal, '完成')
+  await closeClient()
+  process.exit(0)
+}
 if (mode === 'error') {
   // M6：握手成功后 CLI 自己报终态错误（认证失败 + result error + 退出码 1）。
   out({
@@ -711,6 +748,7 @@ const FAKE_FLAGS = Object.freeze({
   permissionMode: true,
   permissionPrompts: true,
   allowedTools: true,
+  disallowedTools: true,
   model: true,
   verbose: true,
 })
@@ -1130,6 +1168,72 @@ async function main() {
     })
 
 
+    await check('A1 非交互禁用提问工具：probe 确认 --disallowedTools 时 argv 带 AskUserQuestion；不支持时不传且能力如实标注', async () => {
+      resetState()
+      const workspace = freshWorkspace('disallowed-tools')
+      const adapter = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        reminderLimit: 0,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'never' },
+      })
+      const probe = await adapter.probe()
+      A.equal(probe.disallowedTools, true, 'fake --help 里确认 --disallowedTools')
+      A.equal(adapter.capabilities().finishTool, 'native', '可选参数不影响工具通道')
+      A.match(adapter.capabilities().evidence.nonInteractive, /--disallowedTools AskUserQuestion/,
+        'capabilities evidence 必须写明提问工具被禁用')
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '禁用提问节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const [supported] = invocations()
+      const flagIndex = supported.argv.indexOf('--disallowedTools')
+      A.ok(flagIndex >= 0, 'argv 必须带 --disallowedTools')
+      A.equal(supported.argv[flagIndex + 1], 'AskUserQuestion', '值必须是 AskUserQuestion')
+      await handle.exited
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+
+      // CLI 不认识该参数：probe 仍可用（不是必需参数），argv 不传，evidence 如实标未支持。
+      resetState()
+      const workspace2 = freshWorkspace('no-disallowed-tools')
+      const adapter2 = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        reminderLimit: 0,
+        env: {
+          FAKE_CLAUDE_STATE_DIR: stateDir,
+          FAKE_CLAUDE_MODE: 'never',
+          FAKE_CLAUDE_DROP_FLAG: '--disallowedTools',
+        },
+      })
+      const probe2 = await adapter2.probe()
+      A.equal(probe2.disallowedTools, false, '--help 没有该参数时 probe 结果如实为 false')
+      A.equal(adapter2.capabilities().finishTool, 'native', '可选参数缺失不影响 finishTool')
+      A.match(adapter2.capabilities().evidence.nonInteractive, /未确认 --disallowedTools/,
+        '不支持时 capabilities 必须如实降级标注')
+      const gate2 = makeGate(workspace2)
+      const handle2 = await adapter2.start({
+        element: { id: 'agent-1', name: '旧 CLI 节点' },
+        ctx: {},
+        finishGate: gate2,
+        workspaceRoot: workspace2,
+        reminder: { onFire: () => {} },
+      })
+      const [unsupported] = invocations()
+      A.ok(!unsupported.argv.includes('--disallowedTools'), 'CLI 不支持时绝不能传该参数')
+      await handle2.exited
+      await adapter2.dispose(handle2)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+
     await check('worktree 文档：documents 相对路径被 gate 校验并登记 artifacts；越界路径被拒', async () => {
       resetState()
       const workspace = freshWorkspace('doc')
@@ -1214,6 +1318,56 @@ async function main() {
       A.ok(all.slice(1).every(invocation => invocation.resumeId === exited.sessionId),
         'resume 用同一 session id')
       A.ok(all.slice(1).every(invocation => invocation.hasStopHook === false), 'resume 路径不注入 Stop hook')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('A2 只有 assistant authentication_failed + exit 0（无 result）→ CLAUDE_PROVIDER_ERROR、0 提醒；干净停下仍是 MISSING', async () => {
+      const { adapter, handle, gate, exited } = await runClaudeMode('auth-fail-exit0')
+      A.equal(exited.ok, false)
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE,
+        'assistant 报认证失败是 provider 错误，不是「agent 停下没调工具」')
+      A.equal(exited.reminders, 0, 'provider 错误不消耗提醒预算')
+      A.equal(exited.error?.code, 'cli-assistant-error')
+      A.equal(exited.error?.subtype, 'authentication_failed', 'reason 必须保留 authentication_failed')
+      A.match(exited.message, /authentication_failed/)
+      A.equal(invocations().length, 1, '不提醒 / 不续跑')
+      A.equal(gate.settled(), true)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+
+      // 对照：没有任何错误的「停下但没调工具」仍然 MISSING + 提醒预算（不许合并两个分支）。
+      resetState()
+      const workspace = freshWorkspace('clean-stop')
+      const adapter2 = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'never' },
+        reminderLimit: 1,
+      })
+      const gate2 = makeGate(workspace)
+      const fires = []
+      const handle2 = await adapter2.start({
+        element: { id: 'agent-1', name: '干净停下节点' },
+        ctx: {},
+        finishGate: gate2,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info.count) },
+      })
+      const exited2 = await handle2.exited
+      A.equal(exited2.code, 'NODE_FINISH_MISSING', '干净停下必须仍是 MISSING')
+      A.equal(exited2.reminders, 1, '干净停下仍消耗提醒预算')
+      A.deepEqual(fires, [1])
+      await adapter2.dispose(handle2)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('A2 残余：assistant 瞬时错误不能跨 invocation 复用（续跑干净退出仍是 MISSING）', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('stale-assistant-error', {
+        overrides: { reminderLimit: 1 },
+      })
+      A.equal(exited.code, 'NODE_FINISH_MISSING',
+        '初始轮 result 成功、续跑轮无错误 → MISSING（不能复用上一轮的 assistant 错误）')
+      A.equal(exited.reminders, 1, '干净停下仍消耗这一轮提醒预算')
+      A.equal(invocations().length, 2, '初始 + 一次 resume')
       await adapter.dispose(handle)
       A.deepEqual(leftoverDirs(), [])
     })
@@ -1698,7 +1852,7 @@ async function main() {
       A.deepEqual(leftoverDirs(), [])
     })
 
-    await check('M4 同步 spawn 异常（E2BIG）：TOOL_UNAVAILABLE + cleanup，目录/channel/listener 不残留', async () => {
+    await check('A3 命令行过长（E2BIG）→ 独立 CLAUDE_ARGV_TOO_LARGE + 可操作 hint + cleanup；ENOENT 仍走原错误码', async () => {
       resetState()
       const workspace = freshWorkspace('e2big')
       const adapter = makeAdapter({ env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call' } })
@@ -1717,15 +1871,53 @@ async function main() {
         failure = error
       }
       A.ok(failure, '参数超限必须失败而不是只留下资源')
-      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
-      A.equal(failure.details.reason, 'spawn-failed')
+      A.equal(failure.code, CLAUDE_ARGV_TOO_LARGE_CODE,
+        '命令行过长必须有独立错误码（基线：NODE_FINISH_TOOL_UNAVAILABLE）')
+      A.equal(failure.details.reason, 'argv-too-large')
       A.equal(failure.details.cause, 'E2BIG')
-      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir / socket（基线：目录仍在）')
+      A.match(failure.message, /命令行超长/, 'message 要点明命令行超长')
+      A.match(failure.message, /提示词|变量/, 'message 要指出大块输入')
+      A.match(failure.details.hint, /documents/, 'hint 要给出可操作出路：改用文档')
+      A.match(failure.details.hint, /缩短/, 'hint 要给出可操作出路：缩短输入')
+      A.ok(!failure.message.includes('没有建立 flow_finish_node 通道'),
+        '不能和「CLI 没有工具通道」混淆')
+      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir / socket')
       A.ok(failure.cleanup && typeof failure.cleanup === 'object')
       A.equal(failure.cleanup.disposed, true, 'cleanup 必须如实报告已释放')
+      A.equal(failure.cleanup.pendingResources, undefined, '资源登记表（runDir / channel / listener）无残留')
       A.equal((await failure.cleanupFinal).disposed, true)
       A.equal(gate.settled(), true, '启动失败必须 abort gate')
       A.equal(invocations().length, 0, '同步 spawn 失败 → 零派发')
+
+      // 非回归：普通 spawn 失败（ENOENT）仍走 TOOL_UNAVAILABLE + spawn-failed，不套用 ARGV_TOO_LARGE。
+      resetState()
+      const workspace2 = freshWorkspace('spawn-enoent')
+      const missingBin = join(sandbox, 'no-such-claude-for-spawn')
+      const adapter2 = makeAdapter({
+        claudeBin: missingBin,
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'call' },
+      })
+      const gate2 = makeGate(workspace2)
+      let failure2 = null
+      try {
+        await adapter2.start({
+          element: { id: 'agent-1', name: 'ENOENT 节点' },
+          ctx: {},
+          finishGate: gate2,
+          workspaceRoot: workspace2,
+        })
+      } catch (error) {
+        failure2 = error
+      }
+      A.ok(failure2, '不存在的可执行文件必须失败')
+      A.equal(failure2.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        '普通 spawn 失败保持 TOOL_UNAVAILABLE（不回归）')
+      A.equal(failure2.details.reason, 'spawn-failed')
+      A.equal(failure2.details.cause, 'ENOENT')
+      A.equal(failure2.cleanup.disposed, true)
+      A.deepEqual(leftoverDirs(), [], 'ENOENT 同样不能残留资源')
+      A.equal(gate2.settled(), true)
+      A.equal(invocations().length, 0)
     })
 
     await check('M5 零宽限：grace=0 只跳过等待，TERM→KILL 仍执行并完成结算', async () => {

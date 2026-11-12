@@ -36,8 +36,9 @@
  *   - 退出分类（0.14.5 M6）：① gate 已受理 → 完成；② 取消 → 取消；③ 无受理记录时，
  *     握手前失败 → `NODE_FINISH_TOOL_UNAVAILABLE`（带原原因），握手后 CLI 明确终态错误
  *     → 稳定错误码 `CLAUDE_PROVIDER_ERROR`（脱敏 code / subtype / message，**不消耗提醒
- *     预算**）；④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；⑤ 预算耗尽才是
- *     `NODE_FINISH_MISSING`；
+ *     预算**；含只有 assistant 消息带 `error`、无 result、退出码 0 的情形，如
+ *     `authentication_failed`）；④ 只有正常停下、通道可用、无终态错误才提醒 / 续跑；
+ *     ⑤ 预算耗尽才是 `NODE_FINISH_MISSING`；
  *   - 沙箱 / 权限：Claude Code 没有 codex `-s` 那种 OS 沙箱；本适配器默认
  *     `--permission-mode acceptEdits`（允许写文件 / 只读命令，其它 shell 命令会被拒绝），
  *     可用 `settings.permissionMode` 显式改成 `auto` / `dontAsk` / `bypassPermissions` 等。
@@ -147,6 +148,13 @@ const MODEL_PATTERN = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
  */
 export const CLAUDE_PROVIDER_ERROR_CODE = 'CLAUDE_PROVIDER_ERROR'
 
+/**
+ * A3：命令行过长（Linux `E2BIG`；Windows `ERROR_FILENAME_EXCED_RANGE` / errno 206，
+ * Windows 未实测）。它是**启动前**的输入规模问题，不是「CLI 没有工具通道」，
+ * 所以给独立错误码与可操作 hint。
+ */
+export const CLAUDE_ARGV_TOO_LARGE_CODE = 'CLAUDE_ARGV_TOO_LARGE'
+
 /** stream-json 单行上限（原始字节）；600 KiB 的合法事件必须原样通过。 */
 const CLAUDE_MAX_LINE_BYTES = 8 * 1024 * 1024
 /** 展示用 stdout tail 上限。 */
@@ -229,6 +237,8 @@ function probeFlagsOf(probeValue) {
     permissionMode: pick('permissionMode', probe.permissionModeFlag),
     permissionPrompts: pick('permissionPrompts'),
     allowedTools: pick('allowedTools'),
+    // A1：可选参数（不在要求表里）。CLI 不认识时只是不传，不拒绝启动。
+    disallowedTools: pick('disallowedTools', probe.disallowedTools),
     model: pick('model'),
     verbose: pick('verbose'),
   }
@@ -265,6 +275,54 @@ function truncateUtf8Bytes(text, limit) {
 function resolveAllowedToolsFlag(flags) {
   const value = flags && typeof flags === 'object' ? flags.allowedTools : undefined
   return value === '--allowed-tools' ? '--allowed-tools' : '--allowedTools'
+}
+
+/**
+ * A3：这个 spawn 失败是不是「命令行太长」？
+ *
+ * - Linux / POSIX：`E2BIG`（单个 argv 元素超过 MAX_ARG_STRLEN=128 KiB，或总长超 ARG_MAX）；
+ * - Windows：`ERROR_FILENAME_EXCED_RANGE`（Win32 错误号 206，CreateProcess 命令行超限），
+ *   Node 侧以 `code` / `errno` 的形式之一出现。**Windows 路径未实测**，只按错误号形状
+ *   归类；未命中时仍走原来的 `NODE_FINISH_TOOL_UNAVAILABLE`，不会误吞普通启动失败。
+ */
+function isArgvTooLargeError(error) {
+  if (!error || typeof error !== 'object') return false
+  return error.code === 'E2BIG'
+    || error.code === 'ERROR_FILENAME_EXCED_RANGE'
+    || error.errno === 206
+}
+
+/**
+ * A3：命令行过长的独立错误（与「CLI 没有工具通道」区分）。
+ *
+ * 清理由 start 的统一失败路径负责；这里只把「是什么问题、怎么办」说清楚。
+ */
+function argvTooLargeError({ error, args }) {
+  const cause = error && error.code
+    ? String(error.code)
+    : (error && error.errno !== undefined ? `ERRNO_${error.errno}` : 'ARGV_TOO_LARGE')
+  const argvList = Array.isArray(args) ? args : []
+  const promptBytes = argvList[0] === '-p' && typeof argvList[1] === 'string'
+    ? Buffer.byteLength(argvList[1], 'utf8')
+    : 0
+  const argvBytes = argvList.reduce((sum, arg) => sum + Buffer.byteLength(String(arg), 'utf8') + 1, 0)
+  const hint = '把大段正文写进工作区文件，用 flow_finish_node 的 documents 引用；'
+    + '或缩短 element.node.prompt / ctx.variables 后重试'
+  return new ClaudeAdapterError(
+    CLAUDE_ARGV_TOO_LARGE_CODE,
+    `Claude 启动命令行超长（${cause}）：提示词或变量过大（prompt ${promptBytes} 字节，`
+      + `argv 合计 ${argvBytes} 字节），进程未能启动。${hint}。`
+      + '这是输入规模问题，不是「CLI 没有工具通道」。',
+    {
+      adapterId: CLAUDE_ADAPTER_ID,
+      field: 'spawn',
+      reason: 'argv-too-large',
+      cause,
+      hint,
+      promptBytes,
+      argvBytes,
+    },
+  )
 }
 
 /** 解析出的最低主版本：1.x 的 `--mcp-config` / `-p` 行为与本适配器假设不同。 */
@@ -696,6 +754,9 @@ function buildClaudeArgs({
   }
   if (model) args.push('--model', model)
   args.push(resolveAllowedToolsFlag(flags), CLAUDE_FINISH_MCP_TOOL_NAME)
+  // A1：非交互运行里没人回答 AskUserQuestion——支持该参数的 CLI 直接禁用提问工具。
+  // CLI 不支持（probe 未确认）时不传，绝不假装禁用（capabilities.evidence 会如实标注）。
+  if (flags && flags.disallowedTools === true) args.push('--disallowedTools', 'AskUserQuestion')
   // 无人可答权限询问：不让 -p 卡在一个不会有人回答的提示上。旧版本不认识就别加。
   if (flags && flags.permissionPrompts === true) args.push('--permission-prompts', 'none')
   return args
@@ -797,6 +858,8 @@ export function createClaudeAdapter(options = {}) {
       allowedTools: /--allowedTools\b/.test(text)
         ? '--allowedTools'
         : (/--allowed-tools\b/.test(text) ? '--allowed-tools' : false),
+      // A1：可选。CLI 不支持时 argv 不传，capabilities evidence 如实标未支持。
+      disallowedTools: /--disallowedTools\b/.test(text),
       model: /--model\b/.test(text),
       verbose: /--verbose\b/.test(text),
     }
@@ -895,6 +958,8 @@ export function createClaudeAdapter(options = {}) {
       requiredFlags: requiredFlags.map(entry => entry.key),
       missingFlags: [],
       allowedToolsFlag: resolveAllowedToolsFlag(flags),
+      // A1：可选参数探测结果，start 决定要不要拼 --disallowedTools。
+      disallowedTools: flags.disallowedTools === true,
       printMode: flags.print,
       outputFormat: flags.outputFormat,
       mcpConfig,
@@ -991,6 +1056,13 @@ export function createClaudeAdapter(options = {}) {
         'turn.stop': hooksContinueEvidence(probeValue, hookLevel),
         messages: ['claude -p 没有可去重的轮次中投递通道：capabilities().messages=unsupported'],
         parameters: parametersEvidence(flags, missingFlags),
+        // A1：提问工具在非交互运行里没有人能回答。只有 probe 确认 CLI 认识
+        // --disallowedTools 才真的禁用；否则如实标「未禁用」，不假装支持。
+        nonInteractive: flags.disallowedTools === true
+          ? '--disallowedTools AskUserQuestion：probe 已从 claude --help 确认该参数，'
+            + '非交互运行不会等待提问工具的回答'
+          : 'probe 未确认 --disallowedTools：CLI 不支持时**不传**该参数，'
+            + '提问工具在非交互运行中未被禁用（不谎称已禁用）',
         usage: ['assistant 事件 message.usage（input / cache_creation / cache_read / output 互斥）→'
           + ' claude-usage-ledger 按稳定 message.id 去重（一处调用一条记录）',
         'result.usage 是**范围级结算快照**（agent/usage-snapshot，scope=invocation / '
@@ -1443,6 +1515,7 @@ export function createClaudeAdapter(options = {}) {
         exitCode: undefined,
         signal: undefined,
         spawnError: null,
+        spawnArgv: null,
         events: [],
         // 0.14.5 M3 / M6 诊断（小、有界；与用量账本分开）
         protocolErrors: 0,
@@ -1712,9 +1785,14 @@ export function createClaudeAdapter(options = {}) {
        *   - 独立 `createUtf8LineReader` + `attachProcessStreams`（M3）；
        *   - 进程组 supervisor（M5 / m1）；
        *   - 资源登记表里的 stream dispose。
-       * 同步 spawn 异常（E2BIG 等）转成 TOOL_UNAVAILABLE，由外层 protect 清理（M4）。
+       * 同步 spawn 异常：命令行过长（E2BIG / Windows 206）→ `CLAUDE_ARGV_TOO_LARGE`；
+       * 其它启动失败仍转成 TOOL_UNAVAILABLE。两者都由外层 protect 清理（M4）。
        */
       const spawnClaude = (args, kind, invocationId) => {
+        state.spawnArgv = args
+        // A2：assistant 错误属于**本次 invocation**，不能跨 resume 复用——否则一次
+        // 瞬时错误 + 后续干净退出会被误判成 provider 错误，把 MISSING 分支吞掉。
+        state.assistantError = undefined
         const proc = {
           kind,
           invocationId,
@@ -1747,6 +1825,9 @@ export function createClaudeAdapter(options = {}) {
             stdio: ['ignore', 'pipe', 'pipe'],
           })
         } catch (error) {
+          // A3：命令行过长是输入规模问题，给独立错误码 + 可操作 hint；普通 spawn
+          // 失败（ENOENT / EACCES …）保持原有 TOOL_UNAVAILABLE，不混为一谈。
+          if (isArgvTooLargeError(error)) throw argvTooLargeError({ error, args })
           throw new ClaudeAdapterError(
             ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
             `Claude 进程无法启动（${error && error.code ? error.code : 'SPAWN_FAILED'}）：`
@@ -1857,6 +1938,19 @@ export function createClaudeAdapter(options = {}) {
             code: (state.terminalError && state.terminalError.code) || 'cli-result-error',
             subtype: invocation.resultSubtype,
             message: (state.terminalError && state.terminalError.message) || '',
+          }
+        } else if (invocation.exitCode === 0
+          && invocation.resultIsError !== true
+          && typeof invocation.resultSubtype !== 'string'
+          && typeof state.assistantError === 'string' && state.assistantError !== '') {
+          // A2：只有 assistant 消息带 error（如 authentication_failed）、**没有 result 事件**、
+          // 退出码 0。这是 provider 侧的执行错误，不是「agent 正常停下但没调工具」：
+          // 不能落 MISSING、也不能提醒一个认证已经失败的 CLI。只有「没有任何错误」的
+          // 正常停下才走提醒 / MISSING 分支（两者不能合并）。
+          terminal = {
+            code: 'cli-assistant-error',
+            subtype: state.assistantError,
+            message: `assistant 消息报告 ${state.assistantError}（没有 result 事件）`,
           }
         } else if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
           terminal = {
@@ -2291,6 +2385,10 @@ export function createClaudeAdapter(options = {}) {
           // 握手前就失败（CS：exit 分支之前先 abort gate 会导致后续误判——这里在
           // gate 尚未 settle 时统一抛 TOOL_UNAVAILABLE，gate 已 settle 则交给退出结算）。
           if (!finishGate.settled()) {
+            // A3：异步 spawn 失败也要认出命令行过长（与同步抛错的分类保持一致）。
+            if (outcome === 'spawn-failed' && isArgvTooLargeError(state.spawnError)) {
+              throw argvTooLargeError({ error: state.spawnError, args: state.spawnArgv })
+            }
             const cause = state.terminalError
               || (state.assistantError ? { code: state.assistantError, message: '' } : null)
             const reason = outcome === 'spawn-failed'

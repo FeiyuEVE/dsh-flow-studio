@@ -63,8 +63,10 @@ $DSH_HOME/flow-studio/instances/<id>/
 |---|---|---|---|
 | `dsh` | 子 agent 会话注册模型工具 `flow_finish_node`（`agents.create` 的 `setup` 里 `agentCtx.tools.register`，会话级可见） | 工具 handler 记一次完成；`agent/turn-stopping` 时未完成 → `agent.steer(提醒)` 唤醒（native）；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`，`hooks['turn.stop']: native` |
 | `codex` | 插件自带 MCP stdio server 暴露同名工具，`codex exec` 配置 `mcp_servers` 指向它 | 工具调用记完成；原生 `Stop` hook（0.167+）注入提醒（native）；无 hook 能力时用 `codex exec resume <session>` 重发提醒（emulated，进程级）；**握手之后 CLI 报 `turn.failed` / 异常退出 / 非零退出码 / 被信号终止 → `CODEX_CLI_TURN_FAILED` / `CODEX_CLI_ERROR` / `CODEX_CLI_EXIT_NONZERO` / `CODEX_CLI_SIGNALED`，不消耗提醒预算**；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测 MCP），`hooks['turn.stop']: native/emulated` |
-| `claude` | 同一个插件自带 MCP stdio server，`claude -p` 用本次进程的 `--mcp-config <0600 文件>` + `--strict-mcp-config` 加载它；凭据只在该文件与子进程 env 里 | 工具调用记完成；默认 `claude -p --resume <session-id>` 进程级续跑（emulated，与 native Stop hook 共用同一个提醒计数）；**握手之后 CLI 自己给出终态错误（认证失败 / result `is_error` / 非零退出码 / 被信号终止）→ `CLAUDE_PROVIDER_ERROR`，`error.code` 形如 `cli-result-error` / `cli-exit-nonzero` / `cli-signaled`，不消耗提醒预算**；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测参数面 + 桥自检），`hooks['turn.stop']: native/emulated`，`usage: native`（调用走 `claude-usage-ledger`，`result.usage` 是范围级结算快照） |
+| `claude` | 同一个插件自带 MCP stdio server，`claude -p` 用本次进程的 `--mcp-config <0600 文件>` + `--strict-mcp-config` 加载它；凭据只在该文件与子进程 env 里 | 工具调用记完成；默认 `claude -p --resume <session-id>` 进程级续跑（emulated，与 native Stop hook 共用同一个提醒计数）；**握手之后 CLI 自己给出终态错误（认证失败 / result `is_error` / 非零退出码 / 被信号终止）→ `CLAUDE_PROVIDER_ERROR`，`error.code` 形如 `cli-result-error` / `cli-assistant-error` / `cli-exit-nonzero` / `cli-signaled`，不消耗提醒预算**；提醒用尽 → `NODE_FINISH_MISSING` | `finishTool: native`（probe 必须实测参数面 + 桥自检），`hooks['turn.stop']: native/emulated`，`usage: native`（调用走 `claude-usage-ledger`，`result.usage` 是范围级结算快照） |
 | 其它/旧版 | 无 | admission 拒绝 | `finishTool: unsupported` |
+
+Claude 的非交互调用在 probe 确认 `--disallowedTools` 后，argv 会带 `--disallowedTools AskUserQuestion`（`-p` 运行没有人能回答提问）；CLI 不支持时**不传**该参数，`capabilities().evidence.nonInteractive` 如实标注「未禁用」，不谎称支持。它是可选探测，不进必需参数表。
 
 ### 4.1 终态错误分类（0.14.6）
 
@@ -74,7 +76,7 @@ $DSH_HOME/flow-studio/instances/<id>/
 2. 闸门被 abort 且实例已取消 → `NODE_FINISH_CANCELED`。
 3. 没有受理记录、且失败发生在**握手之前** → `NODE_FINISH_TOOL_UNAVAILABLE`（保留原原因）。
 4. 握手之后 CLI 给出终态错误 → provider 错误码，**不消耗提醒预算**：
-   - Claude：`CLAUDE_PROVIDER_ERROR`，`error:{code, subtype?, message}`；`code` 形如 `cli-result-error`（`result.errors[0]` / assistant 错误）、`cli-exit-nonzero`、`cli-signaled`（SIGKILL / OOM / 外部 kill），`subtype` 是 CLI 的 result subtype。
+   - Claude：`CLAUDE_PROVIDER_ERROR`，`error:{code, subtype?, message}`；`code` 形如 `cli-result-error`（`result.errors[0]` / assistant 错误）、`cli-assistant-error`（只有 assistant 消息带 `error`、没有 result 事件、退出码 0，如 `authentication_failed`）、`cli-exit-nonzero`、`cli-signaled`（SIGKILL / OOM / 外部 kill），`subtype` 是 CLI 的 result subtype 或 assistant 错误名。
    - Codex：`CODEX_CLI_TURN_FAILED` / `CODEX_CLI_ERROR`（`turn.failed` / 异常退出）、`CODEX_CLI_EXIT_NONZERO`、`CODEX_CLI_SIGNALED`；`errorDetails:{kind, cliCode}` 保留分类与脱敏后的 CLI 原始码。
 5. 只有正常停下、通道可用、没有终态错误才提醒 / 续跑；提醒预算耗尽才是 `NODE_FINISH_MISSING`。
 
@@ -92,7 +94,8 @@ provider 错误文本不可信（CLI 可能把凭据或 12 KB 文本塞进 `erro
 
 ### 4.3 启动失败：清理与已观测用量（0.14.6）
 
-- **资源所有权边界**：Codex 的 runDir 一创建就登记进资源 registry；写 hook、建完成通道与 listener、构造参数、**同步 `spawn`**（含 `E2BIG`）、MCP 握手都在保护块内。启动失败统一 abort 闸门 → 整组 TERM→KILL 并确认 → 关 channel / 撤 listener / 删 runDir，并在错误对象上挂 `cleanup` / `cleanupFinal`。不再出现「start 抛错但临时目录 / MCP server 残留」。
+- **资源所有权边界**：Codex 的 runDir 一创建就登记进资源 registry；写 hook、建完成通道与 listener、构造参数、**同步 `spawn`**、MCP 握手都在保护块内。启动失败统一 abort 闸门 → 整组 TERM→KILL 并确认 → 关 channel / 撤 listener / 删 runDir，并在错误对象上挂 `cleanup` / `cleanupFinal`。不再出现「start 抛错但临时目录 / MCP server 残留」。
+- **命令行过长 ≠ 没有工具通道**：Claude 启动时 Linux `E2BIG`（或 Windows `ERROR_FILENAME_EXCED_RANGE` / errno 206，Windows 未实测）是输入规模问题 → 独立 `CLAUDE_ARGV_TOO_LARGE`（`details.reason='argv-too-large'`，带 prompt / argv 字节数与「改用 `documents` / 缩短输入」hint），清理路径与其它启动失败相同；ENOENT / EACCES 等普通 spawn 失败仍是 `NODE_FINISH_TOOL_UNAVAILABLE`。
 - **失败载体带用量**：`start()` 在返回 handle 之前失败时，适配器把已观测的调用 / 结算快照挂到错误对象上：`error.usageCalls[]` / `error.usageSnapshots[]`（`readAdapterUsageCalls` / `readAdapterUsageSnapshots` 同时接受数组和函数）。`agent-execute` 在 `finally` 里从 `failure.cause` 取同一份载体，落成 `agent/usage` / `agent/usage-snapshot` 事件；一条都没有就不挂空账本。
 - **不伪造调用事实**：只有已经拿到 handle 的轮次，才在「适配器宣称能观测却一条 usage 都没有」时写 unknown 占位；握手前失败没有真实启动轮次，不补 synthetic 调用。
 

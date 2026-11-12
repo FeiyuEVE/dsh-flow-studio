@@ -150,6 +150,8 @@ function takeValue(name) {
   return index >= 0 && index + 1 < argv.length ? argv[index + 1] : null
 }
 
+// m3：模拟「CLI 从不报 session_id」的版本（配合 FAKE_CLAUDE_DROP_FLAG=--session-id）。
+const emitSession = process.env.FAKE_CLAUDE_OMIT_SESSION !== '1'
 const prompt = argv[0] === '-p' && argv.length > 1 ? argv[1] : argv[argv.length - 1]
 const mcpConfigPath = takeValue('--mcp-config')
 const settingsPath = takeValue('--settings')
@@ -209,6 +211,7 @@ writeFileSync(join(stateDir, 'invocations', process.pid + '.json'), JSON.stringi
 if (process.env.FAKE_CLAUDE_SKIP_INIT !== '1') out({ type: 'system', subtype: 'init', session_id: sessionId })
 
 const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn' || mode === 'early-error'
+  || mode === 'usage-then-no-mcp'
 let transport = null
 let client = null
 if (!skipMcp && mcpConfig) {
@@ -225,7 +228,7 @@ if (!skipMcp && mcpConfig) {
 function assistantEvent(usage, text, id) {
   out({
     type: 'assistant',
-    session_id: sessionId,
+    ...(emitSession ? { session_id: sessionId } : {}),
     parent_tool_use_id: null,
     message: {
       id: id || ('msg_' + Date.now() + '_' + Math.random().toString(16).slice(2)),
@@ -242,7 +245,7 @@ function resultEvent(usage, text) {
   out({
     type: 'result',
     subtype: 'success',
-    session_id: sessionId,
+    ...(emitSession ? { session_id: sessionId } : {}),
     is_error: false,
     num_turns: 1,
     result: text,
@@ -472,6 +475,12 @@ if (mode === 'usage-then-hang') {
   await hangForever()
 }
 if (mode === 'sleep') {
+  // 初始进程挂住（等测试 kill）；resume 立刻退出——旧实现「SIGKILL → 提醒续跑」时
+  // 不会把一个永远不退出的 resume 进程留在用例里（那会让失败的基线套件挂住）。
+  if (isResume) {
+    await closeClient()
+    process.exit(0)
+  }
   await hangForever()
 }
 if (mode === 'no-mcp') {
@@ -639,6 +648,30 @@ if (mode === 'error') {
     result: 'API Error: 401 invalid credential',
   })
   await closeClient()
+  process.exit(1)
+}
+if (mode === 'usage-then-no-mcp') {
+  // M2 残余：已经观测到 assistant / result 用量，但 MCP 握手前就卡住（随后超时失败）。
+  assistantEvent(usageA, '先花掉一次调用，然后不拉起 MCP。')
+  resultEvent(usageResultFinal, '完成')
+  await hangForever()
+}
+if (mode === 'secret-error') {
+  // F2：凭据分别藏在 errors[0]（→ code）、subtype、result（→ message）里；message 超长。
+  const fakeBearer = 'Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+  out({
+    type: 'assistant',
+    ...(emitSession ? { session_id: sessionId } : {}),
+    message: { id: 'msg_secret', content: [ { type: 'text', text: '认证失败' } ] },
+  })
+  out({
+    type: 'result',
+    subtype: 'Bearer ' + token + ' ' + 'z'.repeat(40),
+    ...(emitSession ? { session_id: sessionId } : {}),
+    is_error: true,
+    errors: ['api_key=' + fakeBearer + ' token=' + token],
+    result: ('Authorization: ' + fakeBearer + ' sk-' + 'Q'.repeat(64) + ' token=' + token + ' ').repeat(150),
+  })
   process.exit(1)
 }
 if (mode === 'early-error') {
@@ -1823,6 +1856,162 @@ async function main() {
       A.match(failure.message, /握手前退出/)
       A.equal(failure.cleanup.disposed, true)
       A.equal((await failure.cleanupFinal).disposed, true)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M6 残余 a：CLI 被 SIGKILL → CLAUDE_PROVIDER_ERROR、0 提醒（不再 MISSING）', async () => {
+      resetState()
+      const workspace = freshWorkspace('sigkill')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'sleep' },
+      })
+      const gate = makeGate(workspace)
+      const fires = []
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '被 KILL 的节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: info => fires.push(info.count) },
+      })
+      A.equal(typeof handle.pid, 'number', '假 claude 已启动（MCP 已握手）')
+      process.kill(handle.pid, 'SIGKILL')
+      const exited = await handle.exited
+      A.equal(exited.ok, false)
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE,
+        '信号终止是终态执行错误，不是「没调用 finish」（基线：提醒 1 次后 NODE_FINISH_MISSING）')
+      A.equal(exited.reminders, 0, '死掉的 CLI 不该被提醒 / 续跑')
+      A.deepEqual(fires, [], '不触发任何提醒')
+      A.equal(exited.error?.code, 'cli-signaled', '原因如实标注信号退出')
+      A.match(String(exited.error?.message), /SIGKILL/)
+      A.equal(gate.settled(), true, '终态错误必须 abort 闸门')
+      A.equal(invocations().length, 1, '信号退出后不再起 resume 进程')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M6 残余 b：闸门已受理后的迟到 cancel 不能覆盖成功结果', async () => {
+      resetState()
+      const workspace = freshWorkspace('late-cancel')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'zero-grace' },
+        // 宽限期拉长：cancel 一定发生在进程自然结束之前，业务结果已经被受理。
+        postFinishGraceMs: 60_000,
+        killTimeoutMs: 300,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '迟到取消节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const record = await gate.result
+      A.equal(record?.summary, 'zero-grace', '闸门已受理成功')
+      // 迟到的 cancel：只负责清理进程，不得把业务结果改写成 CANCELED。
+      await adapter.cancel(handle, 'late-cancel')
+      const exited = await handle.exited
+      A.equal(exited.ok, true, '已受理的成功结果优先于迟到 cancel（基线：NODE_FINISH_CANCELED）')
+      A.equal(exited.code, 'OK')
+      A.equal(exited.record?.summary, record.summary)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('m3 残余：probe 不支持 --session-id 时不返回没传给 CLI 的 UUID', async () => {
+      resetState()
+      const workspace = freshWorkspace('no-session-id')
+      // 不用注入的 probeResult：必须走**真实 probe** 才能反映 --help 里没有 --session-id。
+      const adapter = createClaudeAdapter({
+        claudeBin: fakeBin,
+        tmpRoot: sandbox,
+        selfTest: false,
+        reminderLimit: 1,
+        env: {
+          FAKE_CLAUDE_STATE_DIR: stateDir,
+          FAKE_CLAUDE_MODE: 'never',
+          // probe 的 --help 里没有 --session-id，且 CLI 自己也从不报 session_id。
+          FAKE_CLAUDE_DROP_FLAG: '--session-id',
+          FAKE_CLAUDE_SKIP_INIT: '1',
+          FAKE_CLAUDE_OMIT_SESSION: '1',
+        },
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '无 session-id 节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      const [invocation] = invocations()
+      A.equal(invocation.sessionIdArg, null, '初始进程没有传 --session-id')
+      A.equal(handle.sessionId, undefined,
+        'handle.sessionId 不能返回一个从未传给 CLI 的随机 UUID（基线：返回 UUID）')
+      A.equal(exited.sessionId, undefined, 'exited.sessionId 同理')
+      A.equal(exited.reminders, 0, '没有确实可续跑的 session id 时不假装续跑')
+      A.equal(exited.code, 'NODE_FINISH_MISSING')
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('F2 终态错误脱敏与长度：code/subtype/message 分别藏秘密，全部抹掉且 ≤1000 字节', async () => {
+      const { adapter, handle, exited } = await runClaudeMode('secret-error')
+      A.equal(exited.code, CLAUDE_PROVIDER_ERROR_CODE)
+      const [invocation] = invocations()
+      const secretToken = invocation.token
+      const fakeBearerSecret = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+      const skSecret = `sk-${'Q'.repeat(64)}`
+      A.ok(secretToken.length > 0)
+      const json = JSON.stringify(exited)
+      A.equal(json.includes(secretToken), false,
+        '本执行凭据藏在 errors[0] / subtype / result 任一处都必须脱敏（基线：code/subtype 泄漏）')
+      A.equal(json.includes(fakeBearerSecret), false, 'Bearer 秘密必须被共享脱敏规则抹掉')
+      A.equal(json.includes(skSecret), false, 'sk- 开头的 API key 必须被抹掉')
+      A.ok(Buffer.byteLength(String(exited.message), 'utf8') <= 1_000, '终态错误 message ≤1000 字节')
+      A.ok(Buffer.byteLength(String(exited.error?.code ?? ''), 'utf8') <= 1_000, 'code 有界')
+      A.ok(Buffer.byteLength(String(exited.error?.subtype ?? ''), 'utf8') <= 1_000, 'subtype 有界')
+      const diagnostic = handle.diagnostics.terminalError
+      A.equal(JSON.stringify(diagnostic).includes(secretToken), false, 'diagnostics.terminalError 同样脱敏')
+      A.ok(Buffer.byteLength(String(diagnostic?.message ?? ''), 'utf8') <= 1_000)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M2 残余：start 握手前失败也把已观测 usage 挂到失败载体（executor 可读）', async () => {
+      resetState()
+      const workspace = freshWorkspace('usage-before-handshake')
+      const adapter = makeAdapter({
+        env: { FAKE_CLAUDE_STATE_DIR: stateDir, FAKE_CLAUDE_MODE: 'usage-then-no-mcp' },
+        helloTimeoutMs: 400,
+      })
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          element: { id: 'agent-1', name: '握手前失败但已用量的节点' },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'start 必须失败')
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.equal(failure.details.reason, 'mcp-handshake-timeout')
+      A.ok(Array.isArray(failure.usageCalls), '失败载体必须带 usageCalls（基线：丢失）')
+      A.equal(failure.usageCalls.length, 1)
+      A.equal(failure.usageCalls[0].usage.output, 30)
+      A.ok(Array.isArray(failure.usageSnapshots), '失败载体必须带 usageSnapshots（基线：丢失）')
+      A.equal(failure.usageSnapshots.length, 1)
+      // executor 收尾用的就是这两个读取器（与 handle 同一份契约）。
+      A.equal(readAdapterUsageCalls(failure, 'claude').length, 1,
+        'executor 用同一读取器能从失败载体拿到已观测调用')
+      A.equal(readAdapterUsageSnapshots(failure, 'claude').length, 1)
+      A.equal(failure.cleanup.disposed, true, '带上用量不影响启动失败清理')
       A.deepEqual(leftoverDirs(), [])
     })
 

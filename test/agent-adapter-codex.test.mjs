@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url'
 import { createFinishGate } from '../src/node-finish.js'
 import { createCodexAdapter, CODEX_ADAPTER_ID } from '../src/agent-adapter-codex.js'
 import { ADAPTER_ERROR, assertFinishToolNative, validateAdapter } from '../src/agent-adapter.js'
+import { readAdapterUsageCalls } from '../src/agent-telemetry.js'
 import { admitAdapter } from '../src/agent-execute.js'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -180,7 +181,7 @@ writeFileSync(join(stateDir, 'invocations', process.pid + '.json'), JSON.stringi
 
 out({ type: 'thread.started', thread_id: threadId })
 
-const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn'
+const skipMcp = mode === 'no-mcp' || mode === 'no-mcp-stubborn' || mode === 'usage-then-no-mcp'
 let transport = null
 let client = null
 if (!skipMcp) {
@@ -501,6 +502,28 @@ if (mode === 'drain-stall') {
   writeFileSync(join(stateDir, 'stdout-holder.pid'), String(holder.pid))
   writeFileSync(join(stateDir, 'drain-started'), String(process.pid))
   process.exit(0)
+}
+if (mode === 'usage-then-no-mcp') {
+  // M2 残余：已经观测到一轮用量，但不拉起 MCP → 握手超时失败，用量必须随失败载体上交。
+  out({ type: 'turn.completed', usage: { input_tokens: 9, output_tokens: 4 } })
+  mkdirSync(stateDir, { recursive: true })
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+if (mode === 'terminal-error-huge') {
+  // F2：CLI 错误码与消息都不可信且可以很长（实测能构造 12 KB 级异常 message）。
+  mkdirSync(stateDir, { recursive: true })
+  await closeClient()
+  const fakeBearer = 'Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+  const codeChunk = 'sk-' + 'Q'.repeat(64) + ' token=' + (token || 'sk-test') + ' '
+  out({
+    type: 'turn.failed',
+    error: {
+      code: codeChunk.repeat(120),
+      message: (fakeBearer + ' ').repeat(20) + 'y'.repeat(12_000),
+    },
+  })
+  process.exit(1)
 }
 if (mode === 'sleep') {
   mkdirSync(stateDir, { recursive: true })
@@ -1557,6 +1580,132 @@ async function main() {
       A.deepEqual(fires, [])
       A.equal(invocations().length, 1, 'M6：异常退出不再 spawn resume')
       await adapter.dispose(handle)
+    })
+
+    await check('M4 残余：同步 spawn E2BIG → TOOL_UNAVAILABLE + cleanup，目录/channel/listener 不残留', async () => {
+      resetState()
+      const workspace = freshWorkspace('e2big')
+      const adapter = makeAdapter()
+      const before = leftoverDirs()
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          // 约 200 KB 单参数：Linux MAX_ARG_STRLEN=128 KiB → spawn 同步 E2BIG。
+          element: { id: 'agent-1', name: '超长提示词节点', node: { prompt: 'x'.repeat(200_000) } },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, '参数超限必须失败而不是只留下资源')
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.equal(failure.details.reason, 'spawn-failed')
+      A.equal(failure.details.cause, 'E2BIG', '同步 spawn 的 E2BIG 必须保留为 cause')
+      A.deepEqual(leftoverDirs(), before, '启动失败不能残留 runDir（基线：目录留在 tmpRoot）')
+      A.ok(failure.cleanup && typeof failure.cleanup === 'object', '失败错误带物理清理信号')
+      A.equal(failure.cleanup.disposed, true, 'cleanup 必须如实报告已释放（基线：无 cleanup）')
+      A.equal((await failure.cleanupFinal).disposed, true)
+      A.equal(gate.settled(), true, '启动失败必须 abort gate（基线：gate 未中止）')
+      A.equal(invocations().length, 0, '同步 spawn 失败 → 零派发')
+    })
+
+    await check('M6 残余 b：闸门已受理后的迟到 cancel 不能覆盖成功结果', async () => {
+      resetState()
+      const workspace = freshWorkspace('late-cancel')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'call-then-hang' },
+        // 宽限期拉长：cancel 一定发生在进程自然结束之前，业务结果已经被受理。
+        postFinishGraceMs: 60_000,
+        killTimeoutMs: 300,
+      })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '迟到取消节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const record = await gate.result
+      A.equal(record?.summary, 'fake codex finished', '闸门已受理成功')
+      // 迟到的 cancel：只负责清理进程，不得把业务结果改写成 CANCELED。
+      await adapter.cancel(handle, 'late-cancel')
+      const exited = await handle.exited
+      A.equal(exited.ok, true, '已受理的成功结果优先于迟到 cancel（基线：NODE_FINISH_CANCELED）')
+      A.equal(exited.code, 'OK')
+      A.equal(exited.record?.summary, record.summary)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('F2 终态错误脱敏与长度：错误码 + 消息分别藏秘密，全部抹掉且 message ≤1000 字节', async () => {
+      resetState()
+      const workspace = freshWorkspace('terminal-huge')
+      const adapter = makeAdapter({ env: { FAKE_CODEX_MODE: 'terminal-error-huge' }, reminderLimit: 1 })
+      const gate = makeGate(workspace)
+      const handle = await adapter.start({
+        element: { id: 'agent-1', name: '超长错误节点' },
+        ctx: {},
+        finishGate: gate,
+        workspaceRoot: workspace,
+        reminder: { onFire: () => {} },
+      })
+      const exited = await handle.exited
+      A.equal(exited.ok, false)
+      A.equal(exited.code, 'CODEX_CLI_TURN_FAILED')
+      const [invocation] = invocations()
+      const secretToken = invocation.token
+      const fakeBearerSecret = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+      const skSecret = `sk-${'Q'.repeat(64)}`
+      A.ok(secretToken.length > 0)
+      const json = JSON.stringify(exited)
+      A.equal(json.includes(secretToken), false,
+        'CLI 的 code / message 里的本执行凭据都必须脱敏（基线：code 原样进 message 与 errorDetails）')
+      A.equal(json.includes(fakeBearerSecret), false, 'Bearer 秘密必须被共享脱敏规则抹掉')
+      A.equal(json.includes(skSecret), false, 'sk- 开头的 API key 必须被抹掉')
+      A.ok(Buffer.byteLength(String(exited.message), 'utf8') <= 1_000,
+        '终态错误 message ≤1000 字节（基线：code + 12000 字符 message 共 12113 字节）')
+      A.ok(Buffer.byteLength(String(exited.errorDetails?.cliCode ?? ''), 'utf8') <= 1_000, 'errorDetails.cliCode 有界')
+      const diagnostic = handle.terminalError
+      A.equal(JSON.stringify(diagnostic).includes(secretToken), false, 'handle.terminalError 同样脱敏')
+      A.ok(Buffer.byteLength(String(diagnostic?.message ?? ''), 'utf8') <= 1_000)
+      await adapter.dispose(handle)
+      A.deepEqual(leftoverDirs(), [])
+    })
+
+    await check('M2 残余：start 握手前失败也把已观测 usage 挂到失败载体（executor 可读）', async () => {
+      resetState()
+      const workspace = freshWorkspace('usage-before-handshake')
+      const adapter = makeAdapter({
+        env: { FAKE_CODEX_MODE: 'usage-then-no-mcp' },
+        helloTimeoutMs: 400,
+      })
+      const gate = makeGate(workspace)
+      let failure = null
+      try {
+        await adapter.start({
+          element: { id: 'agent-1', name: '握手前失败但已用量的节点' },
+          ctx: {},
+          finishGate: gate,
+          workspaceRoot: workspace,
+        })
+      } catch (error) {
+        failure = error
+      }
+      A.ok(failure, 'start 必须失败')
+      A.equal(failure.code, ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE)
+      A.equal(failure.details.reason, 'mcp-handshake-timeout')
+      A.ok(Array.isArray(failure.usageCalls), '失败载体必须带 usageCalls（基线：丢失）')
+      A.equal(failure.usageCalls.length, 1)
+      A.equal(failure.usageCalls[0].usage.output_tokens, 4)
+      // executor 收尾用的就是这个读取器（与 handle 同一份契约）。
+      A.equal(readAdapterUsageCalls(failure, 'codex').length, 1,
+        'executor 用同一读取器能从失败载体拿到已观测调用')
+      A.equal(failure.cleanup.disposed, true, '带上用量不影响启动失败清理')
+      A.deepEqual(leftoverDirs(), [])
     })
 
     await check('M4：凭据 / socket 路径不进 handle.events / lastMessage / stdoutTail', async () => {

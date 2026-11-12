@@ -17,10 +17,10 @@
 | [faq.md](faq.md) | 高频问题的**短答案 + 指向 owner 的链接** | 与 owner 重复的长篇解释 |
 | [cookbook/](cookbook/release.md) | 编号步骤式 how-to，每步带可验证结果 | 设计理由、字段全表 |
 | [postmortem/](postmortem/2026-11-07-oom.md) | 事故记录体例：现象、时间线、根因链、修复、遗留 | 常规教程 |
-| [DESIGN.md](DESIGN.md) | **历史资料**：旧运行域时代的设计总案（定位、视觉方向、布局、打回 / executor、冲突裁决表）；0.14.0 起冻结 | 当前契约（归 design/09–13 与 reference/instance-api.md） |
+| [DESIGN.md](DESIGN.md) | **历史资料**：旧运行域时代的设计总案（定位、视觉方向、布局、打回 / executor、冲突裁决表）；0.14.0 起冻结 | 当前契约（归 design/09–14 与 reference/instance-api.md） |
 | [DESIGN-BRIEF.md](DESIGN-BRIEF.md) | 最初的设计任务书（历史输入，冻结） | 现行裁决 |
 | [design/01–08 + REVIEW.md](design/01-ia-interaction.md) | **历史资料**：旧运行域时代的分册数值规格、接口契约、审核记录（0.14.0 起不更新） | 当前实例域契约（归 design/10–13） |
-| [design/09–13](design/10-bpmn-instance-api.md) | 当前契约：agent 适配器 hooks（09）、BPMN 实例 API / 事件（10）、finish 工具（11）、实例指标（12）、业务证据（13） | 旧运行域行为 |
+| [design/09–14](design/10-bpmn-instance-api.md) | 当前契约：agent 适配器 hooks（09）、BPMN 实例 API / 事件（10）、finish 工具（11）、实例指标（12）、业务证据（13）、ACP 适配器（14） | 旧运行域行为 |
 | [AGENTS.md](AGENTS.md)（本文件） | 文档分层税则与写作规则 | 产品事实、版本历史 |
 
 ## 2. 事实 → 归哪个 tier（查这张表再动笔）
@@ -39,7 +39,7 @@
 | 某一版的改动 | `history/releases.md` | README 里写「当前版本：0.9.0 + 各版历史」 |
 | 当前实例指标 / 证据数值（阈值、聚合口径） | `design/12–13`；旧界面数值在 `DESIGN.md` 与 `design/01–08`（**历史资料，0.14.0 起冻结**） | guide 里写像素值或阈值形成第二真相 |
 | 旧设计数值冲突的历史裁决 | `DESIGN.md` §6（只解释 0.14.0 之前的选择，不再是现行裁决依据） | 拿历史裁决表给当前实现定数 |
-| 为什么这么设计 / 否决了什么 | 当前契约的理由写在 `design/09–13`；旧运行域的 `DESIGN.md` §1–§5 与 `design/01–08` 只作历史资料 | 在 reference 里讲心路历程 |
+| 为什么这么设计 / 否决了什么 | 当前契约的理由写在 `design/09–14`；旧运行域的 `DESIGN.md` §1–§5 与 `design/01–08` 只作历史资料 | 在 reference 里讲心路历程 |
 | 事故与教训 | `postmortem/`（唯一允许讲故事的 tier） | 在测试注释里写完整事故报告 |
 | 高频疑问 | `faq.md`（短答案 + 链接） | FAQ 里复制整段契约 |
 
@@ -55,10 +55,10 @@
 
 ## 4. 本仓硬约束
 
-1. **`design/` 分册冻结**：`01-ia-interaction.md` … `08-state-machine.md`、`REVIEW.md` 自 0.14.0 起是**历史资料**，文件名与编号不许重排、不许改名、不许按新域重写；只允许加「历史资料」标注或修失效链接。`09–13` 是当前契约，可以随实现更新。
+1. **`design/` 分册冻结**：`01-ia-interaction.md` … `08-state-machine.md`、`REVIEW.md` 自 0.14.0 起是**历史资料**，文件名与编号不许重排、不许改名、不许按新域重写；只允许加「历史资料」标注或修失效链接。`09–14` 是当前契约，可以随实现更新。
 2. **当前实例事件 / 指标 / 证据的唯一真相源分别是 `design/10-bpmn-instance-api.md`、`design/12-instance-metrics.md`、`design/13-instance-evidence.md`**。旧 `design/05-run-log.md` 只解释历史 run 事件；`reference/run-log.md` 的旧事件速查同样只作历史资料，不再描述当前实例事件。其它文档只写「契约在哪、怎么用、字段速查」，详细字段、校验规则、聚合口径一律链接过去，不复制。
 3. **README 不写版本历史**。历史只进 `history/releases.md`；README 的文档导航给一个入口。
-4. **`DESIGN.md` 自 0.14.0 起是历史资料，不再更新、也不再是现行冲突裁决依据**（§6 裁决表只解释旧运行域时代 01–08 分册的选择）。当前契约以 `design/09–13` 与 `reference/instance-api.md` 为准；旧分册出现旧值时保留原文并标注历史，不要在两处各留一套现行值。
+4. **`DESIGN.md` 自 0.14.0 起是历史资料，不再更新、也不再是现行冲突裁决依据**（§6 裁决表只解释旧运行域时代 01–08 分册的选择）。当前契约以 `design/09–14` 与 `reference/instance-api.md` 为准；旧分册出现旧值时保留原文并标注历史，不要在两处各留一套现行值。
 5. **一个事实一个家**：新写一段前先搜关键字（比如 `FLOW_STUDIO_TOKEN`、`instance.json`），已有家就链接，不新开第二节。
 6. **链接必须通**：一律用相对链接；改文件名或移动目录后，全仓扫一遍 `](` 引用。跨文件锚点按 GitHub slug 规则（小写、空格转 `-`、去标点），中文标题保留中文字符。
 7. **只描述当前行为**：历史用版本号或日期限定（如「0.8.2 起」）；不写「未来会」「已实现！」这类会腐烂的状态标注，交付状态归 `history/releases.md`。

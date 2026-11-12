@@ -48,6 +48,7 @@
 | [DESIGN-BRIEF.md](DESIGN-BRIEF.md) | 最初的设计任务书（历史输入，不再更新） | 想理解设计来源的人 |
 | [design/01–08 + REVIEW.md](design/01-ia-interaction.md) | 旧运行域时代的分册数值规格与独立审核（**历史资料，编号与内容冻结**） | 想理解旧设计的人 |
 | [design/09–13](design/10-bpmn-instance-api.md) | 当前契约：适配器 hooks、BPMN 实例 API、finish 工具、实例指标、业务证据 | 实现者 |
+| [design/14](design/14-acp-adapter.md) | ACP 适配器：决策、连接 / 会话生命周期、probe 四层证据、完结与提醒、权限、清理与取消、错误索引与明确不做 | 接 ACP agent 的实现者 / 验收者 |
 
 ## 读文档的顺序
 

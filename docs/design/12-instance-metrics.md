@@ -51,10 +51,23 @@
 | dsh / DeepSeek TokenUsage | `inputTokens`、`cacheReadTokens`、`cacheWriteTokens`、`outputTokens`（互斥） | 不再拆；`cacheRead` 单独成桶，不能加回 input |
 | claude / Anthropic 风格 | `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`（互斥） | 与 dsh 同口径，不拆 input；`claude-usage-ledger.js`（0.14.5）解释调用身份与结算作用域，适配器不再自己按事件计数、也不再把 `result.usage` 当第 N 次调用 |
 | 已有四桶的输入 | `input` / `cacheRead` / `cacheWrite` / `output` | 视为已归一，不二次拆分 |
+| acp / codex-acp 2.6.0 prompt usage | `inputTokens`、`cachedReadTokens`、`cachedWriteTokens`、`outputTokens`、`totalTokens`、`thoughtTokens` | agent 已按**本轮**差分并扣掉缓存：直接记 `scope:'invocation'`，不再对相邻 prompt 做差分；只有已验证 profile 才解释数值 |
 
 数据矛盾（`cached > input`）时按原始 input 截断（先读后写），守住「四桶之和 === total」这条不变量；坏数值（负数、字符串、NaN）整条 usage 标 `unknown`，不把坏值当 0。
 
 **观测掩码是权威（0.14.6）**：事件带 `observedBuckets` 时，不在掩码里的桶即使 `usage` 对象里有 `0` 也是**未观测**（输出 `null`），不能把补零当真实值；只有历史事件缺掩码时才从数值反推，并标 `usage-history-mask-missing`。`provisional:true`（assistant 的 `output` 可能只是响应开始时的占位值、还没有 `result` 结算）时，桶值可以展示，但该调用 / 范围不计「完整」，完整 total 为 `null` 并带 `usage-output-provisional`。
+
+### 3.1 ACP prompt profile
+
+ACP 适配器只在 agent 身份**精确匹配** `agentInfo.name === '@agentclientprotocol/codex-acp'` 且 `agentInfo.version === '2.6.0'` 时解释 prompt usage；其它版本 / 身份一律 unknown，不猜累计、不猜 invocation、不做差分。
+
+- **不差分**：`codex-acp 2.6.0` 在每次 `session/prompt` 开始时记下 `session.totalTokenUsage`，返回时用 `latest − startTotal` 得到本轮用量；`inputTokens` 也已经扣掉缓存。因此账本把 prompt 响应当作**本次 invocation** 直接结算，再对相邻 prompt 做差分会二次扣减。
+- **四桶映射**：`inputTokens → input`、`cachedReadTokens → cacheRead`、`cachedWriteTokens → cacheWrite`、`outputTokens → output`，`canonical:1`；`thoughtTokens` 只是 `output` 的子集，只有 `0 ≤ thought ≤ output` 时记为 `reasoning`，绝不加进 `total`。四桶全部上报时 `total` 取四桶之和；agent 上报的 `totalTokens` 与四桶之和矛盾 → 整轮 `usage-malformed`，不取 max、不修正。
+- **缺桶 null**：字段缺失或显式 `null` 是**未观测**，对应桶为 `null` 且不出现在 `observedBuckets`；只有明确上报的 `0` 才算观测值。没有任何桶（例如只有 `totalTokens`）→ `usage-malformed`。
+- **结算快照**：有效数值记一条 `agent/usage-snapshot`：`provider:'acp'`、`scope:'invocation'`、`snapshotId:'acp-prompt:' + sha256(executionId + '\0' + invocationId)`、`invocationId`、`sessionScopeId`、`agentScope:'main'`、`observedBuckets`、`provenance:{contract:'acp-codex-2.6.0-prompt-v1', realCliVerified:false}`。`realCliVerified:false` 表示真实多轮 CLI 尚未验收，不能拿单轮录制冒充；ACP 不使用 `session-cumulative` 或数值型 `unknown` 快照。
+- **unknown 不是零**：profile 未验证、prompt 响应缺 `usage`、只有 `usage_update`、取消 / 断线后尾窗内没有响应 → 不为该轮造 0，只记一条 synthetic 调用：`provider:'acp'`、`callId:'acp-unknown:' + sha256(executionId + '\0' + invocationId)`、`usage:null`、`observedBuckets:[]`、`synthetic:true`、`source:'acp-prompt'`、`invocationId`、`sessionScopeId`、`agentScope:'main'`、`reason:'usage-unavailable'`。形状坏（负数、非安全整数、四桶与 total 矛盾、`thought > output`）用 `reason:'usage-malformed'`。原因只复用这两个稳定字符串。
+- **同一次 invocation 只结算一次**：snapshot 与 unknown 调用二选一，重复 `end` / `sealUnknown` 只记诊断，不重复计数；取消也先等尾窗收完，再对没有响应的轮次落 unknown。
+- **`usage_update.used/size` 只进诊断**，不当 token、不当基线、不参与计费；`used/size` 不是 token 桶。`capabilities().usage` 固定为 `unknown`，prompt 也不冒充一次模型调用，所以 ACP 的 `agent.modelCalls` 在没有其它已知调用时为 `null`；`agent.invocations` 仍按 `agent/invocation` 计。
 
 ## 4 指标表
 

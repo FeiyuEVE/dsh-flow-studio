@@ -30,6 +30,7 @@
 **A-2 Claude 补充**：hook 位置 `~/.claude/settings.json`、`.claude/settings.json`、`.claude/settings.local.json`、managed、插件 `hooks/hooks.json`、skill/subagent frontmatter；`matcher` 在「仅字母数字`_-,|`空格」时按精确/`|`列表，否则按 JS 正则（未锚）；exec-form（`args`）不走 shell；`SessionEnd` 不能阻断。来源：<https://code.claude.com/docs/zh-CN/hooks.md>、<https://code.claude.com/docs/zh-CN/cli-reference.md>。
 **A-3 DSH 参考实现（只借语义，不 import）**：本仓库 fork（`deepseek-harness/packages/experimental/`）里已经有两套方言的桥，共享协议层——`hook-protocol/`（匹配/执行/解码/合并/`hook/*` 事件）、`hooks-codex/src/index.ts:187-262`（5 事件）、`hooks-claude-code/src/index.ts:208-296`（7 事件）。桥的映射即本设计的现实基线：`SessionStart→agent/created`、`UserPromptSubmit/PreToolUse→agent/pre-step / tools/pre-execute`、`PostToolUse→tools/post-execute`、`Stop→agent/turn-stopping`、`SubagentStart/Stop→subagent/start|end`；**`updatedInput` 不生效、`continue:false` 无 run 级效果、非 command handler 跳过**。
 **但这些包没有随宿主发布**：运行中的 `/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/` 里没有任何 `hooks-*` / `hook-protocol`（实测 `ls | grep -i hook` 为空），web profile 也没依赖它们。所以 flow-studio **不能 import**，只能照这套语义自己实现一层薄桥（协议形状照抄、事件映射照抄，代码独立）。
+**A-4 ACP（0.15.0）**：ACP v1 适配器把 agent 当 stdio 协议对端；能力为 `finishTool:'native'`（仅当 probe 证明 agent 拉起 finish MCP 并完成 tools/list discovery）、`hooks['turn.stop']:'emulated'`（同一 session 再 prompt 提醒）、`messages:'unsupported'`、`usage:'unknown'`、`resume:'unsupported'`、`cancel:'native'`。决策、probe 四层证据、完结 / 提醒与权限见 [14 · ACP 适配器](14-acp-adapter.md)；真实 `codex-acp 2.6.0` 的 finish 模型调用仍未验证。
 
 ## B 抽象设计
 

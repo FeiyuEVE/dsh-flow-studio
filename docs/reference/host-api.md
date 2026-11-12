@@ -67,7 +67,7 @@
 | `flow_instance_worktrees` | 实例 worktree 的 list / inspect / remove / branch / prune |
 | `flow_instance_send_message` / `flow_instance_reply` | 实例收件箱发消息 / 回复来源 |
 
-agent 节点会话里另有 `flow_finish_node`：由 AgentAdapter（dsh 会话级工具 / codex MCP server）提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 13 个工具之一，见 [finish 工具](../design/11-node-finish-tool.md)。
+agent 节点会话里另有 `flow_finish_node`：由 AgentAdapter（dsh 会话级工具 / codex 与 ACP 的 MCP server）提供，节点必须调用它提交结论与证据才能完结。它不是全局注册的 13 个工具之一，见 [finish 工具](../design/11-node-finish-tool.md)；ACP 的通道与证据分层见 [ACP 适配器](../design/14-acp-adapter.md)。
 
 ## 环境变量
 
@@ -80,6 +80,33 @@ agent 节点会话里另有 `flow_finish_node`：由 AgentAdapter（dsh 会话�
 | `FLOW_STUDIO_AGENT_GLOBAL` / `FLOW_STUDIO_AGENT_PER_WORKSPACE` | agent 执行并发上限（全局 / 每工作区） |
 | `FLOW_STUDIO_AGENT_QUEUE_MAX` / `FLOW_STUDIO_AGENT_QUEUE_TIMEOUT_MS` | 并发满时的有限排队长度 / 等待上限 |
 | `FLOW_STUDIO_FINISH_SOCKET` / `FLOW_STUDIO_FINISH_TOKEN` | codex MCP 完结通道的每执行私有 IPC 凭据（适配器内部设置，不需要手工配置） |
+| `FLOW_STUDIO_ACP_CONFIG` | ACP 适配器的唯一配置入口，JSON 对象；字段见下文 [ACP 适配器配置](#acp-适配器配置) |
+
+### ACP 适配器配置
+
+`FLOW_STUDIO_ACP_CONFIG` 只在节点显式使用 `adapter:"acp"` 时由 ACP 适配器读取；不读实例字段，不拼接 shell 字符串，不自动 `npx` 下载。省略或空串使用默认配置；直接调用解析函数时显式 `null` 也按省略处理。
+
+```jsonc
+{
+  "command": "codex-acp",
+  "args": [],
+  "env": {},
+  "mode": "workspace-write",
+  "permissionPolicy": "deny"
+}
+```
+
+| 字段 | 类型 | 默认 | 非法值 |
+|---|---|---|---|
+| `command` | 非空字符串（可执行名或路径），不含控制字符 | `"codex-acp"` | 空串、非字符串、含 `U+0000`–`U+001F` / `U+007F` → `ACP_CONFIG_INVALID` |
+| `args` | 字符串数组；每项不得含 NUL | `[]` | 非数组、非字符串项、含 NUL → `ACP_CONFIG_INVALID` |
+| `env` | 字符串值对象；变量名匹配 `^[A-Za-z_][A-Za-z0-9_]*$`；值不得含 NUL | `{}` | 非对象、变量名非法、`__proto__` / `constructor` / `prototype`、大小写不敏感前缀 `FLOW_STUDIO_FINISH_`、非字符串值 → `ACP_CONFIG_INVALID` |
+| `mode` | 非空字符串，≤128 字符，不含控制字符 | `"workspace-write"` | 空串、非字符串、超长、含控制字符 → `ACP_CONFIG_INVALID`；传到 agent 后值不在 `availableModes` → `ACP_MODE_UNAVAILABLE` |
+| `permissionPolicy` | `"deny"` 或 `"allow"` | `"deny"` | 其它值（含大小写变体、布尔、`null`）→ `ACP_CONFIG_INVALID` |
+
+- 顶层必须是 JSON 对象；非法 JSON、非字符串原始值或未知键一律 `ACP_CONFIG_INVALID`。错误结果只带结构化 `message`，不回显原始 JSON 或配置值。
+- 子进程环境 = 宿主白名单（`PATH` / `HOME` / `LANG` / 代理变量 / `LC_*` / `CLAUDE_*` / `ANTHROPIC_*` 等）+ 本表 `env`；`FLOW_STUDIO_FINISH_*` 由适配器按执行生成，管理员不能覆盖。
+- `mode` 与 `permissionPolicy` 的运行时语义、probe 与完结行为见 [ACP 适配器](../design/14-acp-adapter.md)；错误码全集见 [实例域接口 · ACP 适配器错误码](instance-api.md#acp-适配器错误码)。
 
 ## 错误与状态码
 

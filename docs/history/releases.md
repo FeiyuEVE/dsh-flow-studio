@@ -1,4 +1,4 @@
-# 版本历史（0.1 → 0.14.7）
+# 版本历史（0.1 → 0.14.8）
 
 按版本从旧到新。这里记录「哪一版加了什么、修了什么、留下什么边界」；当前行为以 [产品指南](../guide/overview.md) 与 [参考](../reference/host-api.md) 为准，README 不再承载历史。
 
@@ -1020,3 +1020,19 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 32 MiB 仍是硬上限：超限行仍整条丢弃（只留诊断），只是阈值更高；单条 32 MiB 行会短暂占用内存。
 - 脱敏规则按标准令牌长度/形态收紧：非标准长度的 `ghp_` / `glpat-` / `xapp-` 等可能漏抹；带 `=` padding 的 JWT 只抹内容、标记后可能残留 `=`。
 - 真实 Claude CLI 仍未验证（本机无 CLI，测试明确 SKIP）。
+
+## 0.14.8 — 闭合 0.14.7 复审的两个 MAJOR
+
+0.14.7 的独立复审判「不可验收」（2 MAJOR、0 BLOCKER）。本版只闭合这两条，外加复审的两条建议，以及一个被 32 MiB 行界放大的崩溃缺陷。
+
+- **适配器行界真正生效**：`agent-adapter-claude` / `agent-adapter-codex` 不再各自把单行上限覆盖成 8 MiB，改用共享的 `DEFAULT_MAX_LINE_BYTES`（32 MiB）。约 9 MiB 的合法终态事件此前会被整行丢弃、误判成 `NODE_FINISH_MISSING`；现在按 provider / turn-failed 正确分类，`--help` 探测的读行同样走 32 MiB。
+- **部分脱敏泄漏**：`process-output` 只在值**整体**是脱敏产物（`^[A-Za-z0-9_-]{0,24}\[REDACTED\]$`）时放行。`password="ghp_…;hunter2"` 不再泄漏标记之后的残余秘密；完整形态（`ghp_[REDACTED]` / `glpat-[REDACTED]` / `AKIA[REDACTED]` 等）原样保留、整体幂等。
+- **超长输入脱敏不再爆栈**：V8 正则在单次 ≥6 MiB 的超长匹配上会抛 `RangeError`（32 MiB 行界生效后，一段约 9 MiB 无空白事件正文即可触发）。现在先按空白切词、把超长无空白串整体判 `[REDACTED]`，再按 ≤256 KiB 片段逐段脱敏；凭据不含空白，不会跨段被劈开。
+- **A2 判据**：assistant-only 认证失败改用显式 `resultSeen`；收到 `{type:"result"}` 但缺 subtype 时不再被误判成 provider 错误，真正的「agent 停下没调工具」仍是 `NODE_FINISH_MISSING`。
+- **诊断清洗**：C0 规则补剥 `\r`（只保留 `\t` / `\n`），与注释口径一致。
+- **测试**：新增 9 MiB 事件（Claude 两路 + Codex）、probe 9 MiB `--help`、result 无 subtype、部分脱敏泄漏、超大输入分段脱敏等用例；原有 0.14.7 用例全部保留。
+
+**已知边界**
+- 真实 Claude / Codex CLI 仍未验证（本机无 Claude CLI，相关用例明确 SKIP）；Windows `ERROR_FILENAME_EXCED_RANGE (206)` 分支与异步 spawn E2BIG 未实测。
+- 32 MiB 仍是硬上限：超限行整条丢弃（只留诊断）；单条 32 MiB 行会短暂占用内存。
+- 超过 256 KiB 且**不含任何空白**的串会被整体判成 `[REDACTED]`（安全方向的取舍）；含空白的超大文本按词分段，凭据不会被拆开。

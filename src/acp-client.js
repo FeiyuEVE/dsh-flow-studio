@@ -42,8 +42,11 @@
  * 权限请求（入站反向请求）的 id 去重契约：**每个请求 id 恰好一次有效决策**。
  * 同一 id 再次到达时不调用 `onPermission`，直接回
  * `{outcome:{outcome:'cancelled'}}`（对端仍能收到一条应答，不会悬挂），
- * 只计 `permissionDuplicates` 并记一条 `permission-duplicate` 诊断；去重集合有界
- * （{@link MAX_PERMISSION_REQUEST_IDS} 条，超出淘汰最早插入项）。
+ * 只计 `permissionDuplicates` 并记一条 `permission-duplicate` 诊断。
+ * 去重集合有界（{@link MAX_PERMISSION_REQUEST_IDS} 条，按插入顺序 FIFO 淘汰）；
+ * 一旦发生过淘汰，集合外的 id 既可能是新请求、也可能是被淘汰后重放的老 id，无法
+ * 安全区分，**一律按未知 fail-closed 回 cancelled**（计 `permissionUnknownIds` 并记
+ * `permission-id-unknown` 诊断），避免重放老 id 拿到第二次有效决策（0.15.2 / m2）。
  *
  * 返回句柄约定：
  *   - `request(method, params, { timeoutMs })`：`timeoutMs` 省略时用 `requestTimeoutMs`
@@ -56,7 +59,8 @@
  *     `closedReason` / `signal.reason`。
  *   - `stats`：只读计数快照（`requests` / `updatesDelivered` / `updatesRejected` /
  *     `notificationsDropped` / `strayResponses` / `duplicateResponses` /
- *     `permissionRequests` / `permissionDuplicates` / `callbackFailures` / `diagnostics*` /
+ *     `permissionRequests` / `permissionDuplicates` / `permissionUnknownIds` /
+ *     `permissionIdEvictions` / `callbackFailures` / `diagnostics*` /
  *     `pending` / `closed`），
  *     供 P4 观测与诊断，不可反向驱动状态。
  *   - 已知 SDK 行为：`session/close` / `session/delete` 的 `-32002` 被 SDK 归一成成功 `{}`。
@@ -102,8 +106,22 @@ const MAX_ERROR_CHARS = 400
 /** 追踪的 id 集合上限（请求 id / 已应答 id / 已见响应 id 各自独立）。 */
 const MAX_TRACKED_IDS = 64
 
-/** 入站权限请求 id 去重集合上限；同一 id 只允许一次有效决策。 */
-const MAX_PERMISSION_REQUEST_IDS = 256
+/**
+ * 入站权限请求 id 去重集合上限（0.15.2 / m2：由 256 提升到 4096）。
+ *
+ * 复审实测：256 条太容易被「不同 id」冲刷——257 个不同 id 之后重放最老 id，旧实现
+ * 已把它淘汰，于是再调用一次 `onPermission`、再返回一次 `selected`，违反「每个 id
+ * 恰好一次有效决策」。4096 条覆盖任何现实会话的权限请求数（每轮人工审批）。
+ *
+ * 内存上界与淘汰语义：
+ *   - Set 至多 4096 个 id 字符串（外加一个布尔 `permissionIdsOverflowed`）；
+ *   - 按**插入顺序 FIFO** 淘汰最早插入的 id（重复 id 在去重判定处就返回，不刷新顺序）；
+ *   - 一旦发生淘汰，后续「集合外」id 一律按未知处理并回 cancelled（fail-closed）：
+ *     无法区分新请求与重放，宁可拒绝也不冒第二次有效决策的风险；容量溢出后**全新**
+ *     的权限请求也会被拒，这是有意的安全取舍。
+ *   - 连接关闭时随集合一起重置。
+ */
+const MAX_PERMISSION_REQUEST_IDS = 4096
 
 const SESSION_UPDATE_METHOD = 'session/update'
 const CANCEL_REQUEST_METHOD = '$/cancel_request'
@@ -271,6 +289,8 @@ export async function openAcpClient(options = {}) {
     duplicateResponses: 0,
     permissionRequests: 0,
     permissionDuplicates: 0,
+    permissionUnknownIds: 0,
+    permissionIdEvictions: 0,
     callbackFailures: 0,
     diagnosticsSeen: 0,
     diagnosticsEmitted: 0,
@@ -290,10 +310,12 @@ export async function openAcpClient(options = {}) {
   /** 已应答过的请求 id（诊断用途，暂未参与路由，保留给 P4 观察）。 */
   const answeredRequestIds = new Set()
   /**
-   * 入站权限请求 id（有界）：每个 id 恰好一次有效决策。
+   * 入站权限请求 id（有界，0.15.2 / m2）：每个 id 恰好一次有效决策。
    * 重复 id 仍回一条 cancelled 应答，但不再调用 onPermission、不产生第二条事件。
+   * 集合溢出发生过淘汰后，`permissionIdsOverflowed` 让集合外 id 一律按未知 fail-closed。
    */
   const permissionRequestIds = new Set()
+  let permissionIdsOverflowed = false
 
   const diagnosticsByCode = new Map()
 
@@ -496,14 +518,34 @@ export async function openAcpClient(options = {}) {
   const permissionHandler = context => {
     counters.permissionRequests += 1
     const { params, requestId, signal } = context ?? {}
+    const trackableId = isJsonRpcId(requestId)
     // 每个请求 id 恰好一次有效决策：重复 id 只回一条 cancelled（对端不悬挂），
     // 不再调用 onPermission，也不产生第二条 agent/permission 事件。
-    if (isJsonRpcId(requestId) && permissionRequestIds.has(requestId)) {
+    if (trackableId && permissionRequestIds.has(requestId)) {
       counters.permissionDuplicates += 1
       diagnose('permission-duplicate', '同一权限请求 id 重复到达：只回 cancelled，不再调用 onPermission')
       return cancelledPermission()
     }
-    if (isJsonRpcId(requestId)) rememberBounded(permissionRequestIds, requestId, MAX_PERMISSION_REQUEST_IDS)
+    if (trackableId && permissionIdsOverflowed) {
+      // 集合发生过淘汰：不在集合里的 id 无法区分「全新」与「被淘汰后重放」，
+      // fail-closed 回 cancelled，绝不冒第二次有效决策的风险。
+      counters.permissionUnknownIds += 1
+      diagnose(
+        'permission-id-unknown',
+        '权限请求 id 去重集合溢出后无法判定：按未知处理，只回 cancelled',
+      )
+      return cancelledPermission()
+    }
+    if (trackableId && permissionRequestIds.size >= MAX_PERMISSION_REQUEST_IDS) {
+      permissionRequestIds.delete(permissionRequestIds.values().next().value)
+      permissionIdsOverflowed = true
+      counters.permissionIdEvictions += 1
+      diagnose(
+        'permission-id-evicted',
+        '权限请求 id 去重集合达到容量上限：淘汰最早插入项，之后的未知 id 一律按未知处理',
+      )
+    }
+    if (trackableId) permissionRequestIds.add(requestId)
     if (typeof onPermission !== 'function') return cancelledPermission()
     let response
     try {
@@ -538,6 +580,7 @@ export async function openAcpClient(options = {}) {
     sentRequestIds.clear()
     answeredRequestIds.clear()
     permissionRequestIds.clear()
+    permissionIdsOverflowed = false
     seenResponseIds.clear()
     resolveClosed()
   })

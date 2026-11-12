@@ -66,6 +66,27 @@ function isAlive(pid) {
   }
 }
 
+/**
+ * 真实子进程把 payload 原样写到 stdout 与 stderr，返回两路展示 tail。
+ *
+ * 与既有 tail 用例同一条路径（stdin → 子进程 → 两个 pipe → attachProcessStreams），
+ * 不直接调用内部函数，保证断言的是真实交付内容。
+ */
+async function runEchoTail(payload, options = {}) {
+  const { reader } = makeReader()
+  const script = "process.stdin.on('data', chunk => { process.stdout.write(chunk); process.stderr.write(chunk) }); process.stdin.resume()"
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const attach = attachProcessStreams(child, { stdoutReader: reader, drainTimeoutMs: 3000, ...options })
+  child.stdin.end(payload)
+  try {
+    assert.deepEqual(await attach.drained, { drained: true, timedOut: false })
+    return { stdoutTail: attach.stdoutTail(), stderrTail: attach.stderrTail() }
+  } finally {
+    attach.dispose()
+    await waitExit(child)
+  }
+}
+
 test('默认行长上限是 32 MiB，初始行缓冲至少 1 MiB', () => {
   assert.equal(DEFAULT_MAX_LINE_BYTES, 32 * 1024 * 1024)
   assert.ok(DEFAULT_INITIAL_LINE_BUFFER_BYTES >= 1024 * 1024)
@@ -467,6 +488,95 @@ test('tail 未被截断时不误伤：完整小于窗口的正常多行输出原
     attach.dispose()
     await waitExit(child)
   }
+})
+
+test('tail 头部截断 + 跨行值（LF）：续行整行替换，两路都不泄漏（0.15.2 B2）', async () => {
+  // 9000 个 A 远大于保留窗口（64 + 4096），窗口起点落在引号值内部；第一个 `\n`
+  // 落在值内部，丢半截首行后剩下的续行 `  hunter2"` 没有键名，旧实现会原样导出。
+  const payload = `password="${'A'.repeat(9000)}\n  hunter2"\nnormal-line-1\nnormal-line-2\n`
+  const { stdoutTail, stderrTail } = await runEchoTail(payload, { stdoutTailBytes: 64, stderrTailBytes: 64 })
+  for (const [route, tail] of [['stdout', stdoutTail], ['stderr', stderrTail]]) {
+    assert.equal(tail.includes('hunter2'), false, `${route} tail 不得泄漏跨行值的续行：${JSON.stringify(tail)}`)
+    assert.match(tail, /\[REDACTED\]/, `${route} 续行必须整行替换成 [REDACTED]`)
+    assert.match(tail, /normal-line-2/, `${route} 后续完整行仍要保留`)
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 64, `${route} tail 仍按上限有界`)
+  }
+  assert.equal(stdoutTail, stderrTail, 'stdout / stderr 两路规则一致')
+})
+
+test('tail 头部截断 + 跨行值（CRLF）：续行同样整行替换，不泄漏（0.15.2 B2）', async () => {
+  const payload = `password="${'A'.repeat(9000)}\r\n  hunter2"\r\nnormal-line-1\r\nnormal-line-2\r\n`
+  const { stdoutTail, stderrTail } = await runEchoTail(payload, { stdoutTailBytes: 64, stderrTailBytes: 64 })
+  for (const [route, tail] of [['stdout', stdoutTail], ['stderr', stderrTail]]) {
+    assert.equal(tail.includes('hunter2'), false, `${route} tail 不得泄漏 CRLF 跨行值：${JSON.stringify(tail)}`)
+    assert.match(tail, /\[REDACTED\]/, `${route} 续行必须整行替换成 [REDACTED]`)
+    assert.match(tail, /normal-line-2\r\n/, `${route} 后续完整行（保留 CRLF）仍要出现`)
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 64, `${route} tail 仍按上限有界`)
+  }
+  assert.equal(stdoutTail, stderrTail, 'stdout / stderr 两路规则一致')
+})
+
+test('tail 头部截断 + 未闭合转义引号：按未转义计数判定，转义引号不冒充配对（0.15.2 B2）', async () => {
+  // 续行是 `  \"hunter2"`：字面 2 个引号（朴素计数为偶数，会放过），但第一个是
+  // 反斜杠转义（值里的内容，不是定界符），未转义计数为 1 → 必须整行替换。
+  const dangerous = `password="${'A'.repeat(9000)}\n  \\"hunter2"\nnormal-line-1\nnormal-line-2\n`
+  const leaked = await runEchoTail(dangerous, { stdoutTailBytes: 64, stderrTailBytes: 64 })
+  for (const [route, tail] of [['stdout', leaked.stdoutTail], ['stderr', leaked.stderrTail]]) {
+    assert.equal(tail.includes('hunter2'), false, `${route} tail 不得泄漏未闭合转义引号续行：${JSON.stringify(tail)}`)
+    assert.match(tail, /\[REDACTED\]/, `${route} 续行必须整行替换成 [REDACTED]`)
+  }
+
+  // 反方向：整行都是成对转义引号（`\"ok\"`，未转义计数 0）不得误伤。
+  const benign = `password="${'A'.repeat(9000)}\n  note \\"ok\\" here\nnormal-line-1\nnormal-line-2\n`
+  const kept = await runEchoTail(benign, { stdoutTailBytes: 64, stderrTailBytes: 64 })
+  const expected = '  note \\"ok\\" here\nnormal-line-1\nnormal-line-2\n'
+  assert.equal(kept.stdoutTail, expected, 'stdout 不得把成对转义引号误伤成 [REDACTED]')
+  assert.equal(kept.stderrTail, expected, 'stderr 不得把成对转义引号误伤成 [REDACTED]')
+})
+
+test('tail 整窗只有一个行尾换行且内容超窗：返回 [REDACTED]，绝不返回空串（0.15.2 M4）', async () => {
+  // 200000 个 x + 一个行尾换行：旧实现丢完半截首行后什么也不剩，诊断完全消失。
+  const payload = `${'x'.repeat(200000)}\n`
+  const { stdoutTail, stderrTail } = await runEchoTail(payload)
+  assert.equal(stdoutTail, '[REDACTED]', 'stdout 不能返回空串')
+  assert.equal(stderrTail, '[REDACTED]', 'stderr 不能返回空串')
+})
+
+test('tail 窗口起点落在行边界：完整首行不丢（0.15.2 M4）', async () => {
+  // 展示上限 4096 → 保留窗口 8192。构造 rest 恰好 8192 字节，并把前缀行长度凑到
+  // 「裁掉的最后一个字符是 `\n`」，即保留窗口的第一字节紧跟换行（行边界）。
+  const retentionBytes = 8192
+  const line1 = `diagnostic-1: ${'f'.repeat(6500)} ... END-OF-FIRST-LINE`
+  const fillBytes = retentionBytes - Buffer.byteLength(line1, 'utf8') - 1
+  let fill = ''
+  let index = 0
+  while (fill.length < fillBytes) {
+    const label = `\nR${String(index).padStart(4, '0')}-complete-line`
+    fill += fill.length + label.length <= fillBytes ? label : 'z'.repeat(fillBytes - fill.length)
+    index += 1
+  }
+  const rest = `${line1}\n${fill}`
+  const payload = `${'P'.repeat(500)}\n${rest}`
+  // 前置自检：fixture 确实让窗口起点落在行边界（而不是半截行）。
+  assert.equal(Buffer.byteLength(rest, 'utf8'), retentionBytes, 'fixture 的保留窗口必须恰好等于 rest')
+  assert.equal(payload[payload.length - retentionBytes - 1], '\n', 'fixture 的窗口起点必须紧跟换行')
+
+  const { stdoutTail, stderrTail } = await runEchoTail(payload, { stdoutTailBytes: 4096, stderrTailBytes: 4096 })
+  for (const [route, tail] of [['stdout', stdoutTail], ['stderr', stderrTail]]) {
+    assert.ok(tail.includes('END-OF-FIRST-LINE'), `${route} 完整首行的内容必须保留（实际 ${JSON.stringify(tail.slice(0, 40))}…）`)
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 4096, `${route} tail 仍按上限有界`)
+  }
+  assert.equal(stdoutTail, stderrTail, 'stdout / stderr 两路规则一致')
+})
+
+test('tail 头部截断后的正常多行输出：保留最后若干完整行、不误伤（0.15.2）', async () => {
+  // 窗口起点落在超长正常行内部：丢弃半截首行后，留下的都是完整诊断行。
+  const payload = `partial-line ${'Q'.repeat(9000)}\ninfo: started\ninfo: working\ndone-ok\n`
+  const { stdoutTail, stderrTail } = await runEchoTail(payload, { stdoutTailBytes: 200, stderrTailBytes: 200 })
+  const expected = 'info: started\ninfo: working\ndone-ok\n'
+  assert.equal(stdoutTail, expected, 'stdout 必须原样保留截断点之后的完整行')
+  assert.equal(stderrTail, expected, 'stderr 必须原样保留截断点之后的完整行')
+  assert.equal(stdoutTail.includes('[REDACTED]'), false, '正常诊断行不得被误伤')
 })
 
 test('drained 有界：后代继承 stdout 时超时返回 timedOut，而不是无限等待', async () => {

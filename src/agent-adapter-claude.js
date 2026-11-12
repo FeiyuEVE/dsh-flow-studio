@@ -82,6 +82,7 @@
  * @module @feiyueve/dsh-flow-studio/agent-adapter-claude
  */
 
+import { Buffer } from 'node:buffer'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, promises as fsp, writeFileSync } from 'node:fs'
@@ -92,6 +93,7 @@ import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
 import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
 import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
 import { createClaudeUsageLedger } from './claude-usage-ledger.js'
+import { redactText as redactSharedText } from './process-output.js'
 import {
   FINISH_CHANNEL_ENV,
   FINISH_REMINDER_TEXT,
@@ -159,6 +161,11 @@ const MAX_STREAM_DIAGNOSTICS = 50
 const MAX_PROTOCOL_EVENTS = 200
 /** 错误文本脱敏后的字符上限。 */
 const MAX_ERROR_TEXT = 200
+/**
+ * F2：**终态错误**的最终 UTF-8 字节上限（code / subtype / message 各自不超过它）。
+ * provider 错误文本不可信（Codex 侧实测能到 12 KB），既有共享脱敏也不能保证有界。
+ */
+const MAX_TERMINAL_ERROR_BYTES = 1_000
 
 /**
  * **唯一的 CLI 参数要求表**（0.14.5 m4）：probe 拒绝、start 零派发、capabilities
@@ -230,6 +237,28 @@ function probeFlagsOf(probeValue) {
 /** 缺失的必需参数 key 列表。 */
 function missingRequiredFlags(flags, entries) {
   return entries.filter(entry => !flagPresent(flags, entry.key)).map(entry => entry.key)
+}
+
+/**
+ * F2：按 UTF-8 字节截断，并显式标记截断（绝不静默丢弃）。
+ *
+ * 用码点迭代而不是 `slice()`：后者按 UTF-16 单元切，可能把代理对切成半个字符；
+ * 这里保证输出仍然是合法 UTF-8 且总字节数不超过 `limit`。
+ */
+function truncateUtf8Bytes(text, limit) {
+  const value = typeof text === 'string' ? text : String(text ?? '')
+  if (Buffer.byteLength(value, 'utf8') <= limit) return value
+  const marker = '…[truncated]'
+  const budget = Math.max(0, limit - Buffer.byteLength(marker, 'utf8'))
+  let output = ''
+  let used = 0
+  for (const char of value) {
+    const size = Buffer.byteLength(char, 'utf8')
+    if (used + size > budget) break
+    output += char
+    used += size
+  }
+  return `${output}${marker}`
 }
 
 /** 实际要拼进 argv 的 `--allowedTools` 别名（probe 确认了哪个就用哪个）。 */
@@ -1071,6 +1100,9 @@ export function createClaudeAdapter(options = {}) {
     )
     if (error.cleanup) wrapped.cleanup = error.cleanup
     if (error.cleanupFinal) wrapped.cleanupFinal = error.cleanupFinal
+    // M2 残余：包装成 TOOL_UNAVAILABLE 时也要带上失败载体上的用量视图。
+    if (Array.isArray(error.usageCalls)) wrapped.usageCalls = error.usageCalls
+    if (Array.isArray(error.usageSnapshots)) wrapped.usageSnapshots = error.usageSnapshots
     return wrapped
   }
 
@@ -1210,6 +1242,9 @@ export function createClaudeAdapter(options = {}) {
     let state = null
     let handle = null
     let ledger = null
+    // M2 残余：用量视图导出函数（定义在 protect 内，失败 catch 也要能调用）。
+    let exportUsageCalls = null
+    let exportUsageSnapshots = null
     let signalListener = null
     let handleRef = null
     let pendingAbort = false
@@ -1489,6 +1524,20 @@ export function createClaudeAdapter(options = {}) {
       }
       const boundText = (value, limit = MAX_ERROR_TEXT) =>
         redactText(value === undefined || value === null ? '' : String(value)).slice(0, limit)
+      /**
+       * F2：终态错误（code / subtype / message）的唯一脱敏出口。
+       *
+       * 顺序：共享脱敏（Bearer / Basic / sk- / token=… / 长串）→ 本 execution 的精确
+       * 秘密替换（通道凭据 / socket / runDir）→ UTF-8 字节截断并标记。既有 `redactText`
+       * 只做第三步之前的一半工作，不能单独用于 provider 错误文本。
+       */
+      const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => {
+        let text = redactSharedText(value === undefined || value === null ? '' : String(value))
+        for (const secret of [channel.credential, channel.socketPath, runDir]) {
+          if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[redacted]')
+        }
+        return truncateUtf8Bytes(text, limit)
+      }
       const streamsTail = (picker, limit) => redactText(
         spawnedProcesses.map(proc => (proc.streams ? picker(proc.streams) : '')).join('').slice(-limit),
       )
@@ -1514,24 +1563,52 @@ export function createClaudeAdapter(options = {}) {
 
       ledger = createClaudeUsageLedger({ provider: CLAUDE_ADAPTER_ID })
 
+      /**
+       * M2 残余（跨单元约定）：适配器观测到的用量视图。
+       *
+       * 同一个导出同时供 `handle.usageCalls()` / `handle.usageSnapshots()` 与**启动失败
+       * 载体**使用：`start()` 在返回 handle 之前失败时，executor 只能从错误对象上拿到
+       * 已观测用量（`error.usageCalls` / `error.usageSnapshots`），不能因为没拿到句柄就丢账。
+       */
+      exportUsageCalls = () => ledger.usageCalls().map(call => ({
+        provider: CLAUDE_ADAPTER_ID,
+        ...call,
+        ...(call.invocationId
+          ? {}
+          : (callInvocationIds.has(call.callId)
+            ? { invocationId: callInvocationIds.get(call.callId) }
+            : {})),
+        usage: call.usage === null ? null : { ...call.usage },
+        observedBuckets: [...call.observedBuckets],
+      }))
+      exportUsageSnapshots = () => ledger.snapshots().map(snapshot => ({
+        provider: CLAUDE_ADAPTER_ID,
+        ...snapshot,
+        usage: snapshot.usage === null ? null : { ...snapshot.usage },
+        observedBuckets: [...snapshot.observedBuckets],
+        provenance: { ...snapshot.provenance },
+      }))
+
       /** 从 current invocation 的 result 事件抽取**脱敏、有界**的终态错误（M6）。 */
       const recordTerminalError = event => {
         const firstError = Array.isArray(event.errors) && typeof event.errors[0] === 'string'
           ? event.errors[0]
           : null
-        const code = boundText(
+        const code = boundTerminalText(
           firstError
             || state.assistantError
             || 'cli-result-error',
-          120,
+          200,
         )
         const rawMessage = typeof event.result === 'string' && event.result.trim() !== ''
           ? event.result
           : (Array.isArray(event.errors) ? event.errors.join('; ') : '')
+        // F2：`subtype` 以前直接 `slice(0, 64)`，既不脱敏也不按字节限制——凭据可以
+        // 藏在 subtype 里绕过本执行 token 替换。三处出口统一走 boundTerminalText。
         state.terminalError = {
           code,
-          subtype: typeof event.subtype === 'string' ? event.subtype.slice(0, 64) : undefined,
-          message: boundText(rawMessage),
+          subtype: typeof event.subtype === 'string' ? boundTerminalText(event.subtype, 200) : undefined,
+          message: boundTerminalText(rawMessage),
         }
         state.invocation.resultIsError = true
       }
@@ -1768,38 +1845,65 @@ export function createClaudeAdapter(options = {}) {
       /** 终态错误：握手之后 CLI 自己给出的错误（result is_error / 非 success / 非零退出码）。 */
       const terminalErrorFor = invocation => {
         if (!invocation) return null
+        let terminal = null
         if (invocation.resultIsError === true) {
-          return state.terminalError || {
+          terminal = state.terminalError || {
             code: 'cli-result-error',
             subtype: invocation.resultSubtype,
             message: '',
           }
-        }
-        if (typeof invocation.resultSubtype === 'string' && invocation.resultSubtype !== 'success') {
-          return {
+        } else if (typeof invocation.resultSubtype === 'string' && invocation.resultSubtype !== 'success') {
+          terminal = {
             code: (state.terminalError && state.terminalError.code) || 'cli-result-error',
             subtype: invocation.resultSubtype,
             message: (state.terminalError && state.terminalError.message) || '',
           }
-        }
-        if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
-          return {
+        } else if (Number.isSafeInteger(invocation.exitCode) && invocation.exitCode !== 0) {
+          terminal = {
             code: 'cli-exit-nonzero',
             subtype: invocation.resultSubtype,
             message: `claude 以退出码 ${invocation.exitCode} 结束`,
           }
+        } else if (typeof invocation.signal === 'string' && invocation.signal !== '') {
+          // M6 残余 a：被信号终止（SIGKILL / OOM / 外部 kill）不是「正常停下」，
+          // 提醒 / resume 对已经死掉的 CLI 毫无意义。与认证失败同一分类：终态 provider 错误。
+          terminal = {
+            code: 'cli-signaled',
+            subtype: invocation.resultSubtype,
+            message: `claude 被信号 ${invocation.signal} 终止（不是正常停下）`,
+          }
         }
-        return null
+        if (terminal === null) return null
+        // F2：`resultSubtype` 来自 CLI 协议原文，可能夹带秘密；三个出口统一在这里有界脱敏。
+        return {
+          code: boundTerminalText(terminal.code, 200) || 'cli-result-error',
+          ...(terminal.subtype === undefined
+            ? {}
+            : { subtype: boundTerminalText(terminal.subtype, 200) }),
+          message: boundTerminalText(terminal.message || ''),
+        }
       }
 
       const providerErrorMessage = terminal => {
         const label = `code=${terminal.code}${terminal.subtype ? `, subtype=${terminal.subtype}` : ''}`
-        return boundText(
+        // F2：整条 message 也走**共享脱敏 + 字节上限**（不是只做本执行 token 替换）。
+        return boundTerminalText(
           `Claude CLI 给出终态错误（${label}）${terminal.message ? `：${terminal.message}` : ''}；`
             + '节点没有完结——这是执行错误，不是「没调用 finish」，不消耗提醒预算',
-          500,
         )
       }
+
+      /**
+       * m3：对外 / 续跑可用的 session id。
+       *
+       * - `state.sessionId`：CLI 自己在事件里报的 id，可信；
+       * - `state.sessionIdHint`：本次显式拼进 `--session-id` 的 UUID，**只有** probe 支持
+       *   该参数时才会传给 CLI；probe 不支持时这里必须返回 undefined，否则就是伪造。
+       */
+      const sessionIdForOutput = () => state.sessionId
+        || (flags.sessionId === true && typeof state.sessionIdHint === 'string' && state.sessionIdHint !== ''
+          ? state.sessionIdHint
+          : undefined)
 
       const resolveExited = value => {
         if (exitedDone) return
@@ -1818,18 +1922,33 @@ export function createClaudeAdapter(options = {}) {
         }
         exitedResolve({
           // init 事件可能晚于 exit 被解析：显式 --session-id 生成的值同样是稳定 key。
-          sessionId: state.sessionId || state.sessionIdHint,
+          // m3：只有**真的传给 CLI**（probe 支持 --session-id）或 CLI 自己报过的 id
+          // 才能对外；否则按「未知」处理，不伪造一个从未被 CLI 用过的 UUID。
+          sessionId: sessionIdForOutput(),
           reminders: state.reminders,
           ...value,
         })
       }
 
+      /**
+       * M6 残余 b：闸门 settled 只有两种状态——**受理**（result resolve）或**被 abort**。
+       * 已受理的成功结果优先于迟到的 cancel：cancel 只影响进程清理，不改业务结局。
+       * 只有闸门确实被 abort 时才允许按取消分类（否则保留 abort 的真实原因）。
+       */
       const resolveFromGate = async () => {
         try {
           const record = await finishGate.result
           state.record = record
           resolveExited({ ok: true, code: 'OK', record })
         } catch (error) {
+          if (state.canceled) {
+            resolveExited({
+              ok: false,
+              code: 'NODE_FINISH_CANCELED',
+              message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
+            })
+            return
+          }
           resolveExited({
             ok: false,
             code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_ABORTED',
@@ -1891,6 +2010,12 @@ export function createClaudeAdapter(options = {}) {
        *   ⑤ 提醒预算耗尽才是 NODE_FINISH_MISSING。
        */
       const finishAfterNaturalExit = async () => {
+        // M6 残余 b：**先看闸门是否已受理**，再看取消。已受理的成功结果不能被迟到的
+        // cancel 覆盖成 NODE_FINISH_CANCELED（cancel 照常负责进程清理）。
+        if (finishGate.settled()) {
+          await resolveFromGate()
+          return
+        }
         if (state.canceled) {
           abortGate('canceled')
           resolveExited({
@@ -1900,16 +2025,19 @@ export function createClaudeAdapter(options = {}) {
           })
           return
         }
-        if (finishGate.settled()) {
-          await resolveFromGate()
-          return
-        }
         if (state.startFailed) return
         if (state.handshakeRequired && state.handshakeOk !== true) {
           abortGate('cli-unavailable-before-handshake')
-          const cause = state.terminalError || (state.assistantError
+          const rawCause = state.terminalError || (state.assistantError
             ? { code: state.assistantError, message: '' }
             : null)
+          const cause = rawCause === null ? null : {
+            code: boundTerminalText(rawCause.code, 200),
+            ...(rawCause.subtype === undefined ? {} : { subtype: boundTerminalText(rawCause.subtype, 200) }),
+            ...(rawCause.message === undefined || rawCause.message === ''
+              ? {}
+              : { message: boundTerminalText(rawCause.message) }),
+          }
           resolveExited({
             ok: false,
             code: ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
@@ -1920,7 +2048,7 @@ export function createClaudeAdapter(options = {}) {
                 + 'flow_finish_node 没有被加载，节点零完结',
               500,
             ),
-            ...(cause ? { error: { code: cause.code, subtype: cause.subtype, message: cause.message } } : {}),
+            ...(cause ? { error: { ...cause } } : {}),
             reminders: state.reminders,
           })
           return
@@ -1972,6 +2100,11 @@ export function createClaudeAdapter(options = {}) {
             flags,
           }), 'resume', `${executionId}:invoke-r${state.reminders}`)
           await awaitProcessEnd(resumeProc)
+          // M6 残余 b：续跑期间闸门已受理成功，迟到的 cancel 不能覆盖它。
+          if (finishGate.settled()) {
+            await resolveFromGate()
+            return
+          }
           if (state.canceled) {
             abortGate('canceled')
             resolveExited({
@@ -1979,10 +2112,6 @@ export function createClaudeAdapter(options = {}) {
               code: 'NODE_FINISH_CANCELED',
               message: `Claude 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
             })
-            return
-          }
-          if (finishGate.settled()) {
-            await resolveFromGate()
             return
           }
           const resumeTerminal = terminalErrorFor(state.invocation)
@@ -2123,7 +2252,8 @@ export function createClaudeAdapter(options = {}) {
 
       // 初始 session id：probe 确认 CLI 支持 --session-id 时显式指定 UUID，
       // 这样即使 stream-json 没来得及给出 session_id，续跑也有稳定的 key。
-      const sessionId = randomUUID()
+      // m3：probe 不支持该参数时不生成 UUID——否则会对外暴露一个从未传给 CLI 的 id。
+      const sessionId = flags.sessionId === true ? randomUUID() : undefined
       state.sessionIdHint = sessionId
       const initialProc = spawnClaude(buildClaudeArgs({
         prompt,
@@ -2196,7 +2326,8 @@ export function createClaudeAdapter(options = {}) {
           return initialProc.child && initialProc.child.pid ? initialProc.child.pid : undefined
         },
         get sessionId() {
-          return state.sessionId || state.sessionIdHint
+          // m3：只返回真的传给 CLI / CLI 自己报过的 id。
+          return sessionIdForOutput()
         },
         get reminders() {
           return state.reminders
@@ -2216,27 +2347,11 @@ export function createClaudeAdapter(options = {}) {
          * agent-execute 在任何结局收尾时读它。
          */
         usageCalls() {
-          return ledger.usageCalls().map(call => ({
-            provider: CLAUDE_ADAPTER_ID,
-            ...call,
-            ...(call.invocationId
-              ? {}
-              : (callInvocationIds.has(call.callId)
-                ? { invocationId: callInvocationIds.get(call.callId) }
-                : {})),
-            usage: call.usage === null ? null : { ...call.usage },
-            observedBuckets: [...call.observedBuckets],
-          }))
+          return exportUsageCalls()
         },
         /** 范围级结算快照（result.usage）：不增加调用数，交给 agent/usage-snapshot。 */
         usageSnapshots() {
-          return ledger.snapshots().map(snapshot => ({
-            provider: CLAUDE_ADAPTER_ID,
-            ...snapshot,
-            usage: snapshot.usage === null ? null : { ...snapshot.usage },
-            observedBuckets: [...snapshot.observedBuckets],
-            provenance: { ...snapshot.provenance },
-          }))
+          return exportUsageSnapshots()
         },
         /** 诊断用：每次返回**脱敏后的深拷贝**；完结判定不看这些。 */
         get events() {
@@ -2292,6 +2407,19 @@ export function createClaudeAdapter(options = {}) {
         if (error && typeof error === 'object') {
           error.cleanup = snapshot
           error.cleanupFinal = cleanupFinal
+        }
+      }
+      // M2 残余：没有返回 handle 时，已观测用量只能经失败载体交给 executor；
+      // 一条都没有就不挂（不留空的假账本）。
+      if (error && typeof error === 'object'
+        && typeof exportUsageCalls === 'function' && typeof exportUsageSnapshots === 'function') {
+        try {
+          const calls = exportUsageCalls()
+          const snapshots = exportUsageSnapshots()
+          if (calls.length > 0) error.usageCalls = calls
+          if (snapshots.length > 0) error.usageSnapshots = snapshots
+        } catch {
+          // 读取账本失败不改变启动失败的结局（诊断信息本来就不保证）。
         }
       }
       throw error

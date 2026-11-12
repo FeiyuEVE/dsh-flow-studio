@@ -60,7 +60,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { AdapterError, ADAPTER_ERROR } from './agent-adapter.js'
-import { createProcessGroupSupervisor } from './agent-cli-lifecycle.js'
+import { createProcessGroupSupervisor, createResourceRegistry } from './agent-cli-lifecycle.js'
 import { attachProcessStreams, createUtf8LineReader } from './agent-cli-stream.js'
 import {
   FINISH_CHANNEL_ENV,
@@ -69,6 +69,7 @@ import {
   defaultTmpRoot,
   verifyFinishBridge,
 } from './node-finish-mcp.js'
+import { redactText as redactSharedText } from './process-output.js'
 
 /** 适配器 id（注册表 / 运行日志 / admission 都用它）。 */
 export const CODEX_ADAPTER_ID = 'codex'
@@ -118,6 +119,11 @@ const PROTOCOL_ERROR_LIMIT = 20
 const DIAGNOSTIC_LIMIT = 50
 const STREAM_MAX_LINE_BYTES = 8 * 1024 * 1024
 const MAX_TERMINAL_MESSAGE = 300
+/**
+ * F2：终态错误最终 UTF-8 字节上限（code / 详情 / message 都不超过它）。
+ * Codex 的 `turn.failed.error.code` 不可信：实测能构造出 12 KB 的异常 message。
+ */
+const MAX_TERMINAL_ERROR_BYTES = 1_000
 const DEFAULT_DRAIN_TIMEOUT_MS = 5_000
 
 /**
@@ -299,6 +305,25 @@ function nonEmptyTrimmedString(value) {
 
 function nonNegativeIntOr(value, fallback) {
   return Number.isSafeInteger(value) && value >= 0 ? value : fallback
+}
+
+/**
+ * F2：按 UTF-8 字节截断并显式标记（不按 UTF-16 单元切，避免半个代理对）。
+ */
+function truncateUtf8Bytes(text, limit) {
+  const value = typeof text === 'string' ? text : String(text ?? '')
+  if (Buffer.byteLength(value, 'utf8') <= limit) return value
+  const marker = '…[truncated]'
+  const budget = Math.max(0, limit - Buffer.byteLength(marker, 'utf8'))
+  let output = ''
+  let used = 0
+  for (const char of value) {
+    const size = Buffer.byteLength(char, 'utf8')
+    if (used + size > budget) break
+    output += char
+    used += size
+  }
+  return `${output}${marker}`
 }
 
 /**
@@ -957,10 +982,103 @@ export function createCodexAdapter(options = {}) {
 
     ensurePrivateDir(settings.tmpRoot)
     const runDir = ensurePrivateDir(await fsp.mkdtemp(join(settings.tmpRoot, 'fs-codex-')))
+    // M4：runDir 一创建就进入**资源所有权边界**。之后任何一步（写 hook / 建通道 /
+    // 构造参数 / 同步 spawn / 握手）失败都由 `cleanupAfterStartFailure` 统一收口。
+    const resources = createResourceRegistry()
+    resources.add('run-dir', () => fsp.rm(runDir, { recursive: true, force: true }))
+
     let hookScriptPath = null
-    let channel
-    let state
+    let channel = null
+    let state = null
     let fireReminder = () => {}
+    let startFailureOutcome = null
+    /**
+     * 清理函数可能在任何一步抛出后的 catch 里被调用，因此只用**可空引用**访问后面
+     * 才初始化的组件（避免 TDZ）；每个组件初始化后立刻登记到这里。
+     */
+    const runtime = {
+      supervisor: null,
+      terminateAllGroups: null,
+      waitGroupsGone: null,
+      removeSignalListener: null,
+      watchFinalCleanup: null,
+      cleanupSnapshot: null,
+    }
+
+    // 最终清理 Promise 必须从失败清理路径起就可用（原先定义在 1400 行之后）。
+    let finalCleanupSettled = false
+    let resolveFinalCleanup = null
+    const cleanupFinal = new Promise(resolveFinal => { resolveFinalCleanup = resolveFinal })
+    const settleFinalCleanup = value => {
+      if (finalCleanupSettled) return
+      finalCleanupSettled = true
+      resolveFinalCleanup(value)
+    }
+
+    /**
+     * M4（Codex 侧残余）：启动失败清理，与 Claude 同口径：
+     *   abort gate → 整组 TERM→KILL 并确认 → 释放已登记资源（channel / listener / runDir）
+     *   → 启动最终清理盯守，并把 `cleanup` / `cleanupFinal` 挂到错误对象上。
+     * 幂等：握手分支已经清理过时直接复用同一份结果。
+     */
+    const cleanupAfterStartFailure = async () => {
+      if (startFailureOutcome) return startFailureOutcome
+      try {
+        if (typeof finishGate.abort === 'function' && !finishGate.settled()) finishGate.abort('start-failed')
+      } catch {
+        // gate abort 失败不改变清理结果。
+      }
+      let gone = true
+      if (runtime.terminateAllGroups) {
+        let results = []
+        try {
+          results = await runtime.terminateAllGroups('start-failure')
+        } catch {
+          results = []
+        }
+        gone = results.length > 0
+          ? results.every(result => Boolean(result && result.gone === true))
+          : true
+        if (!gone && runtime.supervisor) {
+          await runtime.supervisor.disposeAll().catch(() => {})
+          if (runtime.waitGroupsGone) gone = await runtime.waitGroupsGone(1_000)
+        }
+      }
+      if (runtime.removeSignalListener) runtime.removeSignalListener()
+      await resources.disposeAll()
+      if (runtime.watchFinalCleanup) runtime.watchFinalCleanup()
+      startFailureOutcome = {
+        cleanup: runtime.cleanupSnapshot ? runtime.cleanupSnapshot() : { disposed: gone },
+        cleanupFinal,
+        gone,
+      }
+      return startFailureOutcome
+    }
+
+    /** 把物理清理信号挂到 start 失败错误上（runtime / 探针按此判断是否已清理）。 */
+    const attachCleanup = (error, outcome) => {
+      if (error && typeof error === 'object' && outcome) {
+        error.cleanup = outcome.cleanup
+        error.cleanupFinal = outcome.cleanupFinal
+      }
+      return error
+    }
+
+    /**
+     * M2 残余（跨单元约定）：`start()` 在返回 handle 之前失败时，把已观测到的用量
+     * 挂到**失败载体**上（`error.usageCalls` / `error.usageSnapshots`）。executor 的
+     * `readAdapterUsageCalls` 支持数组或函数；一条都没观测到就不挂（不制造空账本）。
+     */
+    const attachUsage = error => {
+      if (error && typeof error === 'object' && state && Array.isArray(state.usageCalls)) {
+        const calls = state.usageCalls.map(call => ({
+          ...call,
+          usage: call.usage === null ? null : { ...call.usage },
+        }))
+        if (calls.length > 0) error.usageCalls = calls
+      }
+      return error
+    }
 
     try {
       state = {
@@ -1011,10 +1129,10 @@ export function createCodexAdapter(options = {}) {
           state.channelFailed = true
         },
       })
+      resources.add('finish-channel', () => channel.close())
     } catch (error) {
-      if (channel) await channel.close().catch(() => {})
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
-      throw error
+      const cleanupOutcome = await cleanupAfterStartFailure()
+      throw attachCleanup(attachUsage(error), cleanupOutcome)
     }
 
     /** 提醒回调只通知一次，异常不影响流程。 */
@@ -1062,6 +1180,8 @@ export function createCodexAdapter(options = {}) {
       }
       signalListener = null
     }
+    resources.add('signal-listener', () => removeSignalListener())
+    runtime.removeSignalListener = removeSignalListener
 
     let child = null
     let resumeChild = null
@@ -1104,6 +1224,7 @@ export function createCodexAdapter(options = {}) {
         }
         : {}),
     })
+    runtime.supervisor = supervisor
 
     const resolveExited = value => {
       if (exitedDone) return
@@ -1147,6 +1268,21 @@ export function createCodexAdapter(options = {}) {
       return value
     }
 
+    /**
+     * F2：终态错误（code / message / details）的唯一脱敏出口。
+     *
+     * 顺序：共享脱敏（Bearer / Basic / sk- / token=… / 长串）→ 本 execution 的精确
+     * 秘密替换（通道凭据 / socket / runDir）→ UTF-8 字节截断并标记。旧的
+     * `redactText` 只做本执行秘密替换，`failure.code` 更是完全没清洗。
+     */
+    const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => {
+      let text = redactSharedText(value === undefined || value === null ? '' : String(value))
+      for (const secret of [channel.credential, channel.socketPath, runDir]) {
+        if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[redacted]')
+      }
+      return truncateUtf8Bytes(text, limit)
+    }
+
     /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
     const abortGate = reason => {
       try {
@@ -1157,12 +1293,24 @@ export function createCodexAdapter(options = {}) {
       }
     }
 
+    /**
+     * M6 残余 b：闸门 settled 只有两种状态——**受理**（result resolve）或**被 abort**。
+     * 已受理的成功结果优先于迟到的 cancel：cancel 只影响进程清理，不改业务结局。
+     */
     const resolveFromGate = async () => {
       try {
         const record = await finishGate.result
         state.record = record
         resolveExited({ ok: true, code: 'OK', record })
       } catch (error) {
+        if (state.canceled) {
+          resolveExited({
+            ok: false,
+            code: 'NODE_FINISH_CANCELED',
+            message: `Codex 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
+          })
+          return
+        }
         resolveExited({
           ok: false,
           code: error && typeof error.code === 'string' ? error.code : 'NODE_FINISH_ABORTED',
@@ -1397,6 +1545,7 @@ export function createCodexAdapter(options = {}) {
         reason: `仍有 ${pending.length} 个 codex 进程组未确认退出（${pending.map(record => record.kind).join(' / ')}）`,
       }
     }
+    runtime.cleanupSnapshot = cleanupSnapshot
 
     /**
      * 独立的**最终清理 Promise**：只有所有被跟踪进程组确认消失才 resolve disposed:true。
@@ -1406,14 +1555,6 @@ export function createCodexAdapter(options = {}) {
      * 失败路径启动、有界盯住进程组消失，让 runtime 可以等它 settle 再释放。
      */
     const FINAL_CLEANUP_WATCH_MS = Math.min(60_000, Math.max(5_000, settings.killTimeoutMs * 2 + 2_000))
-    let finalCleanupSettled = false
-    let resolveFinalCleanup = null
-    const cleanupFinal = new Promise(resolve => { resolveFinalCleanup = resolve })
-    const settleFinalCleanup = value => {
-      if (finalCleanupSettled) return
-      finalCleanupSettled = true
-      resolveFinalCleanup(value)
-    }
     // 只用于「兜底盯守」：定时器 unref，进程可以随时退出，不会被它拖住。
     const sleepUnref = ms => new Promise(resolveSleep => {
       const timer = setTimeout(resolveSleep, ms)
@@ -1446,6 +1587,7 @@ export function createCodexAdapter(options = {}) {
         })
       })
     }
+    runtime.watchFinalCleanup = watchFinalCleanup
 
     const trackGroup = (spawned, kind) => {
       if (!Number.isSafeInteger(spawned.pid) || spawned.pid <= 0) {
@@ -1474,6 +1616,7 @@ export function createCodexAdapter(options = {}) {
       }
       return Promise.all(jobs)
     }
+    runtime.terminateAllGroups = terminateAllGroups
 
     /** 有界等待所有被跟踪进程组（含组长已退出、后代仍活着的组）消失。 */
     const waitTrackedGroupsGone = async timeoutMs => {
@@ -1485,6 +1628,7 @@ export function createCodexAdapter(options = {}) {
         await sleep(Math.min(remaining, 50))
       }
     }
+    runtime.waitGroupsGone = waitTrackedGroupsGone
 
     const spawnCodex = (args, kind) => {
       const env = buildChildEnv([settings.env, channel.env])
@@ -1526,11 +1670,15 @@ export function createCodexAdapter(options = {}) {
         // 只有进程同时异常退出才按终态处理（plan-0145 M6：不能一见 error 就收口）。
         const recovered = failure.kind !== 'turn.failed' && invocation.exitCode === 0
         if (!recovered) {
-          const reason = redactText(String(failure.message)).replace(/\s+/g, ' ').slice(0, MAX_TERMINAL_MESSAGE)
+          // F2：`failure.code` 以前未脱敏、无长度限制地插进 message / errorDetails；
+          // 现在 code 与 message 都走同一个有界脱敏出口。
+          const cliCode = boundTerminalText(failure.code, 200) || 'unknown'
+          const reason = boundTerminalText(failure.message, MAX_TERMINAL_MESSAGE)
+            .replace(/\s+/g, ' ')
           return {
             code: failure.kind === 'turn.failed' ? 'CODEX_CLI_TURN_FAILED' : 'CODEX_CLI_ERROR',
-            message: `Codex 报告终态错误（${failure.code}）：${reason}`,
-            details: { kind: failure.kind, cliCode: failure.code },
+            message: boundTerminalText(`Codex 报告终态错误（${cliCode}）：${reason}`),
+            details: { kind: failure.kind, cliCode },
           }
         }
       }
@@ -1566,6 +1714,11 @@ export function createCodexAdapter(options = {}) {
     }
 
     const finishAfterNaturalExit = async (invocation = null) => {
+      // M6 残余 b：先看闸门是否已受理，再看取消——已受理的成功不能被迟到 cancel 覆盖。
+      if (finishGate.settled()) {
+        await resolveFromGate()
+        return
+      }
       if (state.canceled) {
         abortGate('canceled')
         resolveExited({
@@ -1573,10 +1726,6 @@ export function createCodexAdapter(options = {}) {
           code: 'NODE_FINISH_CANCELED',
           message: `Codex 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
         })
-        return
-      }
-      if (finishGate.settled()) {
-        await resolveFromGate()
         return
       }
       if (state.spawnError && !(child && child.pid)) {
@@ -1624,6 +1773,11 @@ export function createCodexAdapter(options = {}) {
         // M3：续跑进程的 stdout 也必须排空（有界）后再判定，不能按 exit 抢跑。
         await drainInvocation(resumeInvocation)
         resumeChild = null
+        // M6 残余 b：续跑期间闸门已受理成功，迟到的 cancel 不能覆盖它。
+        if (finishGate.settled()) {
+          await resolveFromGate()
+          return
+        }
         if (state.canceled) {
           abortGate('canceled')
           resolveExited({
@@ -1631,10 +1785,6 @@ export function createCodexAdapter(options = {}) {
             code: 'NODE_FINISH_CANCELED',
             message: `Codex 活动被取消${state.cancelReason ? `：${state.cancelReason}` : ''}`,
           })
-          return
-        }
-        if (finishGate.settled()) {
-          await resolveFromGate()
           return
         }
         // M6：续跑进程报终态错误时停止提醒，保留真实原因。
@@ -1648,15 +1798,34 @@ export function createCodexAdapter(options = {}) {
       finishWithoutTool()
     }
 
-    child = spawnCodex(buildExecArgs({
-      workspaceRoot: workspace,
-      prompt,
-      serverPath: SERVER_PATH,
-      hookScriptPath,
-      sandbox: settings.sandbox,
-      approvalPolicy: settings.approvalPolicy,
-      model,
-    }), 'initial')
+    // M4（Codex 侧残余）：**参数构造 + 同步 spawn** 也在保护内。E2BIG 这类同步异常
+    // 以前直接冒泡，runDir / MCP server / 完成通道 listener 全部留在原地。
+    // 现在与 Claude 同口径：abort gate → 整组 TERM/KILL → 关 channel → 删 runDir，
+    // 并把 cleanup / cleanupFinal 挂到错误上。
+    try {
+      child = spawnCodex(buildExecArgs({
+        workspaceRoot: workspace,
+        prompt,
+        serverPath: SERVER_PATH,
+        hookScriptPath,
+        sandbox: settings.sandbox,
+        approvalPolicy: settings.approvalPolicy,
+        model,
+      }), 'initial')
+    } catch (error) {
+      const cleanupOutcome = await cleanupAfterStartFailure()
+      throw attachCleanup(attachUsage(new CodexAdapterError(
+        ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
+        `Codex 进程无法启动（${error && error.code ? error.code : 'SPAWN_FAILED'}）：`
+          + '参数或环境不可用，节点零派发',
+        {
+          adapterId: CODEX_ADAPTER_ID,
+          field: 'spawn',
+          reason: 'spawn-failed',
+          cause: error && error.code ? String(error.code) : 'SPAWN_FAILED',
+        },
+      )), cleanupOutcome)
+    }
 
     const mainPid = child.pid
 
@@ -1776,9 +1945,9 @@ export function createCodexAdapter(options = {}) {
       get terminalError() {
         return state.terminalError
           ? {
-            code: state.terminalError.code,
-            message: redactText(state.terminalError.message),
-            ...(state.terminalError.details ? { details: { ...state.terminalError.details } } : {}),
+            code: boundTerminalText(state.terminalError.code, 200),
+            message: boundTerminalText(state.terminalError.message),
+            ...(state.terminalError.details ? { details: redactValue(state.terminalError.details) } : {}),
           }
           : null
       },
@@ -1809,42 +1978,6 @@ export function createCodexAdapter(options = {}) {
       cancelHandle(handle, 'ctx.signal').catch(() => {})
     }
 
-    /**
-     * review-0141 M1 ①：start 阶段失败也必须等**物理清理**。
-     *
-     * 旧实现等的是逻辑 `exited`（失败路径上早已 resolve），SIGTERM 被忽略时
-     * 会在进程还活着时就抛出 NODE_FINISH_TOOL_UNAVAILABLE。现在按进程组有界等待，
-     * 未确认就如实返回 `disposed:false + reason`（挂到错误对象上供调用方识别）。
-     */
-    const cleanupAfterStartFailure = async () => {
-      // M5：统一走 supervisor 的完整 TERM → KILL 升级（不是只发 TERM 就返回）。
-      const results = await terminateAllGroups('start-failure')
-      let gone = results.every(result => Boolean(result && result.gone === true))
-      if (!gone) {
-        await supervisor.disposeAll().catch(() => {})
-        gone = await waitTrackedGroupsGone(1_000)
-      }
-      removeSignalListener()
-      try {
-        await channel.close()
-      } catch {
-        // ignore
-      }
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
-      // 仍有活着的进程组时，最终清理 Promise 会继续有界盯守到它们消失/超时。
-      watchFinalCleanup()
-      return { cleanup: cleanupSnapshot(), cleanupFinal, gone }
-    }
-
-    /** 把物理清理信号挂到 start 失败错误上（runtime / 探针按此判断是否已清理）。 */
-    const attachCleanup = (error, outcome) => {
-      if (error && typeof error === 'object' && outcome) {
-        error.cleanup = outcome.cleanup
-        error.cleanupFinal = outcome.cleanupFinal
-      }
-      return error
-    }
-
     // 等 MCP server 第一次连上通道：说明 codex 真的把它拉起来了（probe 已验证工具可调用）。
     // 等不到就把进程组收掉，按「工具通道不可用」失败（不允许静默降级）。握手期取消、
     // spawn 失败、进程提前退出都参与竞速，不再死等满 helloTimeoutMs（B1 / M2 / m9）。
@@ -1864,11 +1997,11 @@ export function createCodexAdapter(options = {}) {
         if (state.canceled) {
           abortGate('canceled')
           const cleanupOutcome = await cleanupAfterStartFailure()
-          throw attachCleanup(new CodexAdapterError(
+          throw attachCleanup(attachUsage(new CodexAdapterError(
             'NODE_FINISH_CANCELED',
             'Codex 活动在 MCP 握手期间被取消（finish.sock 与 runDir 已清理）',
             { adapterId: CODEX_ADAPTER_ID, reason: 'canceled-during-handshake' },
-          ), cleanupOutcome)
+          )), cleanupOutcome)
         }
         if (!finishGate.settled()) {
           abortGate('mcp-handshake-failed')
@@ -1882,7 +2015,7 @@ export function createCodexAdapter(options = {}) {
             })
           }
           const cleanupOutcome = await cleanupAfterStartFailure()
-          throw attachCleanup(new CodexAdapterError(
+          throw attachCleanup(attachUsage(new CodexAdapterError(
             ADAPTER_ERROR.NODE_FINISH_TOOL_UNAVAILABLE,
             outcome === 'spawn-failed'
               ? `Codex 进程无法启动（${state.spawnError && state.spawnError.code ? state.spawnError.code : 'unknown'}）`
@@ -1896,7 +2029,7 @@ export function createCodexAdapter(options = {}) {
                 ? { cause: state.spawnError.code }
                 : {}),
             },
-          ), cleanupOutcome)
+          )), cleanupOutcome)
         }
       }
     }
@@ -1974,12 +2107,9 @@ export function createCodexAdapter(options = {}) {
       // resume 进程也可能忽略信号并继续存活。
       await waitTrackedGroupsGone(settings.killTimeoutMs)
       removeSignalListener()
-      try {
-        await channel.close()
-      } catch {
-        // ignore
-      }
-      await fsp.rm(runDir, { recursive: true, force: true }).catch(() => {})
+      // 已登记资源（finish-channel / signal-listener / run-dir）统一释放；registry 幂等，
+      // 启动失败路径可能已经释放过一部分。
+      await resources.disposeAll()
       // 独立最终清理 Promise：dispose 返回后组才退出，也要让 runtime 能看到 disposed:true。
       watchFinalCleanup()
     }

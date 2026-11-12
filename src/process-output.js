@@ -64,6 +64,9 @@ function positiveIntOr(value, fallback) {
  * 规则 4 与旧执行链曾保持同口径；旧链退役后这里只维护这一份。
  *
  * 覆盖：
+ *   0. 显式凭据形态（保留可识别前缀）：PEM 私钥块、AWS Access Key / secret access key、
+ *      GitHub / Slack / GitLab / Google / Stripe 令牌、三段 JWT、数据库 / 消息连接串
+ *      的 user:pass；
  *   1. `Authorization: Bearer <token>`；
  *   2. `sk-...` API key（保留前缀，值抹掉）；
  *   3. `key: value` / `key=value` / `"key": "value"`（token / password / secret / api_key / authorization）；
@@ -92,13 +95,52 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
 
 export function redactText(raw) {
   let text = typeof raw === 'string' ? raw : String(raw ?? '')
+  // 0) 显式凭据形态（0.14.7）。这类规则必须先于通用规则执行，否则会被规则 5 的
+  //    「≥32 连续可疑字符」整段替换成 `[REDACTED]`、丢掉可识别前缀。输出统一保留前缀
+  //    （`ghp_[REDACTED]` / `AKIA[REDACTED]` 等），便于排障；且二次执行不再匹配，保持幂等。
+  //    PEM 私钥块：保留 BEGIN/END 头（能看出密钥类型），块体整体抹掉。
+  text = text.replace(
+    /-----BEGIN ((?:[A-Z0-9]+ )?PRIVATE KEY)-----[\s\S]*?-----END \1-----/g,
+    '-----BEGIN $1-----\n[REDACTED]\n-----END $1-----',
+  )
+  // AWS Access Key ID：`AKIA` + 固定 16 位大写/数字；两侧词边界防止把更长标识切一半。
+  text = text.replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA[REDACTED]')
+  // AWS secret access key：只认显式 `…secret…access…key=` 形态，值限 base64 字符且
+  // 至少 32 位（真实值 40 位），避免把 `too-short` 这类占位文本当凭据。
+  text = text.replace(
+    /\b((?:aws[_-]?)?secret[_-]?access[_-]?key)\b(\s*[:=]\s*)("[A-Za-z0-9/+=]{32,}"|'[A-Za-z0-9/+=]{32,}'|[A-Za-z0-9/+=]{32,})(?![A-Za-z0-9/+=])/gi,
+    (match, name, separator) => `${name}${separator}"[REDACTED]"`,
+  )
+  // GitHub：经典 5 种前缀 + fine-grained PAT；长度下限按真实令牌留余量。
+  text = text.replace(/\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, match => `${match.slice(0, 4)}[REDACTED]`)
+  text = text.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, 'github_pat_[REDACTED]')
+  // Slack：xox[bporase]- 与 xapp-。
+  text = text.replace(/\b(xox[bporase]|xapp)-[A-Za-z0-9-]{10,}\b/g, '$1-[REDACTED]')
+  // GitLab personal access token。
+  text = text.replace(/\bglpat-[A-Za-z0-9_-]{20,}\b/g, 'glpat-[REDACTED]')
+  // Google API key：`AIza` + 35 位；两侧排除同类字符，不把更长串切一半。
+  text = text.replace(/(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g, 'AIza[REDACTED]')
+  // Stripe live secret / restricted key。
+  text = text.replace(/\b((?:sk|rk)_live_)[A-Za-z0-9]{16,}\b/g, '$1[REDACTED]')
+  // JWT：三段 base64url，保留 header 的 `eyJ` 前缀。
+  text = text.replace(
+    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+    'eyJ[REDACTED]',
+  )
+  // 连接串：只抹 user:pass，保留 scheme / host / port 便于排障。
+  text = text.replace(
+    /\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/)[^\s:/@]+:[^\s/@]+@/g,
+    '$1[REDACTED]@',
+  )
   // 1) Authorization 头的认证方案 + 凭据（Bearer / Basic / Token）。
   //    N9（复核2）：原先只认 Bearer，`Authorization: Basic <base64>` 会走到下面第 4 条
   //    的 key:value 规则——那条只把 `Basic` 当值抹掉，真正的 base64 凭据反而原样留下，
   //    还把外层字符串改坏。现在与 host-check.redactSensitiveText 同口径。
+  //    规则 0 已把凭据换成 `ghp_[REDACTED]` 这类带前缀的标记；这里把标记形态纳入
+  //    候选并原样放行，否则只吃掉 `ghp_`、把之前保留的前缀二次抹掉。
   text = text.replace(
-    /\b(Bearer|Basic|Token)\s+(?:"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,})/gi,
-    '$1 [REDACTED]',
+    /\b(Bearer|Basic|Token)\s+((?:"[A-Za-z0-9._~+/=-]*\[REDACTED\]"|'[A-Za-z0-9._~+/=-]*\[REDACTED\]'|[A-Za-z0-9._~+/=-]*\[REDACTED\]|"[A-Za-z0-9._~+/=-]{4,}"|'[A-Za-z0-9._~+/=-]{4,}'|[A-Za-z0-9._~+/=-]{4,}))/gi,
+    (match, scheme, credential) => (credential.includes('[REDACTED]') ? match : `${scheme} [REDACTED]`),
   )
   // 2) 敏感标志位：`--token <值>` / `--api-key=<值>` 等空格或等号分隔形态
   //    （N3 接线）。参数名必须完整（名字后只接受空白或 `=`），所以 `--token-file` /
@@ -117,6 +159,9 @@ export function redactText(raw) {
     /(["']?(?:token|password|passwd|secret|api[_-]?key|authorization)["']?\s*[:=]\s*)("[^"\x00-\x1F\x7F]*"|'[^'\x00-\x1F\x7F]*'|[^\s,;&}；，\x00-\x1F\x7F]+)/gi,
     (match, prefix, value) => {
       if (/^(?:Bearer|Basic|Token)$/i.test(String(value).replace(/["']/g, ''))) return match
+      // 规则 0 产出的带前缀标记（`ghp_[REDACTED]`、`glpat-[REDACTED]`）原样放行，
+      // 避免 key=value 规则把前缀二次抹掉，也保证整体幂等。
+      if (String(value).includes('[REDACTED]')) return match
       return `${prefix}"[REDACTED]"`
     },
   )

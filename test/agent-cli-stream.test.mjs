@@ -267,6 +267,25 @@ test('诊断摘要剥掉 C0 控制字符（保留 \\t / \\n），且不切断 UT
   assert.ok(!astral.includes('\uFFFD'), '不得出现替换字符（半个多字节字符）')
 })
 
+test('诊断摘要剥掉裸 \\r 与其它 C0（只保留 \\t / \\n）', () => {
+  const diagnostics = []
+  const reader = createUtf8LineReader({
+    onLine: () => {
+      // 裸 CR（0x0D）不在旧的 C0 范围里，会原样进日志；BEL / ESC 一并验证。
+      throw new Error('a\tb\nc\rd\u0007e\u001bf')
+    },
+    onDiagnostic: diag => diagnostics.push(diag),
+  })
+  reader.write('boom\n')
+  reader.end()
+
+  assert.equal(diagnostics.length, 1)
+  const message = diagnostics[0].message
+  assert.equal(message, 'a\tb\ncdef', '只保留 \\t / \\n，裸 CR 与其它 C0 一起剥掉')
+  assert.ok(!message.includes('\r'), '不得残留裸 CR')
+  assert.ok(!/[\u0000-\u0008\u000B-\u001F]/.test(message), '除 \\t / \\n 外的 C0 必须全部剥掉')
+})
+
 test('诊断有界：超过上限后只计数不再保留', () => {
   const diagnostics = []
   const reader = createUtf8LineReader({

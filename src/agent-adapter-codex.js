@@ -69,7 +69,7 @@ import {
   defaultTmpRoot,
   verifyFinishBridge,
 } from './node-finish-mcp.js'
-import { redactText as redactSharedText } from './process-output.js'
+import { redactStructured } from './process-output.js'
 
 /** 适配器 id（注册表 / 运行日志 / admission 都用它）。 */
 export const CODEX_ADAPTER_ID = 'codex'
@@ -1281,38 +1281,28 @@ export function createCodexAdapter(options = {}) {
     }
 
     /**
-     * 导出前脱敏（M4）：本 execution 的凭据、socket 路径与 runDir 都替换成占位符。
-     * `state.events` 里仍保留原始事件（诊断需要），只有 `handle` 暴露的副本被脱敏。
-     * 深度超过 8 层的子树一律替换成 `[redacted:depth]`——**绝不返回原对象**（#9）。
+     * 本 execution 的精确秘密（通道凭据 / socket / runDir）：共享规则之外再做字面量替换。
      */
-    const redactText = text => {
-      // 0.15.1：先走共享文本规则（JSON 转义 / 引号 / 键值 / 超长串），再做本 execution
-      // 的精确秘密替换。handle.events / lastMessage 也走这里，和终态结果面同一套规则。
-      // ≤1 MiB 的文本关掉「≥64 KiB 连续串预抹」：那是为超大输入避开 V8 爆栈的兜底，
-      // 但会把 600 KiB 的合法 x…x 长串整段替换；规则 5 仍按跨类字符判敏感。
-      const value = typeof text === 'string' ? text : String(text)
-      let output = redactSharedText(value, { capOversize: value.length > 1024 * 1024 })
-      const secrets = [channel.credential, channel.socketPath, runDir]
-      for (const secret of secrets) {
-        if (typeof secret === 'string' && secret !== '') output = output.split(secret).join('[redacted]')
-      }
-      return output
-    }
-    const redactValue = (value, depth = 0) => {
-      if (typeof value === 'string') return redactText(value)
-      const tooDeep = depth > 8
-      if (Array.isArray(value)) {
-        // 超深子树**必须**替换成占位符：直接返回原值会让深层凭据绕过脱敏（#9）。
-        return tooDeep ? '[redacted:depth]' : value.map(item => redactValue(item, depth + 1))
-      }
-      if (isPlainObject(value)) {
-        if (tooDeep) return '[redacted:depth]'
-        const output = {}
-        for (const [key, item] of Object.entries(value)) output[key] = redactValue(item, depth + 1)
-        return output
-      }
-      return value
-    }
+    const executionSecrets = () => [channel.credential, channel.socketPath, runDir]
+      .filter(secret => typeof secret === 'string' && secret !== '')
+
+    /**
+     * 导出前脱敏（M4 / B1）：所有导出面共用一个入口。
+     *
+     * `redactStructured` 做结构化深拷贝 + **敏感键名下的值整体替换** + 共享文本规则，
+     * 再叠加本 execution 的精确秘密替换。`handle.events` / `lastMessage` /
+     * `protocolErrors` / `diagnostics` / `terminalError.details` 全部走它；
+     * 0.15.1 的本地 `redactValue` 只对字符串脱敏、不看键名，`handle.events` 里的
+     * `{"env":{"password":"hunter2"}}` 会原样导出（B1），已删除。
+     */
+    const redactValue = value => redactStructured(value, {
+      secrets: executionSecrets(),
+      // 诊断事件缓存上限 200 条：结构化副本不能被共享默认的 64 键上限裁掉（M2 回归锁）。
+      maxKeys: EVENT_CACHE_LIMIT,
+    })
+
+    /** 单字符串出口（tail / 诊断消息）：与结构化出口同一套规则。 */
+    const redactText = text => redactValue(typeof text === 'string' ? text : String(text))
 
     /**
      * F2：终态错误（code / message / details）的唯一脱敏出口。
@@ -1321,13 +1311,10 @@ export function createCodexAdapter(options = {}) {
      * 秘密替换（通道凭据 / socket / runDir）→ UTF-8 字节截断并标记。旧的
      * `redactText` 只做本执行秘密替换，`failure.code` 更是完全没清洗。
      */
-    const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => {
-      let text = redactSharedText(value === undefined || value === null ? '' : String(value))
-      for (const secret of [channel.credential, channel.socketPath, runDir]) {
-        if (typeof secret === 'string' && secret !== '') text = text.split(secret).join('[redacted]')
-      }
-      return truncateUtf8Bytes(text, limit)
-    }
+    const boundTerminalText = (value, limit = MAX_TERMINAL_ERROR_BYTES) => truncateUtf8Bytes(
+      redactText(value === undefined || value === null ? '' : String(value)),
+      limit,
+    )
 
     /** 取消 / 失败时收掉闸门：未 settle 才 abort；重复 abort 幂等。 */
     const abortGate = reason => {

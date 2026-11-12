@@ -1900,7 +1900,10 @@ try {
       method: 'POST', parts: ['instances', id, 'tasks', 'human1', 'complete'], url, body: { payload: { approved: true } },
     })
     eq(replay.status, 409, '不可恢复实例不能再 complete（不能重放失败前的工作）')
-    eq(replay.body.code, 'BPMN_INSTANCE_NOT_RECOVERABLE')
+    // MAJOR-3 残余（契约）：executionFailure 是「执行已确认停下」的事实，冷恢复与热 runner
+    // 同口径返回 BPMN_INSTANCE_BLOCKED（带 recoveryCode），不再是 NOT_RECOVERABLE。
+    eq(replay.body.code, 'BPMN_INSTANCE_BLOCKED')
+    eq(replay.body.recoveryCode, raw.lastError.code, 'recoveryCode 保留失败码')
     await runtimeB.dispose()
   })
 
@@ -3768,7 +3771,7 @@ try {
     eq(res.body.code, 'BPMN_INSTANCE_BLOCKED', 'resume 只解除挂起，不伪造可执行待办')
   })
 
-  await check('0.14.4 部分提交：事件分片写失败 → resume 200 committed/eventLogPending，磁盘 ACTIVE；修复后重试不重复写事件', async home => {
+  await check('0.14.4/0.14.6 部分提交：事件分片写失败只认 store 的提交事实（契约在→200 committed/pending；不在→显式失败）', async home => {
     const { runtime, url, instanceId } = await setupWaitingInstance(home)
     const instancesRoot = instStore.instancesDir(home)
     let res = await runtime.handle({
@@ -3786,9 +3789,20 @@ try {
     res = await runtime.handle({
       method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: { reason: 'commit-fault' },
     })
-    eq(res.status, 200, JSON.stringify(res.body))
-    eq(res.body.committed, true, '状态已提交必须如实返回 committed:true')
-    eq(res.body.eventLogPending, true, '事件正文缺失必须标 eventLogPending')
+    // 跨单元契约（U3，`appendInstanceEvents` 在「元数据已提交、事件正文追加失败」时抛
+    // `InstanceError{committed:true, eventLogPending:true, lastSeq}`）：
+    //   - 契约在：只凭 error.committed 返回 200 + committed/pending + lastSeq；
+    //   - 契约不在（本 worktree 的基线 store）：运行时不拿「磁盘最终状态等于目标状态」
+    //     替 store 认领提交（复审 NEW-2），显式 500，绝不 200/committed。
+    if (res.status === 200) {
+      eq(res.body.committed, true, '状态已提交必须如实返回 committed:true')
+      eq(res.body.eventLogPending, true, '事件正文缺失必须标 eventLogPending')
+      eq(res.body.lastSeq, seqBeforeResume + 1, 'lastSeq 取自 store 报告的本次提交事实')
+    } else {
+      eq(res.status, 500, 'store 未报告本次提交时不得谎报 200')
+      eq(res.body.committed, undefined, '没有 store 提交事实就不能返回 committed')
+      eq(res.body.ok, false)
+    }
     const committed = readInstanceJson(home, instanceId)
     eq(committed.status, 'ACTIVE', '磁盘状态以最后一次成功写入为准')
     eq(committed.lastSeq, seqBeforeResume + 1, 'seq 已分配（事件行缺失）')
@@ -3901,7 +3915,16 @@ try {
       const runtimeB = createBpmnRuntime({ dir: dataDir, env: {}, adapters: makeFakeAdapters() })
       const url = new URL('http://localhost/')
       try {
-        const eventsBefore = (await instStore.readInstanceEvents(instanceId, { instancesRoot })) ?? []
+        // peer 的 `ready` 在 adapter.start 里就发了，启动事件可能还没 flush 完：先等它落盘，
+        // 否则 eventsBefore 会读到 0 条，把 peer 自己的 wait 事件误当成「被拒的挂起写了事件」。
+        let eventsBefore = []
+        const eventsDeadline = Date.now() + 5000
+        while (Date.now() < eventsDeadline) {
+          eventsBefore = (await instStore.readInstanceEvents(instanceId, { instancesRoot })) ?? []
+          if (eventsBefore.some(event => event.type === 'activity/start')) break
+          await sleep(10)
+        }
+        ok(eventsBefore.some(event => event.type === 'activity/start'), '前置条件：peer 的 activity/start 已落盘')
         const res = await runtimeB.handle({
           method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: 'cross-process' },
         })
@@ -3914,7 +3937,10 @@ try {
         ok(typeof ownerActivity.since === 'string' && ownerActivity.since !== '', 'owner.since 可用于排障')
 
         const eventsAfter = (await instStore.readInstanceEvents(instanceId, { instancesRoot })) ?? []
-        eq(eventsAfter.length, eventsBefore.length, '被拒的挂起不能写挂起事件')
+        // 只比「挂起事件」：peer 的 agent 仍在跑，期间可能继续落事件（agent/invocation 等），
+        // 拿总条数判定会把 peer 的正常事件误判成被拒挂起的副作用。
+        eq(countType(eventsBefore, 'instance/suspended'), 0, '前置条件：还没有挂起事件')
+        eq(countType(eventsAfter, 'instance/suspended'), 0, '被拒的挂起不能写挂起事件')
         eq(readInstanceJson(home, instanceId).status, 'ACTIVE')
 
         // 绕过生命周期路由直接抢状态：必须被 store 拒绝。
@@ -4002,6 +4028,196 @@ try {
       eq(countType(events.body.events, 'activity/wait'), 1, '跨进程 resume 不得重放 wait')
     } finally {
       await peer.stop()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 12.6 0.14.6 所有权 / 准入 / 提交事实（复审 0145 的 NEW-1 / NEW-3 / NEW-2 残余）
+  // -------------------------------------------------------------------------
+  await check('0.14.6 NEW-3：executionFailure 落盘后缓存 runner 不得继续使用（complete 409 BLOCKED）', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    const instancesRoot = instStore.instancesDir(home)
+    eq(runtime._runners.size, 1, '前置条件：waiting runner 在内存缓存里')
+    await instStore.recordExecutionFailure(instanceId, {
+      instancesRoot,
+      lastError: { code: 'BPMN_PROBE_FAILURE', message: 'probe: 已确认失败' },
+    })
+    eq(readInstanceJson(home, instanceId).status, 'ACTIVE', '失败事实不改实例状态')
+    const res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+    })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'BPMN_INSTANCE_BLOCKED', 'NEW-3：失败事实优先于缓存 runner')
+    eq(res.body.recoveryCode, 'BPMN_PROBE_FAILURE')
+    eq(runtime._runners.size, 0, 'NEW-3：已确认失败的 runner 不能再当缓存')
+    eq(runtime._ownedInstances.size, 0, '没有 runner 就不占所有权')
+  })
+
+  await check('0.14.6 MAJOR-3 契约：挂起期间超时 + 冷恢复 → 409 BPMN_INSTANCE_BLOCKED + recoveryCode', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home, {
+      FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS: '300',
+    })
+    let res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {},
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    eq(await waitUntil(() => readInstanceJson(home, instanceId).lastError !== null, 4000), true, '超时事实已落盘')
+    // 原 owner 退出（dispose 释放所有权）后由新 runtime 冷恢复。
+    await runtime.dispose()
+    const runtimeB = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters() })
+    try {
+      res = await runtimeB.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+      eq(res.status, 200, JSON.stringify(res.body))
+      res = await runtimeB.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+      })
+      eq(res.status, 409, JSON.stringify(res.body))
+      eq(res.body.code, 'BPMN_INSTANCE_BLOCKED', '冷恢复与热 runner 同口径（复审 MAJOR-3 残余）')
+      eq(res.body.recoveryCode, 'BPMN_ACTIVITY_TIMEOUT', 'recoveryCode 保留失败码')
+    } finally {
+      await runtimeB.dispose()
+    }
+  })
+
+  await check('0.14.6 NEW-2：生命周期 200 只认 store 的本次提交事实，不拿磁盘状态替别人认领', async home => {
+    const { runtime, url, instanceId } = await setupWaitingInstance(home)
+    let res = await runtime.handle({
+      method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: {},
+    })
+    eq(res.status, 200, JSON.stringify(res.body))
+    const original = runtime._appendLifecycleEvent.bind(runtime)
+    try {
+      // A) 跨单元契约（U3 已冻结，commit 5ff4292）：store 报「元数据已提交、事件正文追加失败」
+      //    → `InstanceError(500,'INSTANCE_EVENT_APPEND_FAILED',{committed:true,eventLogPending:true,
+      //    firstSeq,lastSeq,status,revision,activityId,attempt,eventLogError})` → 必须如实 200。
+      runtime._appendLifecycleEvent = async () => {
+        const error = new Error('injected: metadata committed, event body append failed')
+        Object.assign(error, {
+          code: 'INSTANCE_EVENT_APPEND_FAILED',
+          committed: true,
+          eventLogPending: true,
+          firstSeq: 4242,
+          lastSeq: 4242,
+          status: 'ACTIVE',
+          revision: 100,
+          activityId: 'process',
+          attempt: 1,
+          eventLogError: 'EISDIR',
+        })
+        throw error
+      }
+      res = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: { reason: 'injected-contract' },
+      })
+      eq(res.status, 200, JSON.stringify(res.body))
+      eq(res.body.committed, true)
+      eq(res.body.eventLogPending, true)
+      eq(res.body.lastSeq, 4242, 'lastSeq 来自 store 报告的本次提交')
+      eq(res.body.reason, 'injected-contract')
+      eq(readInstanceJson(home, instanceId).status, 'SUSPENDED', '注入的「提交」没写盘：证明 200 不是读磁盘推出来的')
+
+      // B) NEW-2 反例：别的请求提交了同一次迁移，本请求失败且没有 committed 事实 →
+      // 磁盘状态恰好等于目标，也绝不能 200（旧实现会把它认成自己的提交）。
+      runtime._appendLifecycleEvent = async (id, event, options) => {
+        // 模拟「另一个请求提交了同一次迁移」。
+        await original(id, event, options)
+        // 本请求的元数据没写成：store 契约是 committed:false（INSTANCE_METADATA_WRITE_FAILED）。
+        const error = new Error('injected: 本请求的元数据写入失败（committed:false）')
+        Object.assign(error, {
+          code: 'INSTANCE_METADATA_WRITE_FAILED',
+          committed: false,
+          eventLogPending: false,
+          lastSeq: readInstanceJson(home, instanceId).lastSeq - 1,
+        })
+        throw error
+      }
+      res = await runtime.handle({
+        method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: { reason: 'A-not-committed' },
+      })
+      eq(res.status, 500, JSON.stringify(res.body))
+      eq(res.body.committed, undefined, '没有本次提交事实就不能返回 committed')
+      eq(readInstanceJson(home, instanceId).status, 'ACTIVE', '磁盘已是目标状态（那是对端请求的提交）')
+    } finally {
+      runtime._appendLifecycleEvent = original
+    }
+    // 恢复真实路径：状态已是 ACTIVE，resume 409 且不重复写事件。
+    const lastSeq = readInstanceJson(home, instanceId).lastSeq
+    res = await runtime.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+    eq(res.status, 409, JSON.stringify(res.body))
+    eq(res.body.code, 'INSTANCE_NOT_SUSPENDED')
+    eq(readInstanceJson(home, instanceId).lastSeq, lastSeq, '失败请求没有留下 seq 空洞')
+  })
+
+  await check('0.14.6 MAJOR-1 残余：派发前复查磁盘 SUSPENDED → 零派发、摘掉 runner、409 INSTANCE_SUSPENDED', async home => {
+    const dir = join(home, 'flow-studio')
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:fs="http://feiyueve.dev/schema/bpmn/fs/1.0" id="defs-admission" targetNamespace="http://example.com/flow-studio">
+  <bpmn:process id="proc-admission" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="human1"/>
+    <bpmn:serviceTask id="agent1"><bpmn:extensionElements><fs:node nodeType="agent" adapter="dsh"></fs:node></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="human1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="human1" targetRef="agent1"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="agent1" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>`
+    const adapter = makeFakeAdapter()
+    const runtimeA = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters(adapter) })
+    const url = new URL('http://localhost/')
+    const runtimeB = createBpmnRuntime({ dir, env: {}, adapters: makeFakeAdapters() })
+    try {
+      let res = await runtimeA.handle({ method: 'POST', parts: ['definitions'], url, body: { id: 'flow-admission', xml } })
+      eq(res.status, 201, JSON.stringify(res.body))
+      res = await runtimeA.handle({ method: 'POST', parts: ['instances'], url, body: { definitionId: 'flow-admission' } })
+      eq(res.status, 201, JSON.stringify(res.body))
+      const instanceId = res.body.id
+      eq(adapter.calls.length, 0, '前置条件：agent1 还没派发')
+      eq(runtimeA._runners.size, 1, '前置条件：waiting runner 在 A 的缓存里')
+
+      // 让 A 的 complete 在「取到缓存 runner（入口已读 ACTIVE）」与「真正派发」之间停下：
+      // 这段时间里同进程另一个 runtime 提交挂起（owner 是同 pid，不算 foreign）。
+      let markEnsure
+      const ensureReached = new Promise(resolveReached => { markEnsure = resolveReached })
+      let releaseSuspend
+      const suspendGate = new Promise(resolveGate => { releaseSuspend = resolveGate })
+      const originalEnsure = runtimeA._ensureRunner.bind(runtimeA)
+      runtimeA._ensureRunner = async instance => {
+        const ensured = await originalEnsure(instance)
+        markEnsure()
+        await suspendGate
+        return ensured
+      }
+      const completing = runtimeA.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+      })
+      await ensureReached
+      res = await runtimeB.handle({
+        method: 'POST', parts: ['instances', instanceId, 'suspend'], url, body: { reason: 'hot-suspend' },
+      })
+      eq(res.status, 200, JSON.stringify(res.body))
+      eq(readInstanceJson(home, instanceId).status, 'SUSPENDED')
+      releaseSuspend()
+      res = await completing
+      eq(res.status, 409, JSON.stringify(res.body))
+      eq(res.body.code, 'INSTANCE_SUSPENDED', '真正派发之前必须发现磁盘挂起')
+      eq(adapter.calls.length, 0, 'MAJOR-1：零派发')
+      eq(runtimeA._runners.size, 0, 'MAJOR-1：已恢复 / 缓存的 runner 收回，不再当缓存')
+      eq(readInstanceJson(home, instanceId).pendingTasks.length, 1, '磁盘待办保持不变')
+
+      // resume 之后同一 runtime 重新取得准入并正常完成（一次派发）。
+      res = await runtimeB.handle({ method: 'POST', parts: ['instances', instanceId, 'resume'], url, body: {} })
+      eq(res.status, 200, JSON.stringify(res.body))
+      res = await runtimeA.handle({
+        method: 'POST', parts: ['instances', instanceId, 'tasks', 'human1', 'complete'], url, body: { payload: {} },
+      })
+      eq(res.status, 200, JSON.stringify(res.body))
+      eq(res.body.status, 'COMPLETED')
+      eq(adapter.calls.length, 1, 'resume 后正常派发一次')
+      eq(readInstanceJson(home, instanceId).status, 'COMPLETED')
+    } finally {
+      await runtimeB.dispose()
+      await runtimeA.dispose()
     }
   })
 

@@ -13,6 +13,21 @@
  * 文件：`<instancesRoot>/<instanceId>/owner.json`
  * 形状：`{pid, host, bootId, startTime, runtimeId, since}`
  *
+ * 0.14.6：**夺取所有权是跨进程互斥的**（复审 NEW-1）。`claimInstanceOwner` /
+ * `releaseInstanceOwner` 的「读旧记录 → 判定 → 原子替换 / 删除」整段跑在
+ * `<instancesRoot>/.locks/<instanceId>.lock` 的内核 flock 临界区里（复用
+ * `instance-resources.js` 的宿主 fd + util-linux flock 原语；helper 死亡 fail-closed），
+ * 所以两个进程不会同时从「没有 owner」各写一份。拿不到所有权时抛
+ * `INSTANCE_OWNED_ELSEWHERE` / `INSTANCE_OWNER_UNKNOWN`（409），调用方必须在
+ * recover / signal / adapter 派发前退出。
+ *
+ * 锁放在实例目录**之外**的隐藏目录里：`withResourceLock` 会为锁文件建父目录，
+ * 若把锁放进 `<instanceId>/`，实例被删后一次 release/dispose 就会把空目录复活。
+ *
+ * 平台边界：Windows / 找不到 util-linux `flock` 时 `withResourceLock` 退回**进程内
+ * 队列**，此时只有同进程互斥，跨进程互斥不成立——与 `instance-resources.js` 声明的
+ * 降级边界是同一处（`resourceLockBackend()` 可判当前后端）。
+ *
  * @module @feiyueve/dsh-flow-studio/instance-owner
  */
 
@@ -22,10 +37,20 @@ import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
+import { withResourceLock } from './instance-resources.js'
 import { checkRunId } from './storage-contract.js'
 
 const FILE_MODE = 0o600
 const OWNER_FILE = 'owner.json'
+/**
+ * 所有权临界区锁目录（宿主 fd + util-linux flock，见 `instance-resources.js`）。
+ * 锁文件 `<instancesRoot>/.locks/<instanceId>.lock` 只作 inode 锚点，**常驻不删**：
+ * 删除会让等待者与新建者各自锁住不同 inode（ABA）。放在实例目录之外，
+ * 避免 `withResourceLock` 的建目录行为把已删除的实例目录复活。
+ */
+const OWNER_LOCKS_DIR = '.locks'
+/** 等所有权锁的上限：拿不到就 fail-closed（调用方必须在派发前退出）。 */
+const OWNER_CLAIM_WAIT_MS = 10 * 1000
 
 let tmpCounter = 0
 
@@ -154,6 +179,13 @@ export function ownerFilePath(instanceDir) {
   return join(instanceDir, OWNER_FILE)
 }
 
+/** `<instancesRoot>/.locks/<instanceId>.lock`（跨进程所有权临界区锚点）。 */
+export function ownerLockFilePath(instancesRoot, instanceId) {
+  const checked = checkRunId(instanceId)
+  if (checked === null) return null
+  return join(resolve(instancesRoot), OWNER_LOCKS_DIR, `${checked}.lock`)
+}
+
 /** id → 实例目录；非法 id / 越界返回 null。 */
 function instanceDirOf(instancesRoot, instanceId) {
   const checked = checkRunId(instanceId)
@@ -228,36 +260,107 @@ function normalizeOwner(raw) {
   return owner
 }
 
+/** 带 code / status 的所有权错误（runtime 据此映射 409 / 404）。 */
+function ownerError(code, message, status, extra = {}) {
+  const error = new Error(message)
+  error.code = code
+  error.status = status
+  Object.assign(error, extra)
+  return error
+}
+
 /**
- * 原子写 owner.json（不建目录：实例被删后不能靠写 owner 把目录复活）。
+ * 夺取 / 登记实例执行所有权（**跨进程互斥**）。
+ *
+ * 互斥由 `withResourceLock` 提供（宿主 fd 上的内核 flock；helper 死亡 fail-closed），
+ * 因此「读旧 owner → 判定 → 原子 rename」整段落在同一个临界区里：两个进程不可能
+ * 同时读到「没有 owner」再各自写入。复审 NEW-1 的双派发就来自这里缺少互斥。
+ *
+ * 判定（与 `readInstanceOwner` / `ownerState` 同一套事实口径）：
+ *   - 没有记录 → 写入本 runtime 的记录，`previous:null`；
+ *   - 记录是 `alive` 的**别的进程** → 抛 `INSTANCE_OWNED_ELSEWHERE`（409），**不写盘**；
+ *   - 记录是 `alive` 的**同一进程其它 runtime** → 允许接管：同进程内由 runner 活跃表
+ *     （`BPMN_INSTANCE_ID_CONFLICT`）兜底串行，不构成跨进程双执行；
+ *   - 记录是 `gone`（pid 不存在 / starttime 变了 / bootId 变了）→ 接管并返回 `previous`；
+ *   - 坏 JSON / 跨主机 / 读不到 pid = `unknown` → 抛 `INSTANCE_OWNER_UNKNOWN`（409），
+ *     保持 fail-closed；人工核对后可删除 `owner.json` 由持有者重新登记。
  *
  * @param {string} instanceId
  * @param {{instancesRoot: string, owner?: object}} input
- * @returns {Promise<{owner: object, previous: object|null}>}
+ * @returns {Promise<{owner: object, previous: object|null, state: 'alive'|'gone'|'unknown'|null, takeover: boolean}>}
  */
 export async function claimInstanceOwner(instanceId, input = {}) {
   const dir = instanceDirOf(input.instancesRoot, instanceId)
   if (dir === null || !(await dirExists(dir))) {
-    const error = new Error(`实例 ${String(instanceId)} 不存在，不能登记执行所有权`)
-    error.code = 'INSTANCE_NOT_FOUND'
-    error.status = 404
-    throw error
+    throw ownerError('INSTANCE_NOT_FOUND', `实例 ${String(instanceId)} 不存在，不能登记执行所有权`, 404)
   }
   const path = ownerFilePath(dir)
-  const previousPayload = await readOwnerPayload(path)
-  const previous = previousPayload.kind === 'ok' ? previousPayload.value : null
-  const owner = normalizeOwner(input.owner ?? selfOwner())
-  if (owner.startTime === null && owner.pid === process.pid) {
-    // selfOwner() 在 /proc 首次读取失败时可能给 null；claim 是异步路径，补一次。
-    owner.startTime = await selfProcessStartTime()
+  const lockPath = ownerLockFilePath(input.instancesRoot, instanceId)
+  if (lockPath === null) {
+    throw ownerError('INSTANCE_NOT_FOUND', `实例 ${String(instanceId)} 不存在，不能登记执行所有权`, 404)
   }
-  if (owner.since === undefined) owner.since = new Date().toISOString()
-  await writeJsonAtomic(path, owner)
-  return { owner, previous }
+  return await withResourceLock(lockPath, async () => {
+    // 目录可能在等锁期间被删：临界区里再确认一次（claim 不能复活实例目录）。
+    if (!(await dirExists(dir))) {
+      throw ownerError('INSTANCE_NOT_FOUND', `实例 ${String(instanceId)} 不存在，不能登记执行所有权`, 404)
+    }
+    const previousPayload = await readOwnerPayload(path)
+    const previous = previousPayload.kind === 'ok' ? previousPayload.value : null
+    const owner = normalizeOwner(input.owner ?? selfOwner())
+    if (owner.startTime === null && owner.pid === process.pid) {
+      // selfOwner() 在 /proc 首次读取失败时可能给 null；claim 是异步路径，补一次。
+      owner.startTime = await selfProcessStartTime()
+    }
+    if (owner.since === undefined) owner.since = new Date().toISOString()
+
+    if (previousPayload.kind === 'corrupt') {
+      // 坏 JSON 不能当成「没有 owner」直接覆盖：那会掩盖一个可能还活着的执行者。
+      throw ownerError(
+        'INSTANCE_OWNER_UNKNOWN',
+        `实例 ${String(instanceId)} 的 owner.json 无法解析，不能确认执行所有权：为安全起见拒绝夺取；请人工核对 ${path}`,
+        409,
+        { owner: null, state: 'unknown', path },
+      )
+    }
+
+    let state = null
+    if (previous !== null) {
+      state = await ownerState(previous)
+      const sameRuntime = previous.runtimeId === owner.runtimeId
+      const sameProcess = previous.pid === process.pid
+      if (state === 'alive' && !sameRuntime && !sameProcess) {
+        throw ownerError(
+          'INSTANCE_OWNED_ELSEWHERE',
+          `实例 ${String(instanceId)} 的执行所有权被另一个活进程持有（pid ${previous.pid} @ ${previous.host || '?'}，自 ${previous.since ?? '未知时间'}），本次不夺取、不派发`,
+          409,
+          { owner: previous, state },
+        )
+      }
+      if (state === 'unknown') {
+        throw ownerError(
+          'INSTANCE_OWNER_UNKNOWN',
+          `实例 ${String(instanceId)} 的执行所有权记录无法确认（跨主机 / 读不到进程信息）：为安全起见拒绝夺取；请人工核对 ${path}`,
+          409,
+          { owner: previous, state },
+        )
+      }
+      // 同一 runtime 重复 claim（准备 / 恢复路径会多次进入）：保留原始 since，不制造时间漂移。
+      if (sameRuntime && state === 'alive' && typeof previous.since === 'string' && previous.since !== '') {
+        owner.since = previous.since
+      }
+    }
+    await writeJsonAtomic(path, owner)
+    return {
+      owner,
+      previous,
+      state,
+      takeover: previous !== null && state === 'gone',
+    }
+  }, { waitMs: OWNER_CLAIM_WAIT_MS })
 }
 
 /**
- * 读所有权记录。
+ * 读所有权记录（无锁纯读：`owner.json` 是 rename 原子替换，读到的总是完整一份）。
  *
  * @param {string} instanceId
  * @param {{instancesRoot: string}} input
@@ -275,7 +378,8 @@ export async function readInstanceOwner(instanceId, input = {}) {
 }
 
 /**
- * 释放所有权：只删自己写的（runtimeId 不匹配不删）。
+ * 释放所有权：只删自己写的（runtimeId 不匹配不删）。与 claim 同一把跨进程锁，
+ * 避免「读到的还是自己 → 删除期间被接管 → 删掉继任者的记录」。
  *
  * @param {string} instanceId
  * @param {{instancesRoot: string, runtimeId: string}} input
@@ -284,16 +388,23 @@ export async function readInstanceOwner(instanceId, input = {}) {
 export async function releaseInstanceOwner(instanceId, input = {}) {
   const dir = instanceDirOf(input.instancesRoot, instanceId)
   if (dir === null) return false
+  if (!(await dirExists(dir))) return false
   const path = ownerFilePath(dir)
-  const payload = await readOwnerPayload(path)
-  if (payload.kind !== 'ok') return false
+  const lockPath = ownerLockFilePath(input.instancesRoot, instanceId)
+  if (lockPath === null) return false
   const runtimeId = typeof input.runtimeId === 'string' ? input.runtimeId : ''
-  if (runtimeId === '' || payload.value.runtimeId !== runtimeId) return false
-  try {
-    await unlink(path)
-    return true
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return false
-    throw error
-  }
+  if (runtimeId === '') return false
+  return await withResourceLock(lockPath, async () => {
+    const payload = await readOwnerPayload(path)
+    if (payload.kind !== 'ok') return false
+    if (payload.value.runtimeId !== runtimeId) return false
+    try {
+      await unlink(path)
+      return true
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return false
+      throw error
+    }
+  }, { waitMs: OWNER_CLAIM_WAIT_MS })
 }
+

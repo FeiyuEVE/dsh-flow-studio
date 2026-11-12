@@ -3741,6 +3741,62 @@ try {
     eq(countType(events.events, 'instance/suspended'), 0, '被拒的挂起不能写事件')
   })
 
+  await check('C2 准备阶段抛异常：实例收成 CANCELED + lastError；owner / preparing 归零；返回错误分支不回退', async home => {
+    const runtime = createBpmnRuntime({ dir: join(home, 'flow-studio'), env: {}, adapters: makeFakeAdapters() })
+    const url = new URL('http://localhost/')
+    let res = await runtime.handle({
+      method: 'POST',
+      parts: ['definitions'],
+      url,
+      body: { id: 'flow-demo', name: '演示流程', xml: workflowXml('proc-prepare-throw') },
+    })
+    eq(res.status, 201, JSON.stringify(res.body))
+    const body = {
+      definitionId: 'flow-demo',
+      variables: { amount: 7 },
+      workspace: { path: home, worktree: { mode: 'off' } },
+    }
+    try {
+      // 1) 准备函数**抛异常**（不是返回 {error}）：基线会留一个 ACTIVE 空壳。
+      runtime._prepareInstanceWorkspace = async () => {
+        throw new Error('准备探针抛异常')
+      }
+      res = await runtime.handle({ method: 'POST', parts: ['instances'], url, body })
+      eq(res.status, 500, JSON.stringify(res.body))
+      eq(res.body.ok, false)
+      eq(res.body.code, 'BPMN_WORKSPACE_OPERATION_FAILED', '无 code 的异常收成统一工作区错误码')
+      ok(String(res.body.error).includes('准备探针抛异常'), '响应保留原始原因')
+      const thrownId = res.body.id
+      ok(typeof thrownId === 'string' && thrownId !== '', '响应带回实例 id')
+      const thrownRaw = readInstanceJson(home, thrownId)
+      eq(thrownRaw.status, 'CANCELED', '准备抛异常必须收成 CANCELED（基线：实例留 ACTIVE）')
+      eq(thrownRaw.lastError?.code, 'BPMN_WORKSPACE_OPERATION_FAILED')
+      ok(String(thrownRaw.lastError?.message).includes('准备探针抛异常'), 'lastError 保留原因')
+      eq(runtime._preparing.size, 0, 'preparing 计数归零')
+      eq(runtime._ownedInstances.size, 0, 'owner 已交还')
+      eq(existsSync(join(instStore.instancesDir(home), thrownId, 'owner.json')), false, 'owner.json 已释放')
+      eq(runtime._runners.has(thrownId), false, '零派发')
+
+      // 2) 返回错误分支（原有行为）不得改变：同样的响应形状 + CANCELED + lastError。
+      runtime._prepareInstanceWorkspace = async () => ({
+        workspace: null,
+        error: { status: 400, code: 'BPMN_WORKSPACE_INVALID', message: '准备返回错误探针' },
+      })
+      res = await runtime.handle({ method: 'POST', parts: ['instances'], url, body })
+      eq(res.status, 400, JSON.stringify(res.body))
+      eq(res.body.ok, false)
+      eq(res.body.code, 'BPMN_WORKSPACE_INVALID')
+      ok(typeof res.body.id === 'string' && res.body.id !== '')
+      const returnedRaw = readInstanceJson(home, res.body.id)
+      eq(returnedRaw.status, 'CANCELED', '返回错误分支仍是 CANCELED')
+      eq(returnedRaw.lastError?.code, 'BPMN_WORKSPACE_INVALID')
+      eq(runtime._preparing.size, 0)
+      eq(runtime._ownedInstances.size, 0)
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
   await check('0.14.4 挂起期间超时：错误事实落盘、待办清空、error 恰好一条；resume 后 complete 明确 BLOCKED', async home => {
     const { runtime, url, instanceId } = await setupWaitingInstance(home, {
       FLOW_STUDIO_BPMN_ACTIVITY_TIMEOUT_MS: '500',

@@ -247,6 +247,8 @@ if (mode === 'redaction-scan') {
           token2: 'hunter2',
           nested: { api_key: 'hunter2' },
         },
+        // 0.15.2 回归：用量计数不是凭据，数值必须原样导出。
+        usage: { inputTokens: 6501, outputTokens: 5, maxTokens: 4096 },
       },
     },
   })
@@ -1907,6 +1909,12 @@ async function main() {
       A.equal(structuredEvent.item.structured.env.auth, '[REDACTED]')
       A.equal(structuredEvent.item.structured.env.token2, '[REDACTED]')
       A.equal(structuredEvent.item.structured.env.nested.api_key, '[REDACTED]')
+      // 0.15.2 回归：token 计数（usage）不能被当成凭据抹掉。
+      A.deepEqual(
+        structuredEvent.item.structured.usage,
+        { inputTokens: 6501, outputTokens: 5, maxTokens: 4096 },
+        'usage 计数必须原样保留（旧判据会把 inputTokens 抹成 [REDACTED]）',
+      )
       A.equal(structuredEvent.item.aggregated_output, 'structured', '普通字段不得误改')
       // B3 / M1 / M2 / m1：文本写法在同一导出面上也必须抹掉。
       for (const marker of ['B3a', 'B3b', 'M1a', 'M2c', 'm1b', 'm1d']) {

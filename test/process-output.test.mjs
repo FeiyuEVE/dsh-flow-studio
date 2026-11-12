@@ -618,6 +618,56 @@ await check('0.15.2 M1/M3：isSensitiveKeyName 覆盖复审列出的全部键名
   assert.equal(isSensitiveKeyName('keyboard_secret'), true, 'keyboard 豁免不能给 secret 开后门')
 })
 
+await check('0.15.2 回归：token 计数 / 上限键名不脱敏，token 凭据仍脱敏', () => {
+  // 14 个复审列出的计数 / 上限键名（camel / snake / kebab 都覆盖）。
+  const countKeys = [
+    'inputTokens', 'outputTokens', 'cachedTokens', 'cacheReadTokens', 'cacheWriteTokens',
+    'reasoningTokens', 'thoughtTokens', 'totalTokens', 'tokenCount', 'token_count',
+    'maxTokens', 'max_tokens', 'tokensUsed', 'tokenLimit', 'limit_tokens',
+    'input_tokens', 'output-tokens', 'max-tokens', 'tokens-used', 'token-limit',
+  ]
+  for (const key of countKeys) {
+    assert.equal(isSensitiveKeyName(key), false, `计数/上限键名不得判敏感：${key}`)
+  }
+  // 事件里的 usage 数值必须原样保留（整值替换会把可观测性数据抹掉）。
+  const usage = {
+    inputTokens: 6501,
+    outputTokens: 5,
+    cachedTokens: 120,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 7,
+    reasoningTokens: 12,
+    thoughtTokens: 3,
+    totalTokens: 6506,
+    tokenCount: 6506,
+    maxTokens: 4096,
+    tokensUsed: 6506,
+    tokenLimit: 8192,
+  }
+  const out = redactStructured({ usage, note: 'keep-me' })
+  A.deepEqual(out.usage, usage, 'usage 计数必须原样保留')
+  A.equal(out.usage.inputTokens, 6501, 'inputTokens 数值不变')
+  A.equal(out.usage.outputTokens, 5, 'outputTokens 数值不变')
+  A.equal(out.note, 'keep-me')
+  // 文本赋值形态同样不误伤计数。
+  A.equal(redactText('usage inputTokens=6501 outputTokens=5'), 'usage inputTokens=6501 outputTokens=5')
+  A.equal(redactText('max_tokens: 4096'), 'max_tokens: 4096')
+  // 真正的 token 凭据仍必须敏感：access / refresh / id / api / 裸 token / token2。
+  const credentialKeys = ['accessToken', 'refresh_token', 'token', 'token2', 'api_token', 'idToken']
+  for (const key of credentialKeys) {
+    assert.equal(isSensitiveKeyName(key), true, `token 凭据键名必须敏感：${key}`)
+    assert.equal(redactStructured({ [key]: 'hunter2' })[key], '[REDACTED]', `${key} 的值必须整值脱敏`)
+    assert.equal(redactText(`${key}=hunter2`).includes('hunter2'), false, `${key}= 文本形态必须脱敏`)
+  }
+  // 计数与凭据混在同一层：只抹凭据。
+  const mixed = redactStructured({
+    usage: { inputTokens: 6501, outputTokens: 5 },
+    auth: { accessToken: 'hunter2' },
+  })
+  A.deepEqual(mixed.usage, { inputTokens: 6501, outputTokens: 5 })
+  A.equal(mixed.auth, '[REDACTED]')
+})
+
 await check('0.15.2 B1：redactStructured 敏感键值整体替换，非字符串叶子原样', () => {
   const input = {
     item: {

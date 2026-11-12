@@ -447,3 +447,23 @@ await check('redactText：超大输入分段脱敏，不因正则爆栈（0.14.8
   A.ok(out.endsWith(' tail'), '尾部普通文本保持原样')
   A.equal(redactText(out), out, '大文本整体幂等')
 })
+
+await check('redactText：分段边界不能把引号内的敏感值切开（0.14.8 复审回归）', () => {
+  // 复审实测泄漏：262090 个 'A' 之后紧跟 `password="ghp_…; hunter2"`。旧分段按空白切，
+  // 引号内的空白被当成边界，后半段 `hunter2"` 逃过 key=value 规则。
+  const raw = 'A'.repeat(262_090) + '1 password="ghp_' + 'A'.repeat(36) + '; hunter2"'
+  const out = redactText(raw)
+  A.ok(!out.includes('hunter2'), '引号内的残余秘密不能被分段漏掉')
+  A.ok(out.endsWith('password="[REDACTED]"'), '整值必须被抹掉')
+
+  // 同样的值放在多行文本里、跨过 256 KiB 边界附近，也不能被拆开。
+  const filler = 'line padding\n'.repeat(20_000)
+  const withQuoted = `${filler}password="ghp_${'A'.repeat(36)}; hunter2"\n`
+  const red = redactText(withQuoted)
+  A.ok(!red.includes('hunter2'), '多行文本里的引号值同样不得泄漏')
+
+  // 引号不闭合的脏输入：不能崩，也不能把秘密原样留下。
+  const unbalanced = 'A'.repeat(262_090) + '1 password="ghp_' + 'A'.repeat(36)
+  const odd = redactText(unbalanced)
+  A.ok(!odd.includes('A'.repeat(36)), '引号未闭合时令牌本身仍要被抹掉')
+})

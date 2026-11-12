@@ -66,9 +66,13 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
  * 保持纯函数：host-check 等调用方都需要它不依赖 fs / 存储层，反向 import 会形成环。
  *
  * 实现分两层：{@link redactSegment} 是完整的规则管线（只在有界片段上跑）；本函数负责
- * **分段**——先按空白切出「词」，把长度超过 {@link REDACT_MAX_SEGMENT} 的整段无空白串
- * 直接判成 `[REDACTED]`（这类串本来就会命中规则 4 的多类字符判定），再把其余词按顺序
- * 装箱成 ≤256 KiB 的片段逐段脱敏。凭据本身不含空白，所以不会因为分段被劈成两半。
+ * **分段**——按行切分（行是语义完整的单位，quoted 值 / Authorization 头通常在同一行），
+ * 每段 ≤ {@link REDACT_MAX_SEGMENT}。单行本身就超长时，退一步按「引号外的空白」切词；
+ * 仍超长的无空白串整段判成 `[REDACTED]`（这类串本来就会命中规则 4 的多类字符判定）。
+ *
+ * 为什么不能只按空白切：`password="…; hunter2"` 这种引号内含空白的值会被劈成两半，
+ * 后半段逃过 key=value 规则（0.14.8 复审实测泄漏）。所以词法上只在**引号未被打开**
+ * 时把空白当分隔符；引号打开的前提是紧跟在 `=` / `:` 后面（值开头）。
  *
  * @param {unknown} raw
  * @returns {string}
@@ -76,22 +80,6 @@ const SECRET_FLAG = new RegExp(SECRET_FLAG_PATTERN, 'gi')
 export function redactText(raw) {
   const text = typeof raw === 'string' ? raw : String(raw ?? '')
   if (text.length <= REDACT_MAX_SEGMENT) return redactSegment(text)
-  const pieces = []
-  let index = 0
-  while (index < text.length) {
-    let end = index
-    while (end < text.length && !isWhitespaceCode(text.charCodeAt(end))) end += 1
-    if (end === index) {
-      let wsEnd = index
-      while (wsEnd < text.length && isWhitespaceCode(text.charCodeAt(wsEnd))) wsEnd += 1
-      pieces.push({ kind: 'ws', text: text.slice(index, wsEnd) })
-      index = wsEnd
-      continue
-    }
-    const token = text.slice(index, end)
-    pieces.push(token.length > REDACT_MAX_SEGMENT ? { kind: 'giant' } : { kind: 'token', text: token })
-    index = end
-  }
   let out = ''
   let buffer = ''
   const flush = () => {
@@ -100,24 +88,81 @@ export function redactText(raw) {
       buffer = ''
     }
   }
-  for (const piece of pieces) {
-    if (piece.kind === 'giant') {
+  let index = 0
+  while (index < text.length) {
+    const newline = text.indexOf('\n', index)
+    const lineEnd = newline === -1 ? text.length : newline + 1
+    const line = text.slice(index, lineEnd)
+    index = lineEnd
+    if (line.length > REDACT_MAX_SEGMENT) {
       flush()
-      out += '[REDACTED]'
+      let lineBuffer = ''
+      const lineFlush = () => {
+        if (lineBuffer !== '') {
+          out += redactSegment(lineBuffer)
+          lineBuffer = ''
+        }
+      }
+      for (const piece of splitOversizeLine(line)) {
+        if (piece === '[REDACTED]') {
+          lineFlush()
+          out += '[REDACTED]'
+          continue
+        }
+        if (lineBuffer.length + piece.length > REDACT_MAX_SEGMENT) lineFlush()
+        lineBuffer += piece
+      }
+      lineFlush()
       continue
     }
-    if (piece.kind === 'ws' && piece.text.length > REDACT_MAX_SEGMENT) {
-      flush()
-      out += piece.text
-      continue
-    }
-    if (buffer.length + piece.text.length > REDACT_MAX_SEGMENT) flush()
-    buffer += piece.text
+    if (buffer.length + line.length > REDACT_MAX_SEGMENT) flush()
+    buffer += line
   }
   flush()
   return out
 }
 
+/**
+ * 把「单行超长」的文本切成词（引号内的空白不算分隔符）。
+ *
+ * 唯一会返回 `'[REDACTED]'` 的情况是某个词本身超过 {@link REDACT_MAX_SEGMENT}——
+ * 这种无空白超长串按规则 4 的语义就该整体抹掉，同时避开正则在超长匹配上爆栈。
+ *
+ * @param {string} line
+ * @returns {string[]}
+ */
+function splitOversizeLine(line) {
+  const pieces = []
+  let index = 0
+  while (index < line.length) {
+    const start = index
+    let quote = null
+    while (index < line.length) {
+      const code = line.charCodeAt(index)
+      if (quote === null && isWhitespaceCode(code)) break
+      const char = line[index]
+      if (char === '"' || char === "'") {
+        if (quote === null) {
+          const previous = index > 0 ? line[index - 1] : ''
+          if (previous === '=' || previous === ':') quote = char
+        } else if (quote === char) {
+          quote = null
+        }
+      }
+      index += 1
+    }
+    if (index === start) {
+      let wsEnd = index
+      while (wsEnd < line.length && isWhitespaceCode(line.charCodeAt(wsEnd))) wsEnd += 1
+      pieces.push(line.slice(start, wsEnd))
+      index = wsEnd
+      continue
+    }
+    const token = line.slice(start, index)
+    pieces.push(token.length > REDACT_MAX_SEGMENT ? '[REDACTED]' : token)
+  }
+  return pieces
+}
 
 /**
  * 超大文本的分段阈值（UTF-16 码元数，0.14.8）。

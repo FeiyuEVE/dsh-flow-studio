@@ -1092,3 +1092,17 @@ codex 对 0.13.4 的复审结论是「原 BLOCKER 已关闭，但仍有 8 MAJOR 
 - 变异验证：漏 `HOST_MODULES` 条目 → build / verify-build 与打包测试红；SDK 移入 `devDependencies` → 打包测试红；默认适配器改成 `codex` → 集成测试红。
 - **未验收**：真实 `codex-acp 2.6.0` 的模型调用与 finish（第 ④ 层）没跑——`scripts/acp-smoke.mjs` 默认只做 probe（①②③），`--prompt` 才跑真实调用，缺 CLI 时输出 `skipped:true`（不是通过）；18 帧真实报文重放不含 `flow_finish_node`、`mcpServers` 为空，不构成 MCP 完结证据，`capabilities().evidence.realChannel` 固定写未验证。真实 Claude CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。
 - 打包测试依赖本机 `bubblewrap` 与可安装依赖（约 17s），在完全离线的环境里会失败而不是静默跳过。
+
+## 0.15.1 — 脱敏层转义感知、先脱敏再截尾，闭合复审的 13 类新写法
+
+0.15.0 的独立复审（第五轮）确认终态结果面对**旧**写法已干净（76/76），但新造出的 13 类写法仍会泄漏 `hunter2`，诊断导出面另有系统性缺陷。0.15.1 只动脱敏相关代码与测试，不改 ACP 适配器行为、不改版本号。
+
+- **取值扫描器补上转义感知**：赋值分隔符后出现 `\"` / `\'` 时按「引号已打开」处理，收尾标记也是 `\"` / `\'`；值内 `\n` / `\t` / `\\` 是转义序列，不是真正的换行 / 反斜杠；未闭合的转义引号把剩余文本都算作值。`JSON.stringify({msg:'password="…; hunter2"'})` 这类**序列化后**的文本不再泄漏。
+- **先脱敏再截断**：`attachProcessStreams` 的 `stdoutTail` / `stderrTail` 不再边收边按 64 KiB / 8 KiB 切；收流时保留「上限 + 余量」的原始窗口（余量与上限同量级，至少 4 KiB），导出时先整段 `redactText` 再按展示上限截尾。`agent-adapter-claude` 的合并 tail 也改成「合并 → 脱敏 → 按字节取尾」，不再是 `slice(-limit)` 之后才脱敏。
+- **`handle.events` 走同一套文本规则**：codex / claude 的导出副本（events / lastMessage / tail）不再只做「本 execution 精确秘密替换」，而是先过共享 `redactText`（JSON 转义、键值、超长串），再做精确替换。≤1 MiB 的事件文本关闭「≥64 KiB 连续串预抹」——那是给超大输入避开 V8 爆栈的兜底，会把 600 KiB 的合法 `x…x` 长串整段替换；规则 5 仍按跨类字符判敏感，所以合法大输出与凭据判定都不回退。
+- **补齐 13 类写法**：三引号（`"""` / `'''`）、shell 词内拼接（`"abc"hunter2` / `""hunter2`）、全角分隔符（`：` / `＝`，含 `--token：…`）、箭头（`=>` / `->`）、YAML 块标量（`|` / `>` + 缩进后续行）、裸方案名授权头（`Authorization: ApiKey …` / `SSWS …`，保留方案名、抹掉凭据）、SQL 双写单引号（`'it''s hunter2'`）、反斜杠续行；对照 `?token=secret&hunter2` 里的 `hunter2` 是另一个 query 参数，保持不误伤。
+- **收紧「已脱敏值」放行**：`isFullyRedactedValue` 不再接受任意 ≤24 位前缀，只放行 `[REDACTED]` / `Bearer [REDACTED]` / `ghp_[REDACTED]` / `glpat-[REDACTED]` / `AKIA[REDACTED]` 等**已知方案前缀 + 标记**；`password="hunter2[REDACTED]"` 现在整值抹掉。
+- **既有缺陷收口**：`process-output` 里从未使用的 `SECRET_FLAG` 与对 `host-check` 的死 import 删掉，敏感键名改成 `process-output` 导出的 `SENSITIVE_KEY_NAME_SOURCE` 单一来源、由 `host-check` 反向复用；模块头注释同步改对。`host-check.redactSensitiveText`（导出 API，`runHostCheck` 目前在 src 无调用者）改为直接复用 `redactText`，不再留旧正则副本。`redactDeep` 增加键名判据：`token` / `password` / `apiKey` / `clientSecret` 等键的未知值直接 `[REDACTED]`，不再只看值形态。
+- **回归与变异**：新增 15 条写法用例（修复前 15/15 泄漏，修复后 0/15）、tail 跨上限用例，以及 adapter 的 `handle.events` 赋值型秘密断言；三条变异——去掉转义感知、把 tail 改回先切后脱敏、放开任意 marker 前缀——均被测试拦红。全量 `npm test` 通过，`node scripts/build.mjs && node scripts/verify-build.mjs` 通过。9 MiB / 31 MiB 输入实测 396 / 1235 ms（混合敏感值样本 510 / 1554 ms），无 `RangeError`。
+
+**已知边界**：tail 的余量是「与上限同量级」的固定窗口；若敏感值本身长到键名落在窗口之外，仍依赖规则 5 的超长串口径兜底（值本身够长时会被判 `[REDACTED]`）。YAML 块标量整块替换成 `"[REDACTED]"`（保留块尾换行），不再保留 `|` 指示符。`Authorization` 的裸方案名按「方案词 + 一个凭据」解析，方案词保留；无方案词时仍整值替换。真实 Claude / Codex CLI、Windows 206 / 异步 spawn E2BIG、32 MiB 单行内存峰值仍未验证。

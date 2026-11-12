@@ -365,6 +365,36 @@ test('展示 tail 有界且 UTF-8 安全，完整行交付不受 tail 上限影�
   }
 })
 
+test('tail 先整段脱敏再截尾：键名落在展示上限之外也不得泄漏（0.15.1）', async () => {
+  const { reader } = makeReader()
+  // 键名（password=）离输出末尾约 1.5 KiB，旧实现先切 64 字节再脱敏时键名已被切掉，
+  // 值里的 hunter2 会原样出现在 tail 里。新实现保留「上限 + 余量」的原始窗口再脱敏。
+  const stdoutPayload = `${'x'.repeat(2000)} password="${'y'.repeat(1500)}; hunter2"`
+  const stderrPayload = `${'z'.repeat(1200)} password="${'w'.repeat(900)}; hunter2"`
+  const script = `process.stdout.write(${JSON.stringify(stdoutPayload)}); process.stderr.write(${JSON.stringify(stderrPayload)})`
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const attach = attachProcessStreams(child, {
+    stdoutReader: reader,
+    stdoutTailBytes: 64,
+    stderrTailBytes: 32,
+    drainTimeoutMs: 3000,
+  })
+  try {
+    assert.deepEqual(await attach.drained, { drained: true, timedOut: false })
+    const stdoutTail = attach.stdoutTail()
+    const stderrTail = attach.stderrTail()
+    assert.ok(!stdoutTail.includes('hunter2'), `stdout tail 不得泄漏（实际 ${JSON.stringify(stdoutTail)}）`)
+    assert.match(stdoutTail, /\[REDACTED\]/, 'stdout tail 应包含脱敏标记')
+    assert.ok(Buffer.byteLength(stdoutTail, 'utf8') <= 64, 'stdout tail 仍按展示上限有界')
+    assert.ok(!stderrTail.includes('hunter2'), `stderr tail 不得泄漏（实际 ${JSON.stringify(stderrTail)}）`)
+    assert.match(stderrTail, /\[REDACTED\]/, 'stderr tail 应包含脱敏标记')
+    assert.ok(Buffer.byteLength(stderrTail, 'utf8') <= 32, 'stderr tail 仍按展示上限有界')
+  } finally {
+    attach.dispose()
+    await waitExit(child)
+  }
+})
+
 test('drained 有界：后代继承 stdout 时超时返回 timedOut，而不是无限等待', async () => {
   const { reader } = makeReader()
   // 父进程把 stdout 继承给一个长期存活的后代后自己退出：pipe 不会 close。

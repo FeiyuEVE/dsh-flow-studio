@@ -471,7 +471,7 @@ if (mode === 'hook-never') {
   process.exit(0)
 }
 if (mode === 'leak') {
-  assistantEvent(usageA, 'token=' + token + ' socket=' + socketPath)
+  assistantEvent(usageA, 'token=' + token + ' socket=' + socketPath + ' password="abc; hunter2"')
   await callTool('泄漏测试')
   resultEvent(usageResultFinal, 'token=' + token + ' socket=' + socketPath)
   await closeClient()
@@ -1755,9 +1755,11 @@ async function main() {
       const eventsText = JSON.stringify(handle.events)
       A.equal(eventsText.includes(invocation.token), false, 'events 里不能出现凭据')
       A.equal(eventsText.includes('fs-claude-'), false, 'events 里不能出现 runDir 路径')
-      A.ok(eventsText.includes('[redacted]'), 'events 确实执行了脱敏')
+      A.match(eventsText, /\[redacted\]/i, 'events 确实执行了脱敏')
+      A.ok(eventsText.includes('password='), 'events 应包含 agent_message 正文（否则下一条断言是空的）')
+      A.equal(eventsText.includes('hunter2'), false, 'events 里的赋值型秘密必须走共享文本规则抹掉')
       A.equal(String(handle.lastMessage).includes(invocation.token), false, 'lastMessage 不能泄漏')
-      A.match(String(handle.lastMessage), /\[redacted\]/)
+      A.match(String(handle.lastMessage), /\[redacted\]/i)
       A.equal(String(handle.stdoutTail).includes(invocation.token), false)
       A.equal(String(handle.stderrTail).includes(invocation.token), false)
       await adapter.dispose(handle)

@@ -212,7 +212,7 @@ if (mode === 'leak') {
       exit_code: 0,
     },
   })
-  out({ type: 'item.completed', item: { id: 'item_msg', type: 'agent_message', text: 'token=' + token + ' socket=' + socketPath } })
+  out({ type: 'item.completed', item: { id: 'item_msg', type: 'agent_message', text: 'token=' + token + ' socket=' + socketPath + ' password="abc; hunter2"' } })
 }
 
 if (mode === 'leak-deep') {
@@ -1807,9 +1807,11 @@ async function main() {
       const eventsText = JSON.stringify(handle.events)
       A.equal(eventsText.includes(invocation.token), false, 'events 里不能出现凭据')
       A.equal(eventsText.includes('fs-codex-'), false, 'events 里不能出现 runDir / socket 路径')
-      A.ok(eventsText.includes('[redacted]'), 'events 里应看到脱敏占位符（说明脱敏真的执行了）')
+      A.match(eventsText, /\[redacted\]/i, 'events 里应看到脱敏占位符（说明脱敏真的执行了）')
+      A.ok(eventsText.includes('password='), 'events 应包含 agent_message 正文（否则下一条断言是空的）')
+      A.equal(eventsText.includes('hunter2'), false, 'events 里的赋值型秘密必须走共享文本规则抹掉')
       A.equal(String(handle.lastMessage).includes(invocation.token), false, 'lastMessage 里不能出现凭据')
-      A.match(String(handle.lastMessage), /\[redacted\]/)
+      A.match(String(handle.lastMessage), /\[redacted\]/i)
       A.equal(String(handle.stdoutTail).includes(invocation.token), false, 'stdoutTail 里不能出现凭据')
       A.equal(String(handle.stderrTail).includes(invocation.token), false, 'stderrTail 里不能出现凭据')
       await adapter.dispose(handle)

@@ -62,6 +62,26 @@ const DEFAULT_STDOUT_TAIL_BYTES = 64 * 1024
 /** 展示用 stderr tail 默认上限（8 KiB）。 */
 const DEFAULT_STDERR_TAIL_BYTES = 8 * 1024
 
+/**
+ * tail 的**原始窗口余量**（0.15.1）。
+ *
+ * 旧实现按上限边收边切，导出时才脱敏：切点落在敏感值中间时键名已经被切掉，值就裸奔。
+ * 现在收流时保留 `上限 + 余量` 的原始窗口，导出时先对整段窗口脱敏、再按上限截尾。
+ * 余量取与上限相同（至少 4 KiB），覆盖「键名刚落在窗口外一点」的常见情形；真正超长的
+ * 值还有规则 5 的超长串兜底。
+ */
+const TAIL_REDACT_MARGIN_MIN_BYTES = 4 * 1024
+
+/**
+ * 计算 tail 的原始保留窗口。
+ *
+ * @param {number} limit
+ * @returns {number}
+ */
+function tailRetentionBytes(limit) {
+  return limit + Math.max(TAIL_REDACT_MARGIN_MIN_BYTES, limit)
+}
+
 /** 退出后等待 stdout 排空的默认上限（5s）。 */
 const DEFAULT_DRAIN_TIMEOUT_MS = 5000
 
@@ -398,7 +418,8 @@ export function createUtf8LineReader(options = {}) {
  *   省略时内部创建一个（建议每个初始/resume 进程传入独立实例）。
  * @param {ReturnType<typeof createUtf8LineReader>} [options.stderrReader] 可选；stderr
  *   通常只做 tail 诊断，需要结构化诊断时才传。
- * @param {number} [options.stdoutTailBytes=65536] 展示 tail 上限（按字节）。
+ * @param {number} [options.stdoutTailBytes=65536] 展示 tail 上限（按字节）；内部保留
+ *   `上限 + 余量` 的原始窗口，导出时**先脱敏再截尾**。
  * @param {number} [options.stderrTailBytes=8192] 展示 tail 上限（按字节）。
  * @param {number} [options.drainTimeoutMs=5000] 子进程退出后等待 stdout 排空的上限；
  *   `0` 表示退出即刻判定（仍然有界）。
@@ -418,6 +439,9 @@ export function attachProcessStreams(child, options = {}) {
   const stderrReader = options.stderrReader || null
   const stdoutTailBytes = positiveIntOr(options.stdoutTailBytes, DEFAULT_STDOUT_TAIL_BYTES)
   const stderrTailBytes = positiveIntOr(options.stderrTailBytes, DEFAULT_STDERR_TAIL_BYTES)
+  // 收流时保留「上限 + 余量」的原始窗口；导出时再脱敏并截到展示上限。
+  const stdoutRetentionBytes = tailRetentionBytes(stdoutTailBytes)
+  const stderrRetentionBytes = tailRetentionBytes(stderrTailBytes)
   const drainTimeoutMs = nonNegativeIntOr(options.drainTimeoutMs, DEFAULT_DRAIN_TIMEOUT_MS)
 
   const stdoutTailDecoder = new StringDecoder('utf8')
@@ -474,7 +498,7 @@ export function attachProcessStreams(child, options = {}) {
       // 展示 tail 用独立的 decoder，按字节有界；与协议缓冲完全分离。
       stdoutTailText = trimTextToBytes(
         stdoutTailText + stdoutTailDecoder.write(chunk),
-        stdoutTailBytes,
+        stdoutRetentionBytes,
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -491,7 +515,7 @@ export function attachProcessStreams(child, options = {}) {
     try {
       stderrTailText = trimTextToBytes(
         stderrTailText + stderrTailDecoder.write(chunk),
-        stderrTailBytes,
+        stderrRetentionBytes,
       )
     } catch (error) {
       recordOwnDiagnostic({ kind: 'tail-error', message: String(error && error.message) })
@@ -508,7 +532,7 @@ export function attachProcessStreams(child, options = {}) {
   function finishStdout() {
     if (disposed) return
     try {
-      stdoutTailText = trimTextToBytes(stdoutTailText + stdoutTailDecoder.end(), stdoutTailBytes)
+      stdoutTailText = trimTextToBytes(stdoutTailText + stdoutTailDecoder.end(), stdoutRetentionBytes)
     } catch {
       // decoder.end() 不应失败；展示 tail 失败不影响协议行。
     }
@@ -523,7 +547,7 @@ export function attachProcessStreams(child, options = {}) {
   function finishStderr() {
     if (disposed) return
     try {
-      stderrTailText = trimTextToBytes(stderrTailText + stderrTailDecoder.end(), stderrTailBytes)
+      stderrTailText = trimTextToBytes(stderrTailText + stderrTailDecoder.end(), stderrRetentionBytes)
     } catch {
       // 同上
     }
@@ -593,10 +617,11 @@ export function attachProcessStreams(child, options = {}) {
   return {
     drained,
     stdoutTail() {
-      return stdoutTailText
+      // 先整段脱敏、再截到展示上限：切点落在值中间也不会露出裸值。
+      return trimTextToBytes(redactText(stdoutTailText), stdoutTailBytes)
     },
     stderrTail() {
-      return stderrTailText
+      return trimTextToBytes(redactText(stderrTailText), stderrTailBytes)
     },
     diagnostics() {
       const merged = ownDiagnostics.map(entry => ({ ...entry }))

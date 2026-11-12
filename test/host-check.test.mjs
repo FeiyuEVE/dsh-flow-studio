@@ -613,6 +613,30 @@ await check('脱敏规则反例：--token-file / --tokenize / 裸 --token 不吞
   assert.equal(redactSensitiveText('--password "two words" tail'), '--password "[REDACTED]" tail')
 })
 
+await check('导出的 redactSensitiveText 复用共享规则：JSON 转义 / 三引号 / 全角 / 箭头 / YAML / 裸方案（0.15.1）', () => {
+  const cases = [
+    [JSON.stringify({ msg: 'password="x; hunter2"' }), 'hunter2'],
+    ['password="""hunter2"""', 'hunter2'],
+    ['password="abc"hunter2', 'hunter2'],
+    ['password：hunter2', 'hunter2'],
+    ['password => "hunter2"', 'hunter2'],
+    ['password: |\n  hunter2', 'hunter2'],
+    ['Authorization: ApiKey hunter2', 'hunter2'],
+    ["password='it''s hunter2'", 'hunter2'],
+    ['password= \\\n  hunter2', 'hunter2'],
+  ]
+  for (const [raw, secret] of cases) {
+    const out = redactSensitiveText(raw)
+    assert.equal(out.includes(secret), false, `redactSensitiveText 不得泄漏：${raw} → ${out}`)
+    assert.equal(redactSensitiveText(out), out, `redactSensitiveText 必须幂等：${out}`)
+  }
+  // 完整已脱敏形态原样放行，普通文本不变。
+  for (const preserved of ['password="[REDACTED]"', 'Authorization: Bearer ghp_[REDACTED]']) {
+    assert.equal(redactSensitiveText(preserved), preserved)
+  }
+  assert.equal(redactSensitiveText('normal text without secrets'), 'normal text without secrets')
+})
+
 await check('真实 spawn 失败（PATH 不可解析 sh）→ fail / HOST_CHECK_SPAWN', async () => {
   const result = await runHostCheck({
     check: { command: 'true' },

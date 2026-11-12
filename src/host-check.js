@@ -52,6 +52,7 @@ import {
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import { CHECK_LIMITS, normalizeNodeCheck, validateNodeCheck } from './node-check.js'
+import { redactText, SENSITIVE_KEY_NAME_SOURCE } from './process-output.js'
 
 /** 检查结果三态：pass / fail / skipped（skipped 在聚合里按 unknown 处理）。 */
 export const HOST_CHECK_STATE = Object.freeze({
@@ -124,10 +125,11 @@ function hostCheckInvalid(field, message) {
  *
  * 导出 pattern 字符串（而不是带 `g` 的 RegExp 实例）供同源规则复用：带 `g` 的对象
  * 在 `test`/`exec` 之间共享 `lastIndex`，跨模块复用会埋并发/顺序 bug。
- * 捕获组顺序固定为 `(前导)(标志)(分隔)(双引号值)(单引号值)(裸值)`，下游
- * `process-output.js` 依赖这个顺序。
+ * 捕获组顺序固定为 `(前导)(标志)(分隔)(双引号值)(单引号值)(裸值)`，本模块的
+ * `redactHighConfidence` 替换回调依赖这个顺序（0.15.1 起 `process-output.js` 已不再
+ * import 本规则，敏感键名的唯一来源是它导出的 `SENSITIVE_KEY_NAME_SOURCE`）。
  */
-const FLAG_NAME = `--?(?:token|password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|auth[_-]?token|secret[_-]?key|private[_-]?key|credentials?|authorization|cookie|session[_-]?key|ssh[_-]?key)`
+const FLAG_NAME = `--?${SENSITIVE_KEY_NAME_SOURCE}`
 
 /**
  * 构造标志位规则。
@@ -197,24 +199,22 @@ function redactHighConfidence(text, binary = false) {
 }
 
 /**
- * 与环境无关的保守脱敏：高置信规则 + ≥32 连续可疑串。
+ * 与环境无关的保守脱敏：**直接复用共享的文本规则** `process-output.redactText`。
  *
- * 与 engine 的 `redactArguments` 同源的文本规则，额外补齐「空格 / 引号」形态：
- *   - `--token <value>`、`--api-key <value>`、`--token=<value>`（值可带引号）；
- *   - `-H "Authorization: Bearer <value>"` / `Authorization: Basic <value>`。
+ * 0.15.1 之前这里维护了一套正则（高置信规则 + ≥32 连续可疑串），六种新写法全部漏
+ * （JSON 转义、三引号、词内拼接、全角分隔符、箭头、YAML 块标量……）。`runHostCheck`
+ * 当前在 src 里没有调用者，但它是导出 API，不能留着一份会泄漏的旧副本。
  *
- * 只用于**可判读文本**（outputTail / 文本报告副本）。二进制报告只跑
- * `redactHighConfidence`，不要用这里第 5 条的 ≥32 启发式——它在 PDF / 图片 /
- * 长十六进制头这类不可判读字节上会大量假阳性，把「无凭据二进制逐字节不变」的前提
- * 直接打破。
+ * 只用于**可判读文本**（outputTail / 文本报告副本）。二进制报告仍只跑
+ * `redactHighConfidence`（单字节 latin1 口径），不要用这里的 ≥32 启发式——它在
+ * PDF / 图片 / 长十六进制头这类不可判读字节上会大量假阳性，把「无凭据二进制逐字节
+ * 不变」的前提直接打破。
  *
  * @param {unknown} raw
  * @returns {string}
  */
 export function redactSensitiveText(raw) {
-  const text = typeof raw === 'string' ? raw : String(raw ?? '')
-  // 5) 超长连续串（哈希 / JWT 片段 / 裸 token）：≥32 个不含空白的可疑字符。
-  return redactHighConfidence(text).replace(/[A-Za-z0-9_+/=.-]{32,}/g, '[REDACTED]')
+  return redactText(raw)
 }
 
 /**
